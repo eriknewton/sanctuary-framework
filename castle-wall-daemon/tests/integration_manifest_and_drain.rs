@@ -1310,3 +1310,249 @@ fn audit_drain_more_pending_when_capped() {
     let _ = stream;
     let _ = booted.handle.stop();
 }
+
+// ---- T3w: the stop guard in the real daemon binary --------------------------
+//
+// Capability (LINUX-STOP-PATH-BUDGET-01): once the daemon binary has enabled
+// its stop guard, a stop whose teardown never finishes still ends the process
+// with a nonzero exit CODE (never a signal) about one guard deadline after the
+// guard was armed. The teardown wedge and the one-second deadline are
+// `test-isolation` seams (`--test-hang-teardown`,
+// `--test-stop-guard-deadline-secs`); a release build has neither.
+//
+// This lives in a suite that runs on every host (macOS and Linux) because the
+// guard is a process-level mechanism: on macOS the subprocess boots
+// control-plane-only, on privileged Linux it holds the isolated kernel runtime.
+
+/// The fixed line the guard's arming path writes to stderr in a
+/// `test-isolation` build. Must match `SystemAlarm::schedule` in
+/// `src/exit_guard.rs`.
+const STOP_GUARD_ARMED_LINE: &str = "castle-wall-daemon: stop guard armed";
+/// The injected guard deadline, in seconds.
+const T3W_DEADLINE_SECS: u64 = 1;
+/// Scheduler and CI allowance on top of the injected deadline.
+const T3W_CI_ALLOWANCE: Duration = Duration::from_secs(2);
+/// The harness's own give-up bound: long enough that a working guard always
+/// exits first, short enough that a missing guard fails the test instead of
+/// hanging the suite. 30 s = boot (bounded well under this on CI) plus deadline
+/// plus allowance, with room to spare.
+const T3W_HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long, after the daemon exits, the harness waits for its pipes to reach
+/// EOF. Bounded like the give-up branch: a descendant still holding a pipe must
+/// not hang the suite. 5 s is generous for two already-closed pipes.
+const T3W_PIPE_DRAIN: Duration = Duration::from_secs(5);
+
+enum T3wTrigger {
+    FatalControlPath,
+    Sigterm,
+}
+
+struct T3wRun {
+    code: Option<i32>,
+    signal: Option<i32>,
+    armed_at: Option<std::time::Instant>,
+    sigterm_at: Option<std::time::Instant>,
+    exited_at: std::time::Instant,
+    stderr: String,
+    stdout: String,
+}
+
+fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let _suite = isolation::guard();
+    reset_isolated_host_state();
+    let dir = TempDir::new().expect("tempdir");
+    let policy_dir = dir.path().join("policy/egress");
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned_path = policy_dir.join("pinned.key");
+    fs::write(&pinned_path, signing.verifying_key().to_bytes()).unwrap();
+    write_signed_manifest(&policy_dir, &signing, 1, 1);
+    let socket_path = dir.path().join("guard.sock");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"));
+    command
+        .args(["--fortress-id", "deadbeef"])
+        .arg("--socket-path")
+        .arg(&socket_path)
+        .arg("--policy-dir")
+        .arg(&policy_dir)
+        .arg("--wal-path")
+        .arg(dir.path().join("guard.wal"))
+        .arg("--pinned-public-key")
+        .arg(&pinned_path)
+        .arg("--producer-key")
+        .arg(policy_dir.join("audit-producer.key"))
+        .arg("--producer-pub-key")
+        .arg(policy_dir.join("audit-producer.pub"))
+        .args(isolation::subprocess_args())
+        .arg("--test-hang-teardown")
+        .args([
+            "--test-stop-guard-deadline-secs",
+            &T3W_DEADLINE_SECS.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if matches!(trigger, T3wTrigger::FatalControlPath) {
+        command.arg("--test-trigger-fatal-control-path");
+    }
+    let mut child = command.spawn().expect("spawn the daemon binary");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<String>();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stdout), &mut text);
+        let _ = stdout_tx.send(text);
+    });
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel::<(Instant, String)>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send((Instant::now(), line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut sigterm_at = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        if matches!(trigger, T3wTrigger::Sigterm) && sigterm_at.is_none() && socket_path.exists() {
+            // The IPC socket exists only after boot installed the SIGTERM handler,
+            // so this signal is caught by the daemon, not by the default action.
+            // SAFETY: kill(2) on our own direct child's pid, which is unreaped
+            // (try_wait just returned None), so it cannot name a reused pid.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            sigterm_at = Some(Instant::now());
+        }
+        if started.elapsed() > T3W_HARNESS_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers are NOT joined here: a descendant still holding a pipe
+            // would block the join and hang the suite, which is exactly what this
+            // give-up bound exists to prevent. Their handles are dropped (detached)
+            // and the lines already received are reported.
+            drop(reader);
+            drop(stdout_reader);
+            let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+            panic!(
+                "the daemon did not exit within {T3W_HARNESS_TIMEOUT:?} with a wedged teardown: \
+                 the stop guard is not ending the process. stderr: {lines:#?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let exited_at = Instant::now();
+    // Bounded drain, never an unbounded join (same reason as the give-up branch):
+    // wait for both pipes to reach EOF up to T3W_PIPE_DRAIN, then detach whatever
+    // reader is still blocked and use what has already arrived.
+    let drain_until = exited_at + T3W_PIPE_DRAIN;
+    while !(reader.is_finished() && stdout_reader.is_finished()) && Instant::now() < drain_until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(reader);
+    drop(stdout_reader);
+    let stdout = stdout_rx.try_recv().unwrap_or_default();
+    let lines: Vec<(Instant, String)> = rx.try_iter().collect();
+    let armed_at = lines
+        .iter()
+        .find(|(_, l)| l == STOP_GUARD_ARMED_LINE)
+        .map(|(at, _)| *at);
+    let stderr = lines
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    reset_isolated_host_state();
+    if stderr.contains("kernel runtime activation failed") {
+        // An unprivileged Linux host cannot boot the subprocess at all; the
+        // privileged CI job sets SANCTUARY_EXPECT_PRIVILEGED_LINUX and must not skip.
+        if std::env::var_os("SANCTUARY_EXPECT_PRIVILEGED_LINUX").is_some() {
+            panic!("privileged Linux runtime was required but unavailable: {stderr}");
+        }
+        eprintln!("SKIP (privileged Linux runtime unavailable): {stderr}");
+        return None;
+    }
+    Some(T3wRun {
+        code: status.code(),
+        signal: status.signal(),
+        armed_at,
+        sigterm_at,
+        exited_at,
+        stderr,
+        stdout,
+    })
+}
+
+fn t3w_assert_guard_exit(run: &T3wRun, clock_start: std::time::Instant, case: &str) {
+    assert_eq!(
+        run.signal, None,
+        "{case}: the process must end by an exit code, not a signal. stderr:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.code,
+        Some(75),
+        "{case}: a wedged stop exits with the decided code 75. stderr:\n{}",
+        run.stderr
+    );
+    // The clean-exit line is printed to STDOUT (`main`'s `println!`), so that is
+    // where its absence is asserted. Model: `integration_failure_modes.rs`.
+    assert!(
+        !run.stdout.contains("clean exit"),
+        "{case}: a guard exit must never claim a clean exit. stdout:\n{}",
+        run.stdout
+    );
+    let bound = Duration::from_secs(T3W_DEADLINE_SECS) + T3W_CI_ALLOWANCE;
+    let took = run.exited_at.saturating_duration_since(clock_start);
+    assert!(
+        took <= bound,
+        "{case}: exit took {took:?} from the arm, over the {bound:?} bound"
+    );
+}
+
+/// T3w (a): a fatal control-path self-exit whose teardown wedges, with no
+/// signal sent, exits 75 within the guard deadline measured from the arm.
+#[test]
+fn t3w_a_fatal_self_exit_with_a_wedged_teardown_exits_75_by_the_guard() {
+    let Some(run) = t3w_run(T3wTrigger::FatalControlPath) else {
+        return;
+    };
+    let armed_at = run.armed_at.unwrap_or_else(|| {
+        panic!(
+            "the guard never armed (no `{STOP_GUARD_ARMED_LINE}` line). stderr:\n{}",
+            run.stderr
+        )
+    });
+    t3w_assert_guard_exit(&run, armed_at, "fatal self-exit");
+}
+
+/// T3w (b): a manager-style SIGTERM whose teardown wedges exits 75 within the
+/// guard deadline measured from the SIGTERM, which is when the guard arms.
+#[test]
+fn t3w_b_sigterm_with_a_wedged_teardown_exits_75_by_the_guard() {
+    let Some(run) = t3w_run(T3wTrigger::Sigterm) else {
+        return;
+    };
+    let sigterm_at = run.sigterm_at.unwrap_or_else(|| {
+        panic!(
+            "the daemon never became signalable. stderr:\n{}",
+            run.stderr
+        )
+    });
+    assert!(
+        run.armed_at.is_some(),
+        "the SIGTERM must arm the guard. stderr:\n{}",
+        run.stderr
+    );
+    t3w_assert_guard_exit(&run, sigterm_at, "SIGTERM");
+}

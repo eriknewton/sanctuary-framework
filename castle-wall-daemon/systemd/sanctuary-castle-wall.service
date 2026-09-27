@@ -71,6 +71,9 @@ TimeoutStartSec=60
 # Live nft ownership checks are isolated behind a one-second deadline. If the
 # underlying fork/netlink transaction remains wedged, shutdown still has a hard
 # bound and systemd kills every child in this service cgroup before restart.
+# Must match STOP_GUARD_TIMEOUT_STOP_SECS in castle-wall-daemon/src/exit_guard.rs:
+# the daemon's stop guard exits with its decided code 2 s before this timeout,
+# so a wedged stop reads as an exit code, not as systemd's SIGKILL.
 TimeoutStopSec=10
 KillMode=control-group
 

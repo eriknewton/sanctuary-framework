@@ -52,6 +52,330 @@ pub enum NftablesError {
     /// unknown ruleset nor deletes another owner's table.
     #[error("foreign or incompatible sanctuary-castle table: {0}")]
     ForeignState(String),
+    /// LINUX-NFT-PID-REUSE-KILL-01: an `nft` child could not be proven finished
+    /// (its waiter could not be spawned, it did not exit after SIGKILL, or it was
+    /// not reaped in the grace window). The child stays held in its slot until it
+    /// is joined. This proves NOTHING about the table: every consumer must read it
+    /// as an indeterminate outcome, never as a loss and never as health.
+    #[error("nft child could not be proven finished at stage {stage:?}; its slot stays held")]
+    ChildStuck { stage: ChildStuckStage },
+    /// LINUX-NFT-PID-REUSE-KILL-01: no child slot was free for this origin, so no
+    /// `nft` was spawned. Fail-closed and indeterminate, like `ChildStuck`.
+    #[error("nft child slots exhausted for {origin:?} calls; nothing was spawned")]
+    ChildSlotsExhausted { origin: NftOrigin },
+}
+
+/// Which slot pool an `nft` invocation may draw from (LINUX-NFT-PID-REUSE-KILL-01).
+///
+/// Passed as the FIRST argument of every `run_nft` / `run_nft_stdin` call, so the
+/// origin of each call site is visible at the site and parsed from it by the
+/// inventory test. `SafetyNet` is reserved for the deny-all net install and its
+/// read-back; everything else is `General`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftOrigin {
+    General,
+    SafetyNet,
+}
+
+/// Where a child that could not be proven finished got stuck (named states of
+/// the bounded wait, `S_WAITING` / `S_EXITED?` / `S_REAPED?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStuckStage {
+    /// The output waiter thread could not be spawned.
+    WaiterSpawnFailed,
+    /// SIGKILL was sent (or no pidfd existed to send it through) and the process
+    /// was not observed to exit within the kill grace.
+    NotExited,
+    /// The process exited but the waiter did not reap it within the reap grace
+    /// (for example a descendant still holds an output pipe open).
+    NotReaped,
+}
+
+/// General-pool child slots. Policy: four concurrent general `nft` calls, the cap
+/// both design reviews accepted as fixed.
+pub const NFT_CHILD_SLOTS_GENERAL: usize = 4;
+/// Slots only a `SafetyNet` call may take: one net install in flight at a time.
+pub const NFT_CHILD_SLOTS_SAFETY_NET_RESERVED: usize = 1;
+/// Every slot, computed: `GENERAL + SAFETY_NET_RESERVED`.
+pub const NFT_CHILD_SLOTS_TOTAL: usize =
+    NFT_CHILD_SLOTS_GENERAL + NFT_CHILD_SLOTS_SAFETY_NET_RESERVED;
+
+/// How an `nft` invocation passes its command: argv or a `-f -` stdin script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NftSiteKind {
+    Argv,
+    Stdin,
+}
+
+/// Every `run_nft` / `run_nft_stdin` call site in this file's production code,
+/// as (enclosing fn, kind, mutating, origin); a function with two calls appears
+/// twice. Line numbers are deliberately absent (they drift); function names are
+/// not. The T12 inventory test parses every field back out of the call site
+/// itself and requires multiset equality, so a new call site, a retagged origin
+/// (a General site taking the reserved `SafetyNet` slot) or a new mutating argv
+/// verb cannot land without an edit here. Must match the call sites below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NFT_INVOCATION_SITES: &[(&str, NftSiteKind, bool, NftOrigin)] = &[
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_deny_all_safety_net_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "live_table_is_deny_all_safety_net_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "live_net_covers_attempt_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "list_castle_table_json_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "atomic_reset_deny_all_net_to_fresh_owned_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "force_delete_castle_table_by_name_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "create_castle_table_exclusive_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "list_owned_castle_table_json_for_binding_set",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl_from_live_inventory",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_agent_jump_rule_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "list_agent_rulesets_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "table_exists_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_castle_table_shape_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+];
+
+/// A child held in a slot after its call returned without proving it finished.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) trait ParkedChild {
+    /// Whether the child is now finished (joinable without blocking).
+    fn poll_finished(&mut self) -> bool;
+    /// Join the finished child, releasing everything it holds.
+    fn reap(self);
+}
+
+/// Per-origin child slots with reserved headroom (mirrors the audit ring's
+/// reserved-capacity rule). A slot is held from admission until the child is
+/// joined, so in-flight and parked children count alike.
+///
+/// INVARIANT (per-origin slot rule): a `General` call is admitted only while
+/// `held < NFT_CHILD_SLOTS_GENERAL` and a `SafetyNet` call only while
+/// `held < NFT_CHILD_SLOTS_TOTAL`, so General pressure can never consume the
+/// reserved slot. The reservation happens at ADMISSION, before any timeout can
+/// race it (AGENTS rule 12); a timeout never releases a slot, only a join does.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ChildSlotTable<P: ParkedChild> {
+    next_id: u64,
+    in_flight: Vec<(u64, NftOrigin)>,
+    parked: Vec<(NftOrigin, P)>,
+    /// `poll_finished` calls made by the most recent admission's sweep; bounded
+    /// by `NFT_CHILD_SLOTS_TOTAL` (the per-request work bound).
+    last_sweep_polls: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<P: ParkedChild> ChildSlotTable<P> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_id: 0,
+            in_flight: Vec::new(),
+            parked: Vec::new(),
+            last_sweep_polls: 0,
+        }
+    }
+
+    /// Slots currently held, in flight or parked.
+    pub(crate) fn held(&self) -> usize {
+        self.in_flight.len() + self.parked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_sweep_polls(&self) -> usize {
+        self.last_sweep_polls
+    }
+
+    /// Join every parked child that has finished, freeing its slot. Touches at
+    /// most `NFT_CHILD_SLOTS_TOTAL` entries, because no more can ever be held.
+    pub(crate) fn sweep(&mut self) {
+        let mut polls = 0;
+        let mut index = 0;
+        while index < self.parked.len() {
+            polls += 1;
+            if self.parked[index].1.poll_finished() {
+                let (_, child) = self.parked.swap_remove(index);
+                // Freeing a slot drops (reaps) its child, closing its pidfd.
+                child.reap();
+            } else {
+                index += 1;
+            }
+        }
+        self.last_sweep_polls = polls;
+    }
+
+    /// `S_ADMIT`: sweep, then reserve a slot for `origin` or refuse.
+    pub(crate) fn admit(&mut self, origin: NftOrigin) -> Result<u64, NftablesError> {
+        self.sweep();
+        let cap = match origin {
+            NftOrigin::General => NFT_CHILD_SLOTS_GENERAL,
+            NftOrigin::SafetyNet => NFT_CHILD_SLOTS_TOTAL,
+        };
+        if self.held() >= cap {
+            return Err(NftablesError::ChildSlotsExhausted { origin });
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.in_flight.push((id, origin));
+        Ok(id)
+    }
+
+    /// The call finished and its child was joined: free the slot.
+    pub(crate) fn release(&mut self, id: u64) {
+        self.in_flight.retain(|(held, _)| *held != id);
+    }
+
+    /// `S_PARKED`: the call returns, the slot stays held by the parked child.
+    ///
+    /// INVARIANT (per-origin slot rule): parking MOVES an in-flight slot to the
+    /// parked list, it never adds one. An `id` that is not in flight is refused
+    /// and the child handed back, so `held()` can never grow past the cap and the
+    /// origin is never guessed.
+    pub(crate) fn park(&mut self, id: u64, child: P) -> Result<(), P> {
+        let Some(at) = self.in_flight.iter().position(|(held, _)| *held == id) else {
+            debug_assert!(false, "park of nft slot {id}, which is not in flight");
+            return Err(child);
+        };
+        let origin = self.in_flight.swap_remove(at).1;
+        self.parked.push((origin, child));
+        Ok(())
+    }
 }
 
 /// Identifier for a wrapped agent's uid-bound ruleset.
@@ -958,6 +1282,29 @@ pub(crate) fn agent_chain_name(agent_id: &str) -> String {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const NFT_ABSOLUTE_PATHS: [&str; 3] = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
 
+/// TEST-ISOLATION ONLY (C2a2 harness legs H4(d) and H5): a substituted `nft`
+/// binary path, set once by `main`'s `--test-nft-binary <path>` before any nft
+/// call. Compiled out of release builds, where `nft_path` keeps the
+/// absolute-path, no-PATH-fallback rule. Must match `--test-nft-binary` in
+/// `main.rs`.
+#[cfg(feature = "test-isolation")]
+static TEST_NFT_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// TEST-ISOLATION ONLY: install the substituted `nft` binary. The path must be
+/// absolute (the no-PATH-search rule still holds for the substitute) and may be
+/// set only once per process.
+#[cfg(feature = "test-isolation")]
+pub fn use_test_nft_binary(path: String) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!(
+            "--test-nft-binary must be an absolute path, got {path:?}"
+        ));
+    }
+    TEST_NFT_BINARY
+        .set(path)
+        .map_err(|_| "--test-nft-binary may be set only once".to_string())
+}
+
 /// True iff `path` is a regular file with at least one execute bit set. The nft
 /// binary is selected by this direct check, never a PATH lookup.
 #[cfg(all(unix, any(target_os = "linux", test)))]
@@ -993,46 +1340,366 @@ pub(crate) fn resolve_nft_binary(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{Child, Command, Output};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
 
-    const NFT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Per-call deadline for an `nft` child before it is killed.
+    pub(crate) const NFT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Policy allowance for a SIGKILLed, runnable process to be observed exiting
+    /// through its pidfd (scheduler-tick scale; an allowance, not a measurement).
+    pub(crate) const NFT_KILL_GRACE: Duration = Duration::from_millis(200);
+    /// Policy allowance for pipe EOF and `waitpid` after a confirmed exit.
+    pub(crate) const NFT_REAP_GRACE: Duration = Duration::from_millis(500);
+    /// The longest one `nft` call can hold its caller: 2.7 s. Derived, used only
+    /// by T13 and harness leg H3; no inequality against the health interval is
+    /// claimed. Read by tests and the harness only, hence the allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const NFT_CALL_WORST_CASE: Duration = Duration::from_millis(
+        NFT_COMMAND_TIMEOUT.as_millis() as u64
+            + NFT_KILL_GRACE.as_millis() as u64
+            + NFT_REAP_GRACE.as_millis() as u64,
+    );
 
-    fn wait_nft_bounded(child: Child) -> Result<Output, NftablesError> {
-        let pid = child.id();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let waiter = std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-        match rx.recv_timeout(NFT_COMMAND_TIMEOUT) {
+    /// The three budgets of one bounded wait. Production passes
+    /// [`PRODUCTION_WAIT_BUDGET`]; tests inject short ones.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct NftWaitBudget {
+        pub(crate) command: Duration,
+        pub(crate) kill_grace: Duration,
+        pub(crate) reap_grace: Duration,
+    }
+
+    pub(crate) const PRODUCTION_WAIT_BUDGET: NftWaitBudget = NftWaitBudget {
+        command: NFT_COMMAND_TIMEOUT,
+        kill_grace: NFT_KILL_GRACE,
+        reap_grace: NFT_REAP_GRACE,
+    };
+
+    type WaitResult = std::io::Result<Output>;
+
+    /// A child held in its slot after the call that spawned it returned.
+    pub(crate) enum ParkedNftChild {
+        /// The waiter thread owns the child and will reap it; the pidfd is kept
+        /// only so it is closed when the slot is freed, never reused.
+        Waiter {
+            waiter: std::thread::JoinHandle<()>,
+            _pidfd: Option<OwnedFd>,
+        },
+        /// No waiter could be spawned: this entry owns the unreaped child (a
+        /// zombie at worst) and reaps it with a non-blocking `try_wait`.
+        Unwaited {
+            child: Child,
+            _pidfd: Option<OwnedFd>,
+        },
+    }
+
+    impl super::ParkedChild for ParkedNftChild {
+        fn poll_finished(&mut self) -> bool {
+            match self {
+                Self::Waiter { waiter, .. } => waiter.is_finished(),
+                // Ok(Some) reaped it now; Err means it can no longer be waited on
+                // (already reaped), so there is nothing left to hold.
+                Self::Unwaited { child, .. } => !matches!(child.try_wait(), Ok(None)),
+            }
+        }
+
+        fn reap(self) {
+            if let Self::Waiter { waiter, .. } = self {
+                let _ = waiter.join();
+            }
+        }
+    }
+
+    pub(crate) type NftSlotTable = super::ChildSlotTable<ParkedNftChild>;
+
+    /// The process's one slot table. Poison is recovered: the table holds only
+    /// counters and handles, and jamming it would refuse every later nft call.
+    static NFT_CHILD_SLOTS: Mutex<NftSlotTable> = Mutex::new(super::ChildSlotTable::new());
+
+    fn lock_slots(table: &Mutex<NftSlotTable>) -> MutexGuard<'_, NftSlotTable> {
+        table.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// A reserved slot. Dropping it frees the slot (the call finished and joined
+    /// its child, or never spawned one); `park` hands it to a stuck child instead.
+    pub(crate) struct SlotTicket {
+        table: &'static Mutex<NftSlotTable>,
+        id: u64,
+        armed: bool,
+    }
+
+    impl SlotTicket {
+        fn park(mut self, child: ParkedNftChild) {
+            self.armed = false;
+            if let Err(unheld) = lock_slots(self.table).park(self.id, child) {
+                // Unreachable by construction: an armed ticket's id was pushed by
+                // `admit` and only this ticket removes it (release or park, once).
+                // The table refused rather than exceed its cap; the child is
+                // dropped here (a waiter still reaps it, an unwaited one is a
+                // zombie until exit), which is the lesser escape.
+                drop(unheld);
+            }
+        }
+    }
+
+    impl Drop for SlotTicket {
+        fn drop(&mut self) {
+            if self.armed {
+                lock_slots(self.table).release(self.id);
+            }
+        }
+    }
+
+    /// `S_ADMIT` against `table`: reserve a slot for `origin` before anything is
+    /// spawned. A refusal spawns nothing and is written to stderr once.
+    pub(crate) fn admit_slot(
+        table: &'static Mutex<NftSlotTable>,
+        origin: NftOrigin,
+    ) -> Result<SlotTicket, NftablesError> {
+        let mut slots = lock_slots(table);
+        match slots.admit(origin) {
+            Ok(id) => Ok(SlotTicket {
+                table,
+                id,
+                armed: true,
+            }),
+            Err(err) => {
+                // SAFETY: stderr is the operator channel for a fail-closed
+                // refusal that adds no WAL writer; the probe reads it as an
+                // indeterminate outcome and systemd journals this line.
+                eprintln!(
+                    "castle-wall-daemon: nft child slots exhausted (origin {origin:?}, held {}); \
+                     refusing to spawn nft",
+                    slots.held()
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// `pidfd_open(pid, 0)`. `None` on any error (ENOSYS on a kernel before 5.3):
+    /// the caller then never signals at all.
+    pub(crate) fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: a plain syscall with integer arguments; the result is an fd the
+        // kernel just created for us, or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        let fd = std::os::fd::RawFd::try_from(fd)
+            .ok()
+            .filter(|fd| *fd >= 0)?;
+        // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `pidfd_send_signal(pidfd, SIGKILL, NULL, 0)`. `Err(errno)` on failure;
+    /// `ESRCH` means the process already exited and was reaped, never that a
+    /// reused pid was signalled (premise P11).
+    pub(crate) fn pidfd_kill(pidfd: &OwnedFd) -> Result<(), i32> {
+        // SAFETY: the fd is a live pidfd we own; a null siginfo is permitted.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    }
+
+    /// `S_EXITED?`: whether the pidfd becomes readable (the process exited) within
+    /// `grace`. SA_RESTART does not restart poll(2), so an EINTR (a returning
+    /// stop-guard handler) loops against the SAME deadline; it is never read as
+    /// "not readable".
+    fn pidfd_exited_within(pidfd: &OwnedFd, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Round UP to whole milliseconds so a sub-millisecond remainder still
+            // waits instead of polling with a zero timeout.
+            let millis = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+            if rc > 0 {
+                return true;
+            }
+            if rc == 0 {
+                return false;
+            }
+            let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            if !interrupted || remaining.is_zero() {
+                return false;
+            }
+        }
+    }
+
+    /// Wait for an admitted `nft` child with the production budget.
+    fn wait_nft_bounded(child: Child, ticket: SlotTicket) -> Result<Output, NftablesError> {
+        wait_nft_bounded_with(child, ticket, PRODUCTION_WAIT_BUDGET)
+    }
+
+    /// The bounded wait, in named states. Returns within
+    /// `command + kill_grace + reap_grace`; a child it cannot prove finished is
+    /// PARKED in its slot with a `ChildStuck` error rather than detached.
+    pub(crate) fn wait_nft_bounded_with(
+        child: Child,
+        ticket: SlotTicket,
+        budget: NftWaitBudget,
+    ) -> Result<Output, NftablesError> {
+        // S_SPAWNED. INVARIANT: the pidfd is opened before the waiter exists,
+        // because the waiter is the only reaper; a pidfd opened after a reap could
+        // name a reused pid.
+        let pidfd = pidfd_open(child.id());
+
+        // S_WAITING. The child is handed to the waiter through a cell rather than
+        // moved into the closure, so a failed spawn (which drops the closure)
+        // cannot drop the child with it.
+        let cell: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WaitResult>(1);
+        let waiter_cell = Arc::clone(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("castle-wall-nft-waiter".to_string())
+            .spawn(move || {
+                let taken = waiter_cell.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(child) = taken {
+                    let _ = tx.send(child.wait_with_output());
+                }
+            });
+        let waiter = match spawned {
+            Ok(waiter) => waiter,
+            Err(_) => {
+                if let Some(fd) = &pidfd {
+                    let _ = pidfd_kill(fd);
+                }
+                // Poison is recovered, never read as "no child": the closure that
+                // would have taken the child never ran, so it is still in the cell,
+                // and dropping it here would free the slot over a live, unsignalled
+                // child (round-2 code gate).
+                let taken = cell.lock().unwrap_or_else(|err| err.into_inner()).take();
+                if let Some(child) = taken {
+                    ticket.park(ParkedNftChild::Unwaited {
+                        child,
+                        _pidfd: pidfd,
+                    });
+                }
+                return Err(NftablesError::ChildStuck {
+                    stage: ChildStuckStage::WaiterSpawnFailed,
+                });
+            }
+        };
+        match rx.recv_timeout(budget.command) {
             Ok(result) => {
                 let _ = waiter.join();
-                result.map_err(|err| NftablesError::InvocationFailed(err.to_string()))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Absolute binary, direct child: terminate the process whose
-                // bounded output waiter we own, then join it so no detached nft
-                // worker survives a control-path timeout.
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                let result = rx.recv().map_err(|err| {
-                    NftablesError::InvocationFailed(format!(
-                        "nft timed out and waiter result was lost: {err}"
-                    ))
-                })?;
-                let _ = waiter.join();
-                let _ = result;
-                Err(NftablesError::InvocationFailed(format!(
-                    "nft invocation exceeded {}ms deadline",
-                    NFT_COMMAND_TIMEOUT.as_millis()
-                )))
+                drop(ticket);
+                return result.map_err(|err| NftablesError::InvocationFailed(err.to_string()));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = waiter.join();
-                Err(NftablesError::InvocationFailed(
+                drop(ticket);
+                return Err(NftablesError::InvocationFailed(
                     "nft output waiter disconnected".to_string(),
-                ))
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // S_KILLED. Only through the pidfd: never a raw kill(pid), which after
+        // the waiter's reap could signal an unrelated process that reused the pid.
+        let Some(fd) = pidfd else {
+            ticket.park(ParkedNftChild::Waiter {
+                waiter,
+                _pidfd: None,
+            });
+            return Err(NftablesError::ChildStuck {
+                stage: ChildStuckStage::NotExited,
+            });
+        };
+        // ESRCH: it already exited; either way S_EXITED? decides.
+        let _ = pidfd_kill(&fd);
+
+        // S_EXITED?
+        if !pidfd_exited_within(&fd, budget.kill_grace) {
+            ticket.park(ParkedNftChild::Waiter {
+                waiter,
+                _pidfd: Some(fd),
+            });
+            return Err(NftablesError::ChildStuck {
+                stage: ChildStuckStage::NotExited,
+            });
+        }
+
+        // S_REAPED?
+        match rx.recv_timeout(budget.reap_grace) {
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = waiter.join();
+                // Freeing the slot drops the ticket; the pidfd closes with `fd`.
+                drop(ticket);
+                Err(NftablesError::InvocationFailed(format!(
+                    "nft invocation exceeded {}ms deadline",
+                    budget.command.as_millis()
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // S_PARKED: a descendant still holds a pipe, so the waiter never
+                // sees EOF. The slot stays held until the sweep joins it.
+                ticket.park(ParkedNftChild::Waiter {
+                    waiter,
+                    _pidfd: Some(fd),
+                });
+                Err(NftablesError::ChildStuck {
+                    stage: ChildStuckStage::NotReaped,
+                })
             }
         }
+    }
+
+    /// Write `script` to an admitted child's stdin, close it, then run the
+    /// bounded wait. `run_nft_stdin`'s body after the spawn; split out so the
+    /// write-failure path is testable with an injected child and budget.
+    pub(crate) fn feed_stdin_and_wait_with(
+        mut child: Child,
+        ticket: SlotTicket,
+        script: &str,
+        budget: NftWaitBudget,
+    ) -> Result<Output, NftablesError> {
+        use std::io::Write;
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(script.as_bytes()),
+            None => Ok(()),
+        };
+        // Closing stdin is required before waiting; otherwise nft correctly
+        // waits forever for more script bytes.
+        drop(child.stdin.take());
+        if let Err(write_err) = written {
+            // INVARIANT (per-origin slot rule): a failed write never returns past
+            // the child. Returning here with `?` would drop the ticket (freeing the
+            // slot) and the `Child` (which neither signals nor reaps), leaving a
+            // live, uncounted nft process. The child instead goes through the same
+            // kill-and-park path as a timed-out call: a zero command budget means
+            // "signal through the pidfd now", and the slot is freed only by a join
+            // or held by the parked child. The write error is what the caller sees.
+            let kill_now = NftWaitBudget {
+                command: Duration::ZERO,
+                ..budget
+            };
+            let _ = wait_nft_bounded_with(child, ticket, kill_now);
+            return Err(NftablesError::InvocationFailed(format!(
+                "writing the nft script to stdin failed: {write_err}"
+            )));
+        }
+        wait_nft_bounded_with(child, ticket, budget)
     }
 
     /// Locate the `nft` binary by DIRECT absolute-path existence/executable
@@ -1040,6 +1707,10 @@ mod linux {
     /// removed in blocker 9, so a missing absolute binary is a hard error, never
     /// a silent degrade to a bare `nft` resolved through PATH.
     fn nft_path() -> Result<&'static str, NftablesError> {
+        #[cfg(feature = "test-isolation")]
+        if let Some(substitute) = super::TEST_NFT_BINARY.get() {
+            return Ok(substitute.as_str());
+        }
         super::resolve_nft_binary(&super::NFT_ABSOLUTE_PATHS, super::is_executable_file).ok_or_else(
             || {
                 NftablesError::BinaryMissing(
@@ -1087,9 +1758,10 @@ mod linux {
         Ok(())
     }
 
-    fn run_nft(args: &[&str]) -> Result<String, NftablesError> {
+    fn run_nft(origin: NftOrigin, args: &[&str]) -> Result<String, NftablesError> {
         refuse_production_table_under_test()?;
         let nft = nft_path()?;
+        let ticket = admit_slot(&NFT_CHILD_SLOTS, origin)?;
         let child = Command::new(nft)
             .env("LC_ALL", "C")
             .args(args)
@@ -1097,7 +1769,7 @@ mod linux {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        let output = wait_nft_bounded(child)?;
+        let output = wait_nft_bounded(child, ticket)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftablesError::InvocationFailed(format!(
@@ -1110,10 +1782,11 @@ mod linux {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    fn run_nft_stdin(script: &str) -> Result<(), NftablesError> {
+    fn run_nft_stdin(origin: NftOrigin, script: &str) -> Result<(), NftablesError> {
         refuse_production_table_under_test()?;
         let nft = nft_path()?;
-        let mut child = Command::new(nft)
+        let ticket = admit_slot(&NFT_CHILD_SLOTS, origin)?;
+        let child = Command::new(nft)
             .env("LC_ALL", "C")
             .arg("-f")
             .arg("-")
@@ -1122,16 +1795,7 @@ mod linux {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(script.as_bytes())
-                .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        }
-        // Closing stdin is required before waiting; otherwise nft correctly
-        // waits forever for more script bytes.
-        drop(child.stdin.take());
-        let output = wait_nft_bounded(child)?;
+        let output = feed_stdin_and_wait_with(child, ticket, script, PRODUCTION_WAIT_BUDGET)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftablesError::InvocationFailed(format!(
@@ -1180,7 +1844,10 @@ mod linux {
             // single-threaded test / agent-management path, so a racing writer is
             // out of scope (the ACQUISITION path uses the host-lock-guarded
             // `create_castle_table_exclusive_impl`).
-            run_nft_stdin(&super::build_create_castle_table_script(&marker))?;
+            run_nft_stdin(
+                NftOrigin::General,
+                &super::build_create_castle_table_script(&marker),
+            )?;
         } else {
             // Idempotent: the marked table already exists. Ensure the base output
             // chain is present without disturbing the marker; `add chain` is a
@@ -1189,7 +1856,7 @@ mod linux {
                 "add chain {CASTLE_FAMILY} {castle_table} output \
                  {{ type filter hook output priority 0 ; policy accept ; }}\n"
             );
-            let _ = run_nft_stdin(&chain_script);
+            let _ = run_nft_stdin(NftOrigin::General, &chain_script);
         }
         Ok(())
     }
@@ -1244,7 +1911,7 @@ mod linux {
         // builder so the transaction this installs is byte-identical to the one
         // the unit tests assert. Must match `build_deny_all_safety_net_script`.
         let script = super::build_deny_all_safety_net_script(scope);
-        run_nft_stdin(&script).map_err(|err| {
+        run_nft_stdin(NftOrigin::SafetyNet, &script).map_err(|err| {
             let scope_text = match scope {
                 SafetyNetScope::Identity(set) => {
                     format!("the confined identity {:?}", set.uids())
@@ -1276,7 +1943,10 @@ mod linux {
                 )))
             }
         };
-        match run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(json) => Ok(super::is_deny_all_safety_net_json(&json, overflow)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1294,7 +1964,10 @@ mod linux {
                 "cannot classify live safety net without kernel.overflowuid: {e}"
             ))
         })?;
-        let json = run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::SafetyNet,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         Ok(super::deny_all_net_covers_scope_json(
             &json, overflow, scope,
         ))
@@ -1308,7 +1981,10 @@ mod linux {
     /// net read "no table" as "unreadable" and lose source (c) on every fresh host.
     /// Must match the same recognition in `live_table_is_deny_all_safety_net_impl`.
     pub fn list_castle_table_json_impl() -> Result<Option<String>, NftablesError> {
-        match run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(json) => Ok(Some(json)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1363,7 +2039,7 @@ mod linux {
              create chain {CASTLE_FAMILY} {castle_table} output \
              {{ type filter hook output priority 0 ; policy accept ; }}\n"
         );
-        run_nft_stdin(&script).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &script).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "failed to atomically reset the deny-all net to a fresh owned table: {err}"
             ))
@@ -1384,7 +2060,7 @@ mod linux {
             "add table {CASTLE_FAMILY} {castle_table}\n\
              delete table {CASTLE_FAMILY} {castle_table}\n"
         );
-        run_nft_stdin(&script).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &script).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "failed to force-delete the drifted sanctuary-castle table by name: {err}"
             ))
@@ -1425,7 +2101,7 @@ mod linux {
                 "ownership marker contains characters unsafe for an nft comment".to_string(),
             ));
         }
-        run_nft_stdin(&super::build_create_castle_table_script(marker)).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &super::build_create_castle_table_script(marker)).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "exclusive owned-table creation failed (Sanctuary requires nft table-comment and JSON-comment support): {err}"
             ))
@@ -1443,7 +2119,10 @@ mod linux {
         // `-a/--handle` is mandatory: libnftables omits handles from listings by
         // default, while the ownership parser deliberately requires both the
         // table and base-chain handles as part of the exact live identity.
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // A table this daemon just created with `create table` holds ZERO agent
         // chains by construction, so any per-agent binding present here is
         // something this process did not install: refuse it rather than capture
@@ -1472,14 +2151,20 @@ mod linux {
     /// no table handle at all. Must match the argv in
     /// [`verify_owned_castle_table_impl`], whose parse this one mirrors.
     pub fn list_owned_castle_table_json_for_binding_set() -> Result<String, NftablesError> {
-        run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])
+        run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )
     }
 
     pub fn verify_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
         expectation: &super::ExpectedAgentBinding,
     ) -> Result<Vec<String>, NftablesError> {
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // This caller needs BOTH phases: it is a pre-mutation ownership
         // precondition, so a drifted binding must refuse. Must match the polarity
         // in `parse_owned_table_identity`.
@@ -1523,13 +2208,16 @@ mod linux {
     ) -> Result<(), NftablesError> {
         // Prove the live table is still exactly ours before removing anything.
         verify_owned_castle_table_impl(ownership, expectation)?;
-        run_nft(&[
-            "delete",
-            "table",
-            CASTLE_FAMILY,
-            "handle",
-            &ownership.table_handle.to_string(),
-        ])
+        run_nft(
+            NftOrigin::General,
+            &[
+                "delete",
+                "table",
+                CASTLE_FAMILY,
+                "handle",
+                &ownership.table_handle.to_string(),
+            ],
+        )
         .map(|_| ())
     }
 
@@ -1583,8 +2271,10 @@ mod linux {
             super::AGENT_UID_SEAL_INFIX,
             uid_seal
         );
-        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1619,13 +2309,16 @@ mod linux {
         }
         let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         script.push_str(&format!("{rule} comment \"{jump_comment}\"\n"));
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     fn capture_owned_castle_table_impl_from_live_inventory(
         fortress_id: &str,
     ) -> Result<CastleTableOwnership, NftablesError> {
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // Seal-only: this reads the marker off a table that may legitimately
         // already carry an older agent binding, on the way to REPLACING it. The
         // manifest-uid comparison belongs to the reclaim/adoption and health
@@ -1724,8 +2417,10 @@ mod linux {
         super::verify_active_runtime_ownership(&id.fortress_id)?;
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
-        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1747,7 +2442,7 @@ mod linux {
             "flush chain {CASTLE_FAMILY} {castle_table} {chain_name}\n\
              delete chain {CASTLE_FAMILY} {castle_table} {chain_name}\n"
         ));
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     /// Install the jump rule from the base `output` chain into this agent's
@@ -1768,7 +2463,7 @@ mod linux {
         let _ = remove_agent_jump_rule_impl(id);
         let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         let script = format!("{rule}\n");
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     /// Remove the jump rule from the base `output` chain that targets this
@@ -1779,14 +2474,17 @@ mod linux {
         let chain_name = agent_chain_name(&id.agent_id);
         // `-a` annotates each rule with `# handle <N>`; we parse those
         // handles for any rule whose verdict targets our chain.
-        let listing = match run_nft(&[
-            "-a",
-            "list",
-            "chain",
-            CASTLE_FAMILY,
-            castle_table(),
-            "output",
-        ]) {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &[
+                "-a",
+                "list",
+                "chain",
+                CASTLE_FAMILY,
+                castle_table(),
+                "output",
+            ],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1799,15 +2497,18 @@ mod linux {
         };
         let handles = parse_jump_rule_handles(&listing, &chain_name);
         for handle in handles {
-            run_nft(&[
-                "delete",
-                "rule",
-                CASTLE_FAMILY,
-                castle_table(),
-                "output",
-                "handle",
-                &handle.to_string(),
-            ])?;
+            run_nft(
+                NftOrigin::General,
+                &[
+                    "delete",
+                    "rule",
+                    CASTLE_FAMILY,
+                    castle_table(),
+                    "output",
+                    "handle",
+                    &handle.to_string(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -1852,7 +2553,7 @@ mod linux {
     /// half-empty identity a caller could mistake for a real binding. Callers
     /// that need the binding read it from the inventory parser.
     pub fn list_agent_rulesets_impl() -> Result<Vec<String>, NftablesError> {
-        let output = run_nft(&["list", "chains", CASTLE_FAMILY])?;
+        let output = run_nft(NftOrigin::General, &["list", "chains", CASTLE_FAMILY])?;
         let mut results = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -1872,11 +2573,18 @@ mod linux {
     }
 
     pub fn remove_castle_table_impl() -> Result<(), NftablesError> {
-        run_nft(&["delete", "table", CASTLE_FAMILY, castle_table()]).map(|_| ())
+        run_nft(
+            NftOrigin::General,
+            &["delete", "table", CASTLE_FAMILY, castle_table()],
+        )
+        .map(|_| ())
     }
 
     pub fn table_exists_impl() -> Result<bool, NftablesError> {
-        match run_nft(&["list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(_) => Ok(true),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1894,7 +2602,10 @@ mod linux {
         // take. Structured parsing (not a substring scan) is what lets us tell a
         // base output chain from a same-named regular chain, and a chain in our
         // table from one in a foreign table. (blocker 2)
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // A table that shares the `sanctuary-castle` name but lacks our exact
         // base-output-chain shape — or carries any foreign base chain — is
         // foreign/incompatible state (another owner, a hand-edited ruleset, a
@@ -5799,5 +6510,516 @@ table inet sanctuary-castle {
 ";
         let handles = linux::parse_jump_rule_handles(listing, "agent_dup");
         assert_eq!(handles, vec![21, 22, 23]);
+    }
+}
+
+/// LINUX-NFT-PID-REUSE-KILL-01: every `nft` child is admitted into a bounded,
+/// per-origin slot table, killed only through a pidfd, and either proven
+/// finished within a bounded wait or held in its slot until it is joined.
+#[cfg(test)]
+mod child_slot_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A fake parked child: finishes when the test says so, counts its polls.
+    struct FakeChild {
+        finished: Rc<Cell<bool>>,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl ParkedChild for FakeChild {
+        fn poll_finished(&mut self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            self.finished.get()
+        }
+        fn reap(self) {}
+    }
+
+    impl<P: ParkedChild> ChildSlotTable<P> {
+        fn held_by(&self, origin: NftOrigin) -> usize {
+            self.in_flight.iter().filter(|(_, o)| *o == origin).count()
+                + self.parked.iter().filter(|(o, _)| *o == origin).count()
+        }
+    }
+
+    fn fake(polls: &Rc<Cell<usize>>) -> (FakeChild, Rc<Cell<bool>>) {
+        let finished = Rc::new(Cell::new(false));
+        (
+            FakeChild {
+                finished: Rc::clone(&finished),
+                polls: Rc::clone(polls),
+            },
+            finished,
+        )
+    }
+
+    fn check_bounds(table: &ChildSlotTable<FakeChild>) {
+        assert!(
+            table.held() <= NFT_CHILD_SLOTS_TOTAL,
+            "held {} over the cap",
+            table.held()
+        );
+        assert!(
+            table.held_by(NftOrigin::General) <= NFT_CHILD_SLOTS_GENERAL,
+            "General took the reserved slot"
+        );
+        assert!(
+            table.last_sweep_polls() <= NFT_CHILD_SLOTS_TOTAL,
+            "unbounded sweep work"
+        );
+    }
+
+    /// T10 (AGENTS rules 8 and 12): 10 x NFT_CHILD_SLOTS_TOTAL wedge episodes in
+    /// waves of admit, time-out, park, late completion, sweep and re-admit, driven
+    /// by explicit schedules with no processes and no sleeps.
+    #[test]
+    fn t10_slots_hold_their_cap_and_reserve_under_timeout_then_release_waves() {
+        let polls = Rc::new(Cell::new(0));
+        let mut table: ChildSlotTable<FakeChild> = ChildSlotTable::new();
+        let mut episodes = 0;
+        let mut pending: Vec<Rc<Cell<bool>>> = Vec::new();
+        while episodes < 10 * NFT_CHILD_SLOTS_TOTAL {
+            // A call that completes normally frees its slot at once.
+            let done = table
+                .admit(NftOrigin::General)
+                .expect("an empty table admits");
+            table.release(done);
+            assert_eq!(table.held(), 0, "a completed call holds nothing");
+            // Admit: general until refused, never past its pool.
+            let mut general = Vec::new();
+            loop {
+                match table.admit(NftOrigin::General) {
+                    Ok(id) => general.push(id),
+                    Err(NftablesError::ChildSlotsExhausted {
+                        origin: NftOrigin::General,
+                    }) => break,
+                    Err(other) => panic!("unexpected {other:?}"),
+                }
+                check_bounds(&table);
+            }
+            assert!(
+                table.held() >= NFT_CHILD_SLOTS_GENERAL,
+                "general refused only when full"
+            );
+            // While general is exhausted and the reserved slot is free, the net
+            // install still gets in.
+            let net = if table.held() < NFT_CHILD_SLOTS_TOTAL {
+                Some(
+                    table
+                        .admit(NftOrigin::SafetyNet)
+                        .expect("the reserved slot admits a net"),
+                )
+            } else {
+                None
+            };
+            check_bounds(&table);
+            assert!(table.admit(NftOrigin::General).is_err());
+            // Time out and park every in-flight call: the slots stay held.
+            for id in general.into_iter().chain(net) {
+                let (child, finished) = fake(&polls);
+                assert!(table.park(id, child).is_ok());
+                pending.push(finished);
+                episodes += 1;
+                check_bounds(&table);
+            }
+            assert_eq!(
+                table.held(),
+                NFT_CHILD_SLOTS_TOTAL,
+                "parking never frees a slot"
+            );
+            assert!(table.admit(NftOrigin::General).is_err());
+            assert!(table.admit(NftOrigin::SafetyNet).is_err());
+            check_bounds(&table);
+            // Late completion of half the wave; the next admission sweeps it.
+            let half = pending.len() / 2;
+            for finished in pending.drain(..half) {
+                finished.set(true);
+            }
+            table.sweep();
+            check_bounds(&table);
+            assert_eq!(
+                table.parked(),
+                pending.len(),
+                "the sweep frees exactly the finished"
+            );
+            // The rest complete before the next wave.
+            for finished in pending.drain(..) {
+                finished.set(true);
+            }
+        }
+        table.sweep();
+        assert_eq!(table.held(), 0, "every finished child was reclaimed");
+    }
+
+    /// T10: the stated bound, not a stronger one. Four held General calls plus
+    /// one parked SafetyNet child that never finishes refuse the next net
+    /// install, and General never takes the reserved slot.
+    #[test]
+    fn t10_a_parked_safety_net_child_refuses_the_next_net_install() {
+        let polls = Rc::new(Cell::new(0));
+        let mut table: ChildSlotTable<FakeChild> = ChildSlotTable::new();
+        for _ in 0..NFT_CHILD_SLOTS_GENERAL {
+            table.admit(NftOrigin::General).expect("general admitted");
+            check_bounds(&table);
+        }
+        assert!(matches!(
+            table.admit(NftOrigin::General),
+            Err(NftablesError::ChildSlotsExhausted {
+                origin: NftOrigin::General
+            })
+        ));
+        // General is exhausted and the reserved slot is free: the net gets in.
+        let net = table
+            .admit(NftOrigin::SafetyNet)
+            .expect("the reserved slot admits");
+        let (child, _never_finishes) = fake(&polls);
+        assert!(table.park(net, child).is_ok());
+        check_bounds(&table);
+        // Four General held plus one parked SafetyNet child that never finishes:
+        // the next net install is refused, as stated, and General stays refused.
+        assert!(matches!(
+            table.admit(NftOrigin::SafetyNet),
+            Err(NftablesError::ChildSlotsExhausted {
+                origin: NftOrigin::SafetyNet
+            })
+        ));
+        assert!(table.admit(NftOrigin::General).is_err());
+        assert_eq!(table.held_by(NftOrigin::General), NFT_CHILD_SLOTS_GENERAL);
+        check_bounds(&table);
+    }
+
+    /// T12 (LINUX-NFT-PID-REUSE-KILL-01): the nft site inventory. Every field is
+    /// parsed at the call site (kind from the callee token, origin from the
+    /// `NftOrigin::` first argument, mutating from the verb) and compared to
+    /// `NFT_INVOCATION_SITES` by multiset equality over the full tuple; there are
+    /// exactly two spawn paths and the bounded wait is reached only through them.
+    #[test]
+    fn t12_the_nft_invocation_inventory_matches_every_call_site() {
+        use crate::source_scan::{
+            enclosing_fn, fn_body, offsets_of, production_part, without_comment_lines,
+        };
+        let code = without_comment_lines(&production_part(include_str!("nftables.rs")));
+        let mut found: Vec<String> = Vec::new();
+        for (token, kind) in [
+            ("run_nft(", NftSiteKind::Argv),
+            ("run_nft_stdin(", NftSiteKind::Stdin),
+        ] {
+            for at in offsets_of(&code, token) {
+                let before = &code[..at];
+                if before.ends_with("fn ")
+                    || before
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let args = code[at + token.len()..].trim_start();
+                let origin = if args.starts_with("NftOrigin::General") {
+                    NftOrigin::General
+                } else if args.starts_with("NftOrigin::SafetyNet") {
+                    NftOrigin::SafetyNet
+                } else {
+                    panic!("a call site at {at} does not name its NftOrigin first");
+                };
+                let mutating = match kind {
+                    NftSiteKind::Stdin => true,
+                    NftSiteKind::Argv => {
+                        let open = args.find('"').expect("an argv site names its verb");
+                        let verb = &args[open + 1..];
+                        let verb = &verb[..verb.find('"').expect("closed literal")];
+                        match verb {
+                            "delete" => true,
+                            "-j" | "-a" | "list" => false,
+                            other => panic!(
+                                "unclassified nft argv verb {other:?}: classify it by hand \
+                                 in NFT_INVOCATION_SITES"
+                            ),
+                        }
+                    }
+                };
+                found.push(format!(
+                    "{:?}",
+                    (enclosing_fn(&code, at), kind, mutating, origin)
+                ));
+            }
+        }
+        let mut expected: Vec<String> = NFT_INVOCATION_SITES
+            .iter()
+            .map(|(f, kind, mutating, origin)| {
+                format!("{:?}", (f.to_string(), *kind, *mutating, *origin))
+            })
+            .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        let spawns: Vec<String> = offsets_of(&code, "Command::new(")
+            .into_iter()
+            .map(|at| enclosing_fn(&code, at))
+            .collect();
+        assert_eq!(
+            spawns,
+            vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
+        );
+        let callers_of = |callee: &str| -> Vec<String> {
+            offsets_of(&code, callee)
+                .into_iter()
+                .filter(|at| !code[..*at].ends_with("fn "))
+                .map(|at| enclosing_fn(&code, at))
+                .collect()
+        };
+        // The bounded wait is reached only from the two runners: `run_nft`
+        // through `wait_nft_bounded`, `run_nft_stdin` through the stdin feeder,
+        // whose write-failure path also ends in the bounded wait (kill-and-park).
+        assert_eq!(callers_of("wait_nft_bounded("), vec!["run_nft".to_string()]);
+        assert_eq!(
+            callers_of("feed_stdin_and_wait_with("),
+            vec!["run_nft_stdin".to_string()]
+        );
+        assert_eq!(
+            callers_of("wait_nft_bounded_with("),
+            vec![
+                "wait_nft_bounded".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+            ]
+        );
+        for runner in ["run_nft", "run_nft_stdin"] {
+            assert!(fn_body(&code, runner).contains("admit_slot(&NFT_CHILD_SLOTS, origin)?"));
+        }
+    }
+
+    /// T11 (structural half): production code never signals a bare pid.
+    #[test]
+    fn t11_no_raw_pid_kill_in_nftables_production_code() {
+        let code = crate::source_scan::without_comment_lines(&crate::source_scan::production_part(
+            include_str!("nftables.rs"),
+        ));
+        assert!(
+            !code.contains("libc::kill("),
+            "an nft child is signalled only through its pidfd"
+        );
+    }
+
+    /// T13: the syscall numbers this crate relies on for the two architectures
+    /// it ships for, and the one derived worst-case figure.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn t13_pidfd_syscall_numbers_and_the_worst_case_are_pinned() {
+        assert_eq!(libc::SYS_pidfd_open, 434);
+        assert_eq!(libc::SYS_pidfd_send_signal, 424);
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            linux::NFT_COMMAND_TIMEOUT + linux::NFT_KILL_GRACE + linux::NFT_REAP_GRACE
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux_children {
+        use super::super::linux::{
+            admit_slot, feed_stdin_and_wait_with, pidfd_kill, pidfd_open, wait_nft_bounded_with,
+            NftSlotTable, NftWaitBudget,
+        };
+        use super::super::{ChildSlotTable, ChildStuckStage, NftOrigin, NftablesError};
+        use std::process::{Command, Stdio};
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        /// A slot table owned by one test, so no test shares the process table.
+        fn local_table() -> &'static Mutex<NftSlotTable> {
+            Box::leak(Box::new(Mutex::new(ChildSlotTable::new())))
+        }
+
+        fn held(table: &'static Mutex<NftSlotTable>) -> usize {
+            table.lock().unwrap_or_else(|e| e.into_inner()).held()
+        }
+
+        fn piped(command: &mut Command) -> std::process::Child {
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn test child")
+        }
+
+        /// These tests spawn real children and T11 (d) counts the process's open
+        /// pidfds, so they run one at a time: a concurrent sibling's pidfd would
+        /// otherwise read as a leak (flake risk named by the round-1 code gate).
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn serial() -> std::sync::MutexGuard<'static, ()> {
+            SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// A command budget far below `sleep 5`, so T11 (a) always reaches the
+        /// kill. 20 ms is short on purpose; it is only ever used against a child
+        /// that is meant to overrun it.
+        const WEDGE_COMMAND_BUDGET: Duration = Duration::from_millis(20);
+
+        const SHORT: NftWaitBudget = NftWaitBudget {
+            command: WEDGE_COMMAND_BUDGET,
+            kill_grace: Duration::from_millis(200),
+            reap_grace: Duration::from_millis(500),
+        };
+
+        /// For children that are meant to COMPLETE (`true`): a command budget with
+        /// slack for a loaded CI runner, so a slow fork is never read as a wedge.
+        /// 5 s = 250 x the wedge budget; `true` finishes in well under 100 ms.
+        const COMPLETES: NftWaitBudget = NftWaitBudget {
+            command: Duration::from_secs(5),
+            ..SHORT
+        };
+
+        /// T11 (a): a child past its budget is killed through its pidfd and the
+        /// call returns within the budget, freeing its slot.
+        #[test]
+        fn t11_a_a_wedged_child_is_killed_through_its_pidfd_within_the_budget() {
+            let _serial = serial();
+            let table = local_table();
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = piped(Command::new("sleep").arg("5"));
+            let started = Instant::now();
+            let result = wait_nft_bounded_with(child, ticket, SHORT);
+            let took = started.elapsed();
+            assert!(
+                matches!(&result, Err(NftablesError::InvocationFailed(m)) if m.contains("exceeded")),
+                "{result:?}"
+            );
+            assert!(
+                took < SHORT.command + SHORT.kill_grace + SHORT.reap_grace,
+                "took {took:?}"
+            );
+            assert_eq!(held(table), 0, "a reaped child frees its slot");
+        }
+
+        /// T11 (b): a child whose descendant holds its stdout cannot be reaped, so
+        /// it stays parked in its slot until the descendant dies and a sweep joins it.
+        #[test]
+        fn t11_b_an_unreapable_child_stays_parked_until_a_sweep_joins_it() {
+            let _serial = serial();
+            let table = local_table();
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let pid_file = dir.path().join("descendant.pid");
+            let script = format!("sleep 30 & echo $! > {}; exec sleep 30", pid_file.display());
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = piped(Command::new("sh").args(["-c", &script]));
+            let result = wait_nft_bounded_with(child, ticket, SHORT);
+            assert!(
+                matches!(
+                    result,
+                    Err(NftablesError::ChildStuck {
+                        stage: ChildStuckStage::NotReaped
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(held(table), 1, "the stuck child keeps its slot");
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("descendant pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            // SAFETY: the pid names this test's own live grandchild (it is still
+            // holding the pipe, so it has not exited and cannot have been reused).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while held(table) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the sweep never reclaimed the slot"
+                );
+                table.lock().unwrap_or_else(|e| e.into_inner()).sweep();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// T11 (c): once the child is reaped its pidfd refuses the signal with
+        /// ESRCH; it can never reach a process that reused the pid.
+        #[test]
+        fn t11_c_a_pidfd_after_reap_answers_esrch() {
+            let _serial = serial();
+            let mut child = Command::new("true").spawn().expect("spawn");
+            let fd = pidfd_open(child.id()).expect("pidfd_open on a 5.3+ kernel");
+            child.wait().expect("reap");
+            assert_eq!(pidfd_kill(&fd), Err(libc::ESRCH));
+        }
+
+        fn open_pidfds() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("procfs")
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .filter(|target| target.to_string_lossy().contains("pidfd"))
+                .count()
+        }
+
+        /// T11 (d): the pidfd is closed on every non-parked path, so 100 completed
+        /// calls leave the process's open pidfd count unchanged. Uses the
+        /// `COMPLETES` budget: with the 20 ms wedge budget a slow fork of `true`
+        /// on a loaded runner was killed and read as a failure (flake risk).
+        #[test]
+        fn t11_d_completed_calls_leak_no_pidfd() {
+            let _serial = serial();
+            let table = local_table();
+            let before = open_pidfds();
+            for _ in 0..100 {
+                let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+                let child = piped(&mut Command::new("true"));
+                wait_nft_bounded_with(child, ticket, COMPLETES).expect("true completes");
+            }
+            assert_eq!(open_pidfds(), before, "a completed call leaked its pidfd");
+            assert_eq!(held(table), 0);
+        }
+
+        /// R1 (LINUX-NFT-PID-REUSE-KILL-01): a stdin write that fails (the child
+        /// closed its stdin and kept running) never returns past a live child. The
+        /// child is killed through its pidfd and joined, or parked with its slot
+        /// held; a free slot with a live child is the escape this pins.
+        #[test]
+        fn r1_a_failed_stdin_write_kills_and_joins_or_parks_the_child() {
+            let _serial = serial();
+            let table = local_table();
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let pid_file = dir.path().join("child.pid");
+            // `exec sleep` keeps the shell's pid, so `$$` names the live child.
+            let program = format!("echo $$ > {}; exec 0<&-; exec sleep 30", pid_file.display());
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = Command::new("sh")
+                .args(["-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn test child");
+            // 1 MiB: larger than any pipe buffer, so the write is still blocked
+            // when the child closes its read end and fails with EPIPE.
+            let script = "x".repeat(1 << 20);
+            let result = feed_stdin_and_wait_with(child, ticket, &script, COMPLETES);
+            assert!(
+                matches!(&result, Err(NftablesError::InvocationFailed(m)) if m.contains("stdin")),
+                "{result:?}"
+            );
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("child pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            // SAFETY: signal 0 only probes; the pid is this test's own child.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            let slots = held(table);
+            if alive && slots == 0 {
+                // SAFETY: as above; reap the escaped child so the run leaves nothing.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                slots == 1 || !alive,
+                "a failed stdin write freed its slot ({slots} held) with the child still alive"
+            );
+        }
     }
 }

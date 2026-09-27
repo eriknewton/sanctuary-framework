@@ -28,7 +28,21 @@ from pathlib import Path
 # Rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
 # Claude and Grok code gates (three rounds, final dry) reviewed it before this pin moved.
 # The guard constants it mirrors are unchanged.
-NFTABLES_SOURCE_SHA256 = "2e4cc8a85918f6e545052eef74649ffd5ba18504894a11b8409374c868ec8e91"
+# Refreshed for C2a2 (2026-09-27, builder refresh; the slice's two-family code gate reviews
+# it before merge): nftables.rs gained the pid-safe bounded wait (pidfd kill, bounded
+# post-kill waits, parked children), the per-origin child slot table, an NftOrigin first
+# argument at every run_nft/run_nft_stdin call site, the NFT_INVOCATION_SITES inventory, the
+# test-isolation --test-nft-binary seam, and tests. The rule grammar, the owned-table parser,
+# the receipt mint and the net script are byte-unchanged. The guard constants it mirrors are
+# unchanged.
+# Refreshed for the C2a2 code-gate fix round 1 (2026-09-27): run_nft_stdin's stdin feed moved
+# into feed_stdin_and_wait_with, whose write-failure path kills and joins or parks the child
+# through its slot instead of returning past it; T12 and the child tests were updated. The
+# rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
+# Refreshed for the round-2 polish (2026-09-27): ChildSlotTable::park refuses an id that is
+# not in flight, and the waiter-spawn failure path recovers a poisoned cell instead of
+# dropping the child. The rule grammar, parser, receipt mint and net script are unchanged.
+NFTABLES_SOURCE_SHA256 = "428c4a7017063d71b2c35dc309b587728f3525d83569504e6b38493a06aa4624"
 
 
 def fail(message):

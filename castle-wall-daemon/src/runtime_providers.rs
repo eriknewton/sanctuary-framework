@@ -1474,7 +1474,10 @@ fn refuse_after_owned_table(
     if ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Routed through the one arming writer, like every stop request: a seam
+        // that stored the flag directly would leave the stop guard IDLE for the
+        // stop it simulates (round-1 code gate, T14).
+        crate::exit_guard::request_daemon_stop(shutdown_requested);
     }
     // register LINUX-BOOT-STOP-SLICEA-REFUSAL-01: loaded HERE, live, not
     // captured by the caller — this is after scope resolution and immediately
@@ -2778,6 +2781,13 @@ fn classify_nft_ownership_probe(
     match result {
         Ok(()) => Ok(true),
         Err(NftablesError::ForeignState(_)) => Ok(false),
+        // LINUX-NFT-PID-REUSE-KILL-01: a child that could not be proven finished,
+        // or a call refused a slot, concluded NOTHING about the table. Explicit
+        // arms ahead of the string arms below, so a future reshaping into
+        // `InvocationFailed(String)` can never read one as a proven loss.
+        Err(NftablesError::ChildStuck { .. }) | Err(NftablesError::ChildSlotsExhausted { .. }) => {
+            Err(())
+        }
         Err(NftablesError::InvocationFailed(message))
             if message.contains("No such file or directory")
                 || message.contains("does not exist") =>
@@ -3257,10 +3267,11 @@ impl NftablesTableComponent {
     /// [`AcquiredComponent::health_fresh`] (R3, LINUX-STOP-LOSS-RACE-01, Claude
     /// F3). `fresh=false` uses `BoundedHealthProbe::poll_result`, which may
     /// return a reading cached for up to `NFT_HEALTH_MIN_INTERVAL`;
-    /// `fresh=true` uses `reprobe_after_latch`, which clears that cache before
-    /// running the same check, so the result is a live proof. Must match the
-    /// latch-handling invariant documented on `reprobe_after_latch` itself:
-    /// this is bypassing a cache, not weakening the readiness claim.
+    /// `fresh=true` uses `poll_bypassing_cache`, which clears only that cache
+    /// (never the terminal latches) before running the same check, so the result
+    /// is a live proof. Must match the latch order documented on
+    /// `poll_bypassing_cache`: latches are read before `last`, so a stop-time read
+    /// never restores readiness.
     fn health_impl(&self, fresh: bool) -> crate::enforcement::ComponentHealth {
         use crate::enforcement::ComponentHealth;
         if self.released || self.lock.is_none() {
@@ -3304,7 +3315,9 @@ impl NftablesTableComponent {
             ))
         };
         let outcome = if fresh {
-            self.probe.reprobe_after_latch(check)
+            // LINUX-STOP-FRESH-PROBE-LATCH-01: the stop-time read clears ONLY the
+            // cache (`last`); a proven loss or exhausted budget still answers.
+            self.probe.poll_bypassing_cache(check)
         } else {
             self.probe.poll_result(check)
         };
@@ -3389,8 +3402,9 @@ impl AcquiredComponent for NftablesTableComponent {
     }
 
     /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the fresh variant `health_impl(true)`
-    /// selects, using `reprobe_after_latch` instead of `poll_result` so the read
-    /// bypasses `NFT_HEALTH_MIN_INTERVAL`. See `health_impl` for the shared body.
+    /// selects, using `poll_bypassing_cache` instead of `poll_result` so the read
+    /// bypasses `NFT_HEALTH_MIN_INTERVAL` and nothing else. See `health_impl` for
+    /// the shared body.
     fn health_fresh(&self) -> crate::enforcement::ComponentHealth {
         self.health_impl(true)
     }
@@ -4443,6 +4457,80 @@ fn reload_manifest_from_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T6s (LINUX-STOP-FRESH-PROBE-LATCH-01): the stop-time fresh read clears
+    /// only the cache. `health_impl`'s fresh arm calls `poll_bypassing_cache`,
+    /// the latch-clearing `reprobe_after_latch` keeps exactly one production
+    /// caller (the recovery controller's later-poll proof), and neither health
+    /// doc still names it as the stop-time primitive.
+    #[test]
+    fn t6s_the_stop_time_read_uses_the_cache_only_bypass() {
+        use crate::source_scan::{
+            daemon_sources, doc_block_of, enclosing_fn, fn_body, offsets_of, production_part,
+            without_comment_lines,
+        };
+        let whole = include_str!("runtime_providers.rs");
+        let code = without_comment_lines(&production_part(whole));
+        let health_impl = fn_body(&code, "health_impl");
+        assert!(health_impl.contains("self.probe.poll_bypassing_cache(check)"));
+        assert!(!health_impl.contains("reprobe_after_latch("));
+
+        let mut callers = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, ".reprobe_after_latch(") {
+                callers.push((path.clone(), enclosing_fn(&code, at)));
+            }
+        }
+        assert_eq!(
+            callers,
+            vec![(
+                "src/runtime_providers.rs".to_string(),
+                "recover_post_ready_loss".to_string()
+            )]
+        );
+        for name in ["health_impl", "health_fresh"] {
+            assert!(
+                !doc_block_of(whole, name).contains("reprobe_after_latch"),
+                "{name}'s doc must name the cache-only primitive"
+            );
+        }
+    }
+
+    /// T8 (LINUX-NFT-PID-REUSE-KILL-01): an nft child that could not be proven
+    /// finished, or a call refused a slot, is INDETERMINATE for the ownership
+    /// probe (`Err(())`), never a proven loss (`Ok(false)`) and never health.
+    #[test]
+    fn t8_a_stuck_or_refused_nft_child_classifies_as_indeterminate() {
+        use crate::nftables::{ChildStuckStage, NftOrigin, NftablesError};
+        for stage in [
+            ChildStuckStage::WaiterSpawnFailed,
+            ChildStuckStage::NotExited,
+            ChildStuckStage::NotReaped,
+        ] {
+            let err = NftablesError::ChildStuck { stage };
+            assert!(
+                !err.to_string().contains("No such file or directory")
+                    && !err.to_string().contains("does not exist"),
+                "a stuck child's message must never read like a missing table"
+            );
+            assert_eq!(classify_nft_ownership_probe(Err(err)), Err(()), "{stage:?}");
+        }
+        for origin in [NftOrigin::General, NftOrigin::SafetyNet] {
+            assert_eq!(
+                classify_nft_ownership_probe(Err(NftablesError::ChildSlotsExhausted { origin })),
+                Err(()),
+                "{origin:?}"
+            );
+        }
+        // The string arm that WOULD read a loss stays scoped to InvocationFailed.
+        assert_eq!(
+            classify_nft_ownership_probe(Err(NftablesError::InvocationFailed(
+                "No such file or directory".to_string()
+            ))),
+            Ok(false)
+        );
+    }
     use crate::audit::{AuditRingBuffer, WalWriter};
     use crate::crypto::castle_wall_signing_key_id;
     use crate::manifest::canonical_json::canonicalize_to_bytes;
