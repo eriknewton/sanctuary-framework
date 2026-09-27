@@ -2759,24 +2759,13 @@ mod tests {
                 ],
             ),
         ] {
-            let fields = struct_fields(&code, decl);
+            let fields = crate::source_scan::struct_fields(&code, decl);
             let got: Vec<(&str, &str)> = fields
                 .iter()
                 .map(|(n, t)| (n.as_str(), t.as_str()))
                 .collect();
             assert_eq!(got, expected, "{decl} field set (no visibility modifier)");
         }
-    }
-
-    /// The `(name, type)` fields of the struct declared by `decl`, via the shared
-    /// scanner. A field with a visibility modifier reads as `pub name`.
-    fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
-        let at = code
-            .find(decl)
-            .unwrap_or_else(|| panic!("{decl} must exist"));
-        let open = at + decl.len() - 1;
-        let close = crate::source_scan::matching_brace(code, open).expect("struct closes");
-        crate::source_scan::top_level_params(&format!("({})", &code[open + 1..close]))
     }
 
     /// T3 (LINUX-JOURNAL-OWNED-WRITERS-01): the confined-uid writer reloads and

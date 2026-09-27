@@ -727,12 +727,23 @@ fn persist_kill_set_write_ahead_at_boot(
          written ahead of the kernel step"
             .to_string()
     })?;
-    let Some(OwnershipJournal::Owned {
+    // INVARIANT: an ABSENT record is a named refusal, never a silent `Ok`. Before the
+    // opaque type this writer took `&OwnershipJournal`, so absence was unrepresentable;
+    // both callers still skip it, and a future caller that drops that guard must get
+    // an error to record, not a no-op that reads as a written history.
+    let Some(record) = existing.record() else {
+        return Err(
+            "no ownership journal record was loaded at acquisition, so there is no confined \
+             history to write ahead of the kernel step"
+                .to_string(),
+        );
+    };
+    let OwnershipJournal::Owned {
         identity,
         table_handle,
         base_chain_handle,
         confined,
-    }) = existing.record()
+    } = record
     else {
         // INVARIANT: only the acquisition's step-2 load under the host lock constructs
         // an `AcquisitionJournal` (its fields are private to the `acquisition_journal`
@@ -743,8 +754,7 @@ fn persist_kill_set_write_ahead_at_boot(
         // (`ownership_journal::decide`) and has no history yet; the write-ahead for a
         // fresh create happens when the record becomes `Owned`. The caller's snapshot
         // is sound here because nothing writes the journal between that load and this
-        // store on the acquisition stack. An absent record is never passed: both
-        // callers skip the persist when `existing.record()` is `None`.
+        // store on the acquisition stack.
         return Ok(());
     };
     let next = record_from_merged(
@@ -1958,9 +1968,17 @@ fn bind_admitted_uid_before_ready(
     let journal = match journal {
         Ok(handle) => handle,
         Err(err) => {
-            let uncovered: &[u32] = match &plan {
-                BindPlan::RefuseWithNet { uncovered_uids, .. } => uncovered_uids,
-                _ => &[],
+            // When the plan had already refused with a net, keep its own reason visible
+            // beside this one: same net, same refusal class, both causes named.
+            let (uncovered, plan_reason): (&[u32], String) = match &plan {
+                BindPlan::RefuseWithNet {
+                    uncovered_uids,
+                    reason,
+                } => (
+                    uncovered_uids,
+                    format!(" The binding plan also refused: {reason}"),
+                ),
+                _ => (&[], String::new()),
             };
             return Err(refuse(
                 net_required_mid_plan,
@@ -1968,7 +1986,7 @@ fn bind_admitted_uid_before_ready(
                 format!(
                     "the ownership journal does not hold the Owned record for the activation \
                      this process just made ({err}), so its confined history cannot be \
-                     proven; refusing readiness."
+                     proven; refusing readiness.{plan_reason}"
                 ),
             ));
         }
@@ -2313,8 +2331,9 @@ impl ComponentProvider for NftablesTableProvider {
                         let resolution =
                             resolve_net_scope_at_site(existing.record(), &self.decision_engine);
                         let mut persist_failure: Option<String> = None;
-                        // An absent record is never passed to the boot writer (it has nothing to
-                        // extend); the unknown-history reason never persists at all.
+                        // An absent record has nothing to extend, so the persist is skipped (the
+                        // boot writer would refuse it by name); the unknown-history reason never
+                        // persists at all.
                         if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory
                             && existing.record().is_some()
                         {
@@ -2505,8 +2524,9 @@ impl ComponentProvider for NftablesTableProvider {
                     let resolution =
                         resolve_net_scope_at_site(existing.record(), &self.decision_engine);
                     let mut persist_failure: Option<String> = None;
-                    // An absent record is never passed to the boot writer (it has nothing to
-                    // extend); the unknown-history reason never persists at all.
+                    // An absent record has nothing to extend, so the persist is skipped (the
+                    // boot writer would refuse it by name); the unknown-history reason never
+                    // persists at all.
                     if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory
                         && existing.record().is_some()
                     {
@@ -7203,7 +7223,12 @@ mod tests {
             .find("\n/// Fault-injection seam")
             .expect("the refusal helper must be followed by the write-ahead seam")
             + helper_start;
-        let helper = &production[helper_start..helper_end];
+        // Whole-line comments are blanked before the needle check (as the T-P1
+        // scanner does), so the helper's doc prose, which names the journal, can sit
+        // anywhere around the signature without deciding this test.
+        let helper =
+            crate::source_scan::without_comment_lines(&production[helper_start..helper_end]);
+        let helper = helper.as_str();
         for needle in [
             "persist_kill_set_write_ahead",
             "persist_kill_set_write_ahead_at_boot",
@@ -7978,12 +8003,12 @@ mod tests {
             }
         }
         assert_eq!(constructors, vec!["load_under_lock".to_string()]);
-        let fields = struct_fields(module, "struct AcquisitionJournal {");
+        let fields = crate::source_scan::struct_fields(module, "struct AcquisitionJournal {");
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["path", "record"], "no visibility modifier");
 
         // The component holds the proof token and nothing that carries a record.
-        let component = struct_fields(rp, "struct NftablesTableComponent {");
+        let component = crate::source_scan::struct_fields(rp, "struct NftablesTableComponent {");
         assert!(
             component
                 .iter()
@@ -7998,16 +8023,6 @@ mod tests {
                 assert!(!token, "the component field {name}: {ty} carries a record");
             }
         }
-    }
-
-    /// The `(name, type)` fields of the struct declared by `decl` in `code`.
-    fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
-        let at = code
-            .find(decl)
-            .unwrap_or_else(|| panic!("{decl} must exist"));
-        let open = at + decl.len() - 1;
-        let close = crate::source_scan::matching_brace(code, open).expect("the struct closes");
-        crate::source_scan::top_level_params(&format!("({})", &code[open + 1..close]))
     }
 
     /// T7, structural half (LINUX-JOURNAL-OWNED-WRITERS-01): the admitted-into-
@@ -8321,6 +8336,15 @@ mod tests {
             let before = fingerprint(&fx.path);
             assert!(persist_kill_set_write_ahead_at_boot(&acq, None, Some((60400, None))).is_err());
             assert_eq!(fingerprint(&fx.path), before);
+
+            // Absent record: a named refusal, never a silent Ok, and nothing is created.
+            std::fs::remove_file(&fx.path).unwrap();
+            let acq = AcquisitionJournal::load_under_lock(&lock, &fx.path, Some(&fx.key)).unwrap();
+            let err =
+                persist_kill_set_write_ahead_at_boot(&acq, Some(&fx.key), Some((60400, None)))
+                    .expect_err("an absent record at boot is refused by name");
+            assert!(err.contains("no ownership journal record"), "{err}");
+            assert!(!fx.path.exists());
             drop(lock);
 
             // The W8 sibling: owned_record_preserving_history over each prior.

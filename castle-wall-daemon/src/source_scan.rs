@@ -377,6 +377,19 @@ pub(crate) fn blank_string_literals(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The `(name, type)` fields of the struct declared by `decl` (for example
+/// `"pub struct Foo {"`) in `code`, via [`top_level_params`] over the brace-matched
+/// body. A field with a visibility modifier reads as `pub name`, so a field-set
+/// equality also pins "no visibility modifier".
+pub(crate) fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
+    let at = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("{decl} must exist"));
+    let open = at + decl.len() - 1;
+    let close = matching_brace(code, open).expect("the struct closes");
+    top_level_params(&format!("({})", &code[open + 1..close]))
+}
+
 /// Whether byte `offset` of `text` falls inside one of `ranges`.
 pub(crate) fn in_ranges(ranges: &[(usize, usize)], offset: usize) -> bool {
     ranges.iter().any(|(s, e)| (*s..*e).contains(&offset))
@@ -420,7 +433,25 @@ pub(crate) fn doc_block_of(text: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{blank_string_literals, offsets_of_unqualified, receiver_before, top_level_params};
+    use super::{
+        blank_string_literals, offsets_of_unqualified, receiver_before, struct_fields,
+        top_level_params,
+    };
+
+    /// A struct's fields come back as `(name, type)` pairs, a generic type with a
+    /// comma stays whole, and a visibility modifier stays on the name.
+    #[test]
+    fn struct_fields_reads_names_types_and_visibility() {
+        let code = "struct Other { x: u8 }\npub struct Token {\n    path: PathBuf,\n    \
+                    pub map: Map<u32, Vec<u8>>,\n}\n";
+        assert_eq!(
+            struct_fields(code, "pub struct Token {"),
+            vec![
+                ("path".to_string(), "PathBuf".to_string()),
+                ("pub map".to_string(), "Map<u32, Vec<u8>>".to_string()),
+            ]
+        );
+    }
 
     /// Words inside plain, escaped, multi-line and raw string literals are blanked;
     /// code outside them, a `'"'` char literal, and line structure survive.
