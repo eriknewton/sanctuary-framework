@@ -1317,6 +1317,173 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     drop(component);
 }
 
+/// The journal file's inode and its authenticated record. Every successful store
+/// renames a new inode into place, so an unchanged inode proves no write happened.
+fn journal_inode_and_record(cfg: &LinuxRuntimeConfig) -> (u64, OwnershipJournal) {
+    use std::os::unix::fs::MetadataExt;
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let inode = std::fs::metadata(&cfg.journal_path)
+        .expect("the journal is present")
+        .ino();
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("the journal authenticates")
+        .expect("the journal is present");
+    (inode, record)
+}
+
+/// Delete the owned table externally and poll `health()` to the completed loss, in
+/// the `gf1_3` shape (8 polls at 600 ms, a 4.8 s ceiling above the 500 ms
+/// `NFT_HEALTH_MIN_INTERVAL`).
+fn lose_the_owned_table(component: &dyn AcquiredComponent) {
+    let deleted = Command::new("nft")
+        .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("delete the owned table");
+    assert!(deleted.status.success(), "external delete must succeed");
+    let mut became_lost = false;
+    for _ in 0..8 {
+        if matches!(component.health(), ComponentHealth::Lost) {
+            became_lost = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    assert!(
+        became_lost,
+        "health() must report the completed loss as Lost"
+    );
+}
+
+// T-W1 (LINUX-JOURNAL-OWNED-WRITERS-01), wired consumer: the post-READY journal
+// write reached through the REAL acquisition (the proof token is built at its real
+// site inside `acquire`) and the real recovery controller.
+//
+// (a) STALE: a MAC-valid `Owned` record for ANOTHER activation (a different marker,
+// same boot, source and handles), planted AFTER the acquisition, is refused by the
+// post-READY write: the net still goes in, and the journal's inode and record are
+// exactly the planted ones. (b) FRESH, the next test: with no plant, the same write
+// happens (the inode changes and the record is still `Owned` for the component's
+// activation), so (a)'s refusal is not a dead writer.
+#[test]
+fn tw1a_the_post_ready_journal_write_refuses_another_activations_record() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    // (a) STALE.
+    {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let paths = isolation::runtime_paths();
+        let cfg = config(&paths, policy_dir.path());
+        let component =
+            acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+        // Plant only now: planting before the acquisition would route `decide` to
+        // another arm and fail the acquisition for the wrong reason.
+        let (_, acquired) = journal_inode_and_record(&cfg);
+        let OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } = acquired
+        else {
+            panic!("the acquisition wrote an Owned record");
+        };
+        let planted = OwnershipJournal::owned_with_known_history(
+            JournalIdentity {
+                marker: format!("{OWNER_MARKER_PREFIX}{}", "b".repeat(32)),
+                ..identity.clone()
+            },
+            table_handle,
+            base_chain_handle,
+            Vec::new(),
+        )
+        .expect("empty history");
+        assert_ne!(
+            planted,
+            acquired_record(&identity, table_handle, base_chain_handle),
+            "the plant is another activation"
+        );
+        let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+        journal::store_atomic(&cfg.journal_path, &planted, &key)
+            .expect("plant another activation's record");
+        let (planted_inode, _) = journal_inode_and_record(&cfg);
+
+        lose_the_owned_table(component.as_ref());
+        let result = component.attempt_post_ready_recovery(&|| false);
+        assert!(
+            result.holds_gate(),
+            "the net goes in whatever the journal write does"
+        );
+        let (inode, record) = journal_inode_and_record(&cfg);
+        assert_eq!(
+            inode, planted_inode,
+            "the post-READY write into another activation's record was refused"
+        );
+        assert_eq!(record, planted, "the planted record is exactly as planted");
+        drop(component);
+    }
+}
+
+// T-W1 (b) FRESH, the positive control for (a): see the comment above (a).
+#[test]
+fn tw1b_the_post_ready_journal_write_happens_for_the_components_own_activation() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let paths = isolation::runtime_paths();
+        let cfg = config(&paths, policy_dir.path());
+        let component =
+            acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+        let (acquired_inode, acquired) = journal_inode_and_record(&cfg);
+        lose_the_owned_table(component.as_ref());
+        assert!(component
+            .attempt_post_ready_recovery(&|| false)
+            .holds_gate());
+        let (inode, record) = journal_inode_and_record(&cfg);
+        assert_ne!(
+            inode, acquired_inode,
+            "the post-READY write happened for the component's own activation"
+        );
+        let same_activation = |r: &OwnershipJournal| match r {
+            OwnershipJournal::Owned {
+                identity,
+                table_handle,
+                base_chain_handle,
+                ..
+            } => Some((identity.clone(), *table_handle, *base_chain_handle)),
+            OwnershipJournal::Preparing { .. } => None,
+        };
+        assert_eq!(
+            same_activation(&record),
+            same_activation(&acquired),
+            "the record is still Owned for the component's activation"
+        );
+        drop(component);
+    }
+}
+
+/// The record the acquisition wrote, rebuilt for comparison (known-empty history:
+/// the test seam admits no confined identity).
+fn acquired_record(
+    identity: &JournalIdentity,
+    table_handle: u64,
+    base_chain_handle: u64,
+) -> OwnershipJournal {
+    OwnershipJournal::owned_with_known_history(
+        identity.clone(),
+        table_handle,
+        base_chain_handle,
+        Vec::new(),
+    )
+    .expect("empty history")
+}
+
 /// Read the exact live isolated-table identity through nft's real JSON output.
 fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
     let output = Command::new("nft")
