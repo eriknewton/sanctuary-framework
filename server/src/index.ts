@@ -1870,6 +1870,10 @@ export async function createSanctuaryServer(options?: {
     storage,
     masterKey,
     fortressId: sdwFortressId,
+    // Must match DEFAULT_OWNER_REF in server/src/cli/memory-file.ts, which
+    // refuses any `--owner-ref` other than this scope (STEP1-F1/F2): a CLI
+    // ingest pinned under a different owner_ref would be invisible to this
+    // guard and to `sdw-owner`, which also hard-codes "fleet-self".
     ownerRef: "fleet-self",
     ownerIdentity: sdwMemoryIdentity,
   });

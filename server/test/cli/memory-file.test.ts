@@ -1,4 +1,4 @@
-// fail-before-exempt: C3 fixture-wiring only — this existing CLI suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
+// fail-before-exempt: STEP1-F1 isolation wiring only: existing tests now pre-claim the SDW owner pin and pass an explicit test agent id so the new CLI owner-pin precheck does not scan the corpus these tests corrupt; the behavior the precheck adds is proven by test/cli/memory-file-owner-pin.test.ts, which fails on the base tree.
 /**
  * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI tests.
  *
@@ -27,6 +27,7 @@ import {
   runMemoryTranscodeCommand as runMemoryTranscodeCommandProduction,
   runMemoryTranscodeRestoreCommand as runMemoryTranscodeRestoreCommandProduction,
 } from "../../src/cli/memory-file.js";
+import { claimSdwOwnerForOperator } from "../../src/sdw/memory-isolation.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -53,6 +54,13 @@ const APPROVE_DIALOG = () => ({
   signal: null,
   stdout: Buffer.from("approve\n"),
 });
+// STEP1-F1 fix round 1: `runMemoryIngestCommand` now refuses outright with no
+// wrap-time `SANCTUARY_AGENT_ID` (no synthetic fallback principal). This
+// file's tests are about dialog/policy/audit behavior, not identity, so give
+// every call through the wrapper below a stable default identity unless the
+// test's own `env` already sets one; a test that specifically exercises the
+// missing-identity refusal lives in memory-file-owner-pin.test.ts.
+const TEST_AGENT_ID = "claude_code:memory-file-cli-test";
 
 // memory_ingest is Tier-1 (S4): it now passes the human ApprovalGate like the
 // other memory verbs, so default the local-operator dialog to APPROVE unless a
@@ -61,6 +69,7 @@ const runMemoryIngestCommand: typeof runMemoryIngestCommandProduction = (args) =
   runMemoryIngestCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+    env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
   });
 const runMemoryEmitCommand: typeof runMemoryEmitCommandProduction = (args) =>
   runMemoryEmitCommandProduction({
@@ -353,7 +362,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
       out: out.stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: noDialog,
     });
     expect(plain, err.text()).toBe(0);
@@ -367,7 +376,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress, "--allow-file", "MEMORY.md"],
       out: makeSink().stream,
       err: makeSink().stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: noDialog,
     });
     expect(waived).toBe(1);
@@ -377,7 +386,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress, "--allow-file", "MEMORY.md"],
       out: makeSink().stream,
       err: makeSink().stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: () => {
         dialogs += 1;
         return APPROVE_DIALOG();
@@ -886,6 +895,35 @@ describe("memory file CLI: fortress-backed round trip", () => {
 
     it("writes the override audit record BEFORE the first corpus write, even when the corpus write then fails", async () => {
       const source = await refusedFixture("memfile-cli-high-c2-source");
+      // STEP1-F1: the CLI ingest path's pin PRECHECK (`precheckSdwOwnerPin` in
+      // `../../src/sdw/memory-isolation.js`, called from
+      // `../../src/cli/memory-file.ts` before the approval dialog) reads the
+      // establishment namespaces, including the corpus one this test corrupts
+      // below — so claim the pin up front, under the SAME id this test's
+      // `SANCTUARY_AGENT_ID` resolves to, which makes the precheck a plain
+      // "pinned" read of `_sdw_meta` only (no establishment scan needed since
+      // the pin already exists). That isolates this test to its intended
+      // target: a commit-phase corpus-write failure, not the unrelated
+      // owner-pin machinery (covered by memory-file-owner-pin.test.ts).
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase: PASSPHRASE,
+        storagePathHint: fortress,
+      });
+      expect(
+        await claimSdwOwnerForOperator({
+          storage,
+          masterKey,
+          fortressId: fortressIdFromStoragePath(fortress),
+          ownerRef: "fleet-self",
+          agentId: TEST_AGENT_ID,
+        }),
+      ).toEqual({ status: "claimed" });
+      // fix round 2 (Claude): this key is resolved only for the claim call
+      // above and never handed to the CLI's own owned-and-zeroed master; zero
+      // it here so it does not outlive its one use.
+      masterKey.fill(0);
+
       // Pre-occupy the corpus namespace as a plain FILE instead of a
       // directory: every corpus write inside it fails (ENOTDIR/EEXIST-class),
       // while the SEPARATE _audit namespace directory is untouched, so audit
@@ -906,7 +944,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
         ],
         out: out.stream,
         err: err.stream,
-        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       });
 
       expect(
