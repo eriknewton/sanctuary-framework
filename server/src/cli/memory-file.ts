@@ -35,6 +35,11 @@ import { SdwValidationError, sdwClassifierReasonText } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { ingestMemoryFiles } from "../sdw/memory-file-ingest-service.js";
 import {
+  checkOrEstablishSdwOwnerPin,
+  type IsolationRefusalReason,
+} from "../sdw/memory-isolation.js";
+import type { StorageBackend } from "../storage/interface.js";
+import {
   MEMORY_TRANSCODE_MODE,
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
@@ -70,6 +75,63 @@ export interface MemoryFileCommandArgs {
 }
 
 const DEFAULT_OWNER_REF = "fleet-self";
+
+/**
+ * Identity the CLI ingest path establishes/checks the SDW owner pin under
+ * when the process has no wrap-time `SANCTUARY_AGENT_ID` (an unwrapped,
+ * operator-run ingest — the exact fresh-fortress case STEP1-F1 diagnosed).
+ * Parity with the MCP guard means the SAME env var is read first (see
+ * `resolveCliIngestAgentId` below); this is only the fallback so a bare CLI
+ * run still establishes a stable, named pin instead of skipping establishment
+ * entirely. Precedent: `cli.ts`'s `broker-server` subcommand falls back to
+ * the analogous `"mcp-host"` for the same "no wrap identity" case.
+ */
+export const CLI_INGEST_UNWRAPPED_AGENT_ID = "cli-ingest";
+
+/**
+ * Must resolve the SAME identity the MCP guard would for this process: the
+ * wrap-time `SANCTUARY_AGENT_ID` (must match `wrappedAgentIdentityFromEnv` in
+ * `../sdw/memory-isolation.js`), read from the CLI's OWN threaded `env`
+ * (never `process.env` directly) so tests can exercise both the wrapped and
+ * unwrapped cases without mutating the real process environment.
+ */
+function resolveCliIngestAgentId(env: NodeJS.ProcessEnv): string {
+  const wrapped = env.SANCTUARY_AGENT_ID;
+  return wrapped !== undefined && wrapped.length > 0
+    ? wrapped
+    : CLI_INGEST_UNWRAPPED_AGENT_ID;
+}
+
+/**
+ * Operator-facing text for a `checkOrEstablishSdwOwnerPin` refusal, printed to
+ * stderr before ingest returns 1. Never invents a new reason string: the
+ * refusal `reason` itself is the guard's own (STEP1-F1 constraint: reuse the
+ * MCP guard's reasons verbatim). This only adds the remediation command.
+ */
+function describeOwnerPinRefusal(
+  reason: IsolationRefusalReason,
+  agentId: string,
+  fortress: string | undefined,
+): string {
+  const fortressFlag = fortress !== undefined ? ` --fortress ${fortress}` : "";
+  const claimCommand = `sanctuary sdw-owner claim --agent-id ${agentId}${fortressFlag}`;
+  switch (reason) {
+    case "owner_pin_missing_after_establishment":
+      return (
+        `memory_ingest: refused (${reason}) - this SDW store already has passages but no owner pin.\n` +
+        `memory_ingest: run '${claimCommand}' to claim it, then re-run.\n`
+      );
+    case "owner_scope_conflict":
+      return `memory_ingest: refused (${reason}) - this SDW store is pinned to a different agent id than ${agentId}.\n`;
+    case "owner_pin_invalid":
+    case "owner_pin_backend_unsupported":
+    case "owner_pin_io_error":
+      return `memory_ingest: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
+    case "owner_identity_missing":
+      return `memory_ingest: refused (${reason}) - no ingesting agent id was resolved.\n`;
+  }
+}
+
 /**
  * Bound on the `--passphrase-stdin` read so a pipe that is opened and never
  * written does not hang the command forever. An empty read falls through to the
@@ -131,6 +193,31 @@ export async function runMemoryIngestCommand(
   if (!boot) return 1;
 
   try {
+    // STEP1-F1: a CLI-first write on a fresh fortress must go through the SAME
+    // establish-or-check rule the MCP persistent guard applies (must match
+    // `createPersistentMultiAgentIsolationGuard` in `../sdw/memory-isolation.js`),
+    // BEFORE any passage is read from source or written to the vault. Without
+    // this, a fresh store ends up established with no owner pin and every
+    // later MCP read is refused (`owner_pin_missing_after_establishment`) until
+    // a manual `sdw-owner claim`.
+    const cliIngestAgentId = resolveCliIngestAgentId(env);
+    const ownerPinCheck = await checkOrEstablishSdwOwnerPin({
+      storage: boot.storage,
+      masterKey: boot.masterKey,
+      fortressId: boot.fortressId,
+      ownerRef: parsed.ownerRef,
+      agentId: cliIngestAgentId,
+    });
+    if (!ownerPinCheck.allowed) {
+      write(err, describeOwnerPinRefusal(ownerPinCheck.reason, cliIngestAgentId, parsed.fortress));
+      await appendFailure(boot.auditLog, "memory_ingest", {
+        harness: parsed.harness,
+        owner_ref: parsed.ownerRef,
+        denial_class: ownerPinCheck.reason,
+      });
+      return 1;
+    }
+
     const result = await ingestMemoryFiles({
       adapter: boot.adapter,
       auditLog: boot.auditLog,
@@ -736,6 +823,14 @@ interface BootstrappedMemoryFileCommand {
   readonly auditLog: AuditLog;
   readonly baseline: BaselineTracker;
   readonly fortressPath: string;
+  /** Same backend the adapter above writes through; exposed so a caller can
+   * run `checkOrEstablishSdwOwnerPin` (STEP1-F1) against the real store
+   * before any ingest write, not a copy. */
+  readonly storage: StorageBackend;
+  /** Must match the value `adapter`/`migration` were constructed with below
+   * (`fortressIdFromStoragePath(config.storage_path)`) — the owner-pin check
+   * scopes to this same id. */
+  readonly fortressId: string;
   /**
    * The 32-byte fortress master key, OWNED by the caller: every verb must
    * `masterKey.fill(0)` in its `finally` AFTER the audit flush (the flush is the
@@ -848,6 +943,8 @@ async function bootstrap(
       auditLog,
       baseline,
       fortressPath: config.storage_path,
+      storage,
+      fortressId,
       masterKey,
       ...(unlocked.barrier !== undefined ? { barrier: unlocked.barrier } : {}),
     };

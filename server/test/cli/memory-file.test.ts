@@ -21,12 +21,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  CLI_INGEST_UNWRAPPED_AGENT_ID,
   PASSPHRASE_ARGV_WARNING,
   runMemoryEmitCommand as runMemoryEmitCommandProduction,
   runMemoryIngestCommand as runMemoryIngestCommandProduction,
   runMemoryTranscodeCommand as runMemoryTranscodeCommandProduction,
   runMemoryTranscodeRestoreCommand as runMemoryTranscodeRestoreCommandProduction,
 } from "../../src/cli/memory-file.js";
+import { claimSdwOwnerForOperator } from "../../src/sdw/memory-isolation.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -886,6 +888,31 @@ describe("memory file CLI: fortress-backed round trip", () => {
 
     it("writes the override audit record BEFORE the first corpus write, even when the corpus write then fails", async () => {
       const source = await refusedFixture("memfile-cli-high-c2-source");
+      // STEP1-F1: the CLI ingest path now checks/establishes the SDW owner pin
+      // before ever reaching the classifier/commit phase (`checkOrEstablishSdwOwnerPin`
+      // in `../../src/cli/memory-file.ts`). On a FRESH store that check itself
+      // enumerates the establishment namespaces, including the corpus one this
+      // test corrupts below — so claim the pin up front, under the same
+      // identity the CLI resolves with no `SANCTUARY_AGENT_ID`
+      // (`CLI_INGEST_UNWRAPPED_AGENT_ID`), which makes the later check a plain
+      // "pin already valid" read of `_sdw_meta` only. That isolates this test
+      // to its intended target: a commit-phase corpus-write failure, not the
+      // unrelated owner-pin establishment scan.
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase: PASSPHRASE,
+        storagePathHint: fortress,
+      });
+      expect(
+        await claimSdwOwnerForOperator({
+          storage,
+          masterKey,
+          fortressId: fortressIdFromStoragePath(fortress),
+          ownerRef: "fleet-self",
+          agentId: CLI_INGEST_UNWRAPPED_AGENT_ID,
+        }),
+      ).toEqual({ status: "claimed" });
+
       // Pre-occupy the corpus namespace as a plain FILE instead of a
       // directory: every corpus write inside it fails (ENOTDIR/EEXIST-class),
       // while the SEPARATE _audit namespace directory is untouched, so audit

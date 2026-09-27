@@ -162,58 +162,99 @@ function sameScope(
   return data.fortress_id === fortressId && data.owner_ref === ownerRef;
 }
 
+export interface SdwOwnerPinCheckOptions {
+  readonly storage: StorageBackend;
+  readonly masterKey: Uint8Array;
+  readonly fortressId: string;
+  readonly ownerRef: string;
+  readonly agentId: string;
+  readonly now?: () => string;
+}
+
+export type SdwOwnerPinCheckResult =
+  | { readonly allowed: true }
+  | { readonly allowed: false; readonly reason: IsolationRefusalReason };
+
 /**
- * Production guard. Every wrapped harness starts a separate server process,
- * so the owner lives in a MAC-authenticated fortress record and is checked on
- * every call. An empty SDW scope is claimed through atomic create-if-absent;
- * a used legacy scope with no pin refuses until an operator explicitly claims
- * it. Missing wrap identity always refuses.
+ * Shared owner-pin check-or-establish rule. Both callers below MUST route
+ * through this one function so a fresh store can only ever be established
+ * once, by whichever caller writes first, under one shared rule:
+ *   - `createPersistentMultiAgentIsolationGuard` (this file), the per-MCP-call
+ *     guard, calls it with the wrap-time `SANCTUARY_AGENT_ID`.
+ *   - `runMemoryIngestCommand` in `server/src/cli/memory-file.ts` calls it
+ *     directly (must match the import there) with the CLI's resolved agent
+ *     id, so a CLI-first write on a fresh fortress establishes the SAME pin
+ *     the MCP guard would have, instead of leaving the store established with
+ *     no pin (STEP1-F1: that drift left every later MCP read refused with
+ *     `owner_pin_missing_after_establishment` until a manual `sdw-owner
+ *     claim`).
+ * An empty SDW scope is claimed through atomic create-if-absent; a used
+ * legacy scope with no pin refuses until an operator explicitly claims it.
  */
-export function createPersistentMultiAgentIsolationGuard(
-  options: PersistentIsolationGuardOptions,
-): MultiAgentIsolationGuard {
+export async function checkOrEstablishSdwOwnerPin(
+  options: SdwOwnerPinCheckOptions,
+): Promise<SdwOwnerPinCheckResult> {
   const now = options.now ?? (() => new Date().toISOString());
   const refuse = (reason: IsolationRefusalReason) => ({
     allowed: false as const,
     reason,
   });
+  try {
+    let pin = await readSdwOwnerPin(options.storage, options.masterKey);
+    if (pin.status === "absent") {
+      if (await sdwStoreEstablished(options.storage)) {
+        return refuse("owner_pin_missing_after_establishment");
+      }
+      const created = await createSdwOwnerPinIfAbsent(
+        options.storage,
+        options.masterKey,
+        pinData(options.fortressId, options.ownerRef, options.agentId, now),
+      );
+      if (created === "unsupported") {
+        return refuse("owner_pin_backend_unsupported");
+      }
+      // The record on disk is authoritative. Two first callers may both
+      // observe absence, but only one atomic create can win; the loser sees
+      // the winner here and is refused on this same first call.
+      pin = await readSdwOwnerPin(options.storage, options.masterKey);
+    }
+    if (
+      pin.status !== "valid" ||
+      !sameScope(pin.data, options.fortressId, options.ownerRef)
+    ) {
+      return refuse("owner_pin_invalid");
+    }
+    return pin.data.agent_id === options.agentId
+      ? { allowed: true }
+      : refuse("owner_scope_conflict");
+  } catch {
+    return refuse("owner_pin_io_error");
+  }
+}
 
+/**
+ * Production guard. Every wrapped harness starts a separate server process,
+ * so the owner lives in a MAC-authenticated fortress record and is checked on
+ * every call. Missing wrap identity always refuses; the establish-or-check
+ * rule itself is `checkOrEstablishSdwOwnerPin` above, shared with the CLI
+ * ingest path.
+ */
+export function createPersistentMultiAgentIsolationGuard(
+  options: PersistentIsolationGuardOptions,
+): MultiAgentIsolationGuard {
   return async (_operation: string) => {
     const observed = options.ownerIdentity();
     if (observed === undefined || observed.length === 0) {
-      return refuse("owner_identity_missing");
+      return { allowed: false, reason: "owner_identity_missing" };
     }
-    try {
-      let pin = await readSdwOwnerPin(options.storage, options.masterKey);
-      if (pin.status === "absent") {
-        if (await sdwStoreEstablished(options.storage)) {
-          return refuse("owner_pin_missing_after_establishment");
-        }
-        const created = await createSdwOwnerPinIfAbsent(
-          options.storage,
-          options.masterKey,
-          pinData(options.fortressId, options.ownerRef, observed, now),
-        );
-        if (created === "unsupported") {
-          return refuse("owner_pin_backend_unsupported");
-        }
-        // The record on disk is authoritative. Two first callers may both
-        // observe absence, but only one atomic create can win; the loser sees
-        // the winner here and is refused on this same first call.
-        pin = await readSdwOwnerPin(options.storage, options.masterKey);
-      }
-      if (
-        pin.status !== "valid" ||
-        !sameScope(pin.data, options.fortressId, options.ownerRef)
-      ) {
-        return refuse("owner_pin_invalid");
-      }
-      return pin.data.agent_id === observed
-        ? { allowed: true }
-        : refuse("owner_scope_conflict");
-    } catch {
-      return refuse("owner_pin_io_error");
-    }
+    return checkOrEstablishSdwOwnerPin({
+      storage: options.storage,
+      masterKey: options.masterKey,
+      fortressId: options.fortressId,
+      ownerRef: options.ownerRef,
+      agentId: observed,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+    });
   };
 }
 
