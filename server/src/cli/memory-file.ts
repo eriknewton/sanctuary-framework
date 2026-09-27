@@ -36,6 +36,7 @@ import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { ingestMemoryFiles } from "../sdw/memory-file-ingest-service.js";
 import {
   checkOrEstablishSdwOwnerPin,
+  precheckSdwOwnerPin,
   type IsolationRefusalReason,
 } from "../sdw/memory-isolation.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -74,39 +75,50 @@ export interface MemoryFileCommandArgs {
   readonly dialogRunner?: MemoryArchiveDialogRunner;
 }
 
+// Must match ownerRef: "fleet-self" in server/src/index.ts
+// (sdwMemoryIsolationGuard construction) and OWNER_REF in
+// server/src/cli/sdw-owner.ts: the only scope those know how to read, claim,
+// or transfer. STEP1-F1/F2: a pin under any other owner_ref would be
+// invisible to both, with no recovery verb, so runMemoryIngestCommand refuses
+// a non-default `--owner-ref` outright (see the check below) rather than
+// establishing a pin under a scope nothing else can ever reconcile.
 const DEFAULT_OWNER_REF = "fleet-self";
 
 /**
- * Identity the CLI ingest path establishes/checks the SDW owner pin under
- * when the process has no wrap-time `SANCTUARY_AGENT_ID` (an unwrapped,
- * operator-run ingest — the exact fresh-fortress case STEP1-F1 diagnosed).
- * Parity with the MCP guard means the SAME env var is read first (see
- * `resolveCliIngestAgentId` below); this is only the fallback so a bare CLI
- * run still establishes a stable, named pin instead of skipping establishment
- * entirely. Precedent: `cli.ts`'s `broker-server` subcommand falls back to
- * the analogous `"mcp-host"` for the same "no wrap identity" case.
- */
-export const CLI_INGEST_UNWRAPPED_AGENT_ID = "cli-ingest";
-
-/**
- * Must resolve the SAME identity the MCP guard would for this process: the
- * wrap-time `SANCTUARY_AGENT_ID` (must match `wrappedAgentIdentityFromEnv` in
+ * The wrap-time `SANCTUARY_AGENT_ID` the MCP guard's `wrappedAgentIdentityFromEnv`
+ * would resolve for this SAME process (must match that function in
  * `../sdw/memory-isolation.js`), read from the CLI's OWN threaded `env`
- * (never `process.env` directly) so tests can exercise both the wrapped and
- * unwrapped cases without mutating the real process environment.
+ * (never `process.env` directly) so tests can exercise the identity-present
+ * and identity-missing cases without mutating the real process environment.
+ *
+ * STEP1-F1 fix round 1 (Claude F3 / Grok finding 1): there is deliberately NO
+ * fallback identity here. A prior version substituted a synthetic
+ * `"cli-ingest"` principal when this was unset, which let an UNWRAPPED
+ * ingest silently pin a fresh fortress to a principal no wrapped MCP server
+ * can ever be — the exact lockout STEP1-F1 was meant to remove, just moved
+ * one step over. `undefined`/empty is a hard refusal (see the caller).
  */
-function resolveCliIngestAgentId(env: NodeJS.ProcessEnv): string {
+function resolveCliIngestAgentId(env: NodeJS.ProcessEnv): string | undefined {
   const wrapped = env.SANCTUARY_AGENT_ID;
-  return wrapped !== undefined && wrapped.length > 0
-    ? wrapped
-    : CLI_INGEST_UNWRAPPED_AGENT_ID;
+  return wrapped !== undefined && wrapped.length > 0 ? wrapped : undefined;
 }
 
+const NO_WRAPPED_AGENT_ID_MESSAGE =
+  "memory_ingest: refused (owner_identity_missing) - set SANCTUARY_AGENT_ID to the wrapped harness id, " +
+  "or run 'sanctuary sdw-owner claim --agent-id <your wrapped harness id>'.\n";
+
 /**
- * Operator-facing text for a `checkOrEstablishSdwOwnerPin` refusal, printed to
- * stderr before ingest returns 1. Never invents a new reason string: the
- * refusal `reason` itself is the guard's own (STEP1-F1 constraint: reuse the
- * MCP guard's reasons verbatim). This only adds the remediation command.
+ * Operator-facing text for an owner-pin refusal, printed to stderr before
+ * ingest returns 1. Never invents a new reason string: the refusal `reason`
+ * itself is the guard's own (STEP1-F1 constraint: reuse the MCP guard's
+ * reasons verbatim). This only adds the remediation command.
+ *
+ * `owner_identity_missing` is UNREACHABLE through this function: the caller
+ * refuses that case itself, before ever calling `precheckSdwOwnerPin` or
+ * `checkOrEstablishSdwOwnerPin` (see `NO_WRAPPED_AGENT_ID_MESSAGE` above and
+ * its call site), so neither of those ever returns it to here. The arm is
+ * kept only so this switch stays exhaustive over `IsolationRefusalReason`
+ * (the MCP guard's own inline identity check still produces it there).
  */
 function describeOwnerPinRefusal(
   reason: IsolationRefusalReason,
@@ -128,7 +140,7 @@ function describeOwnerPinRefusal(
     case "owner_pin_io_error":
       return `memory_ingest: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
     case "owner_identity_missing":
-      return `memory_ingest: refused (${reason}) - no ingesting agent id was resolved.\n`;
+      return NO_WRAPPED_AGENT_ID_MESSAGE;
   }
 }
 
@@ -160,6 +172,20 @@ export async function runMemoryIngestCommand(
 
   const parsed = parseCommonArgs(args.argv, "memory_ingest", err);
   if (!parsed) return 2;
+  // STEP1-F1/F2: the owner-pin machinery below (and the MCP guard, and
+  // `sdw-owner`) all hard-code the "fleet-self" scope (see the pin comment on
+  // DEFAULT_OWNER_REF). A pin under any other owner_ref would be written and
+  // then permanently unreachable by anything that could read or reconcile it,
+  // so refuse before any bootstrap or fortress unlock, never establish under
+  // a different scope.
+  if (parsed.ownerRef !== DEFAULT_OWNER_REF) {
+    write(
+      err,
+      `memory_ingest: refused - only --owner-ref ${DEFAULT_OWNER_REF} is supported; ` +
+        `the MCP guard and 'sanctuary sdw-owner' hard-code this scope and cannot read back or reconcile any other owner_ref.\n`,
+    );
+    return 1;
+  }
   // Rung-1 point 3: an explicit, named, per-file escape hatch, never a global
   // force flag. Each path is exact-match only (no globs, no directories) and
   // is checked against the actual source directory listing below; an unknown
@@ -193,27 +219,40 @@ export async function runMemoryIngestCommand(
   if (!boot) return 1;
 
   try {
-    // STEP1-F1: a CLI-first write on a fresh fortress must go through the SAME
-    // establish-or-check rule the MCP persistent guard applies (must match
-    // `createPersistentMultiAgentIsolationGuard` in `../sdw/memory-isolation.js`),
-    // BEFORE any passage is read from source or written to the vault. Without
-    // this, a fresh store ends up established with no owner pin and every
-    // later MCP read is refused (`owner_pin_missing_after_establishment`) until
-    // a manual `sdw-owner claim`.
+    // STEP1-F1: no wrap-time identity, no ingest. Refuse before ever touching
+    // the pin machinery or showing the approval dialog (fix round 1, Claude
+    // F3 / Grok finding 1: there is no synthetic fallback principal here).
     const cliIngestAgentId = resolveCliIngestAgentId(env);
-    const ownerPinCheck = await checkOrEstablishSdwOwnerPin({
+    if (cliIngestAgentId === undefined) {
+      write(err, NO_WRAPPED_AGENT_ID_MESSAGE);
+      await appendFailure(boot.auditLog, "memory_ingest", {
+        harness: parsed.harness,
+        owner_ref: parsed.ownerRef,
+        denial_class: "owner_identity_missing",
+      });
+      return 1;
+    }
+
+    // READ-ONLY precheck, run BEFORE the Tier-1 approval dialog (fix round 1,
+    // Claude F1 / Grok finding 2). An already-decidable refusal (pinned to a
+    // different agent, or a used-but-unpinned legacy store) returns here
+    // without ever bothering the operator or writing anything. It NEVER
+    // creates the pin — a genuinely fresh, untouched store reports "fresh"
+    // and establishment is deferred to the `authorize` success branch below,
+    // so a denied dialog leaves the store exactly as it found it.
+    const ownerPinPrecheck = await precheckSdwOwnerPin({
       storage: boot.storage,
       masterKey: boot.masterKey,
       fortressId: boot.fortressId,
       ownerRef: parsed.ownerRef,
       agentId: cliIngestAgentId,
     });
-    if (!ownerPinCheck.allowed) {
-      write(err, describeOwnerPinRefusal(ownerPinCheck.reason, cliIngestAgentId, parsed.fortress));
+    if (ownerPinPrecheck.status === "refuse") {
+      write(err, describeOwnerPinRefusal(ownerPinPrecheck.reason, cliIngestAgentId, parsed.fortress));
       await appendFailure(boot.auditLog, "memory_ingest", {
         harness: parsed.harness,
         owner_ref: parsed.ownerRef,
-        denial_class: ownerPinCheck.reason,
+        denial_class: ownerPinPrecheck.reason,
       });
       return 1;
     }
@@ -230,7 +269,11 @@ export async function runMemoryIngestCommand(
       beforeCommit: async () => {},
       authorize: async () => {
         // Tier-1 gate FIRST: the service reads no source and writes no vault
-        // content or ingest-intent audit until this exact request is allowed.
+        // content or ingest-intent audit, and the SDW owner pin (below) is
+        // established, until this exact request is allowed. STEP1-F1 fix
+        // round 1: a denied request must never leave a pin behind, so nothing
+        // here writes the pin before this decision, and a "deny" returns null
+        // without ever reaching the establishment step.
         const decision = await new ApprovalGate(
           await loadPrincipalPolicy(boot.fortressPath),
           boot.baseline,
@@ -247,21 +290,40 @@ export async function runMemoryIngestCommand(
         const humanApproved = decision.allowed &&
           (decision.tier === 1 || (allowFiles.size === 0 && decision.tier === 2)) &&
           Boolean(decision.approval_audit_id);
-        if (unattended) {
-          return {
-            approvalBasis: "operator_policy_tier3" as const,
-            policyTier: 3 as const,
-            ...(decision.approval_audit_id ? { approvalAuditId: decision.approval_audit_id } : {}),
-          };
+        const authorization = unattended
+          ? {
+              approvalBasis: "operator_policy_tier3" as const,
+              policyTier: 3 as const,
+              ...(decision.approval_audit_id ? { approvalAuditId: decision.approval_audit_id } : {}),
+            }
+          : humanApproved
+            ? {
+                approvalBasis: "human" as const,
+                policyTier: decision.tier as 1 | 2,
+                approvalAuditId: decision.approval_audit_id!,
+              }
+            : null;
+        if (authorization === null) return null;
+
+        // Establish ONLY now: the request is approved, and the precheck above
+        // found nothing pinned yet ("fresh"). A "pinned" precheck means this
+        // exact agent id already owns the scope — nothing to write.
+        if (ownerPinPrecheck.status === "fresh") {
+          const established = await checkOrEstablishSdwOwnerPin({
+            storage: boot.storage,
+            masterKey: boot.masterKey,
+            fortressId: boot.fortressId,
+            ownerRef: parsed.ownerRef,
+            agentId: cliIngestAgentId,
+          });
+          if (!established.allowed) {
+            // Lost a race with a concurrent first writer between the precheck
+            // and here; deny rather than proceed under a scope we do not own.
+            write(err, describeOwnerPinRefusal(established.reason, cliIngestAgentId, parsed.fortress));
+            return null;
+          }
         }
-        if (humanApproved) {
-          return {
-            approvalBasis: "human" as const,
-            policyTier: decision.tier as 1 | 2,
-            approvalAuditId: decision.approval_audit_id!,
-          };
-        }
-        return null;
+        return authorization;
       },
     });
     if (result === null) {

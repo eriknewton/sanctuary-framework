@@ -232,6 +232,48 @@ export async function checkOrEstablishSdwOwnerPin(
   }
 }
 
+export type SdwOwnerPinPrecheckResult =
+  | { readonly status: "pinned" }
+  | { readonly status: "fresh" }
+  | { readonly status: "refuse"; readonly reason: IsolationRefusalReason };
+
+/**
+ * READ-ONLY counterpart to `checkOrEstablishSdwOwnerPin`, for a caller whose
+ * own authorization gate has not run yet (STEP1-F1 fix round 1: the pin must
+ * never be created before Tier-1 approval, AGENTS.md #3 "no irreversible
+ * operation without a confirmation gate"). NEVER calls
+ * `createSdwOwnerPinIfAbsent` or otherwise writes. `runMemoryIngestCommand`
+ * (`server/src/cli/memory-file.ts`) calls this BEFORE the approval dialog, so
+ * an already-decidable refusal (a different agent's pin, or a used-but-unpinned
+ * legacy store) never bothers the operator; a genuinely fresh, untouched store
+ * reports "fresh" and establishment is deferred to `checkOrEstablishSdwOwnerPin`,
+ * run only from inside that caller's OWN approved branch.
+ */
+export async function precheckSdwOwnerPin(
+  options: Omit<SdwOwnerPinCheckOptions, "now">,
+): Promise<SdwOwnerPinPrecheckResult> {
+  try {
+    const pin = await readSdwOwnerPin(options.storage, options.masterKey);
+    if (pin.status === "absent") {
+      if (await sdwStoreEstablished(options.storage)) {
+        return { status: "refuse", reason: "owner_pin_missing_after_establishment" };
+      }
+      return { status: "fresh" };
+    }
+    if (
+      pin.status !== "valid" ||
+      !sameScope(pin.data, options.fortressId, options.ownerRef)
+    ) {
+      return { status: "refuse", reason: "owner_pin_invalid" };
+    }
+    return pin.data.agent_id === options.agentId
+      ? { status: "pinned" }
+      : { status: "refuse", reason: "owner_scope_conflict" };
+  } catch {
+    return { status: "refuse", reason: "owner_pin_io_error" };
+  }
+}
+
 /**
  * Production guard. Every wrapped harness starts a separate server process,
  * so the owner lives in a MAC-authenticated fortress record and is checked on
