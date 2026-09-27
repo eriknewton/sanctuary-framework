@@ -593,6 +593,26 @@ mod structure {
         assert!(hits.is_empty(), "raw exits outside the gate: {hits:?}");
     }
 
+    /// T9 (LINUX-WAIT-FOR-SHUTDOWN-API-01): the unsupervised wait API is gone
+    /// and nothing calls or defines it again. It waited for a stop without
+    /// supervising kernel-runtime health or arming the stop guard, so a new
+    /// caller would reopen a stop path the guard does not cover. Only call
+    /// syntax is matched; prose that names the old API is not a caller.
+    #[test]
+    fn t9_the_unsupervised_wait_api_has_no_definition_or_caller() {
+        // Built with concat! so this test's own source never matches itself.
+        let needle = concat!("wait_for", "_shutdown(");
+        let mut hits = Vec::new();
+        for dir in ["src", "tests"] {
+            for (path, text) in crate::source_scan::rust_files_under(dir) {
+                for at in offsets_of(&text, needle) {
+                    hits.push(format!("{path}:{}", line_of(&text, at)));
+                }
+            }
+        }
+        assert!(hits.is_empty(), "the removed wait API reappeared: {hits:?}");
+    }
+
     /// T15: nothing in the crate can block `SIGALRM` or take `ITIMER_REAL` away
     /// from the guard (premise P7). A mask that blocked it on every thread would
     /// leave the guard silently inert.

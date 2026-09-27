@@ -555,7 +555,7 @@ fn run_daemon_main() -> ExitCode {
 
     // Supervise: run until a shutdown signal OR a post-ready kernel-runtime
     // loss. A control-plane-only boot (no kernel runtime) never reports a loss,
-    // so this behaves like wait_for_shutdown there; a boot that came up ready
+    // so there it simply returns once a stop is requested; a boot that came up ready
     // and then lost the verdict thread / table / watcher returns
     // KernelRuntimeLost, which we turn into an ordered teardown and a NONZERO
     // exit so systemd (Restart=on-failure) restarts the daemon instead of

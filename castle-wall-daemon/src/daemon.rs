@@ -256,7 +256,7 @@ pub struct DaemonHandle {
     /// the IPC control surface (see [`teardown`](Self::teardown)).
     enforcement: Option<Arc<Mutex<EnforcementRuntime>>>,
     /// Daemon shutdown-REQUEST flag. Signal handlers and [`request_stop`] set
-    /// ONLY this; it is what [`wait_for_shutdown`] / [`is_shutdown_requested`]
+    /// ONLY this; it is what [`supervise_until_shutdown`] / [`is_shutdown_requested`]
     /// observe and what drives the daemon's DECISION to begin teardown. It is
     /// deliberately NOT the IPC accept-loop stop flag: a shutdown request must
     /// never tear the IPC control surface down before enforcement is released
@@ -265,7 +265,7 @@ pub struct DaemonHandle {
     /// `enforcement.shutdown()`.
     ///
     /// [`request_stop`]: Self::request_stop
-    /// [`wait_for_shutdown`]: Self::wait_for_shutdown
+    /// [`supervise_until_shutdown`]: Self::supervise_until_shutdown
     /// [`is_shutdown_requested`]: Self::is_shutdown_requested
     /// [`teardown`]: Self::teardown
     shutdown_flag: Arc<AtomicBool>,
@@ -427,20 +427,6 @@ impl DaemonHandle {
 
     pub fn is_fatal_control_path_requested(&self) -> bool {
         self.fatal_control_path.load(Ordering::SeqCst)
-    }
-
-    /// Block until shutdown is requested, sweeping audit-buffer expirations
-    /// every `tick`. Does NOT supervise kernel-runtime health; the production
-    /// entry point uses [`supervise_until_shutdown`](Self::supervise_until_shutdown)
-    /// so a component that dies after boot forces a restart. Retained for the
-    /// control-plane-only / smoke paths that hold no kernel runtime.
-    pub fn wait_for_shutdown(&self, tick: Duration) {
-        while !self.is_shutdown_requested() {
-            std::thread::sleep(tick);
-            if let Ok(mut buf) = self.audit_buffer.lock() {
-                buf.evict_expired(std::time::SystemTime::now());
-            }
-        }
     }
 
     /// Kernel-runtime health for the supervision loop, as a THREE-valued state.
@@ -1101,8 +1087,8 @@ impl DaemonHandle {
     }
 
     /// Programmatically request shutdown. Sets ONLY the daemon
-    /// shutdown-request flag — so [`wait_for_shutdown`](Self::wait_for_shutdown)
-    /// returns and [`teardown`](Self::teardown) begins — and deliberately does
+    /// shutdown-request flag — so
+    /// [`supervise_until_shutdown`](Self::supervise_until_shutdown) returns and [`teardown`](Self::teardown) begins — and deliberately does
     /// NOT stop the IPC accept loop. `teardown` stops IPC via
     /// [`IpcServer::stop_and_join`] only AFTER enforcement is released, so a
     /// programmatic (or signal-driven) stop can never terminate the control
@@ -1420,7 +1406,7 @@ pub struct DaemonExitReport {
 }
 
 /// Boot the daemon. On success returns a handle; the caller is responsible
-/// for calling `wait_for_shutdown` then `stop`.
+/// for calling `supervise_until_shutdown` then `stop`.
 pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     #[cfg(target_os = "linux")]
     config
@@ -1464,7 +1450,7 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     )));
 
     // Daemon shutdown-REQUEST flag: set by signal handlers and request_stop,
-    // observed by wait_for_shutdown. It drives the DECISION to shut down.
+    // observed by supervise_until_shutdown. It drives the DECISION to shut down.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     // TEST-ISOLATION ONLY (LINUX-BOOT-STOP-HOSTWIDE-NET-01): pre-set the flag
     // before kernel activation runs, simulating a stop already requested
