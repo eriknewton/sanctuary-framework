@@ -919,6 +919,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
           agentId: TEST_AGENT_ID,
         }),
       ).toEqual({ status: "claimed" });
+      // fix round 2 (Claude): this key is resolved only for the claim call
+      // above and never handed to the CLI's own owned-and-zeroed master; zero
+      // it here so it does not outlive its one use.
+      masterKey.fill(0);
 
       // Pre-occupy the corpus namespace as a plain FILE instead of a
       // directory: every corpus write inside it fails (ENOTDIR/EEXIST-class),

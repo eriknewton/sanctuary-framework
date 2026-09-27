@@ -17,6 +17,10 @@ import {
 } from "../sdw/memory-isolation.js";
 import { consumeFlagValue } from "./argv.js";
 
+// Must match DEFAULT_OWNER_REF in server/src/cli/memory-file.ts (which
+// refuses any `--owner-ref` other than this) and ownerRef: "fleet-self" in
+// server/src/index.ts (the MCP guard construction) — the one scope this
+// verb, the guard, and memory_ingest all agree on.
 const OWNER_REF = "fleet-self";
 
 export interface SdwOwnerCommandArgs {

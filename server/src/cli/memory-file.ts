@@ -56,6 +56,7 @@ import {
   flagValue,
   fortressFlagRefusalText,
   hasFlag,
+  shellQuoteSingleArg,
 } from "./argv.js";
 
 export interface MemoryFileCommandArgs {
@@ -103,9 +104,32 @@ function resolveCliIngestAgentId(env: NodeJS.ProcessEnv): string | undefined {
   return wrapped !== undefined && wrapped.length > 0 ? wrapped : undefined;
 }
 
-const NO_WRAPPED_AGENT_ID_MESSAGE =
-  "memory_ingest: refused (owner_identity_missing) - set SANCTUARY_AGENT_ID to the wrapped harness id, " +
-  "or run 'sanctuary sdw-owner claim --agent-id <your wrapped harness id>'.\n";
+// fix round 2 (Claude N5): every printed remediation command shell-quotes its
+// interpolated values, so an agent id or fortress path containing a space or
+// shell metacharacter still pastes as the one command it names, not a
+// silently different one (same discipline as shellQuoteSingleArg's own doc
+// comment in argv.ts).
+function sdwOwnerStatusCommand(fortress: string | undefined): string {
+  return fortress !== undefined
+    ? `sanctuary sdw-owner status --fortress ${shellQuoteSingleArg(fortress)}`
+    : "sanctuary sdw-owner status";
+}
+
+function sdwOwnerClaimCommand(agentId: string, fortress: string | undefined): string {
+  const fortressFlag = fortress !== undefined ? ` --fortress ${shellQuoteSingleArg(fortress)}` : "";
+  return `sanctuary sdw-owner claim --agent-id ${shellQuoteSingleArg(agentId)}${fortressFlag}`;
+}
+
+// fix round 2 (Claude N1): also names `sdw-owner status`, the only way to
+// learn the id an already-pinned store requires; `sdw-owner claim` alone only
+// helps a store nothing has pinned yet.
+function noWrappedAgentIdMessage(fortress: string | undefined): string {
+  return (
+    "memory_ingest: refused (owner_identity_missing) - set SANCTUARY_AGENT_ID to the wrapped harness id.\n" +
+    `memory_ingest: run '${sdwOwnerStatusCommand(fortress)}' to see the required id if this store is already pinned, ` +
+    `or '${sdwOwnerClaimCommand("<your wrapped harness id>", fortress)}' to claim a fresh one.\n`
+  );
+}
 
 /**
  * Operator-facing text for an owner-pin refusal, printed to stderr before
@@ -115,32 +139,36 @@ const NO_WRAPPED_AGENT_ID_MESSAGE =
  *
  * `owner_identity_missing` is UNREACHABLE through this function: the caller
  * refuses that case itself, before ever calling `precheckSdwOwnerPin` or
- * `checkOrEstablishSdwOwnerPin` (see `NO_WRAPPED_AGENT_ID_MESSAGE` above and
- * its call site), so neither of those ever returns it to here. The arm is
- * kept only so this switch stays exhaustive over `IsolationRefusalReason`
- * (the MCP guard's own inline identity check still produces it there).
+ * `checkOrEstablishSdwOwnerPin` (see `noWrappedAgentIdMessage` above and its
+ * call site), so neither of those ever returns it to here. The arm is kept
+ * only so this switch stays exhaustive over `IsolationRefusalReason` (the MCP
+ * guard's own inline identity check still produces it there).
  */
 function describeOwnerPinRefusal(
   reason: IsolationRefusalReason,
   agentId: string,
   fortress: string | undefined,
 ): string {
-  const fortressFlag = fortress !== undefined ? ` --fortress ${fortress}` : "";
-  const claimCommand = `sanctuary sdw-owner claim --agent-id ${agentId}${fortressFlag}`;
   switch (reason) {
     case "owner_pin_missing_after_establishment":
       return (
         `memory_ingest: refused (${reason}) - this SDW store already has passages but no owner pin.\n` +
-        `memory_ingest: run '${claimCommand}' to claim it, then re-run.\n`
+        `memory_ingest: run '${sdwOwnerClaimCommand(agentId, fortress)}' to claim it, then re-run.\n`
       );
     case "owner_scope_conflict":
-      return `memory_ingest: refused (${reason}) - this SDW store is pinned to a different agent id than ${agentId}.\n`;
+      // fix round 2 (Claude N1): name `sdw-owner status`, the only way to
+      // learn the pinned id — this is the message an operator who set the
+      // WRONG SANCTUARY_AGENT_ID sees, so it must say how to find the right one.
+      return (
+        `memory_ingest: refused (${reason}) - this SDW store is pinned to a different agent id than ${agentId}.\n` +
+        `memory_ingest: run '${sdwOwnerStatusCommand(fortress)}' to see the required id.\n`
+      );
     case "owner_pin_invalid":
     case "owner_pin_backend_unsupported":
     case "owner_pin_io_error":
       return `memory_ingest: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
     case "owner_identity_missing":
-      return NO_WRAPPED_AGENT_ID_MESSAGE;
+      return noWrappedAgentIdMessage(fortress);
   }
 }
 
@@ -224,7 +252,7 @@ export async function runMemoryIngestCommand(
     // F3 / Grok finding 1: there is no synthetic fallback principal here).
     const cliIngestAgentId = resolveCliIngestAgentId(env);
     if (cliIngestAgentId === undefined) {
-      write(err, NO_WRAPPED_AGENT_ID_MESSAGE);
+      write(err, noWrappedAgentIdMessage(parsed.fortress));
       await appendFailure(boot.auditLog, "memory_ingest", {
         harness: parsed.harness,
         owner_ref: parsed.ownerRef,
@@ -256,6 +284,14 @@ export async function runMemoryIngestCommand(
       });
       return 1;
     }
+
+    // Set only by the race branch inside `authorize` below (fix round 2,
+    // Grok finding / Claude N4): a `null` from `ingestMemoryFiles` otherwise
+    // always means "the policy gate denied this," so the generic message
+    // after the call must not fire when the REAL reason was a lost owner-pin
+    // race, and that race must leave its own audit row, not silently ride
+    // along as an approved-but-undone gate decision.
+    let ownerPinRaceRefusal: IsolationRefusalReason | null = null;
 
     const result = await ingestMemoryFiles({
       adapter: boot.adapter,
@@ -319,7 +355,18 @@ export async function runMemoryIngestCommand(
           if (!established.allowed) {
             // Lost a race with a concurrent first writer between the precheck
             // and here; deny rather than proceed under a scope we do not own.
+            // This is NOT a policy denial — the gate already approved the
+            // request — so it gets its own message and its own audit row
+            // (fix round 2), never the generic "not permitted by the local
+            // policy" line below, which would misreport an owner-pin failure
+            // as a policy failure.
+            ownerPinRaceRefusal = established.reason;
             write(err, describeOwnerPinRefusal(established.reason, cliIngestAgentId, parsed.fortress));
+            await appendFailure(boot.auditLog, "memory_ingest", {
+              harness: parsed.harness,
+              owner_ref: parsed.ownerRef,
+              denial_class: established.reason,
+            });
             return null;
           }
         }
@@ -327,7 +374,9 @@ export async function runMemoryIngestCommand(
       },
     });
     if (result === null) {
-      write(err, "Denied: memory ingest was not permitted by the local policy.\n");
+      if (ownerPinRaceRefusal === null) {
+        write(err, "Denied: memory ingest was not permitted by the local policy.\n");
+      }
       return 1;
     }
     write(
@@ -1086,7 +1135,9 @@ Options:
                          the classifier never refused is reported as unused,
                          and an unknown path is an error. There is no flag
                          that waives the classifier for every file.
-  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --owner-ref <id>       Only "fleet-self" is accepted; the MCP guard and
+                         'sanctuary sdw-owner' both hard-code this scope, so
+                         any other value refuses before touching the vault.
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
   --passphrase <value>   Fortress passphrase. Visible in the process list to

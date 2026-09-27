@@ -12,6 +12,17 @@
  * either. Isolation: every run points at a throwaway fortress created in a
  * temp dir, unlocked via SANCTUARY_PASSPHRASE, so the operator's real login
  * keychain and real ~/.sanctuary are never touched (AGENTS.md test isolation).
+ *
+ * Fail-before witnesses, stated plainly per revision (fix round 2, Claude
+ * fail-before note): (a), (b), (c), (e), (f) fail against the pre-STEP1-F1
+ * base tree `e7e09d65` (no CLI owner-pin logic existed at all — the MCP
+ * guard's own read in (a) returns `owner_pin_missing_after_establishment`
+ * instead of `{allowed:true}`, and (e)/(f) accept the request and leave a
+ * nonzero corpus). Test (d) is different: it passes on `e7e09d65` (a denied
+ * dialog there never wrote anything, because there was no pin logic to run
+ * at all) and fails only on round 1's head `2ca3fa0e`, which is the correct
+ * witness for THIS fix — `2ca3fa0e` established the pin before the Tier-1
+ * gate ran, so a denied dialog there still left a pin behind.
  */
 
 import { mkdir, readdir, readFile, rm, mkdtemp, writeFile } from "node:fs/promises";
@@ -202,6 +213,8 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     });
     expect(claim).toEqual({ status: "claimed" });
     const before = await corpusEntryCount();
+    const pinBefore = await readSdwOwnerPin(storage, masterKey);
+    expect(pinBefore.status).toBe("valid");
 
     const source = await copyFixtureSet("basic", "memfile-owner-pin-conflict");
     const out = makeSink();
@@ -215,6 +228,15 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     expect(code).toBe(1);
     expect(err.text()).toContain("owner_scope_conflict");
     expect(await corpusEntryCount()).toBe(before);
+    // fix round 2 (Claude N6): the refused ingest must not just fail to
+    // ADVANCE the pin (a status check alone would miss a read-modify-write
+    // that happened to round-trip the same agent id) — it must never touch
+    // the record at all, proven by the raw ciphertext bytes being identical.
+    const pinAfter = await readSdwOwnerPin(storage, masterKey);
+    expect(pinAfter.status).toBe("valid");
+    if (pinBefore.status === "valid" && pinAfter.status === "valid") {
+      expect(Buffer.from(pinAfter.raw)).toEqual(Buffer.from(pinBefore.raw));
+    }
   });
 
   it("(c) established with passages but no pin (the F1-drifted state): CLI ingest refuses with owner_pin_missing_after_establishment and prints the claim command; no passage written", async () => {
@@ -247,7 +269,8 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     });
     expect(code).toBe(1);
     expect(err.text()).toContain("owner_pin_missing_after_establishment");
-    expect(err.text()).toContain(`sdw-owner claim --agent-id ${agentId}`);
+    // fix round 2: the printed command shell-quotes its arguments.
+    expect(err.text()).toContain(`sdw-owner claim --agent-id '${agentId}'`);
     expect(await corpusEntryCount()).toBe(before);
   });
 
