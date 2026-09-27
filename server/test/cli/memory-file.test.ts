@@ -1,4 +1,4 @@
-// fail-before-exempt: C3 fixture-wiring only — this existing CLI suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
+// fail-before-exempt: STEP1-F1 isolation wiring only: existing tests now pre-claim the SDW owner pin and pass an explicit test agent id so the new CLI owner-pin precheck does not scan the corpus these tests corrupt; the behavior the precheck adds is proven by test/cli/memory-file-owner-pin.test.ts, which fails on the base tree.
 /**
  * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI tests.
  *
