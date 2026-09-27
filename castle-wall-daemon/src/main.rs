@@ -87,6 +87,11 @@ fn has_structural_flag(args: &[String], wanted: &str) -> bool {
     {
         value_options.push("--test-health-interval-ms");
         value_options.push("--test-shutdown-at");
+        // LINUX-STOP-PATH-BUDGET-01: the stop-guard deadline and nft-binary seams
+        // take a value, so the scan must skip it. Same test-isolation-only rule as
+        // the two entries above; a release build never carries them.
+        value_options.push("--test-stop-guard-deadline-secs");
+        value_options.push("--test-nft-binary");
     }
     // Invariant: `args` is already `std::env::args().skip(1)` (the program name
     // is stripped by the caller), so scanning MUST start at index 0. Starting at
@@ -239,7 +244,17 @@ fn install_isolated_castle_table(args: &[String]) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The daemon's exit is claimed through the single exit gate
+/// (`exit_guard::claim_return`, LINUX-STOP-PATH-BUDGET-01): `main` either wins
+/// `EXIT_RETURNING`, cancels any pending stop-guard alarm and returns, or parks
+/// because the guard or the verdict fail-stop already won and is in `_exit`.
 fn main() -> ExitCode {
+    let code = run_daemon_main();
+    castle_wall_daemon::exit_guard::claim_return();
+    code
+}
+
+fn run_daemon_main() -> ExitCode {
     // `mut` is used only by the feature-gated isolation-flag strip below; the
     // allow keeps a production build warning-clean without a second code path.
     #[cfg_attr(not(feature = "test-isolation"), allow(unused_mut))]
@@ -252,6 +267,10 @@ fn main() -> ExitCode {
     let mut test_health_interval_ms: Option<u64> = None;
     #[cfg(feature = "test-isolation")]
     let mut test_shutdown_at: Option<String> = None;
+    // LINUX-STOP-PATH-BUDGET-01 (T3w/H4): an injected stop-guard deadline so a
+    // subprocess test waits about one second instead of the production eight.
+    #[cfg(feature = "test-isolation")]
+    let mut test_stop_guard_deadline_secs: Option<u32> = None;
 
     #[cfg(feature = "test-isolation")]
     {
@@ -308,6 +327,42 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // LINUX-STOP-PATH-BUDGET-01: drained before the run-config parser for the
+        // same reason as W1a. Zero is refused because an alarm of zero cancels instead of
+        // arming, which would silently disable the guard under test.
+        if let Some(index) = args
+            .iter()
+            .position(|a| a == "--test-stop-guard-deadline-secs")
+        {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u32>().ok()).filter(|s| *s > 0) {
+                Some(secs) => test_stop_guard_deadline_secs = Some(secs),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-stop-guard-deadline-secs requires a \
+                         positive whole number of seconds"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // H4(d)/H5 seam: substitute the nft binary path. Applied before any nft
+        // call; production keeps the absolute-path, no-PATH-fallback rule. Must
+        // match `nftables::use_test_nft_binary`.
+        if let Some(index) = args.iter().position(|a| a == "--test-nft-binary") {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            let installed = value
+                .ok_or_else(|| "--test-nft-binary requires a path".to_string())
+                .and_then(castle_wall_daemon::nftables::use_test_nft_binary);
+            if let Err(err) = installed {
+                // SAFETY: stderr is the CLI parse-error contract, as above.
+                eprintln!("castle-wall-daemon: {err}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     // Recovery action: `--disarm` is the ONE explicit, unmistakable path that
@@ -334,13 +389,17 @@ fn main() -> ExitCode {
     let trigger_fatal_control_path = args
         .iter()
         .any(|a| a == "--test-trigger-fatal-control-path");
+    // LINUX-STOP-PATH-BUDGET-01: stripped like the fatal trigger, or the config
+    // parser rejects it and the process exits 2 before any guard exists.
+    #[cfg(feature = "test-isolation")]
+    let test_hang_teardown = args.iter().any(|a| a == "--test-hang-teardown");
     let parser_args: Vec<String> = args
         .into_iter()
         .filter(|a| {
             a != "--boot-and-exit" && {
                 #[cfg(feature = "test-isolation")]
                 {
-                    a != "--test-trigger-fatal-control-path"
+                    a != "--test-trigger-fatal-control-path" && a != "--test-hang-teardown"
                 }
                 #[cfg(not(feature = "test-isolation"))]
                 {
@@ -386,6 +445,24 @@ fn main() -> ExitCode {
         config.wal_path.display()
     );
 
+    // Stop guard (LINUX-STOP-PATH-BUDGET-01): enabled here and ONLY here, after
+    // argv parsing and before `daemon::boot` spawns any thread, so every daemon
+    // thread inherits an unblocked SIGALRM. The in-process integration tests call
+    // `daemon::boot` directly and never reach this line, so no test runner can be
+    // killed by a real alarm.
+    #[cfg(feature = "test-isolation")]
+    let stop_guard_deadline_secs = test_stop_guard_deadline_secs
+        .unwrap_or(castle_wall_daemon::exit_guard::STOP_GUARD_DEADLINE_SECS);
+    #[cfg(not(feature = "test-isolation"))]
+    let stop_guard_deadline_secs = castle_wall_daemon::exit_guard::STOP_GUARD_DEADLINE_SECS;
+    if let Err(err) = castle_wall_daemon::exit_guard::enable_process_guard(stop_guard_deadline_secs)
+    {
+        // SAFETY: stderr is the CLI refuse-to-start contract here, not a log
+        // channel; without the guard the stop path has no bound, so start refuses.
+        eprintln!("castle-wall-daemon: refusing to start: {err}");
+        return ExitCode::from(castle_wall_daemon::exit_guard::EXIT_CODE_STOP_INCOMPLETE);
+    }
+
     let handle = match daemon::boot(config) {
         Ok(h) => h,
         Err(err) => {
@@ -405,6 +482,10 @@ fn main() -> ExitCode {
     #[cfg(feature = "test-isolation")]
     if trigger_fatal_control_path {
         handle.request_fatal_control_path_for_test();
+    }
+    #[cfg(feature = "test-isolation")]
+    if test_hang_teardown {
+        handle.arm_test_hang_teardown();
     }
     // W1b: armed only after a successful boot, so the seam cannot fire before a
     // handle exists to flip. `boot-acquire` is applied to `config` earlier
@@ -491,6 +572,11 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "test-isolation"))]
     let health_interval = HEALTH_INTERVAL;
     let outcome = handle.supervise_until_shutdown(SHUTDOWN_TICK, health_interval);
+    // Arm for EVERY outcome, including FatalControlPath returns that write no
+    // audit row and a plain ShutdownRequested, BEFORE the stderr block below, so a
+    // wedged stderr write is already covered. Idempotent when a decision site or
+    // the stop request already armed.
+    castle_wall_daemon::exit_guard::arm();
     match &outcome {
         // SAFETY: stderr is the operator-visible supervision-outcome contract. These
         // two arms explain a NONZERO exit that systemd is about to restart; the
@@ -535,7 +621,7 @@ fn main() -> ExitCode {
             None
         }
     };
-    let exit_status = supervision_exit_status(&outcome, report.is_some());
+    let exit_status = daemon::supervision_exit_status(&outcome, report.is_some());
     if exit_status != 0 {
         return ExitCode::from(exit_status);
     }
@@ -551,50 +637,11 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn supervision_exit_status(outcome: &daemon::SupervisionOutcome, stop_succeeded: bool) -> u8 {
-    match outcome {
-        daemon::SupervisionOutcome::RepairRequired { .. } => 78,
-        daemon::SupervisionOutcome::ShutdownRequested if stop_succeeded => 0,
-        daemon::SupervisionOutcome::ShutdownRequested
-        | daemon::SupervisionOutcome::KernelRuntimeLost(_)
-        | daemon::SupervisionOutcome::FatalControlPath => 75,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    // The only test in this module is default-build-only (see its doc).
+    #[cfg(not(feature = "test-isolation"))]
     use super::*;
-    use castle_wall_daemon::enforcement::{ComponentKind, NotReadyReason, PostReadyRecoveryResult};
-
-    #[test]
-    fn supervision_exit_status_preserves_repair_and_shutdown_matrix() {
-        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
-        let repair = daemon::SupervisionOutcome::RepairRequired {
-            reason,
-            install_result: PostReadyRecoveryResult::InstallSucceeded,
-        };
-        assert_eq!(supervision_exit_status(&repair, true), 78);
-        assert_eq!(supervision_exit_status(&repair, false), 78);
-        assert_eq!(
-            supervision_exit_status(&daemon::SupervisionOutcome::ShutdownRequested, true),
-            0
-        );
-        assert_eq!(
-            supervision_exit_status(&daemon::SupervisionOutcome::ShutdownRequested, false),
-            75
-        );
-        assert_eq!(
-            supervision_exit_status(&daemon::SupervisionOutcome::FatalControlPath, true),
-            75
-        );
-        assert_eq!(
-            supervision_exit_status(&daemon::SupervisionOutcome::FatalControlPath, false),
-            75
-        );
-        let lost = daemon::SupervisionOutcome::KernelRuntimeLost(reason);
-        assert_eq!(supervision_exit_status(&lost, true), 75);
-        assert_eq!(supervision_exit_status(&lost, false), 75);
-    }
 
     /// F5 (LINUX-STOP-LOSS-RACE-01, Claude F5, gate I5): in a build with the
     /// `test-isolation` feature OFF (this test file's own default build,

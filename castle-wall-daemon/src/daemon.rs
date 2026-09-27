@@ -302,6 +302,12 @@ pub struct DaemonHandle {
     /// `--test-shutdown-at=pre-recovery` in `main.rs`.
     #[cfg(feature = "test-isolation")]
     test_shutdown_at_pre_recovery: Arc<AtomicBool>,
+    /// TEST-ISOLATION ONLY (LINUX-STOP-PATH-BUDGET-01). Set by
+    /// `arm_test_hang_teardown`; makes `teardown` park forever right after its
+    /// `request_stop`, so a subprocess test can prove the stop guard ends a
+    /// wedged stop path. Must match `--test-hang-teardown` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    test_hang_teardown: AtomicBool,
     started_at: Instant,
 }
 
@@ -654,7 +660,31 @@ impl DaemonHandle {
     /// than leaving a live-but-not-enforcing service reporting itself active.
     /// Before returning the loss outcome it attempts a critical, fsync-backed
     /// `kernel_runtime_lost` WAL record carrying the exact `NotReadyReason`.
+    ///
+    /// Stop guard (LINUX-STOP-PATH-BUDGET-01): on return the outcome's code,
+    /// `supervision_exit_status(&outcome, false)`, is stored in the process exit
+    /// guard's decided-code cell, so a guard exit during the teardown that follows
+    /// carries the code of the decision that was actually made. Every audited
+    /// decision inside the body has already stored and armed before its WAL write.
     pub fn supervise_until_shutdown(
+        &self,
+        tick: Duration,
+        health_interval: Duration,
+    ) -> SupervisionOutcome {
+        let outcome = self.supervise_until_shutdown_body(tick, health_interval);
+        crate::exit_guard::PROCESS_EXIT_GUARD.decide(supervision_exit_status(&outcome, false));
+        outcome
+    }
+
+    /// Store the outcome's exit code and arm the stop guard. Called on the line
+    /// BEFORE each audited decision's WAL write (`record_recovery_attempt` /
+    /// `record_runtime_loss(reason, false)`), so a hang in that write is already
+    /// inside the guard's deadline and a guard exit carries the decided code.
+    fn decide_and_arm(&self, outcome: &SupervisionOutcome) {
+        crate::exit_guard::decide_and_arm(supervision_exit_status(outcome, false));
+    }
+
+    fn supervise_until_shutdown_body(
         &self,
         tick: Duration,
         health_interval: Duration,
@@ -685,11 +715,15 @@ impl DaemonHandle {
                 reason,
                 install_result,
             } => {
-                self.record_recovery_attempt(reason, install_result);
-                return SupervisionOutcome::RepairRequired {
+                let outcome = SupervisionOutcome::RepairRequired {
                     reason,
                     install_result,
                 };
+                // Stored and armed BEFORE the WAL write: 78 is the one code that
+                // differs from the guard's default, and the write can block.
+                self.decide_and_arm(&outcome);
+                self.record_recovery_attempt(reason, install_result);
+                return outcome;
             }
             RecoveryCallDecision::Inconsistent => {
                 // SAFETY: stderr is the last-resort operator channel when a returned
@@ -768,11 +802,14 @@ impl DaemonHandle {
                         reason,
                         install_result,
                     } => {
-                        self.record_recovery_attempt(reason, install_result);
-                        return SupervisionOutcome::RepairRequired {
+                        let outcome = SupervisionOutcome::RepairRequired {
                             reason,
                             install_result,
                         };
+                        // Stored and armed BEFORE the WAL write (see the initial poll).
+                        self.decide_and_arm(&outcome);
+                        self.record_recovery_attempt(reason, install_result);
+                        return outcome;
                     }
                     RecoveryCallDecision::Inconsistent => {
                         // SAFETY: systemd captures the protocol conflict even without a WAL row.
@@ -802,8 +839,10 @@ impl DaemonHandle {
                         consecutive_unavailable = consecutive_unavailable.saturating_add(1);
                         if consecutive_unavailable >= MAX_CONSECUTIVE_UNAVAILABLE_HEALTH_READINGS {
                             let reason = crate::enforcement::NotReadyReason::HealthProbeUnavailable;
+                            let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                            self.decide_and_arm(&outcome);
                             self.record_runtime_loss(reason, false);
-                            return SupervisionOutcome::KernelRuntimeLost(reason);
+                            return outcome;
                         }
                     }
                     RuntimeHealthState::Indeterminate => {
@@ -829,8 +868,10 @@ impl DaemonHandle {
                             eprintln!("castle-wall-daemon: terminal_dispatch=runtime_absent");
                         }
                         let reason = crate::enforcement::NotReadyReason::HealthProbeIndeterminate;
+                        let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                        self.decide_and_arm(&outcome);
                         self.record_runtime_loss(reason, false);
-                        return SupervisionOutcome::KernelRuntimeLost(reason);
+                        return outcome;
                     }
                     // No attempt returned on this call. Preserve recovery observations
                     // and tag transitions without manufacturing another attempt row.
@@ -850,8 +891,10 @@ impl DaemonHandle {
                         // A PROVEN loss with no recovery attempt outstanding is acted on
                         // immediately: no grace, no budget. Only the indeterminate arm
                         // above and the recovering arm are retried.
+                        let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                        self.decide_and_arm(&outcome);
                         self.record_runtime_loss(reason, false);
-                        return SupervisionOutcome::KernelRuntimeLost(reason);
+                        return outcome;
                     }
                 }
             }
@@ -889,11 +932,15 @@ impl DaemonHandle {
                 reason,
                 install_result,
             } => {
-                self.record_recovery_attempt(reason, install_result);
-                return SupervisionOutcome::RepairRequired {
+                let outcome = SupervisionOutcome::RepairRequired {
                     reason,
                     install_result,
                 };
+                // Stored and armed BEFORE the WAL write: 78 is the one code that
+                // differs from the guard's default, and the write can block.
+                self.decide_and_arm(&outcome);
+                self.record_recovery_attempt(reason, install_result);
+                return outcome;
             }
             RecoveryCallDecision::Inconsistent => {
                 // SAFETY: stderr is the last-resort operator channel when a returned
@@ -917,8 +964,10 @@ impl DaemonHandle {
                 SupervisionOutcome::ShutdownRequested
             }
             RuntimeHealthState::Lost(reason) => {
+                let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                self.decide_and_arm(&outcome);
                 self.record_runtime_loss(reason, false);
-                SupervisionOutcome::KernelRuntimeLost(reason)
+                outcome
             }
             RuntimeHealthState::Indeterminate => {
                 if let Some(runtime) = &self.enforcement {
@@ -934,16 +983,20 @@ impl DaemonHandle {
                     eprintln!("castle-wall-daemon: terminal_dispatch=runtime_absent");
                 }
                 let reason = crate::enforcement::NotReadyReason::HealthProbeIndeterminate;
+                let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                self.decide_and_arm(&outcome);
                 self.record_runtime_loss(reason, false);
-                SupervisionOutcome::KernelRuntimeLost(reason)
+                outcome
             }
             RuntimeHealthState::ProbeUnavailable => {
                 // A stop-time pass gets no retry budget (S_STOP_FINAL_HEALTH runs the
                 // probe exactly once); unresolved contention at stop is not proven
                 // healthy, so it fails closed instead of exiting 0.
                 let reason = crate::enforcement::NotReadyReason::HealthProbeUnavailable;
+                let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                self.decide_and_arm(&outcome);
                 self.record_runtime_loss(reason, false);
-                SupervisionOutcome::KernelRuntimeLost(reason)
+                outcome
             }
             RuntimeHealthState::Recovering(reason) => {
                 // Grok 4 (LINUX-STOP-LOSS-RACE-01): reachable whenever this
@@ -955,8 +1008,10 @@ impl DaemonHandle {
                 // and the skip itself returns NoInstall because there is no
                 // known confined identity to scope it to). Neither is proven
                 // healthy: fail closed rather than exit 0, in both cases.
+                let outcome = SupervisionOutcome::KernelRuntimeLost(reason);
+                self.decide_and_arm(&outcome);
                 self.record_runtime_loss(reason, false);
-                SupervisionOutcome::KernelRuntimeLost(reason)
+                outcome
             }
         }
     }
@@ -1054,7 +1109,9 @@ impl DaemonHandle {
     /// surface before enforcement teardown. Used by tests and by the
     /// signal-handler thread.
     pub fn request_stop(&self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        // Every production writer of the stop-request flag goes through the one
+        // helper that also arms the stop guard (LINUX-STOP-PATH-BUDGET-01).
+        crate::exit_guard::request_daemon_stop(&self.shutdown_flag);
     }
 
     /// Hidden subprocess seam for the privileged integration binary. It is
@@ -1077,6 +1134,14 @@ impl DaemonHandle {
     pub fn arm_test_shutdown_at_pre_recovery(&self) {
         self.test_shutdown_at_pre_recovery
             .store(true, Ordering::SeqCst);
+    }
+
+    /// TEST-ISOLATION ONLY (LINUX-STOP-PATH-BUDGET-01): arm the teardown wedge
+    /// documented on the `test_hang_teardown` field. Absent from release builds;
+    /// must match the CLI seam name `--test-hang-teardown` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    pub fn arm_test_hang_teardown(&self) {
+        self.test_hang_teardown.store(true, Ordering::SeqCst);
     }
 
     /// Test-only: attach an enforcement runtime so the readiness derivation can
@@ -1128,6 +1193,17 @@ impl DaemonHandle {
         // only records that a stop was requested (idempotent with a prior
         // signal / request_stop).
         self.request_stop();
+        // TEST-ISOLATION ONLY (LINUX-STOP-PATH-BUDGET-01, T3w/H4): wedge teardown
+        // here, AFTER `request_stop` armed the stop guard and BEFORE enforcement is
+        // released, so every path into teardown is already inside the alarm when it
+        // wedges. Must match `--test-hang-teardown` in `main.rs`. Compiled out of
+        // release builds.
+        #[cfg(feature = "test-isolation")]
+        if self.test_hang_teardown.load(Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
         // The mutation fence is deliberately earlier than enforcement release
         // and deliberately does not stop the IPC accept loop. Work that has not
         // crossed its durable WAL linearization point cancels; work that has
@@ -1248,6 +1324,21 @@ pub enum SupervisionOutcome {
         reason: crate::enforcement::NotReadyReason,
         install_result: crate::enforcement::PostReadyRecoveryResult,
     },
+}
+
+/// The process exit code for a supervision outcome. The ONE mapping: `main`
+/// uses it after teardown, and the stop guard stores it (with
+/// `stop_succeeded = false`) at every decision so a guard exit carries it.
+/// 78 is `RestartPreventExitStatus=78` in the unit (repair required, no restart);
+/// 75 is `EX_TEMPFAIL`, must match `crate::exit_guard::EXIT_CODE_STOP_INCOMPLETE`.
+pub fn supervision_exit_status(outcome: &SupervisionOutcome, stop_succeeded: bool) -> u8 {
+    match outcome {
+        SupervisionOutcome::RepairRequired { .. } => 78,
+        SupervisionOutcome::ShutdownRequested if stop_succeeded => 0,
+        SupervisionOutcome::ShutdownRequested
+        | SupervisionOutcome::KernelRuntimeLost(_)
+        | SupervisionOutcome::FatalControlPath => crate::exit_guard::EXIT_CODE_STOP_INCOMPLETE,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1645,6 +1736,8 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         ipc_stop_flag,
         #[cfg(feature = "test-isolation")]
         test_shutdown_at_pre_recovery,
+        #[cfg(feature = "test-isolation")]
+        test_hang_teardown: AtomicBool::new(false),
         started_at: Instant::now(),
     })
 }
@@ -1853,7 +1946,9 @@ static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 #[cfg(unix)]
 extern "C" fn handle_termination_signal(_signum: libc::c_int) {
     if let Some(flag) = SHUTDOWN_FLAG.get() {
-        flag.store(true, Ordering::SeqCst);
+        // Arms the stop guard at the same instant systemd's TimeoutStopSec clock
+        // starts (this SIGTERM). A store plus the alarm syscall: async-signal-safe.
+        crate::exit_guard::request_daemon_stop(flag);
     }
 }
 
@@ -3319,6 +3414,40 @@ mod tests {
             SupervisionOutcome::ShutdownRequested
         );
         handle.stop().expect("stop");
+    }
+
+    /// Moved from `main.rs` with `supervision_exit_status` itself (v2 §8 G2): the
+    /// one mapping lives beside `SupervisionOutcome`, where the stop guard's
+    /// decided-code cell is written.
+    #[test]
+    fn supervision_exit_status_preserves_repair_and_shutdown_matrix() {
+        use crate::enforcement::{ComponentKind, NotReadyReason, PostReadyRecoveryResult};
+        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        let repair = SupervisionOutcome::RepairRequired {
+            reason,
+            install_result: PostReadyRecoveryResult::InstallSucceeded,
+        };
+        assert_eq!(supervision_exit_status(&repair, true), 78);
+        assert_eq!(supervision_exit_status(&repair, false), 78);
+        assert_eq!(
+            supervision_exit_status(&SupervisionOutcome::ShutdownRequested, true),
+            0
+        );
+        assert_eq!(
+            supervision_exit_status(&SupervisionOutcome::ShutdownRequested, false),
+            75
+        );
+        assert_eq!(
+            supervision_exit_status(&SupervisionOutcome::FatalControlPath, true),
+            75
+        );
+        assert_eq!(
+            supervision_exit_status(&SupervisionOutcome::FatalControlPath, false),
+            75
+        );
+        let lost = SupervisionOutcome::KernelRuntimeLost(reason);
+        assert_eq!(supervision_exit_status(&lost, true), 75);
+        assert_eq!(supervision_exit_status(&lost, false), 75);
     }
 
     #[test]

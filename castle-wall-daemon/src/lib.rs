@@ -25,6 +25,10 @@ pub mod crypto;
 pub mod daemon;
 pub mod decision;
 pub mod enforcement;
+// Premise P6: `AtomicU8` must be lock-free for the SIGALRM handler to be
+// async-signal-safe, so a target without 8-bit atomics fails to compile here.
+#[cfg(target_has_atomic = "8")]
+pub mod exit_guard;
 pub mod failure;
 pub mod habeas;
 pub mod health_probe;
@@ -43,6 +47,8 @@ pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
 pub mod safety_net_uid;
+#[cfg(test)]
+pub(crate) mod source_scan;
 pub mod systemd_notify;
 pub mod thread_component;
 

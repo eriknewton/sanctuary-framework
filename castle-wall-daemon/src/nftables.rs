@@ -958,6 +958,27 @@ pub(crate) fn agent_chain_name(agent_id: &str) -> String {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const NFT_ABSOLUTE_PATHS: [&str; 3] = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
 
+/// TEST-ISOLATION ONLY (C2a2 harness legs H4(d) and H5): a substituted `nft`
+/// binary path, set once by `main`'s `--test-nft-binary <path>` before any nft
+/// call. Compiled out of release builds, where `nft_path` keeps the
+/// absolute-path, no-PATH-fallback rule. Must match `--test-nft-binary` in
+/// `main.rs`.
+#[cfg(feature = "test-isolation")]
+static TEST_NFT_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// TEST-ISOLATION ONLY: install the substituted `nft` binary. The path must be
+/// absolute (the no-PATH-search rule still holds for the substitute) and may be
+/// set only once per process.
+#[cfg(feature = "test-isolation")]
+pub fn use_test_nft_binary(path: String) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("--test-nft-binary must be an absolute path, got {path:?}"));
+    }
+    TEST_NFT_BINARY
+        .set(path)
+        .map_err(|_| "--test-nft-binary may be set only once".to_string())
+}
+
 /// True iff `path` is a regular file with at least one execute bit set. The nft
 /// binary is selected by this direct check, never a PATH lookup.
 #[cfg(all(unix, any(target_os = "linux", test)))]
@@ -1040,6 +1061,10 @@ mod linux {
     /// removed in blocker 9, so a missing absolute binary is a hard error, never
     /// a silent degrade to a bare `nft` resolved through PATH.
     fn nft_path() -> Result<&'static str, NftablesError> {
+        #[cfg(feature = "test-isolation")]
+        if let Some(substitute) = super::TEST_NFT_BINARY.get() {
+            return Ok(substitute.as_str());
+        }
         super::resolve_nft_binary(&super::NFT_ABSOLUTE_PATHS, super::is_executable_file).ok_or_else(
             || {
                 NftablesError::BinaryMissing(

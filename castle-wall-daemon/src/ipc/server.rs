@@ -1026,7 +1026,9 @@ fn withdraw_after_activation_audit_failure(state: &ServerState) {
     // order and race away the evidence response.
     state.fatal_control_path.store(true, Ordering::SeqCst);
     state.mutation_cancel.store(true, Ordering::SeqCst);
-    state.daemon_shutdown_request.store(true, Ordering::SeqCst);
+    // Through the one stop-request helper, which also arms the stop guard: this
+    // self-exit has no manager TimeoutStopSec behind it (LINUX-STOP-PATH-BUDGET-01).
+    crate::exit_guard::request_daemon_stop(&state.daemon_shutdown_request);
 }
 
 #[derive(Debug, Clone, Copy)]

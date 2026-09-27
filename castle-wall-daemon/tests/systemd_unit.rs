@@ -79,9 +79,11 @@ fn shipped_wall_unit_identity_bytes_are_pinned() {
     // does not model systemd's comments, continuations, or repeated sections.
     // Any unit edit needs a fresh review of the effective identity before this
     // digest is updated. Drop-ins and host configuration require host checks.
+    // Refreshed for C2a2 (2026-09-27): a comment-only edit, the TimeoutStopSec
+    // must-match pin to the stop guard; no directive changed.
     assert_eq!(
         format!("{:x}", Sha256::digest(unit.as_bytes())),
-        "d9efca36caf21d362921ff086a06b1ebbc608499e6b6ca68b8f9c233fb546d10",
+        "061cd109121e06cb36117024589dadd4aceed04c82efb648dcd0775235d7a3d5",
         "the audited castle-wall service identity or unit bytes changed"
     );
 }
@@ -454,13 +456,21 @@ fn unit_bounds_shutdown_and_kills_wedged_health_children() {
     let unit = unit_text();
     let timeout = directive_values(&unit, "TimeoutStopSec");
     assert_eq!(timeout.len(), 1, "exactly one TimeoutStopSec must be set");
-    assert!(
-        timeout[0]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit()),
-        "TimeoutStopSec must be a concrete duration, got {:?}",
-        timeout[0]
+    // T2u (LINUX-STOP-PATH-BUDGET-01): pinned EXACTLY, on both sides. The stop
+    // guard's deadline is derived from this value minus a margin, so a longer
+    // timeout would leave the guard firing needlessly early and a shorter one
+    // would let systemd's SIGKILL beat it. Must match
+    // `exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS`.
+    assert_eq!(
+        timeout,
+        vec!["10"],
+        "TimeoutStopSec must be exactly 10 seconds, got {:?}",
+        timeout
+    );
+    assert_eq!(
+        timeout[0],
+        castle_wall_daemon::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS.to_string(),
+        "TimeoutStopSec must match the stop guard's STOP_GUARD_TIMEOUT_STOP_SECS"
     );
     assert_eq!(
         directive_values(&unit, "KillMode"),
