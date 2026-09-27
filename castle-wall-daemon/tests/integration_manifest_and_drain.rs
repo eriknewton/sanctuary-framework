@@ -1350,6 +1350,7 @@ struct T3wRun {
     sigterm_at: Option<std::time::Instant>,
     exited_at: std::time::Instant,
     stderr: String,
+    stdout: String,
 }
 
 fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
@@ -1390,13 +1391,19 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
             "--test-stop-guard-deadline-secs",
             &T3W_DEADLINE_SECS.to_string(),
         ])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if matches!(trigger, T3wTrigger::FatalControlPath) {
         command.arg("--test-trigger-fatal-control-path");
     }
     let mut child = command.spawn().expect("spawn the daemon binary");
 
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stdout), &mut text);
+        text
+    });
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = std::sync::mpsc::channel::<(Instant, String)>();
     let reader = std::thread::spawn(move || {
@@ -1425,7 +1432,12 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
         if started.elapsed() > T3W_HARNESS_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = reader.join();
+            // The readers are NOT joined here: a descendant still holding a pipe
+            // would block the join and hang the suite, which is exactly what this
+            // give-up bound exists to prevent. Their handles are dropped (detached)
+            // and the lines already received are reported.
+            drop(reader);
+            drop(stdout_reader);
             let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
             panic!(
                 "the daemon did not exit within {T3W_HARNESS_TIMEOUT:?} with a wedged teardown: \
@@ -1436,6 +1448,7 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
     };
     let exited_at = Instant::now();
     let _ = reader.join();
+    let stdout = stdout_reader.join().unwrap_or_default();
     let lines: Vec<(Instant, String)> = rx.try_iter().collect();
     let armed_at = lines
         .iter()
@@ -1463,6 +1476,7 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
         sigterm_at,
         exited_at,
         stderr,
+        stdout,
     })
 }
 
@@ -1478,9 +1492,12 @@ fn t3w_assert_guard_exit(run: &T3wRun, clock_start: std::time::Instant, case: &s
         "{case}: a wedged stop exits with the decided code 75. stderr:\n{}",
         run.stderr
     );
+    // The clean-exit line is printed to STDOUT (`main`'s `println!`), so that is
+    // where its absence is asserted. Model: `integration_failure_modes.rs`.
     assert!(
-        !run.stderr.contains("clean exit"),
-        "{case}: a guard exit must never claim a clean exit"
+        !run.stdout.contains("clean exit"),
+        "{case}: a guard exit must never claim a clean exit. stdout:\n{}",
+        run.stdout
     );
     let bound = Duration::from_secs(T3W_DEADLINE_SECS) + T3W_CI_ALLOWANCE;
     let took = run.exited_at.saturating_duration_since(clock_start);

@@ -210,8 +210,14 @@ pub(crate) fn enclosing_fn(text: &str, offset: usize) -> String {
 }
 
 /// The identifier immediately before byte `offset` (which points at a `.`).
+///
+/// Whitespace and newlines between the receiver and the `.` are skipped, so
+/// rustfmt's wrapped method-chain form (`self.flag` on one line, `.store(true`
+/// indented on the next) resolves to the same receiver as the one-line form.
+/// Without that, a wrapped writer read as the empty receiver and was silently
+/// dropped from every writer-set scan (round-1 code gate).
 pub(crate) fn receiver_before(text: &str, offset: usize) -> String {
-    let head = &text[..offset];
+    let head = text[..offset].trim_end();
     let start = head
         .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
         .map(|i| i + 1)
@@ -263,4 +269,28 @@ pub(crate) fn doc_block_of(text: &str, name: &str) -> String {
         .collect();
     docs.reverse();
     docs.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receiver_before;
+
+    /// The one-line and the rustfmt-wrapped method-chain forms name the same
+    /// receiver. The store token is assembled with `concat!` so this module's own
+    /// source never reads as a stop-flag writer to T14's scan.
+    #[test]
+    fn receiver_before_reads_through_the_wrapped_chain_form() {
+        const STORE: &str = concat!(".st", "ore(true, Ordering::SeqCst);");
+        for (text, receiver) in [
+            (format!("self.shutdown_flag{STORE}"), "shutdown_flag"),
+            (
+                format!("self.daemon_shutdown_request\n            {STORE}"),
+                "daemon_shutdown_request",
+            ),
+            (format!("flag\r\n\t{STORE}"), "flag"),
+        ] {
+            let at = text.find(STORE).expect("store");
+            assert_eq!(receiver_before(&text, at), receiver, "{text:?}");
+        }
+    }
 }

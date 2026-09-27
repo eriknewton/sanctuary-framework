@@ -35,7 +35,11 @@ from pathlib import Path
 # test-isolation --test-nft-binary seam, and tests. The rule grammar, the owned-table parser,
 # the receipt mint and the net script are byte-unchanged. The guard constants it mirrors are
 # unchanged.
-NFTABLES_SOURCE_SHA256 = "f4fbdbd397e3bd4138deefefc46a2dea5d9241ee93773ba2c0355130d14f77c0"
+# Refreshed for the C2a2 code-gate fix round 1 (2026-09-27): run_nft_stdin's stdin feed moved
+# into feed_stdin_and_wait_with, whose write-failure path kills and joins or parks the child
+# through its slot instead of returning past it; T12 and the child tests were updated. The
+# rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
+NFTABLES_SOURCE_SHA256 = "feb29aa5141ea030e366a100b09b09ee8c8f0f55ca6cc0ff4291755690cd6616"
 
 
 def fail(message):

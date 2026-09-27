@@ -1474,7 +1474,10 @@ fn refuse_after_owned_table(
     if ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Routed through the one arming writer, like every stop request: a seam
+        // that stored the flag directly would leave the stop guard IDLE for the
+        // stop it simulates (round-1 code gate, T14).
+        crate::exit_guard::request_daemon_stop(shutdown_requested);
     }
     // register LINUX-BOOT-STOP-SLICEA-REFUSAL-01: loaded HERE, live, not
     // captured by the caller — this is after scope resolution and immediately

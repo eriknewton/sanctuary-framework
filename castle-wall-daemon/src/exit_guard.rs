@@ -154,9 +154,22 @@ impl ExitGuard {
         true
     }
 
-    /// Store the code every non-returning terminator will use.
-    pub fn decide(&self, code: u8) {
+    /// Store the code every non-returning terminator will use. Private: the
+    /// only public way in is [`decide_stop_incomplete`](Self::decide_stop_incomplete),
+    /// which cannot express 0.
+    fn decide(&self, code: u8) {
         self.decided_code.store(code, Ordering::Release);
+    }
+
+    /// Store the code for `outcome` as a stop that has NOT completed.
+    ///
+    /// INVARIANT: a guard or verdict exit happens only while teardown is still
+    /// running, so its code is `supervision_exit_status(outcome, false)`, which is
+    /// nonzero for every outcome (T3). `stop_succeeded` is hard-coded here rather
+    /// than taken as an argument, so no call site can store the 0 of a clean stop
+    /// and have the guard exit 0 with enforcement mid-release.
+    pub fn decide_stop_incomplete(&self, outcome: &crate::daemon::SupervisionOutcome) {
+        self.decide(crate::daemon::supervision_exit_status(outcome, false));
     }
 
     pub fn decided_code(&self) -> u8 {
@@ -251,11 +264,11 @@ pub fn arm() {
     PROCESS_EXIT_GUARD.arm_with(&SystemAlarm);
 }
 
-/// Store `code` as the decided exit code, then arm. Called at every audited
+/// Store `outcome`'s stop-incomplete code, then arm. Called at every audited
 /// supervision decision BEFORE its WAL write, so a hang in that write is inside
 /// the deadline.
-pub fn decide_and_arm(code: u8) {
-    PROCESS_EXIT_GUARD.decide(code);
+pub fn decide_and_arm(outcome: &crate::daemon::SupervisionOutcome) {
+    PROCESS_EXIT_GUARD.decide_stop_incomplete(outcome);
     arm();
 }
 
@@ -327,6 +340,12 @@ pub fn terminate_with_decided_code() -> ! {
         // (no atexit in the crate, stderr is unbuffered).
         unsafe { libc::_exit(libc::c_int::from(code)) }
     }
+    // A losing verdict fail-stop parks forever. That is safe only because `main`
+    // cannot win EXIT_RETURNING while the NFQUEUE evaluator that called this is
+    // still alive: runtime release joins every component worker unconditionally.
+    // If release ever detached a worker, this park would let the process exit 0
+    // with a wedged evaluator. Must match `ThreadBackedComponent::release` in
+    // `src/thread_component.rs`.
     park_forever()
 }
 
@@ -466,8 +485,13 @@ mod tests {
         ];
         for (outcome, want) in cases {
             let guard = ExitGuard::new();
-            guard.decide(supervision_exit_status(&outcome, false));
+            guard.decide_stop_incomplete(&outcome);
             assert_eq!(guard.decided_code(), want, "{outcome:?}");
+            assert_eq!(
+                supervision_exit_status(&outcome, false),
+                want,
+                "{outcome:?}"
+            );
             assert_eq!(guard.alarm_action(), AlarmAction::Terminate(want));
         }
     }
@@ -613,6 +637,29 @@ mod structure {
         assert!(hits.is_empty(), "the removed wait API reappeared: {hits:?}");
     }
 
+    /// The real alarm is enabled only by the daemon binary's `main` (premise
+    /// P12): an in-process integration test that enabled it would get a real
+    /// `SIGALRM` whose handler `_exit`s the whole test runner mid-suite. Call
+    /// syntax only, over `src/` and `tests/`; the definition lives here.
+    #[test]
+    fn the_process_guard_is_enabled_only_from_the_daemon_main() {
+        // Built with concat! so this test's own source is not a hit.
+        let needle = concat!("enable_process", "_guard(");
+        let mut sites = BTreeSet::new();
+        for dir in ["src", "tests"] {
+            for (path, text) in crate::source_scan::rust_files_under(dir) {
+                if !offsets_of(&text, needle).is_empty() {
+                    sites.insert(path);
+                }
+            }
+        }
+        let expected: BTreeSet<String> = ["src/exit_guard.rs", "src/main.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(sites, expected);
+    }
+
     /// T15: nothing in the crate can block `SIGALRM` or take `ITIMER_REAL` away
     /// from the guard (premise P7). A mask that blocked it on every thread would
     /// leave the guard silently inert.
@@ -683,10 +730,6 @@ mod structure {
             // The IPC accept-loop flag, a different flag with the same name.
             ("src/ipc/server.rs", "stop_and_join"),
             ("src/ipc/server.rs", "drop"),
-            // #[cfg(all(target_os = "linux", feature = "test-isolation"))] slice-A
-            // seam simulating a stop landing after scope resolution; same class as
-            // the boot seam above.
-            ("src/runtime_providers.rs", "refuse_after_owned_table"),
         ]
         .into_iter()
         .map(|(p, f)| (p.to_string(), f.to_string()))
@@ -710,6 +753,11 @@ mod structure {
                 "src/ipc/server.rs",
                 "withdraw_after_activation_audit_failure",
             ),
+            // #[cfg(all(target_os = "linux", feature = "test-isolation"))] slice-A
+            // seam simulating a stop landing after scope resolution: it arms like
+            // a real stop request, so it is a caller of the helper, not an
+            // exemption from it.
+            ("src/runtime_providers.rs", "refuse_after_owned_table"),
         ]
         .into_iter()
         .map(|(p, f)| (p.to_string(), f.to_string()))
@@ -805,7 +853,7 @@ mod structure {
         let wrapper = fn_body(&daemon, "supervise_until_shutdown");
         assert!(
             wrapper.contains(
-                "crate::exit_guard::PROCESS_EXIT_GUARD.decide(supervision_exit_status(&outcome, false));"
+                "crate::exit_guard::PROCESS_EXIT_GUARD.decide_stop_incomplete(&outcome);"
             ),
             "the wrapper must store every returned outcome's code"
         );

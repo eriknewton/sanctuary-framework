@@ -658,7 +658,7 @@ impl DaemonHandle {
         health_interval: Duration,
     ) -> SupervisionOutcome {
         let outcome = self.supervise_until_shutdown_body(tick, health_interval);
-        crate::exit_guard::PROCESS_EXIT_GUARD.decide(supervision_exit_status(&outcome, false));
+        crate::exit_guard::PROCESS_EXIT_GUARD.decide_stop_incomplete(&outcome);
         outcome
     }
 
@@ -667,7 +667,7 @@ impl DaemonHandle {
     /// `record_runtime_loss(reason, false)`), so a hang in that write is already
     /// inside the guard's deadline and a guard exit carries the decided code.
     fn decide_and_arm(&self, outcome: &SupervisionOutcome) {
-        crate::exit_guard::decide_and_arm(supervision_exit_status(outcome, false));
+        crate::exit_guard::decide_and_arm(outcome);
     }
 
     fn supervise_until_shutdown_body(

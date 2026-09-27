@@ -144,6 +144,17 @@ struct ProbeState {
     /// Stays set on every later poll until a COMPLETED proof of either polarity
     /// arrives, so a wedged check never decays into a claim about the resource.
     latched_indeterminate: bool,
+    /// Generation counter: bumped every time a slot-owning check STARTS. A check's
+    /// drop guard carries the value it started under, so a publish can be dated
+    /// relative to a forced-live read (LINUX-STOP-FRESH-PROBE-LATCH-01).
+    check_starts: u64,
+    /// `check_starts` at the moment the most recent forced-live read began. A
+    /// positive publish from a check that started before it (`seq < floor`) is
+    /// stale: it may not write `last` or clear a latch.
+    forced_read_floor: u64,
+    /// Forced-live reads currently running. While nonzero, no positive publish
+    /// from a slot-owning check may write `last` or clear a latch.
+    forced_reads_in_progress: u32,
 }
 
 #[derive(Debug)]
@@ -177,6 +188,8 @@ struct SlotGuard {
     max_consecutive_unavailable: u32,
     /// The check's answer, or `None` if it panicked before producing one.
     result: Option<Result<bool, ()>>,
+    /// `ProbeState::check_starts` when this check started.
+    seq: u64,
 }
 
 impl Drop for SlotGuard {
@@ -185,7 +198,17 @@ impl Drop for SlotGuard {
             let mut state = self.shared.lock();
             state.in_flight_since = None;
             state.completions = state.completions.saturating_add(1);
+            // INVARIANT (stop-time forced read, LINUX-STOP-FRESH-PROBE-LATCH-01): a
+            // POSITIVE publish is stale if it comes from a check that started before
+            // the latest forced-live read, or lands while one is running. A stale
+            // positive publish records nothing: it may not refresh `last` (which the
+            // cache would then serve) or clear `latched_lost` (which would undo the
+            // forced read's proven loss). A stale NEGATIVE proof still latches, since
+            // loss evidence is never discarded (fail closed). Must match
+            // `poll_bypassing_cache`.
+            let stale = self.seq < state.forced_read_floor || state.forced_reads_in_progress > 0;
             match self.result {
+                Some(Ok(true)) if stale => {}
                 Some(Ok(ready)) => {
                     state.last = Some((Instant::now(), ready));
                     state.consecutive_unavailable = 0;
@@ -254,6 +277,9 @@ impl BoundedHealthProbe {
                     consecutive_unavailable: 0,
                     latched_lost: false,
                     latched_indeterminate: false,
+                    check_starts: 0,
+                    forced_read_floor: 0,
+                    forced_reads_in_progress: 0,
                 }),
                 terminated: Condvar::new(),
             }),
@@ -303,24 +329,110 @@ impl BoundedHealthProbe {
         self.poll_result(check)
     }
 
-    /// Run a live check, bypassing ONLY the min-interval cache (LINUX-STOP-FRESH-PROBE-LATCH-01).
+    /// Forced-live read for the stop-time final health pass
+    /// (LINUX-STOP-FRESH-PROBE-LATCH-01): always runs ITS OWN check and answers
+    /// only from that check or from a terminal latch.
     ///
-    /// The stop-time final health pass needs a reading no older than the stop
-    /// request, so it must not be served a cached `Ready` younger than
-    /// [`ProbeBudget::min_interval`]; but it must also never re-litigate a proven
-    /// loss or an exhausted budget, which is what clearing the latches (as
+    /// The stop pass needs a reading no older than the stop request, so it must
+    /// not be served a cached `Ready` younger than [`ProbeBudget::min_interval`];
+    /// and it must never re-litigate a proven loss or an exhausted budget, which
+    /// is what clearing the latches (as
     /// [`reprobe_after_latch`](Self::reprobe_after_latch) does for the recovery
-    /// controller) would allow.
+    /// controller) would allow. Clearing `last` and then asking the cached path
+    /// was not enough: an abandoned, deadline-overrun worker could publish a
+    /// fresh `Ready` (and clear `latched_lost`) between the clear and the read,
+    /// and the cache would answer in place of the check.
     ///
-    /// INVARIANT: bypasses the rate-limit cache and nothing else; the terminal
-    /// latches are read before `last` in `poll_result`, so a stop-time read can
-    /// never restore readiness. Must match the latch order in `poll_result`.
+    /// INVARIANT: the freshness shortcut is skipped entirely, never emptied and
+    /// re-consulted, so no other worker's publish can answer for this read; the
+    /// two latches are still read first, so this read can never restore
+    /// readiness; and while it runs (and afterwards, for any check that started
+    /// before it) a slot-owning worker's positive publish is stale and records
+    /// nothing. Must match the stale rule in `SlotGuard::drop`.
+    ///
+    /// Single-flight: this read does not take the in-flight slot, so an
+    /// abandoned worker may still hold it; the nft child this check spawns is
+    /// bounded by the nft child slots, not by this probe's slot. The read is
+    /// bounded by [`ProbeBudget::timeout`] like every poll.
     pub fn poll_bypassing_cache<F>(&self, check: F) -> ProbeOutcome
     where
         F: FnOnce() -> Result<bool, ()> + Send + 'static,
     {
-        self.shared.lock().last = None;
-        self.poll_result(check)
+        {
+            let mut state = self.shared.lock();
+            if state.latched_lost {
+                return ProbeOutcome::Lost;
+            }
+            if state.latched_indeterminate {
+                return ProbeOutcome::Indeterminate;
+            }
+            state.forced_read_floor = state.check_starts;
+            state.forced_reads_in_progress = state.forced_reads_in_progress.saturating_add(1);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Result<bool, ()>>>(1);
+        let worker_shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("castle-wall-health-forced".to_string())
+            .spawn(move || {
+                // A panicking check sends `None` through the unwind below.
+                struct Report {
+                    tx: std::sync::mpsc::SyncSender<Option<Result<bool, ()>>>,
+                    shared: Arc<Shared>,
+                    result: Option<Result<bool, ()>>,
+                }
+                impl Drop for Report {
+                    fn drop(&mut self) {
+                        if self.result == Some(Ok(false)) {
+                            // A completed negative proof latches even if the
+                            // waiter already gave up: loss evidence is kept.
+                            let mut state = self.shared.lock();
+                            state.last = Some((Instant::now(), false));
+                            state.latched_lost = true;
+                        }
+                        let _ = self.tx.try_send(self.result);
+                    }
+                }
+                let mut report = Report {
+                    tx,
+                    shared: worker_shared,
+                    result: None,
+                };
+                report.result = Some(check());
+            });
+        let received = match spawned {
+            Ok(_) => rx.recv_timeout(self.budget.timeout).ok().flatten(),
+            Err(_) => None,
+        };
+        let mut state = self.shared.lock();
+        state.forced_reads_in_progress = state.forced_reads_in_progress.saturating_sub(1);
+        // Latches first, exactly as in `poll_result`: a loss proven by this read's
+        // own worker, or by any other completed check meanwhile, wins.
+        if state.latched_lost {
+            return ProbeOutcome::Lost;
+        }
+        match received {
+            Some(Ok(true)) if !state.latched_indeterminate => {
+                // This read's own completed positive proof. It refreshes the cache
+                // but clears no latch: a stop-time read never restores readiness.
+                state.last = Some((Instant::now(), true));
+                state.consecutive_unavailable = 0;
+                ProbeOutcome::Ready
+            }
+            Some(Ok(true)) => ProbeOutcome::Indeterminate,
+            // Unreachable in practice (the worker latched it above), stated so a
+            // change to that latch cannot turn a proven loss into readiness.
+            Some(Ok(false)) => ProbeOutcome::Lost,
+            Some(Err(())) | None => {
+                // No conclusion: a timeout, a failed spawn, a panic, or an nft child
+                // that could not be proven finished. Indeterminate, never a loss.
+                note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
+                if state.latched_indeterminate {
+                    ProbeOutcome::Indeterminate
+                } else {
+                    ProbeOutcome::Unavailable
+                }
+            }
+        }
     }
 
     /// Three-valued variant for probes whose command may fail without proving
@@ -357,6 +469,8 @@ impl BoundedHealthProbe {
         let started_at = Instant::now();
         state.in_flight_since = Some(started_at);
         let generation = state.completions;
+        let seq = state.check_starts;
+        state.check_starts = state.check_starts.wrapping_add(1);
 
         // Spawned while the lock is HELD. That is what makes the wait below
         // race-free: the worker's drop guard cannot take the lock, clear the
@@ -371,6 +485,7 @@ impl BoundedHealthProbe {
                     shared,
                     max_consecutive_unavailable,
                     result: None,
+                    seq,
                 };
                 // On a panic inside `check`, `guard` is dropped during unwind
                 // with `result` still `None`, which releases the slot and counts
@@ -610,6 +725,146 @@ mod tests {
             "the loss latch survives the stop-time read"
         );
         assert_eq!(state.latched_indeterminate, indeterminate_before);
+    }
+
+    /// T6 case D (LINUX-STOP-FRESH-PROBE-LATCH-01, round-1 code gate): an
+    /// abandoned, deadline-overrun worker that publishes `Ready` while the
+    /// stop-time read is running can neither answer for that read nor clear the
+    /// loss it proves. Multi-threaded: the abandoned worker, the forced read's own
+    /// worker and the caller are three threads, and the publish is forced to land
+    /// inside the read.
+    #[test]
+    fn t6_d_a_late_worker_publish_cannot_answer_or_unlatch_the_stop_time_read() {
+        let probe = BoundedHealthProbe::new(ProbeBudget {
+            timeout: Duration::from_millis(200),
+            // Far longer than the test: any publish is inside the cache window.
+            min_interval: Duration::from_secs(60),
+            max_consecutive_unavailable: 3,
+        });
+        // 1. A periodic poll whose check outlives its deadline: the caller gives
+        //    up, the worker keeps the slot and will publish Ready when released.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            probe.poll_result(move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Ok(true)
+            }),
+            ProbeOutcome::Unavailable
+        );
+        // 2. The stop-time read. Its own check releases the abandoned worker,
+        //    waits until that worker's Ready publish has landed, then proves loss.
+        let shared = Arc::clone(&probe.shared);
+        let completions_before = shared.lock().completions;
+        let calls = Arc::new(AtomicU32::new(0));
+        let check_calls = Arc::clone(&calls);
+        let outcome = probe.poll_bypassing_cache(move || {
+            check_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = release_tx.send(());
+            let give_up = Instant::now() + Duration::from_secs(5);
+            while shared.lock().completions == completions_before && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(false)
+        });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the read must run its own check"
+        );
+        assert!(
+            probe.shared.lock().completions > completions_before,
+            "the abandoned worker's publish must have landed during the read"
+        );
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Lost,
+            "the late Ready answered for the read"
+        );
+        assert!(
+            probe.shared.lock().latched_lost,
+            "the late Ready cleared the loss"
+        );
+        // The ordinary cached path now sees the loss too.
+        assert_eq!(probe.poll_result(|| Ok(true)), ProbeOutcome::Lost);
+    }
+
+    /// Leave a periodic check abandoned past its deadline, holding the slot; it
+    /// publishes `Ready` once the returned sender fires (or after 10 s).
+    fn abandon_a_ready_worker(probe: &BoundedHealthProbe) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            probe.poll_result(move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Ok(true)
+            }),
+            ProbeOutcome::Unavailable
+        );
+        release_tx
+    }
+
+    fn wait_for_completion_past(probe: &BoundedHealthProbe, before: u64) {
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while probe.shared.lock().completions == before {
+            assert!(
+                Instant::now() < give_up,
+                "the abandoned worker never published"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn long_cache_budget() -> ProbeBudget {
+        ProbeBudget {
+            timeout: Duration::from_millis(200),
+            min_interval: Duration::from_secs(60),
+            max_consecutive_unavailable: 3,
+        }
+    }
+
+    /// T6 case D2: a worker that started BEFORE the stop-time read and publishes
+    /// `Ready` AFTER it proved loss cannot clear that loss (the generation floor).
+    #[test]
+    fn t6_d2_a_worker_older_than_the_stop_time_read_cannot_clear_its_loss() {
+        let probe = BoundedHealthProbe::new(long_cache_budget());
+        let release = abandon_a_ready_worker(&probe);
+        assert_eq!(probe.poll_bypassing_cache(|| Ok(false)), ProbeOutcome::Lost);
+        let before = probe.shared.lock().completions;
+        let _ = release.send(());
+        wait_for_completion_past(&probe, before);
+        assert!(
+            probe.shared.lock().latched_lost,
+            "a stale Ready cleared the loss"
+        );
+        assert_eq!(probe.poll_result(|| Ok(true)), ProbeOutcome::Lost);
+    }
+
+    /// T6 case D3: a late `Ready` that lands while the stop-time read's own check
+    /// is still running records nothing, so an inconclusive read stays
+    /// inconclusive and the cache is not seeded with a reading nobody took for it.
+    #[test]
+    fn t6_d3_a_late_ready_during_an_inconclusive_stop_time_read_records_nothing() {
+        let probe = BoundedHealthProbe::new(long_cache_budget());
+        let release = abandon_a_ready_worker(&probe);
+        let shared = Arc::clone(&probe.shared);
+        let before = shared.lock().completions;
+        let outcome = probe.poll_bypassing_cache(move || {
+            let _ = release.send(());
+            let give_up = Instant::now() + Duration::from_secs(5);
+            while shared.lock().completions == before && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(())
+        });
+        assert_eq!(outcome, ProbeOutcome::Unavailable);
+        assert!(
+            probe.shared.lock().completions > before,
+            "the abandoned worker's publish must have landed during the read"
+        );
+        assert_eq!(
+            probe.shared.lock().last,
+            None,
+            "a stale Ready seeded the cache"
+        );
     }
 
     /// T6 case C: the same for an exhausted indeterminate budget.

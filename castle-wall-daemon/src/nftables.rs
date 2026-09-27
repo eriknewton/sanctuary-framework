@@ -1653,6 +1653,43 @@ mod linux {
         }
     }
 
+    /// Write `script` to an admitted child's stdin, close it, then run the
+    /// bounded wait. `run_nft_stdin`'s body after the spawn; split out so the
+    /// write-failure path is testable with an injected child and budget.
+    pub(crate) fn feed_stdin_and_wait_with(
+        mut child: Child,
+        ticket: SlotTicket,
+        script: &str,
+        budget: NftWaitBudget,
+    ) -> Result<Output, NftablesError> {
+        use std::io::Write;
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(script.as_bytes()),
+            None => Ok(()),
+        };
+        // Closing stdin is required before waiting; otherwise nft correctly
+        // waits forever for more script bytes.
+        drop(child.stdin.take());
+        if let Err(write_err) = written {
+            // INVARIANT (per-origin slot rule): a failed write never returns past
+            // the child. Returning here with `?` would drop the ticket (freeing the
+            // slot) and the `Child` (which neither signals nor reaps), leaving a
+            // live, uncounted nft process. The child instead goes through the same
+            // kill-and-park path as a timed-out call: a zero command budget means
+            // "signal through the pidfd now", and the slot is freed only by a join
+            // or held by the parked child. The write error is what the caller sees.
+            let kill_now = NftWaitBudget {
+                command: Duration::ZERO,
+                ..budget
+            };
+            let _ = wait_nft_bounded_with(child, ticket, kill_now);
+            return Err(NftablesError::InvocationFailed(format!(
+                "writing the nft script to stdin failed: {write_err}"
+            )));
+        }
+        wait_nft_bounded_with(child, ticket, budget)
+    }
+
     /// Locate the `nft` binary by DIRECT absolute-path existence/executable
     /// check. NO PATH search, NO `which`: a PATH fallback is the exact hazard
     /// removed in blocker 9, so a missing absolute binary is a hard error, never
@@ -1737,7 +1774,7 @@ mod linux {
         refuse_production_table_under_test()?;
         let nft = nft_path()?;
         let ticket = admit_slot(&NFT_CHILD_SLOTS, origin)?;
-        let mut child = Command::new(nft)
+        let child = Command::new(nft)
             .env("LC_ALL", "C")
             .arg("-f")
             .arg("-")
@@ -1746,16 +1783,7 @@ mod linux {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(script.as_bytes())
-                .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        }
-        // Closing stdin is required before waiting; otherwise nft correctly
-        // waits forever for more script bytes.
-        drop(child.stdin.take());
-        let output = wait_nft_bounded(child, ticket)?;
+        let output = feed_stdin_and_wait_with(child, ticket, script, PRODUCTION_WAIT_BUDGET)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftablesError::InvocationFailed(format!(
@@ -6723,14 +6751,28 @@ mod child_slot_tests {
             spawns,
             vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
         );
-        let waits: Vec<String> = offsets_of(&code, "wait_nft_bounded(")
-            .into_iter()
-            .filter(|at| !code[..*at].ends_with("fn "))
-            .map(|at| enclosing_fn(&code, at))
-            .collect();
+        let callers_of = |callee: &str| -> Vec<String> {
+            offsets_of(&code, callee)
+                .into_iter()
+                .filter(|at| !code[..*at].ends_with("fn "))
+                .map(|at| enclosing_fn(&code, at))
+                .collect()
+        };
+        // The bounded wait is reached only from the two runners: `run_nft`
+        // through `wait_nft_bounded`, `run_nft_stdin` through the stdin feeder,
+        // whose write-failure path also ends in the bounded wait (kill-and-park).
+        assert_eq!(callers_of("wait_nft_bounded("), vec!["run_nft".to_string()]);
         assert_eq!(
-            waits,
-            vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
+            callers_of("feed_stdin_and_wait_with("),
+            vec!["run_nft_stdin".to_string()]
+        );
+        assert_eq!(
+            callers_of("wait_nft_bounded_with("),
+            vec![
+                "wait_nft_bounded".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+            ]
         );
         for runner in ["run_nft", "run_nft_stdin"] {
             assert!(fn_body(&code, runner).contains("admit_slot(&NFT_CHILD_SLOTS, origin)?"));
@@ -6768,7 +6810,8 @@ mod child_slot_tests {
     #[cfg(target_os = "linux")]
     mod linux_children {
         use super::super::linux::{
-            admit_slot, pidfd_kill, pidfd_open, wait_nft_bounded_with, NftSlotTable, NftWaitBudget,
+            admit_slot, feed_stdin_and_wait_with, pidfd_kill, pidfd_open, wait_nft_bounded_with,
+            NftSlotTable, NftWaitBudget,
         };
         use super::super::{ChildSlotTable, ChildStuckStage, NftOrigin, NftablesError};
         use std::process::{Command, Stdio};
@@ -6792,16 +6835,39 @@ mod child_slot_tests {
                 .expect("spawn test child")
         }
 
+        /// These tests spawn real children and T11 (d) counts the process's open
+        /// pidfds, so they run one at a time: a concurrent sibling's pidfd would
+        /// otherwise read as a leak (flake risk named by the round-1 code gate).
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn serial() -> std::sync::MutexGuard<'static, ()> {
+            SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// A command budget far below `sleep 5`, so T11 (a) always reaches the
+        /// kill. 20 ms is short on purpose; it is only ever used against a child
+        /// that is meant to overrun it.
+        const WEDGE_COMMAND_BUDGET: Duration = Duration::from_millis(20);
+
         const SHORT: NftWaitBudget = NftWaitBudget {
-            command: Duration::from_millis(20),
+            command: WEDGE_COMMAND_BUDGET,
             kill_grace: Duration::from_millis(200),
             reap_grace: Duration::from_millis(500),
+        };
+
+        /// For children that are meant to COMPLETE (`true`): a command budget with
+        /// slack for a loaded CI runner, so a slow fork is never read as a wedge.
+        /// 5 s = 250 x the wedge budget; `true` finishes in well under 100 ms.
+        const COMPLETES: NftWaitBudget = NftWaitBudget {
+            command: Duration::from_secs(5),
+            ..SHORT
         };
 
         /// T11 (a): a child past its budget is killed through its pidfd and the
         /// call returns within the budget, freeing its slot.
         #[test]
         fn t11_a_a_wedged_child_is_killed_through_its_pidfd_within_the_budget() {
+            let _serial = serial();
             let table = local_table();
             let ticket = admit_slot(table, NftOrigin::General).expect("admit");
             let child = piped(Command::new("sleep").arg("5"));
@@ -6823,6 +6889,7 @@ mod child_slot_tests {
         /// it stays parked in its slot until the descendant dies and a sweep joins it.
         #[test]
         fn t11_b_an_unreapable_child_stays_parked_until_a_sweep_joins_it() {
+            let _serial = serial();
             let table = local_table();
             let dir = tempfile::TempDir::new().expect("tempdir");
             let pid_file = dir.path().join("descendant.pid");
@@ -6863,6 +6930,7 @@ mod child_slot_tests {
         /// ESRCH; it can never reach a process that reused the pid.
         #[test]
         fn t11_c_a_pidfd_after_reap_answers_esrch() {
+            let _serial = serial();
             let mut child = Command::new("true").spawn().expect("spawn");
             let fd = pidfd_open(child.id()).expect("pidfd_open on a 5.3+ kernel");
             child.wait().expect("reap");
@@ -6879,18 +6947,67 @@ mod child_slot_tests {
         }
 
         /// T11 (d): the pidfd is closed on every non-parked path, so 100 completed
-        /// calls leave the process's open pidfd count unchanged.
+        /// calls leave the process's open pidfd count unchanged. Uses the
+        /// `COMPLETES` budget: with the 20 ms wedge budget a slow fork of `true`
+        /// on a loaded runner was killed and read as a failure (flake risk).
         #[test]
         fn t11_d_completed_calls_leak_no_pidfd() {
+            let _serial = serial();
             let table = local_table();
             let before = open_pidfds();
             for _ in 0..100 {
                 let ticket = admit_slot(table, NftOrigin::General).expect("admit");
                 let child = piped(&mut Command::new("true"));
-                wait_nft_bounded_with(child, ticket, SHORT).expect("true completes");
+                wait_nft_bounded_with(child, ticket, COMPLETES).expect("true completes");
             }
             assert_eq!(open_pidfds(), before, "a completed call leaked its pidfd");
             assert_eq!(held(table), 0);
+        }
+
+        /// R1 (LINUX-NFT-PID-REUSE-KILL-01): a stdin write that fails (the child
+        /// closed its stdin and kept running) never returns past a live child. The
+        /// child is killed through its pidfd and joined, or parked with its slot
+        /// held; a free slot with a live child is the escape this pins.
+        #[test]
+        fn r1_a_failed_stdin_write_kills_and_joins_or_parks_the_child() {
+            let _serial = serial();
+            let table = local_table();
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let pid_file = dir.path().join("child.pid");
+            // `exec sleep` keeps the shell's pid, so `$$` names the live child.
+            let program = format!("echo $$ > {}; exec 0<&-; exec sleep 30", pid_file.display());
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = Command::new("sh")
+                .args(["-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn test child");
+            // 1 MiB: larger than any pipe buffer, so the write is still blocked
+            // when the child closes its read end and fails with EPIPE.
+            let script = "x".repeat(1 << 20);
+            let result = feed_stdin_and_wait_with(child, ticket, &script, COMPLETES);
+            assert!(
+                matches!(&result, Err(NftablesError::InvocationFailed(m)) if m.contains("stdin")),
+                "{result:?}"
+            );
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("child pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            // SAFETY: signal 0 only probes; the pid is this test's own child.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            let slots = held(table);
+            if alive && slots == 0 {
+                // SAFETY: as above; reap the escaped child so the run leaves nothing.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                slots == 1 || !alive,
+                "a failed stdin write freed its slot ({slots} held) with the child still alive"
+            );
         }
     }
 }
