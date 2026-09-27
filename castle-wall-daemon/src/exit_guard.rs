@@ -707,8 +707,18 @@ mod structure {
         for (path, text) in daemon_sources() {
             let code = without_comment_lines(&text);
             let tests = cfg_test_module_ranges(&code);
-            for at in offsets_of(&code, ".store(true") {
+            // concat! so this test's own needle is not itself a (receiverless) hit.
+            for at in offsets_of(&code, concat!(".st", "ore(true")) {
                 let receiver = receiver_before(&code, at);
+                // An unclassifiable receiver is a finding, not a pass: skipping it
+                // would let a stop-flag writer in an unmodelled shape go unseen.
+                assert!(
+                    !receiver.is_empty(),
+                    "{path}:{}: a stop-flag-shaped store whose receiver the scanner cannot \
+                     name; rewrite it as `<ident>` then the store, or teach `receiver_before` \
+                     the shape",
+                    line_of(&code, at)
+                );
                 if !STOP_FLAG_RECEIVERS.contains(&receiver.as_str()) {
                     continue;
                 }

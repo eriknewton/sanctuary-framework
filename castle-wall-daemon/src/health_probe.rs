@@ -372,6 +372,11 @@ impl BoundedHealthProbe {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Result<bool, ()>>>(1);
         let worker_shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
+            // Detached on purpose: the JoinHandle is dropped, so this worker can
+            // outlive the read and runtime release. It is one of the two bounded
+            // health-read thread classes named as the exception to the
+            // component-worker join contract. Must match the release comment in
+            // `src/enforcement.rs` (the test component's `release`).
             .name("castle-wall-health-forced".to_string())
             .spawn(move || {
                 // A panicking check sends `None` through the unwind below.

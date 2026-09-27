@@ -1628,7 +1628,14 @@ mod tests {
                 return; // idempotent
             }
             // Join the owned thread BEFORE marking released, mirroring the real
-            // contract: no detached resource-owning thread outlives release.
+            // contract: no detached COMPONENT worker outlives release. The contract
+            // covers component workers only. Two bounded health-read thread classes
+            // are the named exception: the probe's `castle-wall-health-probe`
+            // worker abandoned on a deadline overrun, and the stop-time
+            // `castle-wall-health-forced` worker (at most one per forced read); each
+            // holds at most one nft child, bounded by the nft child slots, and is
+            // reaped by the process exit. Must match the spawn sites in
+            // `src/health_probe.rs`.
             if let Some(stop) = &self.stop {
                 stop.store(true, Ordering::SeqCst);
             }

@@ -216,8 +216,14 @@ pub(crate) fn enclosing_fn(text: &str, offset: usize) -> String {
 /// indented on the next) resolves to the same receiver as the one-line form.
 /// Without that, a wrapped writer read as the empty receiver and was silently
 /// dropped from every writer-set scan (round-1 code gate).
+///
+/// A zero-argument accessor call (`self.engine.mutation_cancel_flag()`) resolves
+/// to the accessor's name. Any other shape (a call with arguments, an index, a
+/// parenthesised expression) returns the empty string, which callers must treat
+/// as unclassifiable, never as "not a stop flag".
 pub(crate) fn receiver_before(text: &str, offset: usize) -> String {
     let head = text[..offset].trim_end();
+    let head = head.strip_suffix("()").unwrap_or(head);
     let start = head
         .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
         .map(|i| i + 1)
@@ -288,6 +294,11 @@ mod tests {
                 "daemon_shutdown_request",
             ),
             (format!("flag\r\n\t{STORE}"), "flag"),
+            (
+                format!("self.decision_engine\n    .mutation_cancel_flag()\n    {STORE}"),
+                "mutation_cancel_flag",
+            ),
+            (format!("flags[0]{STORE}"), ""),
         ] {
             let at = text.find(STORE).expect("store");
             assert_eq!(receiver_before(&text, at), receiver, "{text:?}");

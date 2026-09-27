@@ -362,14 +362,19 @@ impl<P: ParkedChild> ChildSlotTable<P> {
     }
 
     /// `S_PARKED`: the call returns, the slot stays held by the parked child.
-    pub(crate) fn park(&mut self, id: u64, child: P) {
-        let origin = self
-            .in_flight
-            .iter()
-            .position(|(held, _)| *held == id)
-            .map(|at| self.in_flight.swap_remove(at).1)
-            .unwrap_or(NftOrigin::General);
+    ///
+    /// INVARIANT (per-origin slot rule): parking MOVES an in-flight slot to the
+    /// parked list, it never adds one. An `id` that is not in flight is refused
+    /// and the child handed back, so `held()` can never grow past the cap and the
+    /// origin is never guessed.
+    pub(crate) fn park(&mut self, id: u64, child: P) -> Result<(), P> {
+        let Some(at) = self.in_flight.iter().position(|(held, _)| *held == id) else {
+            debug_assert!(false, "park of nft slot {id}, which is not in flight");
+            return Err(child);
+        };
+        let origin = self.in_flight.swap_remove(at).1;
         self.parked.push((origin, child));
+        Ok(())
     }
 }
 
@@ -1428,7 +1433,14 @@ mod linux {
     impl SlotTicket {
         fn park(mut self, child: ParkedNftChild) {
             self.armed = false;
-            lock_slots(self.table).park(self.id, child);
+            if let Err(unheld) = lock_slots(self.table).park(self.id, child) {
+                // Unreachable by construction: an armed ticket's id was pushed by
+                // `admit` and only this ticket removes it (release or park, once).
+                // The table refused rather than exceed its cap; the child is
+                // dropped here (a waiter still reaps it, an unwaited one is a
+                // zombie until exit), which is the lesser escape.
+                drop(unheld);
+            }
         }
     }
 
@@ -1542,7 +1554,7 @@ mod linux {
     /// `command + kill_grace + reap_grace`; a child it cannot prove finished is
     /// PARKED in its slot with a `ChildStuck` error rather than detached.
     pub(crate) fn wait_nft_bounded_with(
-        mut child: Child,
+        child: Child,
         ticket: SlotTicket,
         budget: NftWaitBudget,
     ) -> Result<Output, NftablesError> {
@@ -1554,10 +1566,7 @@ mod linux {
         // S_WAITING. The child is handed to the waiter through a cell rather than
         // moved into the closure, so a failed spawn (which drops the closure)
         // cannot drop the child with it.
-        let cell: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-        if let Ok(mut slot) = cell.lock() {
-            *slot = Some(child);
-        }
+        let cell: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
         let (tx, rx) = std::sync::mpsc::sync_channel::<WaitResult>(1);
         let waiter_cell = Arc::clone(&cell);
         let spawned = std::thread::Builder::new()
@@ -1574,9 +1583,12 @@ mod linux {
                 if let Some(fd) = &pidfd {
                     let _ = pidfd_kill(fd);
                 }
-                let taken = cell.lock().ok().and_then(|mut slot| slot.take());
-                if let Some(owned) = taken {
-                    child = owned;
+                // Poison is recovered, never read as "no child": the closure that
+                // would have taken the child never ran, so it is still in the cell,
+                // and dropping it here would free the slot over a live, unsignalled
+                // child (round-2 code gate).
+                let taken = cell.lock().unwrap_or_else(|err| err.into_inner()).take();
+                if let Some(child) = taken {
                     ticket.park(ParkedNftChild::Unwaited {
                         child,
                         _pidfd: pidfd,
@@ -6606,7 +6618,7 @@ mod child_slot_tests {
             // Time out and park every in-flight call: the slots stay held.
             for id in general.into_iter().chain(net) {
                 let (child, finished) = fake(&polls);
-                table.park(id, child);
+                assert!(table.park(id, child).is_ok());
                 pending.push(finished);
                 episodes += 1;
                 check_bounds(&table);
@@ -6662,7 +6674,7 @@ mod child_slot_tests {
             .admit(NftOrigin::SafetyNet)
             .expect("the reserved slot admits");
         let (child, _never_finishes) = fake(&polls);
-        table.park(net, child);
+        assert!(table.park(net, child).is_ok());
         check_bounds(&table);
         // Four General held plus one parked SafetyNet child that never finishes:
         // the next net install is refused, as stated, and General stays refused.

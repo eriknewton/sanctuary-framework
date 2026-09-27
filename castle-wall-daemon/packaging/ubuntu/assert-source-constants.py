@@ -39,7 +39,10 @@ from pathlib import Path
 # into feed_stdin_and_wait_with, whose write-failure path kills and joins or parks the child
 # through its slot instead of returning past it; T12 and the child tests were updated. The
 # rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
-NFTABLES_SOURCE_SHA256 = "feb29aa5141ea030e366a100b09b09ee8c8f0f55ca6cc0ff4291755690cd6616"
+# Refreshed for the round-2 polish (2026-09-27): ChildSlotTable::park refuses an id that is
+# not in flight, and the waiter-spawn failure path recovers a poisoned cell instead of
+# dropping the child. The rule grammar, parser, receipt mint and net script are unchanged.
+NFTABLES_SOURCE_SHA256 = "428c4a7017063d71b2c35dc309b587728f3525d83569504e6b38493a06aa4624"
 
 
 def fail(message):

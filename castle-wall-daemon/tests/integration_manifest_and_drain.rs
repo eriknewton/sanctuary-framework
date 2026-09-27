@@ -1337,6 +1337,10 @@ const T3W_CI_ALLOWANCE: Duration = Duration::from_secs(2);
 /// hanging the suite. 30 s = boot (bounded well under this on CI) plus deadline
 /// plus allowance, with room to spare.
 const T3W_HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long, after the daemon exits, the harness waits for its pipes to reach
+/// EOF. Bounded like the give-up branch: a descendant still holding a pipe must
+/// not hang the suite. 5 s is generous for two already-closed pipes.
+const T3W_PIPE_DRAIN: Duration = Duration::from_secs(5);
 
 enum T3wTrigger {
     FatalControlPath,
@@ -1399,10 +1403,11 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
     let mut child = command.spawn().expect("spawn the daemon binary");
 
     let stdout = child.stdout.take().expect("piped stdout");
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<String>();
     let stdout_reader = std::thread::spawn(move || {
         let mut text = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stdout), &mut text);
-        text
+        let _ = stdout_tx.send(text);
     });
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = std::sync::mpsc::channel::<(Instant, String)>();
@@ -1447,8 +1452,16 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
         std::thread::sleep(Duration::from_millis(20));
     };
     let exited_at = Instant::now();
-    let _ = reader.join();
-    let stdout = stdout_reader.join().unwrap_or_default();
+    // Bounded drain, never an unbounded join (same reason as the give-up branch):
+    // wait for both pipes to reach EOF up to T3W_PIPE_DRAIN, then detach whatever
+    // reader is still blocked and use what has already arrived.
+    let drain_until = exited_at + T3W_PIPE_DRAIN;
+    while !(reader.is_finished() && stdout_reader.is_finished()) && Instant::now() < drain_until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(reader);
+    drop(stdout_reader);
+    let stdout = stdout_rx.try_recv().unwrap_or_default();
     let lines: Vec<(Instant, String)> = rx.try_iter().collect();
     let armed_at = lines
         .iter()
