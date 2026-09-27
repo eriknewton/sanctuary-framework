@@ -30,8 +30,8 @@ use castle_wall_daemon::protected_agent::owner;
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime,
-    force_next_reclaim_owned_probe_error_for_test, DisarmOutcome, LinuxRuntimeConfig,
-    NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
+    force_next_journal_establish_error_for_test, force_next_reclaim_owned_probe_error_for_test,
+    DisarmOutcome, LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -1466,6 +1466,96 @@ fn tw1b_the_post_ready_journal_write_happens_for_the_components_own_activation()
         );
         drop(component);
     }
+}
+
+// LINUX-JOURNAL-OWNED-WRITERS-01, code-gate round 1: a failure to build the
+// journal's proof token AFTER the table was proven ours is a slice-A refusal, and it
+// takes the net-on-refusal rule like every other one. On a ReclaimOwned start whose
+// journal names a uid confined earlier in this boot whose jump is gone, a failed
+// `establish` installs the IDENTITY-scoped net naming that uid and refuses readiness;
+// it never returns a bare acquisition failure that leaves the reclaimed table's
+// `policy accept` in force.
+#[test]
+fn an_establish_failure_after_reclaim_installs_the_identity_scoped_net() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    // A uid confined earlier in this boot; its per-agent jump never exists on the
+    // reclaimed table, which is the "jump gone" state.
+    const GONE_UID: u32 = 60177;
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    // 1) A real owned table and journal, then an ordinary release: the table and its
+    //    journal survive for the next start to reclaim.
+    let component =
+        acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+    let (_, acquired) = journal_inode_and_record(&cfg);
+    drop(component);
+    let OwnershipJournal::Owned {
+        identity,
+        table_handle,
+        base_chain_handle,
+        ..
+    } = acquired
+    else {
+        panic!("the acquisition wrote an Owned record");
+    };
+    // 2) This boot's history names GONE_UID.
+    write_owned_journal_with_history(
+        &cfg,
+        &identity.marker,
+        table_handle,
+        base_chain_handle,
+        Some(vec![journal::ConfinedIdentity {
+            uid: GONE_UID,
+            role: journal::ConfinedRole::Agent,
+        }]),
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("accept"));
+
+    // 3) ReclaimOwned, with the proof token forced to fail.
+    let forced = force_next_journal_establish_error_for_test();
+    let result = acquire_castle_table_component_for_test(&cfg);
+    drop(forced);
+    let detail = match result {
+        Err(EnforcementError::AcquireFailed { detail, .. }) => detail,
+        Err(other) => panic!("expected the acquisition refusal class, got {other:?}"),
+        Ok(_) => panic!("a failed proof token must refuse readiness"),
+    };
+    assert!(
+        detail.contains("forced to fail"),
+        "the refusal is the establish failure: {detail}"
+    );
+    assert!(
+        detail.contains("Installed the safety net"),
+        "the establish refusal went through the net-on-refusal rule: {detail}"
+    );
+
+    // 4) The IDENTITY-scoped net is in the kernel and names the gone uid.
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "the safety net replaced the reclaimed accept table"
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert_eq!(
+        live_rule_comments_in_order(),
+        vec![
+            nftables::NET_RULE_COMMENT_IDENTITY.to_string(),
+            nftables::NET_RULE_COMMENT_KERNEL_ND.to_string(),
+            nftables::NET_RULE_COMMENT_OTHERS.to_string(),
+        ],
+        "the identity-scoped shape, not the host-wide one"
+    );
+    assert!(
+        live_table_json()
+            .unwrap_or_default()
+            .contains(&GONE_UID.to_string()),
+        "the net names the uid confined earlier in this boot"
+    );
 }
 
 /// The record the acquisition wrote, rebuilt for comparison (known-empty history:

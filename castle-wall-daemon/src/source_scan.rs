@@ -315,6 +315,68 @@ pub(crate) fn top_level_params(signature: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `text` with the CONTENTS of every string literal (plain, escaped, and raw
+/// `r"..."`/`r#"..."#`) replaced by spaces, quotes and newlines kept, so a word in a
+/// message is not read as an identifier. A `'"'` char literal is not a string.
+pub(crate) fn blank_string_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if bytes.get(i + 1) == Some(&b'"') && bytes.get(i + 2) == Some(&b'\'') => {
+                i += 3;
+                continue;
+            }
+            b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#'))
+                && (i == 0 || !is_ident_byte(bytes[i - 1])) =>
+            {
+                let mut hashes = 0;
+                let mut j = i + 1;
+                while bytes.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let from = j + 1;
+                    let end = text[from..]
+                        .find(&close)
+                        .map(|o| from + o)
+                        .unwrap_or(bytes.len());
+                    blank(&mut out, from, end);
+                    i = end + close.len();
+                    continue;
+                }
+            }
+            b'"' => {
+                let from = i + 1;
+                let mut j = from;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let end = j.min(bytes.len());
+                blank(&mut out, from, end);
+                i = end + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Whether byte `offset` of `text` falls inside one of `ranges`.
 pub(crate) fn in_ranges(ranges: &[(usize, usize)], offset: usize) -> bool {
     ranges.iter().any(|(s, e)| (*s..*e).contains(&offset))
@@ -358,7 +420,22 @@ pub(crate) fn doc_block_of(text: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{offsets_of_unqualified, receiver_before, top_level_params};
+    use super::{blank_string_literals, offsets_of_unqualified, receiver_before, top_level_params};
+
+    /// Words inside plain, escaped, multi-line and raw string literals are blanked;
+    /// code outside them, a `'"'` char literal, and line structure survive.
+    #[test]
+    fn blank_string_literals_hides_only_literal_contents() {
+        let text = "let a = journal; f(\"the journal key\", '\"', journal)\n\
+                    g(\"x \\\" journal \\\n  journal\")\n\
+                    h(r#\"raw journal \"quoted\" \"#, journal.path())";
+        let blanked = blank_string_literals(text);
+        assert_eq!(blanked.len(), text.len());
+        assert_eq!(blanked.lines().count(), text.lines().count());
+        assert_eq!(blanked.matches("journal").count(), 3, "{blanked}");
+        assert!(blanked.contains("'\"'"));
+        assert!(blanked.contains("journal.path()"));
+    }
 
     /// The unqualified reading excludes a method call, a longer identifier and a
     /// path-qualified call, and keeps a bare call. The needle is assembled with

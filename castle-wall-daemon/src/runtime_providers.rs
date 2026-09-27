@@ -686,8 +686,8 @@ fn persist_kill_set_post_ready(
     // iteration); a change that keeps a released component listed must revisit
     // this. There is no history to extend, and returning `Ok` would hide that the
     // confined history was not written. Refuse (`reload_for_activation` returns
-    // `NotOwnedForActivation`); the caller reports it, and the net install this
-    // persist follows is unaffected. What the refusal costs is bounded in the C2a2b
+    // `NotOwnedForActivation`); the caller reports it, and the net install on this
+    // row is unaffected, whether it precedes or follows this persist. What the refusal costs is bounded in the C2a2b
     // design packet section 8.
     let now = journal.reload_for_activation(key)?;
     // W_MUTATE over the history loaded in THIS call; a writer that reused an earlier
@@ -1690,6 +1690,38 @@ pub fn force_next_agent_binding_write_ahead_error_for_test() -> ForcedAgentBindi
     ForcedAgentBindingWriteAheadError { _private: () }
 }
 
+/// Fault-injection seam: forces the NEXT journal proof-token `establish` inside the
+/// nftables `acquire` to fail, so the Linux integration suite can drive the
+/// PRODUCTION refusal that follows (the bind's net-on-refusal rule over the
+/// pre-match evidence) without corrupting a real journal mid-boot. Same convention as
+/// [`AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR`]: compiled only under `test-isolation`,
+/// consumed by exactly the next `establish`, and cleared by the RAII guard.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static JOURNAL_ESTABLISH_FORCE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above; see
+/// [`force_next_journal_establish_error_for_test`].
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ForcedJournalEstablishError {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedJournalEstablishError {
+    fn drop(&mut self) {
+        JOURNAL_ESTABLISH_FORCE_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next `establish`. Bind the returned guard
+/// (not `let _ = ...`, which drops it and clears the latch before the acquisition).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_journal_establish_error_for_test() -> ForcedJournalEstablishError {
+    JOURNAL_ESTABLISH_FORCE_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedJournalEstablishError { _private: () }
+}
+
 /// A7 fail-before test seam: forces the NEXT readback inside
 /// [`bind_admitted_uid_before_ready`] to read as a mismatch, regardless of what
 /// the kernel actually holds, so the Linux integration suite can drive the
@@ -1803,17 +1835,23 @@ fn bind_admitted_uid_before_ready(
     // `refuse_after_owned_table`, which loads it live after scope resolution.
     // The `Arc`, never a `bool`: see that function's own parameter doc.
     shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    // WRITE ONLY. This handle is for the write-ahead and never sources the net
-    // decision. The net decision is `existing`, the PRE-MATCH record, and it must
-    // stay that: a re-read after a fresh create already names the admitted uid, which
-    // is the fail-open shape the invariant on `history_for_net_decision` below exists
-    // to prevent. The two journal views here have different jobs, and `establish`'s
-    // own load is discarded for the same reason.
-    journal: &crate::ownership_journal::OwnedJournalHandle,
+    // WRITE ONLY. The proof token (or the reason `establish` could not build it) is
+    // for the write-ahead and never sources the net decision. The net decision is
+    // `existing`, the PRE-MATCH record, and it must stay that: a re-read after a fresh
+    // create already names the admitted uid, which is the fail-open shape the
+    // invariant on `history_for_net_decision` below exists to prevent. `establish`
+    // discards its own load for a different reason: a token that carried the record
+    // would turn every later write into a stale overwrite (C2a2 gate F4). A failed
+    // `establish` is a refusal AFTER the ownership proof, so it is taken below through
+    // the one net-on-refusal rule, never returned bare.
+    journal: Result<
+        crate::ownership_journal::OwnedJournalHandle,
+        crate::ownership_journal::OwnershipJournalError,
+    >,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
     boot_id: &str,
-) -> Result<(), EnforcementError> {
+) -> Result<crate::ownership_journal::OwnedJournalHandle, EnforcementError> {
     use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
     use crate::ownership_journal::ConfinedRole;
 
@@ -1903,13 +1941,46 @@ fn bind_admitted_uid_before_ready(
     // tests run on any platform. Below this line the code only executes a plan.
     let plan = plan_admitted_binding(identity, &live, &history_for_net_decision);
 
+    // THE NET DECISION FOR A FAILURE THAT HAPPENS OUTSIDE THE PLAN'S OWN REFUSALS
+    // (the proof token below, and the kernel steps further down). Computed from the
+    // same predicate and the same two inputs the plan's own refusals used, so such a
+    // failure cannot answer the question differently from a refusal the plan itself
+    // took. A literal here would be the fail-open answer: H can name a uid whose jump
+    // was deleted, and that uid is left over `policy accept` if the net is skipped.
+    let net_required_mid_plan = net_required_on_refusal(&history_for_net_decision, &live);
+
+    // INVARIANT: the ownership journal must hold the Owned record for this exact
+    // activation before anything is bound. A failed `establish` is a refusal after
+    // the table was proven ours, so it goes through the ONE net-on-refusal rule (the
+    // `refuse` closure into `refuse_after_owned_table`) with the plan's own uncovered
+    // uids when it computed any: a this-boot uid whose jump is gone gets its net
+    // exactly as the plan's own refusal would give it.
+    let journal = match journal {
+        Ok(handle) => handle,
+        Err(err) => {
+            let uncovered: &[u32] = match &plan {
+                BindPlan::RefuseWithNet { uncovered_uids, .. } => uncovered_uids,
+                _ => &[],
+            };
+            return Err(refuse(
+                net_required_mid_plan,
+                uncovered,
+                format!(
+                    "the ownership journal does not hold the Owned record for the activation \
+                     this process just made ({err}), so its confined history cannot be \
+                     proven; refusing readiness."
+                ),
+            ));
+        }
+    };
+
     let (agent_uid, ceiling, install_required) = match plan {
         BindPlan::RefuseWithNet {
             reason,
             uncovered_uids,
         } => return Err(refuse(true, &uncovered_uids, reason)),
         BindPlan::RefuseWithoutNet { reason } => return Err(refuse(false, &[], reason)),
-        BindPlan::NothingToBind => return Ok(()),
+        BindPlan::NothingToBind => return Ok(journal),
         BindPlan::Adopt { agent_uid } => (agent_uid, 0, false),
         BindPlan::Install { agent_uid, ceiling } => (agent_uid, ceiling, true),
     };
@@ -1920,14 +1991,6 @@ fn bind_admitted_uid_before_ready(
             "internal: a continuing binding plan was produced with no armed identity".to_string(),
         ));
     };
-
-    // THE NET DECISION FOR A FAILURE THAT HAPPENS WHILE EXECUTING THE PLAN.
-    // Computed from the same predicate and the same two inputs the plan's own
-    // refusals used, so a failure at the kernel step cannot answer the question
-    // differently from a refusal the plan itself took. A literal here would be
-    // the fail-open answer: H can name a uid whose jump was deleted, and that uid
-    // is left over `policy accept` if the net is skipped.
-    let net_required_mid_plan = net_required_on_refusal(&history_for_net_decision, &live);
 
     if install_required {
         let key = match crate::ownership_journal::load_or_generate_auth_key(key_path) {
@@ -1967,7 +2030,7 @@ fn bind_admitted_uid_before_ready(
             )
         } else {
             crate::ownership_journal::persist_confined_uid_write_ahead(
-                journal,
+                &journal,
                 &key,
                 agent_uid,
                 ConfinedRole::Agent,
@@ -2078,7 +2141,7 @@ fn bind_admitted_uid_before_ready(
         "{AGENT_BINDING_READBACK_LINE_PREFIX} uid={agent_uid} agent={}",
         crate::nftables::confined_agent_id(agent_uid)
     );
-    Ok(())
+    Ok(journal)
 }
 
 impl ComponentProvider for NftablesTableProvider {
@@ -2554,13 +2617,32 @@ impl ComponentProvider for NftablesTableProvider {
             // `activate_runtime_ownership` accepted this exact identity and before the
             // bind. INVARIANT: `establish` reloads and returns `Ok` only if the record
             // is `Owned` for this activation, so the token can only name the activation
-            // this process runs under; a record that is not means the proof this
-            // acquisition just wrote or confirmed is not on disk, and readiness is
-            // refused rather than continued on an unproven journal (the same
-            // `AcquireFailed` class as the step-2 load failure). The key is resolved by
-            // the same call the bind makes, so no new key path appears.
-            let owned_journal = match crate::ownership_journal::load_or_generate_auth_key(key_path)
-                .and_then(|key| {
+            // this process runs under. A record that is not means the proof this
+            // acquisition just wrote or confirmed is not on disk; that is a refusal
+            // AFTER the table was proven ours, so its `Err` is handed to the bind, which
+            // refuses through the one net-on-refusal rule (`refuse_after_owned_table`)
+            // over the same evidence as every other slice-A refusal, never a bare
+            // `AcquireFailed` that would skip the net. The key is resolved by the same
+            // call the bind makes, so no new key path appears.
+            //
+            // TEST-ISOLATION SEAM: a forced error is folded into the SAME `Result` the
+            // real `establish` returns, so a test that arms it exercises the production
+            // refusal. See `force_next_journal_establish_error_for_test`.
+            #[cfg(feature = "test-isolation")]
+            let forced_establish_error =
+                JOURNAL_ESTABLISH_FORCE_ERROR.swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(feature = "test-isolation"))]
+            let forced_establish_error = false;
+            let established = if forced_establish_error {
+                Err(
+                    crate::ownership_journal::OwnershipJournalError::UnsafeJournal {
+                        path: journal_path.to_path_buf(),
+                        reason: "test-isolation: the journal proof token was forced to fail"
+                            .to_string(),
+                    },
+                )
+            } else {
+                crate::ownership_journal::load_or_generate_auth_key(key_path).and_then(|key| {
                     crate::ownership_journal::OwnedJournalHandle::establish(
                         journal_path,
                         &key,
@@ -2572,34 +2654,29 @@ impl ComponentProvider for NftablesTableProvider {
                             source.clone(),
                         ),
                     )
-                }) {
-                Ok(handle) => handle,
-                Err(err) => {
-                    drop(lock);
-                    return Err(acquire_failed(format!(
-                        "the ownership journal does not hold the Owned record for the activation \
-                         this process just made, so its confined history cannot be proven; \
-                         refusing readiness: {err}"
-                    )));
-                }
+                })
             };
 
             // SLICE A: bind the admitted uid and read it back from the kernel.
             // Everything after this point runs only if the wall is holding the
             // identity it was armed with, so the readiness beacon below can mean
-            // "an agent started now starts confined".
-            if let Err(err) = bind_admitted_uid_before_ready(
+            // "an agent started now starts confined". The bind returns the proof token
+            // it was handed, for the component to own.
+            let owned_journal = match bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
                 &self.shutdown_requested,
-                &owned_journal,
+                established,
                 key_path,
                 existing.record(),
                 &boot_id,
             ) {
-                drop(lock);
-                return Err(err);
-            }
+                Ok(handle) => handle,
+                Err(err) => {
+                    drop(lock);
+                    return Err(err);
+                }
+            };
 
             // Seed the retained deny set from the resolution this acquisition just
             // computed, so a later loss installs the net from an IN-MEMORY set rather
@@ -7062,8 +7139,9 @@ mod tests {
         let body = bind_function_source();
         assert_eq!(
             body.matches("net_required_mid_plan,").count(),
-            2,
-            "the key-load and write-ahead failure arms both pass the predicate"
+            3,
+            "the proof-token (establish), key-load and write-ahead failure arms all pass \
+             the predicate"
         );
         // ANCHORED, not distance-measured: find the plan's own no-net arm by its
         // match pattern and require the ONE literal-false refusal in the whole
@@ -7211,7 +7289,7 @@ mod tests {
             .find("crate::nftables::activate_runtime_ownership(&ownership)")
             .expect("the acquisition must activate runtime ownership");
         let bind = source
-            .find("if let Err(err) = bind_admitted_uid_before_ready(")
+            .find("let owned_journal = match bind_admitted_uid_before_ready(")
             .expect("the acquisition must call the bind");
         assert!(
             activate < bind,
@@ -7652,14 +7730,29 @@ mod tests {
     /// where "inside `acquire`" pins look: three providers declare a byte-identical
     /// `fn acquire(self: Box<Self>)`, so `find("fn acquire(")` would be ambiguous.
     fn nftables_acquire_region(code: &str) -> (usize, usize) {
-        let start = code
+        let impl_at = code
             .find("\nimpl ComponentProvider for NftablesTableProvider {")
             .expect("the nftables provider impl");
-        let end = code[start + 1..]
-            .find("\nimpl ")
-            .map(|o| start + 1 + o)
-            .expect("an impl follows the nftables provider");
-        (start, end)
+        let fn_at = impl_at
+            + code[impl_at..]
+                .find("fn acquire(")
+                .expect("the nftables provider declares acquire");
+        let open = fn_at + code[fn_at..].find('{').expect("acquire has a body");
+        let close =
+            crate::source_scan::matching_brace(code, open).expect("the acquire body closes");
+        (fn_at, close + 1)
+    }
+
+    /// Whether every production call of the boot writer is inside the nftables
+    /// provider's `fn acquire` body (not merely its impl or the functions after it).
+    fn boot_writer_calls_are_inside_acquire(code: &str) -> (usize, bool) {
+        let (start, end) = nftables_acquire_region(code);
+        let calls: Vec<usize> = offsets_of_word(code, "persist_kill_set_write_ahead_at_boot(")
+            .into_iter()
+            .filter(|&at| !is_declaration(code, at))
+            .collect();
+        let inside = calls.iter().all(|&at| (start..end).contains(&at));
+        (calls.len(), inside)
     }
 
     /// The parameters of `fn <name>(` in `code`.
@@ -7735,22 +7828,39 @@ mod tests {
             );
         }
         let (region_start, region_end) = nftables_acquire_region(rp);
-        let boot_calls: Vec<usize> = offsets_of_word(rp, "persist_kill_set_write_ahead_at_boot(")
-            .into_iter()
-            .filter(|&at| !is_declaration(rp, at))
-            .collect();
-        assert_eq!(boot_calls.len(), 2, "two boot call sites");
+        let (boot_call_count, boot_calls_inside) = boot_writer_calls_are_inside_acquire(rp);
+        assert_eq!(boot_call_count, 2, "two boot call sites");
         assert!(
-            boot_calls
-                .iter()
-                .all(|&at| (region_start..region_end).contains(&at)),
-            "both boot call sites are inside the nftables acquire"
+            boot_calls_inside,
+            "both boot call sites are inside the nftables provider's fn acquire body"
+        );
+        // Negative case: the same check refuses a boot-writer call placed in
+        // `finalize_owned`, a function after `acquire` in the same provider region.
+        let finalize_at = rp
+            .find("fn finalize_owned(")
+            .expect("finalize_owned exists");
+        let finalize_open = finalize_at + rp[finalize_at..].find('{').expect("body");
+        let mutated = format!(
+            "{}\n    let _ = persist_kill_set_write_ahead_at_boot(&existing, None, None);{}",
+            &rp[..=finalize_open],
+            &rp[finalize_open + 1..]
+        );
+        let (mutated_count, mutated_inside) = boot_writer_calls_are_inside_acquire(&mutated);
+        assert_eq!(mutated_count, 3);
+        assert!(
+            !mutated_inside,
+            "a boot-writer call in finalize_owned must fail the inside-acquire pin"
         );
 
-        // The bind's handle is WRITE ONLY: every use of the identifier `journal` in
-        // its body is the parameter declaration, the first argument of the
-        // confined write-ahead, or the path in the test-isolation seam's error.
-        let bind = crate::source_scan::fn_body(rp, "bind_admitted_uid_before_ready");
+        // The bind's proof token is WRITE ONLY: every use of the identifier `journal`
+        // in its body (string literal contents blanked, so a word in a message is not
+        // a use) is the parameter declaration, the unwrap of the `establish` result
+        // (the binding and the scrutinee), the path in the test-isolation seam's
+        // error, the first argument of the confined write-ahead, or the token handed
+        // back to `acquire` for the component to own.
+        let bind_raw = crate::source_scan::fn_body(rp, "bind_admitted_uid_before_ready");
+        let bind = crate::source_scan::blank_string_literals(bind_raw);
+        let bind = bind.as_str();
         let bytes = bind.as_bytes();
         let mut uses = Vec::new();
         for at in crate::source_scan::offsets_of(bind, "journal") {
@@ -7762,26 +7872,28 @@ mod tests {
             if next.is_ascii_alphanumeric() || next == b'_' || bind[at..].starts_with("journal::") {
                 continue;
             }
-            // The word followed by a space is prose inside a message literal ("the
-            // journal authentication key"); an expression use of the handle is
-            // followed by `,`, `.`, `:`, `)` or `;`. BOUND: a use written as
-            // `journal {` or `journal as` would be skipped here too; neither is a way
-            // to pass a borrowed handle to the net decision.
-            if next == b' ' {
-                continue;
-            }
             let after = &bind[at + "journal".len()..];
             let before = bind[..at].trim_end();
-            let class = if after.starts_with(": &crate::ownership_journal::OwnedJournalHandle") {
+            let before_ref = before
+                .strip_suffix('&')
+                .map(str::trim_end)
+                .unwrap_or(before);
+            let class = if after.starts_with(": Result<") {
                 "declaration"
-            } else if after.starts_with(',')
-                && before.ends_with("persist_confined_uid_write_ahead(")
-            {
-                "write-ahead first argument"
+            } else if before.ends_with("let") && after.starts_with(" = match journal {") {
+                "unwrap binding"
+            } else if before.ends_with("match") && after.starts_with(" {") {
+                "unwrap scrutinee"
             } else if after.starts_with(".path().to_path_buf()") && before.ends_with("path:") {
                 "forced-error path"
+            } else if after.starts_with(',')
+                && before_ref.ends_with("persist_confined_uid_write_ahead(")
+            {
+                "write-ahead first argument"
+            } else if before.ends_with("Ok(") && after.starts_with(')') {
+                "handed back"
             } else {
-                panic!("the bind uses its journal handle outside the write-ahead: {after:.60}")
+                panic!("the bind uses its journal token outside the write-ahead: {after:.60}")
             };
             uses.push(class);
         }
@@ -7789,13 +7901,17 @@ mod tests {
             uses,
             vec![
                 "declaration",
+                "unwrap binding",
+                "unwrap scrutinee",
+                "handed back",
                 "forced-error path",
-                "write-ahead first argument"
+                "write-ahead first argument",
+                "handed back",
             ],
-            "the bind's handle feeds the write-ahead only, never the net decision"
+            "the bind's token feeds the write-ahead only, never the net decision"
         );
         assert!(
-            !bind.contains("net_scope_for_refusal(journal"),
+            !bind.contains("net_scope_for_refusal(journal") && !bind.contains("refuse(journal"),
             "the handle never reaches the refusal scope"
         );
 
