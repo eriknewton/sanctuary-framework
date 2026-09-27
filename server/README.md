@@ -154,7 +154,9 @@ Sanctuary lives in your menubar. When your agent wants to do something risky, yo
 The dashboard is for setup, inspection, and authenticated operator approvals.
 It includes the substrate selector, policy editor, audit deep-dive, exit bundle
 drill, and fortress configuration. The menubar keeps routine status and
-approval entry points close at hand.
+approval entry points close at hand. When started with `--dashboard`, a busy
+dashboard port refuses startup and names the port rather than starting a
+server with no dashboard.
 
 Concierge chat is a read-oriented natural-language interface to fortress state.
 "What's going on?" returns a summary from the audit log. "Why did my Hermes

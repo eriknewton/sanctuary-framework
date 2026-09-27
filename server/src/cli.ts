@@ -752,9 +752,23 @@ Commands:
     return;
   }
 
+  // A163 (fix round 1, 2026-09-27, code-gate finding Claude-2/Grok-1): this
+  // `for` loop is the ONLY site that sets `explicitDashboardRequested`. It is
+  // a boot-local `const`, scoped to THIS invocation's argv, never an env var
+  // or a config-file key: `SANCTUARY_DASHBOARD_ENABLED` (set two lines below)
+  // and `config.dashboard.enabled` (config.ts) both persist across boots --
+  // `saveConfig` (index.ts) writes the in-memory config back to
+  // `sanctuary.json`, and `wrap` copies the env var into every harness's MCP
+  // client config (wrap/cli.ts, wrap/config-reader.ts) -- so either one means
+  // "some earlier setup asked", not "this process's operator typed
+  // `--dashboard` just now". Must match the consumer at
+  // `createSanctuaryServer`'s `explicitDashboardRequested` option in
+  // index.ts, which the refusal check in the dashboard boot case reads.
+  let explicitDashboardRequested = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+      explicitDashboardRequested = true;
     } else if (args[i] === "--allow-plaintext-remote") {
       process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
     } else if (args[i] === "--passphrase" && args[i + 1]) {
@@ -776,7 +790,10 @@ Commands:
 
   await refuseMissingMcpChildFortressOrExit();
 
-  const { server, config, cleanup } = await createSanctuaryServer({ passphrase });
+  const { server, config, cleanup } = await createSanctuaryServer({
+    passphrase,
+    explicitDashboardRequested,
+  });
 
   if (config.transport === "stdio") {
     const transport = new StdioServerTransport();
