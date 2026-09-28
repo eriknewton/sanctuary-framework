@@ -361,13 +361,22 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
  * through the same real persistent guard the MCP server constructs, exactly
  * as the STEP1-F1 block above does for `memory_ingest`.
  *
- * Fail-before witness: every test in these three blocks fails on the
- * pre-STEP1-F2 tree (the commit immediately before this change) because none
- * of `memory_emit`/`memory_transcode`/`memory_transcode_restore` ran any
+ * Fail-before witness: every (a)/(b)/(c) test in these three blocks fails on
+ * the pre-STEP1-F2 tree (the commit immediately before this change) because
+ * none of `memory_emit`/`memory_transcode`/`memory_transcode_restore` ran any
  * owner-pin check at all: a "different agent" run that should refuse with
  * `owner_scope_conflict` instead proceeds and produces output, and a
  * "drifted" store that should refuse with
  * `owner_pin_missing_after_establishment` instead proceeds silently.
+ *
+ * STEP1-F2 fix round 1 added (d)/(e)/(f) to each block, for the non-default
+ * `--owner-ref` lockout the adversarial code gate on commit `0f0db45d` found.
+ * Of those three, only (d) is a fail-before witness of that round: it fails
+ * on `0f0db45d` for all three verbs. (e) and (f) already passed on
+ * `0f0db45d` — the protections they check (missing-identity refusal, and
+ * establishment happening only after approval) already existed there via
+ * `precheckOwnerPinOrRefuse` / `establishOwnerPinAfterApproval`; they are
+ * regression guards closing a prior test gap, not proof of that round's fix.
  */
 for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_restore"] as const) {
   describe(`CLI ${verbName} owner-pin establishment (STEP1-F2)`, () => {
@@ -578,7 +587,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
-    it("(e) STEP1-F2 fix round 1: with no SANCTUARY_AGENT_ID, a fresh store refuses instead of pinning an unwrapped principal", async () => {
+    it("(e) regression guard, not a fail-before witness of this round: with no SANCTUARY_AGENT_ID, a fresh store refuses instead of pinning an unwrapped principal (this protection already existed via precheckOwnerPinOrRefuse before STEP1-F2 fix round 1; this case just was not tested for the three sibling verbs until now)", async () => {
       let dialogs = 0;
       const countingApprove = () => {
         dialogs += 1;
@@ -593,7 +602,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
     });
 
-    it("(f) a denied dialog on a fresh store leaves NO owner pin and writes nothing (the pin is established only after Tier-1 approval)", async () => {
+    it("(f) regression guard, not a fail-before witness of this round: a denied dialog on a fresh store leaves NO owner pin and writes nothing (this protection already existed via establishOwnerPinAfterApproval running only after ApprovalGate approval, before STEP1-F2 fix round 1; this case just was not tested for the three sibling verbs until now)", async () => {
       const { storage, masterKey } = await realStorageAndMasterKey();
       const agentId = `claude_code:owner-pin-denied-${verbName}`;
       const result = await runVerb({ agentId, dialogRunner: DENY_DIALOG });
