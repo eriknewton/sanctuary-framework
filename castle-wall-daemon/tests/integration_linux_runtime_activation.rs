@@ -3076,6 +3076,29 @@ mod tb10_agent_unit_against_real_systemd {
             .expect("run systemctl")
     }
 
+    /// The program every teardown `systemctl` call is spawned through (the
+    /// same bounding wrapper `systemctl` above uses).
+    const TEARDOWN_SPAWN_PROGRAM: &str = "timeout";
+
+    /// `systemctl` for TEARDOWN paths: a spawn failure is an `Err`, never a
+    /// panic. A panic inside `Drop` would still drop the struct's fields, and
+    /// any directory still held as a `TempDir` would be deleted under a live
+    /// unit; so nothing reachable from `Tb10Units::drop` may panic.
+    fn try_systemctl(args: &[&str]) -> Result<std::process::Output, String> {
+        Command::new(TEARDOWN_SPAWN_PROGRAM)
+            .arg("90")
+            .arg("systemctl")
+            .args(args)
+            .output()
+            .map_err(|err| format!("spawn {TEARDOWN_SPAWN_PROGRAM} systemctl {args:?}: {err}"))
+    }
+
+    /// `prop` for teardown paths, spawn failure as `Err`.
+    fn try_prop(unit: &str, property: &str) -> Result<String, String> {
+        try_systemctl(&["show", "--value", "-p", property, unit])
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     pub(super) fn prop(unit: &str, property: &str) -> String {
         String::from_utf8_lossy(&systemctl(&["show", "--value", "-p", property, unit]).stdout)
             .trim()
@@ -3142,6 +3165,9 @@ mod tb10_agent_unit_against_real_systemd {
         /// removed only after a settled teardown.
         owned: Vec<TempDir>,
         settled: Option<UnitsSettled>,
+        /// `unit_stop_bound()`, computed at construction: it reads the shipped
+        /// unit files and may panic, which is allowed here and never in Drop.
+        stop_bound: Duration,
     }
 
     /// What one teardown observed.
@@ -3177,9 +3203,16 @@ mod tb10_agent_unit_against_real_systemd {
         shipped_wall_value("TimeoutStopSec")
     }
 
-    fn settled_state(unit: &str) -> bool {
-        let state = prop(unit, "ActiveState");
-        state == "inactive" || state == "failed"
+    /// Settled means the manager reports inactive or failed. A read that could
+    /// not be made is NOT settled; the error is kept for the report.
+    fn settled_state(unit: &str, errors: &mut Vec<String>) -> bool {
+        match try_prop(unit, "ActiveState") {
+            Ok(state) => state == "inactive" || state == "failed",
+            Err(err) => {
+                errors.push(err);
+                false
+            }
+        }
     }
 
     impl Tb10Units {
@@ -3206,6 +3239,7 @@ mod tb10_agent_unit_against_real_systemd {
                 extra_dirs: Vec::new(),
                 owned: Vec::new(),
                 settled: None,
+                stop_bound: unit_stop_bound(),
             }
         }
 
@@ -3284,21 +3318,36 @@ mod tb10_agent_unit_against_real_systemd {
         pub(super) fn stop_all(&self) -> StopReport {
             let mut report = StopReport::default();
             for unit in &self.stop_order {
-                let stop_ok = systemctl(&["stop", unit]).status.success();
-                if !wait_until(unit_stop_bound(), || settled_state(unit)) {
-                    let kill_ok = systemctl(&["kill", "-s", "SIGKILL", unit]).status.success();
+                let mut errors = Vec::new();
+                let stop_ok = match try_systemctl(&["stop", unit]) {
+                    Ok(out) => out.status.success(),
+                    Err(err) => {
+                        errors.push(err);
+                        false
+                    }
+                };
+                if !wait_until(self.stop_bound, || settled_state(unit, &mut errors)) {
+                    let kill_ok = match try_systemctl(&["kill", "-s", "SIGKILL", unit]) {
+                        Ok(out) => out.status.success(),
+                        Err(err) => {
+                            errors.push(err);
+                            false
+                        }
+                    };
                     report
                         .escalated
                         .push(format!("{unit} (stop ok={stop_ok}, SIGKILL ok={kill_ok})"));
-                    if !wait_until(KILL_SETTLE, || settled_state(unit)) {
+                    if !wait_until(KILL_SETTLE, || settled_state(unit, &mut errors)) {
+                        let read = |p: &str| try_prop(unit, p).unwrap_or_else(|e| format!("<{e}>"));
+                        errors.dedup();
                         report.still_present.push(format!(
-                            "{unit} (ActiveState={}, SubState={})",
-                            prop(unit, "ActiveState"),
-                            prop(unit, "SubState")
+                            "{unit} (ActiveState={}, SubState={}, errors={errors:?})",
+                            read("ActiveState"),
+                            read("SubState"),
                         ));
                     }
                 }
-                let _ = systemctl(&["reset-failed", unit]);
+                let _ = try_systemctl(&["reset-failed", unit]);
             }
             report
         }
@@ -3306,45 +3355,53 @@ mod tb10_agent_unit_against_real_systemd {
 
     impl Drop for Tb10Units {
         fn drop(&mut self) {
+            // PRESERVE FIRST, before any command can fail: release every
+            // directory a live unit may read from its `TempDir`, so no failure
+            // below (and no field drop after it) can delete it. The paths are
+            // removed only on the settled path at the end.
+            let mut dirs: Vec<(&str, PathBuf)> = Vec::new();
+            if let Some(dir) = self.dir.take() {
+                dirs.push(("scratch", dir.into_path()));
+            }
+            for dir in self.owned.drain(..) {
+                dirs.push(("state", dir.into_path()));
+            }
             let report = self.stop_all();
             for unit in &report.escalated {
                 eprintln!("TB10 teardown: stop did not settle, SIGKILL sent: {unit}");
             }
             if !report.still_present.is_empty() {
                 // Leave everything a live unit uses in place and say so loudly:
-                // the unit files, the scratch and state dirs (leaked, not
-                // deleted) and, through the shared flag, the isolated table.
+                // the unit files, the scratch and state dirs and, through the
+                // shared flag, the isolated table.
                 for unit in &report.still_present {
-                    let status = systemctl(&["status", "--no-pager", &unit_name(unit)]);
+                    let status = match try_systemctl(&["status", "--no-pager", &unit_name(unit)]) {
+                        Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+                        Err(err) => format!("<status unavailable: {err}>"),
+                    };
                     eprintln!(
                         "TB10 teardown: STILL PRESENT after stop and SIGKILL: {unit}; unit files, \
-                         state and the isolated table are LEFT IN PLACE.\n{}",
-                        String::from_utf8_lossy(&status.stdout)
+                         state and the isolated table are LEFT IN PLACE.\n{status}"
                     );
                 }
-                if let Some(dir) = self.dir.take() {
-                    eprintln!(
-                        "TB10 teardown: scratch dir left at {}",
-                        dir.into_path().display()
-                    );
+                for (kind, dir) in &dirs {
+                    eprintln!("TB10 teardown: {kind} dir left at {}", dir.display());
                 }
-                for dir in self.owned.drain(..) {
-                    eprintln!(
-                        "TB10 teardown: state dir left at {}",
-                        dir.into_path().display()
-                    );
+                for file in &self.files {
+                    eprintln!("TB10 teardown: unit file left at {}", file.display());
                 }
                 return;
             }
             for file in &self.files {
                 let _ = std::fs::remove_file(file);
             }
-            let _ = systemctl(&["daemon-reload"]);
+            let _ = try_systemctl(&["daemon-reload"]);
             for dir in &self.extra_dirs {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            // Owned state and the scratch dir are removed by their own drops,
-            // after this point, with every unit confirmed settled.
+            for (_, dir) in &dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
             if let Some(settled) = &self.settled {
                 settled.store(true, std::sync::atomic::Ordering::SeqCst);
             }
