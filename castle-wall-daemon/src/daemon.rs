@@ -4694,3 +4694,216 @@ mod tests {
         assert_eq!(recover.matches("reprobe_after_latch(").count(), 1);
     }
 }
+
+/// Structural tests for the liveness watchdog's one pet site
+/// (LINUX-SUPERVISOR-WEDGE-R1-01, LINUX-WD-POSTSTOP-PET-01). They pin where the
+/// pet may be sent, that nothing else sends one, and that the watchdog and the
+/// stop guard stay independent. Needles are assembled with `concat!` so this
+/// module's own source never matches itself.
+#[cfg(test)]
+mod watchdog_structure {
+    use crate::source_scan::{
+        daemon_sources, enclosing_fn, fn_body, line_of, offsets_of, production_part,
+        receiver_before, without_comment_lines,
+    };
+    use std::collections::BTreeSet;
+
+    fn code_of(path: &str) -> String {
+        let text = daemon_sources()
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text)
+            .unwrap_or_else(|| panic!("{path} must exist"));
+        without_comment_lines(&production_part(&text))
+    }
+
+    /// TS1: the watchdog datagram literal appears in production code only as the
+    /// beacon's one const and the release-disabled stop-owner's own pinger.
+    #[test]
+    fn ts1_the_watchdog_datagram_literal_has_one_daemon_site() {
+        let needle = concat!("WATCH", "DOG=1");
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, needle) {
+                let site = if path == "src/systemd_notify.rs" {
+                    code[..at]
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .trim()
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    enclosing_fn(&code, at)
+                };
+                hits.push((path.clone(), site));
+            }
+        }
+        hits.sort();
+        let expected: Vec<(String, String)> = vec![
+            ("src/protected_agent/owner.rs", "watchdog_ping"),
+            ("src/protected_agent/owner.rs", "watchdog_ping"),
+            ("src/systemd_notify.rs", "pub const WATCHDOG_DATAGRAM"),
+        ]
+        .into_iter()
+        .map(|(p, f)| (p.to_string(), f.to_string()))
+        .collect();
+        assert_eq!(hits, expected);
+    }
+
+    /// TS2: exactly one production pet call, on the beacon field, inside the
+    /// supervisor body; the supervisor has exactly one production caller, the
+    /// daemon's `main`; the beacon is built once, in `boot`. Call syntax only: a
+    /// hit preceded by `fn ` is a definition.
+    #[test]
+    fn ts2_one_pet_site_one_supervisor_caller_one_beacon() {
+        let pet = concat!(".pe", "t(");
+        let mut pets = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, pet) {
+                pets.push((
+                    path.clone(),
+                    enclosing_fn(&code, at),
+                    receiver_before(&code, at),
+                    line_of(&code, at),
+                ));
+            }
+        }
+        assert_eq!(pets.len(), 1, "one pet call in production code: {pets:?}");
+        let (path, func, receiver, _) = &pets[0];
+        assert_eq!(path, "src/daemon.rs");
+        assert_eq!(func, "supervise_until_shutdown_body");
+        assert_eq!(receiver, "watchdog");
+
+        let supervise = concat!("supervise_until", "_shutdown(");
+        let mut callers = BTreeSet::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, supervise) {
+                if code[..at].ends_with("fn ") || code[..at].ends_with('_') {
+                    continue;
+                }
+                callers.insert((path.clone(), enclosing_fn(&code, at)));
+            }
+        }
+        let expected: BTreeSet<(String, String)> =
+            [("src/main.rs".to_string(), "run_daemon_main".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(callers, expected);
+
+        let from_env = concat!("WatchdogBeacon::from", "_env(");
+        let mut builders = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, from_env) {
+                builders.push((path.clone(), enclosing_fn(&code, at)));
+            }
+        }
+        assert_eq!(
+            builders,
+            vec![("src/daemon.rs".to_string(), "boot".to_string())]
+        );
+    }
+
+    /// TS3: the pet follows the loop's fatal and stop checks and precedes the
+    /// tick sleep; nothing in the stop, teardown or decision paths pets, and
+    /// neither does the `Indeterminate` arm.
+    #[test]
+    fn ts3_the_pet_follows_the_loop_top_checks_and_never_the_stop_path() {
+        let code = code_of("src/daemon.rs");
+        let body = fn_body(&code, "supervise_until_shutdown_body");
+        let pet = concat!("self.watchdog.pe", "t()");
+        let loop_top = body.find("loop {").expect("the supervisor loop");
+        let in_loop = &body[loop_top..];
+        let pet_at = in_loop.find(pet).expect("the pet site");
+        let fatal = in_loop
+            .find("self.is_fatal_control_path_requested()")
+            .expect("fatal check");
+        let stop = in_loop
+            .find("self.is_shutdown_requested()")
+            .expect("stop check");
+        let sleep = in_loop
+            .find("std::thread::sleep(tick)")
+            .expect("tick sleep");
+        assert!(fatal < pet_at && stop < pet_at, "pet before the checks");
+        assert!(pet_at < sleep, "pet after the sleep");
+        // The pet is gated on a completed pass.
+        let gate = in_loop[..pet_at]
+            .rfind("if completed_health_pass {")
+            .expect("the completed-pass gate");
+        assert!(
+            in_loop[gate..pet_at].lines().count() <= 2,
+            "gate directly guards the pet"
+        );
+
+        let bare = concat!(".pe", "t(");
+        for name in [
+            "stop_final_health_outcome",
+            "teardown",
+            "stop",
+            "decide_and_arm",
+        ] {
+            assert!(
+                !fn_body(&code, name).contains(bare),
+                "{name} must never pet"
+            );
+        }
+        let arm = in_loop
+            .find("RuntimeHealthState::Indeterminate => {")
+            .expect("the Indeterminate arm");
+        let arm_end = arm
+            + crate::source_scan::matching_brace(in_loop, arm + in_loop[arm..].find('{').unwrap())
+                .map(|close| close - arm)
+                .expect("arm closes");
+        assert!(
+            !in_loop[arm..arm_end].contains(bare),
+            "the Indeterminate arm must not pet"
+        );
+    }
+
+    /// TS4: the watchdog and the stop guard are independent mechanisms.
+    #[test]
+    fn ts4_the_watchdog_and_the_stop_guard_do_not_reference_each_other() {
+        let all = |path: &str| {
+            daemon_sources()
+                .into_iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, t)| t)
+                .unwrap()
+        };
+        let guard = all("src/exit_guard.rs");
+        assert!(!guard.contains(concat!("pe", "t(")));
+        assert!(!guard.contains(concat!("systemd", "_notify")));
+        let notify = all("src/systemd_notify.rs");
+        assert!(!notify.contains(concat!("exit", "_guard")));
+    }
+
+    /// TS5: every `--test-*` value flag drained in `run_daemon_main` is listed in
+    /// `has_structural_flag`'s test-isolation `value_options` block, and vice
+    /// versa, so a seam added to one site only cannot swallow or leak a token.
+    #[test]
+    fn ts5_test_value_flags_are_listed_where_they_are_drained() {
+        let code = code_of("src/main.rs");
+        let flag_after = |text: &str, prefix: &str| -> BTreeSet<String> {
+            text.match_indices(prefix)
+                .map(|(at, _)| {
+                    let rest = &text[at + prefix.len()..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .filter(|flag| flag.starts_with("--test-"))
+                .collect()
+        };
+        let listed = flag_after(
+            fn_body(&code, "has_structural_flag"),
+            "value_options.push(\"",
+        );
+        let drained = flag_after(fn_body(&code, "run_daemon_main"), "position(|a| a == \"");
+        assert!(!listed.is_empty());
+        assert_eq!(listed, drained);
+    }
+}

@@ -2384,6 +2384,13 @@ fn spawn_long_running_daemon_with_extra_args(
         .args(isolation_args())
         .args(extra_args)
         .env("NOTIFY_SOCKET", notify_socket)
+        // C2a3 (LINUX-SUPERVISOR-WEDGE-R1-01): the direct-spawn equivalent of a
+        // drop-in's `WatchdogSec=0`. These seams stretch the health interval, so
+        // an inherited watchdog interval would make this a watchdog run; with no
+        // `WATCHDOG_USEC` the beacon never pets. Failure mode if dropped: an
+        // environment that exports one reads here as extra datagrams, not READY=1.
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the shipped daemon binary (long-running, with test seam args)")
