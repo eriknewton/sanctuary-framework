@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture update only; supplies a wrapped agent id so the test still reaches the fortress-internal primary-identity-unavailable refusal after the shared pre-bootstrap identity check landed (STEP1-F2); its assertions are unchanged and it witnesses nothing new
 /**
  * L2 (Grok re-gate residual): a `writeIntent` memory unlock acquires the shared
  * master-rotation barrier BEFORE the unlock and transfers it to the caller ONLY
