@@ -88,7 +88,7 @@ mod isolation;
 /// Suite-entry guard: serializes this binary's tests and re-asserts, on every
 /// entry, that no production runtime object has been resolved. See
 /// [`isolation`] for why both halves are needed.
-fn suite_guard() -> std::sync::MutexGuard<'static, ()> {
+fn suite_guard() -> isolation::SuiteGuard {
     isolation::guard()
 }
 

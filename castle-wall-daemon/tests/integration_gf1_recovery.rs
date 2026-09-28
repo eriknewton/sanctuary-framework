@@ -2170,3 +2170,42 @@ fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it()
     );
     drop(readopted);
 }
+
+// Runner hygiene: the isolation teardown REFUSES a kernel table named for this run
+// that survives its sweep, rather than sweeping it silently, and removes it while
+// refusing so the failure does not also cut the network for every later step (see
+// `isolation::SuiteGuard` for the failure mode this guards). The leak here is an
+// empty table with no chain, so it filters nothing even if this test aborts.
+#[test]
+fn the_isolation_teardown_refuses_a_table_left_behind_for_this_run() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let leaked = format!("{}-leak", isolation::table());
+    let added = Command::new("nft")
+        .args(["add", "table", CASTLE_FAMILY, &leaked])
+        .output()
+        .expect("run nft add table");
+    assert!(added.status.success(), "plant the leaked table");
+
+    let report = isolation::leftover_kernel_state()
+        .expect_err("a table named for this run must be refused, never swept silently");
+    assert!(
+        report.contains(&leaked),
+        "the refusal names the leftover table: {report}"
+    );
+    let tables = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .expect("run nft list tables");
+    assert!(
+        !String::from_utf8_lossy(&tables.stdout).contains(&leaked),
+        "the refusal removed the leftover so the runner keeps its network"
+    );
+    assert!(
+        isolation::leftover_kernel_state().is_ok(),
+        "nothing named for this run remains after the refusal"
+    );
+}

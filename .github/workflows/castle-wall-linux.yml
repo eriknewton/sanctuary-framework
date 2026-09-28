@@ -257,6 +257,34 @@ jobs:
         env:
           SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
+      - name: Refuse leftover kernel state before the upload
+        if: always()
+        run: |
+          # Failure mode this catches: a test that leaves a Castle Wall table
+          # behind, above all the deny-all safety net (`policy drop` on the inet
+          # output hook), cuts this runner's network for every later step. The
+          # next network step (the evidence upload below) then fails with
+          # `getaddrinfo EAI_AGAIN results-receiver.actions.githubusercontent.com`,
+          # which reads as GitHub weather rather than as a test that did not clean
+          # up. Every suite's teardown (castle-wall-daemon/tests/isolation/mod.rs,
+          # `SuiteGuard`) already refuses its own leftovers; this step is the
+          # cross-binary check that nothing survived the whole run.
+          # Patterns must match `CASTLE_TABLE`, `ISOLATED_TABLE_PREFIX` and the
+          # `NET_RULE_COMMENT_*` constants in castle-wall-daemon/src/nftables.rs,
+          # and `names_this_run` in castle-wall-daemon/tests/isolation/mod.rs.
+          ruleset=$(sudo nft list ruleset)
+          if printf '%s\n' "$ruleset" | grep -Eq '^table [a-z0-9]+ sanctuary-castle|sanctuary-castle-net:'; then
+            echo "FAIL: Castle Wall kernel state survived the test run; the ruleset was:"
+            printf '%s\n' "$ruleset"
+            # Remove it now so the evidence upload below can still reach the
+            # network and the failure is diagnosable; the step still fails.
+            for t in $(sudo nft list tables | awk '$3 ~ /^sanctuary-castle/ {print $2 " " $3}' | tr ' ' ':'); do
+              sudo nft delete table "${t%%:*}" "${t#*:}" || true
+            done
+            exit 1
+          fi
+          echo "no Castle Wall kernel state left after the tests"
+
       - name: Retain Linux integration and real-systemd evidence logs
         if: always()
         uses: actions/upload-artifact@v7

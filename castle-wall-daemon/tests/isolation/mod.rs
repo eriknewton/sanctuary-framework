@@ -91,7 +91,7 @@ pub fn write_ahead_receipt_for(
     castle_wall_daemon::ownership_journal::WriteAheadReceipt::for_isolated_test(binding.agent_uid)
 }
 
-pub fn guard() -> MutexGuard<'static, ()> {
+pub fn guard() -> SuiteGuard {
     let lock = SUITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let iso = isolated();
     assert!(
@@ -138,7 +138,135 @@ pub fn guard() -> MutexGuard<'static, ()> {
     let _ = std::process::Command::new("nft")
         .args(["delete", "table", nftables::CASTLE_FAMILY, iso.table])
         .output();
-    lock
+    SuiteGuard { _lock: lock }
+}
+
+/// The suite lock plus the end-of-test teardown of this run's kernel state.
+///
+/// Holding it serializes the binary (see [`SUITE_LOCK`]); dropping it, on a
+/// passing return AND on a panic unwind, removes the isolated table and then
+/// refuses any leftover kernel object named for this run.
+///
+/// Why the teardown exists: the entry sweep in [`guard`] cleaned up after a test
+/// only when ANOTHER test in the same binary started. The LAST test of a binary
+/// therefore left its table in the kernel until the workflow's final cleanup
+/// step, and a test that drives a refusal arm leaves the deny-all safety net
+/// there (`policy drop` on the inet output hook). Failure mode: every later
+/// step on the same runner loses DNS, and the next network step fails with
+/// `getaddrinfo EAI_AGAIN`, which reads as GitHub weather rather than as a test
+/// that did not clean up.
+pub struct SuiteGuard {
+    /// Fields drop only after `Drop::drop` returns, so the lock is still held
+    /// while the teardown sweeps: the next test cannot start against a table this
+    /// one still owns.
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for SuiteGuard {
+    fn drop(&mut self) {
+        let iso = isolated();
+        // The net goes in `castle_table()` (src/nftables.rs
+        // `install_deny_all_safety_net`), which this run pinned to `iso.table`
+        // through `use_isolated_castle_table`, so deleting that one name removes
+        // an owned wall and a safety net alike. Must match the name
+        // `castle_table()` resolves in src/nftables.rs; `guard` asserts the
+        // production name is never resolved, so this never names the operator's
+        // table.
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", nftables::CASTLE_FAMILY, iso.table])
+            .output();
+        // A leftover after the sweep is a TEST FAILURE, never a second silent
+        // sweep: a table the sweep could not remove, or one named for this run
+        // that the sweep does not own, is exactly the state that took the
+        // runner's DNS down, and it must name itself where it happened.
+        if let Err(report) = leftover_kernel_state() {
+            if std::thread::panicking() {
+                // A second panic during an unwind aborts the process and loses the
+                // original failure; report beside it instead.
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
+        }
+    }
+}
+
+/// Must match `EXPECT_PRIVILEGED_ENV` in the privileged suites and the
+/// `SANCTUARY_EXPECT_PRIVILEGED_LINUX` env in `.github/workflows/castle-wall-linux.yml`.
+const EXPECT_PRIVILEGED_ENV: &str = "SANCTUARY_EXPECT_PRIVILEGED_LINUX";
+
+/// Every kernel table this run could have created: this run's isolated table and
+/// any `<isolated table>-<suffix>` beside it. The trailing `-` keeps a different
+/// process's tag that merely starts with this one's hex (pid `2b3` vs `2b30`)
+/// out of the match. The production `sanctuary-castle` table is deliberately NOT
+/// matched: [`guard`] asserts no test in this binary resolves it, and on an
+/// operator's host it is live enforcement this suite must never touch.
+/// The workflow step `Refuse leftover kernel state before the upload` in
+/// `.github/workflows/castle-wall-linux.yml` refuses the wider `sanctuary-castle*`
+/// family across the whole run; must match that step's patterns.
+fn names_this_run(name: &str, table: &str) -> bool {
+    name == table
+        || name
+            .strip_prefix(table)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// Refuse kernel state this run left behind: `Err` names each leftover table and
+/// carries the whole ruleset, after deleting the leftovers so a failed test does
+/// not ALSO take the runner's DNS down for every later step.
+///
+/// A ruleset that cannot be read is indeterminate. Under the privileged contract
+/// ([`EXPECT_PRIVILEGED_ENV`]) that is a failure, never a pass; on an ad-hoc
+/// unprivileged host (or one with no `nft`) the suite could not have created a
+/// table either, so there is nothing to refuse.
+pub fn leftover_kernel_state() -> Result<(), String> {
+    let table = isolated().table;
+    let listed = std::process::Command::new("nft")
+        .args(["list", "tables"])
+        .output();
+    let listing = match listed {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        other => {
+            if std::env::var_os(EXPECT_PRIVILEGED_ENV).is_some() {
+                return Err(format!(
+                    "leftover kernel state check: `nft list tables` could not be read under \
+                     {EXPECT_PRIVILEGED_ENV}; an unreadable ruleset is not a clean one: {other:?}"
+                ));
+            }
+            return Ok(());
+        }
+    };
+    // `nft list tables` prints one `table <family> <name>` line per table.
+    let leftovers: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("table"), Some(family), Some(name)) if names_this_run(name, table) => {
+                    Some((family.to_string(), name.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    let ruleset = std::process::Command::new("nft")
+        .args(["list", "ruleset"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_else(|err| format!("<`nft list ruleset` failed: {err}>"));
+    for (family, name) in &leftovers {
+        let _ = std::process::Command::new("nft")
+            .args(["delete", "table", family, name])
+            .output();
+    }
+    Err(format!(
+        "leftover kernel state after the isolation teardown: {leftovers:?} survived the \
+         sweep of `{table}` (deleted now so later steps keep their network). A test left \
+         kernel state behind; the ruleset at teardown was:\n{ruleset}"
+    ))
 }
 
 /// The isolated host-global paths a `DaemonConfig` in this suite must carry.
