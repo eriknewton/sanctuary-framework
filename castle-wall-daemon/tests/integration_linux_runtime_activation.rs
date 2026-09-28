@@ -2955,7 +2955,17 @@ fn tb9_the_real_verbs_admit_only_the_bound_uid_and_refuse_by_name() {
             nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
             Ok(true)
         ),
-        "the stop-time pass must have installed the net naming U (daemon exit {status:?})"
+        "the stop-time pass must have installed a recognised net (daemon exit {status:?})"
+    );
+    // `live_net_covers_attempt` is also true for the HOST-WIDE net, which drops
+    // every uid on the host. Require the IDENTITY shape: a rule carrying the
+    // identity comment whose skuid scope is exactly {U}. A host-wide net has no
+    // such rule, so this reads empty and fails.
+    assert_eq!(
+        installed_net_rule_one_uids(),
+        vec![TEST_AGENT_UID],
+        "the stop-time net must be the identity net naming exactly U, never host-wide \
+         (daemon exit {status:?})"
     );
     tb9_assert(
         &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
@@ -3186,11 +3196,40 @@ mod tb10_agent_unit_against_real_systemd {
         }
     }
 
+    impl Tb10Units {
+        /// Stop every unit in `stop_order` and wait until each is inactive or
+        /// failed. Returns the units that are STILL PRESENT (stop refused, or
+        /// still running after the bound). Order matters to the caller: the
+        /// isolated table may be deleted only after this returns empty, or a
+        /// still-running daemon unit can recreate it after the delete.
+        pub(super) fn stop_all(&self) -> Vec<String> {
+            let mut still_present = Vec::new();
+            for unit in &self.stop_order {
+                let stopped = systemctl(&["stop", unit]).status.success();
+                // Bound: the longest TimeoutStopSec of these units (10 s, the
+                // shipped agent's and wall's) plus scheduling slack.
+                let settled = wait_until(Duration::from_secs(10) + SLACK, || {
+                    let state = prop(unit, "ActiveState");
+                    state == "inactive" || state == "failed"
+                });
+                if !stopped || !settled {
+                    still_present.push(format!(
+                        "{unit} (stop ok={stopped}, ActiveState={})",
+                        prop(unit, "ActiveState")
+                    ));
+                }
+                let _ = systemctl(&["reset-failed", unit]);
+            }
+            still_present
+        }
+    }
+
     impl Drop for Tb10Units {
         fn drop(&mut self) {
-            for unit in &self.stop_order {
-                let _ = systemctl(&["stop", unit]);
-                let _ = systemctl(&["reset-failed", unit]);
+            // Not ignored: a unit that did not stop is reported, because the
+            // test's kernel-state guard deletes the isolated table after this.
+            for unit in self.stop_all() {
+                eprintln!("TB10 teardown: STILL PRESENT after stop: {unit}");
             }
             for file in &self.files {
                 let _ = std::fs::remove_file(file);
@@ -3725,6 +3764,9 @@ mod tb10_agent_unit_against_real_systemd {
             Ok(account) => account,
             Err(reason) => panic!("(ix) could not provision the agent account: {reason}"),
         };
+        // Declared BEFORE the units so the wall's policy, key and WAL outlive
+        // its stop (locals drop in reverse order).
+        let state = TempDir::new().unwrap();
         let mut units = Tb10Units::new();
         let tag = units.tag.clone();
         let d = units.dir.path().display().to_string();
@@ -3736,8 +3778,8 @@ mod tb10_agent_unit_against_real_systemd {
                 .expect("0755 binary");
         }
         let bin = binary.display().to_string();
-        // Daemon state in its own 0700 root dir (the scratch dir is 0777).
-        let state = TempDir::new().unwrap();
+        // Daemon state lives in `state`, its own 0700 root dir (the scratch
+        // dir is 0777).
         let signing = SigningKey::generate(&mut OsRng);
         let pinned = write_pinned_key(&state, &signing);
         write_confining_manifest(state.path(), &signing);
@@ -3837,6 +3879,13 @@ mod tb10_agent_unit_against_real_systemd {
                 "agent_credential_check=match uid={TEST_AGENT_UID}"
             )),
             "(ix) the credential check must have matched as the instance"
+        );
+        // Stop the agent and the isolated wall and prove both inactive BEFORE
+        // `_kernel` deletes the isolated table.
+        let still_present = units.stop_all();
+        assert!(
+            still_present.is_empty(),
+            "(ix) STILL PRESENT after stop: {still_present:?}"
         );
     }
 }

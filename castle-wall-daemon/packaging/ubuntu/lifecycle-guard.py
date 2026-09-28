@@ -323,10 +323,14 @@ def systemd_files(installed):
                 if info is None:
                     refuse("systemd path changed during inventory")
                 relevant = name == UNIT_NAME or name == UNIT_NAME + ".d"
-                # Agent rules: the package's template is the ONLY agent entry
-                # allowed anywhere. A template or instance drop-in directory, an
-                # alternate fragment, an alias or an instance enablement symlink
-                # would change what the agent unit runs, or start it at boot.
+                # Agent rules: the package's template is the ONLY entry named
+                # `sanctuary-agent@...` allowed anywhere. A template or instance
+                # drop-in directory, an alternate fragment or an instance
+                # enablement symlink would change what the agent unit runs, or
+                # start it at boot. BOUND: the prefix drop-in
+                # `sanctuary-.service.d/` and the top-level `service.d/` also
+                # apply to agent instances and are NOT refused here; host
+                # acceptance checks the unit's DropInPaths instead (README).
                 if name.startswith(AGENT_UNIT_PREFIX) and path != AGENT_UNIT_PATH:
                     if name.endswith(".service.d"):
                         refuse(f"agent unit drop-in directory present: {path}")

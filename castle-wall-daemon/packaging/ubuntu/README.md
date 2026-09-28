@@ -31,9 +31,18 @@ and rechecks full absence before reinstall. Hooks never do those actions.
 
 The package also ships `/etc/systemd/system/sanctuary-agent@.service`, a
 template whose instance name is the agent's numeric uid. It has no `[Install]`
-section, so nothing enables or starts it; the guard refuses any agent drop-in,
-alternate fragment, alias or instance enablement symlink, and refuses any
-package operation while an agent instance is active or transitioning. The
+section, so nothing enables or starts it. In every systemd unit root the guard
+refuses any entry whose name starts with `sanctuary-agent@` other than the
+packaged template itself (the template drop-in directory
+`sanctuary-agent@.service.d/`, an instance drop-in directory such as
+`sanctuary-agent@<uid>.service.d/`, an alternate fragment, an instance
+enablement symlink) and any symlink whose target names `sanctuary-agent@`. It
+also refuses any package operation while an agent instance is active or
+transitioning. Two drop-in directories that systemd also applies to every agent
+instance are outside the guard's scope: the prefix drop-in
+`sanctuary-.service.d/` and the top-level `service.d/` (distributions ship files
+there, so it cannot be refused wholesale). Host acceptance checks them instead:
+the agent unit's `DropInPaths` must be empty. The
 package does not ship the agent executable
 (`/usr/local/libexec/sanctuary/protected-agent-v1`); an instance whose
 executable is absent fails with 203/EXEC and no agent process runs.
