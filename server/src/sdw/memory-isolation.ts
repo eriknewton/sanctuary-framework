@@ -176,16 +176,20 @@ export type SdwOwnerPinCheckResult =
   | { readonly allowed: false; readonly reason: IsolationRefusalReason };
 
 /**
- * Shared owner-pin check-or-establish rule. Both callers below MUST route
+ * Shared owner-pin check-or-establish rule. Every caller below MUST route
  * through this one function so a fresh store can only ever be established
  * once, by whichever caller writes first, under one shared rule:
  *   - `createPersistentMultiAgentIsolationGuard` (this file), the per-MCP-call
  *     guard, calls it with the wrap-time `SANCTUARY_AGENT_ID`.
- *   - `runMemoryIngestCommand` in `server/src/cli/memory-file.ts` calls it
- *     directly (must match the import there) with the CLI's resolved agent
- *     id, so a CLI-first write on a fresh fortress establishes the SAME pin
- *     the MCP guard would have, instead of leaving the store established with
- *     no pin (STEP1-F1: that drift left every later MCP read refused with
+ *   - `runMemoryIngestCommand`, `runMemoryEmitCommand`, `runMemoryTranscodeCommand`
+ *     and `runMemoryTranscodeRestoreCommand` in `server/src/cli/memory-file.ts`
+ *     (must match the import there) all call it with the CLI's resolved
+ *     wrap-time agent id, so a CLI-first write on a fresh fortress, through
+ *     ANY of the four verbs, establishes the SAME pin the MCP guard would
+ *     have, instead of leaving the store established with no pin (STEP1-F1
+ *     covered `memory_ingest`; STEP1-F2 extended the same rule to the other
+ *     three so the drift could not recur through a sibling path: that drift
+ *     left every later MCP read refused with
  *     `owner_pin_missing_after_establishment` until a manual `sdw-owner
  *     claim`).
  * An empty SDW scope is claimed through atomic create-if-absent; a used
@@ -242,9 +246,12 @@ export type SdwOwnerPinPrecheckResult =
  * own authorization gate has not run yet (STEP1-F1 fix round 1: the pin must
  * never be created before Tier-1 approval, AGENTS.md #3 "no irreversible
  * operation without a confirmation gate"). NEVER calls
- * `createSdwOwnerPinIfAbsent` or otherwise writes. `runMemoryIngestCommand`
- * (`server/src/cli/memory-file.ts`) calls this BEFORE the approval dialog, so
- * an already-decidable refusal (a different agent's pin, or a used-but-unpinned
+ * `createSdwOwnerPinIfAbsent` or otherwise writes. All four memory-file CLI
+ * verbs in `server/src/cli/memory-file.ts` (`runMemoryIngestCommand`,
+ * `runMemoryEmitCommand`, `runMemoryTranscodeCommand`,
+ * `runMemoryTranscodeRestoreCommand`; STEP1-F1 wired the first, STEP1-F2 the
+ * other three) call this BEFORE their own approval dialog, so an
+ * already-decidable refusal (a different agent's pin, or a used-but-unpinned
  * legacy store) never bothers the operator; a genuinely fresh, untouched store
  * reports "fresh" and establishment is deferred to `checkOrEstablishSdwOwnerPin`,
  * run only from inside that caller's OWN approved branch.

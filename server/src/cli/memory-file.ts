@@ -38,6 +38,7 @@ import {
   checkOrEstablishSdwOwnerPin,
   precheckSdwOwnerPin,
   type IsolationRefusalReason,
+  type SdwOwnerPinPrecheckResult,
 } from "../sdw/memory-isolation.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
@@ -98,8 +99,14 @@ const DEFAULT_OWNER_REF = "fleet-self";
  * ingest silently pin a fresh fortress to a principal no wrapped MCP server
  * can ever be — the exact lockout STEP1-F1 was meant to remove, just moved
  * one step over. `undefined`/empty is a hard refusal (see the caller).
+ *
+ * STEP1-F2: shared by every CLI verb that touches the SDW owner-pin rule
+ * (`memory_ingest`, `memory_emit`, `memory_transcode`,
+ * `memory_transcode_restore`), not just ingest — the wrap-time identity is
+ * the same for all four verbs run inside the same wrapped harness process,
+ * so there is exactly one resolver, never a per-verb copy.
  */
-function resolveCliIngestAgentId(env: NodeJS.ProcessEnv): string | undefined {
+function resolveCliMemoryAgentId(env: NodeJS.ProcessEnv): string | undefined {
   const wrapped = env.SANCTUARY_AGENT_ID;
   return wrapped !== undefined && wrapped.length > 0 ? wrapped : undefined;
 }
@@ -123,24 +130,29 @@ function sdwOwnerClaimCommand(agentId: string, fortress: string | undefined): st
 // fix round 2 (Claude N1): also names `sdw-owner status`, the only way to
 // learn the id an already-pinned store requires; `sdw-owner claim` alone only
 // helps a store nothing has pinned yet.
-function noWrappedAgentIdMessage(fortress: string | undefined): string {
+// STEP1-F2: `command` is the exact CLI verb name printed as the message
+// prefix (e.g. "memory_ingest", "memory_emit") so the four callers below
+// share one function instead of four near-identical copies drifting apart.
+function noWrappedAgentIdMessage(fortress: string | undefined, command: string): string {
   return (
-    "memory_ingest: refused (owner_identity_missing) - set SANCTUARY_AGENT_ID to the wrapped harness id.\n" +
-    `memory_ingest: run '${sdwOwnerStatusCommand(fortress)}' to see the required id if this store is already pinned, ` +
+    `${command}: refused (owner_identity_missing) - set SANCTUARY_AGENT_ID to the wrapped harness id.\n` +
+    `${command}: run '${sdwOwnerStatusCommand(fortress)}' to see the required id if this store is already pinned, ` +
     `or '${sdwOwnerClaimCommand("<your wrapped harness id>", fortress)}' to claim a fresh one.\n`
   );
 }
 
 /**
- * Operator-facing text for an owner-pin refusal, printed to stderr before
- * ingest returns 1. Never invents a new reason string: the refusal `reason`
+ * Operator-facing text for an owner-pin refusal, printed to stderr before the
+ * verb returns 1. Never invents a new reason string: the refusal `reason`
  * itself is the guard's own (STEP1-F1 constraint: reuse the MCP guard's
- * reasons verbatim). This only adds the remediation command.
+ * reasons verbatim). This only adds the remediation command. `command` is the
+ * printed message prefix (STEP1-F2: shared by all four CLI verbs, never a
+ * copy per verb).
  *
- * `owner_identity_missing` is UNREACHABLE through this function: the caller
+ * `owner_identity_missing` is UNREACHABLE through this function: every caller
  * refuses that case itself, before ever calling `precheckSdwOwnerPin` or
  * `checkOrEstablishSdwOwnerPin` (see `noWrappedAgentIdMessage` above and its
- * call site), so neither of those ever returns it to here. The arm is kept
+ * call sites), so neither of those ever returns it to here. The arm is kept
  * only so this switch stays exhaustive over `IsolationRefusalReason` (the MCP
  * guard's own inline identity check still produces it there).
  */
@@ -148,27 +160,28 @@ function describeOwnerPinRefusal(
   reason: IsolationRefusalReason,
   agentId: string,
   fortress: string | undefined,
+  command: string,
 ): string {
   switch (reason) {
     case "owner_pin_missing_after_establishment":
       return (
-        `memory_ingest: refused (${reason}) - this SDW store already has passages but no owner pin.\n` +
-        `memory_ingest: run '${sdwOwnerClaimCommand(agentId, fortress)}' to claim it, then re-run.\n`
+        `${command}: refused (${reason}) - this SDW store already has passages but no owner pin.\n` +
+        `${command}: run '${sdwOwnerClaimCommand(agentId, fortress)}' to claim it, then re-run.\n`
       );
     case "owner_scope_conflict":
       // fix round 2 (Claude N1): name `sdw-owner status`, the only way to
       // learn the pinned id — this is the message an operator who set the
       // WRONG SANCTUARY_AGENT_ID sees, so it must say how to find the right one.
       return (
-        `memory_ingest: refused (${reason}) - this SDW store is pinned to a different agent id than ${agentId}.\n` +
-        `memory_ingest: run '${sdwOwnerStatusCommand(fortress)}' to see the required id.\n`
+        `${command}: refused (${reason}) - this SDW store is pinned to a different agent id than ${agentId}.\n` +
+        `${command}: run '${sdwOwnerStatusCommand(fortress)}' to see the required id.\n`
       );
     case "owner_pin_invalid":
     case "owner_pin_backend_unsupported":
     case "owner_pin_io_error":
-      return `memory_ingest: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
+      return `${command}: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
     case "owner_identity_missing":
-      return noWrappedAgentIdMessage(fortress);
+      return noWrappedAgentIdMessage(fortress, command);
   }
 }
 
@@ -250,9 +263,9 @@ export async function runMemoryIngestCommand(
     // STEP1-F1: no wrap-time identity, no ingest. Refuse before ever touching
     // the pin machinery or showing the approval dialog (fix round 1, Claude
     // F3 / Grok finding 1: there is no synthetic fallback principal here).
-    const cliIngestAgentId = resolveCliIngestAgentId(env);
+    const cliIngestAgentId = resolveCliMemoryAgentId(env);
     if (cliIngestAgentId === undefined) {
-      write(err, noWrappedAgentIdMessage(parsed.fortress));
+      write(err, noWrappedAgentIdMessage(parsed.fortress, "memory_ingest"));
       await appendFailure(boot.auditLog, "memory_ingest", {
         harness: parsed.harness,
         owner_ref: parsed.ownerRef,
@@ -276,7 +289,7 @@ export async function runMemoryIngestCommand(
       agentId: cliIngestAgentId,
     });
     if (ownerPinPrecheck.status === "refuse") {
-      write(err, describeOwnerPinRefusal(ownerPinPrecheck.reason, cliIngestAgentId, parsed.fortress));
+      write(err, describeOwnerPinRefusal(ownerPinPrecheck.reason, cliIngestAgentId, parsed.fortress, "memory_ingest"));
       await appendFailure(boot.auditLog, "memory_ingest", {
         harness: parsed.harness,
         owner_ref: parsed.ownerRef,
@@ -361,7 +374,7 @@ export async function runMemoryIngestCommand(
             // policy" line below, which would misreport an owner-pin failure
             // as a policy failure.
             ownerPinRaceRefusal = established.reason;
-            write(err, describeOwnerPinRefusal(established.reason, cliIngestAgentId, parsed.fortress));
+            write(err, describeOwnerPinRefusal(established.reason, cliIngestAgentId, parsed.fortress, "memory_ingest"));
             await appendFailure(boot.auditLog, "memory_ingest", {
               harness: parsed.harness,
               owner_ref: parsed.ownerRef,
@@ -443,6 +456,97 @@ export async function runMemoryIngestCommand(
   }
 }
 
+/** The three plaintext-materializing CLI verbs the owner-pin gate below
+ * applies to, besides `memory_ingest` (which inlines its own copy of this
+ * same two-step shape because its establishment sits inside a service
+ * `authorize` callback, not a flat sequence — see `runMemoryIngestCommand`). */
+type OwnerPinGatedCommand = "memory_emit" | "memory_transcode" | "memory_transcode_restore";
+
+interface OwnerPinGateResult {
+  readonly agentId: string;
+  readonly precheck: SdwOwnerPinPrecheckResult;
+}
+
+/**
+ * STEP1-F2: shared pre-approval half of the SAME owner-pin rule
+ * `memory_ingest` applies (STEP1-F1) — the MCP persistent guard and all four
+ * CLI verbs must reach one custody decision for the shared `fleet-self`
+ * scope, never a per-verb copy (module doc above: "Read paths and bulk
+ * plaintext export paths are the same custody question"). Resolves the
+ * wrap-time identity, then runs the READ-ONLY precheck before the Tier-1
+ * approval dialog, so an already-decidable refusal (pinned to a different
+ * agent, or a used-but-unpinned legacy store) never bothers the operator or
+ * writes anything. On refusal this writes the message and the audit denial
+ * itself and returns null; the caller just propagates a `return 1`.
+ */
+async function precheckOwnerPinOrRefuse(
+  boot: BootstrappedMemoryFileCommand,
+  env: NodeJS.ProcessEnv,
+  parsed: ParsedVaultArgs,
+  command: OwnerPinGatedCommand,
+  err: Writable,
+): Promise<OwnerPinGateResult | null> {
+  const agentId = resolveCliMemoryAgentId(env);
+  if (agentId === undefined) {
+    write(err, noWrappedAgentIdMessage(parsed.fortress, command));
+    await appendFailure(boot.auditLog, command, {
+      owner_ref: parsed.ownerRef,
+      denial_class: "owner_identity_missing",
+    });
+    return null;
+  }
+  const precheck = await precheckSdwOwnerPin({
+    storage: boot.storage,
+    masterKey: boot.masterKey,
+    fortressId: boot.fortressId,
+    ownerRef: parsed.ownerRef,
+    agentId,
+  });
+  if (precheck.status === "refuse") {
+    write(err, describeOwnerPinRefusal(precheck.reason, agentId, parsed.fortress, command));
+    await appendFailure(boot.auditLog, command, {
+      owner_ref: parsed.ownerRef,
+      denial_class: precheck.reason,
+    });
+    return null;
+  }
+  return { agentId, precheck };
+}
+
+/**
+ * Post-approval half of the same gate: establishes the pin ONLY if the
+ * precheck above found nothing pinned yet ("fresh"), and only from inside the
+ * caller's OWN approved branch — a denied dialog must leave the store exactly
+ * as it found it, same as `memory_ingest`'s `authorize` establishment step
+ * (STEP1-F1 fix round 1). Must run before any plaintext is read from or
+ * written into the vault by the caller. Returns true on success; on a lost
+ * race with a concurrent first writer it writes the refusal and its own audit
+ * denial row (never the generic policy-denied message) and returns false.
+ */
+async function establishOwnerPinAfterApproval(
+  boot: BootstrappedMemoryFileCommand,
+  gate: OwnerPinGateResult,
+  parsed: ParsedVaultArgs,
+  command: OwnerPinGatedCommand,
+  err: Writable,
+): Promise<boolean> {
+  if (gate.precheck.status !== "fresh") return true;
+  const established = await checkOrEstablishSdwOwnerPin({
+    storage: boot.storage,
+    masterKey: boot.masterKey,
+    fortressId: boot.fortressId,
+    ownerRef: parsed.ownerRef,
+    agentId: gate.agentId,
+  });
+  if (established.allowed) return true;
+  write(err, describeOwnerPinRefusal(established.reason, gate.agentId, parsed.fortress, command));
+  await appendFailure(boot.auditLog, command, {
+    owner_ref: parsed.ownerRef,
+    denial_class: established.reason,
+  });
+  return false;
+}
+
 export async function runMemoryEmitCommand(
   args: MemoryFileCommandArgs,
 ): Promise<number> {
@@ -464,6 +568,13 @@ export async function runMemoryEmitCommand(
   if (!boot) return 1;
 
   try {
+    // STEP1-F2: same owner-pin custody question memory_ingest answers before
+    // its approval dialog (STEP1-F1) — memory_emit materializes vault content
+    // as plaintext on disk, so it is one of the "bulk plaintext export paths"
+    // the module doc on memory-isolation.ts names as sharing this rule.
+    const ownerPinGate = await precheckOwnerPinOrRefuse(boot, env, parsed, "memory_emit", err);
+    if (ownerPinGate === null) return 1;
+
     const decision = await new ApprovalGate(
       await loadPrincipalPolicy(boot.fortressPath),
       boot.baseline,
@@ -477,6 +588,12 @@ export async function runMemoryEmitCommand(
     });
     if (!decision.allowed || !decision.approval_audit_id) {
       write(err, "Denied: plaintext memory emission was not approved by the local operator.\n");
+      return 1;
+    }
+    // Establish the pin only now that this exact request is approved (never
+    // before, same as memory_ingest: a denied dialog leaves the store exactly
+    // as it found it), and before any plaintext is read from the vault below.
+    if (!(await establishOwnerPinAfterApproval(boot, ownerPinGate, parsed, "memory_emit", err))) {
       return 1;
     }
     // Write-ahead INTENT, durable before any plaintext file is materialized
@@ -569,6 +686,12 @@ export async function runMemoryTranscodeCommand(
   if (!boot) return 1;
 
   try {
+    // STEP1-F2: same owner-pin custody question memory_ingest answers before
+    // its approval dialog (STEP1-F1) — memory_transcode reads the SDW vault
+    // and materializes a plaintext projection on disk.
+    const ownerPinGate = await precheckOwnerPinOrRefuse(boot, env, parsed, "memory_transcode", err);
+    if (ownerPinGate === null) return 1;
+
     const decision = await new ApprovalGate(
       await loadPrincipalPolicy(boot.fortressPath),
       boot.baseline,
@@ -583,6 +706,12 @@ export async function runMemoryTranscodeCommand(
     });
     if (!decision.allowed || !decision.approval_audit_id) {
       write(err, "Denied: plaintext memory transcode was not approved by the local operator.\n");
+      return 1;
+    }
+    // Establish the pin only now that this exact request is approved, and
+    // before any vault content is read below (same discipline as memory_emit
+    // and memory_ingest).
+    if (!(await establishOwnerPinAfterApproval(boot, ownerPinGate, parsed, "memory_transcode", err))) {
       return 1;
     }
     await boot.auditLog.appendCritical({
@@ -687,6 +816,12 @@ export async function runMemoryTranscodeRestoreCommand(
   if (!boot) return 1;
 
   try {
+    // STEP1-F2: same owner-pin custody question memory_ingest answers before
+    // its approval dialog (STEP1-F1) — memory_transcode_restore materializes
+    // exact plaintext source files from an encrypted archive onto disk.
+    const ownerPinGate = await precheckOwnerPinOrRefuse(boot, env, parsed, "memory_transcode_restore", err);
+    if (ownerPinGate === null) return 1;
+
     const decision = await new ApprovalGate(
       await loadPrincipalPolicy(boot.fortressPath),
       boot.baseline,
@@ -700,6 +835,11 @@ export async function runMemoryTranscodeRestoreCommand(
     });
     if (!decision.allowed || !decision.approval_audit_id) {
       write(err, "Denied: plaintext memory transcode restore was not approved by the local operator.\n");
+      return 1;
+    }
+    // Establish the pin only now that this exact request is approved, and
+    // before the archive is read below.
+    if (!(await establishOwnerPinAfterApproval(boot, ownerPinGate, parsed, "memory_transcode_restore", err))) {
       return 1;
     }
     await boot.auditLog.appendCritical({
