@@ -30,8 +30,8 @@ use castle_wall_daemon::protected_agent::owner;
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime,
-    force_next_reclaim_owned_probe_error_for_test, DisarmOutcome, LinuxRuntimeConfig,
-    NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
+    force_next_journal_establish_error_for_test, force_next_reclaim_owned_probe_error_for_test,
+    DisarmOutcome, LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -1317,6 +1317,263 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     drop(component);
 }
 
+/// The journal file's inode and its authenticated record. Every successful store
+/// renames a new inode into place, so an unchanged inode proves no write happened.
+fn journal_inode_and_record(cfg: &LinuxRuntimeConfig) -> (u64, OwnershipJournal) {
+    use std::os::unix::fs::MetadataExt;
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let inode = std::fs::metadata(&cfg.journal_path)
+        .expect("the journal is present")
+        .ino();
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("the journal authenticates")
+        .expect("the journal is present");
+    (inode, record)
+}
+
+/// Delete the owned table externally and poll `health()` to the completed loss, in
+/// the `gf1_3` shape (8 polls at 600 ms, a 4.8 s ceiling above the 500 ms
+/// `NFT_HEALTH_MIN_INTERVAL`).
+fn lose_the_owned_table(component: &dyn AcquiredComponent) {
+    let deleted = Command::new("nft")
+        .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("delete the owned table");
+    assert!(deleted.status.success(), "external delete must succeed");
+    let mut became_lost = false;
+    for _ in 0..8 {
+        if matches!(component.health(), ComponentHealth::Lost) {
+            became_lost = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    assert!(
+        became_lost,
+        "health() must report the completed loss as Lost"
+    );
+}
+
+// T-W1 (LINUX-JOURNAL-OWNED-WRITERS-01), wired consumer: the post-READY journal
+// write reached through the REAL acquisition (the proof token is built at its real
+// site inside `acquire`) and the real recovery controller.
+//
+// (a) STALE: a MAC-valid `Owned` record for ANOTHER activation (a different marker,
+// same boot, source and handles), planted AFTER the acquisition, is refused by the
+// post-READY write: the net still goes in, and the journal's inode and record are
+// exactly the planted ones. (b) FRESH, the next test: with no plant, the same write
+// happens (the inode changes and the record is still `Owned` for the component's
+// activation), so (a)'s refusal is not a dead writer.
+#[test]
+fn tw1a_the_post_ready_journal_write_refuses_another_activations_record() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    // (a) STALE.
+    {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let paths = isolation::runtime_paths();
+        let cfg = config(&paths, policy_dir.path());
+        let component =
+            acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+        // Plant only now: planting before the acquisition would route `decide` to
+        // another arm and fail the acquisition for the wrong reason.
+        let (_, acquired) = journal_inode_and_record(&cfg);
+        let OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } = acquired
+        else {
+            panic!("the acquisition wrote an Owned record");
+        };
+        let planted = OwnershipJournal::owned_with_known_history(
+            JournalIdentity {
+                marker: format!("{OWNER_MARKER_PREFIX}{}", "b".repeat(32)),
+                ..identity.clone()
+            },
+            table_handle,
+            base_chain_handle,
+            Vec::new(),
+        )
+        .expect("empty history");
+        assert_ne!(
+            planted,
+            acquired_record(&identity, table_handle, base_chain_handle),
+            "the plant is another activation"
+        );
+        let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+        journal::store_atomic(&cfg.journal_path, &planted, &key)
+            .expect("plant another activation's record");
+        let (planted_inode, _) = journal_inode_and_record(&cfg);
+
+        lose_the_owned_table(component.as_ref());
+        let result = component.attempt_post_ready_recovery(&|| false);
+        assert!(
+            result.holds_gate(),
+            "the net goes in whatever the journal write does"
+        );
+        let (inode, record) = journal_inode_and_record(&cfg);
+        assert_eq!(
+            inode, planted_inode,
+            "the post-READY write into another activation's record was refused"
+        );
+        assert_eq!(record, planted, "the planted record is exactly as planted");
+        drop(component);
+    }
+}
+
+// T-W1 (b) FRESH, the positive control for (a): see the comment above (a).
+#[test]
+fn tw1b_the_post_ready_journal_write_happens_for_the_components_own_activation() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let paths = isolation::runtime_paths();
+        let cfg = config(&paths, policy_dir.path());
+        let component =
+            acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+        let (acquired_inode, acquired) = journal_inode_and_record(&cfg);
+        lose_the_owned_table(component.as_ref());
+        assert!(component
+            .attempt_post_ready_recovery(&|| false)
+            .holds_gate());
+        let (inode, record) = journal_inode_and_record(&cfg);
+        assert_ne!(
+            inode, acquired_inode,
+            "the post-READY write happened for the component's own activation"
+        );
+        let same_activation = |r: &OwnershipJournal| match r {
+            OwnershipJournal::Owned {
+                identity,
+                table_handle,
+                base_chain_handle,
+                ..
+            } => Some((identity.clone(), *table_handle, *base_chain_handle)),
+            OwnershipJournal::Preparing { .. } => None,
+        };
+        assert_eq!(
+            same_activation(&record),
+            same_activation(&acquired),
+            "the record is still Owned for the component's activation"
+        );
+        drop(component);
+    }
+}
+
+// LINUX-JOURNAL-OWNED-WRITERS-01, code-gate round 1: a failure to build the
+// journal's proof token AFTER the table was proven ours is a slice-A refusal, and it
+// takes the net-on-refusal rule like every other one. On a ReclaimOwned start whose
+// journal names a uid confined earlier in this boot whose jump is gone, a failed
+// `establish` installs the IDENTITY-scoped net naming that uid and refuses readiness;
+// it never returns a bare acquisition failure that leaves the reclaimed table's
+// `policy accept` in force.
+#[test]
+fn an_establish_failure_after_reclaim_installs_the_identity_scoped_net() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    // A uid confined earlier in this boot; its per-agent jump never exists on the
+    // reclaimed table, which is the "jump gone" state.
+    const GONE_UID: u32 = 60177;
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    // 1) A real owned table and journal, then an ordinary release: the table and its
+    //    journal survive for the next start to reclaim.
+    let component =
+        acquire_castle_table_component_for_test(&cfg).expect("fresh acquire an owned table");
+    let (_, acquired) = journal_inode_and_record(&cfg);
+    drop(component);
+    let OwnershipJournal::Owned {
+        identity,
+        table_handle,
+        base_chain_handle,
+        ..
+    } = acquired
+    else {
+        panic!("the acquisition wrote an Owned record");
+    };
+    // 2) This boot's history names GONE_UID.
+    write_owned_journal_with_history(
+        &cfg,
+        &identity.marker,
+        table_handle,
+        base_chain_handle,
+        Some(vec![journal::ConfinedIdentity {
+            uid: GONE_UID,
+            role: journal::ConfinedRole::Agent,
+        }]),
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("accept"));
+
+    // 3) ReclaimOwned, with the proof token forced to fail.
+    let forced = force_next_journal_establish_error_for_test();
+    let result = acquire_castle_table_component_for_test(&cfg);
+    drop(forced);
+    let detail = match result {
+        Err(EnforcementError::AcquireFailed { detail, .. }) => detail,
+        Err(other) => panic!("expected the acquisition refusal class, got {other:?}"),
+        Ok(_) => panic!("a failed proof token must refuse readiness"),
+    };
+    assert!(
+        detail.contains("forced to fail"),
+        "the refusal is the establish failure: {detail}"
+    );
+    assert!(
+        detail.contains("Installed the safety net"),
+        "the establish refusal went through the net-on-refusal rule: {detail}"
+    );
+
+    // 4) The IDENTITY-scoped net is in the kernel and names the gone uid.
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "the safety net replaced the reclaimed accept table"
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert_eq!(
+        live_rule_comments_in_order(),
+        vec![
+            nftables::NET_RULE_COMMENT_IDENTITY.to_string(),
+            nftables::NET_RULE_COMMENT_KERNEL_ND.to_string(),
+            nftables::NET_RULE_COMMENT_OTHERS.to_string(),
+        ],
+        "the identity-scoped shape, not the host-wide one"
+    );
+    assert!(
+        live_table_json()
+            .unwrap_or_default()
+            .contains(&GONE_UID.to_string()),
+        "the net names the uid confined earlier in this boot"
+    );
+}
+
+/// The record the acquisition wrote, rebuilt for comparison (known-empty history:
+/// the test seam admits no confined identity).
+fn acquired_record(
+    identity: &JournalIdentity,
+    table_handle: u64,
+    base_chain_handle: u64,
+) -> OwnershipJournal {
+    OwnershipJournal::owned_with_known_history(
+        identity.clone(),
+        table_handle,
+        base_chain_handle,
+        Vec::new(),
+    )
+    .expect("empty history")
+}
+
 /// Read the exact live isolated-table identity through nft's real JSON output.
 fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
     let output = Command::new("nft")
@@ -1912,4 +2169,126 @@ fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it()
         "adoption re-uses the preserved object rather than replacing it"
     );
     drop(readopted);
+}
+
+// Runner hygiene: the isolation teardown REFUSES a kernel table named for this run
+// that survives its sweep, rather than sweeping it silently, and removes it while
+// refusing so the failure does not also cut the network for every later step (see
+// `isolation::SuiteGuard` for the failure mode this guards). This drives the REAL
+// `Drop` over the real failure shape: the isolated table AND a `-leak` table beside
+// it, each carrying the deny-all net's `policy drop` output hook.
+#[test]
+fn the_isolation_teardown_refuses_a_table_left_behind_for_this_run() {
+    let outer = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let table = isolation::table().to_string();
+    let leaked = format!("{table}-leak");
+    // Declared after `outer`, so it drops FIRST, on success and on any panic below:
+    // this witness plants `policy drop` hooks and must leave none behind even when
+    // the teardown under test is broken. `outer`'s own teardown then runs as well.
+    let _scrub = PlantedTables(vec![table.clone(), leaked.clone()]);
+    for name in [&table, &leaked] {
+        let added = Command::new("nft")
+            .args(["add", "table", CASTLE_FAMILY, name])
+            .output()
+            .expect("run nft add table");
+        assert!(added.status.success(), "plant table {name}");
+        let chain = Command::new("nft")
+            .args([
+                "add",
+                "chain",
+                CASTLE_FAMILY,
+                name,
+                "output",
+                "{ type filter hook output priority filter ; policy drop ; }",
+            ])
+            .output()
+            .expect("run nft add chain");
+        assert!(
+            chain.status.success(),
+            "plant the policy-drop output hook on {name}: {}",
+            String::from_utf8_lossy(&chain.stderr)
+        );
+    }
+    assert!(
+        !loopback_round_trip(),
+        "the planted hooks are the real failure shape: they cut loopback traffic"
+    );
+
+    // The same `Drop` every test runs, while `outer` still holds the suite lock so
+    // no other test can recreate the isolated table before the checks below.
+    let nested = isolation::nested_teardown(&outer);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(nested)));
+    let payload =
+        dropped.expect_err("the teardown must refuse a leftover, never sweep it silently");
+    let report = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        report.contains(&leaked),
+        "the refusal names the leftover table: {report}"
+    );
+    assert!(
+        !report.contains("STILL PRESENT"),
+        "every planted table was removed: {report}"
+    );
+    let tables = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .expect("run nft list tables");
+    let listing = String::from_utf8_lossy(&tables.stdout).into_owned();
+    assert!(
+        tables.status.success()
+            && !listing
+                .lines()
+                .any(|line| line.ends_with(&format!(" {table}"))
+                    || line.ends_with(&format!(" {leaked}"))),
+        "neither planted table survives the teardown: {listing}"
+    );
+    assert!(
+        loopback_round_trip(),
+        "loopback traffic flows again once the teardown has run"
+    );
+}
+
+/// Tables this witness planted, removed on drop whatever the test's outcome.
+struct PlantedTables(Vec<String>);
+
+impl Drop for PlantedTables {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            if let Err(still_present) = isolation::delete_table(CASTLE_FAMILY, name) {
+                eprintln!("witness scrub: {still_present}");
+            }
+        }
+    }
+}
+
+/// Wait for a loopback datagram. Loopback delivery takes well under a millisecond;
+/// 500 ms is the bound past which a `policy drop` output hook is the explanation,
+/// not scheduling.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether one UDP datagram crosses 127.0.0.1. A `policy drop` hook on the inet
+/// output chain drops locally generated loopback packets too, so this reads the
+/// same cut the runner's DNS suffers without depending on any external resolver.
+fn loopback_round_trip() -> bool {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback receiver");
+    receiver
+        .set_read_timeout(Some(LOOPBACK_PROBE_TIMEOUT))
+        .expect("set the probe timeout");
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback sender");
+    let target = receiver.local_addr().expect("receiver address");
+    const PROBE: &[u8] = b"probe";
+    // An output-hook drop can surface as EPERM on the send itself.
+    if sender.send_to(PROBE, target).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; PROBE.len()];
+    matches!(receiver.recv_from(&mut buf), Ok((n, _)) if n == PROBE.len())
 }

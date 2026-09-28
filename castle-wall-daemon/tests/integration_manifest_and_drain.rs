@@ -44,7 +44,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -64,7 +64,7 @@ struct BootedDaemon {
     /// is what serializes this binary's tests against the ONE isolated table,
     /// host lock, and ownership journal they share. Declared last so it is
     /// released only after `handle` (whose `Drop` tears enforcement down) has run.
-    _suite: MutexGuard<'static, ()>,
+    _suite: isolation::SuiteGuard,
 }
 
 /// Build a minimally-valid `AllowlistRule` JSON body whose `id` field
