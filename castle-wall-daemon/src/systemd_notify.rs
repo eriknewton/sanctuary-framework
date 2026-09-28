@@ -623,10 +623,31 @@ mod tests {
         // the macOS receive buffer); 1 s is a policy allowance, not a measurement.
         const FLOOD_PETS: usize = 10_000;
         const FLOOD_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(1);
+        // The socket itself is non-blocking (some kernels answer a full datagram
+        // queue with an error even on a blocking socket, so the timing below
+        // alone cannot tell the two apart there).
+        let fd = std::os::fd::AsRawFd::as_raw_fd(beacon.socket.as_ref().expect("opened"));
+        // SAFETY: F_GETFL on a descriptor this beacon owns and keeps open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && flags & libc::O_NONBLOCK != 0,
+            "the pet socket must be non-blocking"
+        );
+        // The flood runs on its own thread so a blocking pet fails this test by
+        // the allowance instead of hanging the suite.
+        let beacon = std::sync::Arc::new(beacon);
+        let flooding = std::sync::Arc::clone(&beacon);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
-        let dropped = (0..FLOOD_PETS)
-            .filter(|_| beacon.pet() == PetOutcome::Dropped)
-            .count();
+        std::thread::spawn(move || {
+            let dropped = (0..FLOOD_PETS)
+                .filter(|_| flooding.pet() == PetOutcome::Dropped)
+                .count();
+            let _ = done_tx.send(dropped);
+        });
+        let dropped = done_rx
+            .recv_timeout(FLOOD_ALLOWANCE)
+            .unwrap_or_else(|_| panic!("pets blocked past {FLOOD_ALLOWANCE:?}"));
         assert!(
             started.elapsed() < FLOOD_ALLOWANCE,
             "pets blocked: {:?}",
