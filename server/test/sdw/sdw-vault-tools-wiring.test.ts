@@ -65,6 +65,8 @@ import {
 } from "../../src/sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "../../src/sdw/memory-provenance-tool.js";
 import { buildSanctuaryEnv, wrappedAgentId } from "../../src/wrap/cli.js";
+import { createSdwOwnerPinIfAbsent } from "../../src/sdw/write-gate.js";
+import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 
 const SERVER_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -255,6 +257,36 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
     expect((await callTool(server, "sdw_import", { bundle: "AAAA", source_key_ref: "this-fortress" })).denied).toBe(true);
     expect((await auditOps(auditLog, "sdw_import_denied")).map((e) => e.details?.denial_class))
       .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+  });
+
+  it("SDW-OWNER-PIN-AGENT-ID-SHAPE-01: through the production server, a store pinned to a LEGACY id keeps working for that id and the composition root writes ONE legacy audit note", async () => {
+    const storage = new MemoryStorage();
+    process.env.SANCTUARY_AGENT_ID = "cli-ingest";
+    const { server, auditLog, masterKey, config } = await createSanctuaryServer({
+      storage,
+      passphrase: "isolation-legacy-pin-v1",
+    });
+    // A pin written before the shape rule existed, in the exact scope the
+    // production guard checks (fortress id from the storage path, fleet-self).
+    expect(
+      await createSdwOwnerPinIfAbsent(storage, masterKey, {
+        version: 1,
+        fortress_id: fortressIdFromStoragePath(config.storage_path),
+        owner_ref: "fleet-self",
+        agent_id: "cli-ingest",
+        pinned_at: "2026-01-01T00:00:00.000Z",
+      }),
+    ).not.toBe("unsupported");
+    const first = await callTool(server, "memory_count");
+    expect(first.denied).toBeUndefined();
+    expect(first.count).toBe(0);
+    expect((await callTool(server, "memory_count")).count).toBe(0);
+    const notes = await auditOps(auditLog, "sdw_owner_pin_legacy");
+    expect(notes).toHaveLength(1);
+    expect(String(notes[0]!.details?.reason)).toContain("LEGACY SDW owner pin");
+    // A NEW malformed principal still cannot use the store.
+    process.env.SANCTUARY_AGENT_ID = "claude_code:ic16";
+    expect((await callTool(server, "memory_count")).denied).toBe(true);
   });
 
   it("provenance: the gate-time projection refuses a foreign identity before the approval gate, and the handler rechecks", async () => {

@@ -1119,6 +1119,12 @@ function buildConciergePiiFilter(): ConciergePiiFilter {
  * basis for fortress-scoped liveness checks. It is not remote evidence, but it
  * is a local trust anchor for separating one storage-backed fortress from
  * another.
+ *
+ * The 16 hex characters kept here must match
+ * WRAPPED_AGENT_ID_FORTRESS_HEX_LENGTH in `sdw/memory-isolation.ts`: this is
+ * the fortress half of the wrapped harness id (`wrappedAgentId` in
+ * `wrap/cli.ts`), and the SDW owner pin refuses any other length
+ * (`test/sdw/wrapped-agent-id-mint-parity.test.ts` guards the pair).
  */
 export function fortressIdFromStoragePath(storagePath: string): string {
   const digest = createHash("sha256").update(storagePath).digest("hex");

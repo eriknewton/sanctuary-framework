@@ -51,7 +51,8 @@ import {
   readSdwOwnerPin,
 } from "../../src/sdw/memory-isolation.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
-import { writeReplayAnchor } from "../../src/sdw/write-gate.js";
+import { createSdwOwnerPinIfAbsent, writeReplayAnchor } from "../../src/sdw/write-gate.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 const FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/", import.meta.url),
@@ -186,7 +187,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
 
   it("(a) a CLI ingest on a fresh store establishes the pin: the same agent id reads through the MCP guard, a different one is refused", async () => {
     const source = await copyFixtureSet("basic", "memfile-owner-pin-fresh");
-    const agentId = "claude_code:owner-pin-fresh";
+    const agentId = "claude_code:fortress-00000000000a1000";
     const out = makeSink();
     const err = makeSink();
     const code = await runMemoryIngestCommand({
@@ -261,7 +262,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     expect(before).toBe(0);
 
     const source = await copyFixtureSet("basic", "memfile-owner-pin-drifted");
-    const agentId = "claude_code:drifted-run";
+    const agentId = "claude_code:fortress-00000000000c3000";
     const out = makeSink();
     const err = makeSink();
     const code = await runMemoryIngestCommand({
@@ -279,7 +280,12 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
 
   it("(d) fix round 1: a denied dialog on a fresh store leaves NO owner pin and NO passage (the pin is established only after Tier-1 approval)", async () => {
     const source = await copyFixtureSet("basic", "memfile-owner-pin-denied");
-    const agentId = "claude_code:owner-pin-denied";
+    const agentId = "claude_code:fortress-00000000000f6000";
+    let dialogs = 0;
+    const countingDeny = () => {
+      dialogs += 1;
+      return DENY_DIALOG();
+    };
     const before = await corpusEntryCount();
     expect(before).toBe(0);
     expect(await pinIsAbsent()).toBe(true);
@@ -291,15 +297,50 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
       out: out.stream,
       err: err.stream,
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: agentId },
-      dialogRunner: DENY_DIALOG,
+      dialogRunner: countingDeny,
     });
     expect(code).toBe(1);
+    // The run must have REACHED the Tier-1 dialog and been denied there, not
+    // been refused earlier (for example by the agent-id shape rule, which
+    // also leaves no pin): exactly one dialog, and the policy-denied text.
+    expect(dialogs).toBe(1);
+    expect(err.text()).toContain("not permitted by the local policy");
     expect(await corpusEntryCount()).toBe(before);
     // The invariant this proves: `checkOrEstablishSdwOwnerPin` runs only
     // inside the `authorize` success branch in `runMemoryIngestCommand`, so a
     // denial never reaches it. Fails on 2ca3fa0e, where the pin was written
     // unconditionally before the Tier-1 gate ran at all.
     expect(await pinIsAbsent()).toBe(true);
+  });
+
+  it("(g) SDW-OWNER-PIN-AGENT-ID-SHAPE-01: a store already pinned to a LEGACY (pre-rule) id keeps working for that id, with a stderr note and a legacy audit row", async () => {
+    const { storage, masterKey } = await realStorageAndMasterKey();
+    expect(
+      await createSdwOwnerPinIfAbsent(storage, masterKey, {
+        version: 1,
+        fortress_id: fortressIdFromStoragePath(fortress),
+        owner_ref: "fleet-self",
+        agent_id: "cli-ingest",
+        pinned_at: "2026-01-01T00:00:00.000Z",
+      }),
+    ).not.toBe("unsupported");
+    const source = await copyFixtureSet("basic", "memfile-owner-pin-legacy");
+    const out = makeSink();
+    const err = makeSink();
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: out.stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "cli-ingest" },
+    });
+    expect(code, err.text()).toBe(0);
+    expect(await corpusEntryCount()).toBeGreaterThan(0);
+    expect(err.text()).toContain("LEGACY SDW owner pin");
+    const reread = await realStorageAndMasterKey();
+    const audit = new AuditLog(reread.storage, reread.masterKey);
+    const { entries } = await audit.query({ operation_type: "memory_ingest_owner_pin_legacy", limit: 10 });
+    expect(entries).toHaveLength(1);
+    expect(String(entries[0]!.details?.reason)).toContain("LEGACY SDW owner pin");
   });
 
   it("(e) fix round 1: a non-default --owner-ref refuses outright, before any bootstrap or write", async () => {
@@ -379,6 +420,11 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
  * regression guards closing a prior test gap, not proof of that round's fix.
  */
 for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_restore"] as const) {
+  // Every agent id below is in the wrapped form `sanctuary wrap` mints
+  // (`<harness-kind>:fortress-<16 hex>`, SDW-OWNER-PIN-AGENT-ID-SHAPE-01), so
+  // each test reaches the check it names instead of the shape refusal; the
+  // last two hex characters keep the three verbs' ids distinct.
+  const verbHex = { memory_emit: "e1", memory_transcode: "e2", memory_transcode_restore: "e3" }[verbName];
   describe(`CLI ${verbName} owner-pin establishment (STEP1-F2)`, () => {
     let fortress: string;
     let prevStoragePath: string | undefined;
@@ -497,7 +543,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
     }
 
     it("(a) a fresh store establishes the pin on the first run: a same-agent re-run never sees owner_scope_conflict, a different agent's run does, and the MCP guard agrees", async () => {
-      const agentId = `claude_code:owner-pin-fresh-${verbName}`;
+      const agentId = `claude_code:fortress-00000000000a10${verbHex}`;
       // The verb's own business outcome does not matter here (an empty vault
       // has nothing to transcode/restore/emit, so transcode/restore commonly
       // fail after establishing the pin) — what this proves, driven entirely
@@ -554,7 +600,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
         tombstones: [],
         export_state: 0,
       });
-      const agentId = `claude_code:drifted-run-${verbName}`;
+      const agentId = `claude_code:fortress-00000000000c30${verbHex}`;
       const result = await runVerb({ agentId });
       expect(result.code).toBe(1);
       expect(result.err).toContain("owner_pin_missing_after_establishment");
@@ -571,7 +617,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       };
       const { storage, masterKey } = await realStorageAndMasterKey();
       const result = await runVerb({
-        agentId: `claude_code:owner-ref-${verbName}`,
+        agentId: `claude_code:fortress-00000000000d40${verbHex}`,
         ownerRef: "some-other-scope",
         dialogRunner: countingApprove,
       });
@@ -604,7 +650,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
 
     it("(f) regression guard, not a fail-before witness of this round: a denied dialog on a fresh store leaves NO owner pin and writes nothing (this protection already existed via establishOwnerPinAfterApproval running only after ApprovalGate approval, before STEP1-F2 fix round 1; this case just was not tested for the three sibling verbs until now)", async () => {
       const { storage, masterKey } = await realStorageAndMasterKey();
-      const agentId = `claude_code:owner-pin-denied-${verbName}`;
+      const agentId = `claude_code:fortress-00000000000f60${verbHex}`;
       const result = await runVerb({ agentId, dialogRunner: DENY_DIALOG });
       expect(result.code).not.toBe(0);
       expect(result.err).toContain("not approved");

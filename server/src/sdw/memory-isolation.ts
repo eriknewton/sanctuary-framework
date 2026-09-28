@@ -69,16 +69,19 @@ export function wrappedAgentIdentityFromEnv(): string | undefined {
 
 /**
  * The ONE place the wrapped harness id's SHAPE is pinned for the SDW owner
- * pin (register row `SDW-OWNER-PIN-AGENT-ID-SHAPE-01`). Every entry point of
- * the shared rule below (`checkOrEstablishSdwOwnerPin`, `precheckSdwOwnerPin`,
- * `claimSdwOwnerForOperator`'s new owner, `transferSdwOwnerForOperator`'s new
- * owner) refuses an id that does not have it BEFORE any read or write, so no
- * caller (the MCP guard, the four memory-file CLI verbs, `sdw-owner claim` and
- * `transfer`) can pin the store to a principal the wrapped server never
- * presents.
+ * pin (register row `SDW-OWNER-PIN-AGENT-ID-SHAPE-01`). The rule binds
+ * wherever a NEW pin could name an id: establishment of a fresh store
+ * (`checkOrEstablishSdwOwnerPin`, and `precheckSdwOwnerPin` reporting a store
+ * as establishable), `claimSdwOwnerForOperator`'s owner, and
+ * `transferSdwOwnerForOperator`'s new owner. Each refuses a non-conforming id
+ * before any write, so no caller (the MCP guard, the four memory-file CLI
+ * verbs, `sdw-owner claim` and `transfer`) can pin the store to a principal
+ * the wrapped server never presents.
  *
  * The form is what `sanctuary wrap` mints: must match `wrappedAgentId` in
- * `wrap/cli.ts` (`${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`),
+ * `wrap/cli.ts` (which carries the reciprocal pin, and
+ * `test/sdw/wrapped-agent-id-mint-parity.test.ts` builds ids through it and
+ * asserts this rule accepts every one) (`${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`),
  * whose two halves are `LOCAL_HARNESS_KINDS` in
  * `contracts/v1.1/local-agent-records.ts` (imported, never mirrored: AGENTS
  * rule 5) and `fortressIdFromStoragePath` in `dashboard/v1_1/wiring.ts`
@@ -91,10 +94,16 @@ export function wrappedAgentIdentityFromEnv(): string | undefined {
  * into the harness config (see `wrappedAgentIdentityFromEnv`); passing this
  * check proves the value could have been minted by `wrap`, never that it was.
  *
- * Legacy pins written before this rule are NOT re-validated on read: the
- * comparison against a stored `agent_id` is unchanged, and `transfer`'s
- * `expectedAgentId` is deliberately exempt so a malformed legacy pin stays
- * recoverable through the interactive transfer the register row names.
+ * LEGACY PINS (written before this rule) are NOT refused on read. When a
+ * store is already pinned, the caller is compared against the stored
+ * `agent_id` exactly as before: the legacy owner presenting that same id is
+ * ALLOWED, and the result carries `legacyPin: true` so the caller writes a
+ * one-line legacy note to its audit trail (the MCP guard via `onLegacyPin`,
+ * the CLI verbs via their own audit row) and the operator learns the pin
+ * predates the form. Refusing here would lock every existing store out on
+ * upgrade, which the register row never asked for. `transfer`'s
+ * `expectedAgentId` is likewise exempt, so a legacy pin is recoverable
+ * through the interactive transfer to a conforming id.
  */
 export const WRAPPED_AGENT_ID_FORTRESS_HEX_LENGTH = 16;
 export const WRAPPED_AGENT_ID_PATTERN: RegExp = new RegExp(
@@ -151,6 +160,16 @@ export interface PersistentIsolationGuardOptions {
   readonly ownerRef: string;
   readonly ownerIdentity: () => string | undefined;
   readonly now?: () => string;
+  /**
+   * Called at most ONCE per guard (per server process) the first time an
+   * allowed call finds the store pinned to a legacy, pre-wrapped-form id, so
+   * the composition root can write the one-line legacy note to the audit log.
+   * A note, not a security dependency: the allow/refuse decision never
+   * depends on it, so omitting it cannot weaken the guard (AGENTS rule 3).
+   * Once-per-process bounds the audit writes a long-lived server makes
+   * (AGENTS rule 8): one entry, not one per call.
+   */
+  readonly onLegacyPin?: (storedAgentId: string) => void | Promise<void>;
 }
 
 export { readSdwOwnerPin } from "./write-gate.js";
@@ -213,7 +232,9 @@ export interface SdwOwnerPinCheckOptions {
 }
 
 export type SdwOwnerPinCheckResult =
-  | { readonly allowed: true }
+  // `legacyPin` is present (true) only when the stored owner id predates the
+  // wrapped form; see the LEGACY PINS note on WRAPPED_AGENT_ID_PATTERN.
+  | { readonly allowed: true; readonly legacyPin?: true }
   | { readonly allowed: false; readonly reason: IsolationRefusalReason };
 
 /**
@@ -244,13 +265,13 @@ export async function checkOrEstablishSdwOwnerPin(
     allowed: false as const,
     reason,
   });
-  // The shape is checked BEFORE the first read: a malformed id must never
-  // reach `createSdwOwnerPinIfAbsent` below, or a fresh store would be pinned
-  // to a principal no wrapped server presents (the register row's defect).
-  if (!isWrappedAgentId(options.agentId)) return refuse("owner_identity_malformed");
   try {
     let pin = await readSdwOwnerPin(options.storage, options.masterKey);
     if (pin.status === "absent") {
+      // ESTABLISHMENT shape check: a malformed id must never reach
+      // `createSdwOwnerPinIfAbsent` below, or a fresh store would be pinned to
+      // a principal no wrapped server presents (the register row's defect).
+      if (!isWrappedAgentId(options.agentId)) return refuse("owner_identity_malformed");
       if (await sdwStoreEstablished(options.storage)) {
         return refuse("owner_pin_missing_after_establishment");
       }
@@ -273,16 +294,18 @@ export async function checkOrEstablishSdwOwnerPin(
     ) {
       return refuse("owner_pin_invalid");
     }
-    return pin.data.agent_id === options.agentId
+    if (pin.data.agent_id !== options.agentId) return refuse("owner_scope_conflict");
+    // READ of an existing pin: never refused for shape (see LEGACY PINS).
+    return isWrappedAgentId(pin.data.agent_id)
       ? { allowed: true }
-      : refuse("owner_scope_conflict");
+      : { allowed: true, legacyPin: true };
   } catch {
     return refuse("owner_pin_io_error");
   }
 }
 
 export type SdwOwnerPinPrecheckResult =
-  | { readonly status: "pinned" }
+  | { readonly status: "pinned"; readonly legacyPin?: true }
   | { readonly status: "fresh" }
   | { readonly status: "refuse"; readonly reason: IsolationRefusalReason };
 
@@ -304,14 +327,15 @@ export type SdwOwnerPinPrecheckResult =
 export async function precheckSdwOwnerPin(
   options: Omit<SdwOwnerPinCheckOptions, "now">,
 ): Promise<SdwOwnerPinPrecheckResult> {
-  // Same shape rule as `checkOrEstablishSdwOwnerPin`, so a CLI verb's
-  // pre-approval precheck refuses a malformed id before the operator is asked.
-  if (!isWrappedAgentId(options.agentId)) {
-    return { status: "refuse", reason: "owner_identity_malformed" };
-  }
   try {
     const pin = await readSdwOwnerPin(options.storage, options.masterKey);
     if (pin.status === "absent") {
+      // Same ESTABLISHMENT shape rule as `checkOrEstablishSdwOwnerPin`, so a
+      // CLI verb's pre-approval precheck refuses a malformed id before the
+      // operator is asked, rather than reporting the store "fresh".
+      if (!isWrappedAgentId(options.agentId)) {
+        return { status: "refuse", reason: "owner_identity_malformed" };
+      }
       if (await sdwStoreEstablished(options.storage)) {
         return { status: "refuse", reason: "owner_pin_missing_after_establishment" };
       }
@@ -323,9 +347,13 @@ export async function precheckSdwOwnerPin(
     ) {
       return { status: "refuse", reason: "owner_pin_invalid" };
     }
-    return pin.data.agent_id === options.agentId
+    if (pin.data.agent_id !== options.agentId) {
+      return { status: "refuse", reason: "owner_scope_conflict" };
+    }
+    // READ of an existing pin: never refused for shape (see LEGACY PINS).
+    return isWrappedAgentId(pin.data.agent_id)
       ? { status: "pinned" }
-      : { status: "refuse", reason: "owner_scope_conflict" };
+      : { status: "pinned", legacyPin: true };
   } catch {
     return { status: "refuse", reason: "owner_pin_io_error" };
   }
@@ -338,15 +366,29 @@ export async function precheckSdwOwnerPin(
  * rule itself is `checkOrEstablishSdwOwnerPin` above, shared with the CLI
  * ingest path.
  */
+/**
+ * One-line operator note for a store pinned to a legacy owner id. Written to
+ * the audit trail by the MCP composition root (`onLegacyPin` in
+ * `src/index.ts`) and by the memory-file CLI verbs; the store keeps working.
+ */
+export function sdwLegacyOwnerPinNote(storedAgentId: string): string {
+  return (
+    `LEGACY SDW owner pin: agent_id ${JSON.stringify(storedAgentId)} predates the wrapped form ` +
+    `<harness-kind>:fortress-<${WRAPPED_AGENT_ID_FORTRESS_HEX_LENGTH} hex>; the store still works, ` +
+    `and 'sanctuary sdw-owner transfer' can move it to a wrapped id`
+  );
+}
+
 export function createPersistentMultiAgentIsolationGuard(
   options: PersistentIsolationGuardOptions,
 ): MultiAgentIsolationGuard {
+  let legacyNoted = false;
   return async (_operation: string) => {
     const observed = options.ownerIdentity();
     if (observed === undefined || observed.length === 0) {
       return { allowed: false, reason: "owner_identity_missing" };
     }
-    return checkOrEstablishSdwOwnerPin({
+    const result = await checkOrEstablishSdwOwnerPin({
       storage: options.storage,
       masterKey: options.masterKey,
       fortressId: options.fortressId,
@@ -354,6 +396,17 @@ export function createPersistentMultiAgentIsolationGuard(
       agentId: observed,
       ...(options.now !== undefined ? { now: options.now } : {}),
     });
+    if (!result.allowed) return result;
+    if (result.legacyPin === true && !legacyNoted) {
+      legacyNoted = true;
+      try {
+        await options.onLegacyPin?.(observed);
+      } catch {
+        // The note is advisory; a failed audit append must not turn an
+        // allowed read into a refusal or a crash.
+      }
+    }
+    return { allowed: true };
   };
 }
 

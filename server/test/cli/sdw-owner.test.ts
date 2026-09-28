@@ -71,12 +71,12 @@ describe("sanctuary sdw-owner", () => {
           "--from-agent-id",
           "claude_code:fortress-00000000000001c6",
           "--to-agent-id",
-          "codex:ic16",
+          "generic_mcp:fortress-0000000000000c16",
           "--fortress",
           f.root,
         ],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        stdin: Readable.from("codex:ic16\nTRANSFER\n"),
+        stdin: Readable.from("generic_mcp:fortress-0000000000000c16\nTRANSFER\n"),
         out: out.stream,
         err: err.stream,
       }),
@@ -86,7 +86,7 @@ describe("sanctuary sdw-owner", () => {
       f.masterKey,
     );
     expect(pin.status).toBe("valid");
-    if (pin.status === "valid") expect(pin.data.agent_id).toBe("codex:ic16");
+    if (pin.status === "valid") expect(pin.data.agent_id).toBe("generic_mcp:fortress-0000000000000c16");
   });
 
   it("does not mutate on a mistyped confirmation or while a runtime may be live", async () => {

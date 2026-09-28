@@ -119,6 +119,7 @@ import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-too
 import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
 import {
   createPersistentMultiAgentIsolationGuard,
+  sdwLegacyOwnerPinNote,
   wrappedAgentIdentityFromEnv,
 } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
@@ -1876,6 +1877,21 @@ export async function createSanctuaryServer(options?: {
     // guard and to `sdw-owner`, which also hard-codes "fleet-self".
     ownerRef: "fleet-self",
     ownerIdentity: sdwMemoryIdentity,
+    // A store pinned before SDW-OWNER-PIN-AGENT-ID-SHAPE-01 keeps working; the
+    // guard calls this once per process so the operator learns the pin is
+    // legacy (one audit row plus one stderr line, never one per call).
+    onLegacyPin: async (storedAgentId) => {
+      const note = sdwLegacyOwnerPinNote(storedAgentId);
+      // SAFETY: stderr is the operator-facing channel for server diagnostics.
+      console.error(`sanctuary: ${note}`);
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "sdw_owner_pin_legacy",
+        identity_id: "system",
+        result: "success",
+        details: { owner_ref: "fleet-self", reason: note },
+      });
+    },
   });
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,

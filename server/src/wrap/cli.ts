@@ -6462,6 +6462,13 @@ export function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKin
  * entry as `SANCTUARY_AGENT_ID` (buildSanctuaryEnv) and carried, with the
  * `agent:` prefix the router also adds, as the hub record's `agent_id`
  * (buildLocalAgentRecord). One function so the two can never disagree.
+ *
+ * Must match WRAPPED_AGENT_ID_PATTERN in `sdw/memory-isolation.ts`: the SDW
+ * owner pin only ever binds an id of exactly this form, so a change to this
+ * shape (a new harness kind, a different fortress-id length) refuses every
+ * freshly wrapped harness until that rule moves with it.
+ * `test/sdw/wrapped-agent-id-mint-parity.test.ts` mints through this function
+ * for every AgentPlatform and fails if the rule rejects any result.
  */
 export function wrappedAgentId(platform: AgentPlatform, storagePath: string): string {
   return `${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`;

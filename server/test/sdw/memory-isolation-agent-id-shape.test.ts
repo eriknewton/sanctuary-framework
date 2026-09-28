@@ -8,12 +8,17 @@
  * shared rule (the MCP guard, the four memory-file CLI verbs' check and
  * precheck, `sdw-owner claim`, `sdw-owner transfer`'s new owner), so an
  * operator or a misconfigured harness cannot pin the store to a principal the
- * wrapped server never presents. A malformed legacy pin stays transferable.
+ * wrapped server never presents. The rule binds at ESTABLISHMENT, CLAIM and
+ * TRANSFER only: a store already pinned to a legacy (pre-rule) id keeps
+ * working for that id, with a legacy note the caller surfaces to the operator,
+ * and the legacy pin stays transferable.
  * Register row `SDW-OWNER-PIN-AGENT-ID-SHAPE-01`.
  *
  * Fail-before: on the base tree every "refuses" case below is red (the rule
  * accepted any non-empty string and pinned the store to it) and every
- * "accepts" case is green. This file imports only the shared rule's entry
+ * "accepts" case is green. The two "legacy pin READ" cases are red on the
+ * first cut of this change (0e546e65), which refused a legacy owner on every
+ * call and so locked existing stores out. This file imports only the shared rule's entry
  * points, never the pattern, so it compiles against the base tree.
  */
 import { describe, expect, it } from "vitest";
@@ -142,5 +147,55 @@ describe("SDW owner pin agent id shape (shared rule, every entry point)", () => 
     // ... and the interactive transfer away from the legacy id is allowed.
     expect(await transferSdwOwnerForOperator({ ...b, expectedAgentId: "cli-ingest", newAgentId: GOOD })).toEqual({ status: "transferred" });
     expect(await checkOrEstablishSdwOwnerPin({ ...b, agentId: GOOD })).toEqual({ allowed: true });
+  });
+
+  it("legacy pin READ: the legacy owner keeps working, with a legacy note, through check, precheck and the MCP guard", async () => {
+    const b = base();
+    expect(
+      await createSdwOwnerPinIfAbsent(b.storage, MASTER, {
+        version: 1,
+        fortress_id: FORTRESS_ID,
+        owner_ref: OWNER_REF,
+        agent_id: "cli-ingest",
+        pinned_at: NOW(),
+      }),
+    ).not.toBe("unsupported");
+    expect(await checkOrEstablishSdwOwnerPin({ ...b, agentId: "cli-ingest" })).toEqual({ allowed: true, legacyPin: true });
+    expect(
+      await precheckSdwOwnerPin({ storage: b.storage, masterKey: MASTER, fortressId: FORTRESS_ID, ownerRef: OWNER_REF, agentId: "cli-ingest" }),
+    ).toEqual({ status: "pinned", legacyPin: true });
+    const notes: string[] = [];
+    const guard = createPersistentMultiAgentIsolationGuard({
+      ...b,
+      ownerIdentity: () => "cli-ingest",
+      onLegacyPin: (agentId) => {
+        notes.push(agentId);
+      },
+    });
+    expect(await guard("memory_count")).toEqual({ allowed: true });
+    expect(await guard("memory_search")).toEqual({ allowed: true });
+    // One note per process, not one per call: the audit trail is not flooded.
+    expect(notes).toEqual(["cli-ingest"]);
+    // The pin itself is untouched.
+    const pin = await readSdwOwnerPin(b.storage, MASTER);
+    expect(pin.status === "valid" && pin.data.agent_id).toBe("cli-ingest");
+  });
+
+  it("legacy pin READ: a different malformed id is still refused, and a wrapped owner carries no legacy note", async () => {
+    const b = base();
+    await createSdwOwnerPinIfAbsent(b.storage, MASTER, {
+      version: 1,
+      fortress_id: FORTRESS_ID,
+      owner_ref: OWNER_REF,
+      agent_id: "cli-ingest",
+      pinned_at: NOW(),
+    });
+    expect(await checkOrEstablishSdwOwnerPin({ ...b, agentId: "claude_code:ic16" })).toEqual({ allowed: false, reason: "owner_scope_conflict" });
+    const w = base();
+    expect(await checkOrEstablishSdwOwnerPin({ ...w, agentId: GOOD })).toEqual({ allowed: true });
+    expect(await checkOrEstablishSdwOwnerPin({ ...w, agentId: GOOD })).toEqual({ allowed: true });
+    expect(
+      await precheckSdwOwnerPin({ storage: w.storage, masterKey: MASTER, fortressId: FORTRESS_ID, ownerRef: OWNER_REF, agentId: GOOD }),
+    ).toEqual({ status: "pinned" });
   });
 });

@@ -60,7 +60,10 @@ const APPROVE_DIALOG = () => ({
 // every call through the wrapper below a stable default identity unless the
 // test's own `env` already sets one; a test that specifically exercises the
 // missing-identity refusal lives in memory-file-owner-pin.test.ts.
-const TEST_AGENT_ID = "claude_code:memory-file-cli-test";
+// The wrapped form `sanctuary wrap` mints (`<harness-kind>:fortress-<16 hex>`);
+// the SDW owner pin refuses to establish any other shape
+// (SDW-OWNER-PIN-AGENT-ID-SHAPE-01).
+const TEST_AGENT_ID = "claude_code:fortress-000000000000f11e";
 
 // memory_ingest is Tier-1 (S4): it now passes the human ApprovalGate like the
 // other memory verbs, so default the local-operator dialog to APPROVE unless a

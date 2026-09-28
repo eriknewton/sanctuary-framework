@@ -37,6 +37,7 @@ import { ingestMemoryFiles } from "../sdw/memory-file-ingest-service.js";
 import {
   checkOrEstablishSdwOwnerPin,
   precheckSdwOwnerPin,
+  sdwLegacyOwnerPinNote,
   type IsolationRefusalReason,
   type SdwOwnerPinPrecheckResult,
 } from "../sdw/memory-isolation.js";
@@ -183,12 +184,15 @@ function describeOwnerPinRefusal(
     case "owner_identity_missing":
       return noWrappedAgentIdMessage(fortress, command);
     case "owner_identity_malformed":
-      // The shape rule lives in memory-isolation.ts (isWrappedAgentId); this
-      // only names the form so the operator can see what `wrap` would write.
+      // The shape rule lives in memory-isolation.ts (isWrappedAgentId) and is
+      // reached only when this id would ESTABLISH a new pin (an already-pinned
+      // store compares ids and never refuses for shape); this only names the
+      // form so the operator can see what `wrap` would write.
       return (
         `${command}: refused (${reason}) - SANCTUARY_AGENT_ID ${shellQuoteSingleArg(agentId)} is not a wrapped harness id ` +
-        `(<harness-kind>:fortress-<16 hex>, the value 'sanctuary wrap' writes into the harness's sanctuary MCP entry).\n` +
-        `${command}: re-run from the wrapped harness, or run '${sdwOwnerStatusCommand(fortress)}' to see the pinned id.\n`
+        `(<harness-kind>:fortress-<16 hex>, the value 'sanctuary wrap' writes into the harness's sanctuary MCP entry), ` +
+        `and a new SDW owner pin may only bind a wrapped id.\n` +
+        `${command}: re-run from the wrapped harness, or run '${sdwOwnerStatusCommand(fortress)}' to see whether the store is pinned.\n`
       );
   }
 }
@@ -350,6 +354,9 @@ export async function runMemoryIngestCommand(
         denial_class: ownerPinPrecheck.reason,
       });
       return 1;
+    }
+    if (ownerPinPrecheck.status === "pinned" && ownerPinPrecheck.legacyPin === true) {
+      await noteLegacyOwnerPin(boot.auditLog, "memory_ingest", cliIngestAgentId, parsed.ownerRef, err);
     }
 
     // Set only by the race branch inside `authorize` below (fix round 2,
@@ -563,6 +570,9 @@ async function precheckOwnerPinOrRefuse(
       denial_class: precheck.reason,
     });
     return null;
+  }
+  if (precheck.status === "pinned" && precheck.legacyPin === true) {
+    await noteLegacyOwnerPin(boot.auditLog, command, agentId, parsed.ownerRef, err);
   }
   return { agentId, precheck };
 }
@@ -1277,6 +1287,39 @@ async function bootstrap(
     // so a stranded lease does not block a later rotate-master (S1).
     await unlocked.barrier?.release().catch(() => undefined);
     throw e;
+  }
+}
+
+/**
+ * An already-pinned store whose owner id predates the wrapped form keeps
+ * working (the shape rule binds only a NEW pin; see LEGACY PINS on
+ * WRAPPED_AGENT_ID_PATTERN in sdw/memory-isolation.ts). The operator learns of
+ * it through one stderr line and one audit row whose `reason` is the shared
+ * note text; neither changes the verb's outcome.
+ */
+async function noteLegacyOwnerPin(
+  auditLog: AuditLog,
+  operation:
+    | "memory_ingest"
+    | "memory_emit"
+    | "memory_transcode"
+    | "memory_transcode_restore",
+  storedAgentId: string,
+  ownerRef: string,
+  err: Writable,
+): Promise<void> {
+  const note = sdwLegacyOwnerPinNote(storedAgentId);
+  write(err, `${operation}: note - ${note}.\n`);
+  try {
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: `${operation}_owner_pin_legacy`,
+      identity_id: "system",
+      result: "success",
+      details: { owner_ref: ownerRef, reason: note },
+    });
+  } catch {
+    // Advisory only: a failed note append must not refuse an allowed verb.
   }
 }
 
