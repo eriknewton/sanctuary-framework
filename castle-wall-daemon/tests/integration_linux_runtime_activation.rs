@@ -2965,3 +2965,878 @@ fn tb9_the_real_verbs_admit_only_the_bound_uid_and_refuse_by_name() {
     );
     // `daemon` drops here: the child has exited, and the table and journal go.
 }
+
+// --- TB10 (slice B): the SHIPPED agent template unit under a real systemd PID 1.
+//
+// Capability: the agent unit starts only after its wall's READY=1, is never
+// started behind a wall that failed to start, is stopped before the wall is
+// signalled, is stopped and not restarted when the wall's process dies or
+// exits 75 or 78, never reaches ExecStart when the wall stops during a start,
+// runs as the instance uid, and comes back only through a propagated wall
+// restart. Register ids:
+// `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`,
+// `LINUX-AGENT-BOOT-AUTOSTART-01`.
+//
+// Each schedule derives runtime units in /run/systemd/system from the SHIPPED
+// unit by exact, counted textual substitution (so a drifted shipped unit
+// fails the derivation, not silently the schedule), and tears them down with
+// a daemon-reload on every exit path. Schedules (i) to (viii) replace the two
+// verbs and the agent with shell fixtures and bind instance 65534 (the
+// runner's overflow account, which exists and needs no admission); (ix) runs
+// the REAL verbs against a real isolated-table daemon under instance 60123.
+mod tb10_agent_unit_against_real_systemd {
+    use super::*;
+    use std::time::Instant;
+
+    /// Instance for schedules (i) to (viii): the runner's overflow account
+    /// ("nobody"/"nogroup"), present on Ubuntu, so `User=%i` resolves.
+    pub(super) const FIXTURE_INSTANCE: u32 = 65534;
+    /// Fixture READY=1 delay and fixture ExecStartPre= sleep, in seconds: long
+    /// enough that an ordering inversion or a missed cancellation is visible.
+    const FIXTURE_DELAY_SECS: u64 = 5;
+    /// Poll spacing for unit state.
+    const POLL: Duration = Duration::from_millis(100);
+    /// Scheduling and bus latency allowance on top of a derived bound. It is not
+    /// a retry budget.
+    const SLACK: Duration = Duration::from_secs(20);
+
+    pub(super) fn shipped_agent_unit() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("systemd/sanctuary-agent@.service"),
+        )
+        .expect("the shipped agent unit")
+    }
+
+    fn shipped_wall_value(key: &str) -> String {
+        let wall = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("systemd/sanctuary-castle-wall.service"),
+        )
+        .expect("the shipped wall unit");
+        let values: Vec<&str> = wall
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .collect();
+        assert_eq!(values.len(), 1, "the shipped wall sets exactly one {key}");
+        values[0].to_string()
+    }
+
+    fn secs(value: &str) -> u64 {
+        value.parse().expect("whole seconds")
+    }
+
+    /// X = agent `TimeoutStopSec` + 1 s manager and sampling allowance
+    /// (design section 8): the bound on "the agent is inactive" after a wall
+    /// death. Read from the shipped agent unit.
+    fn stop_bound_x() -> Duration {
+        let agent = shipped_agent_unit();
+        let stop = agent
+            .lines()
+            .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+            .expect("agent TimeoutStopSec");
+        Duration::from_secs(secs(stop) + 1)
+    }
+
+    /// W = 2 x (wall `RestartSec` + wall `TimeoutStartSec`) = 124 s today: the
+    /// no-restart observation window (design section 8), read from the
+    /// shipped wall unit so it moves with it.
+    fn no_restart_window_w() -> Duration {
+        Duration::from_secs(
+            2 * (secs(&shipped_wall_value("RestartSec"))
+                + secs(&shipped_wall_value("TimeoutStartSec"))),
+        )
+    }
+
+    /// Replace `from` with `to`, requiring exactly `count` occurrences.
+    pub(super) fn substitute(text: &str, from: &str, to: &str, count: usize) -> String {
+        assert_eq!(
+            text.matches(from).count(),
+            count,
+            "the shipped agent unit must contain {from:?} exactly {count} time(s)"
+        );
+        text.replace(from, to)
+    }
+
+    pub(super) fn systemctl(args: &[&str]) -> std::process::Output {
+        Command::new("timeout")
+            .arg("90")
+            .arg("systemctl")
+            .args(args)
+            .output()
+            .expect("run systemctl")
+    }
+
+    pub(super) fn prop(unit: &str, property: &str) -> String {
+        String::from_utf8_lossy(&systemctl(&["show", "--value", "-p", property, unit]).stdout)
+            .trim()
+            .to_string()
+    }
+
+    fn mono(unit: &str, property: &str) -> u64 {
+        prop(unit, property).parse().unwrap_or(0)
+    }
+
+    pub(super) fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        done()
+    }
+
+    /// Root, a system manager as PID 1, and a bus that answers. Anything else
+    /// is a skip, which the privileged contract and the CI rerun refuse.
+    pub(super) fn real_systemd_available() -> Result<(), String> {
+        // SAFETY: geteuid() is always successful and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("TB10 needs root to write /run/systemd/system".to_string());
+        }
+        let init = std::fs::read_to_string("/proc/1/comm").unwrap_or_default();
+        if init.trim() != "systemd" {
+            return Err(format!("PID 1 is {:?}, not systemd", init.trim()));
+        }
+        if !systemctl(&["show", "--value", "-p", "Version"])
+            .status
+            .success()
+        {
+            return Err("no usable system bus".to_string());
+        }
+        Ok(())
+    }
+
+    /// Runtime units plus scratch state, removed on EVERY exit path: agents
+    /// stopped first, then walls, then `reset-failed`, the unit files, a
+    /// `daemon-reload`, the per-instance directories and the scratch dir.
+    pub(super) struct Tb10Units {
+        pub(super) tag: String,
+        pub(super) dir: TempDir,
+        pub(super) stop_order: Vec<String>,
+        pub(super) files: Vec<PathBuf>,
+        pub(super) extra_dirs: Vec<PathBuf>,
+    }
+
+    impl Tb10Units {
+        pub(super) fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().expect("scratch dir");
+            // 0777: the fixture check and agent run as the instance uid and
+            // write their views and marker here.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+                .expect("0777 scratch dir");
+            let tag = format!(
+                "{:x}{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or_default()
+            );
+            Self {
+                tag,
+                dir,
+                stop_order: Vec::new(),
+                files: Vec::new(),
+                extra_dirs: Vec::new(),
+            }
+        }
+
+        pub(super) fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        pub(super) fn write_unit(&mut self, name: &str, text: &str) {
+            let path = Path::new("/run/systemd/system").join(name);
+            std::fs::create_dir_all("/run/systemd/system").expect("runtime unit dir");
+            std::fs::write(&path, text).expect("write runtime unit");
+            self.files.push(path);
+        }
+
+        pub(super) fn write_script(&self, name: &str, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
+            std::fs::write(&path, body).expect("write fixture script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("0755 fixture script");
+            path
+        }
+
+        /// A root-owned 0600 environment file, as the shipped one is.
+        pub(super) fn write_env(&self, body: &str) -> PathBuf {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = self.path("castle-wall.env");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+                .expect("write the 0600 env file");
+            path
+        }
+
+        pub(super) fn reload(&self) {
+            assert!(
+                systemctl(&["daemon-reload"]).status.success(),
+                "daemon-reload"
+            );
+        }
+    }
+
+    impl Drop for Tb10Units {
+        fn drop(&mut self) {
+            for unit in &self.stop_order {
+                let _ = systemctl(&["stop", unit]);
+                let _ = systemctl(&["reset-failed", unit]);
+            }
+            for file in &self.files {
+                let _ = std::fs::remove_file(file);
+            }
+            let _ = systemctl(&["daemon-reload"]);
+            for dir in &self.extra_dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// One schedule's fixture wall plus the derived agent.
+    struct Fixture {
+        units: Tb10Units,
+        wall: String,
+        agent: String,
+    }
+
+    impl Fixture {
+        /// `wall_restart` is the fixture wall's `Restart=`; the rest of its
+        /// restart shape (`RestartSec`, `RestartPreventExitStatus`,
+        /// `TimeoutStartSec`) is read from the shipped wall.
+        fn new(wall_restart: &str) -> Self {
+            let mut units = Tb10Units::new();
+            let tag = units.tag.clone();
+            let d = units.dir.path().display().to_string();
+            let wall = format!("sanctuary-tb10-wall-{tag}.service");
+            let template = format!("sanctuary-tb10-agent-{tag}@.service");
+            let agent = format!("sanctuary-tb10-agent-{tag}@{FIXTURE_INSTANCE}.service");
+            // The fixture wall: optional READY delay, optional start failure,
+            // then READY=1 from a process that stays alive (`--exec`), then a
+            // loop that exits with whatever code the test writes.
+            units.write_script(
+                "wall.sh",
+                &format!(
+                    "#!/bin/sh\n\
+                     [ -f {d}/delay ] && sleep {FIXTURE_DELAY_SECS}\n\
+                     [ -f {d}/fail-start ] && exit 1\n\
+                     exec systemd-notify --ready --exec ';' /bin/sh {d}/wall-run.sh\n"
+                ),
+            );
+            units.write_script(
+                "wall-run.sh",
+                &format!(
+                    "#!/bin/sh\n\
+                     while [ ! -f {d}/exit-code ]; do sleep 0.1; done\n\
+                     c=$(cat {d}/exit-code); rm -f {d}/exit-code; exit \"$c\"\n"
+                ),
+            );
+            units.write_unit(
+                &wall,
+                &format!(
+                    "[Unit]\nDescription=TB10 fixture wall\n\n[Service]\nType=notify\n\
+                     NotifyAccess=all\nExecStart=/bin/sh {d}/wall.sh\nRestart={wall_restart}\n\
+                     RestartPreventExitStatus={}\nRestartSec={}\nTimeoutStartSec={}\n",
+                    shipped_wall_value("RestartPreventExitStatus"),
+                    shipped_wall_value("RestartSec"),
+                    shipped_wall_value("TimeoutStartSec"),
+                ),
+            );
+            // The fixture verbs and agent. The check runs as the instance and
+            // records its own kernel view; the gate runs as root (`+`) and can
+            // be made to sleep; the agent writes a marker and stays up.
+            units.write_script(
+                "check.sh",
+                &format!(
+                    "#!/bin/sh\ngrep -E '^(Uid|Gid):' /proc/self/status > {d}/check-view\nexit 0\n"
+                ),
+            );
+            units.write_script(
+                "gate.sh",
+                &format!(
+                    "#!/bin/sh\n[ -f {d}/gate-sleep ] && sleep {FIXTURE_DELAY_SECS}\nexit 0\n"
+                ),
+            );
+            units.write_script(
+                "agent.sh",
+                &format!("#!/bin/sh\necho started >> {d}/marker\nexec sleep infinity\n"),
+            );
+            let env = units
+                .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
+            let shipped = shipped_agent_unit();
+            let derived = substitute(&shipped, "sanctuary-castle-wall.service", &wall, 5);
+            let derived = substitute(
+                &derived,
+                "ExecStartPre=/usr/local/libexec/sanctuary/castle-wall-daemon --agent-credential-check %i",
+                &format!("ExecStartPre=/bin/sh {d}/check.sh %i"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "ExecStartPre=+/usr/local/libexec/sanctuary/castle-wall-daemon --agent-start-gate %i --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}",
+                &format!("ExecStartPre=+/bin/sh {d}/gate.sh %i"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1",
+                &format!("ExecStart=/bin/sh {d}/agent.sh"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "EnvironmentFile=/etc/sanctuary/castle-wall.env",
+                &format!("EnvironmentFile={}", env.display()),
+                1,
+            );
+            // Per-run state and runtime directory names, so no fixture ever
+            // touches an operator's /var/lib/sanctuary-agent-<uid>.
+            let derived = substitute(
+                &derived,
+                "sanctuary-agent-%i",
+                &format!("sanctuary-tb10-{tag}-%i"),
+                4,
+            );
+            units.write_unit(&template, &derived);
+            units.extra_dirs.push(PathBuf::from(format!(
+                "/var/lib/sanctuary-tb10-{tag}-{FIXTURE_INSTANCE}"
+            )));
+            // A holder that only ORDERS after both units keeps them loaded once
+            // they go inactive; without it systemd garbage-collects an inactive
+            // runtime unit and its timestamps read back as 0. It adds no
+            // requirement edge, so it changes nothing the schedules observe.
+            let holder = format!("sanctuary-tb10-hold-{tag}.service");
+            units.write_unit(
+                &holder,
+                &format!(
+                    "[Unit]\nDescription=TB10 timestamp holder\nAfter={agent} {wall}\n\n\
+                     [Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+                ),
+            );
+            units.stop_order = vec![agent.clone(), wall.clone(), holder.clone()];
+            units.reload();
+            assert!(
+                systemctl(&["start", &holder]).status.success(),
+                "start the holder"
+            );
+            Self { units, wall, agent }
+        }
+
+        fn touch(&self, name: &str) {
+            std::fs::write(self.units.path(name), b"1").expect("touch control file");
+        }
+
+        fn marker_present(&self) -> bool {
+            self.units.path("marker").exists()
+        }
+
+        /// Wall first (to READY), then the agent: the schedules that test the
+        /// STOP side isolate it from the start-side pull and ordering.
+        fn start_wall_then_agent(&self) {
+            let wall = systemctl(&["start", &self.wall]);
+            assert!(
+                wall.status.success(),
+                "wall start: {}",
+                String::from_utf8_lossy(&wall.stderr)
+            );
+            let out = systemctl(&["start", &self.agent]);
+            assert!(
+                out.status.success(),
+                "agent start: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(prop(&self.agent, "ActiveState"), "active");
+            assert_eq!(prop(&self.wall, "ActiveState"), "active");
+        }
+
+        fn wall_exit(&self, code: u8) {
+            std::fs::write(self.units.path("exit-code"), code.to_string()).expect("exit code");
+        }
+
+        /// The agent is inactive now and stays inactive for `window`.
+        fn assert_agent_stays_down(&self, window: Duration, what: &str) {
+            let start = Instant::now();
+            while start.elapsed() < window {
+                let state = prop(&self.agent, "ActiveState");
+                assert!(
+                    state == "inactive" || state == "failed",
+                    "{what}: the agent came back ({state}) {:?} into the window",
+                    start.elapsed()
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
+    fn require_systemd() -> bool {
+        match real_systemd_available() {
+            Ok(()) => true,
+            Err(reason) => {
+                skip_or_fail_unprivileged(&reason);
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn tb10_i_the_agent_starts_only_after_the_walls_ready() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("delay");
+        // The wall is still inside its READY delay when the agent start is
+        // requested, so only the After= edge can hold the agent back.
+        assert!(systemctl(&["start", "--no-block", &f.wall])
+            .status
+            .success());
+        assert!(
+            systemctl(&["start", &f.agent]).status.success(),
+            "(i) agent start"
+        );
+        assert_eq!(prop(&f.agent, "ActiveState"), "active");
+        let agent_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        let wall_ready = mono(&f.wall, "ActiveEnterTimestampMonotonic");
+        assert!(
+            wall_ready > 0 && agent_start > wall_ready,
+            "(i) agent ExecMainStart {agent_start} must follow wall ActiveEnter {wall_ready}"
+        );
+    }
+
+    #[test]
+    fn tb10_ii_a_wall_that_fails_to_start_fails_the_agent_start() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("fail-start");
+        let out = systemctl(&["start", &f.agent]);
+        assert!(!out.status.success(), "(ii) the agent start job must fail");
+        assert_ne!(prop(&f.agent, "ActiveState"), "active");
+        assert!(
+            !f.marker_present(),
+            "(ii) the agent must never reach ExecStart"
+        );
+    }
+
+    #[test]
+    fn tb10_iii_a_wall_stop_stops_the_agent_first() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        assert!(systemctl(&["stop", &f.wall]).status.success());
+        let agent_down = mono(&f.agent, "InactiveEnterTimestampMonotonic");
+        let wall_exit = mono(&f.wall, "ActiveExitTimestampMonotonic");
+        assert_ne!(
+            prop(&f.agent, "ActiveState"),
+            "active",
+            "(iii) agent stopped"
+        );
+        assert!(
+            agent_down > 0 && agent_down <= wall_exit,
+            "(iii) agent InactiveEnter {agent_down} must not follow wall ActiveExit {wall_exit}"
+        );
+    }
+
+    #[test]
+    fn tb10_iv_a_killed_wall_restarts_alone() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("on-failure");
+        f.start_wall_then_agent();
+        let restarts_before: u64 = prop(&f.wall, "NRestarts").parse().unwrap_or(0);
+        let killed_at = Instant::now();
+        assert!(
+            systemctl(&["kill", "--kill-whom=main", "--signal=SIGKILL", &f.wall])
+                .status
+                .success()
+        );
+        assert!(
+            wait_until(stop_bound_x(), || prop(&f.agent, "ActiveState") != "active"),
+            "(iv) agent must be inactive within X of the wall's death"
+        );
+        assert!(killed_at.elapsed() <= stop_bound_x() + SLACK);
+        assert!(
+            wait_until(no_restart_window_w(), || {
+                prop(&f.wall, "ActiveState") == "active"
+                    && prop(&f.wall, "NRestarts").parse().unwrap_or(0) > restarts_before
+            }),
+            "(iv) the fixture wall must restart on its own"
+        );
+        f.assert_agent_stays_down(no_restart_window_w(), "(iv)");
+    }
+
+    fn exit_code_schedule(code: u8, expect_wall_restart: bool) {
+        let f = Fixture::new("on-failure");
+        f.start_wall_then_agent();
+        f.wall_exit(code);
+        assert!(
+            wait_until(stop_bound_x() + SLACK, || prop(&f.agent, "ActiveState")
+                != "active"),
+            "(v) exit {code}: agent must be stopped"
+        );
+        if expect_wall_restart {
+            assert!(
+                wait_until(no_restart_window_w(), || prop(&f.wall, "ActiveState")
+                    == "active"),
+                "(v) exit {code}: the fixture wall must restart on its own"
+            );
+        } else {
+            assert!(
+                wait_until(SLACK, || prop(&f.wall, "ActiveState") == "failed"),
+                "(v) exit {code}: RestartPreventExitStatus must leave the wall failed"
+            );
+        }
+        f.assert_agent_stays_down(no_restart_window_w(), &format!("(v) exit {code}"));
+    }
+
+    #[test]
+    fn tb10_v_a_wall_exit_78_stops_the_agent_and_nothing_restarts_it() {
+        if !require_systemd() {
+            return;
+        }
+        exit_code_schedule(78, false);
+    }
+
+    #[test]
+    fn tb10_v_a_wall_exit_75_stops_the_agent_and_only_the_wall_returns() {
+        if !require_systemd() {
+            return;
+        }
+        exit_code_schedule(75, true);
+    }
+
+    #[test]
+    fn tb10_vi_a_wall_stop_during_the_agents_start_cancels_it() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("gate-sleep");
+        assert!(systemctl(&["start", &f.wall]).status.success());
+        assert!(systemctl(&["start", "--no-block", &f.agent])
+            .status
+            .success());
+        assert!(
+            wait_until(SLACK, || prop(&f.agent, "SubState") == "start-pre"),
+            "(vi) the agent must be inside its ExecStartPre= stage"
+        );
+        assert!(systemctl(&["stop", &f.wall]).status.success());
+        assert!(wait_until(SLACK, || {
+            let s = prop(&f.agent, "ActiveState");
+            s == "inactive" || s == "failed"
+        }));
+        // Past the fixture gate's own sleep: a start that was not cancelled
+        // would have reached ExecStart by now.
+        std::thread::sleep(Duration::from_secs(FIXTURE_DELAY_SECS + 1));
+        assert!(
+            !f.marker_present(),
+            "(vi) the agent must never reach ExecStart"
+        );
+    }
+
+    #[test]
+    fn tb10_vii_the_agent_and_its_check_run_as_the_instance() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        let pid = prop(&f.agent, "MainPID");
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("agent /proc status");
+        let ids: String = status
+            .lines()
+            .filter(|l| l.starts_with("Uid:") || l.starts_with("Gid:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        for line in ids.lines() {
+            let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+            assert_eq!(fields.len(), 4, "{line}");
+            assert!(
+                fields.iter().all(|v| *v == FIXTURE_INSTANCE.to_string()),
+                "(vii) every id must be the instance: {line}"
+            );
+        }
+        let view = std::fs::read_to_string(f.units.path("check-view")).expect("check view");
+        assert_eq!(
+            view, ids,
+            "(vii) the check saw exactly the agent's credentials"
+        );
+    }
+
+    #[test]
+    fn tb10_viii_a_wall_restart_restarts_the_agent_behind_the_new_ready() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        let first_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        assert!(systemctl(&["restart", &f.wall]).status.success());
+        assert!(
+            wait_until(SLACK, || {
+                prop(&f.agent, "ActiveState") == "active"
+                    && mono(&f.agent, "ExecMainStartTimestampMonotonic") > first_start
+            }),
+            "(viii) the agent must be started again by the propagated restart"
+        );
+        let agent_down = mono(&f.agent, "InactiveEnterTimestampMonotonic");
+        let wall_exit = mono(&f.wall, "ActiveExitTimestampMonotonic");
+        let wall_ready = mono(&f.wall, "ActiveEnterTimestampMonotonic");
+        let agent_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        assert!(
+            agent_down <= wall_exit,
+            "(viii) agent stopped {agent_down} before the wall's ActiveExit {wall_exit}"
+        );
+        assert!(
+            agent_start > wall_ready,
+            "(viii) agent restarted {agent_start} after the new ActiveEnter {wall_ready}"
+        );
+    }
+
+    /// The agent account section 4.1 of the slice B design provisions, with the
+    /// exact argv an operator runs, removed on every exit path IF this test
+    /// created it (a pre-existing matching account is left alone).
+    struct ProvisionedAccount {
+        name: String,
+        created_user: bool,
+        created_group: bool,
+    }
+
+    impl ProvisionedAccount {
+        fn provision(uid: u32) -> Result<Self, String> {
+            let name = format!("sanctuary-agent-{uid}");
+            let getent = |db: &str| {
+                Command::new("getent")
+                    .args([db, &uid.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default()
+            };
+            // Classify first; anything but absent or the exact expected entry
+            // stops the test without modifying the account database.
+            let (user, group) = (getent("passwd"), getent("group"));
+            let want_group = format!("{name}:x:{uid}:");
+            let want_user_prefix = format!("{name}:x:{uid}:{uid}:");
+            if !group.is_empty() && group != want_group {
+                return Err(format!("gid {uid} is held by another entry: {group:?}"));
+            }
+            let user_is_expected =
+                user.starts_with(&want_user_prefix) && user.ends_with(":/usr/sbin/nologin");
+            if !user.is_empty() && !user_is_expected {
+                return Err(format!("uid {uid} is held by another entry: {user:?}"));
+            }
+            let mut account = Self {
+                name: name.clone(),
+                created_user: false,
+                created_group: false,
+            };
+            if group.is_empty() {
+                let out = Command::new("groupadd")
+                    .args(["--system", "--gid", &uid.to_string(), &name])
+                    .output()
+                    .map_err(|e| format!("groupadd: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "groupadd: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                account.created_group = true;
+            }
+            if user.is_empty() {
+                let out = Command::new("useradd")
+                    .args([
+                        "--system",
+                        "--uid",
+                        &uid.to_string(),
+                        "--gid",
+                        &uid.to_string(),
+                        "--no-create-home",
+                        "--home-dir",
+                        "/nonexistent",
+                        "--shell",
+                        "/usr/sbin/nologin",
+                        &name,
+                    ])
+                    .output()
+                    .map_err(|e| format!("useradd: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("useradd: {}", String::from_utf8_lossy(&out.stderr)));
+                }
+                account.created_user = true;
+            }
+            Ok(account)
+        }
+    }
+
+    impl Drop for ProvisionedAccount {
+        fn drop(&mut self) {
+            if self.created_user {
+                let _ = Command::new("userdel").arg(&self.name).output();
+            }
+            if self.created_group {
+                let _ = Command::new("groupdel").arg(&self.name).output();
+            }
+        }
+    }
+
+    /// Removes the isolated table and journal last, after the units stopped.
+    struct IsolatedKernelState;
+
+    impl Drop for IsolatedKernelState {
+        fn drop(&mut self) {
+            cleanup_castle_table();
+            cleanup_journal();
+        }
+    }
+
+    /// (ix): the REAL verbs under the shipped directives. The daemon runs as a
+    /// runtime `Type=notify` unit on an isolated table admitting 60123; the
+    /// agent unit is derived from the shipped one keeping both real
+    /// `ExecStartPre=` lines and their prefixes, `CapabilityBoundingSet=`,
+    /// `NoNewPrivileges=` and `EnvironmentFile=` (a root 0600 test file), with
+    /// no `UnsetEnvironment=`. Reaching ExecStart with the admit line in the
+    /// journal is the integrated proof that the `+` gate kept CAP_NET_ADMIN
+    /// under the empty bounding set and received the trusted uid.
+    #[test]
+    fn tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives() {
+        let _suite = suite_guard();
+        if !require_systemd() {
+            return;
+        }
+        let _kernel = IsolatedKernelState;
+        cleanup_castle_table();
+        cleanup_journal();
+        let _account = match ProvisionedAccount::provision(TEST_AGENT_UID) {
+            Ok(account) => account,
+            Err(reason) => panic!("(ix) could not provision the agent account: {reason}"),
+        };
+        let mut units = Tb10Units::new();
+        let tag = units.tag.clone();
+        let d = units.dir.path().display().to_string();
+        let binary = units.path("castle-wall-daemon");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::copy(env!("CARGO_BIN_EXE_castle-wall-daemon"), &binary).expect("copy");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("0755 binary");
+        }
+        let bin = binary.display().to_string();
+        // Daemon state in its own 0700 root dir (the scratch dir is 0777).
+        let state = TempDir::new().unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let pinned = write_pinned_key(&state, &signing);
+        write_confining_manifest(state.path(), &signing);
+        let st = state.path().display().to_string();
+        let isolation = isolation_args().join(" ");
+        let wall = format!("sanctuary-tb10ix-wall-{tag}.service");
+        units.write_unit(
+            &wall,
+            &format!(
+                "[Unit]\nDescription=TB10 ix isolated wall\n\n[Service]\nType=notify\n\
+                 ExecStart={bin} --fortress-id deadbeef --socket-path {st}/filter.sock \
+                 --policy-dir {st} --wal-path {st}/wal.jsonl --pinned-public-key {} \
+                 --producer-key {st}/audit-producer.key --producer-pub-key {st}/audit-producer.pub \
+                 {isolation}\nRestart=no\nTimeoutStartSec=60\n",
+                pinned.display()
+            ),
+        );
+        units.write_script(
+            "agent.sh",
+            &format!("#!/bin/sh\necho started >> {d}/marker\nexec sleep infinity\n"),
+        );
+        let env = units
+            .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
+        let table_tag = tb9_isolated_table_tail().join(" ");
+        let template = format!("sanctuary-tb10ix-agent-{tag}@.service");
+        let agent = format!("sanctuary-tb10ix-agent-{tag}@{TEST_AGENT_UID}.service");
+        let shipped = shipped_agent_unit();
+        assert!(
+            !shipped.lines().any(|l| l.starts_with("UnsetEnvironment")),
+            "(ix) the shipped unit carries no UnsetEnvironment= directive"
+        );
+        let derived = substitute(&shipped, "sanctuary-castle-wall.service", &wall, 5);
+        let derived = substitute(
+            &derived,
+            "/usr/local/libexec/sanctuary/castle-wall-daemon",
+            &bin,
+            2,
+        );
+        let derived = substitute(
+            &derived,
+            "--trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}",
+            &format!("--trusted-service-uid ${{SANCTUARY_TRUSTED_SERVICE_UID}} {table_tag}"),
+            1,
+        );
+        let derived = substitute(
+            &derived,
+            "ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1",
+            &format!("ExecStart=/bin/sh {d}/agent.sh"),
+            1,
+        );
+        let derived = substitute(
+            &derived,
+            "EnvironmentFile=/etc/sanctuary/castle-wall.env",
+            &format!("EnvironmentFile={}", env.display()),
+            1,
+        );
+        let derived = substitute(
+            &derived,
+            "sanctuary-agent-%i",
+            &format!("sanctuary-tb10-{tag}-%i"),
+            4,
+        );
+        units.write_unit(&template, &derived);
+        units.extra_dirs.push(PathBuf::from(format!(
+            "/var/lib/sanctuary-tb10-{tag}-{TEST_AGENT_UID}"
+        )));
+        units.stop_order = vec![agent.clone(), wall.clone()];
+        units.reload();
+
+        let out = systemctl(&["start", &agent]);
+        let journal = || {
+            Command::new("journalctl")
+                .args(["-u", &agent, "-o", "cat", "--no-pager"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default()
+        };
+        let admit = format!("agent_start_gate=admit uid={TEST_AGENT_UID}");
+        assert!(
+            out.status.success(),
+            "(ix) the agent start must succeed: {} / wall {} / journal: {}",
+            String::from_utf8_lossy(&out.stderr),
+            prop(&wall, "ActiveState"),
+            journal()
+        );
+        assert!(
+            units.path("marker").exists(),
+            "(ix) the agent must reach ExecStart"
+        );
+        assert!(
+            wait_until(SLACK, || journal().contains(&admit)),
+            "(ix) the agent journal must carry {admit:?}: {}",
+            journal()
+        );
+        assert!(
+            journal().contains(&format!(
+                "agent_credential_check=match uid={TEST_AGENT_UID}"
+            )),
+            "(ix) the credential check must have matched as the instance"
+        );
+    }
+}

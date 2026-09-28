@@ -287,7 +287,7 @@ jobs:
             # With --nocapture the witness's own evidence lines sit between
             # "test <name> ... " and its "ok", so the name and a bare "ok" line
             # are checked separately; the result line below pins the count.
-            grep -Fq "test $case_name ... " case.log && grep -Fxq "ok" case.log || {
+            grep -Fq "test $case_name ... " case.log && grep -Eq "(^| )ok$" case.log || {
               echo "FAIL: exact premise case $case_name did not report ok"
               exit 1
             }
@@ -297,6 +297,54 @@ jobs:
             }
             if grep -Fq 'SKIP' case.log; then
               echo "FAIL: premise case $case_name returned early with SKIP"
+              exit 1
+            fi
+          done
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Prove the agent template unit schedules (TB10) ran against real systemd without a skip
+        working-directory: castle-wall-daemon
+        # Three schedules each hold a 124 s no-restart window (W, derived from
+        # the shipped wall unit), so the loop's worst case is several minutes.
+        timeout-minutes: 20
+        run: |
+          # TB10 derives runtime units from the SHIPPED agent unit and drives
+          # them under the runner's systemd PID 1: (i) to (viii) with fixture
+          # verbs as the overflow account, (ix) with the REAL verbs against an
+          # isolated-table daemon as a provisioned agent account. Each case is
+          # rerun uncaptured, one at a time, and a SKIP is refused, because an
+          # early return reads as a pass in the captured all-targets run.
+          # Failure mode this guards: a runner without root or without systemd
+          # as PID 1 turns every schedule into a silent pass.
+          set -o pipefail
+          : > agent-unit-tb10-focused.log
+          prefix=tb10_agent_unit_against_real_systemd
+          for case_name in \
+            $prefix::tb10_i_the_agent_starts_only_after_the_walls_ready \
+            $prefix::tb10_ii_a_wall_that_fails_to_start_fails_the_agent_start \
+            $prefix::tb10_iii_a_wall_stop_stops_the_agent_first \
+            $prefix::tb10_iv_a_killed_wall_restarts_alone \
+            $prefix::tb10_v_a_wall_exit_78_stops_the_agent_and_nothing_restarts_it \
+            $prefix::tb10_v_a_wall_exit_75_stops_the_agent_and_only_the_wall_returns \
+            $prefix::tb10_vi_a_wall_stop_during_the_agents_start_cancels_it \
+            $prefix::tb10_vii_the_agent_and_its_check_run_as_the_instance \
+            $prefix::tb10_viii_a_wall_restart_restarts_the_agent_behind_the_new_ready \
+            $prefix::tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives; do
+            sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+              --test integration_linux_runtime_activation --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee case.log
+            cat case.log >> agent-unit-tb10-focused.log
+            grep -Fq "test $case_name ... " case.log && grep -Eq "(^| )ok$" case.log || {
+              echo "FAIL: exact TB10 case $case_name did not report ok"
+              exit 1
+            }
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' case.log || {
+              echo "FAIL: focused TB10 result for $case_name was absent, skipped, or malformed"
+              exit 1
+            }
+            if grep -Fq 'SKIP' case.log; then
+              echo "FAIL: TB10 case $case_name returned early with SKIP"
               exit 1
             fi
           done
@@ -360,6 +408,7 @@ jobs:
             castle-wall-daemon/cargo-test.plain.log
             castle-wall-daemon/systemd-start-limit-focused.log
             castle-wall-daemon/agent-unit-premises-focused.log
+            castle-wall-daemon/agent-unit-tb10-focused.log
           if-no-files-found: warn
 
       - name: Cleanup nftables state
