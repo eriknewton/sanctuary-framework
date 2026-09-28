@@ -60,10 +60,118 @@ pub const SUPERVISOR_SHUTDOWN_TICK: Duration = Duration::from_millis(200);
 /// one. `kernel_runtime_health` reaches it on runtime-mutex contention
 /// (`TryLockError::WouldBlock`), which never consults the nft probe. A wedged
 /// `nft` instead exhausts the probe's own
-/// `NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE` budget, which returns a PROVEN
-/// `Lost` and is acted on immediately by the no-grace arm below. Both routes end
-/// in `record_runtime_loss`; keep them both.
+/// `NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE` budget, which latches
+/// `Indeterminate` (never a proven `Lost`: `note_indeterminate` in
+/// `src/health_probe.rs`) and is acted on at once by the supervisor's
+/// `Indeterminate` arm, which runs the post-READY hook before its decision; the
+/// `Lost` arm runs no hook. Both routes end in `record_runtime_loss`; keep them
+/// both.
 const MAX_CONSECUTIVE_UNAVAILABLE_HEALTH_READINGS: u32 = 3;
+
+// ---- C2a3: systemd liveness watchdog, derived ------------------------------
+//
+// Two different quantities, kept apart:
+// * the PET GAP: the longest time between two liveness pets while the
+//   supervisor is live. It governs whether a healthy daemon is killed.
+// * the DECISION GAP: the longest BOUNDED time from the watchdog's reference
+//   point (the last pet, or `READY=1` when no pet was sent yet) to a terminal
+//   `decide_and_arm`. It governs whether the stop guard's decided exit code
+//   lands before the watchdog's SIGKILL.
+// Unbounded steps (WAL and journal `sync_all`, the audit-buffer and runtime
+// mutexes, the owner hook's release-log replays) are outside both bounds; the
+// watchdog is what bounds them, at the price of a kill.
+
+/// Longest wait of one nft ownership probe poll a supervisor pass can make.
+/// Must match `NFT_HEALTH_QUERY_TIMEOUT` in `src/runtime_providers.rs` (TD2).
+pub const WATCHDOG_PROBE_WAIT: Duration = Duration::from_secs(1);
+
+/// Probe polls a NON-terminal pass can wait on: the recovery gate read
+/// (`EnforcementRuntime::attempt_post_ready_recovery`), the retrying re-probe
+/// inside `recover_post_ready_loss`, and the status read. Three is a counted
+/// over-estimate (the latch, the min-interval cache and single-flight mean at
+/// most two block); TD3 counts the call sites so a fourth cannot land silently.
+pub const WATCHDOG_PASS_PROBE_WAITS: u32 = 3;
+
+/// The `Indeterminate` arm's one bounded nft call before its decision (the live
+/// table read inside `resolve_net_scope_at_site`): 2700 ms = the nft command
+/// timeout 2000 + kill grace 200 + reap grace 500. Written as the literal
+/// because the nft constant is test-only inside a private module. Must match
+/// `linux::NFT_CALL_WORST_CASE` in `src/nftables.rs` (TD2n pins that side).
+pub const WATCHDOG_HOOK_NFT_WAIT: Duration = Duration::from_millis(2700);
+
+/// Owner socket requests the `Indeterminate` hook can make before its decision:
+/// the completion pull and the signed stop-failure intent inside
+/// `stop_failure_for_hook_at` (TD2 counts the `request_to(` calls).
+pub const WATCHDOG_HOOK_OWNER_REQUESTS: u32 = 2;
+
+/// The owner requests' bounded wait: `WATCHDOG_HOOK_OWNER_REQUESTS` x 250 ms.
+/// 250 must match `CLIENT_DEADLINE` in `src/protected_agent/owner.rs` (TD2).
+pub const WATCHDOG_HOOK_OWNER_WAIT: Duration =
+    Duration::from_millis(WATCHDOG_HOOK_OWNER_REQUESTS as u64 * 250);
+
+/// Pet gap: `SUPERVISOR_HEALTH_INTERVAL + SUPERVISOR_SHUTDOWN_TICK +
+/// WATCHDOG_PASS_PROBE_WAITS * WATCHDOG_PROBE_WAIT` = 2000 + 200 + 3000 = 5200 ms.
+/// A pass starts at most one interval plus one tick after the previous pass
+/// ended, and waits on at most three probe polls.
+pub const WATCHDOG_PET_GAP_BOUND: Duration = Duration::from_millis(
+    SUPERVISOR_HEALTH_INTERVAL.as_millis() as u64
+        + SUPERVISOR_SHUTDOWN_TICK.as_millis() as u64
+        + WATCHDOG_PASS_PROBE_WAITS as u64 * WATCHDOG_PROBE_WAIT.as_millis() as u64,
+);
+
+/// Decision gap: `WATCHDOG_PET_GAP_BOUND + WATCHDOG_HOOK_NFT_WAIT +
+/// WATCHDOG_HOOK_OWNER_WAIT` = 5200 + 2700 + 500 = 8400 ms, reached only on the
+/// `Indeterminate` arm (the `Lost` and probe-budget arms run no hook).
+pub const WATCHDOG_DECISION_GAP_BOUND: Duration = Duration::from_millis(
+    WATCHDOG_PET_GAP_BOUND.as_millis() as u64
+        + WATCHDOG_HOOK_NFT_WAIT.as_millis() as u64
+        + WATCHDOG_HOOK_OWNER_WAIT.as_millis() as u64,
+);
+
+/// When, from the watchdog's reference point, the stop guard's `_exit(decided)`
+/// lands at the latest: `WATCHDOG_DECISION_GAP_BOUND + STOP_GUARD_DEADLINE_SECS
+/// + STOP_GUARD_MARGIN_SECS` = 8400 + 8000 + 2000 = 18400 ms.
+///
+/// `STOP_GUARD_MARGIN_SECS` is REUSED here for a different quantity: the stop
+/// guard defines it as two allowances (SIGTERM delivery at the guard's start,
+/// SIGALRM delivery and `exit_group` at its end); on a self-exit only the second
+/// exists, so the full 2 s over-covers. If that constant is ever split into its
+/// halves, this derivation must take the end-of-deadline half explicitly and be
+/// re-pinned.
+pub const WATCHDOG_DECIDED_EXIT_BOUND: Duration = Duration::from_millis(
+    WATCHDOG_DECISION_GAP_BOUND.as_millis() as u64
+        + (crate::exit_guard::STOP_GUARD_DEADLINE_SECS as u64
+            + crate::exit_guard::STOP_GUARD_MARGIN_SECS as u64)
+            * MILLIS_PER_SEC,
+);
+
+/// Milliseconds in one second, for the whole-second conversions below.
+const MILLIS_PER_SEC: u64 = 1000;
+
+/// The systemd watchdog interval, in whole seconds: the smallest whole second
+/// at or above `WATCHDOG_DECIDED_EXIT_BOUND` = ceil(18.4) = 19 (I2).
+/// Must match `WatchdogSec=` in `systemd/sanctuary-castle-wall.service` (TU1).
+pub const WATCHDOG_SEC: u32 = WATCHDOG_DECIDED_EXIT_BOUND
+    .as_millis()
+    .div_ceil(MILLIS_PER_SEC as u128) as u32;
+
+/// `WATCHDOG_SEC` in milliseconds, for the inequalities below.
+const WATCHDOG_MS: u128 = WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128;
+
+// I1: the watchdog is never the tighter bound on a manager stop.
+const _: () = assert!(WATCHDOG_SEC > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS);
+// I2: a decision inside the decision-gap bound exits by the guard's code before
+// the watchdog's SIGKILL.
+const _: () = assert!(WATCHDOG_MS >= WATCHDOG_DECIDED_EXIT_BOUND.as_millis());
+// I3: at least two pets per watchdog interval (the sd_watchdog_enabled(3) rule).
+const _: () = assert!(WATCHDOG_MS >= 2 * WATCHDOG_PET_GAP_BOUND.as_millis());
+// I7: a manager stop of a healthy daemon lands at most one pet gap after a pet,
+// so even a watchdog systemd kept running through the stop fires only after
+// TimeoutStopSec has ended the stop.
+const _: () = assert!(
+    WATCHDOG_MS - WATCHDOG_PET_GAP_BOUND.as_millis()
+        > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS as u128 * MILLIS_PER_SEC as u128
+);
 
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
@@ -4200,5 +4308,285 @@ mod tests {
         release.store(true, std::sync::atomic::Ordering::SeqCst);
         holder.join().expect("holder thread");
         let _ = handle.stop();
+    }
+
+    // ---- C2a3: the watchdog derivation's inputs (LINUX-SUPERVISOR-WEDGE-R1-01) ----
+
+    /// TD1: the pet gap, the decision gap and `WATCHDOG_SEC` by their formulas,
+    /// and I2, I3 and I7 in milliseconds (the `const` asserts beside the
+    /// constants hold the same inequalities at compile time).
+    #[test]
+    fn td1_watchdog_constants_are_derived_from_their_inputs() {
+        let ms = |d: Duration| d.as_millis();
+        assert_eq!(
+            WATCHDOG_PET_GAP_BOUND,
+            SUPERVISOR_HEALTH_INTERVAL
+                + SUPERVISOR_SHUTDOWN_TICK
+                + WATCHDOG_PROBE_WAIT * WATCHDOG_PASS_PROBE_WAITS
+        );
+        assert_eq!(ms(WATCHDOG_PET_GAP_BOUND), 5200);
+        assert_eq!(
+            WATCHDOG_DECISION_GAP_BOUND,
+            WATCHDOG_PET_GAP_BOUND + WATCHDOG_HOOK_NFT_WAIT + WATCHDOG_HOOK_OWNER_WAIT
+        );
+        assert_eq!(ms(WATCHDOG_DECISION_GAP_BOUND), 8400);
+        let guard = Duration::from_secs(u64::from(
+            crate::exit_guard::STOP_GUARD_DEADLINE_SECS + crate::exit_guard::STOP_GUARD_MARGIN_SECS,
+        ));
+        assert_eq!(
+            WATCHDOG_DECIDED_EXIT_BOUND,
+            WATCHDOG_DECISION_GAP_BOUND + guard
+        );
+        assert_eq!(ms(WATCHDOG_DECIDED_EXIT_BOUND), 18_400);
+        // ceil_secs(8.4 s + 8 s + 2 s) = ceil(18.4) = 19.
+        assert_eq!(
+            u128::from(WATCHDOG_SEC),
+            ms(WATCHDOG_DECIDED_EXIT_BOUND).div_ceil(1000)
+        );
+        assert_eq!(WATCHDOG_SEC, 19);
+        let wd = Duration::from_secs(u64::from(WATCHDOG_SEC));
+        let stop = Duration::from_secs(u64::from(crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS));
+        assert!(wd > stop, "I1");
+        assert!(wd >= WATCHDOG_DECIDED_EXIT_BOUND, "I2");
+        assert!(wd >= WATCHDOG_PET_GAP_BOUND * 2, "I3");
+        assert!(wd - WATCHDOG_PET_GAP_BOUND > stop, "I7");
+    }
+
+    /// TD2 (runtime half, Linux only): the derivation's inputs are the
+    /// product's own budgets (I6). The nft half is TD2n in `src/nftables.rs`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn td2_watchdog_inputs_match_the_product_budgets() {
+        assert_eq!(
+            WATCHDOG_PROBE_WAIT,
+            crate::runtime_providers::NFT_HEALTH_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            WATCHDOG_HOOK_OWNER_WAIT,
+            crate::protected_agent::owner::CLIENT_DEADLINE * WATCHDOG_HOOK_OWNER_REQUESTS
+        );
+        assert_eq!(WATCHDOG_HOOK_NFT_WAIT, Duration::from_millis(2700));
+    }
+
+    /// The body of the first `fn <name>` (generic or not) in `code`.
+    fn watchdog_fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+        let start = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .filter_map(|needle| code.find(needle.as_str()))
+            .min()
+            .unwrap_or_else(|| panic!("fn {name} must exist"));
+        let open = start + code[start..].find('{').expect("a body");
+        let close = crate::source_scan::matching_brace(code, open).expect("a closed body");
+        &code[start..=close]
+    }
+
+    fn watchdog_production_source(path: &str) -> String {
+        let text = crate::source_scan::daemon_sources()
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text)
+            .unwrap_or_else(|| panic!("{path} must exist"));
+        crate::source_scan::without_comment_lines(&crate::source_scan::production_part(&text))
+    }
+
+    /// TD2 (structural half): the `Indeterminate` hook's bounded waits are the
+    /// ones the derivation counts. Two owner requests, one spawning nft call, and
+    /// the hook reaches the probe only through latch-first reads, so its own
+    /// per-component `health()` fan-out waits zero (I5).
+    #[test]
+    fn td2_the_indeterminate_hook_waits_only_where_the_derivation_counts() {
+        let owner = watchdog_production_source("src/protected_agent/owner.rs");
+        let hook = watchdog_fn_body(&owner, "stop_failure_for_hook_at");
+        assert_eq!(
+            hook.matches("request_to(").count(),
+            WATCHDOG_HOOK_OWNER_REQUESTS as usize,
+            "each owner request is one CLIENT_DEADLINE in WATCHDOG_HOOK_OWNER_WAIT"
+        );
+
+        let providers = watchdog_production_source("src/runtime_providers.rs");
+        let resolve = watchdog_fn_body(&providers, "resolve_net_scope_at_site");
+        assert_eq!(
+            resolve
+                .matches("crate::nftables::list_castle_table_json(")
+                .count(),
+            1,
+            "one live-table read is WATCHDOG_HOOK_NFT_WAIT"
+        );
+        // Every other nftables call in the resolution is a pure parse, never a spawn.
+        for (at, _) in resolve.match_indices("crate::nftables::") {
+            let call: String = resolve[at + "crate::nftables::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // A `use` group or a type path (upper-case) is not a call.
+            if call.is_empty() || call.starts_with(|c: char| c.is_uppercase()) {
+                continue;
+            }
+            assert!(
+                ["list_castle_table_json", "live_table_uid_bindings"].contains(&call.as_str()),
+                "a new nftables call in the hook's scope resolution: {call}"
+            );
+        }
+        for name in ["on_post_ready_indeterminate", "net_scope_from_retained_set"] {
+            let body = watchdog_fn_body(&providers, name);
+            assert!(
+                !body.contains("reprobe_after_latch("),
+                "{name} must not clear the latch (up to one more probe wait)"
+            );
+            assert!(!body.contains("health_fresh("), "{name}");
+        }
+        let health_impl = watchdog_fn_body(&providers, "health_impl");
+        assert!(health_impl.contains("self.probe.poll_result(check)"));
+
+        let enforcement = watchdog_production_source("src/enforcement.rs");
+        let fan_out = watchdog_fn_body(&enforcement, "hook_post_ready_indeterminate");
+        assert!(fan_out.contains("component.health()"));
+        assert!(!fan_out.contains("health_fresh("));
+
+        // `poll_result` reads both latches before any wait or foreign-check read.
+        let probe = watchdog_production_source("src/health_probe.rs");
+        let poll = watchdog_fn_body(&probe, "poll_result");
+        let latch = poll
+            .find("state.latched_indeterminate")
+            .expect("latch read");
+        let lost = poll.find("state.latched_lost").expect("lost latch read");
+        for wait in [".wait_timeout(", "observe_foreign_check(", ".spawn("] {
+            let at = poll
+                .find(wait)
+                .unwrap_or_else(|| panic!("{wait} in poll_result"));
+            assert!(latch < at && lost < at, "a latch read must precede {wait}");
+        }
+    }
+
+    /// A counting fake in the nftables slot: every entry that models a waited
+    /// probe (`health`, `health_fresh`, the retrying recovery call) is counted.
+    /// It has no cache or latch, so it counts CALLS; calls >= blocking waits, so
+    /// the bound it checks is conservative.
+    struct ProbeCountingComponent {
+        kind: crate::enforcement::ComponentKind,
+        health: Arc<Mutex<crate::enforcement::ComponentHealth>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ProbeCountingComponent {
+        fn count(&self) {
+            if self.kind == crate::enforcement::ComponentKind::NftablesTable {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl crate::enforcement::AcquiredComponent for ProbeCountingComponent {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.kind
+        }
+        fn is_ready(&self) -> bool {
+            self.health() == crate::enforcement::ComponentHealth::Ready
+        }
+        fn health(&self) -> crate::enforcement::ComponentHealth {
+            self.count();
+            *self.health.lock().unwrap()
+        }
+        fn health_fresh(&self) -> crate::enforcement::ComponentHealth {
+            self.health()
+        }
+        fn attempt_post_ready_recovery(
+            &self,
+            _shutting_down: &dyn Fn() -> bool,
+        ) -> crate::enforcement::PostReadyRecoveryResult {
+            self.count();
+            crate::enforcement::PostReadyRecoveryResult::NoInstall
+        }
+        fn release(&mut self) {}
+    }
+
+    struct ProbeCountingProvider(ProbeCountingComponent);
+    impl crate::enforcement::ComponentProvider for ProbeCountingProvider {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.0.kind
+        }
+        fn acquire(
+            self: Box<Self>,
+        ) -> Result<
+            Box<dyn crate::enforcement::AcquiredComponent>,
+            crate::enforcement::EnforcementError,
+        > {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// TD3 (LINUX-SUPERVISOR-WEDGE-R1-01): a non-terminal supervisor pass makes at
+    /// most `WATCHDOG_PASS_PROBE_WAITS` probe calls, for every pass class that
+    /// pets; the Recovering pass reaches exactly that many. The structural half
+    /// pins one poll per `health_impl` call and one re-probe per recovery call.
+    #[test]
+    fn td3_a_non_terminal_pass_makes_at_most_the_counted_probe_waits() {
+        use crate::enforcement::{ComponentHealth, ComponentKind};
+        let cases = [
+            (ComponentHealth::Ready, RuntimeHealthState::Ready, 2usize),
+            (
+                ComponentHealth::ProbeUnavailable,
+                RuntimeHealthState::ProbeUnavailable,
+                2,
+            ),
+            (
+                ComponentHealth::Recovering,
+                RuntimeHealthState::Recovering(
+                    crate::enforcement::NotReadyReason::SafetyNetRecovering(
+                        ComponentKind::NftablesTable,
+                    ),
+                ),
+                WATCHDOG_PASS_PROBE_WAITS as usize,
+            ),
+        ];
+        for (reading, expected_state, expected_calls) in cases {
+            let dir = TempDir::new().unwrap();
+            let (config, _) = fresh_config_in(&dir);
+            let mut handle = boot(config).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let health = Arc::new(Mutex::new(ComponentHealth::Ready));
+            let providers = ComponentKind::REQUIRED_IN_ORDER
+                .iter()
+                .copied()
+                .map(|kind| {
+                    Box::new(ProbeCountingProvider(ProbeCountingComponent {
+                        kind,
+                        health: if kind == ComponentKind::NftablesTable {
+                            Arc::clone(&health)
+                        } else {
+                            Arc::new(Mutex::new(ComponentHealth::Ready))
+                        },
+                        calls: Arc::clone(&calls),
+                    })) as Box<dyn crate::enforcement::ComponentProvider>
+                })
+                .collect();
+            handle.set_enforcement_for_test(EnforcementRuntime::start(providers).unwrap());
+            *health.lock().unwrap() = reading;
+            calls.store(0, Ordering::SeqCst);
+            // One supervisor pass's probe traffic is one call of this function.
+            let (observed, _) = handle.kernel_runtime_health_with_recovery(false);
+            assert_eq!(observed, expected_state, "{reading:?}");
+            let made = calls.load(Ordering::SeqCst);
+            assert!(
+                made <= WATCHDOG_PASS_PROBE_WAITS as usize,
+                "{reading:?}: {made} probe calls in one pass, over the counted \
+                 WATCHDOG_PASS_PROBE_WAITS; re-derive WATCHDOG_SEC"
+            );
+            assert_eq!(made, expected_calls, "{reading:?}");
+            let _ = handle.stop();
+        }
+
+        let providers = watchdog_production_source("src/runtime_providers.rs");
+        let health_impl = watchdog_fn_body(&providers, "health_impl");
+        assert_eq!(
+            health_impl.matches("self.probe.poll_result(").count()
+                + health_impl
+                    .matches("self.probe.poll_bypassing_cache(")
+                    .count(),
+            2,
+            "one poll on each arm of the fresh/cached split"
+        );
+        let recover = watchdog_fn_body(&providers, "recover_post_ready_loss");
+        assert_eq!(recover.matches("reprobe_after_latch(").count(), 1);
     }
 }
