@@ -13,12 +13,14 @@
 //! cannot fall through to running an unconfined program.
 //!
 //! Usage:
+//! ```text
 //!   sanctuary-plugin-launcher \
 //!     --plugin-id <id> --instance-id <id> --mode <rootless|privileged> \
 //!     --bundle-dir <abs> --scratch-dir <abs> --cgroup-path <abs> \
 //!     --rootfs-hash <hex> --control-pipe-fd <n> --broker-fd <n> \
 //!     --entry <relpath> [--rlimit-cpu <s>] [--rlimit-as <bytes>] \
 //!     [--rlimit-nofile <n>] -- <entry args...>
+//! ```
 
 use std::process;
 

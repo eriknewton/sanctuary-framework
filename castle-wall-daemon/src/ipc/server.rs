@@ -9,7 +9,7 @@
 //! listener, and unlinks the socket. The 120-second idle timeout is therefore
 //! an idle-resource bound, not the shutdown bound.
 //!
-//! Per scope-lock §5: the socket lives at /run/sanctuary/<fortress-id>/filter.sock,
+//! Per scope-lock §5: the socket lives at `/run/sanctuary/<fortress-id>/filter.sock`,
 //! mode 0660, owner root:sanctuary. The accept loop polls every 100ms so
 //! shutdown is observed within a tick.
 

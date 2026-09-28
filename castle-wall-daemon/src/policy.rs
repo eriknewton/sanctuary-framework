@@ -1288,10 +1288,10 @@ fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
 
 /// Build the canonical-JSON `AuditEntry` body for a verdict + request.
 /// Shape matches scope-lock §8 critical-event recommendation: `layer:
-/// "l1"`, `operation` from [`operation_for_verdict`], `identity_id` =
+/// "l1"`, `operation` from `operation_for_verdict`, `identity_id` =
 /// the canonical Sanctuary protection subject (`fortress_id/uid-N`) when the
 /// signed manifest binds Linux uid-mode origin, `result` from
-/// [`result_for_verdict`], and a `details` object carrying destination metadata
+/// `result_for_verdict`, and a `details` object carrying destination metadata
 /// + rule provenance.
 ///
 /// The body is canonicalized so the bytes Sanctuary main signs on drain

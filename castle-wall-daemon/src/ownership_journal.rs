@@ -464,8 +464,8 @@ impl JournalActivation {
 /// no history on purpose. A handle that carried the record would make every later
 /// write a stale overwrite, dropping each uid another write recorded since
 /// construction (C2a2 gate F4); every writer therefore re-loads and re-validates
-/// through [`OwnedJournalHandle::reload_for_activation`] and mutates only the record
-/// that call returned. The fields are private, so [`OwnedJournalHandle::establish`]
+/// through `OwnedJournalHandle::reload_for_activation` and mutates only the record
+/// that call returned. The fields are private, so `OwnedJournalHandle::establish`
 /// is the only way to obtain one, and the type is not `Clone`: the component owns
 /// the one instance and writers borrow it.
 #[derive(Debug)]

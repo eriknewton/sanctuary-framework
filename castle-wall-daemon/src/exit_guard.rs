@@ -13,7 +13,7 @@
 //!
 //! * `main` returning normally ([`claim_return`], state `EXIT_RETURNING`);
 //! * the NFQUEUE verdict fail-stop ([`terminate_with_decided_code`]);
-//! * the `SIGALRM` handler ([`on_stop_guard_alarm`]), which `_exit`s with the
+//! * the `SIGALRM` handler (`on_stop_guard_alarm`), which `_exit`s with the
 //!   decided code.
 //!
 //! No thread is spawned: `alarm` cannot fail and is async-signal-safe, so the

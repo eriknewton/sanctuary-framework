@@ -253,21 +253,20 @@ pub struct DaemonHandle {
     /// `None` (the daemon reports `ControlPlaneOnly`). Either way the daemon is
     /// never `Enforcing` in this slice: no agent is wrapped (ASSURANCE_MATRIX
     /// row 17). Owning the runtime here is what makes teardown release it BEFORE
-    /// the IPC control surface (see [`teardown`](Self::teardown)).
+    /// the IPC control surface (see `teardown`).
     enforcement: Option<Arc<Mutex<EnforcementRuntime>>>,
     /// Daemon shutdown-REQUEST flag. Signal handlers and [`request_stop`] set
     /// ONLY this; it is what [`supervise_until_shutdown`] / [`is_shutdown_requested`]
     /// observe and what drives the daemon's DECISION to begin teardown. It is
     /// deliberately NOT the IPC accept-loop stop flag: a shutdown request must
     /// never tear the IPC control surface down before enforcement is released
-    /// (see [`teardown`]), so the accept loop is stopped by a distinct flag that
+    /// (see `teardown`), so the accept loop is stopped by a distinct flag that
     /// only [`IpcServer::stop_and_join`] sets, and only AFTER
     /// `enforcement.shutdown()`.
     ///
     /// [`request_stop`]: Self::request_stop
     /// [`supervise_until_shutdown`]: Self::supervise_until_shutdown
     /// [`is_shutdown_requested`]: Self::is_shutdown_requested
-    /// [`teardown`]: Self::teardown
     shutdown_flag: Arc<AtomicBool>,
     /// Fatal control-path withdrawal (for example a publication that committed
     /// but whose success receipt could not be durably recorded). Kept separate
@@ -406,7 +405,7 @@ impl DaemonHandle {
     /// realizes the F-1 deny-by-default invariant and the per-attempt
     /// audit emission path called out in the Checkpoint 3 dispatch.
     ///
-    /// Returned verdict is whatever [`PolicySnapshot::evaluate`] decides;
+    /// Returned verdict is whatever [`PolicySnapshot::evaluate`](crate::policy::PolicySnapshot::evaluate) decides;
     /// when the daemon is configured in a transient mode without the
     /// manifest store or WAL wired, [`AttemptError::ManifestStoreUnwired`]
     /// or [`AttemptError::WalUnwired`] surfaces.
@@ -1088,7 +1087,7 @@ impl DaemonHandle {
 
     /// Programmatically request shutdown. Sets ONLY the daemon
     /// shutdown-request flag — so
-    /// [`supervise_until_shutdown`](Self::supervise_until_shutdown) returns and [`teardown`](Self::teardown) begins — and deliberately does
+    /// [`supervise_until_shutdown`](Self::supervise_until_shutdown) returns and `teardown` begins — and deliberately does
     /// NOT stop the IPC accept loop. `teardown` stops IPC via
     /// [`IpcServer::stop_and_join`] only AFTER enforcement is released, so a
     /// programmatic (or signal-driven) stop can never terminate the control
@@ -1222,7 +1221,7 @@ impl DaemonHandle {
 
     /// Stop the IPC server and wait for it to join, then return the exit
     /// report. Delegates the ordered enforcement-before-IPC teardown to the
-    /// shared [`teardown`](Self::teardown) path so it matches the `Drop` route
+    /// shared `teardown` path so it matches the `Drop` route
     /// exactly.
     pub fn stop(mut self) -> Result<DaemonExitReport, DaemonError> {
         self.teardown();

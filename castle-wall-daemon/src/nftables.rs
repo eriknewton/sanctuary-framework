@@ -4105,7 +4105,7 @@ pub fn install_castle_table() -> Result<(), NftablesError> {
 
 /// GF1 deny-all safety net: force `<castle_table>` to a fail-CLOSED base output
 /// chain (`policy drop`, no rules) in one atomic transaction. See
-/// [`linux::install_deny_all_safety_net_impl`]. Used by the reclaim/acquire path
+/// `linux::install_deny_all_safety_net_impl`. Used by the reclaim/acquire path
 /// when the daemon's authenticated ownership journal proves it owned a table
 /// this boot but the live table has been LOST or has DRIFTED off its captured
 /// identity: deny-all is installed BEFORE the acquisition refuses, so the loop
@@ -4121,7 +4121,7 @@ pub fn install_deny_all_safety_net(_scope: &SafetyNetScope) -> Result<(), Nftabl
 }
 
 /// GF1.1: whether the LIVE table is exactly this daemon's deny-all safety net.
-/// See [`linux::live_table_is_deny_all_safety_net_impl`].
+/// See `linux::live_table_is_deny_all_safety_net_impl`.
 #[cfg(target_os = "linux")]
 pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
     linux::live_table_is_deny_all_safety_net_impl()
@@ -4162,7 +4162,7 @@ pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
 }
 
 /// GF1.1 recovery: atomically reset the deny-all net to a fresh owned table
-/// stamped `new_marker`. See [`linux::atomic_reset_deny_all_net_to_fresh_owned_impl`].
+/// stamped `new_marker`. See `linux::atomic_reset_deny_all_net_to_fresh_owned_impl`.
 #[cfg(target_os = "linux")]
 pub fn atomic_reset_deny_all_net_to_fresh_owned(new_marker: &str) -> Result<(), NftablesError> {
     linux::atomic_reset_deny_all_net_to_fresh_owned_impl(new_marker)
@@ -4174,7 +4174,7 @@ pub fn atomic_reset_deny_all_net_to_fresh_owned(_new_marker: &str) -> Result<(),
 }
 
 /// GF1.2 last-resort escalation: delete the `sanctuary-castle` table by name.
-/// See [`linux::force_delete_castle_table_by_name_impl`].
+/// See `linux::force_delete_castle_table_by_name_impl`.
 #[cfg(target_os = "linux")]
 pub fn force_delete_castle_table_by_name() -> Result<(), NftablesError> {
     linux::force_delete_castle_table_by_name_impl()

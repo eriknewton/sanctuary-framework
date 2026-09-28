@@ -43,7 +43,7 @@ pub const CAP_STATUS_RUNTIME_FIELDS: &str = "status_runtime_fields";
 /// `castle_wall_drain_failed` record. A `systemctl stop` with an ACK in flight,
 /// or a 2-second control-lock timeout under load, therefore manufactured
 /// evidence of a transport/persistence fault for a link that was fine. The class
-/// is produced by the ONE mapping in [`DrainErrorClass::of`] rather than by a
+/// is produced by the ONE mapping, the `From` impls on [`DrainErrorClass`], rather than by a
 /// consumer-side table of daemon error strings, which is the hand-mirrored shape
 /// that drifts the moment a message is reworded (AGENTS rule 11).
 ///

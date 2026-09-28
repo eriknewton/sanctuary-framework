@@ -59,7 +59,7 @@ pub struct LiveStatusSnapshot {
     pub runtime_state: &'static str,
     pub kernel_runtime_ready: bool,
     pub enforcing: bool,
-    /// Always [`LINUX_DAEMON_ENGAGES_NO_WALL`]. See that constant: this daemon
+    /// Always `LINUX_DAEMON_ENGAGES_NO_WALL`. See that constant: this daemon
     /// has no no-wall transition, and the value is a structural fact rather than
     /// an observation.
     pub no_wall_engaged: bool,

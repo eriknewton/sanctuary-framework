@@ -819,7 +819,7 @@ impl EnforcementRuntime {
 
     /// Convenience: true iff [`status`](Self::status) is `KernelRuntimeReady`.
     /// This is a kernel-runtime readiness predicate, NOT an enforcement one —
-    /// see the module docs and [`DaemonHandle::is_enforcing`].
+    /// see the module docs and [`DaemonHandle::is_enforcing`](crate::daemon::DaemonHandle::is_enforcing).
     pub fn is_kernel_runtime_ready(&self) -> bool {
         matches!(self.status(), EnforcementStatus::KernelRuntimeReady)
     }

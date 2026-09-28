@@ -1,7 +1,7 @@
 //! Production Linux enforcement-runtime providers.
 //!
 //! These are the concrete [`ComponentProvider`]s the shipped daemon boots
-//! through [`EnforcementRuntime::start`]. They acquire, in order:
+//! through [`EnforcementRuntime::start`](crate::enforcement::EnforcementRuntime::start). They acquire, in order:
 //!
 //! 1. nftables table ([`ComponentKind::NftablesTable`]) — takes the host-global
 //!    ownership lock BEFORE any nftables call, then reads the durable, AUTHENTICATED
@@ -102,7 +102,7 @@ pub struct LinuxRuntimeConfig {
     /// install sites read no shutdown state at all. Every site downstream that
     /// consults this field (the reclaim-drift site, `ReArmLostOwned`, startup
     /// loss, and, as of register LINUX-BOOT-STOP-SLICEA-REFUSAL-01, the slice-A
-    /// refusal path via [`refuse_after_owned_table`]) loads it FRESH at its own
+    /// refusal path via `refuse_after_owned_table`) loads it FRESH at its own
     /// decision point rather than caching a copy earlier, so a stop that
     /// arrives mid-acquisition is still observed. Must be the SAME `Arc`
     /// `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
@@ -926,7 +926,7 @@ enum DriftFailClosedOutcome {
 /// STARTUP LOST path in
 /// [`NftablesTableComponent::install_net_on_startup_loss`], and, as of
 /// register LINUX-BOOT-STOP-SLICEA-REFUSAL-01, the slice-A refusal path routed
-/// through [`refuse_after_owned_table`]) or after it (the post-READY controller,
+/// through `refuse_after_owned_table`) or after it (the post-READY controller,
 /// [`NftablesTableComponent::recover_post_ready_loss`]). `HostWide` here means
 /// no confined uid is known for this boot (or the retained/deny set
 /// overflowed), so an install at stop time would have nothing legitimate to
@@ -1777,7 +1777,7 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
 /// landing in the window between the slice-A refusal path's scope resolution
 /// (`resolve_net_scope_at_site` / `net_scope_for_refusal`, run by the `refuse`
 /// closure inside [`bind_admitted_uid_before_ready`]) returning and
-/// [`refuse_after_owned_table`]'s own live load of the shared flag. Arming this
+/// `refuse_after_owned_table`'s own live load of the shared flag. Arming this
 /// sets the SAME shared `Arc<AtomicBool>` a real signal handler sets -- it is
 /// not a parallel flag -- so, on the single production boot, its effect on
 /// the refusal decision is the one a signal would have (a second in-process
@@ -1806,7 +1806,7 @@ impl Drop for ArmedShutdownAfterSliceAScopeResolutionForTest {
 }
 
 /// Arm the override above for exactly the next call to
-/// [`refuse_after_owned_table`] that reaches its `Some(net)` arm (i.e. the
+/// `refuse_after_owned_table` that reaches its `Some(net)` arm (i.e. the
 /// slice-A refusal path's scope resolution has already produced a scope to
 /// install). Returns a guard that clears the latch on drop; a test must bind
 /// it (not `let _ = ...`, which would drop it immediately and clear the latch

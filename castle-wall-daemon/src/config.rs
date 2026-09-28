@@ -283,13 +283,13 @@ impl DaemonConfig {
     }
 
     /// Hand-rolled argv parser. Recognized flags:
-    ///   --fortress-id <hex>
-    ///   --socket-path <path>
-    ///   --policy-dir <path>
-    ///   --wal-path <path>
-    ///   --pinned-public-key <path>
-    ///   --producer-key <path>
-    ///   --producer-pub-key <path>
+    ///   `--fortress-id <hex>`
+    ///   `--socket-path <path>`
+    ///   `--policy-dir <path>`
+    ///   `--wal-path <path>`
+    ///   `--pinned-public-key <path>`
+    ///   `--producer-key <path>`
+    ///   `--producer-pub-key <path>`
     ///
     /// Unrecognized flags return an error; callers print usage and exit 2.
     pub fn from_argv<I, S>(args: I) -> Result<Self, ConfigError>

@@ -352,7 +352,7 @@ fn disposition_str(d: RuleDisposition) -> &'static str {
 /// operator-shadow scan protects. A rule is genuine only if it matches the
 /// exact form `deriveHabeasDistressRules` would emit:
 ///
-///   local:   ip ⊆ {127.0.0.1, ::1} (non-empty), port == [8741], protocol tcp,
+///   local:   ip ⊆ {127.0.0.1, ::1} (non-empty), port == \[8741\], protocol tcp,
 ///            NO host/host_pattern/cidr axes, emitter-only scope, allow.
 ///   webhook: exactly one host, exactly one port, protocol tcp, NO
 ///            ip/cidr/host_pattern axes, emitter-only scope, allow.
