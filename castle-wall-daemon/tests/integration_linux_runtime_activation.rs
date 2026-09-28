@@ -3117,15 +3117,69 @@ mod tb10_agent_unit_against_real_systemd {
         Ok(())
     }
 
-    /// Runtime units plus scratch state, removed on EVERY exit path: agents
-    /// stopped first, then walls, then `reset-failed`, the unit files, a
-    /// `daemon-reload`, the per-instance directories and the scratch dir.
+    /// Whether every unit a `Tb10Units` started has been confirmed settled
+    /// (inactive or failed). Shared with `IsolatedKernelState`, whose table
+    /// delete DEPENDS on it rather than on declaration order alone: a daemon
+    /// still in its stop path can recreate the isolated table after a delete.
+    /// Starts true (no units, nothing to wait for); `Tb10Units::guarding` sets
+    /// it false, and only a settled teardown sets it true again.
+    pub(super) type UnitsSettled = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+    /// Runtime units plus scratch state. Teardown, on EVERY exit path: stop
+    /// each unit (agents first, then walls), escalate to SIGKILL when a stop
+    /// does not settle, and ONLY when every unit is settled remove the unit
+    /// files, `daemon-reload`, the per-instance directories and the scratch
+    /// and owned state directories. A unit STILL PRESENT after the kill leaves
+    /// all of that in place, reported, because deleting a live unit's files
+    /// or table is worse than a reported leak.
     pub(super) struct Tb10Units {
         pub(super) tag: String,
-        pub(super) dir: TempDir,
+        dir: Option<TempDir>,
         pub(super) stop_order: Vec<String>,
         pub(super) files: Vec<PathBuf>,
         pub(super) extra_dirs: Vec<PathBuf>,
+        /// Directories a live unit reads (the (ix) wall's policy, key and WAL),
+        /// removed only after a settled teardown.
+        owned: Vec<TempDir>,
+        settled: Option<UnitsSettled>,
+    }
+
+    /// What one teardown observed.
+    #[derive(Debug, Default)]
+    pub(super) struct StopReport {
+        /// Units that needed SIGKILL to settle (a stop-path failure).
+        pub(super) escalated: Vec<String>,
+        /// Units still neither inactive nor failed after the kill.
+        pub(super) still_present: Vec<String>,
+    }
+
+    /// Settle allowance after a SIGKILL of the unit's whole cgroup
+    /// (KillMode=control-group): the kernel delivers it immediately, so this
+    /// covers only reaping and the manager's state change. It is an
+    /// allowance, not a retry budget.
+    const KILL_SETTLE: Duration = Duration::from_secs(5);
+
+    /// The stop budget of every unit a TB10 fixture starts: the shipped agent's
+    /// `TimeoutStopSec` (read by `stop_bound_x`, which adds the 1 s manager and
+    /// sampling allowance) and the fixture walls' `TimeoutStopSec`, which every
+    /// fixture wall pins to the shipped wall's value (`fixture_wall_stop_secs`).
+    /// The larger one bounds the wait; the holder units are oneshot and stop at
+    /// once.
+    fn unit_stop_bound() -> Duration {
+        stop_bound_x().max(Duration::from_secs(secs(&fixture_wall_stop_secs()) + 1))
+    }
+
+    /// The `TimeoutStopSec` every fixture wall carries, pinned to the shipped
+    /// wall's so the teardown bound derives from a stated value, not systemd's
+    /// 90 s default. Must match `TimeoutStopSec` in
+    /// systemd/sanctuary-castle-wall.service.
+    pub(super) fn fixture_wall_stop_secs() -> String {
+        shipped_wall_value("TimeoutStopSec")
+    }
+
+    fn settled_state(unit: &str) -> bool {
+        let state = prop(unit, "ActiveState");
+        state == "inactive" || state == "failed"
     }
 
     impl Tb10Units {
@@ -3146,15 +3200,39 @@ mod tb10_agent_unit_against_real_systemd {
             );
             Self {
                 tag,
-                dir,
+                dir: Some(dir),
                 stop_order: Vec::new(),
                 files: Vec::new(),
                 extra_dirs: Vec::new(),
+                owned: Vec::new(),
+                settled: None,
             }
         }
 
+        /// Units whose settled teardown gates `kernel`'s table delete.
+        pub(super) fn guarding(kernel: &IsolatedKernelState) -> Self {
+            let mut units = Self::new();
+            kernel
+                .settled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            units.settled = Some(std::sync::Arc::clone(&kernel.settled));
+            units
+        }
+
+        /// Hand a directory a live unit reads to the settled teardown.
+        pub(super) fn own(&mut self, dir: TempDir) {
+            self.owned.push(dir);
+        }
+
+        pub(super) fn dir_path(&self) -> &Path {
+            self.dir
+                .as_ref()
+                .expect("scratch dir held until teardown")
+                .path()
+        }
+
         pub(super) fn path(&self, name: &str) -> PathBuf {
-            self.dir.path().join(name)
+            self.dir_path().join(name)
         }
 
         pub(super) fn write_unit(&mut self, name: &str, text: &str) {
@@ -3197,39 +3275,66 @@ mod tb10_agent_unit_against_real_systemd {
     }
 
     impl Tb10Units {
-        /// Stop every unit in `stop_order` and wait until each is inactive or
-        /// failed. Returns the units that are STILL PRESENT (stop refused, or
-        /// still running after the bound). Order matters to the caller: the
-        /// isolated table may be deleted only after this returns empty, or a
-        /// still-running daemon unit can recreate it after the delete.
-        pub(super) fn stop_all(&self) -> Vec<String> {
-            let mut still_present = Vec::new();
+        /// Stop every unit in `stop_order`; a unit that is not settled within
+        /// its stop budget is SIGKILLed (whole cgroup) and waited for again.
+        /// Settled means `ActiveState` is inactive or failed, read from the
+        /// manager, never inferred from the `systemctl stop` client's exit: a
+        /// client killed by its 90 s `timeout` wrapper after the unit already
+        /// settled is not a unit still present.
+        pub(super) fn stop_all(&self) -> StopReport {
+            let mut report = StopReport::default();
             for unit in &self.stop_order {
-                let stopped = systemctl(&["stop", unit]).status.success();
-                // Bound: the longest TimeoutStopSec of these units (10 s, the
-                // shipped agent's and wall's) plus scheduling slack.
-                let settled = wait_until(Duration::from_secs(10) + SLACK, || {
-                    let state = prop(unit, "ActiveState");
-                    state == "inactive" || state == "failed"
-                });
-                if !stopped || !settled {
-                    still_present.push(format!(
-                        "{unit} (stop ok={stopped}, ActiveState={})",
-                        prop(unit, "ActiveState")
-                    ));
+                let stop_ok = systemctl(&["stop", unit]).status.success();
+                if !wait_until(unit_stop_bound(), || settled_state(unit)) {
+                    let kill_ok = systemctl(&["kill", "-s", "SIGKILL", unit]).status.success();
+                    report
+                        .escalated
+                        .push(format!("{unit} (stop ok={stop_ok}, SIGKILL ok={kill_ok})"));
+                    if !wait_until(KILL_SETTLE, || settled_state(unit)) {
+                        report.still_present.push(format!(
+                            "{unit} (ActiveState={}, SubState={})",
+                            prop(unit, "ActiveState"),
+                            prop(unit, "SubState")
+                        ));
+                    }
                 }
                 let _ = systemctl(&["reset-failed", unit]);
             }
-            still_present
+            report
         }
     }
 
     impl Drop for Tb10Units {
         fn drop(&mut self) {
-            // Not ignored: a unit that did not stop is reported, because the
-            // test's kernel-state guard deletes the isolated table after this.
-            for unit in self.stop_all() {
-                eprintln!("TB10 teardown: STILL PRESENT after stop: {unit}");
+            let report = self.stop_all();
+            for unit in &report.escalated {
+                eprintln!("TB10 teardown: stop did not settle, SIGKILL sent: {unit}");
+            }
+            if !report.still_present.is_empty() {
+                // Leave everything a live unit uses in place and say so loudly:
+                // the unit files, the scratch and state dirs (leaked, not
+                // deleted) and, through the shared flag, the isolated table.
+                for unit in &report.still_present {
+                    let status = systemctl(&["status", "--no-pager", &unit_name(unit)]);
+                    eprintln!(
+                        "TB10 teardown: STILL PRESENT after stop and SIGKILL: {unit}; unit files, \
+                         state and the isolated table are LEFT IN PLACE.\n{}",
+                        String::from_utf8_lossy(&status.stdout)
+                    );
+                }
+                if let Some(dir) = self.dir.take() {
+                    eprintln!(
+                        "TB10 teardown: scratch dir left at {}",
+                        dir.into_path().display()
+                    );
+                }
+                for dir in self.owned.drain(..) {
+                    eprintln!(
+                        "TB10 teardown: state dir left at {}",
+                        dir.into_path().display()
+                    );
+                }
+                return;
             }
             for file in &self.files {
                 let _ = std::fs::remove_file(file);
@@ -3238,7 +3343,21 @@ mod tb10_agent_unit_against_real_systemd {
             for dir in &self.extra_dirs {
                 let _ = std::fs::remove_dir_all(dir);
             }
+            // Owned state and the scratch dir are removed by their own drops,
+            // after this point, with every unit confirmed settled.
+            if let Some(settled) = &self.settled {
+                settled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
+    }
+
+    /// The unit name at the head of a report entry.
+    fn unit_name(entry: &str) -> String {
+        entry
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// One schedule's fixture wall plus the derived agent.
@@ -3255,7 +3374,7 @@ mod tb10_agent_unit_against_real_systemd {
         fn new(wall_restart: &str) -> Self {
             let mut units = Tb10Units::new();
             let tag = units.tag.clone();
-            let d = units.dir.path().display().to_string();
+            let d = units.dir_path().display().to_string();
             let wall = format!("sanctuary-tb10-wall-{tag}.service");
             let template = format!("sanctuary-tb10-agent-{tag}@.service");
             let agent = format!("sanctuary-tb10-agent-{tag}@{FIXTURE_INSTANCE}.service");
@@ -3284,10 +3403,12 @@ mod tb10_agent_unit_against_real_systemd {
                 &format!(
                     "[Unit]\nDescription=TB10 fixture wall\n\n[Service]\nType=notify\n\
                      NotifyAccess=all\nExecStart=/bin/sh {d}/wall.sh\nRestart={wall_restart}\n\
-                     RestartPreventExitStatus={}\nRestartSec={}\nTimeoutStartSec={}\n",
+                     RestartPreventExitStatus={}\nRestartSec={}\nTimeoutStartSec={}\n\
+                     TimeoutStopSec={}\n",
                     shipped_wall_value("RestartPreventExitStatus"),
                     shipped_wall_value("RestartSec"),
                     shipped_wall_value("TimeoutStartSec"),
+                    fixture_wall_stop_secs(),
                 ),
             );
             // The fixture verbs and agent. The check runs as the instance and
@@ -3733,11 +3854,38 @@ mod tb10_agent_unit_against_real_systemd {
         }
     }
 
-    /// Removes the isolated table and journal last, after the units stopped.
-    struct IsolatedKernelState;
+    /// Removes the isolated table and journal, but ONLY once the units that
+    /// could still write them are confirmed settled (`settled`, set by the
+    /// `Tb10Units` built with `Tb10Units::guarding`). Otherwise the table is
+    /// left in place and reported with the live ruleset: a reported leak, never
+    /// a delete under a daemon that could recreate it.
+    pub(super) struct IsolatedKernelState {
+        settled: UnitsSettled,
+    }
+
+    impl IsolatedKernelState {
+        fn new() -> Self {
+            Self {
+                settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+    }
 
     impl Drop for IsolatedKernelState {
         fn drop(&mut self) {
+            if !self.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                let ruleset = Command::new("nft")
+                    .args(["list", "ruleset"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "TB10 teardown: STILL PRESENT units were not confirmed settled; the \
+                     isolated table {} and journal are LEFT IN PLACE. Live ruleset:\n{ruleset}",
+                    nftables::castle_table()
+                );
+                return;
+            }
             cleanup_castle_table();
             cleanup_journal();
         }
@@ -3757,19 +3905,19 @@ mod tb10_agent_unit_against_real_systemd {
         if !require_systemd() {
             return;
         }
-        let _kernel = IsolatedKernelState;
+        let kernel = IsolatedKernelState::new();
         cleanup_castle_table();
         cleanup_journal();
         let _account = match ProvisionedAccount::provision(TEST_AGENT_UID) {
             Ok(account) => account,
             Err(reason) => panic!("(ix) could not provision the agent account: {reason}"),
         };
-        // Declared BEFORE the units so the wall's policy, key and WAL outlive
-        // its stop (locals drop in reverse order).
+        // The wall's policy, key and WAL; handed to `units` below so it is
+        // removed only by a settled teardown.
         let state = TempDir::new().unwrap();
-        let mut units = Tb10Units::new();
+        let mut units = Tb10Units::guarding(&kernel);
         let tag = units.tag.clone();
-        let d = units.dir.path().display().to_string();
+        let d = units.dir_path().display().to_string();
         let binary = units.path("castle-wall-daemon");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3793,10 +3941,12 @@ mod tb10_agent_unit_against_real_systemd {
                  ExecStart={bin} --fortress-id deadbeef --socket-path {st}/filter.sock \
                  --policy-dir {st} --wal-path {st}/wal.jsonl --pinned-public-key {} \
                  --producer-key {st}/audit-producer.key --producer-pub-key {st}/audit-producer.pub \
-                 {isolation}\nRestart=no\nTimeoutStartSec=60\n",
-                pinned.display()
+                 {isolation}\nRestart=no\nTimeoutStartSec=60\nTimeoutStopSec={}\n",
+                pinned.display(),
+                fixture_wall_stop_secs()
             ),
         );
+        units.own(state);
         units.write_script(
             "agent.sh",
             &format!("#!/bin/sh\necho started >> {d}/marker\nexec sleep infinity\n"),
@@ -3880,12 +4030,16 @@ mod tb10_agent_unit_against_real_systemd {
             )),
             "(ix) the credential check must have matched as the instance"
         );
-        // Stop the agent and the isolated wall and prove both inactive BEFORE
-        // `_kernel` deletes the isolated table.
-        let still_present = units.stop_all();
+        // Stop the agent and the isolated wall and prove both settled by an
+        // ordinary stop (a stop that needed SIGKILL is a stop-path failure).
+        // The table delete then waits on the units' settled teardown through
+        // the shared flag, whatever order the guards drop in.
+        let report = units.stop_all();
         assert!(
-            still_present.is_empty(),
-            "(ix) STILL PRESENT after stop: {still_present:?}"
+            report.escalated.is_empty() && report.still_present.is_empty(),
+            "(ix) stop did not settle: {report:?}"
         );
+        drop(units);
+        drop(kernel);
     }
 }
