@@ -73,8 +73,8 @@ describe("IC-16 durable SDW owner isolation", () => {
     dirs.push(root);
     const statePath = join(root, "state");
     const results = await Promise.all([
-      child("guard", statePath, "claude_code:ic16"),
-      child("guard", statePath, "codex:ic16"),
+      child("guard", statePath, "claude_code:fortress-00000000000001c6"),
+      child("guard", statePath, "cursor:fortress-00000000000001c6"),
     ]);
     expect(results.filter((result) => result.allowed === true)).toHaveLength(1);
     expect(results.filter((result) => result.allowed === false)).toHaveLength(1);
@@ -85,7 +85,7 @@ describe("IC-16 durable SDW owner isolation", () => {
     const pin = await readSdwOwnerPin(new FilesystemStorage(statePath), MASTER);
     expect(pin.status).toBe("valid");
     if (pin.status === "valid") {
-      expect(["claude_code:ic16", "codex:ic16"]).toContain(pin.data.agent_id);
+      expect(["claude_code:fortress-00000000000001c6", "cursor:fortress-00000000000001c6"]).toContain(pin.data.agent_id);
     }
   });
 
@@ -93,10 +93,10 @@ describe("IC-16 durable SDW owner isolation", () => {
     const root = await mkdtemp(join(tmpdir(), "sanctuary-ic16-transfer-"));
     dirs.push(root);
     const statePath = join(root, "state");
-    expect(await child("guard", statePath, "owner:one")).toEqual({ allowed: true });
+    expect(await child("guard", statePath, "claude_code:fortress-00000000000000a1")).toEqual({ allowed: true });
     const results = await Promise.all([
-      child("transfer", statePath, "owner:one", "owner:two"),
-      child("transfer", statePath, "owner:one", "owner:three"),
+      child("transfer", statePath, "claude_code:fortress-00000000000000a1", "claude_code:fortress-00000000000000a2"),
+      child("transfer", statePath, "claude_code:fortress-00000000000000a1", "claude_code:fortress-00000000000000a3"),
     ]);
     expect(results.filter((result) => result.status === "transferred")).toHaveLength(1);
     expect(
@@ -107,7 +107,7 @@ describe("IC-16 durable SDW owner isolation", () => {
     const pin = await readSdwOwnerPin(new FilesystemStorage(statePath), MASTER);
     expect(pin.status).toBe("valid");
     if (pin.status === "valid") {
-      expect(["owner:two", "owner:three"]).toContain(pin.data.agent_id);
+      expect(["claude_code:fortress-00000000000000a2", "claude_code:fortress-00000000000000a3"]).toContain(pin.data.agent_id);
     }
   });
 
@@ -117,8 +117,8 @@ describe("IC-16 durable SDW owner isolation", () => {
       allowed: false,
       reason: "owner_identity_missing",
     });
-    expect(await guard(storage, "owner:one")("memory_count")).toEqual({ allowed: true });
-    expect(await guard(storage, "owner:two")("memory_count")).toEqual({
+    expect(await guard(storage, "claude_code:fortress-00000000000000a1")("memory_count")).toEqual({ allowed: true });
+    expect(await guard(storage, "claude_code:fortress-00000000000000a2")("memory_count")).toEqual({
       allowed: false,
       reason: "owner_scope_conflict",
     });
@@ -127,7 +127,7 @@ describe("IC-16 durable SDW owner isolation", () => {
       masterKey: new Uint8Array(32).fill(42),
       fortressId: FORTRESS_ID,
       ownerRef: "fleet-self",
-      ownerIdentity: () => "owner:one",
+      ownerIdentity: () => "claude_code:fortress-00000000000000a1",
     });
     expect(await wrongKeyGuard("memory_count")).toEqual({
       allowed: false,
@@ -144,7 +144,7 @@ describe("IC-16 durable SDW owner isolation", () => {
       tombstones: [],
       export_state: 0,
     });
-    expect(await guard(storage, "owner:legacy")("memory_count")).toEqual({
+    expect(await guard(storage, "claude_code:fortress-00000000000000e9")("memory_count")).toEqual({
       allowed: false,
       reason: "owner_pin_missing_after_establishment",
     });
@@ -156,11 +156,11 @@ describe("IC-16 durable SDW owner isolation", () => {
         masterKey: MASTER,
         fortressId: FORTRESS_ID,
         ownerRef: "fleet-self",
-        agentId: "owner:legacy",
+        agentId: "claude_code:fortress-00000000000000e9",
         now: () => "2026-09-01T00:00:00.000Z",
       }),
     ).toEqual({ status: "claimed" });
-    expect(await guard(storage, "owner:legacy")("memory_count")).toEqual({
+    expect(await guard(storage, "claude_code:fortress-00000000000000e9")("memory_count")).toEqual({
       allowed: true,
     });
   });
@@ -172,7 +172,7 @@ describe("IC-16 durable SDW owner isolation", () => {
       "legacy-mark",
       new Uint8Array([1]),
     );
-    expect(await guard(storage, "owner:legacy")("memory_count")).toEqual({
+    expect(await guard(storage, "claude_code:fortress-00000000000000e9")("memory_count")).toEqual({
       allowed: false,
       reason: "owner_pin_missing_after_establishment",
     });
@@ -181,30 +181,30 @@ describe("IC-16 durable SDW owner isolation", () => {
 
   it("transfers only from the exact authenticated current owner", async () => {
     const storage = new MemoryStorage();
-    expect(await guard(storage, "owner:one")("memory_count")).toEqual({ allowed: true });
+    expect(await guard(storage, "claude_code:fortress-00000000000000a1")("memory_count")).toEqual({ allowed: true });
     expect(
       await transferSdwOwnerForOperator({
         storage,
         masterKey: MASTER,
         fortressId: FORTRESS_ID,
         ownerRef: "fleet-self",
-        expectedAgentId: "owner:wrong",
-        newAgentId: "owner:two",
+        expectedAgentId: "claude_code:fortress-00000000000000ff",
+        newAgentId: "claude_code:fortress-00000000000000a2",
       }),
-    ).toEqual({ status: "owner_mismatch", agentId: "owner:one" });
+    ).toEqual({ status: "owner_mismatch", agentId: "claude_code:fortress-00000000000000a1" });
     expect(
       await transferSdwOwnerForOperator({
         storage,
         masterKey: MASTER,
         fortressId: FORTRESS_ID,
         ownerRef: "fleet-self",
-        expectedAgentId: "owner:one",
-        newAgentId: "owner:two",
+        expectedAgentId: "claude_code:fortress-00000000000000a1",
+        newAgentId: "claude_code:fortress-00000000000000a2",
       }),
     ).toEqual({ status: "transferred" });
-    expect(await guard(storage, "owner:one")("memory_count")).toMatchObject({
+    expect(await guard(storage, "claude_code:fortress-00000000000000a1")("memory_count")).toMatchObject({
       allowed: false,
     });
-    expect(await guard(storage, "owner:two")("memory_count")).toEqual({ allowed: true });
+    expect(await guard(storage, "claude_code:fortress-00000000000000a2")("memory_count")).toEqual({ allowed: true });
   });
 });

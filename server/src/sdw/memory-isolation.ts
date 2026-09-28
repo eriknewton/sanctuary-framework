@@ -30,6 +30,7 @@ import {
   SDW_WORKING_STATE_NAMESPACE,
 } from "./records.js";
 import { MEMORY_PROVENANCE_BAD_SIGNER_NAMESPACE } from "./memory-provenance-bad-signers.js";
+import { LOCAL_HARNESS_KINDS } from "../contracts/v1.1/local-agent-records.js";
 
 /**
  * The process-local test implementation below is strictly additive:
@@ -66,8 +67,48 @@ export function wrappedAgentIdentityFromEnv(): string | undefined {
   return process.env.SANCTUARY_AGENT_ID;
 }
 
+/**
+ * The ONE place the wrapped harness id's SHAPE is pinned for the SDW owner
+ * pin (register row `SDW-OWNER-PIN-AGENT-ID-SHAPE-01`). Every entry point of
+ * the shared rule below (`checkOrEstablishSdwOwnerPin`, `precheckSdwOwnerPin`,
+ * `claimSdwOwnerForOperator`'s new owner, `transferSdwOwnerForOperator`'s new
+ * owner) refuses an id that does not have it BEFORE any read or write, so no
+ * caller (the MCP guard, the four memory-file CLI verbs, `sdw-owner claim` and
+ * `transfer`) can pin the store to a principal the wrapped server never
+ * presents.
+ *
+ * The form is what `sanctuary wrap` mints: must match `wrappedAgentId` in
+ * `wrap/cli.ts` (`${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`),
+ * whose two halves are `LOCAL_HARNESS_KINDS` in
+ * `contracts/v1.1/local-agent-records.ts` (imported, never mirrored: AGENTS
+ * rule 5) and `fortressIdFromStoragePath` in `dashboard/v1_1/wiring.ts`
+ * (`fortress-` plus the first 16 hex characters of the storage path's sha256;
+ * 16 = that function's `digest.slice(0, 16)`, half of the 32 hex characters a
+ * 16-byte prefix would be and a quarter of the 64 a full sha256 hex is).
+ *
+ * INVARIANT: the shape check is a CONSISTENCY guard, not authentication. A
+ * well-formed id is still only the cooperative-mode identity the wrap wrote
+ * into the harness config (see `wrappedAgentIdentityFromEnv`); passing this
+ * check proves the value could have been minted by `wrap`, never that it was.
+ *
+ * Legacy pins written before this rule are NOT re-validated on read: the
+ * comparison against a stored `agent_id` is unchanged, and `transfer`'s
+ * `expectedAgentId` is deliberately exempt so a malformed legacy pin stays
+ * recoverable through the interactive transfer the register row names.
+ */
+export const WRAPPED_AGENT_ID_FORTRESS_HEX_LENGTH = 16;
+export const WRAPPED_AGENT_ID_PATTERN: RegExp = new RegExp(
+  `^(${LOCAL_HARNESS_KINDS.join("|")}):fortress-[0-9a-f]{${WRAPPED_AGENT_ID_FORTRESS_HEX_LENGTH}}$`,
+);
+
+/** True iff `value` has the wrapped harness id form `<harness-kind>:fortress-<16 hex>`. */
+export function isWrappedAgentId(value: string): boolean {
+  return WRAPPED_AGENT_ID_PATTERN.test(value);
+}
+
 export type IsolationRefusalReason =
   | "owner_identity_missing"
+  | "owner_identity_malformed"
   | "owner_scope_conflict"
   | "owner_pin_invalid"
   | "owner_pin_missing_after_establishment"
@@ -203,6 +244,10 @@ export async function checkOrEstablishSdwOwnerPin(
     allowed: false as const,
     reason,
   });
+  // The shape is checked BEFORE the first read: a malformed id must never
+  // reach `createSdwOwnerPinIfAbsent` below, or a fresh store would be pinned
+  // to a principal no wrapped server presents (the register row's defect).
+  if (!isWrappedAgentId(options.agentId)) return refuse("owner_identity_malformed");
   try {
     let pin = await readSdwOwnerPin(options.storage, options.masterKey);
     if (pin.status === "absent") {
@@ -259,6 +304,11 @@ export type SdwOwnerPinPrecheckResult =
 export async function precheckSdwOwnerPin(
   options: Omit<SdwOwnerPinCheckOptions, "now">,
 ): Promise<SdwOwnerPinPrecheckResult> {
+  // Same shape rule as `checkOrEstablishSdwOwnerPin`, so a CLI verb's
+  // pre-approval precheck refuses a malformed id before the operator is asked.
+  if (!isWrappedAgentId(options.agentId)) {
+    return { status: "refuse", reason: "owner_identity_malformed" };
+  }
   try {
     const pin = await readSdwOwnerPin(options.storage, options.masterKey);
     if (pin.status === "absent") {
@@ -309,6 +359,7 @@ export function createPersistentMultiAgentIsolationGuard(
 
 export type OwnerClaimResult =
   | { readonly status: "claimed" }
+  | { readonly status: "agent_id_malformed" }
   | { readonly status: "already_claimed"; readonly agentId: string }
   | { readonly status: "invalid" }
   | { readonly status: "unsupported" }
@@ -323,6 +374,9 @@ export async function claimSdwOwnerForOperator(options: {
   readonly agentId: string;
   readonly now?: () => string;
 }): Promise<OwnerClaimResult> {
+  // The operator-typed id is the free text the register row names; it is
+  // refused here, before the atomic create, under the one shared shape rule.
+  if (!isWrappedAgentId(options.agentId)) return { status: "agent_id_malformed" };
   const existing = await readSdwOwnerPin(options.storage, options.masterKey);
   if (existing.status === "invalid") return { status: "invalid" };
   if (existing.status === "valid") {
@@ -352,6 +406,7 @@ export async function claimSdwOwnerForOperator(options: {
 
 export type OwnerTransferResult =
   | { readonly status: "transferred" }
+  | { readonly status: "agent_id_malformed" }
   | { readonly status: "absent" }
   | { readonly status: "invalid" }
   | { readonly status: "owner_mismatch"; readonly agentId: string }
@@ -368,6 +423,9 @@ export async function transferSdwOwnerForOperator(options: {
   readonly newAgentId: string;
   readonly now?: () => string;
 }): Promise<OwnerTransferResult> {
+  // Only the NEW owner is shape-checked: `expectedAgentId` must be allowed to
+  // name a malformed legacy pin, or such a pin could never be transferred away.
+  if (!isWrappedAgentId(options.newAgentId)) return { status: "agent_id_malformed" };
   const existing = await readSdwOwnerPin(options.storage, options.masterKey);
   if (existing.status === "absent") return { status: "absent" };
   if (

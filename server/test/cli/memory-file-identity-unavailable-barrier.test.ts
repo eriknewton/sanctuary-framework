@@ -122,7 +122,7 @@ describe.skipIf(!supported)(
         // exercises the SAME identity-unavailable early return the barrier
         // fix is about (a missing PRIMARY IDENTITY inside the fortress, a
         // different thing from a missing wrap-time SANCTUARY_AGENT_ID).
-        env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:l2-identity-unavailable-test" },
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:fortress-00000000000000b2" },
         dialogRunner: APPROVE_DIALOG,
       });
 

@@ -50,9 +50,9 @@ describe("sanctuary sdw-owner", () => {
     const err = capture();
     expect(
       await runSdwOwnerCommand({
-        argv: ["claim", "--agent-id", "claude_code:ic16", "--fortress", f.root],
+        argv: ["claim", "--agent-id", "claude_code:fortress-00000000000001c6", "--fortress", f.root],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        stdin: Readable.from("claude_code:ic16\nCLAIM\n"),
+        stdin: Readable.from("claude_code:fortress-00000000000001c6\nCLAIM\n"),
         out: out.stream,
         err: err.stream,
       }),
@@ -62,14 +62,14 @@ describe("sanctuary sdw-owner", () => {
       f.masterKey,
     );
     expect(pin.status).toBe("valid");
-    if (pin.status === "valid") expect(pin.data.agent_id).toBe("claude_code:ic16");
+    if (pin.status === "valid") expect(pin.data.agent_id).toBe("claude_code:fortress-00000000000001c6");
 
     expect(
       await runSdwOwnerCommand({
         argv: [
           "transfer",
           "--from-agent-id",
-          "claude_code:ic16",
+          "claude_code:fortress-00000000000001c6",
           "--to-agent-id",
           "codex:ic16",
           "--fortress",
@@ -95,7 +95,7 @@ describe("sanctuary sdw-owner", () => {
     const err = capture();
     expect(
       await runSdwOwnerCommand({
-        argv: ["claim", "--agent-id", "claude_code:ic16", "--fortress", f.root],
+        argv: ["claim", "--agent-id", "claude_code:fortress-00000000000001c6", "--fortress", f.root],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
         stdin: Readable.from("wrong\nCLAIM\n"),
         out: out.stream,
@@ -112,9 +112,9 @@ describe("sanctuary sdw-owner", () => {
     await writeFile(join(f.root, "runtime.json"), "{}", { mode: 0o600 });
     expect(
       await runSdwOwnerCommand({
-        argv: ["claim", "--agent-id", "claude_code:ic16", "--fortress", f.root],
+        argv: ["claim", "--agent-id", "claude_code:fortress-00000000000001c6", "--fortress", f.root],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        stdin: Readable.from("claude_code:ic16\nCLAIM\n"),
+        stdin: Readable.from("claude_code:fortress-00000000000001c6\nCLAIM\n"),
         out: out.stream,
         err: err.stream,
       }),

@@ -182,6 +182,14 @@ function describeOwnerPinRefusal(
       return `${command}: refused (${reason}) - the SDW owner pin could not be read or established.\n`;
     case "owner_identity_missing":
       return noWrappedAgentIdMessage(fortress, command);
+    case "owner_identity_malformed":
+      // The shape rule lives in memory-isolation.ts (isWrappedAgentId); this
+      // only names the form so the operator can see what `wrap` would write.
+      return (
+        `${command}: refused (${reason}) - SANCTUARY_AGENT_ID ${shellQuoteSingleArg(agentId)} is not a wrapped harness id ` +
+        `(<harness-kind>:fortress-<16 hex>, the value 'sanctuary wrap' writes into the harness's sanctuary MCP entry).\n` +
+        `${command}: re-run from the wrapped harness, or run '${sdwOwnerStatusCommand(fortress)}' to see the pinned id.\n`
+      );
   }
 }
 

@@ -199,7 +199,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     expect(await corpusEntryCount()).toBeGreaterThan(0);
 
     expect(await mcpReadGuardAllows(agentId)).toEqual({ allowed: true });
-    expect(await mcpReadGuardAllows("codex:someone-else")).toEqual({
+    expect(await mcpReadGuardAllows("cursor:fortress-0000000000000e15")).toEqual({
       allowed: false,
       reason: "owner_scope_conflict",
     });
@@ -212,7 +212,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
       masterKey,
       fortressId: fortressIdFromStoragePath(fortress),
       ownerRef: "fleet-self",
-      agentId: "claude_code:existing-owner",
+      agentId: "claude_code:fortress-0000000000000e01",
     });
     expect(claim).toEqual({ status: "claimed" });
     const before = await corpusEntryCount();
@@ -226,7 +226,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
       out: out.stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:different-agent" },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:fortress-0000000000000d1f" },
     });
     expect(code).toBe(1);
     expect(err.text()).toContain("owner_scope_conflict");
@@ -319,7 +319,7 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
       ],
       out: out.stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:owner-ref-test" },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:fortress-0000000000000ef7" },
     });
     expect(code).not.toBe(0);
     expect(err.text()).toContain("fleet-self");
@@ -514,7 +514,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       const sameAgentAgain = await runVerb({ agentId });
       expect(sameAgentAgain.err).not.toContain("owner_scope_conflict");
 
-      const differentAgent = await runVerb({ agentId: "codex:someone-else" });
+      const differentAgent = await runVerb({ agentId: "cursor:fortress-0000000000000e15" });
       expect(differentAgent.code).toBe(1);
       expect(differentAgent.err).toContain("owner_scope_conflict");
       await expect(readdir(differentAgent.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
@@ -522,7 +522,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       // The MCP persistent guard, reading the SAME real record the CLI wrote,
       // agrees: this agent id reads through, a different one is refused.
       expect(await mcpReadGuardAllows(agentId)).toEqual({ allowed: true });
-      expect(await mcpReadGuardAllows("codex:someone-else")).toEqual({
+      expect(await mcpReadGuardAllows("cursor:fortress-0000000000000e15")).toEqual({
         allowed: false,
         reason: "owner_scope_conflict",
       });
@@ -535,11 +535,11 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
         masterKey,
         fortressId: fortressIdFromStoragePath(fortress),
         ownerRef: "fleet-self",
-        agentId: "claude_code:existing-owner",
+        agentId: "claude_code:fortress-0000000000000e01",
       });
       expect(claim).toEqual({ status: "claimed" });
 
-      const result = await runVerb({ agentId: "claude_code:different-agent" });
+      const result = await runVerb({ agentId: "claude_code:fortress-0000000000000d1f" });
       expect(result.code).toBe(1);
       expect(result.err).toContain("owner_scope_conflict");
       await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
