@@ -186,6 +186,56 @@ function describeOwnerPinRefusal(
 }
 
 /**
+ * STEP1-F2 fix round 1 (Grok/Claude adversarial code gate on commit
+ * 0f0db45d, both UNSOUND / SOUND-WITH-FIXES on the same finding): the ONE
+ * pre-bootstrap gate shared by all FOUR memory-file CLI verbs, called before
+ * `bootstrap()` ever unlocks the fortress. Two checks, in this order:
+ *
+ *   1. A non-default `--owner-ref`. The fortress's SDW owner pin is a SINGLE
+ *      fortress-wide record (`SDW_OWNER_PIN_KEY` in write-gate.ts — never
+ *      keyed by `owner_ref`), and `precheckSdwOwnerPin` compares scope only
+ *      once a pin ALREADY exists (memory-isolation.ts's `sameScope`), so on a
+ *      genuinely fresh store it reports "fresh" for ANY `--owner-ref`. If a
+ *      verb were allowed to establish that one slot under a scope other than
+ *      "fleet-self" (must match `DEFAULT_OWNER_REF` above), the pin would be
+ *      UNRECOVERABLE: the MCP guard and `sanctuary sdw-owner` both hard-code
+ *      "fleet-self" and have no verb that reads, claims, or transfers any
+ *      other `owner_ref` — the real fleet-self principal would be locked out
+ *      of its own fortress with no recovery path. This is the exact lockout
+ *      STEP1-F1 refused for `memory_ingest`; the gate here closes the same
+ *      hole reopened through the three sibling verbs in STEP1-F2.
+ *   2. A missing wrap-time `SANCTUARY_AGENT_ID` (STEP1-F1's no-synthetic-
+ *      fallback-principal rule), checked at this SAME pre-bootstrap point for
+ *      every verb, so a credential-less/unwrapped invocation refuses
+ *      identically everywhere and never even opens the fortress.
+ *
+ * Neither check can write an audit entry (no fortress is open yet to hold
+ * one) — same as the owner-ref check already did before this round. Returns
+ * `true` (refused; the caller returns 1) or `false` (proceed to bootstrap).
+ */
+function refuseOwnerRefOrIdentityBeforeBootstrap(
+  ownerRef: string,
+  env: NodeJS.ProcessEnv,
+  fortress: string | undefined,
+  command: string,
+  err: Writable,
+): boolean {
+  if (ownerRef !== DEFAULT_OWNER_REF) {
+    write(
+      err,
+      `${command}: refused - only --owner-ref ${DEFAULT_OWNER_REF} is supported; ` +
+        `the MCP guard and 'sanctuary sdw-owner' hard-code this scope and cannot read back or reconcile any other owner_ref.\n`,
+    );
+    return true;
+  }
+  if (resolveCliMemoryAgentId(env) === undefined) {
+    write(err, noWrappedAgentIdMessage(fortress, command));
+    return true;
+  }
+  return false;
+}
+
+/**
  * Bound on the `--passphrase-stdin` read so a pipe that is opened and never
  * written does not hang the command forever. An empty read falls through to the
  * normal "no credential supplied" refusal.
@@ -213,18 +263,11 @@ export async function runMemoryIngestCommand(
 
   const parsed = parseCommonArgs(args.argv, "memory_ingest", err);
   if (!parsed) return 2;
-  // STEP1-F1/F2: the owner-pin machinery below (and the MCP guard, and
-  // `sdw-owner`) all hard-code the "fleet-self" scope (see the pin comment on
-  // DEFAULT_OWNER_REF). A pin under any other owner_ref would be written and
-  // then permanently unreachable by anything that could read or reconcile it,
-  // so refuse before any bootstrap or fortress unlock, never establish under
-  // a different scope.
-  if (parsed.ownerRef !== DEFAULT_OWNER_REF) {
-    write(
-      err,
-      `memory_ingest: refused - only --owner-ref ${DEFAULT_OWNER_REF} is supported; ` +
-        `the MCP guard and 'sanctuary sdw-owner' hard-code this scope and cannot read back or reconcile any other owner_ref.\n`,
-    );
+  // STEP1-F1/F2 fix round 1: shared pre-bootstrap gate (owner-ref scope +
+  // wrap-time identity), same function every memory-file CLI verb calls — see
+  // its doc comment above for why both checks must happen before any
+  // bootstrap or fortress unlock, never establish under a different scope.
+  if (refuseOwnerRefOrIdentityBeforeBootstrap(parsed.ownerRef, env, parsed.fortress, "memory_ingest", err)) {
     return 1;
   }
   // Rung-1 point 3: an explicit, named, per-file escape hatch, never a global
@@ -260,9 +303,12 @@ export async function runMemoryIngestCommand(
   if (!boot) return 1;
 
   try {
-    // STEP1-F1: no wrap-time identity, no ingest. Refuse before ever touching
-    // the pin machinery or showing the approval dialog (fix round 1, Claude
-    // F3 / Grok finding 1: there is no synthetic fallback principal here).
+    // STEP1-F2 fix round 1: `refuseOwnerRefOrIdentityBeforeBootstrap` above
+    // already refused and returned before `bootstrap()` ran if `env` carried
+    // no wrap-time identity, so this branch is unreachable in practice. It
+    // stays only because `resolveCliMemoryAgentId` is typed `string |
+    // undefined` and TypeScript cannot narrow that across the two functions;
+    // this is the runtime proof for the compiler, not a second policy.
     const cliIngestAgentId = resolveCliMemoryAgentId(env);
     if (cliIngestAgentId === undefined) {
       write(err, noWrappedAgentIdMessage(parsed.fortress, "memory_ingest"));
@@ -560,6 +606,12 @@ export async function runMemoryEmitCommand(
 
   const parsed = parseCommonArgs(args.argv, "memory_emit", err);
   if (!parsed) return 2;
+  // STEP1-F2 fix round 1: same pre-bootstrap gate memory_ingest applies (see
+  // its doc comment above), so a non-default --owner-ref or a missing
+  // wrap-time identity refuses before any fortress unlock, dialog, or read.
+  if (refuseOwnerRefOrIdentityBeforeBootstrap(parsed.ownerRef, env, parsed.fortress, "memory_emit", err)) {
+    return 1;
+  }
 
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
@@ -680,6 +732,12 @@ export async function runMemoryTranscodeCommand(
   }
   const parsed = parseTranscodeArgs(args.argv, err);
   if (!parsed) return 2;
+  // STEP1-F2 fix round 1: same pre-bootstrap gate memory_ingest applies (see
+  // its doc comment above), so a non-default --owner-ref or a missing
+  // wrap-time identity refuses before any fortress unlock, dialog, or read.
+  if (refuseOwnerRefOrIdentityBeforeBootstrap(parsed.ownerRef, env, parsed.fortress, "memory_transcode", err)) {
+    return 1;
+  }
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
@@ -810,6 +868,12 @@ export async function runMemoryTranscodeRestoreCommand(
   }
   const parsed = parseRestoreArgs(args.argv, err);
   if (!parsed) return 2;
+  // STEP1-F2 fix round 1: same pre-bootstrap gate memory_ingest applies (see
+  // its doc comment above), so a non-default --owner-ref or a missing
+  // wrap-time identity refuses before any fortress unlock, dialog, or read.
+  if (refuseOwnerRefOrIdentityBeforeBootstrap(parsed.ownerRef, env, parsed.fortress, "memory_transcode_restore", err)) {
+    return 1;
+  }
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
@@ -1305,13 +1369,18 @@ into an operator-named output directory. Existing files are never overwritten.
 Options:
   --harness <name>       Required: claude-code or codex.
   --dir <path>           Output directory for emitted plaintext files.
-  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --owner-ref <id>       Only "fleet-self" is accepted; the MCP guard and
+                         'sanctuary sdw-owner' both hard-code this scope, so
+                         any other value refuses before touching the vault.
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
   --passphrase <value>   Fortress passphrase. Visible in the process list to
                          any local user; prefer SANCTUARY_PASSPHRASE or
                          --passphrase-stdin.
   --help, -h             Show this help.
+
+Requires SANCTUARY_AGENT_ID set to the wrapped harness id, same as
+memory_ingest; refuses before opening the fortress if it is unset.
 `,
   );
 }
@@ -1329,11 +1398,16 @@ Options:
   --to-harness <name>   Different destination harness format.
   --mode reversible     Required frozen transcode contract.
   --dir <path>           Empty output directory; existing files are refused.
-  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --owner-ref <id>       Only "fleet-self" is accepted; the MCP guard and
+                         'sanctuary sdw-owner' both hard-code this scope, so
+                         any other value refuses before touching the vault.
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
   --passphrase <value>   Visible in the process list; prefer the environment or stdin.
   --help, -h             Show this help.
+
+Requires SANCTUARY_AGENT_ID set to the wrapped harness id, same as
+memory_ingest; refuses before opening the fortress if it is unset.
 `,
   );
 }
@@ -1349,11 +1423,16 @@ archive into an empty output directory. This is not sync.
 Options:
   --archive-id <id>      Opaque id returned by memory_transcode.
   --dir <path>           Empty output directory; existing files are refused.
-  --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
+  --owner-ref <id>       Only "fleet-self" is accepted; the MCP guard and
+                         'sanctuary sdw-owner' both hard-code this scope, so
+                         any other value refuses before touching the vault.
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).
   --passphrase <value>   Visible in the process list; prefer the environment or stdin.
   --help, -h             Show this help.
+
+Requires SANCTUARY_AGENT_ID set to the wrapped harness id, same as
+memory_ingest; refuses before opening the fortress if it is unset.
 `,
   );
 }

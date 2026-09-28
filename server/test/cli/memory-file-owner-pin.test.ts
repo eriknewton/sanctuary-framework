@@ -434,6 +434,9 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       readonly agentId: string | undefined;
       readonly dialogRunner?: () => { status: number; signal: null; stdout: Buffer };
       readonly archiveId?: string;
+      /** STEP1-F2 fix round 1: an explicit --owner-ref override, to drive the
+       * pre-bootstrap owner-ref refusal in `refuseOwnerRefOrIdentityBeforeBootstrap`. */
+      readonly ownerRef?: string;
     }): Promise<{ code: number; out: string; err: string; outputDir: string }> {
       const outputDir = join(await tempDir(`memfile-owner-pin-${verbName}-out`), "materialized");
       const out = makeSink();
@@ -442,10 +445,11 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
         ? { SANCTUARY_PASSPHRASE: PASSPHRASE }
         : { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: options.agentId };
       const dialogRunner = options.dialogRunner ?? APPROVE_DIALOG;
+      const ownerRefFlags = options.ownerRef !== undefined ? ["--owner-ref", options.ownerRef] : [];
       let code: number;
       if (verbName === "memory_emit") {
         code = await runMemoryEmitCommandProduction({
-          argv: ["--harness", "claude-code", "--dir", outputDir, "--fortress", fortress],
+          argv: ["--harness", "claude-code", "--dir", outputDir, "--fortress", fortress, ...ownerRefFlags],
           out: out.stream,
           err: err.stream,
           env,
@@ -459,6 +463,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
             "--mode", "reversible",
             "--dir", outputDir,
             "--fortress", fortress,
+            ...ownerRefFlags,
           ],
           out: out.stream,
           err: err.stream,
@@ -471,6 +476,7 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
             "--archive-id", options.archiveId ?? "0".repeat(32),
             "--dir", outputDir,
             "--fortress", fortress,
+            ...ownerRefFlags,
           ],
           out: out.stream,
           err: err.stream,
@@ -545,6 +551,59 @@ for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_res
       expect(result.err).toContain("owner_pin_missing_after_establishment");
       expect(result.err).toContain(`sdw-owner claim --agent-id '${agentId}'`);
       await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+    });
+
+    it("(d) STEP1-F2 fix round 1: a non-default --owner-ref on a fresh store is refused before the dialog and leaves NO pin", async () => {
+      let dialogs = 0;
+      const countingApprove = () => {
+        dialogs += 1;
+        return APPROVE_DIALOG();
+      };
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const result = await runVerb({
+        agentId: `claude_code:owner-ref-${verbName}`,
+        ownerRef: "some-other-scope",
+        dialogRunner: countingApprove,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("fleet-self");
+      // The fortress's owner pin is ONE record, never keyed by owner_ref: a
+      // fresh store's precheck would report "fresh" for ANY owner_ref (scope
+      // is compared only once a pin exists), so without this pre-bootstrap
+      // refusal the verb would establish the fortress's only pin slot under
+      // a scope nothing else can ever read, claim, or transfer back.
+      expect(dialogs).toBe(0);
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("(e) STEP1-F2 fix round 1: with no SANCTUARY_AGENT_ID, a fresh store refuses instead of pinning an unwrapped principal", async () => {
+      let dialogs = 0;
+      const countingApprove = () => {
+        dialogs += 1;
+        return APPROVE_DIALOG();
+      };
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const result = await runVerb({ agentId: undefined, dialogRunner: countingApprove });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("SANCTUARY_AGENT_ID");
+      expect(dialogs).toBe(0);
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("(f) a denied dialog on a fresh store leaves NO owner pin and writes nothing (the pin is established only after Tier-1 approval)", async () => {
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const agentId = `claude_code:owner-pin-denied-${verbName}`;
+      const result = await runVerb({ agentId, dialogRunner: DENY_DIALOG });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("not approved");
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+      // The invariant this proves: `establishOwnerPinAfterApproval` runs only
+      // after the ApprovalGate allows the request, so a denial never reaches
+      // it. Same discipline as memory_ingest's own authorize-branch
+      // establishment (STEP1-F1 fix round 1).
       expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
     });
   });
