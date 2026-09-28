@@ -27,6 +27,62 @@ stops, reloads or disarms. A refused old `prerm upgrade` is backed by the new
 ordinary `config-files` residue if present, then runs `systemctl daemon-reload`
 and rechecks full absence before reinstall. Hooks never do those actions.
 
+## Agent template unit
+
+The package also ships `/etc/systemd/system/sanctuary-agent@.service`, a
+template whose instance name is the agent's numeric uid. It has no `[Install]`
+section, so nothing enables or starts it; the guard refuses any agent drop-in,
+alternate fragment, alias or instance enablement symlink, and refuses any
+package operation while an agent instance is active or transitioning. The
+package does not ship the agent executable
+(`/usr/local/libexec/sanctuary/protected-agent-v1`); an instance whose
+executable is absent fails with 203/EXEC and no agent process runs.
+
+Provision one agent uid `U` (root, once per host, before publishing a manifest
+that admits `U`). Classify first and stop on anything unexpected:
+
+```bash
+getent passwd U ; getent group U
+groupadd --system --gid U sanctuary-agent-U
+useradd --system --uid U --gid U --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin sanctuary-agent-U
+```
+
+Run both commands only when both lookups are empty; run only `useradd` when the
+group `sanctuary-agent-U:x:U:` exists and the user does not (an interrupted
+earlier run); do nothing when the user already has uid `U`, gid `U` and shell
+`/usr/sbin/nologin`. Anything else (uid or gid `U` held by another name, a
+different gid, a login shell, the user in a supplementary group) is a stop:
+choose another `U` or repair by hand. Failure mode: `useradd: UID U is not
+unique` looks like a broken tool and is this stop case.
+
+Identity change from `U` to `V`, in this order: `systemctl stop
+sanctuary-agent@U`, `systemctl stop sanctuary-castle-wall`, stop any process of
+uid `U` started outside the unit and confirm `ps -u U` prints nothing, then
+`castle-wall-daemon --disarm`, provision `V`, publish the manifest admitting
+`V`, start the wall, start `sanctuary-agent@V`. Failure mode: skipping the
+disarm makes the wall's start refuse through the drift path and the agent start
+fail as a dependency; that is the designed refusal, not a broken unit. Failure
+mode that looks like success: `--disarm` refuses only while the daemon runs, so
+a surviving uid-`U` process is not detected by it; the explicit agent stop and
+the `ps -u U` check come first for that reason.
+
+The agent's state directory `/var/lib/sanctuary-agent-U` survives stop,
+disarm, package removal and purge. Nothing bounds its size or content. After
+the agent stop, decide whether to archive or delete that exact path; never use
+a glob.
+
+Starting `sanctuary-agent@U` while the wall is stopped or failed starts the
+wall too (`BindsTo=` pulls it). After a wall exit 78 that is an explicit wall
+start, not an automatic restart, so repair the host first. If the wall has hit
+its start limit, the agent start fails with "start request repeated too
+quickly" as a dependency; run `systemctl reset-failed sanctuary-castle-wall`,
+not an edit of the agent unit.
+
+A package built before the agent unit shipped cannot be upgraded in place: the
+new preinst refuses with "required package file absent" for the agent unit and
+nothing is unpacked. Use the guarded remove, purge, `systemctl daemon-reload`
+and a fresh install.
+
 The first slice assumes a quiescent operator-controlled host with no direct
 daemon or concurrent root provisioning actor; hooks cannot prove that process
 or transaction exclusion. Provisioned package upgrades/removal, trusted CLI

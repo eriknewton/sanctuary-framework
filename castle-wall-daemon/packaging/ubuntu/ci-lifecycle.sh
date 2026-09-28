@@ -97,12 +97,15 @@ package=sanctuary-castle-wall-internal
 unit=sanctuary-castle-wall.service
 daemon=/usr/local/libexec/sanctuary/castle-wall-daemon
 unit_file=/etc/systemd/system/sanctuary-castle-wall.service
+# Must match AGENT_UNIT_PATH in lifecycle-guard.py (the fourth payload leaf).
+agent_unit_file=/etc/systemd/system/sanctuary-agent@.service
 identity_file=/usr/share/doc/sanctuary-castle-wall-internal/build-identity
 v1_version="$(dpkg-deb -f "$v1" Version)"
 v2_version="$(dpkg-deb -f "$v2" Version)"
 dpkg --compare-versions "$v1_version" lt "$v2_version" || die "package revisions not increasing"
 v1_daemon_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./usr/local/libexec/sanctuary/castle-wall-daemon | sha256sum | cut -d' ' -f1)"
 v1_unit_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./etc/systemd/system/sanctuary-castle-wall.service | sha256sum | cut -d' ' -f1)"
+v1_agent_unit_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - './etc/systemd/system/sanctuary-agent@.service' | sha256sum | cut -d' ' -f1)"
 v1_identity_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./usr/share/doc/sanctuary-castle-wall-internal/build-identity | sha256sum | cut -d' ' -f1)"
 {
   echo "scenario=$scenario"
@@ -193,7 +196,7 @@ PY
 }
 
 assert_payload_absent() {
-  python3 - "$daemon" "$unit_file" "$identity_file" <<'PY'
+  python3 - "$daemon" "$unit_file" "$agent_unit_file" "$identity_file" <<'PY'
 import os
 import sys
 for path in sys.argv[1:]:
@@ -212,6 +215,7 @@ snapshot() {
   nft -j list tables > "$out/nft-tables.json"
   if [[ -f "$daemon" ]]; then sha256sum "$daemon" > "$out/daemon.sha256"; fi
   if [[ -f "$unit_file" ]]; then sha256sum "$unit_file" > "$out/unit.sha256"; fi
+  if [[ -f "$agent_unit_file" ]]; then sha256sum "$agent_unit_file" > "$out/agent-unit.sha256"; fi
   if [[ -f "$identity_file" ]]; then sha256sum "$identity_file" > "$out/build-identity.sha256"; fi
   find /etc/sanctuary /var/lib/sanctuary /run/sanctuary -maxdepth 2 -print \
     > "$out/bounded-paths.txt" 2> "$out/find-stderr.txt" || true
@@ -231,6 +235,7 @@ assert_absent() {
   direct_daemon_proc_absent /proc || die "direct daemon process exists or inventory is unknown"
   nft_check || die "Castle Wall nft table or bad inventory exists"
   [[ ! -e "$unit_file" ]] || die "unit file exists"
+  [[ ! -e "$agent_unit_file" && ! -L "$agent_unit_file" ]] || die "agent unit file exists"
   systemctl show "$unit" --property=FragmentPath --value --no-pager | grep -Fx '' >/dev/null \
     || die "effective unit fragment exists"
 }
@@ -247,10 +252,11 @@ assert_installed_v1() {
     [[ "$observed" == 'install ok installed' ]] || die "v1 no longer in exact upgrade/install state"
   fi
   [[ "$(status | tail -n1)" == "$v1_version" ]] || die "v1 Version changed"
-  for path in "$daemon" "$unit_file" "$identity_file"; do
+  for path in "$daemon" "$unit_file" "$agent_unit_file" "$identity_file"; do
     case "$path" in
       "$daemon") expected="$v1_daemon_sha"; mode=755 ;;
       "$unit_file") expected="$v1_unit_sha"; mode=644 ;;
+      "$agent_unit_file") expected="$v1_agent_unit_sha"; mode=644 ;;
       "$identity_file") expected="$v1_identity_sha"; mode=644 ;;
     esac
     [[ -f "$path" && ! -L "$path" ]] || die "old package leaf missing or not regular: $path"
@@ -273,6 +279,8 @@ assert_installed_v1() {
   fi
   cmp -s "$unit_file" "$(dirname "${BASH_SOURCE[0]}")/../../systemd/sanctuary-castle-wall.service" \
     || die "installed unit differs from source"
+  cmp -s "$agent_unit_file" "$(dirname "${BASH_SOURCE[0]}")/../../systemd/sanctuary-agent@.service" \
+    || die "installed agent unit differs from source"
   nft_check || die "Castle Wall nft table appeared"
 }
 
@@ -350,7 +358,7 @@ python3 - "$script_dir/lifecycle-guard.py" <<'PY'
 import runpy, sys
 guard = runpy.run_path(sys.argv[1], init_globals={
     'ROLE': 'preinst', 'PACKAGE_VERSION': 'preflight',
-    'DAEMON_SHA256': '0' * 64, 'UNIT_SHA256': '0' * 64,
+    'DAEMON_SHA256': '0' * 64, 'UNIT_SHA256': '0' * 64, 'AGENT_UNIT_SHA256': '0' * 64,
 })
 guard['inspect'](False, 'install')
 PY
@@ -820,6 +828,32 @@ PY
     snapshot remove-veto
     assert_installed_v1 remove-veto
     [[ -f /etc/sanctuary/castle-wall.env ]] || die "remove veto lost colliding environment"
+    ;;
+  pre-b-upgrade)
+    # Installing the B package over a package built from the pre-B base must
+    # refuse in the NEW preinst (the agent unit is a required installed leaf the
+    # old package never had), never partially unpack. The supported path is the
+    # guarded remove, purge, daemon-reload and fresh install.
+    mapfile -t pre_b_matches < <(find "$artifacts/pre-b" -maxdepth 1 -name '*.deb' -type f -print)
+    [[ ${#pre_b_matches[@]} == 1 ]] || die "expected one pre-B deb"
+    pre_b="${pre_b_matches[0]}"
+    pre_b_version="$(dpkg-deb -f "$pre_b" Version)"
+    dpkg --compare-versions "$pre_b_version" lt "$v2_version" || die "pre-B revision is not older than v2"
+    if dpkg-deb -c "$pre_b" | grep -F 'sanctuary-agent@' >/dev/null; then
+      die "pre-B package unexpectedly carries the agent unit"
+    fi
+    dpkg --install "$pre_b" > "$evidence/install-pre-b.stdout" 2> "$evidence/install-pre-b.stderr"
+    snapshot pre-b-installed
+    [[ "$(status | head -n1)" == 'install ok installed' && "$(status | tail -n1)" == "$pre_b_version" ]] \
+      || die "pre-B package did not install"
+    attempt_refusal pre-b-to-b-veto "$v2" "required package file absent: $agent_unit_file"
+    [[ "$(status | head -n1)" == 'install ok installed' && "$(status | tail -n1)" == "$pre_b_version" ]] \
+      || die "pre-B to B refusal changed the installed package state"
+    [[ ! -e "$agent_unit_file" && ! -L "$agent_unit_file" ]] \
+      || die "pre-B to B refusal unpacked the agent unit"
+    dpkg-deb --fsys-tarfile "$pre_b" | tar -xOf - ./usr/local/libexec/sanctuary/castle-wall-daemon | cmp - "$daemon" \
+      || die "pre-B to B refusal replaced the installed daemon"
+    assert_inert
     ;;
   *) die "unknown isolated scenario: $scenario" ;;
 esac

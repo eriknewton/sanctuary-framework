@@ -14,6 +14,8 @@ PACKAGE = "sanctuary-castle-wall-internal"
 PAYLOAD_FILES = {
     "usr/local/libexec/sanctuary/castle-wall-daemon": 0o755,
     "etc/systemd/system/sanctuary-castle-wall.service": 0o644,
+    # Must match AGENT_UNIT_PATH in lifecycle-guard.py.
+    "etc/systemd/system/sanctuary-agent@.service": 0o644,
     "usr/share/doc/sanctuary-castle-wall-internal/build-identity": 0o644,
 }
 PAYLOAD_DIRS = {
@@ -104,6 +106,7 @@ def parse_identity(raw):
         "artifact_kind", "install_ready", "package", "package_version",
         "source_commit", "daemon_sha256", "unit_sha256", "cargo_lock_sha256",
         "runtime_depends", "pre_depends", "unit_source", "rustc_version",
+        "agent_unit_source", "agent_unit_sha256",
     }
     if set(fields) != required:
         fail("build identity field allowlist mismatch")
@@ -111,7 +114,7 @@ def parse_identity(raw):
         fail("build identity claims wrong kind/readiness/package")
     if not re.fullmatch(r"[0-9a-f]{40}", fields["source_commit"]):
         fail("malformed source commit")
-    for key in ("daemon_sha256", "unit_sha256", "cargo_lock_sha256"):
+    for key in ("daemon_sha256", "unit_sha256", "agent_unit_sha256", "cargo_lock_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", fields[key]):
             fail(f"malformed {key}")
     return fields
@@ -121,6 +124,7 @@ def main(deb):
     here = Path(__file__).resolve().parent
     crate = here.parent.parent
     unit_source = crate / "systemd/sanctuary-castle-wall.service"
+    agent_unit_source = crate / "systemd/sanctuary-agent@.service"
     guard_source = (here / "lifecycle-guard.py").read_bytes()
     control = archive(deb, "--ctrl-tarfile")
     payload = archive(deb, "--fsys-tarfile")
@@ -145,6 +149,12 @@ def main(deb):
         fail("payload/build identity SHA mismatch")
     if unit != unit_source.read_bytes() or identity["unit_source"] != "castle-wall-daemon/systemd/sanctuary-castle-wall.service":
         fail("unit differs from exact source bytes")
+    agent_unit = payload["etc/systemd/system/sanctuary-agent@.service"][1]
+    if hashlib.sha256(agent_unit).hexdigest() != identity["agent_unit_sha256"]:
+        fail("agent unit payload/build identity SHA mismatch")
+    if (agent_unit != agent_unit_source.read_bytes()
+            or identity["agent_unit_source"] != "castle-wall-daemon/systemd/sanctuary-agent@.service"):
+        fail("agent unit differs from exact source bytes")
     for role in ("preinst", "prerm"):
         expected = (
             "#!/usr/bin/python3\n"
@@ -152,6 +162,8 @@ def main(deb):
             f'PACKAGE_VERSION = "{version}"\n'
             f'DAEMON_SHA256 = "{identity["daemon_sha256"]}"\n'
             f'UNIT_SHA256 = "{identity["unit_sha256"]}"\n'
+            # Pinned header order; must match the printf sequence in build-deb.sh.
+            f'AGENT_UNIT_SHA256 = "{identity["agent_unit_sha256"]}"\n'
         ).encode() + guard_source
         if control[role][1] != expected:
             fail(f"{role} is not the exact source guard with bound constants")
