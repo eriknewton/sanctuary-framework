@@ -858,13 +858,33 @@ impl DaemonHandle {
         if let RuntimeHealthState::Recovering(reason) = initial_health {
             self.record_runtime_loss(reason, true);
         }
-        // S_RUN_PASS_DONE: the initial pass above reached `Continue`, so it owes
-        // one liveness pet at the loop top below.
-        let mut completed_health_pass = true;
+        // INVARIANT: only a live, completed reading earns a liveness pet. The
+        // initial pass reached `Continue`, but `recovery_call_decision` also
+        // returns `Continue` for a `Lost` or `Indeterminate` reading with no
+        // install result, and the terminal arms that act on those live in the
+        // loop's observation match below. So the initial observation is classified
+        // exactly as that match classifies it: a terminal reading leaves the flag
+        // false (no pet can precede its decision, even if the thread then stalls
+        // in an unbounded step) and forces the first loop pass to run at the first
+        // tick, so the decision lands through the loop's own terminal arm without
+        // waiting a health interval. Must match the fall-through arms of the
+        // observation match in this function (LINUX-SUPERVISOR-WEDGE-R1-01).
+        let initial_is_terminal = match initial_health {
+            // S_RUN_PASS_DONE: owes one pet at the loop top.
+            RuntimeHealthState::NoRuntime
+            | RuntimeHealthState::Ready
+            | RuntimeHealthState::ProbeUnavailable
+            | RuntimeHealthState::Recovering(_) => false,
+            // S_RUN_PASS still owed: the loop's terminal arms decide.
+            RuntimeHealthState::Lost(_) | RuntimeHealthState::Indeterminate => true,
+        };
+        let mut completed_health_pass = !initial_is_terminal;
+        let mut health_pass_due_now = initial_is_terminal;
         // TEST-ISOLATION ONLY: completed passes, counted for the wedge seam; the
-        // initial pass is the first. Must match `test_wedge_health_pass_after`.
+        // initial pass is the first when it completed (a terminal one did not).
+        // Must match `test_wedge_health_pass_after`.
         #[cfg(feature = "test-isolation")]
-        let mut completed_passes: u32 = 1;
+        let mut completed_passes: u32 = u32::from(!initial_is_terminal);
         loop {
             // Fatal wins over normal shutdown even when the IPC handler sets
             // both atomics before this thread is scheduled.
@@ -905,7 +925,8 @@ impl DaemonHandle {
             if let Ok(mut buf) = self.audit_buffer.lock() {
                 buf.evict_expired(std::time::SystemTime::now());
             }
-            if last_health.elapsed() >= health_interval {
+            if health_pass_due_now || last_health.elapsed() >= health_interval {
+                health_pass_due_now = false;
                 // S_RUN_TICK -> S_RUN_PASS: a health pass is in flight; no pet.
                 last_health = Instant::now();
                 // TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01): park this pass
@@ -1875,6 +1896,7 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     if let Some(line) = crate::systemd_notify::watchdog_boot_diagnostic(
         watchdog.notify_configured(),
         watchdog.watchdog_usec(),
+        watchdog.foreign_watchdog_pid(),
         WATCHDOG_PET_GAP_BOUND,
         WATCHDOG_DECIDED_EXIT_BOUND,
         WATCHDOG_SEC,
@@ -4616,6 +4638,66 @@ mod tests {
             crate::enforcement::EnforcementError,
         > {
             Ok(Box::new(self.0))
+        }
+    }
+
+    /// TD4 (LINUX-SUPERVISOR-WEDGE-R1-01, code gate round 1): an initial health
+    /// reading that is terminal (`Lost` or `Indeterminate`, with no install result)
+    /// earns no liveness pet. The supervisor acts on it through its terminal arms
+    /// without first resetting systemd's watchdog.
+    #[test]
+    fn td4_an_initial_terminal_reading_is_never_followed_by_a_pet() {
+        use crate::enforcement::{ComponentHealth, ComponentKind};
+        use std::os::unix::net::UnixDatagram;
+        // 19 000 000 us = the shipped WatchdogSec, so the beacon is enabled.
+        let usec = u64::from(WATCHDOG_SEC) * 1_000_000;
+        for reading in [ComponentHealth::Lost, ComponentHealth::Indeterminate] {
+            let dir = TempDir::new().unwrap();
+            let (config, _) = fresh_config_in(&dir);
+            let mut handle = boot(config).unwrap();
+            let health = Arc::new(Mutex::new(ComponentHealth::Ready));
+            let providers = ComponentKind::REQUIRED_IN_ORDER
+                .iter()
+                .copied()
+                .map(|kind| {
+                    Box::new(ProbeCountingProvider(ProbeCountingComponent {
+                        kind,
+                        health: if kind == ComponentKind::NftablesTable {
+                            Arc::clone(&health)
+                        } else {
+                            Arc::new(Mutex::new(ComponentHealth::Ready))
+                        },
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    })) as Box<dyn crate::enforcement::ComponentProvider>
+                })
+                .collect();
+            handle.set_enforcement_for_test(EnforcementRuntime::start(providers).unwrap());
+            *health.lock().unwrap() = reading;
+            let notify = dir.path().join("notify.sock");
+            let listener = UnixDatagram::bind(&notify).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            handle.watchdog =
+                crate::systemd_notify::WatchdogBeacon::for_socket(Some(notify), Some(usec));
+            // A short interval, so a regression that pets first still reaches the
+            // terminal arm and returns instead of hanging the test.
+            let outcome = handle
+                .supervise_until_shutdown(Duration::from_millis(10), Duration::from_millis(300));
+            assert!(
+                matches!(outcome, SupervisionOutcome::KernelRuntimeLost(_)),
+                "{reading:?}: {outcome:?}"
+            );
+            let mut buf = [0u8; 64];
+            let mut pets = 0;
+            while let Ok(n) = listener.recv(&mut buf) {
+                if &buf[..n] == crate::systemd_notify::WATCHDOG_DATAGRAM {
+                    pets += 1;
+                }
+            }
+            assert_eq!(
+                pets, 0,
+                "{reading:?}: a terminal initial reading was petted"
+            );
+            let _ = handle.stop();
         }
     }
 

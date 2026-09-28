@@ -199,6 +199,9 @@ pub struct WatchdogBeacon {
     watchdog_usec: Option<u64>,
     /// Whether `NOTIFY_SOCKET` was set at all (for the boot diagnostic).
     notify_configured: bool,
+    /// The `WATCHDOG_PID` value when the manager announced a watchdog interval
+    /// for a process other than this one (for the boot diagnostic).
+    foreign_watchdog_pid: Option<String>,
     state: AtomicU8,
     /// Stderr lines this beacon has written (transition lines only).
     lines_written: AtomicU32,
@@ -234,16 +237,24 @@ impl WatchdogBeacon {
         // on our progress. Only the main process pets, which is also what the
         // unit's NotifyAccess=main enforces on the manager side. Must match
         // `NotifyAccess=main` in systemd/sanctuary-castle-wall.service.
-        let pid_is_ours = match watchdog_pid {
+        let pid_is_ours = match &watchdog_pid {
             None => true,
             Some(pid) => pid.to_str().and_then(|p| p.parse::<u32>().ok()) == Some(own_pid),
         };
         let enabled_usec = usec.filter(|_| pid_is_ours && notify_configured);
-        Self::build(
+        // The manager announced a live watchdog for ANOTHER process: this one sends
+        // no pets, so if that watchdog is in fact this unit's, a healthy daemon is
+        // killed every interval. Kept so the boot line can say so, not "unbounded".
+        let foreign_watchdog_pid = watchdog_pid
+            .filter(|_| !pid_is_ours && notify_configured && usec.is_some())
+            .map(|pid| pid.to_string_lossy().into_owned());
+        let mut beacon = Self::build(
             socket_path.filter(|_| enabled_usec.is_some()),
             enabled_usec,
             notify_configured,
-        )
+        );
+        beacon.foreign_watchdog_pid = foreign_watchdog_pid;
+        beacon
     }
 
     /// Test constructor aimed at an explicit socket, mirroring
@@ -265,6 +276,7 @@ impl WatchdogBeacon {
             target,
             watchdog_usec,
             notify_configured,
+            foreign_watchdog_pid: None,
             state: AtomicU8::new(PET_DISABLED),
             lines_written: AtomicU32::new(0),
         };
@@ -338,6 +350,12 @@ impl WatchdogBeacon {
         self.notify_configured
     }
 
+    /// The `WATCHDOG_PID` naming another process, when the manager announced a
+    /// watchdog interval for it rather than for this one.
+    pub fn foreign_watchdog_pid(&self) -> Option<&str> {
+        self.foreign_watchdog_pid.as_deref()
+    }
+
     /// Transition lines this beacon has written to stderr.
     pub fn lines_written(&self) -> u32 {
         self.lines_written.load(Ordering::SeqCst)
@@ -360,6 +378,7 @@ impl WatchdogBeacon {
 pub fn watchdog_boot_diagnostic(
     notify_configured: bool,
     watchdog_usec: Option<u64>,
+    foreign_watchdog_pid: Option<&str>,
     pet_gap: std::time::Duration,
     decided_exit_bound: std::time::Duration,
     built_for_secs: u32,
@@ -367,6 +386,15 @@ pub fn watchdog_boot_diagnostic(
     if !notify_configured {
         // No supervisor at all (dev host, CI smoke): nothing to diagnose.
         return None;
+    }
+    if let Some(pid) = foreign_watchdog_pid {
+        // The manager's watchdog is live but not fed by this process: NOT the
+        // "unbounded" case below, the opposite. Must match `WatchdogBeacon`'s
+        // WATCHDOG_PID check (`from_parts`).
+        return Some(format!(
+            "castle-wall-daemon: WATCHDOG_PID {pid} is not this process; no watchdog pets \
+             are sent and the manager's watchdog will kill this unit while healthy"
+        ));
     }
     let Some(usec) = watchdog_usec else {
         return Some(
@@ -698,6 +726,7 @@ mod tests {
             watchdog_boot_diagnostic(
                 beacon.notify_configured(),
                 beacon.watchdog_usec(),
+                beacon.foreign_watchdog_pid(),
                 crate::daemon::WATCHDOG_PET_GAP_BOUND,
                 crate::daemon::WATCHDOG_DECIDED_EXIT_BOUND,
                 crate::daemon::WATCHDOG_SEC,
@@ -725,10 +754,32 @@ mod tests {
         assert!(line.contains("enabled no watchdog"), "{line}");
         let line = diagnose(None).expect("an absent line");
         assert!(line.contains("enabled no watchdog"), "{line}");
+        // A live interval announced for ANOTHER process: this daemon sends no pets,
+        // so the line must say the watchdog will kill it, never "unbounded".
+        let foreign = WatchdogBeacon::from_parts(
+            Some(OsString::from("/run/systemd/notify")),
+            Some(OsString::from("19000000")),
+            Some(OsString::from((std::process::id() + 1).to_string())),
+            std::process::id(),
+        );
+        assert_eq!(foreign.watchdog_usec(), None, "no pets for another pid");
+        let line = watchdog_boot_diagnostic(
+            foreign.notify_configured(),
+            foreign.watchdog_usec(),
+            foreign.foreign_watchdog_pid(),
+            crate::daemon::WATCHDOG_PET_GAP_BOUND,
+            crate::daemon::WATCHDOG_DECIDED_EXIT_BOUND,
+            crate::daemon::WATCHDOG_SEC,
+        )
+        .expect("a foreign-pid line");
+        assert!(line.contains("is not this process"), "{line}");
+        assert!(line.contains("will kill this unit"), "{line}");
+        assert!(!line.contains("unbounded"), "{line}");
         // No supervisor at all: nothing to say.
         assert_eq!(
             watchdog_boot_diagnostic(
                 false,
+                None,
                 None,
                 crate::daemon::WATCHDOG_PET_GAP_BOUND,
                 crate::daemon::WATCHDOG_DECIDED_EXIT_BOUND,

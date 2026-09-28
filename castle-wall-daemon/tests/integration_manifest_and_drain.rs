@@ -1623,6 +1623,52 @@ impl TwRun {
     }
 }
 
+/// End the daemon (SIGTERM, bounded wait, then SIGKILL) and reap it. Idempotent:
+/// an already-reaped child is waited again harmlessly.
+fn tw_end_child(child: &mut std::process::Child) {
+    use std::time::Instant;
+    if child.try_wait().ok().flatten().is_none() {
+        // SAFETY: kill(2) on our own unreaped direct child's pid.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let until = Instant::now() + TW_HARNESS_TIMEOUT;
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// Owns the spawned daemon and ends and reaps it on drop, so an unwind anywhere
+/// between `spawn` and the explicit end still leaves no live daemon behind. It
+/// also stops the datagram receiver thread. Must be declared after the suite
+/// guard it protects (locals drop in reverse order).
+struct TwChildReaper {
+    child: std::process::Child,
+    receiving: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::ops::Deref for TwChildReaper {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for TwChildReaper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for TwChildReaper {
+    fn drop(&mut self) {
+        tw_end_child(&mut self.child);
+        self.receiving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn tw_run(extra: &[&str], watchdog_usec: Option<String>, stop: TwStop) -> Option<TwRun> {
     use std::io::BufRead;
     use std::os::unix::net::UnixDatagram;
@@ -1685,7 +1731,14 @@ fn tw_run(extra: &[&str], watchdog_usec: Option<String>, stop: TwStop) -> Option
         Some(usec) => command.env("WATCHDOG_USEC", usec),
         None => command.env_remove("WATCHDOG_USEC"),
     };
-    let mut child = command.spawn().expect("spawn the daemon binary");
+    // Declared AFTER `_suite`, so on every exit path, a panic unwind included,
+    // this reaper drops (ends and reaps the daemon) BEFORE the suite guard's
+    // teardown deletes this run's table: the teardown never runs under a live
+    // daemon.
+    let mut child = TwChildReaper {
+        child: command.spawn().expect("spawn the daemon binary"),
+        receiving: Arc::clone(&receiving),
+    };
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
@@ -1701,21 +1754,7 @@ fn tw_run(extra: &[&str], watchdog_usec: Option<String>, stop: TwStop) -> Option
     let collect = |datagrams: &mut Vec<(Instant, Vec<u8>)>| datagrams.extend(dg_rx.try_iter());
     let pet_count =
         |datagrams: &[(Instant, Vec<u8>)]| datagrams.iter().filter(|(_, d)| d == TW_PET).count();
-    // Reap the child on every path, before this function returns and before the
-    // suite guard's teardown deletes the isolated table: the teardown must never
-    // run under a live daemon.
-    let end_child = |child: &mut std::process::Child| {
-        if child.try_wait().ok().flatten().is_none() {
-            // SAFETY: kill(2) on our own unreaped direct child's pid.
-            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-            let until = Instant::now() + TW_HARNESS_TIMEOUT;
-            while child.try_wait().ok().flatten().is_none() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-    };
+    let end_child = tw_end_child;
 
     let wanted = match stop {
         TwStop::AfterPetsThenWatch(n) | TwStop::SigtermAfterPets(n) => n,
@@ -1908,4 +1947,37 @@ fn tw_e_no_watchdog_interval_means_no_pets_and_one_loud_line() {
         "{}",
         run.stderr
     );
+}
+
+/// Witness for the TW harness's reaper (code gate round 1): a panic between
+/// spawn and the explicit end still ends and reaps the child before the
+/// function's other locals (the suite guard among them) drop.
+#[test]
+fn tw_reaper_ends_and_reaps_the_child_on_an_unwind() {
+    use std::process::{Command, Stdio};
+    let mut pid: i32 = 0;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let receiving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child = TwChildReaper {
+            child: Command::new("sleep")
+                .arg("30")
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn sleep"),
+            receiving,
+        };
+        pid = child.id() as i32;
+        panic!("an assertion failing between spawn and the explicit end");
+    }));
+    assert!(unwound.is_err());
+    // kill(pid, 0) succeeds for a live or unreaped (zombie) child; a reaped one
+    // is gone. Read before any cleanup so the result is the reaper's.
+    // SAFETY: signal 0 only probes existence; `pid` was our direct child.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        // Never leak the process, even when the witness fails.
+        // SAFETY: as above; SIGKILL to our own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "the child outlived the unwind (pid {pid})");
 }
