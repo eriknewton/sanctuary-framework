@@ -199,7 +199,15 @@ jobs:
             echo 'an agent-unit byte change was accepted by assert-structure.sh' >&2
             exit 1
           fi
-          grep -F 'differ' "$negative/agent-bytes.log" >/dev/null \
+          # The refusal must be the agent unit's exact-bytes `cmp` in
+          # assert-structure.sh. The fixture APPENDS a line, so the packaged
+          # bytes are a strict prefix of the mutated source and cmp reports
+          # "EOF on - after byte <packaged length>" rather than "differ" (a
+          # same-length change would say "differ"); both are that comparison.
+          # The byte count pins it to the agent unit: its packaged length is
+          # the unmutated source's length.
+          agent_len="$(wc -c < "$agent_unit.baseline" | tr -d ' ')"
+          grep -Eq "^cmp: EOF on - after byte ${agent_len}(,|$)|^- .*sanctuary-agent@\.service differ: " "$negative/agent-bytes.log" \
             || { echo 'agent-unit byte refusal did not come from the exact-bytes comparison' >&2; cat "$negative/agent-bytes.log" >&2; exit 1; }
           cp "$agent_unit.baseline" "$agent_unit"
           cat > "$negative/misleading-Cargo.toml" <<'TOML'
