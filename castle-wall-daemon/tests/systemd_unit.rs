@@ -18,6 +18,10 @@
 //! * `TimeoutStopSec` + `KillMode=control-group` — bound shutdown and reap an
 //!   isolated nft health child if its fork/netlink transaction wedged.
 //! * `WantedBy=multi-user.target` — the reboot-survival / persistence path.
+//! * `WatchdogSec` + `WatchdogSignal=SIGKILL` + `NotifyAccess=main` — the liveness
+//!   watchdog (C2a3): a supervisor that stops completing health passes is killed
+//!   without a core and restarted; the interval is derived in `daemon.rs`
+//!   (`WATCHDOG_SEC`) and only the main process can pet it.
 
 use castle_wall_daemon::ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH;
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
@@ -81,9 +85,13 @@ fn shipped_wall_unit_identity_bytes_are_pinned() {
     // digest is updated. Drop-ins and host configuration require host checks.
     // Refreshed for C2a2 (2026-09-27): a comment-only edit, the TimeoutStopSec
     // must-match pin to the stop guard; no directive changed.
+    // TU7, refreshed for C2a3 (2026-09-28): three directives added under
+    // [Service] (WatchdogSec=19, WatchdogSignal=SIGKILL, NotifyAccess=main, each
+    // pinned by TU1 to TU4 below) plus comment edits to the start-limit
+    // derivation and its failure-mode paragraph; User and Group unchanged.
     assert_eq!(
         format!("{:x}", Sha256::digest(unit.as_bytes())),
-        "061cd109121e06cb36117024589dadd4aceed04c82efb648dcd0775235d7a3d5",
+        "905c138d5240e8ee5b3fce9e1207cdd5707afe6a08ded2f03d56811e5b9ccdf0",
         "the audited castle-wall service identity or unit bytes changed"
     );
 }
@@ -351,6 +359,11 @@ const START_LIMIT_BURST: &str = "5";
 /// Must match `StartLimitIntervalSec` in systemd/sanctuary-castle-wall.service.
 const START_LIMIT_INTERVAL_SEC: &str = "600";
 
+/// The unit's liveness watchdog interval, in seconds (TU6's I4 reads it).
+/// Must match `WatchdogSec` in systemd/sanctuary-castle-wall.service and
+/// `WATCHDOG_SEC` in src/daemon.rs (TU1 checks both).
+const WATCHDOG_SEC_UNIT: &str = "19";
+
 /// The INI section a directive appears in, or None when it is absent.
 ///
 /// systemd reads a directive only in its own section and ignores it elsewhere, so a
@@ -429,6 +442,27 @@ fn unit_ships_a_finite_start_limit_whose_window_outlasts_five_worst_case_activat
          {restart_delay}) = {worst_case_span} seconds, or the limit never trips"
     );
 
+    // TU6 (I4, LINUX-SUPERVISOR-WEDGE-R1-01): the watchdog's own worst cycle, start
+    // to start, must fit five times too, or a watchdog crash wave never reaches the
+    // terminal failed state. A cycle is READY at the TimeoutStartSec edge, one first
+    // pass shorter than WatchdogSec that pets, a wedge killed WatchdogSec after that
+    // pet, then RestartSec: start_timeout + 2 x watchdog + restart_delay.
+    let watchdog = directive_values(&unit, "WatchdogSec");
+    assert_eq!(watchdog.len(), 1, "exactly one WatchdogSec must be set");
+    assert_eq!(
+        watchdog_secs(watchdog[0]),
+        WATCHDOG_SEC_UNIT.parse::<u64>().unwrap()
+    );
+    let watchdog_n: u64 = WATCHDOG_SEC_UNIT.parse().expect("watchdog is seconds");
+    let watchdog_cycle = start_timeout + 2 * watchdog_n + restart_delay;
+    let watchdog_span = burst_n * watchdog_cycle;
+    assert!(
+        interval_n > watchdog_span,
+        "StartLimitIntervalSec {interval_n} must exceed {burst_n} x ({start_timeout} + 2 x \
+         {watchdog_n} + {restart_delay}) = {watchdog_span} seconds, or a watchdog crash \
+         wave never reaches the terminal failed state"
+    );
+
     // And the unlimited form is never shipped here: it is what would move the boot
     // lockout into systemd.
     assert!(
@@ -477,6 +511,109 @@ fn unit_bounds_shutdown_and_kills_wedged_health_children() {
         vec!["control-group"],
         "a wedged nft health child must be killed with the service"
     );
+}
+
+// ---- C2a3: the liveness watchdog directives (LINUX-SUPERVISOR-WEDGE-R1-01) ----
+
+/// A systemd time span in whole seconds, bare (`19`) or `s`-suffixed (`19s`).
+/// Any other unit spelling panics, so a respelled directive cannot pass by
+/// parsing as something else.
+fn watchdog_secs(value: &str) -> u64 {
+    value
+        .strip_suffix('s')
+        .unwrap_or(value)
+        .parse()
+        .unwrap_or_else(|e| panic!("a whole-second time span, got {value:?}: {e}"))
+}
+
+/// The single value of `directive`, asserted to sit in `[Service]`.
+fn service_directive(unit: &str, directive: &str) -> String {
+    assert_eq!(
+        section_of(unit, directive).as_deref(),
+        Some("Service"),
+        "{directive} must sit in [Service]; systemd ignores it elsewhere"
+    );
+    let service = section_text(unit, "Service");
+    let values = section_values(service, directive);
+    assert_eq!(values.len(), 1, "exactly one {directive}: {values:?}");
+    values[0].to_string()
+}
+
+/// TU1: `WatchdogSec` is set once in `[Service]` and equals the derived
+/// `WATCHDOG_SEC`.
+#[test]
+fn tu1_watchdog_sec_matches_the_derived_constant() {
+    let unit = unit_text();
+    let secs = watchdog_secs(&service_directive(&unit, "WatchdogSec"));
+    assert_eq!(secs, u64::from(castle_wall_daemon::daemon::WATCHDOG_SEC));
+    assert_eq!(
+        WATCHDOG_SEC_UNIT,
+        castle_wall_daemon::daemon::WATCHDOG_SEC.to_string()
+    );
+}
+
+/// TU2: I1 and I7. The watchdog is never the tighter bound on a manager stop,
+/// and a stop of a healthy daemon (at most one pet gap after a pet) ends by
+/// `TimeoutStopSec` before any watchdog systemd kept running could fire.
+#[test]
+fn tu2_watchdog_outlasts_a_manager_stop() {
+    let unit = unit_text();
+    let watchdog = watchdog_secs(&service_directive(&unit, "WatchdogSec"));
+    let stop = watchdog_secs(&service_directive(&unit, "TimeoutStopSec"));
+    assert!(
+        watchdog > stop,
+        "I1: WatchdogSec {watchdog} > TimeoutStopSec {stop}"
+    );
+    assert!(
+        castle_wall_daemon::daemon::WATCHDOG_SEC
+            > castle_wall_daemon::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS
+    );
+    let watchdog = std::time::Duration::from_secs(watchdog);
+    assert!(
+        watchdog - castle_wall_daemon::daemon::WATCHDOG_PET_GAP_BOUND
+            > std::time::Duration::from_secs(stop),
+        "I7: WatchdogSec minus the pet gap must exceed TimeoutStopSec"
+    );
+}
+
+/// TU3: `WatchdogSignal=SIGKILL`. The default SIGABRT would core-dump a process
+/// that holds the audit producer's private seed. The one pin for this directive.
+#[test]
+fn tu3_watchdog_signal_is_sigkill() {
+    assert_eq!(service_directive(&unit_text(), "WatchdogSignal"), "SIGKILL");
+}
+
+/// TU4: `NotifyAccess=main`, so a child that inherits `NOTIFY_SOCKET` can neither
+/// pet nor send `READY=1`. Must match `WatchdogBeacon`'s `WATCHDOG_PID` check.
+#[test]
+fn tu4_notify_access_is_main() {
+    assert_eq!(service_directive(&unit_text(), "NotifyAccess"), "main");
+}
+
+/// TU5: a watchdog kill is never read as success and never suppresses restart.
+/// `RestartPreventExitStatus` is exactly `78`, and neither success nor forced
+/// restart lists name 78 or the watchdog's signals.
+#[test]
+fn tu5_a_watchdog_kill_is_never_success_and_always_restarts() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    let tokens = |directive: &str| -> Vec<String> {
+        section_values(service, directive)
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(tokens("RestartPreventExitStatus"), vec!["78".to_string()]);
+    for directive in ["SuccessExitStatus", "RestartForceExitStatus"] {
+        let listed = tokens(directive);
+        for forbidden in ["78", "KILL", "SIGKILL", "9", "ABRT", "SIGABRT"] {
+            assert!(
+                !listed.iter().any(|t| t == forbidden),
+                "{directive} must not list {forbidden}: {listed:?}"
+            );
+        }
+    }
 }
 
 #[test]

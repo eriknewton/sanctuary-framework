@@ -1356,9 +1356,12 @@ mod linux {
     pub(crate) const NFT_KILL_GRACE: Duration = Duration::from_millis(200);
     /// Policy allowance for pipe EOF and `waitpid` after a confirmed exit.
     pub(crate) const NFT_REAP_GRACE: Duration = Duration::from_millis(500);
-    /// The longest one `nft` call can hold its caller: 2.7 s. Derived, used only
-    /// by T13 and harness leg H3; no inequality against the health interval is
-    /// claimed. Read by tests and the harness only, hence the allow.
+    /// The longest one `nft` call can hold its caller: 2.7 s. Derived, used by
+    /// T13, harness leg H3 and TD2n; no inequality against the health interval
+    /// is claimed. Must match `WATCHDOG_HOOK_NFT_WAIT` in `src/daemon.rs`, the
+    /// systemd watchdog derivation's bound on the `Indeterminate` hook's one nft
+    /// call (TD2n pins the 2700 ms on this side). Read by tests and the harness
+    /// only, hence the allow.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const NFT_CALL_WORST_CASE: Duration = Duration::from_millis(
         NFT_COMMAND_TIMEOUT.as_millis() as u64
@@ -6820,6 +6823,24 @@ mod child_slot_tests {
         assert_eq!(
             linux::NFT_CALL_WORST_CASE,
             linux::NFT_COMMAND_TIMEOUT + linux::NFT_KILL_GRACE + linux::NFT_REAP_GRACE
+        );
+    }
+
+    /// TD2n (LINUX-SUPERVISOR-WEDGE-R1-01): the one nft call's worst case is
+    /// 2700 ms, the figure the systemd watchdog interval is derived from. Must
+    /// match `WATCHDOG_HOOK_NFT_WAIT` in `src/daemon.rs`, which pins the same
+    /// literal on its side (TD2), so an nft budget edited here turns this red
+    /// and names the daemon mirror that must move with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn td2n_nft_call_worst_case_matches_the_watchdog_hook_nft_wait() {
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            std::time::Duration::from_millis(2700)
+        );
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            crate::daemon::WATCHDOG_HOOK_NFT_WAIT
         );
     }
 
