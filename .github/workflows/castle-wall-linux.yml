@@ -262,6 +262,47 @@ jobs:
         env:
           SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
+      - name: Prove the agent-unit premise witnesses (TB0a, TB0b) ran without a fixture skip
+        working-directory: castle-wall-daemon
+        timeout-minutes: 5
+        run: |
+          # TB0a (a `+` ExecStartPre= receives an EnvironmentFile= value as one
+          # argv token) and TB0b (a `+` ExecStartPre= keeps CAP_NET_ADMIN under an
+          # empty CapabilityBoundingSet=) are the premises the agent template
+          # unit's kernel gate stands on. Like the start-limit case above, an
+          # early `SKIP` return reads as a pass in the captured all-targets run,
+          # so each case is rerun uncaptured and a SKIP is refused. Failure mode
+          # this guards: a runner without root or without a system bus turns both
+          # witnesses into silent passes and the agent unit's digest then rests
+          # on an unwitnessed manager behaviour.
+          set -o pipefail
+          : > agent-unit-premises-focused.log
+          for case_name in \
+            start_limit_against_real_systemd::tb0a_a_plus_exec_start_pre_receives_the_environment_file_value_as_one_token \
+            start_limit_against_real_systemd::tb0b_a_plus_exec_start_pre_keeps_cap_net_admin_under_an_empty_bounding_set; do
+            sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+              --test systemd_unit --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee case.log
+            cat case.log >> agent-unit-premises-focused.log
+            # With --nocapture the witness's own evidence lines sit between
+            # "test <name> ... " and its "ok", so the name and a bare "ok" line
+            # are checked separately; the result line below pins the count.
+            grep -Fq "test $case_name ... " case.log && grep -Fxq "ok" case.log || {
+              echo "FAIL: exact premise case $case_name did not report ok"
+              exit 1
+            }
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' case.log || {
+              echo "FAIL: focused premise result for $case_name was absent, skipped, or malformed"
+              exit 1
+            }
+            if grep -Fq 'SKIP' case.log; then
+              echo "FAIL: premise case $case_name returned early with SKIP"
+              exit 1
+            fi
+          done
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
       - name: Refuse leftover kernel state before the upload
         if: always()
         run: |
@@ -318,6 +359,7 @@ jobs:
             castle-wall-daemon/cargo-test.log
             castle-wall-daemon/cargo-test.plain.log
             castle-wall-daemon/systemd-start-limit-focused.log
+            castle-wall-daemon/agent-unit-premises-focused.log
           if-no-files-found: warn
 
       - name: Cleanup nftables state
