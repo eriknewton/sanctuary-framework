@@ -179,6 +179,25 @@ pub struct SuiteGuard {
     _lock: Option<MutexGuard<'static, ()>>,
 }
 
+impl SuiteGuard {
+    /// Release the suite lock WITHOUT the sweep, for a caller that has shown a
+    /// unit which can still write the isolated table is alive (the agent-unit
+    /// TB10 teardown). Deleting the table under that live daemon lets it
+    /// recreate the table after the delete, which is worse than a leftover that
+    /// is reported; so the leftover is left in place and named here, loudly.
+    pub fn release_leaving_kernel_state(mut self, why: &str) {
+        eprintln!(
+            "\n!!!!!!!! ISOLATION SWEEP SKIPPED: KERNEL STATE LEFT IN PLACE !!!!!!!!\n\
+             table {} was not deleted: {why}\n!!!!!!!!\n",
+            isolated().table
+        );
+        let lock = self._lock.take();
+        // Skip this guard's Drop (the sweep); the lock is released below.
+        std::mem::forget(self);
+        drop(lock);
+    }
+}
+
 impl Drop for SuiteGuard {
     fn drop(&mut self) {
         let iso = isolated();

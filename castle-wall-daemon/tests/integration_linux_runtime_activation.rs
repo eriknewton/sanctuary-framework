@@ -2818,8 +2818,9 @@ impl Drop for Tb9Daemon {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
-        cleanup_castle_table();
-        cleanup_journal();
+        // The isolated table and any net are removed, and leftovers refused, by
+        // the test's `SuiteGuard` (tests/isolation/mod.rs), which drops after
+        // this with the daemon reaped; no second sweep here.
     }
 }
 
@@ -3918,12 +3919,17 @@ mod tb10_agent_unit_against_real_systemd {
     /// a delete under a daemon that could recreate it.
     pub(super) struct IsolatedKernelState {
         settled: UnitsSettled,
+        /// The suite's own isolation guard, whose Drop deletes the isolated
+        /// table and refuses leftovers. Owned here so that sweep runs ONLY when
+        /// the units are confirmed settled.
+        suite: Option<isolation::SuiteGuard>,
     }
 
     impl IsolatedKernelState {
-        fn new() -> Self {
+        fn new(suite: isolation::SuiteGuard) -> Self {
             Self {
                 settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                suite: Some(suite),
             }
         }
     }
@@ -3941,10 +3947,13 @@ mod tb10_agent_unit_against_real_systemd {
                      isolated table {} and journal are LEFT IN PLACE. Live ruleset:\n{ruleset}",
                     nftables::castle_table()
                 );
+                if let Some(suite) = self.suite.take() {
+                    suite.release_leaving_kernel_state("TB10 units were not confirmed settled");
+                }
                 return;
             }
-            cleanup_castle_table();
-            cleanup_journal();
+            // Settled: the suite guard's own sweep and leftover refusal run now.
+            drop(self.suite.take());
         }
     }
 
@@ -3958,11 +3967,11 @@ mod tb10_agent_unit_against_real_systemd {
     /// under the empty bounding set and received the trusted uid.
     #[test]
     fn tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives() {
-        let _suite = suite_guard();
+        let suite = suite_guard();
         if !require_systemd() {
             return;
         }
-        let kernel = IsolatedKernelState::new();
+        let kernel = IsolatedKernelState::new(suite);
         cleanup_castle_table();
         cleanup_journal();
         let _account = match ProvisionedAccount::provision(TEST_AGENT_UID) {
