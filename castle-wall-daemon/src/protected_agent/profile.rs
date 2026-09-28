@@ -10,6 +10,9 @@ use std::{
 
 pub const PROFILE_PATH: &str = "/etc/sanctuary/launcher/agent-v1.json";
 pub const REGISTRY_PATH: &str = "/etc/sanctuary/launcher/account-registry-v1.json";
+/// The fixed agent executable. Must match `ExecStart=` in
+/// `systemd/sanctuary-agent@.service` (pinned by TB4 in `src/agent_start.rs`),
+/// which starts exactly this path with no arguments.
 pub const EXECUTABLE_PATH: &str = "/usr/local/libexec/sanctuary/protected-agent-v1";
 const MAX_PROFILE: usize = 4096;
 const MAX_EXECUTABLE: u64 = 64 * 1024 * 1024;

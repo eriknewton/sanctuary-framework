@@ -1341,6 +1341,13 @@ pub(crate) fn resolve_nft_binary(
 
 // ---- Linux implementations ------------------------------------------------
 
+// The worst case of one bounded `nft` call, re-exported ALONE and only for
+// tests: the agent unit's `TimeoutStartSec` is pinned against it
+// (`src/agent_start.rs`, TB4). A combined import with the lister would be an
+// unused import in a release Linux build.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::NFT_CALL_WORST_CASE;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;

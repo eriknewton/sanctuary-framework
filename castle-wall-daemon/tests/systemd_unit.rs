@@ -189,6 +189,21 @@ fn the_shipped_daemon_unit_starts_independently_of_the_stop_owner_artifact() {
     );
 }
 
+/// TB3 (slice B): the agent template unit depends on the wall, never the
+/// reverse. The wall's bytes are pinned above and stay unchanged by slice B;
+/// this pins the direction, so a wall-side `Wants=`, `Requires=` or `Before=`
+/// naming the agent (which would let the agent pull or order the wall) is a
+/// visible failure. The wall digest is also what pins the socket parent's
+/// `RuntimeDirectoryMode=0710` `root:sanctuary`, the second defence an agent
+/// process meets at the control socket.
+#[test]
+fn the_shipped_daemon_unit_names_no_agent_unit() {
+    assert!(
+        !unit_text().contains("sanctuary-agent"),
+        "the wall unit must not name the agent unit; the edge is agent to wall only"
+    );
+}
+
 #[test]
 fn the_stop_owner_unit_grants_no_cgroup_write_path_and_keeps_its_socket_parent_volatile() {
     let owner = stop_owner_unit_text();
