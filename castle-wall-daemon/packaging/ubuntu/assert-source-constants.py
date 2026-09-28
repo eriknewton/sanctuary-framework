@@ -45,7 +45,16 @@ from pathlib import Path
 # Refreshed for C2a2b (2026-09-27): the only nftables.rs change is a doc-comment cross-file
 # pin on CastleTableOwnership ("must match JournalActivation in src/ownership_journal.rs").
 # No code line changed; the rule grammar, parser, receipt mint and net script are unchanged.
-NFTABLES_SOURCE_SHA256 = "84975b87a7e17879b2f1280fb75adbb6866ce3b99d49ce808adb4c6f8b3d7a2b"
+# Refreshed for Linux slice B (2026-09-28, builder refresh, on top of C2a2b; the slice's two-family code gate
+# reviews it before merge): nftables.rs gained the extracted set rule binding_set_rule (with
+# owned_binding_inventory) now called by both owned_table_binding_set_from_json and the new
+# pure agent_start_gate_verdict with its AgentStartTableVerdict, two separate re-exports
+# (list_owned_castle_table_json_for_binding_set under target_os linux, NFT_CALL_WORST_CASE
+# under test and linux), the two doc-comment amendments naming the two provenances of
+# ExpectedAgentBinding::Confined (its variant doc and the seal doc), and TB5 tests. The rule
+# grammar, the owned-table parser and its enum variants, the receipt mint and the net script
+# are byte-unchanged. The guard constants it mirrors are unchanged.
+NFTABLES_SOURCE_SHA256 = "a56cb81f440eaee7ab94204bf5ae9791c86f1408058d41db7a91502b37050f64"
 
 
 def fail(message):

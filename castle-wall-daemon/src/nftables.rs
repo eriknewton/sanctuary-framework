@@ -414,15 +414,23 @@ pub struct AgentUidBinding {
 /// refused only by [`Self::Confined`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedAgentBinding {
-    /// The identity this process FROZE at boot confines `agent_uid` under
-    /// `fortress_id`. Every live per-agent binding must carry exactly this uid
-    /// AND a seal that recomputes under this fortress id. This is the trusted
-    /// expectation the design names, and it is read from the write-once armed
-    /// identity cell (`AdmittedIdentity` in `src/decision.rs`, by way of
-    /// `current_expected_agent_binding` in `src/runtime_providers.rs`), never
-    /// re-derived from the live store: a reload that would change the uid is
-    /// REFUSED while armed, so there is no later value for a comparison to drift
-    /// against.
+    /// `agent_uid` is confined under `fortress_id`. Every live per-agent binding
+    /// must carry exactly this uid AND a seal that recomputes under this fortress
+    /// id. It is the trusted expectation the design names, and it has exactly
+    /// TWO admitted provenances, neither of which is ever read from the listing
+    /// it is compared against:
+    ///
+    /// (a) the daemon's frozen armed identity, for acquisition, readback and
+    ///     health: read from the write-once armed identity cell
+    ///     (`AdmittedIdentity` in `src/decision.rs`, by way of
+    ///     `current_expected_agent_binding` in `src/runtime_providers.rs`), never
+    ///     re-derived from the live store; a reload that would change the uid is
+    ///     REFUSED while armed, so there is no later value to drift against.
+    /// (b) the agent unit's instance uid, for the agent start gate ONLY
+    ///     ([`agent_start_gate_verdict`]): trusted because it is the value
+    ///     systemd applies as `User=` to the process the gate admits. That
+    ///     argv-fed construction has exactly one site, pinned by TB5s in
+    ///     `src/agent_start.rs`.
     Confined { fortress_id: String, agent_uid: u32 },
     /// The identity this process FROZE at boot confines NO agent uid (the frozen
     /// cell is `Unconfined`: absent `agent_origin`, or a non-`uid` mode), or the
@@ -1345,6 +1353,11 @@ pub(crate) fn resolve_nft_binary(
 // tests: the agent unit's `TimeoutStartSec` is pinned against it
 // (`src/agent_start.rs`, TB4). A combined import with the lister would be an
 // unused import in a release Linux build.
+// The one bounded listing the agent start gate makes (`src/agent_start.rs`).
+// It is already a row of the `run_nft` inventory above, so the gate adds no
+// `run_nft` site of its own.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::list_owned_castle_table_json_for_binding_set;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::NFT_CALL_WORST_CASE;
 
@@ -3189,8 +3202,10 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
 /// intact, so the recomputed digest no longer matches and the rule is refused.
 /// An actor that reconstructs BOTH expressions AND both comments produces a
 /// self-consistent inventory this digest cannot catch — that case is caught only
-/// by the trusted MANIFEST uid comparison in `parse_owned_table_inventory`, which
-/// is why the seal is documented as a consistency check and never as authority.
+/// by the trusted uid comparison in `parse_owned_table_inventory` (the frozen
+/// manifest uid in the daemon, the unit instance in the agent start gate; the two
+/// provenances of [`ExpectedAgentBinding::Confined`]), which is why the seal is
+/// documented as a consistency check and never as authority.
 ///
 /// `decimal(uid)` is ASCII decimal with no leading zeros and no sign (Rust's
 /// `u32` Display), so one uid has exactly one preimage and two spellings of the
@@ -3878,18 +3893,40 @@ pub(crate) fn owned_table_binding_set_from_json(
             parsed.ownership.marker,
         )));
     }
+    let inventory = owned_binding_inventory(&parsed);
+    // A phase-two uid failure is already a set failure; keep the parser's wording
+    // so the two layers do not describe the same drift differently.
+    if let Some(detail) = phase_two_detail {
+        return Ok(OwnedBindingSet::UidMismatch { inventory, detail });
+    }
+    Ok(binding_set_rule(inventory, expectation))
+}
+
+/// Every live `(agent_id, uid)` binding of a phase-one-verified inventory,
+/// ascending by agent id. Shared by the wall's set rule and the agent start
+/// gate so both compare the same sorted shape.
+#[cfg(any(target_os = "linux", test))]
+fn owned_binding_inventory(parsed: &ParsedOwnedTableInventory) -> OwnedBindingInventory {
     let mut bindings: Vec<(String, u32)> = parsed
         .uid_bindings
         .iter()
         .map(|(agent_id, uid)| (agent_id.clone(), *uid))
         .collect();
     bindings.sort_unstable();
-    let inventory = OwnedBindingInventory { bindings };
-    // A phase-two uid failure is already a set failure; keep the parser's wording
-    // so the two layers do not describe the same drift differently.
-    if let Some(detail) = phase_two_detail {
-        return Ok(OwnedBindingSet::UidMismatch { inventory, detail });
-    }
+    OwnedBindingInventory { bindings }
+}
+
+/// THE SET RULE ITSELF, the one implementation: the live bindings must equal
+/// exactly `[(uid-<U>, U)]` under `Confined { U }` and exactly nothing under
+/// any expectation that confines nobody. Called by
+/// [`owned_table_binding_set_from_json`] (after its ownership-handle equality)
+/// and by [`agent_start_gate_verdict`]; neither carries a second copy, and TB5s
+/// in `src/agent_start.rs` pins that (AGENTS rule 5).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn binding_set_rule(
+    inventory: OwnedBindingInventory,
+    expectation: &ExpectedAgentBinding,
+) -> OwnedBindingSet {
     let expected: Vec<(String, u32)> = match expectation {
         ExpectedAgentBinding::Confined { agent_uid, .. } => {
             vec![(confined_agent_id(*agent_uid), *agent_uid)]
@@ -3905,7 +3942,7 @@ pub(crate) fn owned_table_binding_set_from_json(
         | ExpectedAgentBinding::StructureOnly => Vec::new(),
     };
     if inventory.bindings == expected {
-        return Ok(OwnedBindingSet::Verified(inventory));
+        return OwnedBindingSet::Verified(inventory);
     }
     let detail = format!(
         "the live per-agent binding set is {:?}, not the {:?} the armed identity requires; a \
@@ -3913,7 +3950,70 @@ pub(crate) fn owned_table_binding_set_from_json(
          is refused fail-closed",
         inventory.bindings, expected
     );
-    Ok(OwnedBindingSet::UidMismatch { inventory, detail })
+    OwnedBindingSet::UidMismatch { inventory, detail }
+}
+
+/// The agent start gate's reading of one owned-table listing, as named
+/// verdicts. Mapped to exit codes and stderr tokens by `src/agent_start.rs`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentStartTableVerdict {
+    /// Uid `U` is, at this instant, the owned table's sole bound uid.
+    Admit,
+    /// Phase one failed: not the owned shape (including the deny-all net, whose
+    /// table carries no ownership marker), a seal under another fortress, or
+    /// unparseable output.
+    RefuseNotOwnedShape(String),
+    /// The owned shape passed, but the live set is not exactly `{(uid-U, U)}`.
+    RefuseBindingSet(String),
+}
+
+/// The agent start gate's table verdict: may the agent unit instance `uid`
+/// start now under `fortress_id`?
+///
+/// AGENTS rule 7. Subject: the agent unit instance `uid`. Evidence: the live
+/// owned table listed at this start. Verifier: the shared [`binding_set_rule`]
+/// under this fortress's seal. `Admit` means only "at this instant `uid` is
+/// the wall's sole bound uid"; its freshness ends at the wall's next health
+/// pass, which owns every later instant (rule 10), and the `BindsTo=` edge of
+/// the agent unit, not this read, is what ties the start to a live wall
+/// activation.
+///
+/// Omitted on purpose: the ownership-handle equality the wall's own set rule
+/// applies. The gate has no acquisition-time handles to compare, and a
+/// same-name replacement by another `CAP_NET_ADMIN` actor is outside the
+/// trust base (C2a2 premise P2).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn agent_start_gate_verdict(
+    json: &str,
+    fortress_id: &str,
+    uid: u32,
+) -> AgentStartTableVerdict {
+    // The expected uid is the unit's instance, the value systemd uses for
+    // `User=`; it is never read from the listing it is compared against, so a
+    // self-consistent table for another uid cannot admit this start. This is
+    // provenance (b) of `ExpectedAgentBinding::Confined`, and its only site.
+    let expectation = ExpectedAgentBinding::Confined {
+        fortress_id: fortress_id.to_string(),
+        agent_uid: uid,
+    };
+    let parsed = match parse_owned_table_inventory_phases(json, &expectation) {
+        Err(err) => return AgentStartTableVerdict::RefuseNotOwnedShape(err.to_string()),
+        Ok(OwnedInventoryPhases::Verified(parsed)) => parsed,
+        // Phase one yields no bindings unless the whole owned shape and the seal
+        // passed, and phase two's only check is the skuid against the expected
+        // uid; so a phase-two failure implies a live binding whose uid is not
+        // the expectation's, and the shared set rule refuses it without reading
+        // the phase-two detail. (The wall's consumer gets the same property by
+        // returning on that detail first; the gate gets it from the rule.)
+        Ok(OwnedInventoryPhases::UidMismatch { inventory, .. }) => inventory,
+    };
+    match binding_set_rule(owned_binding_inventory(&parsed), &expectation) {
+        OwnedBindingSet::Verified(_) => AgentStartTableVerdict::Admit,
+        OwnedBindingSet::UidMismatch { detail, .. } => {
+            AgentStartTableVerdict::RefuseBindingSet(detail)
+        }
+    }
 }
 
 /// [`owned_table_binding_set_from_json`] against the LIVE table.
@@ -5110,6 +5210,136 @@ mod tests {
                 assert_eq!(inventory.bindings, vec![(confined_agent_id(60123), 60123)]);
             }
             OwnedBindingSet::Verified(_) => panic!("a drifted uid must not be adopted"),
+        }
+    }
+
+    // ---- TB5 (slice B): the agent start gate's table verdict ---------------
+    //
+    // Capability: the agent unit instance `U` is admitted only when the owned
+    // table's live binding set is exactly the sealed singleton {(uid-U, U)}
+    // under this fortress. Register id:
+    // `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`.
+
+    /// The instance uid the gate fixtures start. Above any plausible
+    /// system-uid ceiling, and distinct from every other uid below.
+    const GATE_UID: u32 = 60123;
+    /// A second provisioned agent uid, for the wrong-instance cases.
+    const GATE_OTHER_UID: u32 = 60124;
+
+    fn gate(json: &str, uid: u32) -> AgentStartTableVerdict {
+        agent_start_gate_verdict(json, FIXTURE_FORTRESS, uid)
+    }
+
+    #[test]
+    fn tb5_the_gate_admits_exactly_the_sealed_singleton_for_the_instance() {
+        let json = owned_table_with_bindings(
+            &fixture_marker(),
+            &[(&confined_agent_id(GATE_UID), GATE_UID)],
+        );
+        assert_eq!(gate(&json, GATE_UID), AgentStartTableVerdict::Admit);
+    }
+
+    #[test]
+    fn tb5_the_gate_refuses_every_other_binding_set() {
+        let marker = fixture_marker();
+        let cases: Vec<(&str, String)> = vec![
+            ("the empty set", owned_table_with_bindings(&marker, &[])),
+            (
+                // Kills a verdict that derives the expected uid from the
+                // listing (self-compare): this table is self-consistent for V.
+                "{(uid-V, V)} started as U",
+                owned_table_with_bindings(
+                    &marker,
+                    &[(&confined_agent_id(GATE_OTHER_UID), GATE_OTHER_UID)],
+                ),
+            ),
+            (
+                // Kills a superset test.
+                "two chains for U",
+                owned_table_with_bindings(
+                    &marker,
+                    &[
+                        (&confined_agent_id(GATE_UID), GATE_UID),
+                        ("shadow", GATE_UID),
+                    ],
+                ),
+            ),
+            (
+                // Kills a uid-only comparison: the frozen parser verifies this.
+                "a foreign agent id bound to U",
+                owned_table_with_bindings(&marker, &[("shadow", GATE_UID)]),
+            ),
+        ];
+        for (name, json) in cases {
+            assert!(
+                matches!(
+                    gate(&json, GATE_UID),
+                    AgentStartTableVerdict::RefuseBindingSet(_)
+                ),
+                "{name} must refuse with RefuseBindingSet, got {:?}",
+                gate(&json, GATE_UID)
+            );
+        }
+    }
+
+    #[test]
+    fn tb5_the_gate_refuses_the_net_unparseable_output_and_a_foreign_seal_as_not_owned() {
+        let cases: Vec<(&str, String)> = vec![
+            // Kills a gate that accepts the net: neither net shape carries the
+            // ownership marker, so phase one refuses it.
+            ("the host-wide deny-all net", v1_host_wide_listing()),
+            (
+                "the identity deny-all net naming U",
+                v2_identity_listing(&[GATE_UID], &[GATE_UID]),
+            ),
+            ("unparseable output", "not json at all".to_string()),
+        ];
+        for (name, json) in cases {
+            assert!(
+                matches!(
+                    gate(&json, GATE_UID),
+                    AgentStartTableVerdict::RefuseNotOwnedShape(_)
+                ),
+                "{name} must refuse with RefuseNotOwnedShape, got {:?}",
+                gate(&json, GATE_UID)
+            );
+        }
+        // A binding sealed under this fixture fortress does not verify under
+        // another: the seal's fortress id is the caller's, never the dump's.
+        let json = owned_table_with_bindings(
+            &fixture_marker(),
+            &[(&confined_agent_id(GATE_UID), GATE_UID)],
+        );
+        assert!(matches!(
+            agent_start_gate_verdict(&json, "another-fortress", GATE_UID),
+            AgentStartTableVerdict::RefuseNotOwnedShape(_)
+        ));
+    }
+
+    #[test]
+    fn tb5_the_wall_and_the_gate_share_one_set_rule_verdict() {
+        // The same inventory reaches the same set-rule answer through both
+        // consumers (the wall's adds only the ownership-handle equality).
+        let marker = fixture_marker();
+        for bindings in [
+            vec![(confined_agent_id(GATE_UID), GATE_UID)],
+            vec![("shadow".to_string(), GATE_UID)],
+            vec![],
+        ] {
+            let refs: Vec<(&str, u32)> = bindings.iter().map(|(a, u)| (a.as_str(), *u)).collect();
+            let json = owned_table_with_bindings(&marker, &refs);
+            let wall = owned_table_binding_set_from_json(
+                &json,
+                &fixture_ownership(&marker),
+                &confined(GATE_UID),
+            )
+            .expect("owned shape");
+            let admitted = gate(&json, GATE_UID) == AgentStartTableVerdict::Admit;
+            assert_eq!(
+                matches!(wall, OwnedBindingSet::Verified(_)),
+                admitted,
+                "wall and gate disagree for {bindings:?}"
+            );
         }
     }
 

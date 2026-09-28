@@ -2651,3 +2651,317 @@ fn shutdown_observed_at_pre_recovery_still_installs_the_net_w1b() {
     cleanup_castle_table();
     cleanup_journal();
 }
+
+// --- TB9 (slice B): the agent unit's two verbs, run as the REAL binary against
+// a real daemon boot whose isolated table admits TEST_AGENT_UID. Capability:
+// the kernel gate admits only the uid the live owned table binds, refuses the
+// trusted control uid, a missing binding and the deny-all net; the credential
+// check matches only the exact instance credentials. Register ids:
+// `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`,
+// `LINUX-AGENT-TRUSTED-UID-COLLISION-01`. Every assertion names the exit code
+// AND the stderr token, because a binary without the verbs exits 2 (usage)
+// and a code alone could read that as a refusal.
+
+/// A second provisioned-looking agent uid: admission-clean, not the bound one.
+const TB9_OTHER_UID: u32 = TEST_AGENT_UID + 1;
+/// A trusted service uid distinct from both agent uids.
+const TB9_TRUSTED_UID: u32 = TEST_AGENT_UID + 2;
+/// Exit code of a named refusal. Must match `agent_start::EXIT_REFUSED`.
+const TB9_EXIT_REFUSED: i32 = 1;
+/// Exit code of a usage error. Must match `agent_start::EXIT_USAGE`.
+const TB9_EXIT_USAGE: i32 = 64;
+
+/// argv tail that lands a spawned verb on this run's isolated table. Only the
+/// table tag: it is drained before the verb route, so the verb's own argv stays
+/// exact. (`--isolated-runtime-root` and `--trusted-service-uid` from
+/// `isolation_args()` are daemon flags and would make it a usage error.)
+fn tb9_isolated_table_tail() -> [String; 2] {
+    let args = isolation_args();
+    let at = args
+        .iter()
+        .position(|a| a == "--isolated-castle-table-tag")
+        .expect("isolation carries a table tag");
+    [args[at].clone(), args[at + 1].clone()]
+}
+
+fn tb9_gate(uid: u32, trusted: u32, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .args([
+            "--agent-start-gate",
+            &uid.to_string(),
+            "--fortress-id",
+            "deadbeef",
+            "--trusted-service-uid",
+            &trusted.to_string(),
+        ])
+        .args(extra)
+        .args(tb9_isolated_table_tail())
+        .output()
+        .expect("run the agent start gate")
+}
+
+fn tb9_assert(out: &std::process::Output, code: i32, stream_token: &str, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{what}: exit code; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains(stream_token) || stderr.contains(stream_token),
+        "{what}: expected token {stream_token:?}; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+/// Delete the isolated agent chain for `uid` and its output jump, leaving the
+/// owned table otherwise intact: the L-A2 binding-loss fault.
+fn tb9_delete_agent_chain(uid: u32) {
+    let table = nftables::castle_table();
+    let listing = Command::new("nft")
+        .args(["-a", "-j", "list", "table", CASTLE_FAMILY, table])
+        .output()
+        .expect("list the isolated table");
+    let doc: serde_json::Value = serde_json::from_slice(&listing.stdout).expect("nft JSON listing");
+    let items = doc["nftables"].as_array().expect("nftables array");
+    let suffix = format!(":agent:{}", nftables::confined_agent_id(uid));
+    let chain = items
+        .iter()
+        .filter_map(|i| i.get("chain"))
+        .find(|c| c["comment"].as_str().is_some_and(|m| m.ends_with(&suffix)))
+        .and_then(|c| c["name"].as_str())
+        .expect("the agent chain for the bound uid")
+        .to_string();
+    let jump = items
+        .iter()
+        .filter_map(|i| i.get("rule"))
+        .find(|r| {
+            r["chain"] == "output"
+                && r["expr"].as_array().is_some_and(|e| {
+                    e.iter()
+                        .any(|x| x["goto"]["target"].as_str() == Some(chain.as_str()))
+                })
+        })
+        .and_then(|r| r["handle"].as_u64())
+        .expect("the output jump to the agent chain");
+    for argv in [
+        vec![
+            "delete".to_string(),
+            "rule".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            "output".to_string(),
+            "handle".to_string(),
+            jump.to_string(),
+        ],
+        vec![
+            "flush".to_string(),
+            "chain".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            chain.clone(),
+        ],
+        vec![
+            "delete".to_string(),
+            "chain".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            chain.clone(),
+        ],
+    ] {
+        let out = Command::new("nft").args(&argv).output().expect("run nft");
+        assert!(
+            out.status.success(),
+            "nft {argv:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A 0755 copy of the test binary, so a non-root uid can execute it whatever
+/// the build directory's own modes are (a runner home can be 0750).
+fn tb9_world_executable_binary(dir: &TempDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("0755 scratch dir");
+    let copy = dir.path().join("castle-wall-daemon");
+    std::fs::copy(env!("CARGO_BIN_EXE_castle-wall-daemon"), &copy).expect("copy the binary");
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).expect("0755 binary");
+    copy
+}
+
+fn tb9_credential_check(binary: &Path, setpriv: Option<&[&str]>) -> std::process::Output {
+    let uid = TEST_AGENT_UID.to_string();
+    let mut command = match setpriv {
+        Some(flags) => {
+            let mut c = Command::new("setpriv");
+            c.args(flags).arg("--").arg(binary);
+            c
+        }
+        None => Command::new(binary),
+    };
+    command
+        .args(["--agent-credential-check", &uid])
+        .output()
+        .expect("run the credential check")
+}
+
+/// Reaps the spawned daemon and removes the isolated table and journal on
+/// EVERY exit path, including a failed assertion. Without it a failing TB9
+/// orphans a live daemon holding the isolated table, the host lock and the
+/// test's stdout pipe, and every later run on the host inherits them.
+struct Tb9Daemon(Child);
+
+impl Drop for Tb9Daemon {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+        cleanup_castle_table();
+        cleanup_journal();
+    }
+}
+
+#[test]
+fn tb9_the_real_verbs_admit_only_the_bound_uid_and_refuse_by_name() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+    let notify_path = dir.path().join("notify-tb9.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // No second periodic health tick inside this test: the binding-loss case
+    // must be read by the gate BEFORE the wall's own health pass installs the
+    // net, and the net case is then produced by the stop-time final pass.
+    const NO_SECOND_TICK_MS: &str = "600000";
+    let mut daemon = Tb9Daemon(spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &["--test-health-interval-ms", NO_SECOND_TICK_MS],
+    ));
+    // READY=1 follows the pinned readback line (A4), so every gate below runs
+    // after the binding was read back from the kernel.
+    if let Err(reason) = wait_for_ready(&mut daemon.0, &listener, Duration::from_secs(10)) {
+        drop(daemon);
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    let admit = format!("agent_start_gate=admit uid={TEST_AGENT_UID}");
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        0,
+        &admit,
+        "gate for U",
+    );
+    tb9_assert(
+        &tb9_gate(TB9_OTHER_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseBindingSet",
+        "gate for V",
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TEST_AGENT_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseTrustedUidCollision",
+        "gate for U with trusted uid U",
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &["--disarm"]),
+        TB9_EXIT_USAGE,
+        "agent verb usage error",
+        "gate with a smuggled --disarm",
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "a smuggled --disarm must leave the isolated owned table in place"
+    );
+
+    // The credential self-check, as the agent uid through setpriv.
+    let scratch = TempDir::new().unwrap();
+    let binary = tb9_world_executable_binary(&scratch);
+    let reuid = format!("--reuid={TEST_AGENT_UID}");
+    let regid = format!("--regid={TEST_AGENT_UID}");
+    let extra_group = format!("--groups={TB9_OTHER_UID}");
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[
+                &reuid,
+                &regid,
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+            ]),
+        ),
+        0,
+        &format!("agent_credential_check=match uid={TEST_AGENT_UID}"),
+        "credential check as U",
+    );
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[&reuid, &regid, "--clear-groups", "--bounding-set=-all"]),
+        ),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseNoNewPrivs",
+        "credential check without no-new-privs",
+    );
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[
+                &reuid,
+                &regid,
+                &extra_group,
+                "--no-new-privs",
+                "--bounding-set=-all",
+            ]),
+        ),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseGroups",
+        "credential check with an extra group",
+    );
+    tb9_assert(
+        &tb9_credential_check(&binary, None),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseUid",
+        "credential check as root",
+    );
+
+    // The binding-loss fault: the owned table survives, the binding does not.
+    tb9_delete_agent_chain(TEST_AGENT_UID);
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseBindingSet",
+        "gate for U after the agent chain was deleted",
+    );
+
+    // The daemon's stop-time final health pass proves the loss and installs
+    // the net naming U; the gate then refuses the net as not the owned shape.
+    let pid = daemon.0.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let status = wait_for_exit(&mut daemon.0, Duration::from_secs(15));
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the stop-time pass must have installed the net naming U (daemon exit {status:?})"
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseNotOwnedShape",
+        "gate for U against the deny-all net",
+    );
+    // `daemon` drops here: the child has exited, and the table and journal go.
+}
