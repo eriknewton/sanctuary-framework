@@ -836,6 +836,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         // temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     };
 
     let handle = boot(config).expect("daemon boot");

@@ -8,6 +8,8 @@
 //! later checkpoints; this module is the orchestration spine they hang off.
 
 use std::path::PathBuf;
+#[cfg(feature = "test-isolation")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -155,21 +157,25 @@ pub const WATCHDOG_SEC: u32 = WATCHDOG_DECIDED_EXIT_BOUND
     .as_millis()
     .div_ceil(MILLIS_PER_SEC as u128) as u32;
 
-/// `WATCHDOG_SEC` in milliseconds, for the inequalities below.
-const WATCHDOG_MS: u128 = WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128;
-
+// The inequalities, in milliseconds; `WATCHDOG_SEC` is scaled inline in each
+// (a named const used only by `const _` assertions reads as dead code to the
+// MSRV compiler).
 // I1: the watchdog is never the tighter bound on a manager stop.
 const _: () = assert!(WATCHDOG_SEC > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS);
 // I2: a decision inside the decision-gap bound exits by the guard's code before
 // the watchdog's SIGKILL.
-const _: () = assert!(WATCHDOG_MS >= WATCHDOG_DECIDED_EXIT_BOUND.as_millis());
+const _: () = assert!(
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) >= WATCHDOG_DECIDED_EXIT_BOUND.as_millis()
+);
 // I3: at least two pets per watchdog interval (the sd_watchdog_enabled(3) rule).
-const _: () = assert!(WATCHDOG_MS >= 2 * WATCHDOG_PET_GAP_BOUND.as_millis());
+const _: () = assert!(
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) >= 2 * WATCHDOG_PET_GAP_BOUND.as_millis()
+);
 // I7: a manager stop of a healthy daemon lands at most one pet gap after a pet,
 // so even a watchdog systemd kept running through the stop fires only after
 // TimeoutStopSec has ended the stop.
 const _: () = assert!(
-    WATCHDOG_MS - WATCHDOG_PET_GAP_BOUND.as_millis()
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) - WATCHDOG_PET_GAP_BOUND.as_millis()
         > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS as u128 * MILLIS_PER_SEC as u128
 );
 
@@ -416,6 +422,20 @@ pub struct DaemonHandle {
     /// wedged stop path. Must match `--test-hang-teardown` in `main.rs`.
     #[cfg(feature = "test-isolation")]
     test_hang_teardown: AtomicBool,
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01). Zero is disarmed.
+    /// Set by `arm_test_wedge_health_pass_after`; after this many completed
+    /// health passes (the initial pass counts as one) the supervisor's next pass
+    /// parks forever right after `last_health` is reset, holding no lock, so no
+    /// liveness pet can follow and a subprocess test can prove the pet stops.
+    /// Must match `--test-wedge-health-pass-after` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    test_wedge_health_pass_after: AtomicU32,
+    /// The systemd liveness-watchdog beacon (C2a3). Required, never an
+    /// `Option`: whether it sends is decided by the `sd_watchdog_enabled(3)`
+    /// environment contract inside the beacon, so an unconfigured beacon is a
+    /// silent no-op only when no manager asked for pets. Petted from exactly one
+    /// site, in `supervise_until_shutdown_body`.
+    watchdog: crate::systemd_notify::WatchdogBeacon,
     started_at: Instant,
 }
 
@@ -838,6 +858,13 @@ impl DaemonHandle {
         if let RuntimeHealthState::Recovering(reason) = initial_health {
             self.record_runtime_loss(reason, true);
         }
+        // S_RUN_PASS_DONE: the initial pass above reached `Continue`, so it owes
+        // one liveness pet at the loop top below.
+        let mut completed_health_pass = true;
+        // TEST-ISOLATION ONLY: completed passes, counted for the wedge seam; the
+        // initial pass is the first. Must match `test_wedge_health_pass_after`.
+        #[cfg(feature = "test-isolation")]
+        let mut completed_passes: u32 = 1;
         loop {
             // Fatal wins over normal shutdown even when the IPC handler sets
             // both atomics before this thread is scheduled.
@@ -849,6 +876,22 @@ impl DaemonHandle {
                 // not exit 0 ahead of a final health pass, or a proven loss racing this
                 // stop leaves the confined identity with no table and no net.
                 return self.stop_final_health_outcome();
+            }
+            // S_RUN_PASS_DONE -> S_RUN_TICK (the one liveness pet, C2a3).
+            // INVARIANT: the liveness pet certifies that THIS thread finished one
+            // bounded health pass and is about to loop again. It is sent only here,
+            // after the fatal and stop checks, so no pet follows a terminal decision
+            // or a stop request, and never from a helper thread, which could keep a
+            // wedged supervisor looking alive while a lost table goes un-re-armed
+            // (R1). It certifies liveness, not health: the arms below act on what
+            // the pass observed. A stop that lands between the check above and this
+            // line lets one pet through (LINUX-WD-POSTSTOP-PET-01); harmless,
+            // because a pet only moves the watchdog's deadline later and the stop
+            // guard never re-arms. Must match WATCHDOG_SEC in this file and
+            // WatchdogSec= in systemd/sanctuary-castle-wall.service.
+            if completed_health_pass {
+                self.watchdog.pet();
+                completed_health_pass = false;
             }
             std::thread::sleep(tick);
             if self.is_fatal_control_path_requested() {
@@ -863,7 +906,20 @@ impl DaemonHandle {
                 buf.evict_expired(std::time::SystemTime::now());
             }
             if last_health.elapsed() >= health_interval {
+                // S_RUN_TICK -> S_RUN_PASS: a health pass is in flight; no pet.
                 last_health = Instant::now();
+                // TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01): park this pass
+                // forever, holding no lock, so no pet can follow. Must match
+                // `--test-wedge-health-pass-after` in `main.rs`.
+                #[cfg(feature = "test-isolation")]
+                {
+                    let wedge_after = self.test_wedge_health_pass_after.load(Ordering::SeqCst);
+                    if wedge_after > 0 && completed_passes >= wedge_after {
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }
                 let (previous_health, previous_tag) = match self
                     .runtime_health
                     .supervisor_snapshot()
@@ -990,6 +1046,14 @@ impl DaemonHandle {
                         self.record_runtime_loss(reason, false);
                         return outcome;
                     }
+                }
+                // S_RUN_PASS -> S_RUN_PASS_DONE: reached only through the arms that
+                // do not return (Ready/NoRuntime, ProbeUnavailable under budget,
+                // Recovering). The pet it owes is sent at the loop top.
+                completed_health_pass = true;
+                #[cfg(feature = "test-isolation")]
+                {
+                    completed_passes = completed_passes.saturating_add(1);
                 }
             }
         }
@@ -1236,6 +1300,16 @@ impl DaemonHandle {
     #[cfg(feature = "test-isolation")]
     pub fn arm_test_hang_teardown(&self) {
         self.test_hang_teardown.store(true, Ordering::SeqCst);
+    }
+
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01): arm the supervisor
+    /// wedge documented on the `test_wedge_health_pass_after` field. `passes`
+    /// must be at least one. Absent from release builds; must match the CLI
+    /// seam name `--test-wedge-health-pass-after` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    pub fn arm_test_wedge_health_pass_after(&self, passes: u32) {
+        self.test_wedge_health_pass_after
+            .store(passes, Ordering::SeqCst);
     }
 
     /// Test-only: attach an enforcement runtime so the readiness derivation can
@@ -1774,6 +1848,14 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // silent no-op. If a CONFIGURED `NOTIFY_SOCKET` is present but delivery
     // FAILS, we must NOT leave a false-started long-running process: unwind
     // enforcement-before-IPC and fail closed so systemd restarts promptly.
+    // TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01, harness leg HW3): hold
+    // the boot here, before READY=1, to show the watchdog is inactive while the
+    // unit is still activating. Must match `--test-delay-before-ready-ms` in
+    // `main.rs`, which sets it on `config` before `boot` runs.
+    #[cfg(feature = "test-isolation")]
+    if let Some(ms) = config.test_delay_before_ready_ms {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let readiness = signal_systemd_readiness(enforcement.as_ref());
     if let Err(err) = readiness {
         mutation_cancel_flag.store(true, Ordering::SeqCst);
@@ -1784,6 +1866,23 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         }
         ipc_server.stop_and_join();
         return Err(err);
+    }
+
+    // The liveness-watchdog beacon (C2a3), built once, beside READY=1. Its pets
+    // come only from the supervisor's one pet site, which runs after `boot`
+    // returns, so on a ready boot READY=1 precedes every pet.
+    let watchdog = crate::systemd_notify::WatchdogBeacon::from_env();
+    if let Some(line) = crate::systemd_notify::watchdog_boot_diagnostic(
+        watchdog.notify_configured(),
+        watchdog.watchdog_usec(),
+        WATCHDOG_PET_GAP_BOUND,
+        WATCHDOG_DECIDED_EXIT_BOUND,
+        WATCHDOG_SEC,
+    ) {
+        // SAFETY: stderr is the boot-time diagnostic channel (systemd journals
+        // it). A host that disabled or resized the watchdog is told what that
+        // costs; this is never a refusal.
+        eprintln!("{line}");
     }
 
     let enforcement = enforcement.map(|runtime| Arc::new(Mutex::new(runtime)));
@@ -1832,6 +1931,9 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         test_shutdown_at_pre_recovery,
         #[cfg(feature = "test-isolation")]
         test_hang_teardown: AtomicBool::new(false),
+        #[cfg(feature = "test-isolation")]
+        test_wedge_health_pass_after: AtomicU32::new(0),
+        watchdog,
         started_at: Instant::now(),
     })
 }
@@ -3020,6 +3122,8 @@ mod tests {
             linux_runtime_paths: crate::config::LinuxRuntimePaths::isolated_under(dir.path()),
             #[cfg(feature = "test-isolation")]
             test_boot_time_shutdown_requested: false,
+            #[cfg(feature = "test-isolation")]
+            test_delay_before_ready_ms: None,
         };
         (config, signing)
     }

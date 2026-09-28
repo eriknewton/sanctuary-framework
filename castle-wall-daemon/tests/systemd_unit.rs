@@ -579,7 +579,7 @@ fn tu2_watchdog_outlasts_a_manager_stop() {
         watchdog > stop,
         "I1: WatchdogSec {watchdog} > TimeoutStopSec {stop}"
     );
-    assert!(
+    const _: () = assert!(
         castle_wall_daemon::daemon::WATCHDOG_SEC
             > castle_wall_daemon::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS
     );
