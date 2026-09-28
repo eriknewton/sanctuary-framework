@@ -1,4 +1,4 @@
-// fail-before-exempt: STEP1-F1 isolation wiring only: existing tests now pre-claim the SDW owner pin and pass an explicit test agent id so the new CLI owner-pin precheck does not scan the corpus these tests corrupt; the behavior the precheck adds is proven by test/cli/memory-file-owner-pin.test.ts, which fails on the base tree.
+// fail-before-exempt: STEP1-F1/F2 isolation wiring only: existing tests now pre-claim or default the SDW owner pin (for all four CLI verbs: ingest, emit, transcode, transcode_restore) and pass an explicit test agent id so the CLI owner-pin precheck does not scan the corpus these tests corrupt; the behavior the precheck adds is proven by test/cli/memory-file-owner-pin.test.ts, which fails on the base tree.
 /**
  * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI tests.
  *
@@ -71,20 +71,27 @@ const runMemoryIngestCommand: typeof runMemoryIngestCommandProduction = (args) =
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
   });
+// STEP1-F2: memory_emit/transcode/transcode_restore now apply the same
+// owner-pin precheck as memory_ingest (STEP1-F1), so they need the same
+// default wrap-time identity for the same reason (fail-before-exempt note at
+// the top of this file covers this, extended from F1 to F2).
 const runMemoryEmitCommand: typeof runMemoryEmitCommandProduction = (args) =>
   runMemoryEmitCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+    env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
   });
 const runMemoryTranscodeCommand: typeof runMemoryTranscodeCommandProduction = (args) =>
   runMemoryTranscodeCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+    env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
   });
 const runMemoryTranscodeRestoreCommand: typeof runMemoryTranscodeRestoreCommandProduction = (args) =>
   runMemoryTranscodeRestoreCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+    env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
   });
 
 function makeSink(): { stream: Writable; text: () => string } {
@@ -414,7 +421,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
       out: makeSink().stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: () => ({
         status: 0,
         signal: null,
@@ -608,7 +615,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       ],
       out: makeSink().stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: () => ({ status: 0, signal: null, stdout: Buffer.from("deny\n") }),
     })).toBe(1);
     expect(await readdir(projection)).toEqual([]);
@@ -646,7 +653,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
       out: makeSink().stream,
       err: err.stream,
-      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: TEST_AGENT_ID },
       dialogRunner: () => ({ status: 0, signal: null, stdout: Buffer.from("deny\n") }),
     })).toBe(1);
     expect(await readdir(restored)).toEqual([]);

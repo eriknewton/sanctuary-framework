@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture update only; supplies a wrapped agent id so the test still reaches the fortress-internal primary-identity-unavailable refusal after the shared pre-bootstrap identity check landed (STEP1-F2); its assertions are unchanged and it witnesses nothing new
 /**
  * L2 (Grok re-gate residual): a `writeIntent` memory unlock acquires the shared
  * master-rotation barrier BEFORE the unlock and transfers it to the caller ONLY
@@ -113,7 +114,15 @@ describe.skipIf(!supported)(
         argv: ["--harness", "claude-code", "--dir", join(fortressPath, "out"), "--fortress", fortressPath],
         out: out.stream,
         err: err.stream,
-        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+        // STEP1-F2 fix round 1: runMemoryEmitCommand now refuses a missing
+        // SANCTUARY_AGENT_ID before bootstrap ever runs (same pre-bootstrap
+        // gate memory_ingest already applied), which would otherwise short
+        // circuit this test before it ever reaches the bootstrap path this
+        // test targets. Supply one so the run proceeds into bootstrap and
+        // exercises the SAME identity-unavailable early return the barrier
+        // fix is about (a missing PRIMARY IDENTITY inside the fortress, a
+        // different thing from a missing wrap-time SANCTUARY_AGENT_ID).
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: "claude_code:l2-identity-unavailable-test" },
         dialogRunner: APPROVE_DIALOG,
       });
 
