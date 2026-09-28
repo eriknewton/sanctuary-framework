@@ -162,6 +162,11 @@ jobs:
 
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
+        # 20 = about 6x the longest observed run of this step (165 to 188 s over
+        # the last seven runs, 2026-09-27), leaving room for a cold-cache rebuild.
+        # Without a bound a hung or OOM-thrashing suite holds the job to the
+        # 360-minute default and the leftover-state refusal below never runs.
+        timeout-minutes: 20
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
@@ -277,10 +282,29 @@ jobs:
             echo "FAIL: Castle Wall kernel state survived the test run; the ruleset was:"
             printf '%s\n' "$ruleset"
             # Remove it now so the evidence upload below can still reach the
-            # network and the failure is diagnosable; the step still fails.
-            for t in $(sudo nft list tables | awk '$3 ~ /^sanctuary-castle/ {print $2 " " $3}' | tr ' ' ':'); do
-              sudo nft delete table "${t%%:*}" "${t#*:}" || true
+            # network and the failure is diagnosable; the step fails either way.
+            # Each delete is checked and retried once after 1 s (a delete of a
+            # table another netlink transaction is still touching fails
+            # transiently; those finish in milliseconds, so one second is far
+            # past one). A delete that fails twice is reported STILL PRESENT and
+            # the step never claims a cleanup it did not do.
+            still_present=0
+            for t in $(sudo nft list tables | awk '$3 ~ /^sanctuary-castle/ {print $2 ":" $3}'); do
+              fam="${t%%:*}"; name="${t#*:}"
+              if ! sudo nft delete table "$fam" "$name"; then
+                sleep 1
+                if ! sudo nft delete table "$fam" "$name"; then
+                  echo "FAIL: table $fam $name is STILL PRESENT after two deletes"
+                  still_present=1
+                fi
+              fi
             done
+            if [ "$still_present" -ne 0 ]; then
+              echo "FAIL: Castle Wall kernel state could NOT be removed; the upload below will likely fail with EAI_AGAIN. The ruleset now:"
+              sudo nft list ruleset
+            else
+              echo "the leftover tables were removed; the job still fails because a test left them"
+            fi
             exit 1
           fi
           echo "no Castle Wall kernel state left after the tests"

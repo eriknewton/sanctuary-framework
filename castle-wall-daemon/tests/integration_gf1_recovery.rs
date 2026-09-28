@@ -2174,38 +2174,121 @@ fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it()
 // Runner hygiene: the isolation teardown REFUSES a kernel table named for this run
 // that survives its sweep, rather than sweeping it silently, and removes it while
 // refusing so the failure does not also cut the network for every later step (see
-// `isolation::SuiteGuard` for the failure mode this guards). The leak here is an
-// empty table with no chain, so it filters nothing even if this test aborts.
+// `isolation::SuiteGuard` for the failure mode this guards). This drives the REAL
+// `Drop` over the real failure shape: the isolated table AND a `-leak` table beside
+// it, each carrying the deny-all net's `policy drop` output hook.
 #[test]
 fn the_isolation_teardown_refuses_a_table_left_behind_for_this_run() {
-    let _suite = isolation::guard();
+    let outer = isolation::guard();
     if !nft_available() {
         skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
         return;
     }
-    let leaked = format!("{}-leak", isolation::table());
-    let added = Command::new("nft")
-        .args(["add", "table", CASTLE_FAMILY, &leaked])
-        .output()
-        .expect("run nft add table");
-    assert!(added.status.success(), "plant the leaked table");
+    let table = isolation::table().to_string();
+    let leaked = format!("{table}-leak");
+    // Declared after `outer`, so it drops FIRST, on success and on any panic below:
+    // this witness plants `policy drop` hooks and must leave none behind even when
+    // the teardown under test is broken. `outer`'s own teardown then runs as well.
+    let _scrub = PlantedTables(vec![table.clone(), leaked.clone()]);
+    for name in [&table, &leaked] {
+        let added = Command::new("nft")
+            .args(["add", "table", CASTLE_FAMILY, name])
+            .output()
+            .expect("run nft add table");
+        assert!(added.status.success(), "plant table {name}");
+        let chain = Command::new("nft")
+            .args([
+                "add",
+                "chain",
+                CASTLE_FAMILY,
+                name,
+                "output",
+                "{ type filter hook output priority filter ; policy drop ; }",
+            ])
+            .output()
+            .expect("run nft add chain");
+        assert!(
+            chain.status.success(),
+            "plant the policy-drop output hook on {name}: {}",
+            String::from_utf8_lossy(&chain.stderr)
+        );
+    }
+    assert!(
+        !loopback_round_trip(),
+        "the planted hooks are the real failure shape: they cut loopback traffic"
+    );
 
-    let report = isolation::leftover_kernel_state()
-        .expect_err("a table named for this run must be refused, never swept silently");
+    // The same `Drop` every test runs, while `outer` still holds the suite lock so
+    // no other test can recreate the isolated table before the checks below.
+    let nested = isolation::nested_teardown(&outer);
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(nested)));
+    let payload =
+        dropped.expect_err("the teardown must refuse a leftover, never sweep it silently");
+    let report = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
     assert!(
         report.contains(&leaked),
         "the refusal names the leftover table: {report}"
+    );
+    assert!(
+        !report.contains("STILL PRESENT"),
+        "every planted table was removed: {report}"
     );
     let tables = Command::new("nft")
         .args(["list", "tables"])
         .output()
         .expect("run nft list tables");
+    let listing = String::from_utf8_lossy(&tables.stdout).into_owned();
     assert!(
-        !String::from_utf8_lossy(&tables.stdout).contains(&leaked),
-        "the refusal removed the leftover so the runner keeps its network"
+        tables.status.success()
+            && !listing
+                .lines()
+                .any(|line| line.ends_with(&format!(" {table}"))
+                    || line.ends_with(&format!(" {leaked}"))),
+        "neither planted table survives the teardown: {listing}"
     );
     assert!(
-        isolation::leftover_kernel_state().is_ok(),
-        "nothing named for this run remains after the refusal"
+        loopback_round_trip(),
+        "loopback traffic flows again once the teardown has run"
     );
+}
+
+/// Tables this witness planted, removed on drop whatever the test's outcome.
+struct PlantedTables(Vec<String>);
+
+impl Drop for PlantedTables {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            if let Err(still_present) = isolation::delete_table(CASTLE_FAMILY, name) {
+                eprintln!("witness scrub: {still_present}");
+            }
+        }
+    }
+}
+
+/// Wait for a loopback datagram. Loopback delivery takes well under a millisecond;
+/// 500 ms is the bound past which a `policy drop` output hook is the explanation,
+/// not scheduling.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether one UDP datagram crosses 127.0.0.1. A `policy drop` hook on the inet
+/// output chain drops locally generated loopback packets too, so this reads the
+/// same cut the runner's DNS suffers without depending on any external resolver.
+fn loopback_round_trip() -> bool {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback receiver");
+    receiver
+        .set_read_timeout(Some(LOOPBACK_PROBE_TIMEOUT))
+        .expect("set the probe timeout");
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback sender");
+    let target = receiver.local_addr().expect("receiver address");
+    const PROBE: &[u8] = b"probe";
+    // An output-hook drop can surface as EPERM on the send itself.
+    if sender.send_to(PROBE, target).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; PROBE.len()];
+    matches!(receiver.recv_from(&mut buf), Ok((n, _)) if n == PROBE.len())
 }

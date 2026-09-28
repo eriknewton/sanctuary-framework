@@ -92,6 +92,23 @@ pub fn write_ahead_receipt_for(
 }
 
 pub fn guard() -> SuiteGuard {
+    SuiteGuard {
+        _lock: Some(enter()),
+    }
+}
+
+/// A second teardown for the witness that proves [`SuiteGuard`]'s `Drop` refuses a
+/// leftover: the SAME `Drop` impl every test runs, holding no lock of its own.
+///
+/// Taking `&SuiteGuard` is the proof the caller already holds the suite lock, so
+/// the witness can drop this one, then inspect the kernel before any other test
+/// in the binary can start and recreate the isolated table. Taking the lock again
+/// here instead would deadlock, since `SUITE_LOCK` is not re-entrant.
+pub fn nested_teardown(_held: &SuiteGuard) -> SuiteGuard {
+    SuiteGuard { _lock: None }
+}
+
+fn enter() -> MutexGuard<'static, ()> {
     let lock = SUITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let iso = isolated();
     assert!(
@@ -138,7 +155,7 @@ pub fn guard() -> SuiteGuard {
     let _ = std::process::Command::new("nft")
         .args(["delete", "table", nftables::CASTLE_FAMILY, iso.table])
         .output();
-    SuiteGuard { _lock: lock }
+    lock
 }
 
 /// The suite lock plus the end-of-test teardown of this run's kernel state.
@@ -158,13 +175,14 @@ pub fn guard() -> SuiteGuard {
 pub struct SuiteGuard {
     /// Fields drop only after `Drop::drop` returns, so the lock is still held
     /// while the teardown sweeps: the next test cannot start against a table this
-    /// one still owns.
-    _lock: MutexGuard<'static, ()>,
+    /// one still owns. `None` only for [`nested_teardown`], whose caller holds it.
+    _lock: Option<MutexGuard<'static, ()>>,
 }
 
 impl Drop for SuiteGuard {
     fn drop(&mut self) {
         let iso = isolated();
+        let mut failures = Vec::new();
         // The net goes in `castle_table()` (src/nftables.rs
         // `install_deny_all_safety_net`), which this run pinned to `iso.table`
         // through `use_isolated_castle_table`, so deleting that one name removes
@@ -172,23 +190,82 @@ impl Drop for SuiteGuard {
         // `castle_table()` resolves in src/nftables.rs; `guard` asserts the
         // production name is never resolved, so this never names the operator's
         // table.
-        let _ = std::process::Command::new("nft")
-            .args(["delete", "table", nftables::CASTLE_FAMILY, iso.table])
-            .output();
+        if let Err(still_present) = delete_table(nftables::CASTLE_FAMILY, iso.table) {
+            failures.push(still_present);
+        }
         // A leftover after the sweep is a TEST FAILURE, never a second silent
         // sweep: a table the sweep could not remove, or one named for this run
         // that the sweep does not own, is exactly the state that took the
         // runner's DNS down, and it must name itself where it happened.
         if let Err(report) = leftover_kernel_state() {
-            if std::thread::panicking() {
-                // A second panic during an unwind aborts the process and loses the
-                // original failure; report beside it instead.
-                eprintln!("{report}");
-            } else {
-                panic!("{report}");
-            }
+            failures.push(report);
+        }
+        if failures.is_empty() {
+            return;
+        }
+        let report = failures.join("\n");
+        if std::thread::panicking() {
+            // A second panic during an unwind aborts the process and loses the
+            // original failure, so report beside it instead, loudly enough that a
+            // table left STILL PRESENT is not read as a side note to that failure.
+            eprintln!(
+                "\n!!!!!!!! ISOLATION TEARDOWN FAILED DURING AN UNWIND !!!!!!!!\n{report}\n\
+                 !!!!!!!! (the test's own panic is reported separately) !!!!!!!!\n"
+            );
+        } else {
+            panic!("{report}");
         }
     }
+}
+
+/// Spacing before the one retry of a failed `nft delete table`. A delete of a
+/// table that exists fails transiently when another netlink transaction on it
+/// (a daemon child's last commit, or its teardown) has not finished; those
+/// transactions complete in milliseconds (the gf1 binary runs its 30 tests, each
+/// with several `nft` transactions, in about 10 s of wall clock), so 250 ms is
+/// more than an order of magnitude above one of them. One retry only: a delete
+/// that fails twice across that gap is a real refusal, not a race.
+const DELETE_RETRY_SPACING: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether `<family> <name>` is in the kernel. Unreadable counts as absent here
+/// only because the callers treat an unreadable ruleset separately
+/// ([`leftover_kernel_state`] fails closed on it under the privileged contract).
+fn table_present(family: &str, name: &str) -> bool {
+    std::process::Command::new("nft")
+        .args(["list", "table", family, name])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Delete `<family> <name>`, checking the result: `Ok` when the table is gone
+/// (deleted now, or already absent), `Err` naming it STILL PRESENT with nft's
+/// stderr after one retry. Never reports a delete it could not confirm.
+pub fn delete_table(family: &str, name: &str) -> Result<(), String> {
+    let attempt = || {
+        std::process::Command::new("nft")
+            .args(["delete", "table", family, name])
+            .output()
+    };
+    let first = attempt();
+    if matches!(&first, Ok(out) if out.status.success()) || !table_present(family, name) {
+        return Ok(());
+    }
+    std::thread::sleep(DELETE_RETRY_SPACING);
+    let second = attempt();
+    if matches!(&second, Ok(out) if out.status.success()) || !table_present(family, name) {
+        return Ok(());
+    }
+    let stderr = |r: &std::io::Result<std::process::Output>| match r {
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        Err(err) => format!("nft could not run: {err}"),
+    };
+    Err(format!(
+        "table {family} {name} is STILL PRESENT after two `nft delete table` attempts \
+         {DELETE_RETRY_SPACING:?} apart; first: `{}`; second: `{}`",
+        stderr(&first),
+        stderr(&second)
+    ))
 }
 
 /// Must match `EXPECT_PRIVILEGED_ENV` in the privileged suites and the
@@ -257,15 +334,26 @@ pub fn leftover_kernel_state() -> Result<(), String> {
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_else(|err| format!("<`nft list ruleset` failed: {err}>"));
-    for (family, name) in &leftovers {
-        let _ = std::process::Command::new("nft")
-            .args(["delete", "table", family, name])
-            .output();
-    }
+    // Remove each leftover so a failed test does not also cut the network for
+    // every later step, and say which removals did NOT happen: a table reported
+    // as removed while still in the kernel is the silent shape this check exists
+    // to end.
+    let still_present: Vec<String> = leftovers
+        .iter()
+        .filter_map(|(family, name)| delete_table(family, name).err())
+        .collect();
+    let disposition = if still_present.is_empty() {
+        "all removed now so later steps keep their network".to_string()
+    } else {
+        format!(
+            "NOT all removed; the runner's network may still be cut:\n{}",
+            still_present.join("\n")
+        )
+    };
     Err(format!(
         "leftover kernel state after the isolation teardown: {leftovers:?} survived the \
-         sweep of `{table}` (deleted now so later steps keep their network). A test left \
-         kernel state behind; the ruleset at teardown was:\n{ruleset}"
+         sweep of `{table}` ({disposition}). A test left kernel state behind; the ruleset \
+         at teardown was:\n{ruleset}"
     ))
 }
 
