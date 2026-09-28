@@ -143,6 +143,7 @@ fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
         // (AGENTS rule 5).
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     };
     let handle = boot(cfg).expect("boot daemon");
     BootedDaemon {

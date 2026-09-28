@@ -145,6 +145,15 @@ pub struct DaemonConfig {
     /// path that can pre-arm this.
     #[cfg(feature = "test-isolation")]
     pub test_boot_time_shutdown_requested: bool,
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01, harness leg HW3): when
+    /// set, `boot()` sleeps this many milliseconds immediately before sending
+    /// `READY=1`, to show systemd's watchdog is inactive while the unit is still
+    /// activating. Routed exactly like `test_boot_time_shutdown_requested`: set
+    /// via `--test-delay-before-ready-ms` in `main.rs` after `from_argv` and
+    /// before `daemon::boot`, because the sleep must run inside `boot()`, before
+    /// any handle exists. Compiled out of the shipped binary.
+    #[cfg(feature = "test-isolation")]
+    pub test_delay_before_ready_ms: Option<u64>,
 }
 
 impl DaemonConfig {
@@ -170,6 +179,8 @@ impl DaemonConfig {
             linux_runtime_paths: LinuxRuntimePaths::production(),
             #[cfg(feature = "test-isolation")]
             test_boot_time_shutdown_requested: false,
+            #[cfg(feature = "test-isolation")]
+            test_delay_before_ready_ms: None,
         }
     }
 

@@ -211,6 +211,7 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         // the suite's temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
 }
 
@@ -235,6 +236,7 @@ fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         trusted_service_uid: Some(unsafe { libc::geteuid() }),
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
 }
 
