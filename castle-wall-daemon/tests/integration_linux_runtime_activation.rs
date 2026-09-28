@@ -3159,13 +3159,15 @@ mod tb10_agent_unit_against_real_systemd {
     pub(super) struct Tb10Units {
         pub(super) tag: String,
         dir: Option<TempDir>,
-        pub(super) stop_order: Vec<String>,
+        stop_order: Vec<String>,
         pub(super) files: Vec<PathBuf>,
         pub(super) extra_dirs: Vec<PathBuf>,
         /// Directories a live unit reads (the (ix) wall's policy, key and WAL),
         /// removed only after a settled teardown.
         owned: Vec<TempDir>,
         settled: Option<UnitsSettled>,
+        /// The guarding kernel-state guard's copy of `stop_order`.
+        watched: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         /// `unit_stop_bound()`, computed at construction: it reads the shipped
         /// unit files and may panic, which is allowed here and never in Drop.
         stop_bound: Duration,
@@ -3240,6 +3242,7 @@ mod tb10_agent_unit_against_real_systemd {
                 extra_dirs: Vec::new(),
                 owned: Vec::new(),
                 settled: None,
+                watched: None,
                 stop_bound: unit_stop_bound(),
             }
         }
@@ -3251,7 +3254,19 @@ mod tb10_agent_unit_against_real_systemd {
                 .settled
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             units.settled = Some(std::sync::Arc::clone(&kernel.settled));
+            units.watched = Some(std::sync::Arc::clone(&kernel.units));
             units
+        }
+
+        /// The units to stop, agents first. Also published to the guarding
+        /// kernel-state guard, which re-reads them itself before any sweep.
+        pub(super) fn set_stop_order(&mut self, units: Vec<String>) {
+            if let Some(watched) = &self.watched {
+                if let Ok(mut list) = watched.lock() {
+                    *list = units.clone();
+                }
+            }
+            self.stop_order = units;
         }
 
         /// Hand a directory a live unit reads to the settled teardown.
@@ -3540,7 +3555,7 @@ mod tb10_agent_unit_against_real_systemd {
                      [Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
                 ),
             );
-            units.stop_order = vec![agent.clone(), wall.clone(), holder.clone()];
+            units.set_stop_order(vec![agent.clone(), wall.clone(), holder.clone()]);
             units.reload();
             assert!(
                 systemctl(&["start", &holder]).status.success(),
@@ -3923,6 +3938,9 @@ mod tb10_agent_unit_against_real_systemd {
         /// table and refuses leftovers. Owned here so that sweep runs ONLY when
         /// the units are confirmed settled.
         suite: Option<isolation::SuiteGuard>,
+        /// The units whose liveness gates the sweep, published by
+        /// `Tb10Units::set_stop_order`.
+        units: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl IsolatedKernelState {
@@ -3930,30 +3948,30 @@ mod tb10_agent_unit_against_real_systemd {
             Self {
                 settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 suite: Some(suite),
+                units: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
 
     impl Drop for IsolatedKernelState {
         fn drop(&mut self) {
-            if !self.settled.load(std::sync::atomic::Ordering::SeqCst) {
-                let ruleset = Command::new("nft")
-                    .args(["list", "ruleset"])
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                    .unwrap_or_default();
-                eprintln!(
-                    "TB10 teardown: STILL PRESENT units were not confirmed settled; the \
-                     isolated table {} and journal are LEFT IN PLACE. Live ruleset:\n{ruleset}",
-                    nftables::castle_table()
-                );
-                if let Some(suite) = self.suite.take() {
-                    suite.release_leaving_kernel_state("TB10 units were not confirmed settled");
-                }
+            let Some(suite) = self.suite.take() else {
                 return;
+            };
+            if !self.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                // The units guard did not confirm a settled teardown. Re-read
+                // every unit through the isolation module: only its proof can
+                // skip the sweep, and taking that branch FAILS the test, leaves
+                // the table and poisons the suite. If every unit now reads
+                // settled there is no proof and the normal sweep below runs.
+                let units = self.units.lock().map(|u| u.clone()).unwrap_or_default();
+                if let Some(proof) = isolation::confirm_units_not_settled(&units) {
+                    suite.fail_leaving_kernel_state(proof);
+                    return;
+                }
             }
             // Settled: the suite guard's own sweep and leftover refusal run now.
-            drop(self.suite.take());
+            drop(suite);
         }
     }
 
@@ -4062,7 +4080,7 @@ mod tb10_agent_unit_against_real_systemd {
         units.extra_dirs.push(PathBuf::from(format!(
             "/var/lib/sanctuary-tb10-{tag}-{TEST_AGENT_UID}"
         )));
-        units.stop_order = vec![agent.clone(), wall.clone()];
+        units.set_stop_order(vec![agent.clone(), wall.clone()]);
         units.reload();
 
         let out = systemctl(&["start", &agent]);

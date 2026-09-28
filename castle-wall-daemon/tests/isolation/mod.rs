@@ -109,6 +109,14 @@ pub fn nested_teardown(_held: &SuiteGuard) -> SuiteGuard {
 }
 
 fn enter() -> MutexGuard<'static, ()> {
+    // Checked BEFORE the lock: a poisoning test leaked the lock, so waiting on
+    // it would hang instead of refusing.
+    if let Some(report) = POISONED.get() {
+        panic!(
+            "refusing to start: an earlier test in this process left kernel state under a unit \
+             that may still be alive, and nothing may start on or delete it:{report}"
+        );
+    }
     let lock = SUITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let iso = isolated();
     assert!(
@@ -152,9 +160,11 @@ fn enter() -> MutexGuard<'static, ()> {
     // whose journal we just cleared, and never a reclaim-verify against a stale
     // agent jump. Isolated name only (iso.table starts with ISOLATED_TABLE_PREFIX,
     // asserted above); the production `sanctuary-castle` table is never named.
-    let _ = std::process::Command::new("nft")
-        .args(["delete", "table", nftables::CASTLE_FAMILY, iso.table])
-        .output();
+    // Checked, not best-effort: a test must never start on a table this entry
+    // could not delete (a live writer, or a delete that failed twice).
+    if let Err(still_present) = delete_table(nftables::CASTLE_FAMILY, iso.table) {
+        panic!("refusing to start a test on an isolated table that could not be deleted: {still_present}");
+    }
     lock
 }
 
@@ -179,22 +189,77 @@ pub struct SuiteGuard {
     _lock: Option<MutexGuard<'static, ()>>,
 }
 
-impl SuiteGuard {
-    /// Release the suite lock WITHOUT the sweep, for a caller that has shown a
-    /// unit which can still write the isolated table is alive (the agent-unit
-    /// TB10 teardown). Deleting the table under that live daemon lets it
-    /// recreate the table after the delete, which is worse than a leftover that
-    /// is reported; so the leftover is left in place and named here, loudly.
-    pub fn release_leaving_kernel_state(mut self, why: &str) {
-        eprintln!(
-            "\n!!!!!!!! ISOLATION SWEEP SKIPPED: KERNEL STATE LEFT IN PLACE !!!!!!!!\n\
-             table {} was not deleted: {why}\n!!!!!!!!\n",
-            isolated().table
+/// Proof, read by THIS module from the manager, that at least one of a
+/// caller's units is not confirmed settled (its `ActiveState` is neither
+/// `inactive` nor `failed`, or could not be read). Its field is private, so the
+/// only way to obtain one is [`confirm_units_not_settled`]; a suite with a
+/// clean state cannot fabricate it to skip the sweep.
+pub struct UnitsNotSettled {
+    report: String,
+}
+
+/// Read each unit's `ActiveState` and return the proof when any is not settled.
+/// `None` means every unit reads inactive or failed, so the normal sweep is
+/// safe and the caller must take it.
+pub fn confirm_units_not_settled(units: &[String]) -> Option<UnitsNotSettled> {
+    let mut report = String::new();
+    for unit in units {
+        let state = std::process::Command::new("systemctl")
+            .args(["show", "--value", "-p", "ActiveState", unit])
+            .output();
+        let settled = matches!(
+            &state,
+            Ok(out) if out.status.success()
+                && matches!(String::from_utf8_lossy(&out.stdout).trim(), "inactive" | "failed")
         );
-        let lock = self._lock.take();
-        // Skip this guard's Drop (the sweep); the lock is released below.
+        if !settled {
+            let status = std::process::Command::new("systemctl")
+                .args(["status", "--no-pager", unit])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|err| format!("<systemctl status could not run: {err}>"));
+            report.push_str(&format!(
+                "unit {unit}: ActiveState read {state:?}\n{status}\n"
+            ));
+        }
+    }
+    (!report.is_empty()).then_some(UnitsNotSettled { report })
+}
+
+/// Set once a test has left kernel state behind under a unit that may still be
+/// alive. Every later `guard()` in this process refuses before touching the
+/// kernel, and the suite lock is never released (its guard is leaked), so no
+/// later test can start on, or delete, that table. The workflow's leftover
+/// kernel-state step then reports the table.
+static POISONED: OnceLock<String> = OnceLock::new();
+
+impl SuiteGuard {
+    /// FAIL the test, leaving the isolated table in place, because a unit that
+    /// can still write it is not confirmed settled (`proof`). Prints the unit
+    /// status and the live ruleset, poisons this process's suite (see
+    /// [`POISONED`]) and leaks the suite lock. Never deletes anything.
+    pub fn fail_leaving_kernel_state(self, proof: UnitsNotSettled) {
+        let ruleset = std::process::Command::new("nft")
+            .args(["list", "ruleset"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|err| format!("<nft list ruleset could not run: {err}>"));
+        let report = format!(
+            "\n!!!!!!!! KERNEL STATE LEFT IN PLACE UNDER A UNIT NOT CONFIRMED SETTLED !!!!!!!!\n\
+             table {} was NOT deleted; this process's isolated suite is now POISONED and no \
+             later test in it will start.\n{}\nLive ruleset:\n{ruleset}\n!!!!!!!!\n",
+            isolated().table,
+            proof.report
+        );
+        let _ = POISONED.set(report.clone());
+        // Leak the whole guard, suite lock included: its Drop (the sweep) must
+        // not run, and the lock must never be released while a unit may be alive.
         std::mem::forget(self);
-        drop(lock);
+        if std::thread::panicking() {
+            eprintln!("{report}");
+        } else {
+            panic!("{report}");
+        }
     }
 }
 
