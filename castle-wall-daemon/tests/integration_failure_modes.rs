@@ -299,6 +299,7 @@ fn fresh_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         // temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolation::runtime_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
 }
 

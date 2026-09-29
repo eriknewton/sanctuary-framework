@@ -54,7 +54,11 @@ from pathlib import Path
 # ExpectedAgentBinding::Confined (its variant doc and the seal doc), and TB5 tests. The rule
 # grammar, the owned-table parser and its enum variants, the receipt mint and the net script
 # are byte-unchanged. The guard constants it mirrors are unchanged.
-NFTABLES_SOURCE_SHA256 = "a56cb81f440eaee7ab94204bf5ae9791c86f1408058d41db7a91502b37050f64"
+# Refreshed for C2a3 after the slice-B rebase: only the NFT_CALL_WORST_CASE
+# comment and its TD2n equality test changed. The test pins the 2700 ms nft
+# bound against WATCHDOG_HOOK_NFT_WAIT; the rule grammar, parser, receipt mint,
+# and net script remain unchanged.
+NFTABLES_SOURCE_SHA256 = "e38c212af0f0e15a791c25361d31355301016ef3336bdaf425060be286f44ea4"
 
 
 # The declared partition of the guard's path constants (every name in

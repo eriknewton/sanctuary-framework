@@ -211,6 +211,7 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         // the suite's temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
 }
 
@@ -235,6 +236,7 @@ fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         trusted_service_uid: Some(unsafe { libc::geteuid() }),
         linux_runtime_paths: isolated_paths(),
         test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
 }
 
@@ -2382,6 +2384,13 @@ fn spawn_long_running_daemon_with_extra_args(
         .args(isolation_args())
         .args(extra_args)
         .env("NOTIFY_SOCKET", notify_socket)
+        // C2a3 (LINUX-SUPERVISOR-WEDGE-R1-01): the direct-spawn equivalent of a
+        // drop-in's `WatchdogSec=0`. These seams stretch the health interval, so
+        // an inherited watchdog interval would make this a watchdog run; with no
+        // `WATCHDOG_USEC` the beacon never pets. Failure mode if dropped: an
+        // environment that exports one reads here as extra datagrams, not READY=1.
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the shipped daemon binary (long-running, with test seam args)")

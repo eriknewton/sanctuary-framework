@@ -41,7 +41,10 @@ const DAEMON_UNIT: &str = "sanctuary-castle-wall.service";
 const PEERPIDFD: libc::c_int = 77; // Linux SO_PEERPIDFD (no pidfd_open fallback)
 const MAX_WIRE: usize = 16 * 1024;
 const MAX_RESPONSE: usize = 20 * 1024;
-const CLIENT_DEADLINE: Duration = Duration::from_millis(250);
+/// One owner request's connect + response budget. Must match the 250 ms in
+/// `WATCHDOG_HOOK_OWNER_WAIT` in `src/daemon.rs` (two requests), from which the
+/// systemd watchdog interval is derived (TD2 compares them).
+pub(crate) const CLIENT_DEADLINE: Duration = Duration::from_millis(250);
 /// How long the accept loop waits between polls of its non-blocking listener.
 const ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(25);
 /// Watchdog keepalive cadence. MUST stay well under `WatchdogSec=` in
