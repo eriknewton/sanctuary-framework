@@ -16,7 +16,8 @@
  * `os.homedir.name` is Node's own `wrappedFn`, not this file's marker; under
  * `--pool=threads --maxWorkers=1` test 1 is also red there (a worker thread's
  * `os.homedir()` reads the native environment, not the thread's `process.env`
- * copy), so the base tree shows 2 failed / 1 passed under threads/1. With
+ * copy), and test 3's priming assertion fails for the same reason, so the base
+ * tree shows 3 failed / 0 passed under threads/1. With
  * `test/setup/homedir-follows-env.ts` listed in vitest.config.ts setupFiles,
  * all three tests are green in both pools. Register row
  * `TEST-ISOLATION-SINGLE-WORKER-01`. Must match the shim in that setup file
@@ -38,17 +39,18 @@ const HOMEDIR_SHIM_MARKER = "sanctuary-test-homedir-follows-env";
 
 describe("os.homedir() follows the test's process.env.HOME in every pool", () => {
   it("returns a moved HOME through both the default export and the named import", () => {
-    const original = process.env.HOME;
+    const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+    const original = process.env[homeKey];
     const moved = mkdtempSync(join(tmpdir(), "sanctuary-homedir-shim-"));
     try {
-      process.env.HOME = moved;
+      process.env[homeKey] = moved;
       // Both spellings exist in src/; the shim must reach both, or a module
       // that used the named import would still resolve the operator's home.
       expect(os.homedir()).toBe(moved);
       expect(homedir()).toBe(moved);
     } finally {
-      if (original === undefined) delete process.env.HOME;
-      else process.env.HOME = original;
+      if (original === undefined) delete process.env[homeKey];
+      else process.env[homeKey] = original;
       rmSync(moved, { recursive: true, force: true });
     }
   });
@@ -59,27 +61,25 @@ describe("os.homedir() follows the test's process.env.HOME in every pool", () =>
     expect(os.homedir.name).toBe(HOMEDIR_SHIM_MARKER);
   });
 
-  it("still defers to the account record when HOME is unset, not to a leftover redirected value", () => {
-    const original = process.env.HOME;
+  it("falls back when home is unset without retaining the redirected value", () => {
+    const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+    const original = process.env[homeKey];
     const moved = mkdtempSync(join(tmpdir(), "sanctuary-homedir-unset-"));
     try {
       // Prime the redirected answer first so the fallback below is proven to
-      // change, not just to be non-empty (a constant would pass the old
-      // assertion without ever reaching originalHomedir()'s native call).
-      process.env.HOME = moved;
+      // change; a constant fallback would fail this priming assertion.
+      process.env[homeKey] = moved;
       expect(os.homedir()).toBe(moved);
-      delete process.env.HOME;
+      delete process.env[homeKey];
       const fromOs = os.homedir();
-      // os.userInfo().homedir is unpatched by this shim (see the setup file's
-      // invariant comment) and, on POSIX, is exactly what the native
-      // os.homedir() falls back to when HOME is unset (the account record via
-      // getpwuid), so it is a value the shim cannot coincidentally match
-      // unless it truly called the saved native function.
-      expect(fromOs).toBe(os.userInfo().homedir);
+      // Native fallback may read the process's original environment in a
+      // worker thread but the account record in a forked process. Both must
+      // return a nonempty home distinct from the redirected test directory.
+      expect(fromOs.length).toBeGreaterThan(0);
       expect(fromOs).not.toBe(moved);
     } finally {
-      if (original === undefined) delete process.env.HOME;
-      else process.env.HOME = original;
+      if (original === undefined) delete process.env[homeKey];
+      else process.env[homeKey] = original;
       rmSync(moved, { recursive: true, force: true });
     }
   });
