@@ -8,13 +8,20 @@
  * (the mutation tooling's `pool: 'threads', maxWorkers: 1`). Register row
  * `TEST-ISOLATION-SINGLE-WORKER-01`.
  *
- * Fail-before: on the base tree this file is red under
- * `npx vitest run --pool=threads --maxWorkers=1 test/structure/homedir-follows-thread-env.test.ts`
- * (a worker thread's `os.homedir()` reads the native environment, not the
- * thread's `process.env` copy) and green under the default pool; with
- * `test/setup/homedir-follows-env.ts` listed in vitest.config.ts setupFiles it is
- * green in both. Must match the shim in that setup file (the marker name and
- * the fallback); the marker is repeated here as a literal, not imported.
+ * Fail-before: on the base tree (setup file not listed), test 1 alone is
+ * ALREADY GREEN under the default `forks` pool, because a forked child
+ * process's native `os.homedir()` already follows `process.env.HOME`; that
+ * test cannot by itself show the shim is installed. Test 2 (the marker) is
+ * RED on the base tree in EVERY pool, including the default pool, because
+ * `os.homedir.name` is Node's own `wrappedFn`, not this file's marker; under
+ * `--pool=threads --maxWorkers=1` test 1 is also red there (a worker thread's
+ * `os.homedir()` reads the native environment, not the thread's `process.env`
+ * copy), so the base tree shows 2 failed / 1 passed under threads/1. With
+ * `test/setup/homedir-follows-env.ts` listed in vitest.config.ts setupFiles,
+ * all three tests are green in both pools. Register row
+ * `TEST-ISOLATION-SINGLE-WORKER-01`. Must match the shim in that setup file
+ * (the marker name and the fallback); the marker is repeated here as a
+ * literal, not imported.
  */
 import { describe, expect, it } from "vitest";
 import os from "node:os";
@@ -52,15 +59,28 @@ describe("os.homedir() follows the test's process.env.HOME in every pool", () =>
     expect(os.homedir.name).toBe(HOMEDIR_SHIM_MARKER);
   });
 
-  it("still defers to the account record when HOME is unset", () => {
+  it("still defers to the account record when HOME is unset, not to a leftover redirected value", () => {
     const original = process.env.HOME;
+    const moved = mkdtempSync(join(tmpdir(), "sanctuary-homedir-unset-"));
     try {
+      // Prime the redirected answer first so the fallback below is proven to
+      // change, not just to be non-empty (a constant would pass the old
+      // assertion without ever reaching originalHomedir()'s native call).
+      process.env.HOME = moved;
+      expect(os.homedir()).toBe(moved);
       delete process.env.HOME;
       const fromOs = os.homedir();
-      expect(typeof fromOs).toBe("string");
-      expect(fromOs.length).toBeGreaterThan(0);
+      // os.userInfo().homedir is unpatched by this shim (see the setup file's
+      // invariant comment) and, on POSIX, is exactly what the native
+      // os.homedir() falls back to when HOME is unset (the account record via
+      // getpwuid), so it is a value the shim cannot coincidentally match
+      // unless it truly called the saved native function.
+      expect(fromOs).toBe(os.userInfo().homedir);
+      expect(fromOs).not.toBe(moved);
     } finally {
-      if (original !== undefined) process.env.HOME = original;
+      if (original === undefined) delete process.env.HOME;
+      else process.env.HOME = original;
+      rmSync(moved, { recursive: true, force: true });
     }
   });
 });
