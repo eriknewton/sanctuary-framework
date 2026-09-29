@@ -10,6 +10,7 @@ on:
       - 'castle-wall-daemon/Cargo.toml'
       - 'castle-wall-daemon/src/**'
       - 'castle-wall-daemon/systemd/sanctuary-castle-wall.service'
+      - 'castle-wall-daemon/systemd/sanctuary-agent@.service'
   pull_request:
     branches: [main]
     paths:
@@ -19,6 +20,7 @@ on:
       - 'castle-wall-daemon/Cargo.toml'
       - 'castle-wall-daemon/src/**'
       - 'castle-wall-daemon/systemd/sanctuary-castle-wall.service'
+      - 'castle-wall-daemon/systemd/sanctuary-agent@.service'
   workflow_dispatch: {}
 
 permissions:
@@ -63,6 +65,21 @@ jobs:
             --revision 1 --output "$RUNNER_TEMP/sanctuary-linux-package/revision-1"
           bash castle-wall-daemon/packaging/ubuntu/build-deb.sh \
             --revision 2 --output "$RUNNER_TEMP/sanctuary-linux-package/revision-2"
+
+      # TB11: a package built from the last base without the agent unit, so the
+      # lifecycle job can prove the B package refuses to upgrade it in place.
+      # Must match the base the slice-B design pins (the pre-B package).
+      - name: Build the pre-B package from the pinned base
+        env:
+          PRE_B_COMMIT: 337dce36684a4667d4ce55bf544ea0c0c1154ba8
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$PRE_B_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/pre-b-source" "$PRE_B_COMMIT"
+          [[ ! -e "$RUNNER_TEMP/pre-b-source/castle-wall-daemon/systemd/sanctuary-agent@.service" ]] \
+            || { echo 'the pinned pre-B base already carries the agent unit' >&2; exit 1; }
+          bash "$RUNNER_TEMP/pre-b-source/castle-wall-daemon/packaging/ubuntu/build-deb.sh" \
+            --revision 1 --output "$RUNNER_TEMP/sanctuary-linux-package/pre-b"
 
       - name: Assert both exact guarded archives
         run: |
@@ -129,10 +146,70 @@ jobs:
             exit 1
           fi
           cp "$negative/nftables-baseline.rs" "$nft_source"
+          # Slice B (TB11): agent-unit and partition drift the source-constants
+          # pin must refuse. Each mutation is one exact replacement on the copy,
+          # restored before the next.
+          constants="$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"
+          agent_unit="$negative/castle-wall-daemon/systemd/sanctuary-agent@.service"
+          guard_copy="$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
+          for file in "$constants" "$agent_unit" "$guard_copy"; do cp "$file" "$file.baseline"; done
+          replace_once() {
+            python3 - "$1" "$2" "$3" <<'PY'
+          import sys
+          from pathlib import Path
+          path, old, new = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          text = path.read_text()
+          if text.count(old) != 1:
+              raise SystemExit(f"mutation anchor occurs {text.count(old)} times: {old!r}")
+          path.write_text(text.replace(old, new))
+          PY
+          }
+          gate='ExecStartPre=+/usr/local/libexec/sanctuary/castle-wall-daemon --agent-start-gate'
+          check='ExecStartPre=/usr/local/libexec/sanctuary/castle-wall-daemon --agent-credential-check'
+          check_other="$(printf '%s' "$check" | sed 's|castle-wall-daemon|other-daemon|')"
+          gate_other="$(printf '%s' "$gate" | sed 's|castle-wall-daemon|other-daemon|')"
+          gate_doubled="$(printf '%s' "$gate" | sed 's|=+/|=++/|')"
+          gate_missing="$(printf '%s' "$gate" | sed 's|=+/|=/|')"
+          while IFS='|' read -r label file old new; do
+            replace_once "$file" "$old" "$new"
+            if python3 "$constants"; then
+              echo "planted $label was accepted" >&2
+              exit 1
+            fi
+            cp "$file.baseline" "$file"
+          done <<MUTATIONS
+          agent BindsTo= target|$agent_unit|BindsTo=sanctuary-castle-wall.service|BindsTo=other.service
+          agent credential-check path|$agent_unit|$check|$check_other
+          agent start-gate path|$agent_unit|$gate|$gate_other
+          doubled start-gate plus|$agent_unit|$gate|$gate_doubled
+          missing start-gate plus|$agent_unit|$gate|$gate_missing
+          guard path constant without an expected entry|$guard_copy|INFO_PATH = "/var/lib/dpkg/info"|INFO_PATH = "/var/lib/dpkg/info"; EXTRA_PATH = "/etc/extra"
+          SOURCE_MIRRORED differing from expected|$constants|"NFT_TABLE", "AGENT_UNIT_PATH",|"NFT_TABLE",
+          MUTATIONS
           python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py" || {
             echo "restored copied source was refused" >&2
             exit 1
           }
+          # An agent-unit byte change must make the copied structure assertion
+          # refuse at the exact-source-bytes comparison.
+          cp AGENTS.md "$negative/AGENTS.md"
+          printf '# drift\n' >> "$agent_unit"
+          if bash "$negative/castle-wall-daemon/packaging/ubuntu/assert-structure.sh" \
+              --artifact-dir "$RUNNER_TEMP/sanctuary-linux-package/revision-1" > "$negative/agent-bytes.log" 2>&1; then
+            echo 'an agent-unit byte change was accepted by assert-structure.sh' >&2
+            exit 1
+          fi
+          # The refusal must be the agent unit's exact-bytes `cmp` in
+          # assert-structure.sh. The fixture APPENDS a line, so the packaged
+          # bytes are a strict prefix of the mutated source and cmp reports
+          # "EOF on - after byte <packaged length>" rather than "differ" (a
+          # same-length change would say "differ"); both are that comparison.
+          # The byte count pins it to the agent unit: its packaged length is
+          # the unmutated source's length.
+          agent_len="$(wc -c < "$agent_unit.baseline" | tr -d ' ')"
+          grep -Eq "^cmp: EOF on - after byte ${agent_len}(,|$)|^- .*sanctuary-agent@\.service differ: " "$negative/agent-bytes.log" \
+            || { echo 'agent-unit byte refusal did not come from the exact-bytes comparison' >&2; cat "$negative/agent-bytes.log" >&2; exit 1; }
+          cp "$agent_unit.baseline" "$agent_unit"
           cat > "$negative/misleading-Cargo.toml" <<'TOML'
           [unrelated]
           version = "99.0.0"
@@ -171,6 +248,34 @@ jobs:
             echo 'planted -dev dependency was accepted' >&2
             exit 1
           fi
+          # A package without the agent unit leaf, and one whose control-script
+          # header carries AGENT_UNIT_SHA256 out of the pinned order.
+          dpkg-deb --raw-extract "${deb[0]}" "$negative/no-agent"
+          rm -- "$negative/no-agent/etc/systemd/system/sanctuary-agent@.service"
+          dpkg-deb --root-owner-group --build "$negative/no-agent" "$negative/no-agent.deb" >/dev/null
+          if python3 "$source/assert-archive.py" "$negative/no-agent.deb" 2> "$negative/no-agent.err"; then
+            echo 'a package without the agent unit was accepted' >&2
+            exit 1
+          fi
+          grep -F 'archive allowlist mismatch' "$negative/no-agent.err" >/dev/null
+          dpkg-deb --raw-extract "${deb[0]}" "$negative/header-order"
+          python3 - "$negative/header-order/DEBIAN/preinst" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          lines = path.read_text().split("\n")
+          unit = next(i for i, line in enumerate(lines) if line.startswith("UNIT_SHA256 = "))
+          if not lines[unit + 1].startswith("AGENT_UNIT_SHA256 = "):
+              raise SystemExit("unexpected control-script header order")
+          lines[unit], lines[unit + 1] = lines[unit + 1], lines[unit]
+          path.write_text("\n".join(lines))
+          PY
+          dpkg-deb --root-owner-group --build "$negative/header-order" "$negative/header-order.deb" >/dev/null
+          if python3 "$source/assert-archive.py" "$negative/header-order.deb" 2> "$negative/header-order.err"; then
+            echo 'an out-of-order control-script header was accepted' >&2
+            exit 1
+          fi
+          grep -F 'preinst is not the exact source guard' "$negative/header-order.err" >/dev/null
           touch "$source/untracked-negative-fixture"
           if bash "$source/build-deb.sh" --revision 3 --output "$negative/should-not-build"; then
             echo 'untracked source input was accepted' >&2
@@ -196,7 +301,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [happy, old-veto, new-veto, unpack-fault, postrm-unwind, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto]
+        scenario: [happy, old-veto, new-veto, unpack-fault, postrm-unwind, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto, pre-b-upgrade]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

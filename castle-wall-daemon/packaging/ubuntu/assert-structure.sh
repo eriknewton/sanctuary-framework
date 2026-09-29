@@ -65,7 +65,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 crate_dir="$(cd -- "$script_dir/../.." && pwd -P)"
 repo_root="$(cd -- "$crate_dir/.." && pwd -P)"
 unit_source="$crate_dir/systemd/sanctuary-castle-wall.service"
-[[ -f "$repo_root/AGENTS.md" && -f "$crate_dir/Cargo.toml" && -f "$unit_source" ]] \
+agent_unit_source="$crate_dir/systemd/sanctuary-agent@.service"
+[[ -f "$repo_root/AGENTS.md" && -f "$crate_dir/Cargo.toml" && -f "$unit_source" && -f "$agent_unit_source" ]] \
   || { echo "package script is not under the Castle Wall daemon subtree" >&2; exit 1; }
 
 for command in cmp dpkg-deb grep python3 sha256sum tar; do
@@ -112,6 +113,10 @@ grep -Fqx 'install_ready=false' <(
 )
 dpkg-deb --fsys-tarfile "$deb_path" | tar -xOf - \
   ./etc/systemd/system/sanctuary-castle-wall.service | cmp - "$unit_source"
+# The agent template unit: exact source bytes, like the wall unit. Failure mode:
+# a stale build output read against an edited source differs here first.
+dpkg-deb --fsys-tarfile "$deb_path" | tar -xOf - \
+  './etc/systemd/system/sanctuary-agent@.service' | cmp - "$agent_unit_source"
 
 python3 "$script_dir/assert-source-constants.py"
 python3 "$script_dir/assert-archive.py" "$deb_path"

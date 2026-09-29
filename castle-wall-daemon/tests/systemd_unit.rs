@@ -189,6 +189,21 @@ fn the_shipped_daemon_unit_starts_independently_of_the_stop_owner_artifact() {
     );
 }
 
+/// TB3 (slice B): the agent template unit depends on the wall, never the
+/// reverse. The wall's bytes are pinned above and stay unchanged by slice B;
+/// this pins the direction, so a wall-side `Wants=`, `Requires=` or `Before=`
+/// naming the agent (which would let the agent pull or order the wall) is a
+/// visible failure. The wall digest is also what pins the socket parent's
+/// `RuntimeDirectoryMode=0710` `root:sanctuary`, the second defence an agent
+/// process meets at the control socket.
+#[test]
+fn the_shipped_daemon_unit_names_no_agent_unit() {
+    assert!(
+        !unit_text().contains("sanctuary-agent"),
+        "the wall unit must not name the agent unit; the edge is agent to wall only"
+    );
+}
+
 #[test]
 fn the_stop_owner_unit_grants_no_cgroup_write_path_and_keeps_its_socket_parent_volatile() {
     let owner = stop_owner_unit_text();
@@ -873,6 +888,266 @@ mod start_limit_against_real_systemd {
             dependent_state, "active",
             "the unit ordered behind the failing service must become active once that \
              service reaches its terminal state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Premise witnesses for the agent template unit (slice B, TB0a and TB0b).
+    //
+    // They exercise systemd, not product code, so they pass on any tree whose
+    // manager behaves as the agent unit assumes; their value is that they run
+    // UNCONDITIONALLY on a real systemd PID 1 before the agent unit's digest is
+    // pinned, and again on every PR (the CI rerun refuses a `SKIP`). Register
+    // id: LINUX-AGENT-TRUSTED-UID-COLLISION-01 closes on the gate plus TB0a.
+    // -----------------------------------------------------------------------
+
+    /// The runtime unit directory systemd reads before `/etc`; a file here is
+    /// gone after a reboot and never touches the shipped fragment path.
+    const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
+
+    /// The value the arrival witness places in the environment file. It is
+    /// `TEST_AGENT_UID` in `tests/integration_linux_runtime_activation.rs`, a
+    /// non-system uid admission accepts, so the witness carries the same shape
+    /// of value the gate's `--trusted-service-uid` argument will.
+    const PROBE_VALUE: &str = "60123";
+
+    /// Overflow uid/gid ("nobody"/"nogroup") on the Ubuntu runner: the account
+    /// exists, and no admission is involved in these premise witnesses.
+    const OVERFLOW_ID: &str = "65534";
+
+    /// `CAP_NET_ADMIN` is capability number 12 (linux/capability.h).
+    const CAP_NET_ADMIN_BIT: u32 = 12;
+
+    /// A root-owned scratch directory under `/run` plus one runtime unit,
+    /// removed with a `daemon-reload` on EVERY exit path, including a
+    /// panicking assertion, so a failed run leaves no unit for the next one.
+    struct RuntimeUnitFixture {
+        dir: std::path::PathBuf,
+        unit_name: String,
+        unit_path: std::path::PathBuf,
+    }
+
+    impl RuntimeUnitFixture {
+        fn new(label: &str, dir_mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let tag = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or_default()
+            );
+            let dir = std::path::PathBuf::from(format!("/run/sanctuary-{label}-{tag}"));
+            std::fs::create_dir(&dir).expect("create the root-owned scratch directory");
+            // set_permissions, not the create mode: the process umask would
+            // otherwise strip the 0777 the unprivileged probe line needs.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(dir_mode))
+                .expect("set the scratch directory mode");
+            let unit_name = format!("sanctuary-{label}-{tag}.service");
+            let unit_path = std::path::Path::new(RUNTIME_UNIT_DIR).join(&unit_name);
+            Self {
+                dir,
+                unit_name,
+                unit_path,
+            }
+        }
+
+        /// Writes the unit, reloads the manager and runs one `systemctl start`
+        /// (a oneshot, so it returns when the unit's commands have ended).
+        /// Returns whether the start succeeded; the caller reads the probe files.
+        fn start(&self, unit_text: &str) -> bool {
+            std::fs::create_dir_all(RUNTIME_UNIT_DIR).expect("the runtime unit directory");
+            std::fs::write(&self.unit_path, unit_text).expect("write the runtime unit");
+            let reload = Command::new("systemctl")
+                .arg("daemon-reload")
+                .output()
+                .expect("run systemctl daemon-reload");
+            assert!(reload.status.success(), "daemon-reload must succeed");
+            Command::new("timeout")
+                .args(["60", "systemctl", "start", &self.unit_name])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for RuntimeUnitFixture {
+        fn drop(&mut self) {
+            let _ = Command::new("systemctl")
+                .args(["stop", &self.unit_name])
+                .output();
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", &self.unit_name])
+                .output();
+            let _ = std::fs::remove_file(&self.unit_path);
+            let _ = Command::new("systemctl").arg("daemon-reload").output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// True when the caller is root and a system manager answers. Reports the
+    /// reason it cannot run, so a skip is never silent; the CI rerun refuses it.
+    fn root_and_systemd_available() -> bool {
+        // SAFETY: geteuid() is always successful and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP (premise witness needs root to write {RUNTIME_UNIT_DIR})");
+            return false;
+        }
+        systemd_run_available()
+    }
+
+    /// The first `systemctl --version` line, written at the head of the evidence.
+    fn systemd_version_line() -> String {
+        Command::new("systemctl")
+            .arg("--version")
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The arrival probe unit. `%%s` is a literal `%s` (a bare `%s` is the
+    /// systemd user-shell specifier, and a probe whose output names a shell
+    /// path hit that, not the premise); `$$#` and `$$@` are the shell's `$#` and
+    /// `$@` (a bare `$` is systemd's own variable syntax, and a probe whose count
+    /// line is empty or literal hit that instead). `${PROBE}` is the braced
+    /// form the agent unit's gate line uses. `User=` mirrors the agent unit: the
+    /// `+` line ignores it, and PID 1, not that user, parses the 0600 file.
+    fn arrival_unit(dir: &std::path::Path, env_file: &std::path::Path, unset: bool) -> String {
+        let unset_line = if unset {
+            "UnsetEnvironment=PROBE\n"
+        } else {
+            ""
+        };
+        format!(
+            "[Service]\n\
+             Type=oneshot\n\
+             User={OVERFLOW_ID}\n\
+             Group={OVERFLOW_ID}\n\
+             EnvironmentFile={env}\n\
+             {unset_line}\
+             ExecStartPre=+/bin/sh -c 'printf \"%%s\\n\" \"$$#\" \"$$@\" > {dir}/arrival.out' sh ${{PROBE}}\n\
+             ExecStart=/bin/true\n",
+            env = env_file.display(),
+            dir = dir.display(),
+        )
+    }
+
+    /// TB0a (PB12): under the agent unit's shape, a `+` `ExecStartPre=` fed
+    /// `${VAR}` from a root-owned 0600 `EnvironmentFile=` receives exactly one
+    /// argv token equal to the file's value. The control case with
+    /// `UnsetEnvironment=` is RECORDED (count 0 means the braced argument was
+    /// dropped, count 1 with an empty token means it expanded empty); it does
+    /// not decide the test because the directive is not in the agent unit.
+    #[test]
+    fn tb0a_a_plus_exec_start_pre_receives_the_environment_file_value_as_one_token() {
+        if !root_and_systemd_available() {
+            return;
+        }
+        let evidence_version = systemd_version_line();
+        eprintln!("TB0a systemd: {evidence_version}");
+
+        let run = |unset: bool| -> (bool, Option<String>) {
+            let fixture = RuntimeUnitFixture::new(if unset { "tb0a-ctl" } else { "tb0a" }, 0o700);
+            let env_file = fixture.dir.join("probe.env");
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&env_file)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "PROBE={PROBE_VALUE}")
+                    })
+                    .expect("write the root-owned 0600 environment file");
+                std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600))
+                    .expect("mode 0600 on the environment file");
+            }
+            let started = fixture.start(&arrival_unit(&fixture.dir, &env_file, unset));
+            let out = std::fs::read_to_string(fixture.dir.join("arrival.out")).ok();
+            (started, out)
+        };
+
+        let (control_started, control_out) = run(true);
+        eprintln!(
+            "TB0a control (UnsetEnvironment=PROBE, recorded not blocking): started={control_started} \
+             arrival.out={control_out:?} branch={}",
+            match control_out.as_deref() {
+                Some("0\n") => "argument dropped (count 0)",
+                Some("1\n\n") => "argument expanded empty (count 1, empty token)",
+                Some(other) if other.starts_with(&format!("1\n{PROBE_VALUE}")) => {
+                    "value still arrived (the two-family reading is refuted)"
+                }
+                _ => "other (see arrival.out)",
+            }
+        );
+
+        let (started, out) = run(false);
+        eprintln!("TB0a positive: started={started} arrival.out={out:?}");
+        assert!(started, "the positive arrival unit must start");
+        assert_eq!(
+            out.as_deref(),
+            Some(format!("1\n{PROBE_VALUE}\n").as_str()),
+            "a `+` ExecStartPre= must receive ${{PROBE}} from the EnvironmentFile= as exactly \
+             one argv token equal to the file value (PB12)"
+        );
+    }
+
+    /// Parses a `/proc/<pid>/status` `CapEff:` line into its bit set.
+    fn cap_eff(line: &str) -> u64 {
+        let hex = line
+            .trim()
+            .strip_prefix("CapEff:")
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("not a CapEff line: {line:?}"));
+        u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("CapEff hex {hex:?}: {e}"))
+    }
+
+    /// TB0b (PB5, the `+` half): under `User=`, `NoNewPrivileges=yes` and an
+    /// empty `CapabilityBoundingSet=`, a `+` `ExecStartPre=` still holds
+    /// `CAP_NET_ADMIN` (so the kernel gate can list the owned table) and a
+    /// non-prefixed one holds no capability at all.
+    #[test]
+    fn tb0b_a_plus_exec_start_pre_keeps_cap_net_admin_under_an_empty_bounding_set() {
+        if !root_and_systemd_available() {
+            return;
+        }
+        eprintln!("TB0b systemd: {}", systemd_version_line());
+        // 0777: the unprivileged line runs as the overflow uid and must write here.
+        let fixture = RuntimeUnitFixture::new("tb0b", 0o777);
+        let dir = fixture.dir.display().to_string();
+        let unit = format!(
+            "[Service]\n\
+             Type=oneshot\n\
+             User={OVERFLOW_ID}\n\
+             Group={OVERFLOW_ID}\n\
+             NoNewPrivileges=yes\n\
+             CapabilityBoundingSet=\n\
+             ExecStartPre=/bin/sh -c 'grep -m1 \"^CapEff:\" /proc/self/status > {dir}/unpriv.caps'\n\
+             ExecStartPre=+/bin/sh -c 'grep -m1 \"^CapEff:\" /proc/self/status > {dir}/plus.caps'\n\
+             ExecStart=/bin/true\n"
+        );
+        let started = fixture.start(&unit);
+        let plus = std::fs::read_to_string(fixture.dir.join("plus.caps")).unwrap_or_default();
+        let unpriv = std::fs::read_to_string(fixture.dir.join("unpriv.caps")).unwrap_or_default();
+        eprintln!("TB0b: started={started} plus.caps={plus:?} unpriv.caps={unpriv:?}");
+        assert!(started, "the capability probe unit must start");
+        assert!(
+            cap_eff(&plus) & (1u64 << CAP_NET_ADMIN_BIT) != 0,
+            "the `+` ExecStartPre= must hold CAP_NET_ADMIN under an empty bounding set: {plus:?}"
+        );
+        assert_eq!(
+            cap_eff(&unpriv),
+            0,
+            "the non-prefixed ExecStartPre= must hold no capability: {unpriv:?}"
         );
     }
 }
