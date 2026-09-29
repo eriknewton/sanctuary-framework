@@ -4966,7 +4966,7 @@ mod watchdog_structure {
     }
 
     /// TS5: every `--test-*` value flag drained in `run_daemon_main` is listed in
-    /// `has_structural_flag`'s test-isolation `value_options` block, and vice
+    /// `value_options`' test-isolation block, and vice
     /// versa, so a seam added to one site only cannot swallow or leak a token.
     #[test]
     fn ts5_test_value_flags_are_listed_where_they_are_drained() {
@@ -4981,7 +4981,7 @@ mod watchdog_structure {
                 .collect()
         };
         let listed = flag_after(
-            fn_body(&code, "has_structural_flag"),
+            fn_body(&code, "value_options"),
             "value_options.push(\"",
         );
         let drained = flag_after(fn_body(&code, "run_daemon_main"), "position(|a| a == \"");
