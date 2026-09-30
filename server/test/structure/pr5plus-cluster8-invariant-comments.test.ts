@@ -119,9 +119,19 @@ describe("PR-5+ cluster-8 invariant comment hygiene", () => {
     expectNear(keychain, "validateSecretName(name);", [
       "cannot inject args or poison dump parsing",
     ]);
-    expectNear(open, "return [];", [
-      "zero grants",
-      "denies access instead of allowing all",
+    // RE-RECORDED 2026-09-30 (credential surrogacy slice 1a). The old anchor was
+    // the bare `catch { return []; }` in `loadBrokerGrants`, which has been
+    // replaced by a classified loader plus one reconciler. The INVARIANT is
+    // unchanged and stronger: every load failure still yields zero grants and
+    // never a partial set. What moved is where it is enforced, so the anchor
+    // moves with it rather than being dropped.
+    expectNear(open, "return { grants: [], bindings: [] };", [
+      "ZERO grants, not",
+      "deliberately moved a secret out of the broker's reach",
+    ]);
+    expectNear(open, "return { outcome: \"absent\" };", [
+      "classifying the failure instead of",
+      "collapsing every cause into zero grants",
     ]);
   });
 

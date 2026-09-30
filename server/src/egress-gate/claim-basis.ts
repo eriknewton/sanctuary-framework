@@ -2036,6 +2036,11 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/protection-claim.ts`]: 0,
   [`${EG}/release-barrier.ts`]: 15,
   [`${EG}/runtime-fs-plan.ts`]: 0,
+  // Zero, and it must stay zero while the helper is process surface only:
+  // the daemon renders a plist and parses an argv, and asserts nothing
+  // about what is enforced. A claim literal appearing here would mean the
+  // helper had started describing its own capability.
+  [`${EG}/surrogate-helper-daemon.ts`]: 0,
 };
 
 /**

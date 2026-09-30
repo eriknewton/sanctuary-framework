@@ -261,6 +261,14 @@ export function egressGateDaemonLogPaths(input: {
 }
 
 /**
+ * CORE DUMPS ARE OFF, hard and soft (design v2.1 section 3.4.6). In forward mode
+ * this process holds a bound credential value in memory for the length of one
+ * request, so a core file would be a plaintext copy of it on a disk nothing else
+ * guards. The HARD limit is set as well as the soft one because a soft limit
+ * alone can be raised by the process or by anything that inherits from it. For
+ * an existing install the key lands at the next boot, because the boot path
+ * rewrites this plist unconditionally, and at the next repair.
+ *
  * Render the gate daemon plist. `RunAtLoad=false` + `KeepAlive={Crashed:true}`
  * deliberately: the ROOT SUPERVISOR sequences gate start inside the exclusive
  * bring-up (owner-checked, generation-bound); an auto-started gate at boot
@@ -322,6 +330,16 @@ ${logXml}\t<key>RunAtLoad</key>
 \t<dict>
 \t\t<key>Crashed</key>
 \t\t<true/>
+\t</dict>
+\t<key>HardResourceLimits</key>
+\t<dict>
+\t\t<key>Core</key>
+\t\t<integer>0</integer>
+\t</dict>
+\t<key>SoftResourceLimits</key>
+\t<dict>
+\t\t<key>Core</key>
+\t\t<integer>0</integer>
 \t</dict>
 </dict>
 </plist>

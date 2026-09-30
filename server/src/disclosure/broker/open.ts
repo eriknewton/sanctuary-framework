@@ -244,6 +244,11 @@ export async function loadBrokerAndSurrogatePolicies(
   const surrogateResult = await loadSurrogatePolicyDocument(storagePath);
   if (surrogateResult.outcome === "failed") {
     await auditLoadFailure("surrogate", surrogateResult.failureClass);
+    // ZERO grants, not "the grants minus the bindings". A fortress that
+    // deliberately moved a secret out of the broker's reach must not fall back
+    // to the broker serving it, or anything else, because the binding file
+    // broke: that would turn one unreadable file into the broker handing out
+    // exactly the credential surrogacy exists to withhold.
     return { grants: [], bindings: [] };
   }
   const bindings =

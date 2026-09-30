@@ -217,19 +217,27 @@ export class Broker {
       // visible in `list_grants` and in the operator inventory as though it
       // worked, and every read against it would then fail as a missing secret.
       // Thrown rather than silently dropped so the operator CLI can say why.
-      void this.auditLog.appendCritical({
-        layer: "l3",
-        operation: BROKER_OPS.SURROGATE_TOKEN_REFUSED,
-        identity_id: this.principalIdentityId,
-        result: "failure",
-        details: {
+      //
+      // `append`, not `appendCritical`, on THIS surface only. `grant` is
+      // synchronous and its two callers expect it to stay so, and an
+      // `appendCritical` that nobody awaits is a floating promise whose
+      // rejection is lost (`test/structure/no-floating-append-critical.test.ts`
+      // refuses one). The durable, awaited records for this operation are the
+      // two on the token paths in `token-issuer.ts`, which is where a refusal
+      // that an AGENT triggered lands. This line records an OPERATOR's own
+      // refused command, and the operator already has the thrown error.
+      void this.auditLog.append(
+        "l3",
+        BROKER_OPS.SURROGATE_TOKEN_REFUSED,
+        this.principalIdentityId,
+        {
           skill: g.skill,
           secret: g.secret,
           scope: g.scope,
           reason: "surrogate_bound",
           surface: "grant",
         },
-      });
+      );
       throw new BrokerDeniedError();
     }
     this.issuer.setGrant(g);

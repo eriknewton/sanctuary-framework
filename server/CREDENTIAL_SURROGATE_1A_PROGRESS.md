@@ -197,19 +197,27 @@ Superseded by the Job 2 section below; read that one.
 
 ### next (do these in this order)
 
-1. **Scope item 5, the root helper daemon**
-   (`egress-gate/surrogate-helper-daemon.ts`). Do this BEFORE the rest of the
-   CLI. `surrogate remove`, `cmdRevoke`, `unlock`, `lock` and `status` all need
-   the unlock-socket path, and rule 11 says one shared derivation: inventing a
-   path in `cli/secrets.ts` now and re-deriving it in the daemon later is exactly
-   the drift the rule forbids. Job 2 stopped at that boundary deliberately.
-   The daemon owns: the plist renderer (`Core = 0` in BOTH limit dictionaries,
-   `RunAtLoad=false`, `KeepAlive: { Crashed: true }`, argv
-   `--agent-uid --gate-uid --operator-uid --generation`), both socket paths,
-   both listeners (restrictive umask around `listen()`, chmod 0600, chown query
-   socket to the gate uid and unlock socket to the operator uid), each bound to
-   exactly ONE codec, and the refusal to start on a generation mismatch or an
-   `--operator-uid` of 0, the agent uid or the gate uid.
+1. **Finish scope item 5, the root helper daemon's RUNTIME**
+   (`egress-gate/surrogate-helper-daemon.ts`). The process SURFACE landed in Job
+   2 (see the Job 2 addendum below); what remains is the behavior:
+   - both listeners, with `SURROGATE_HELPER_SOCKET_UMASK` held across `listen()`
+     then `chmod` 0600 and `chown` (query socket to the gate uid, unlock socket
+     to the operator uid);
+   - each socket bound to exactly ONE codec, so a query frame on the unlock
+     socket and the reverse is `malformed` and never falls through;
+   - the unlock contract: one value per connection, validation (secret in table,
+     own generation, 1 to `MAX_SURROGATE_VALUE_BYTES`, legal HTTP field-value
+     bytes, TTL clamped to `MAX_SURROGATE_UNLOCK_SECONDS`), `unlock_accepted`
+     and `lock_accepted` for EVERY accepted unlock or lock regardless of client,
+     and a `status` that never returns a value or a placeholder;
+   - the query contract of design 3.4.2: one connection per query, one frame each
+     way, `unexpected_extra_bytes` on any byte after the first frame, the `id`
+     echoed, the four decision conditions, and
+     `SURROGATE_HELPER_MAX_CONCURRENT_QUERIES` with `rate_limited`;
+   - the generation check against the bindings file header (the argv parser is
+     pure and deliberately does not do this read) and the over-cap load refusal;
+   - the composition root the `castle-wall surrogate-helper-daemon` verb calls,
+     plus that verb in `cli.ts`.
 2. **Finish scope item 4** against that daemon: the operator-side one-shot
    unlock-socket client (`status` probe classified `unarmed` on socket ENOENT,
    `armed` on a status answer, refuse on EACCES, timeout and malformed), then
@@ -270,3 +278,82 @@ COUNT is unchanged at 979.
 Raw output for the three is in `/tmp/cs1a-evidence/` on the Mini2 host, which is
 NOT durable; the next job re-captures anything it needs for the BUILD_REPORT
 rather than citing that path.
+
+## Job 2 addendum (same session, second half)
+
+### done
+
+- **Scope item 5, the process SURFACE** (`egress-gate/surrogate-helper-daemon.ts`,
+  new, exported through the `egress-gate` barrel): `GATE_SURROGATE_DIR` (0711,
+  pinned to `GATE_CRED_DIR`'s reasoning), the two socket paths (distinct by NAME
+  as well as by owner), the bindings and destinations artifact paths, the
+  launchd label and plist path, the operator-readable log-path derivation, the
+  listen umask, the CLOSED event enum with no free-form `message` field
+  anywhere, and `parseSurrogateHelperDaemonArgs`, which refuses an
+  `--operator-uid` of 0, of the agent uid or of the gate uid, an agent uid equal
+  to the gate uid, a missing flag, and any uid that is not plain decimal digits
+  (`Number("0x1f6")` and `Number(" 502")` both parse, and a uid read one way here
+  and another way by the arming side is a mismatch nothing would report).
+  `renderSurrogateHelperDaemonPlist` emits `RunAtLoad=false`,
+  `KeepAlive={Crashed:true}`, both `Core = 0` limit dictionaries, and the four
+  baked argv values.
+- **Scope item 9 COMPLETE.** `renderEgressGateDaemonPlist` in `gate-daemon.ts`
+  gained `HardResourceLimits` and `SoftResourceLimits` with `Core = 0`, and
+  NOTHING else in that file changed. The byte-identical guard at
+  `test/egress-gate/boot-supervisor.test.ts` is re-recorded: the pre-existing
+  assertion is a self-comparison through one renderer and would still hold if
+  both sides lost the keys together, so two explicit key assertions were added
+  beside it.
+- **Scope item 10, further.** The `egress-gate` row in `server/src/README.md`
+  now names the helper daemon, states exactly what is and is not built, and
+  carries the bound "drill-owed; no capability claim advances".
+
+### three structural guards this work tripped, and how each was answered
+
+Recorded because each is a deliberate decision the code gate should see:
+
+1. `test/structure/no-floating-append-critical.test.ts` refused
+   `void this.auditLog.appendCritical(...)` in the synchronous `Broker.grant`.
+   Answered by using `append` on THAT surface only, with the reason at the line:
+   `grant` is synchronous and its callers expect it to stay so, and the awaited
+   `appendCritical` records for this operation are the two on the token paths,
+   which is where an AGENT-triggered refusal lands. The `grant` line records an
+   operator's own refused command, and the operator already has the thrown error.
+   This is a narrow, stated deviation from design 3.10's blanket
+   "`SURROGATE_TOKEN_REFUSED` via `appendCritical`".
+2. `test/structure/pr5plus-cluster8-invariant-comments.test.ts` anchored on the
+   bare `return [];` that the classified loader replaced. Re-recorded onto the
+   two new enforcement sites, and an invariant comment was added AT the
+   zero-grant return, which is where prose hygiene says the why belongs.
+3. `test/structure/disclosure-guard.test.ts` D8-LOCALIZED went 21 to 22 on the
+   new structural test's header. Rewritten positively; the ratchet is back at 21
+   and `disclosure-baseline.txt` was NOT edited.
+   Also `test/egress-gate/claim-basis-structural.test.ts` required the new source
+   file in the claim-literal ratchet; added at 0 with a comment saying it must
+   stay 0 while the helper is process surface only.
+
+### test results (Job 2 addendum)
+
+- `npx vitest run test/egress-gate/surrogate-helper-daemon-plist.test.ts`: **15 passed**.
+- `npx vitest run test/structure test/egress-gate`: 110 files, **1480 passed**, 0 failed.
+- `npx vitest run test/disclosure/broker test/broker-mcp test/audit test/credential-surrogate test/cli/secrets*.test.ts`:
+  40 files, **476 passed**, 0 failed.
+- `npm run typecheck`: green; tests/scripts baseline unchanged at 979.
+- `npm run check-import-cycles`: exit 0, 10 cycles, all pre-existing, **none
+  involving `credential-surrogate` or `surrogate-helper-daemon`**.
+- `git diff origin/main -- server/src/broker-mcp/broker-server.ts`: **0 bytes**.
+- `scripts/check-ai-tells.sh server/src/README.md`: clean, and clean on the base
+  copy too. `server/reorg-surface-manifest.md`: 5 hits, all 5 present on the base.
+- Zero em-dashes on any added line.
+- NOT RUN this job, owed to the final job: `test/security` and `test/wrap` whole,
+  `node scripts/check-assurance-matrix.mjs`, and the `.test-baseline` recompute
+  from the LINUX count.
+
+### fail-before witness (Job 2 addendum)
+
+| Guard | Command | Base result | Head result |
+|---|---|---|---|
+| gate plist `Core = 0` | `npx vitest run test/egress-gate/surrogate-helper-daemon-plist.test.ts` with `gate-daemon.ts` restored from `origin/main` | 1 failed, 14 passed | 15 passed |
+
+The helper plist and argv guards have no base tree to fail against (the file is
+new), so their witness is the guard-removed form, owed to the next job.

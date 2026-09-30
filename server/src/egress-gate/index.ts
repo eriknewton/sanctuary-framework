@@ -396,3 +396,25 @@ export {
   type QuarantinedBootRegistryEntry,
   type UnprotectWiringDeps,
 } from "./arming-wiring.js";
+
+export {
+  GATE_SURROGATE_DIR,
+  SURROGATE_HELPER_BOUNDS,
+  SURROGATE_HELPER_DAEMON_LABEL_PREFIX,
+  SURROGATE_HELPER_SOCKET_UMASK,
+  SurrogateHelperArgvError,
+  parseSurrogateHelperDaemonArgs,
+  renderSurrogateHelperDaemonPlist,
+  surrogateBindingsPath,
+  surrogateDestinationsPath,
+  surrogateHelperDaemonLabel,
+  surrogateHelperDaemonLogPaths,
+  surrogateHelperDaemonPlistPath,
+  surrogateQuerySocketPath,
+  surrogateUnlockSocketPath,
+  type SurrogateHelperArgvRefusal,
+  type SurrogateHelperDaemonArgs,
+  type SurrogateHelperDaemonPlistOptions,
+  type SurrogateHelperDenyCode,
+  type SurrogateHelperEvent,
+} from "./surrogate-helper-daemon.js";

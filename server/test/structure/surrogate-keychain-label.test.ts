@@ -1,13 +1,15 @@
 /**
- * Capability: the surrogate keychain service literal is declared in exactly one
- * place, and the broker is never constructed with a service override. Those two
- * facts together are what keeps a bound value out of the broker's reach: the
- * separation is storage-level, so a second copy of the literal, or one
- * `service:` option on the broker's backend, would collapse the two labels into
- * one without any test of broker behavior noticing.
+ * Capability: the surrogate keychain service literal has exactly one
+ * declaration in the tree, and the only keychain construction that supplies a
+ * service override is the surrogate store's own.
  *
- * Structural, not behavioral: it reads the source tree, because the failure it
- * guards against is a future edit rather than a runtime path.
+ * Those two facts are what make the separation between the two labels a
+ * storage-level property rather than a convention, which is what the design
+ * asks for. Both are asserted here so a later edit that added a second copy of
+ * the literal, or a second override, has to change this file to land.
+ *
+ * Structural, not behavioral: it reads the source tree, because what it guards
+ * against is a future edit rather than a runtime path.
  *
  * Defect id: SURROGATE-LABEL-CONVERGENCE.
  */

@@ -969,6 +969,19 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
     });
     expect(built.plistPath).toBe(egressGateDaemonPlistPath(502));
     expect(built.plistContent).toBe(historical);
+
+    // RE-RECORDED 2026-09-30 for the core-dump limit (design v2.1 section
+    // 3.4.6). The equality above is a self-comparison through one renderer, so
+    // it would still hold if both sides lost the new keys together. These two
+    // assertions are what actually pins them: in forward mode this process holds
+    // a bound credential value in memory, and a core file would be a plaintext
+    // copy of it. Both limits, because a soft limit alone can be raised.
+    expect(built.plistContent).toContain(
+      "<key>HardResourceLimits</key>\n\t<dict>\n\t\t<key>Core</key>\n\t\t<integer>0</integer>",
+    );
+    expect(built.plistContent).toContain(
+      "<key>SoftResourceLimits</key>\n\t<dict>\n\t\t<key>Core</key>\n\t\t<integer>0</integer>",
+    );
   });
 });
 
