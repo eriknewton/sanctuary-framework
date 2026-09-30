@@ -519,3 +519,134 @@ The helper-plist and argv guards still have no base tree to fail against (the
 file is new), so their witness must be the guard-removed form. Everything marked
 OWED above is work for a later job, and the BUILD_REPORT must not claim a
 witness that no run produced.
+
+## Job 4 (2026-09-30, about 50 minutes of work)
+
+### done
+
+- **Scope item 4 COMPLETE.** The operator side landed in `cli/secrets.ts`
+  against the helper daemon Job 3 built:
+  - **The one-shot unlock-socket client**, `createSurrogateUnlockSocketTransport`
+    plus `sendOnSurrogateUnlockSocket`: one connection per request, one frame
+    each way, the frame cap checked on the ACCUMULATED buffer before any parse,
+    a byte after the first frame classified `malformed_reply`, the correlation
+    `id` checked on the reply, and one deadline covering connect and reply
+    together. Outcomes are a closed three-way split (`answered`, `absent`,
+    `unreachable` with a fixed failure class); the raw errno string never
+    reaches an operator line because it carries the socket path, which names an
+    agent uid.
+  - **`probeSurrogateHelperArmed`**, the decision every destructive verb rests
+    on: ENOENT is `unarmed`, a `status` answer is `armed`, and EACCES, timeout,
+    malformed and a wrong-kind reply are all `indeterminate`. `indeterminate`
+    is not "probably unarmed"; it refuses.
+  - **`surrogate remove`**: refuses while armed or indeterminate, and on ENOENT
+    removes the row and then the value, the reverse of `add`'s order and for
+    the same reason (the state that must never exist between the two writes is
+    a binding with no value behind it).
+  - **`cmdRevoke`**: `removeSurrogateRowForRevoke` runs the same probe when the
+    named secret is bound, removes only the binding ROW on success, keeps the
+    stored value (revoke is a policy verb and has never deleted a secret) and
+    writes `SURROGATE_REMOVED` with `removed_value: false`. An unbound name
+    never reaches the probe.
+  - **`surrogate unlock`**: the step order of design 3.4.4 exactly. Re-exec
+    through `/bin/sh -c 'ulimit -H -c 0 && ulimit -S -c 0 && exec "$@"'`, then
+    VERIFY in the child by reading `ulimit -H -c` (the env marker is never
+    trusted on its own), then the `status` probe, then `openSurrogateStore`,
+    then `appendCritical SURROGATE_UNLOCKED` aborting before any value is read,
+    then one value per connection. `--ttl` is bounded only in shape; the helper
+    clamps (AGENTS.md rule 10).
+  - **`lock`, `status`, `events`.** `status` prints lock state and never a value
+    or a placeholder. `events` refuses unless the effective uid is 0, checked
+    before anything is opened, derives the gate log path through
+    `egressGateDaemonLogPaths` (gate account from `deriveGateAccountName`, home
+    base through a dynamic import of `arming-wiring.ts`, the precedent
+    `cli/castle-wall.ts` already sets), prints only lines carrying
+    `SURROGATE_GATE_EVENT_PREFIX`, and redacts placeholders on the way out.
+- **Test seams added to `SecretsArgs`** so every case above is host-free:
+  `surrogateUnlock` (the transport), `surrogateNoCore` (re-exec and core-limit),
+  `effectiveUid`, `gateLogPathOverride`, and `surrogateBackend` /
+  `brokerBackend` threaded into `openSurrogateStore` / `openBroker`. No
+  `security` subprocess runs, no socket is created under a root-owned path, and
+  no helper is started.
+- **New test file** `test/cli/secrets-surrogate-operator.test.ts`, 30 cases.
+
+### one design gap this work had to close, flagged for the code gate
+
+**`remove`, `revoke`, `unlock`, `lock`, `status` and `events` all require an
+explicit `--agent-uid N`.** The design names `--agent-uid` only for `unlock`
+(3.4.4), but a binding names an agent ID (`"hermes"`) while the helper, its
+sockets and its artifacts are all keyed by agent UID. Deriving one from the
+other in the CLI would be a second resolver beside the arming path's, and after
+an account rename the two would disagree: the CLI would probe a uid no helper
+owns, read `unarmed`, and remove a row a live helper is serving. The operator
+names the uid. The reason is at `parseSurrogateAgentUid`.
+
+### one structural guard this work tripped, and how it was answered
+
+`test/structure/cli-argv-parser-chokepoint.test.ts` flagged
+`buffered.indexOf("\n")` in the unlock-socket reader as hand-rolled argv
+parsing. It is wire framing: the unlock codec is newline-delimited JSON, and
+`flagValue` remains the only reader of argv in the file. Answered with the
+guard's own sanctioned `cli-argv-indexof-allowed:` marker plus the reason at the
+line. NOTE for anyone adding another: the marker must sit on the SAME line, the
+line directly above, or the line directly below (`hasAllowMarker` checks exactly
+those three); a marker four lines up does not count, which is how this was first
+mis-answered.
+
+### next (do these in this order)
+
+1. **Scope items 6 and 7**, the largest remaining packet: arming-twin membership
+   (every function in the design 3.4.1 table), placeholder minting at the one
+   mint site in `productionBringUp`, the three artifact writes (call
+   `renderSurrogate*File` from `artifacts.ts`; do NOT write a second
+   serializer), the `gate-surrogate` runtime-fs plan entry (root 0711), and the
+   `release-barrier.ts` wrapper plus `gateSurrogatePlaceholderPath`. The wrapper
+   owes the pin test named in the `artifacts.ts` header.
+2. **The rest of item 10**: the `ASSURANCE_MATRIX.md` row, the remaining
+   `reorg-surface-manifest.md` notes (row 77 now needs
+   `secrets surrogate add|list|remove|unlock|lock|status|events`; the
+   `surrogate-helper-daemon` verb is NOT in any help text because the daemon
+   verbs are internal, so say that explicitly rather than re-recording a
+   castle-wall help string that does not change), and `.test-baseline` from the
+   LINUX count.
+3. **The OWED fail-before witnesses** in the Job 3 table, plus this job's own
+   (see below). Nothing may be claimed that no run produced.
+4. **The BUILD_REPORT.** Still nothing written to
+   `Review/Sanctuary/Credential_Surrogacy_Slice1a_BUILD_REPORT_2026-09-30.md`.
+
+### open questions
+
+- None blocking.
+- The `--agent-uid` requirement above and Job 3's two reconciliations and Job
+  1's env-name pin deviation all still want the code gate's eye.
+
+### test results (Job 4, additive)
+
+- `npx vitest run test/cli/secrets-surrogate-operator.test.ts
+  test/cli/secrets-surrogate.test.ts`: **42 passed** (30 new).
+- `npx vitest run test/structure test/cli`: 181 files, **2014 passed**, 2
+  skipped, 0 failed (after the chokepoint marker; see the witness below).
+- `npm run typecheck`: green; tests/scripts baseline unchanged at 979.
+- `npx eslint src/cli/secrets.ts test/cli/secrets-surrogate-operator.test.ts`:
+  clean. Zero em-dashes on any added line.
+- NOT RUN this job, still owed to the final job: `test/security` and `test/wrap`
+  whole, `node scripts/check-assurance-matrix.mjs`,
+  `npm run check-import-cycles` (the new static imports of
+  `egress-gate/gate-account.js`, `egress-gate/gate-daemon.js` and
+  `egress-gate/surrogate-helper-daemon.js` from `cli/secrets.ts` MUST be
+  re-checked for a cycle before the final push), the `.test-baseline` recompute
+  from the LINUX count, and the full suite.
+
+### fail-before witnesses (Job 4): what was ACTUALLY observed
+
+| Guard | Observed this job | Status |
+|---|---|---|
+| CLI argv chokepoint rejects a hand-rolled `indexOf` in `src/cli/` | `npx vitest run test/structure/cli-argv-parser-chokepoint.test.ts` FAILED with the offender line quoted (`src/cli/secrets.ts:891`), failed again with the marker four lines above the call, and passes with the marker adjacent | **CAPTURED**, a genuine three-state before/after |
+| `revoke` and `remove` reach a keychain on the success path | both ENOENT cases FAILED (exit 1, not 0) before the `brokerBackend` seam was threaded, which is what showed `cmdRevoke` continues into `openBroker` after the surrogate half | **CAPTURED as a discovery**, not as a guard-removed witness |
+| unlock refuses without a verified hard core limit of 0 | not attempted in guard-removed form | **OWED**: delete the `hardLimit !== NO_CORE_HARD_LIMIT` arm and record the failure |
+| unlock refuses before any keychain read when the helper is absent | not attempted in guard-removed form | **OWED**: move the probe below `openSurrogateStore` and record `keychainReads` going non-empty |
+| `events` refuses when not root | not attempted in guard-removed form | **OWED** |
+| remove and revoke refuse on EACCES, timeout and malformed | not attempted in guard-removed form | **OWED**: make `indeterminate` fall through to `unarmed` and record the four failures |
+
+Everything marked OWED is work for a later job. The BUILD_REPORT must not claim
+a witness that no run produced.
