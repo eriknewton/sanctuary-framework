@@ -84,6 +84,16 @@ import { SURROGATE_WIRE_VERSION } from "../credential-surrogate/wire.js";
 export const GATE_SURROGATE_DIR = "/var/db/sanctuary/gate-surrogate";
 
 /**
+ * The mode the runtime-fs plan applies to {@link GATE_SURROGATE_DIR}. Declared
+ * here, beside the directory and the reasoning above, and imported by
+ * `runtime-fs-plan.ts` rather than restated there, so the plan and the daemon
+ * can never state two different modes for the one directory (the precedent is
+ * `AGENT_HARNESS_HOLD_DIR_MODE`, which that plan already imports for the same
+ * reason).
+ */
+export const GATE_SURROGATE_DIR_MODE = 0o711;
+
+/**
  * The GATE uid's query socket. Owned by the gate uid, mode 0600.
  *
  * Distinct from {@link surrogateUnlockSocketPath} by name as well as by owner:

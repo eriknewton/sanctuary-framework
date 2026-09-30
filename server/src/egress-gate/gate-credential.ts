@@ -371,6 +371,29 @@ export function gateCredentialTokenPath(agentUid: number, dir: string = GATE_CRE
 }
 
 /**
+ * The uid's agent-readable SURROGATE PLACEHOLDER file path (credential
+ * surrogacy, design 3.2). It lives beside the bearer token, owned by the agent
+ * uid at 0600, and carries only `ENV_NAME=<placeholder>` lines: no value and
+ * no destination, so an agent that reads it learns the names it will be handed
+ * and nothing about the credentials behind them.
+ *
+ * It sits HERE rather than in `surrogate-helper-daemon.ts` because the helper
+ * never reads it. Its writer is root arming and its reader is the release exec
+ * wrapper running as the agent uid, which is the same writer/reader pair as
+ * the `.token` file above, and the pair is what fixes the directory and the
+ * mode. The two root-0600 and gate-0600 surrogate artifacts live under
+ * `gate-surrogate` instead, and their paths are in `surrogate-helper-daemon.ts`
+ * with the helper that reads one of them.
+ *
+ * The wrapper derives this path from its own `TOKEN_FILE` argument rather than
+ * calling this function (it runs before any module of this tree is loaded), so
+ * the suffix here must match the one `release-barrier.ts` substitutes.
+ */
+export function gateSurrogatePlaceholderPath(agentUid: number, dir: string = GATE_CRED_DIR): string {
+  return `${dir}/${agentUid}.surrogates`;
+}
+
+/**
  * The fs surface {@link createFsGateCredentialAuthority} writes through.
  * Injectable (tests pin the EXACT ownership/mode sequence with a recorder,
  * fix-round BLOCKER-2); production uses `node:fs/promises`.

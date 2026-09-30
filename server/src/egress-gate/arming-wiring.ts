@@ -43,7 +43,7 @@ import {
   createPublicKey,
   type KeyObject,
 } from "node:crypto";
-import { chmod, chown, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, normalize as normalizePath } from "node:path";
 
 import {
@@ -73,6 +73,7 @@ import {
   createFsGateCredentialAuthority,
   gateCredentialAcceptPath,
   gateCredentialTokenPath,
+  gateSurrogatePlaceholderPath,
 } from "./gate-credential.js";
 import { deriveGateAccountName, planAndCreateGateAccount } from "./gate-account.js";
 import {
@@ -130,6 +131,28 @@ import {
 } from "./peer-resolver-daemon.js";
 import { diffTransientPfRules } from "./drift-guard.js";
 import { ensureExclusiveEgressRuntimeFs } from "./runtime-fs-plan.js";
+import {
+  surrogateBindingsPath,
+  surrogateDestinationsPath,
+  surrogateHelperDaemonLabel,
+  surrogateHelperDaemonPlistPath,
+  renderSurrogateHelperDaemonPlist,
+} from "./surrogate-helper-daemon.js";
+import {
+  SURROGATE_BINDINGS_FILE_KIND,
+  readSurrogateArtifactGeneration,
+  renderSurrogateBindingsFile,
+  renderSurrogateDestinationsFile,
+  renderSurrogatePlaceholderFile,
+} from "../credential-surrogate/artifacts.js";
+import type { MintedSurrogateBinding } from "../credential-surrogate/binding.js";
+import { MAX_SURROGATE_BINDINGS_PER_HOST } from "../credential-surrogate/constants.js";
+import { mintSurrogatePlaceholder } from "../credential-surrogate/placeholder.js";
+import { findSurrogateGrantConflicts } from "../disclosure/broker/policy.js";
+import {
+  loadBrokerGrantsClassified,
+  loadSurrogatePolicyDocument,
+} from "../disclosure/broker/open.js";
 import {
   buildExclusiveEgressPosture,
   summarizeExclusiveEgressStatus,
@@ -864,6 +887,40 @@ async function productionBringUp(
   const credAuthority = createFsGateCredentialAuthority({ gateUid: state.gateUid });
   await credAuthority.mint({ agentUid: input.agentUid, generationId: committed.generation_id });
 
+  // Credential surrogacy (design 3.2, 3.4.1): mint the generation's
+  // placeholders IMMEDIATELY after the bearer mint, from the SAME `committed`
+  // generation, and install the helper BEFORE the resolver and gate reloads
+  // below, so the query socket exists before the gate serves its first
+  // request. This is the ONLY mint site in the tree.
+  //
+  // Both branches are teardown-complete. A fortress that HAD bindings and no
+  // longer does must not leave a root helper running for an agent whose policy
+  // no longer authorizes it, so the no-bindings branch boots the helper out and
+  // deletes its plist and all three artifacts rather than simply not writing
+  // them. Every failure here THROWS and the bring-up fails closed, the same as
+  // a resolver reload failure.
+  const surrogatePlan = await resolveSurrogateBringUpPlan({
+    agentId: input.agentId,
+    storagePath: input.fortressPath,
+    generationId: committed.generation_id,
+  });
+  if (surrogatePlan.kind === "install") {
+    await installSurrogateHelperForBringUp({
+      agentUid: input.agentUid,
+      gateUid: state.gateUid,
+      operatorUid: surrogatePlan.operatorUid,
+      generationId: committed.generation_id,
+      bindings: surrogatePlan.bindings,
+      fortressPath: input.fortressPath,
+      gateDaemonArgvPrefix: input.gateDaemonArgvPrefix,
+    });
+  } else {
+    await removeSurrogateHelperForAgent({
+      agentUid: input.agentUid,
+      context: "bring-up with no surrogate bindings",
+    });
+  }
+
   // 2026-07-24 S5-3 fix (Option 1): install + (re)load the PRIVILEGED
   // peer-resolver daemon (root) BEFORE the gate daemon starts serving, so the
   // gate's peer lookups have somewhere to dial from its very first CONNECT.
@@ -1340,6 +1397,385 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
     runLaunchctlFn: run,
     ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Credential surrogacy: the helper daemon as a member of the arming twin
+// (design 3.4.1). Every path that starts, reloads, verifies or removes the
+// GATE does the same to the helper, because a root process holding credential
+// values for an agent whose gate is down is unaccounted-for privilege, the
+// same M5 reasoning `restoreCoarseCompositionProduction` step 0b applies to
+// the peer resolver.
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the surrogate and broker policy documents live for one agent.
+ *
+ * The fortress path IS the broker's storage path (`brokerPolicyPath` and
+ * `surrogatePolicyPath` both join onto it), so arming reads the exact file the
+ * operator's `secrets surrogate add` wrote and the exact file `openBroker`
+ * refuses against. Overridable only so the arming tests can point at a temp
+ * fortress; production never passes it.
+ */
+export interface SurrogatePolicySource {
+  storagePath: string;
+}
+
+/** What {@link resolveSurrogateBringUpPlan} decided for one agent. */
+export type SurrogateBringUpPlan =
+  | { kind: "none" }
+  | { kind: "install"; bindings: MintedSurrogateBinding[]; operatorUid: number };
+
+/**
+ * Parse both policies, refuse to arm on a conflict or a cap breach, and mint
+ * one placeholder per binding for THIS committed generation.
+ *
+ * THIS IS THE ONE MINT SITE (design 3.2). The boot supervisor, the release
+ * barrier and `commitGeneration` all read placeholders that already exist and
+ * never call {@link mintSurrogatePlaceholder}: a second mint site would hand
+ * the agent a placeholder the helper's table has never heard of, and the gate
+ * would answer `unknown_placeholder` for a value the operator had just
+ * unlocked.
+ *
+ * REFUSALS ARE ARMING FAILURES, not degradations. A present-and-broken policy
+ * file, a binding whose secret also carries a broker `read` or `rotate` grant,
+ * or a host over {@link MAX_SURROGATE_BINDINGS_PER_HOST} all throw, and the
+ * bring-up fails closed exactly as a resolver reload failure does. An ABSENT
+ * file is the normal case and yields `none`; the ENOENT split is the loader's
+ * (`loadSurrogatePolicyDocument`), not re-implemented here.
+ *
+ * The refusal text carries a fixed failure class and never the parser's own
+ * message, because that message is derived from a document that names secrets.
+ */
+export async function resolveSurrogateBringUpPlan(input: {
+  agentId: string;
+  storagePath: string;
+  generationId: number;
+  /** Injected only by tests; production reads the fortress directory owner. */
+  statFn?: (path: string) => Promise<{ uid: number }>;
+}): Promise<SurrogateBringUpPlan> {
+  const loaded = await loadSurrogatePolicyDocument(input.storagePath);
+  if (loaded.outcome === "failed") {
+    throw new Error(
+      `surrogate policy present and unusable (${loaded.failureClass}); refusing to arm. ` +
+        "Arming over an unreadable binding table would start a helper whose view of which " +
+        "credential may be spent where is not the operator's.",
+    );
+  }
+  if (loaded.outcome === "absent") return { kind: "none" };
+
+  // The per-HOST cap, enforced here because this is the only place that sees
+  // every agent's bindings at once, and under the provision lock the bring-up
+  // already holds. The parser owns the per-AGENT cap; both are stated in
+  // `credential-surrogate/constants.ts` with their derivations.
+  if (loaded.document.bindings.length > MAX_SURROGATE_BINDINGS_PER_HOST) {
+    throw new Error(
+      `surrogate policy declares ${loaded.document.bindings.length} bindings, over the host ceiling ` +
+        `of ${MAX_SURROGATE_BINDINGS_PER_HOST}; refusing to arm.`,
+    );
+  }
+
+  const grants = await loadBrokerGrantsClassified(input.storagePath);
+  if (grants.outcome === "failed") {
+    throw new Error(
+      "broker policy present and unusable; refusing to arm with surrogate bindings. " +
+        "The conflict check below cannot run without the grant list, and arming without it " +
+        "would be arming without knowing whether a bound secret is also reachable by token.",
+    );
+  }
+  const conflicts = findSurrogateGrantConflicts(
+    loaded.document.bindings,
+    grants.outcome === "loaded" ? grants.grants : [],
+  );
+  if (conflicts.length > 0) {
+    // The names ARE the conflict and are already in both policy files this
+    // operator wrote; nothing about a VALUE is disclosed by naming them.
+    throw new Error(
+      `refusing to arm: ${conflicts.length} secret(s) are bound as surrogates AND carry a broker ` +
+        `read or rotate grant (${conflicts.join(", ")}). Remove one or the other.`,
+    );
+  }
+
+  const mine = loaded.document.bindings.filter((b) => b.agent === input.agentId);
+  if (mine.length === 0) return { kind: "none" };
+
+  // Ordinals are assigned HERE, dense from 0 in policy order, and are what
+  // every gate event names instead of a secret name or an env name. They are
+  // stable only within one generation, which is why the artifacts all carry
+  // the generation in their header.
+  const bindings: MintedSurrogateBinding[] = mine.map((binding, index) => ({
+    ...binding,
+    ordinal: index,
+    placeholder: mintSurrogatePlaceholder(),
+  }));
+
+  const statFn = input.statFn ?? (async (path: string) => stat(path));
+  const operatorUid = (await statFn(input.storagePath)).uid;
+  return { kind: "install", bindings, operatorUid };
+}
+
+/** Injected file side effects for the surrogate bring-up (production is root). */
+export interface SurrogateArmingFsOps {
+  writeFileAs(path: string, content: string, uid: number, mode: number): Promise<void>;
+  removeFile(path: string): Promise<void>;
+}
+
+function createRealSurrogateArmingFsOps(): SurrogateArmingFsOps {
+  return {
+    async writeFileAs(path: string, content: string, uid: number, mode: number): Promise<void> {
+      // Atomic tmp+rename with the FINAL mode on the tmp file, then chown, then
+      // a re-chmod: the same order `writeFileCustody` uses and for the same
+      // reason. The file must never exist, even for an instant, at a mode or an
+      // owner wider than its final one, because two of these three files are
+      // readable by a principal that must not see the other two.
+      const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+      await writeFile(tmp, content, { mode });
+      try {
+        await chmod(tmp, mode);
+        await chown(tmp, uid, 0);
+        await rename(tmp, path);
+      } catch (err) {
+        await rm(tmp, { force: true }).catch(() => undefined);
+        throw err;
+      }
+    },
+    async removeFile(path: string): Promise<void> {
+      await rm(path, { force: true });
+    },
+  };
+}
+
+/**
+ * The three artifact paths for one agent, in one place, so every teardown path
+ * below removes the same set. A path this function forgets is a file that
+ * survives an unprotect.
+ */
+export function surrogateArtifactPaths(agentUid: number): {
+  placeholders: string;
+  bindings: string;
+  destinations: string;
+  plist: string;
+} {
+  return {
+    placeholders: gateSurrogatePlaceholderPath(agentUid),
+    bindings: surrogateBindingsPath(agentUid),
+    destinations: surrogateDestinationsPath(agentUid),
+    plist: surrogateHelperDaemonPlistPath(agentUid),
+  };
+}
+
+/**
+ * Boot out the helper for one agent and delete its plist and all three
+ * artifacts. Used by the no-bindings branch of the bring-up and by both
+ * teardown paths.
+ *
+ * `throwOnBootoutFailure` is the difference between the two callers, stated
+ * rather than inferred: the bring-up's no-bindings branch and the teardowns
+ * all throw (a helper that will not stop is unaccounted-for privilege), and
+ * nothing here tolerates a failure silently. A not-loaded bootout is success
+ * on every path.
+ */
+export async function removeSurrogateHelperForAgent(input: {
+  agentUid: number;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  fsOps?: SurrogateArmingFsOps;
+  context: string;
+}): Promise<void> {
+  const launchctl = input.runLaunchctlFn ?? runLaunchctl;
+  const fs = input.fsOps ?? createRealSurrogateArmingFsOps();
+  const label = surrogateHelperDaemonLabel(input.agentUid);
+  const bootout = await launchctl(["bootout", `system/${label}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    throw new Error(
+      `${input.context}: could not stop the surrogate helper daemon (launchctl bootout exited ` +
+        `${bootout.code}: ${bootout.stderr.trim()}); refusing to continue with a root process that ` +
+        "may still be holding credential values",
+    );
+  }
+  const paths = surrogateArtifactPaths(input.agentUid);
+  await fs.removeFile(paths.plist);
+  await fs.removeFile(paths.bindings);
+  await fs.removeFile(paths.destinations);
+  await fs.removeFile(paths.placeholders);
+}
+
+/**
+ * Write the three artifacts, render the helper plist and RELOAD the helper.
+ *
+ * ORDER (design 3.4.1, and it is load-bearing): the helper reload happens
+ * BEFORE the resolver reload and therefore before the gate reload, so the
+ * query socket exists before the gate serves its first request. A gate that
+ * dialed a socket the helper had not created yet would deny with
+ * `surrogate-helper-unavailable` for the whole window, which reads to an
+ * operator as a policy that is not in force.
+ *
+ * WRITE ORDER inside the step: bindings (root) first, then destinations (gate
+ * uid), then the agent's placeholder file LAST. The placeholder file is the
+ * only one the agent can read, and a placeholder the agent holds before the
+ * helper's table knows it is a placeholder that resolves to nothing.
+ *
+ * A reload failure THROWS. The bring-up then fails closed exactly as a
+ * resolver reload failure does; a half-armed surrogate path is never left
+ * running.
+ */
+export async function installSurrogateHelperForBringUp(input: {
+  agentUid: number;
+  gateUid: number;
+  operatorUid: number;
+  generationId: number;
+  bindings: readonly MintedSurrogateBinding[];
+  fortressPath: string;
+  gateDaemonArgvPrefix: string[];
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  fsOps?: SurrogateArmingFsOps;
+  sleepMs?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const fs = input.fsOps ?? createRealSurrogateArmingFsOps();
+  const paths = surrogateArtifactPaths(input.agentUid);
+  // Root 0600: the helper and root at release commit are the only readers, and
+  // this is the file that names which credential is spent where.
+  await fs.writeFileAs(
+    paths.bindings,
+    renderSurrogateBindingsFile(input.generationId, input.bindings),
+    0,
+    0o600,
+  );
+  // Gate uid 0600: the gate is entitled to the destination set and to nothing
+  // else in the table (design 3.2, finding A2-S2). The agent uid cannot open
+  // it, so the agent cannot read its own credential-use map.
+  await fs.writeFileAs(
+    paths.destinations,
+    renderSurrogateDestinationsFile(input.generationId, input.bindings),
+    input.gateUid,
+    0o600,
+  );
+  // Agent uid 0600, beside the bearer `.token` and for the same reason: the
+  // release wrapper reads it as the agent. Names and placeholders only.
+  await fs.writeFileAs(
+    paths.placeholders,
+    renderSurrogatePlaceholderFile(input.generationId, input.bindings),
+    input.agentUid,
+    0o600,
+  );
+
+  const plistContent = renderSurrogateHelperDaemonPlist({
+    agentUid: input.agentUid,
+    gateUid: input.gateUid,
+    operatorUid: input.operatorUid,
+    generation: input.generationId,
+    programArguments: [
+      ...input.gateDaemonArgvPrefix,
+      "castle-wall",
+      "surrogate-helper-daemon",
+      `--agent-uid=${input.agentUid}`,
+      `--gate-uid=${input.gateUid}`,
+      `--operator-uid=${input.operatorUid}`,
+      `--generation=${input.generationId}`,
+    ],
+    fortressPath: input.fortressPath,
+  });
+  await atomicRootWrite(paths.plist, plistContent, 0o644);
+  await reloadLaunchdDaemonForBringUp({
+    label: surrogateHelperDaemonLabel(input.agentUid),
+    plistPath: paths.plist,
+    ...(input.runLaunchctlFn !== undefined ? { runLaunchctlFn: input.runLaunchctlFn } : {}),
+    ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
+  });
+}
+
+/**
+ * Boot-path bootstrap for the surrogate helper, the peer resolver's shape
+ * ({@link bootstrapPeerResolverDaemonForBoot}) with one extra pre-condition.
+ *
+ * ONLY when `gate-surrogate/<uid>.bindings` exists. An agent with no bindings
+ * has no helper to start, and bootstrapping a label whose plist is absent
+ * would turn "this agent never used surrogacy" into a loud boot failure.
+ *
+ * The boot path NEVER MINTS. The on-disk plist and the on-disk bindings still
+ * carry the registry's committed generation, so argv and file agree and the
+ * helper's own generation check passes; a helper started here holds no values
+ * and starts LOCKED, because a reboot is exactly the event that must lose
+ * every unlocked value.
+ */
+export async function bootstrapSurrogateHelperDaemonForBoot(input: {
+  agentUid: number;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  /** TEST-ONLY: replaces the reload chokepoint's bootout-settle sleep. */
+  sleepMs?: (ms: number) => Promise<void>;
+  /** TEST-ONLY: replaces the bindings-file existence probe. */
+  bindingsPresent?: (path: string) => Promise<boolean>;
+}): Promise<void> {
+  const bindingsPath = surrogateBindingsPath(input.agentUid);
+  const present =
+    input.bindingsPresent !== undefined
+      ? await input.bindingsPresent(bindingsPath)
+      : await stat(bindingsPath).then(
+          () => true,
+          () => false,
+        );
+  if (!present) return;
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = surrogateHelperDaemonLabel(input.agentUid);
+  const preCheck = await launchdDaemonStatusByLabel(run, label);
+  if (preCheck.running === true) {
+    return;
+  }
+  await reloadLaunchdDaemonForBringUp({
+    label,
+    plistPath: surrogateHelperDaemonPlistPath(input.agentUid),
+    runLaunchctlFn: run,
+    ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
+  });
+}
+
+/**
+ * The release-commit VERIFY step (design 3.4.1, release-commit row). Reads the
+ * bindings file's header generation AS ROOT and throws when it differs from the
+ * generation being committed.
+ *
+ * This is a verify, not a regeneration: it never mints and never rewrites the
+ * file. A mismatch means the helper on this host is serving a table from a
+ * generation that is no longer current, and the barrier maps the throw to a
+ * loud park. The release wrapper's own check over the AGENT-readable
+ * placeholder file (design 3.2) is the second, independent layer; this one runs
+ * as root over the file the agent cannot read, so the two cannot be defeated by
+ * the same tampering.
+ *
+ * An absent file is success: an agent with no bindings commits normally.
+ */
+export async function verifySurrogateBindingsGenerationForCommit(input: {
+  agentUid: number;
+  generationId: number;
+  readBindingsHeader?: (path: string) => Promise<string | null>;
+}): Promise<void> {
+  const path = surrogateBindingsPath(input.agentUid);
+  const read =
+    input.readBindingsHeader ??
+    (async (p: string): Promise<string | null> => {
+      try {
+        return await readFile(p, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+    });
+  const text = await read(path);
+  if (text === null) return;
+  let onDisk: number;
+  try {
+    onDisk = readSurrogateArtifactGeneration(text, SURROGATE_BINDINGS_FILE_KIND);
+  } catch {
+    throw new Error(
+      `surrogate binding table for uid ${input.agentUid} is unreadable; refusing to release. ` +
+        "A helper may be serving a table nobody can account for.",
+    );
+  }
+  if (onDisk !== input.generationId) {
+    throw new Error(
+      `surrogate binding table for uid ${input.agentUid} names generation ${onDisk}, but generation ` +
+        `${input.generationId} is being committed; refusing to release. Re-arm to rebuild it.`,
+    );
+  }
 }
 
 /**
@@ -1841,6 +2277,16 @@ export function createProductionReleaseBarrierOps(input: {
       if (committed === null) {
         throw new Error(`no committed generation for uid ${input.agentUid}; refusing to release`);
       }
+      // Credential surrogacy (design 3.4.1, release-commit row): VERIFY, never
+      // allocate. If a binding table exists for this uid, its header must name
+      // the generation being committed; a throw here is mapped to a loud park
+      // by the barrier. This runs as root over the file the agent cannot read,
+      // so it is independent of the wrapper's own check over the agent-readable
+      // placeholder file.
+      await verifySurrogateBindingsGenerationForCommit({
+        agentUid: input.agentUid,
+        generationId: committed.generation_id,
+      });
       return committed;
     },
     async writeReleasedPlist(committed): Promise<void> {
@@ -2093,6 +2539,19 @@ export async function restoreCoarseCompositionProduction(
         `${resolverBootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live root resolver`,
     );
   }
+  // 0c. The SURROGATE HELPER down too (credential surrogacy, design 3.4.1):
+  // it is a root process holding credential VALUES in memory for an agent
+  // whose gate just stopped, which is the sharpest case of the step 0b
+  // reasoning, not a softer one. A failure other than not-loaded THROWS. Its
+  // plist and artifacts come off at step 3, after the surfaces above.
+  const surrogateBootout = await launchctl(["bootout", `system/${surrogateHelperDaemonLabel(input.agentUid)}`]);
+  if (surrogateBootout.code !== 0 && !launchctlBootoutWasNotLoaded(surrogateBootout)) {
+    throw new Error(
+      `coarse restore: could not stop the surrogate helper daemon (launchctl bootout exited ` +
+        `${surrogateBootout.code}: ${surrogateBootout.stderr.trim()}); refusing to tear down the gate ` +
+        "surfaces under a root process that may still be holding credential values",
+    );
+  }
   // 1. Marker + gate policy OFF next: from the next compose the daemon is in
   // plain coarse mode (gate-scoped rules briefly compose coarse -- the agent
   // has no direct allows in that window, which is the safe direction).
@@ -2129,6 +2588,18 @@ export async function restoreCoarseCompositionProduction(
   await removeFile(egressGatePolicyConfigPath(input.agentUid));
   await removeFile(egressGateRulesConfigPath(input.agentUid));
   await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
+  // The surrogate helper plist and all three artifacts (helper already stopped
+  // in step 0c). Leaving the agent-readable placeholder file behind would let
+  // a degraded agent start with env names pointing at placeholders no helper
+  // will ever resolve; leaving the bindings file behind would let the next
+  // boot supervisor bootstrap a helper for a policy no longer in force.
+  {
+    const surrogatePaths = surrogateArtifactPaths(input.agentUid);
+    await removeFile(surrogatePaths.plist);
+    await removeFile(surrogatePaths.bindings);
+    await removeFile(surrogatePaths.destinations);
+    await removeFile(surrogatePaths.placeholders);
+  }
   // 4. Republish the endpoint rules AGENT-scoped (coarse) + reload.
   const published = await input.publishProvisionedRules({ mode: "coarse" });
   if (!published.ok) {
@@ -3272,6 +3743,17 @@ export function createUnprotectExclusiveEgressOps(
           `launchctl bootout ${resolverLabel} exited ${resolverBootout.code}: ${resolverBootout.stderr.trim()}`,
         );
       }
+      // Then the SURROGATE HELPER, after the resolver and with the same throw
+      // (credential surrogacy, design 3.4.1): a root process still holding
+      // credential values for an agent being unprotected is the unaccounted-for
+      // privilege this whole ordering exists to prevent.
+      const surrogateLabel = surrogateHelperDaemonLabel(input.agentUid);
+      const surrogateBootout = await launchctl(["bootout", `system/${surrogateLabel}`]);
+      if (surrogateBootout.code !== 0 && !launchctlBootoutWasNotLoaded(surrogateBootout)) {
+        throw new Error(
+          `launchctl bootout ${surrogateLabel} exited ${surrogateBootout.code}: ${surrogateBootout.stderr.trim()}`,
+        );
+      }
     },
     async invalidateOracleToken(): Promise<void> {
       await removeFile(gateLivenessTokenPath(input.agentUid));
@@ -3279,6 +3761,11 @@ export function createUnprotectExclusiveEgressOps(
     async revokeCredential(): Promise<void> {
       await removeFile(gateCredentialAcceptPath(input.agentUid));
       await removeFile(gateCredentialTokenPath(input.agentUid));
+      // The agent-readable surrogate placeholder file is a credential surface
+      // in the same sense the bearer token is (it is what the release wrapper
+      // exports into the harness environment), so it is revoked here rather
+      // than with the gate surfaces below.
+      await removeFile(gateSurrogatePlaceholderPath(input.agentUid));
     },
     async removeGateSurfaces(): Promise<void> {
       // The leaving uid is the sole exclusive agent (step 0 invariant), so
@@ -3289,6 +3776,11 @@ export function createUnprotectExclusiveEgressOps(
       await removeFile(egressGatePolicyConfigPath(input.agentUid));
       await removeFile(egressGateRulesConfigPath(input.agentUid));
       await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
+      // The surrogate helper plist and its two root/gate-owned artifacts (the
+      // agent-readable placeholder file went with the credential above).
+      await removeFile(surrogateHelperDaemonPlistPath(input.agentUid));
+      await removeFile(surrogateBindingsPath(input.agentUid));
+      await removeFile(surrogateDestinationsPath(input.agentUid));
       // Fortress exclusive-routing marker + gate policy file (single-uid /
       // fortress-keyed; safe to remove because no sibling shares them).
       await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
@@ -3411,6 +3903,12 @@ export interface ExclusiveEgressBootSupervisorInternals {
    * `launchctl print` samples). Absent = production's real timer.
    */
   gateReloadSleepMs?: (ms: number) => Promise<void>;
+  /**
+   * TEST-ONLY: replaces the surrogate helper's bindings-file existence probe,
+   * so the boot-path tests can say "this uid has bindings" without a file
+   * under a root-owned path. Absent = production's real `stat`.
+   */
+  surrogateBindingsPresent?: (path: string) => Promise<boolean>;
   loadMarker?: (fortressPath: string) => Promise<{ agent_uid: number; gate_uid: number } | null>;
   ensureRuntimeFs?: (input: { agentUid: number; gateUid: number }) => Promise<void>;
   ensureGateHomeLayout?: (input: {
@@ -3913,6 +4411,31 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(
             `[castle-wall] boot: uid ${agentUid} peer-resolver daemon bootstrap failed (${(err as Error).message}); ` +
               "the gate will deny CONNECTs fail-closed (peer_unresolved) until this is repaired.",
+          );
+        }
+        // Credential surrogacy (design 3.4.1, boot row): the surrogate helper
+        // goes up BETWEEN the resolver and the gate, and only when this uid
+        // has a binding table on disk. It starts LOCKED: a reboot is exactly
+        // the event that must lose every unlocked value, and the boot path
+        // never mints, so the plist argv and the file header still name the
+        // registry's committed generation and the helper's own check passes.
+        // A bootstrap failure LOGS and CONTINUES, the resolver precedent above:
+        // surrogate requests then deny 503 surrogate-helper-unavailable while
+        // CONNECT egress is unaffected, which is the honest degraded outcome.
+        try {
+          await bootstrapSurrogateHelperDaemonForBoot({
+            agentUid,
+            runLaunchctlFn: launchctlFn,
+            ...(internals.gateReloadSleepMs !== undefined ? { sleepMs: internals.gateReloadSleepMs } : {}),
+            ...(internals.surrogateBindingsPresent !== undefined
+              ? { bindingsPresent: internals.surrogateBindingsPresent }
+              : {}),
+          });
+        } catch (err) {
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} surrogate helper daemon bootstrap failed ` +
+              `(${(err as Error).message}); surrogate requests will deny fail-closed until this is ` +
+              "repaired. CONNECT egress is unaffected.",
           );
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;

@@ -50,7 +50,13 @@ import {
 import {
   gateCredentialAcceptPath,
   gateCredentialTokenPath,
+  gateSurrogatePlaceholderPath,
 } from "../../src/egress-gate/gate-credential.js";
+import {
+  surrogateBindingsPath,
+  surrogateDestinationsPath,
+  surrogateHelperDaemonPlistPath,
+} from "../../src/egress-gate/surrogate-helper-daemon.js";
 import {
   egressGateDaemonLabel,
   egressGateDaemonLogPaths,
@@ -1047,6 +1053,11 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     expect(calls).toEqual([
       "bootout system/ai.sanctuaryprotocol.egress-gate.601",
       "bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.601",
+      // Credential surrogacy (design 3.4.1, unprotect row): the helper goes
+      // out LAST and with the same throw, because a root process holding
+      // credential values for an agent being unprotected is the sharpest case
+      // of the unaccounted-for-privilege rule this ordering exists for.
+      "bootout system/ai.sanctuaryprotocol.surrogate-helper.601",
     ]);
   });
 
@@ -1077,6 +1088,11 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
       gateLivenessTokenPath(601),
       gateCredentialAcceptPath(601),
       gateCredentialTokenPath(601),
+      // The agent-readable placeholder file is revoked WITH the credential,
+      // not with the gate surfaces: it is what the release wrapper exports
+      // into the harness environment, so it is a credential surface in the
+      // same sense the bearer token is.
+      gateSurrogatePlaceholderPath(601),
     ]);
   });
 
@@ -1094,6 +1110,12 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
       egressGatePolicyConfigPath(601),
       egressGateRulesConfigPath(601),
       egressGateRuntimeUidDirPath(601),
+      // The helper plist and its two root/gate-owned artifacts. The
+      // agent-readable placeholder file is NOT here; it went with the
+      // credential in `revokeCredential` above.
+      surrogateHelperDaemonPlistPath(601),
+      surrogateBindingsPath(601),
+      surrogateDestinationsPath(601),
       exclusiveRoutingMarkerPath("/fortress/a"),
       `/fortress/a/policy/egress/${EXCLUSIVE_EGRESS_GATE_FILENAME}`,
     ]);

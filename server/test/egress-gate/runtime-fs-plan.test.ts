@@ -63,6 +63,12 @@ describe("planExclusiveEgressRuntimeFs", () => {
       { op: "mkdir", path: "/var/db/sanctuary/gate-peer-resolver" },
       { op: "chown", path: "/var/db/sanctuary/gate-peer-resolver", uid: 0, gid: 0 },
       { op: "chmod", path: "/var/db/sanctuary/gate-peer-resolver", mode: 0o711 },
+      // Credential surrogacy: same traversal model, and the mode comes from
+      // `GATE_SURROGATE_DIR_MODE` in `surrogate-helper-daemon.ts` so the plan
+      // and the daemon cannot state two different modes for one directory.
+      { op: "mkdir", path: "/var/db/sanctuary/gate-surrogate" },
+      { op: "chown", path: "/var/db/sanctuary/gate-surrogate", uid: 0, gid: 0 },
+      { op: "chmod", path: "/var/db/sanctuary/gate-surrogate", mode: 0o711 },
       // Hold dir: agent uid reads the hold file + wrapper.
       { op: "mkdir", path: "/var/db/sanctuary/agent-harness" },
       { op: "chown", path: "/var/db/sanctuary/agent-harness", uid: 0, gid: 0 },
@@ -133,7 +139,8 @@ describe("applyGateRuntimeFsPlan", () => {
     expect(calls).toContain("chmod /var/db/sanctuary/gate-cred 0o711");
     expect(calls).toContain("chmod /var/db/sanctuary/gate-liveness 0o711");
     expect(calls).toContain("chmod /var/db/sanctuary/gate-peer-resolver 0o711");
-    expect(calls).toHaveLength(21);
+    expect(calls).toContain("chmod /var/db/sanctuary/gate-surrogate 0o711");
+    expect(calls).toHaveLength(24);
   });
 
   it("fail-closed: the first failing step throws (named) and nothing continues", async () => {
