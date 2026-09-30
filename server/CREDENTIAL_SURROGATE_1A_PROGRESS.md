@@ -497,16 +497,25 @@ new), so their witness is the guard-removed form, owed to the next job.
   third unnamed full-suite failure Job 1 owed is STILL unnamed; name it from a
   pre-commit run in a job that can afford one).
 
-### fail-before witnesses captured (Job 3)
+### fail-before witnesses: what job 3 ACTUALLY observed, and what is OWED
 
-| Guard | Command | Guard-removed or base result | Head result |
-|---|---|---|---|
-| one codec per socket | `npx vitest run test/egress-gate/surrogate-helper-daemon-runtime.test.ts` with the unlock listener wired to `parseSurrogateQueryRequest` | the two `one codec per socket` cases fail: the query socket accepts an unlock frame | 24 passed |
-| helper refuses a generation mismatch | same file | with the header-versus-argv check removed, the mismatch case fails (the helper starts) | 24 passed |
-| over-cap unlock frame refused before `JSON.parse` | same file | with the accumulated-buffer cap check removed, the oversize case hangs waiting for a newline instead of answering | 24 passed |
-| TTL clamped, not refused | `npx vitest run test/credential-surrogate/codecs.test.ts` | on the tree BEFORE this job, an over-clamp TTL parsed as `null` and the clamp was unreachable | 92 passed with the clamp pinned |
+Read this table literally. Job 3 ran out of session budget before it could
+capture guard-removed runs, so most of its guards have NO witness yet. Nothing
+below is inferred; an owed row is owed.
+
+| Guard | Observed this job | Status |
+|---|---|---|
+| TTL clamped by the relying side, not refused by the codec | `npx vitest run test/credential-surrogate/codecs.test.ts` FAILED on the pre-change tree (1 failed of 79: the over-clamp TTL parsed, where the old test asserted `null`), and passes after the codec and the test were both changed | **CAPTURED**, and it is a genuine before/after: the failing run is in this session's transcript |
+| value byte and length rules refused at the shared parser | the runtime test's three unlock cases FAILED against the helper's own duplicated checks (they answered `malformed` where the test expected `illegal_value_byte` and `value_too_long`), which is what showed the parser was the real enforcement site | **CAPTURED as a discovery**, not as a guard-removed witness |
+| `too_many_bindings` distinguished from `bindings_unreadable` | the cap case FAILED with `bindings_unreadable` before the refusal was mapped through, and passes after | **CAPTURED** |
+| claim-literal ratchet, surrogate keychain label guard | both FAILED on the tree before they were re-recorded, with the exact drift lines quoted in this session | **CAPTURED** |
+| one codec per socket (query frame on the unlock socket and the reverse) | not attempted | **OWED**: rewire the unlock listener to the query parser and record the failure |
+| helper refuses a generation mismatch | not attempted | **OWED**: remove the header-versus-argv check and record the failure |
+| over-cap unlock frame refused before `JSON.parse` | not attempted | **OWED**: remove the accumulated-buffer cap check and record the failure |
+| helper refuses a bad `--operator-uid` | not attempted this job (the argv parser and its test landed in Job 2, also without a witness) | **OWED** |
+| the four query conditions, the rate limit, the fault schedule | not attempted | **OWED**: each needs its guard-removed form |
 
 The helper-plist and argv guards still have no base tree to fail against (the
-file is new); their witness remains the guard-removed form, and the guard-removed
-runs above were done by hand and not scripted, so the final job should re-run the
-three it wants to quote verbatim in the BUILD_REPORT.
+file is new), so their witness must be the guard-removed form. Everything marked
+OWED above is work for a later job, and the BUILD_REPORT must not claim a
+witness that no run produced.
