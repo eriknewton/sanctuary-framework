@@ -1315,6 +1315,27 @@ export const BROKER_OPS = {
   TOKEN_ISSUED: "broker_token_issued",
   TOKEN_DENIED: "broker_token_denied",
   BACKEND_UNLOCKED: "broker_backend_unlocked",
+  // Credential surrogacy (design v2.1 section 3.10), additive. These are the
+  // OPERATOR-side records; per-request gate decisions are `EgressGateEvent`
+  // kinds in the gate's own log, because the gate uid holds no master key and so
+  // cannot write this chain. Details carry an agent uid, a generation, secret
+  // names and fixed failure classes, never a value, a placeholder or parser text.
+  /** An operator unlock accepted by the helper THROUGH THE CLI. `appendCritical`. */
+  SURROGATE_UNLOCKED: "broker_surrogate_unlocked",
+  /** A token issue or read refused because the secret is surrogate-bound. `appendCritical`. */
+  SURROGATE_TOKEN_REFUSED: "broker_surrogate_token_refused",
+  /** A surrogate binding added by the operator. `appendCritical`. */
+  SURROGATE_BOUND: "broker_surrogate_bound",
+  /** A surrogate binding removed by the operator. `appendCritical`. */
+  SURROGATE_REMOVED: "broker_surrogate_removed",
+  /**
+   * A policy file that was PRESENT and failed to read or parse. `append`.
+   *
+   * Never fired for ENOENT (round-2 finding B2-S6): an absent policy file is the
+   * normal no-policy case, and auditing it would write a line on every load for
+   * every fortress that has no bindings.
+   */
+  POLICY_LOAD_FAILED: "broker_policy_load_failed",
 } as const;
 
 export type BrokerOp = (typeof BROKER_OPS)[keyof typeof BROKER_OPS];

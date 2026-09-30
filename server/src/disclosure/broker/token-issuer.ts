@@ -146,6 +146,14 @@ export interface TokenIssuerOptions {
   maxLiveTokensPerCaller?: number;
 }
 
+/**
+ * Scope ordering: `rotate` implies `read`.
+ *
+ * PIN: `surrogate` is NOT a token scope; it must not be added here. Surrogate
+ * bindings live in `surrogate-policy.json`, parsed by
+ * `parseSurrogatePolicyDocument` in `policy.ts`. Must stay in step with
+ * `SecretScope` in `backend-interface.ts`.
+ */
 const SCOPE_RANK: Record<SecretScope, number> = { read: 1, rotate: 2 };
 
 function scopeSatisfies(requested: SecretScope, grant: SecretScope): boolean {

@@ -22,7 +22,13 @@ import { AuditLog } from "../../operational/audit-log.js";
 import { getOrCreatePassphrase } from "../../wrap/passphrase.js";
 import { KeychainBackend } from "./keychain-backend.js";
 import { Broker } from "./broker.js";
-import { parseBrokerPolicy } from "./policy.js";
+import {
+  SurrogatePolicyError,
+  parseBrokerPolicy,
+  parseSurrogatePolicyDocument,
+  type SurrogatePolicyDocument,
+  type SurrogatePolicyFailureClass,
+} from "./policy.js";
 import type { Backend } from "./backend-interface.js";
 
 export interface OpenBrokerOptions {
@@ -154,5 +160,101 @@ export async function loadBrokerPolicyRaw(
     return { skills: [] };
   } catch {
     return { skills: [] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Surrogate policy file: a SEPARATE document old writers never touch
+// ---------------------------------------------------------------------------
+//
+// `brokerPolicyPath` above, `saveBrokerPolicy`, `loadBrokerPolicyRaw` and the
+// `secrets grant` / `secrets revoke` writers in `cli/secrets.ts` all read and
+// write `broker-policy.json` ONLY. Keeping bindings out of that file is what makes
+// a rollback safe: an old build keeps serving ordinary grants and simply never
+// sees surrogacy (design v2.1 section 3.3, round-2 finding A2-B2).
+
+/**
+ * Path of the surrogate binding policy, beside `broker-policy.json` and never
+ * inside it.
+ */
+export function surrogatePolicyPath(storagePath: string): string {
+  return join(storagePath, "surrogate-policy.json");
+}
+
+/**
+ * Write the surrogate policy owner-only from the first byte.
+ *
+ * Mode and parent mode match `saveBrokerPolicy` above for the same reason stated
+ * there: this file is a direct fortress-root child, and once a file-grant fortress
+ * traverse ACE is live the agent uid can open root children by known name during a
+ * lax-creation window. It holds secret NAMES, env names, bound headers and
+ * destination hosts, which together are a map of which credential is spent where.
+ */
+export async function saveSurrogatePolicy(
+  storagePath: string,
+  document: SurrogatePolicyDocument,
+): Promise<void> {
+  // Re-parse before writing, so a caller cannot persist a document that the
+  // loader, root arming and the helper would then refuse. The write side and the
+  // read side share one grammar.
+  const validated = parseSurrogatePolicyDocument(document);
+  await writeFileCustody(surrogatePolicyPath(storagePath), JSON.stringify(validated, null, 2), {
+    mode: 0o600,
+    parentMode: 0o700,
+  });
+}
+
+/**
+ * Outcome of a surrogate policy load.
+ *
+ * THE ENOENT SPLIT (round-2 finding B2-S6). An absent file and a present broken
+ * file are different events and must not share a branch, which is the defect in
+ * the bare `catch` that `loadBrokerGrants` above still uses for broker grants:
+ *   - `absent`: the normal "this fortress has no bindings" case. Zero bindings,
+ *     and the caller writes NO audit line. Auditing it would put a line in the
+ *     chain on every load for every fortress that never used surrogacy.
+ *   - `failed`: a file that IS there and could not be read or parsed. Zero
+ *     bindings, and the caller writes `BROKER_OPS.POLICY_LOAD_FAILED` carrying
+ *     `failureClass` and nothing else. Never a partial binding set: arming from
+ *     half a document would give an agent a destination map nobody wrote.
+ */
+export type SurrogatePolicyLoadResult =
+  | { outcome: "absent" }
+  | { outcome: "loaded"; document: SurrogatePolicyDocument }
+  | { outcome: "failed"; failureClass: SurrogatePolicyFailureClass };
+
+/**
+ * Load and parse the surrogate policy, classifying the failure instead of
+ * collapsing every cause into zero bindings.
+ *
+ * Returns a result rather than throwing, because every caller needs the same
+ * three-way decision and none of them may treat "broken" as "absent". The
+ * failure class is fixed; no parser message text is ever returned, so a caller
+ * cannot log the document's contents by logging the error.
+ */
+export async function loadSurrogatePolicyDocument(
+  storagePath: string,
+): Promise<SurrogatePolicyLoadResult> {
+  const path = surrogatePolicyPath(storagePath);
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { outcome: "absent" };
+    return { outcome: "failed", failureClass: "read_error" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { outcome: "failed", failureClass: "json_error" };
+  }
+  try {
+    return { outcome: "loaded", document: parseSurrogatePolicyDocument(parsed) };
+  } catch (err) {
+    if (err instanceof SurrogatePolicyError) {
+      return { outcome: "failed", failureClass: err.failureClass };
+    }
+    return { outcome: "failed", failureClass: "schema_error" };
   }
 }

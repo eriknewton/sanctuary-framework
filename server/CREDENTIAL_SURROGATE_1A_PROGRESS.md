@@ -8,9 +8,16 @@ This ledger is the resume point for the next job in the chain. Read the "next" l
 ## Read this before you do anything (host facts job 1 learned the hard way)
 
 1. **A pre-commit hook IS installed here**, at `Sanctuary/.git/hooks/pre-commit`
-   (the baseline guard). It runs `npm run typecheck` AND THE WHOLE VITEST SUITE on
-   every commit, about 7.5 minutes, and it BLOCKS the commit on any failure. The
-   spawn prompt says no hooks are installed; that is wrong for this host.
+   (the baseline guard, file dated 2026-09-02). It runs `npm run typecheck` AND THE
+   WHOLE VITEST SUITE on every commit, about 7.5 minutes, and it BLOCKS the commit on
+   any failure. The spawn prompt says no hooks are installed; that is wrong for this
+   host. Note the installed hook is the PRE-SPLIT version: `AGENTS.md` (2026-09-26)
+   says pre-commit should run only `vitest related --run` scoped to staged files and
+   that the full suite belongs to pre-push. The installed copy predates that split,
+   and no `pre-push` hook is installed at all (only `pre-push.sample`), so the cost
+   landed on commit instead of push. Re-running `cd server && npm run install-hooks`
+   would fix the split, but that mutates the shared checkout's hooks, so job 1 left it
+   alone and reported it instead.
 2. **The suite cannot pass on this host**, so every commit needs `--no-verify` with
    the reason in the commit message. The blocker is
    `test/castle-wall/runtime/linux-producer-signed-activation.test.ts`, which shells
@@ -56,35 +63,70 @@ This ledger is the resume point for the next job in the chain. Read the "next" l
 - **Scope item 10, partial**: `server/src/README.md` gained the `credential-surrogate`
   row, and its module and barrel counts moved 62 to 63 and 54-of-62 to 55-of-63.
 - Commit `2fc17dd5`, pushed to `origin/feat/credential-surrogate-1a-2026-09-30`.
+- **Scope item 1, the parser and the file seam** (the `openBroker` wiring is still
+  owed, see next step 1):
+  - `parseSurrogatePolicyDocument` in `disclosure/broker/policy.ts`: strict, unknown
+    keys refused at every level, unknown version refused, element grammar taken from
+    `credential-surrogate/binding.ts` rather than re-implemented, 1 to
+    `MAX_SURROGATE_DESTINATIONS_PER_BINDING` destinations on port 443 only, the
+    per-agent cap enforced at parse, a repeated host inside one binding refused, and
+    two bindings naming one secret refused as `duplicate_binding`.
+  - `SurrogatePolicyError` carrying only a fixed `failureClass` from the closed set
+    (`read_error`, `json_error`, `schema_error`, `conflict`, `duplicate_binding`,
+    `bad_version`), never parser message text.
+  - `findSurrogateGrantConflicts` (the conflict check against `read` and `rotate`
+    grants, sorted and deduped so an audit line is stable) and
+    `surrogateBoundSecretNames` (the required set the token issuer will refuse
+    against).
+  - `surrogatePolicyPath`, `saveSurrogatePolicy` (0600 via `writeFileCustody`, and it
+    re-parses before writing so a caller cannot persist what the loader would refuse)
+    and `loadSurrogatePolicyDocument` in `open.ts`, returning the three-way
+    `absent` / `loaded` / `failed` result that IS the ENOENT split.
+- **Scope item 3, partial**: the pin comments on `SecretScope`
+  (`backend-interface.ts`) and `SCOPE_RANK` (`token-issuer.ts`), each naming the
+  other side and stating that `surrogate` must never be added.
+- **Scope item 4, partial**: the five additive `BROKER_OPS` entries in
+  `operational/audit-log.ts` (`SURROGATE_UNLOCKED`, `SURROGATE_TOKEN_REFUSED`,
+  `SURROGATE_BOUND`, `SURROGATE_REMOVED`, `POLICY_LOAD_FAILED`), each commented with
+  whether it is `append` or `appendCritical`.
 
 ### next (do these in this order)
 
-1. **Scope item 1, the policy file and loader.** `parseSurrogatePolicyDocument` in
-   `disclosure/broker/policy.ts`, using the validators already in
-   `credential-surrogate/binding.ts` (do not re-implement a character class there).
-   Then `surrogatePolicyPath` plus `saveSurrogatePolicy` (0600 via `writeFileCustody`,
-   the `saveBrokerPolicy` precedent at `open.ts:143`), the conflict check against
-   `read`/`rotate` grants, and the ENOENT-versus-present-and-broken split at
-   `open.ts:116-125`. Seams confirmed to exist at base: `parseBrokerPolicy`
-   (`policy.ts:48`), `loadBrokerGrants` with the bare catch (`open.ts:116-125`),
-   `writeFileCustody` (`open.ts:143`).
+1. **Finish scope item 1's wiring.** The PARSER and the FILE seam are built (see done
+   below). What remains is threading them through `openBroker`:
+   - call `loadSurrogatePolicyDocument` beside `loadBrokerGrants` (`open.ts:80`);
+   - on `failed`, write `BROKER_OPS.POLICY_LOAD_FAILED` via `append` (not
+     `appendCritical`) carrying the file (`broker` or `surrogate`) and the
+     `failureClass`, and yield ZERO grants and zero bindings;
+   - on `absent`, stay silent with zero bindings;
+   - run `findSurrogateGrantConflicts` against the parsed broker grants; on a
+     conflict, yield ZERO grants and audit `POLICY_LOAD_FAILED` with class
+     `conflict`;
+   - apply the SAME ENOENT-versus-broken split to `loadBrokerGrants`'s own bare
+     `catch` at `open.ts:116-125`, which still collapses both causes.
+   Note `loadBrokerGrants` has no `auditLog` today, so the split needs the audit log
+   threaded in or the load moved after the `AuditLog` construction at `open.ts:73`.
+   The `AuditLog` is already built before grants load, so moving the call is enough.
 2. **Scope item 2**, `disclosure/broker/surrogate-store.ts`. Confirmed seams:
-   `KeychainBackend` takes a `service` override (`keychain-backend.ts:56` option,
-   applied at the constructor), the broker's own derivation is
-   `legacyBrokerKeychainIdentity` plus `brokerKeychainIdentityFor` with
+   `KeychainBackend` takes a `service` override (option declared in
+   `KeychainBackendOptions`, applied in the constructor), the broker's own derivation
+   is `legacyBrokerKeychainIdentity` plus `brokerKeychainIdentityFor` with
    `storagePathDigest` (`keychain-backend.ts:349-386`), and `SERVICE` is the literal
    `sanctuary-broker` at `:36`. NOTE: `storagePathDigest` is NOT exported, so the
    surrogate derivation either exports it or derives its identity by calling
-   `brokerKeychainIdentityFor` and replacing the service prefix. Keep the same keychain
-   FILE (one passphrase unlock) and change only the service prefix, per design 3.3.
-   `openSurrogateStore` shares steps 1 to 4 of `openBroker` (`open.ts:51-73`).
-3. **Scope item 3**, broker refusal: required `surrogateBoundSecrets: ReadonlySet<string>`
-   on `TokenIssuerOptions` (`token-issuer.ts:130`), refusal in `issueToken` (`:230`)
-   and `readViaToken`, `Broker.grant` refusal (`broker.ts:198`), the set threaded from
-   `BrokerOptions` (`broker.ts:29`) through the `new TokenIssuer` call (`broker.ts:94`).
-   Pin comments only on `SecretScope` (`backend-interface.ts:17`) and `SCOPE_RANK`
-   (`token-issuer.ts:149`).
-   New `BROKER_OPS` entries are additive at `operational/audit-log.ts:1308-1318`.
+   `brokerKeychainIdentityFor` and replacing the service prefix. Keep the same
+   keychain FILE (one passphrase unlock) and change only the service prefix, per
+   design 3.3. `openSurrogateStore` shares steps 1 to 4 of `openBroker`
+   (`open.ts:51-73`). Add the structural test that the surrogate service literal is
+   declared only in `surrogate-store.ts` and that `openBroker` never passes a service
+   override.
+3. **Scope item 3**, broker refusal. The pin comments are already in place. What
+   remains: required `surrogateBoundSecrets: ReadonlySet<string>` on
+   `TokenIssuerOptions`, refusal in `issueToken` and `readViaToken` with the generic
+   denial plus `appendCritical BROKER_OPS.SURROGATE_TOKEN_REFUSED`, `Broker.grant`
+   refusal (`broker.ts:198`), and the set threaded from `BrokerOptions`
+   (`broker.ts:29`) through the `new TokenIssuer` call (`broker.ts:94`). Use
+   `surrogateBoundSecretNames` from `policy.ts`, already built and tested.
 4. Then scope items 4 through 7 and 9, then the rest of item 10.
 
 ### open questions
@@ -108,6 +150,16 @@ This ledger is the resume point for the next job in the chain. Read the "next" l
 ### test results so far
 
 - `npx vitest run test/credential-surrogate/`: 5 files, **79 passed**, 0 failed.
+- `npx vitest run test/disclosure/broker/surrogate-policy.test.ts`: **28 passed**.
+- `npx vitest run test/disclosure/broker/surrogate-policy-file.test.ts`: **14 passed**.
+- `npx vitest run test/disclosure/broker test/broker-mcp test/audit`: 28 files,
+  **336 passed**, 0 failed. This is the no-regression check for the additive parser,
+  the two pin comments and the five new audit ops.
+- `npm run check-import-cycles`: exit 0, 10 cycles (all pre-existing baseline
+  cycles), **zero involving `credential-surrogate`**.
+- `git diff origin/main -- server/src/broker-mcp/broker-server.ts`: **empty, 0 bytes**.
+- `scripts/check-ai-tells.sh server/src/README.md`: clean, no tells.
+- Zero em-dashes on any line job 1 added (`git diff -U0 | grep '^+' | grep -c` is 0).
 - `npx vitest run test/structure/codebase-conventions.test.ts`: 2 passed (the module
   map row).
 - `npx vitest run test/composition`: 7 files, 149 passed.
