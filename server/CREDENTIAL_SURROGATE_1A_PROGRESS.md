@@ -4,7 +4,7 @@ Branch `feat/credential-surrogate-1a-2026-09-30`, base `origin/main` at `94bc9d4
 Design: `Review/Sanctuary/Credential_Surrogacy_Design_v2.1_2026-09-30.md` (coordinator repo).
 Dispositions: `Review/Sanctuary/Credential_Surrogacy_Design_Gate_2026-09-30/ROUND2_DISPOSITIONS.md`.
 This ledger is the resume point for the next job in the chain. Read the LAST
-`### next` list in the file first (currently the one under "Job 3").
+`### next` list in the file first (currently the one under "Job 5").
 
 ## Read this before you do anything (host facts job 1 learned the hard way)
 
@@ -650,3 +650,132 @@ mis-answered.
 
 Everything marked OWED is work for a later job. The BUILD_REPORT must not claim
 a witness that no run produced.
+
+
+## Job 5 (2026-09-30, about 50 minutes of work)
+
+### done
+
+- **Scope item 6 COMPLETE, scope item 7 HALF** (the minting half; the release
+  wrapper half is still owed). The helper is now a member of the arming twin
+  at every function the design 3.4.1 table names.
+  - `resolveSurrogateBringUpPlan` (`egress-gate/arming-wiring.ts`): loads
+    `surrogate-policy.json` through `loadSurrogatePolicyDocument` (so the
+    ENOENT split is the loader's and is not re-implemented), refuses to arm on
+    a present-and-broken policy, on a breach of
+    `MAX_SURROGATE_BINDINGS_PER_HOST`, on an unusable broker policy and on any
+    `findSurrogateGrantConflicts` hit, then assigns dense ordinals in policy
+    order and mints one placeholder per binding. **The only mint site in the
+    tree.** The per-HOST cap is enforced here because this is the only place
+    that sees every agent's bindings at once, under the provision lock the
+    bring-up already holds; the parser keeps the per-AGENT cap.
+  - `installSurrogateHelperForBringUp`: the three artifact writes through
+    `renderSurrogate*File` (no second serializer), each chowned to exactly its
+    reader with the final mode on the tmp file before the rename, then the
+    plist render and `reloadLaunchdDaemonForBringUp`. Write order is bindings,
+    destinations, placeholders LAST, stated at the line: the placeholder file
+    is the only one the agent can read, and a placeholder the agent holds
+    before the helper's table knows it is a placeholder that resolves to
+    nothing. Called from `productionBringUp` immediately after the bearer mint
+    and BEFORE the resolver reload.
+  - `removeSurrogateHelperForAgent`: one bootout-and-delete shared by the
+    bring-up's no-bindings branch and both teardowns, so a fortress that stops
+    using surrogacy does not leave a root helper running for a policy that no
+    longer authorizes it. `surrogateArtifactPaths` is the one list of the four
+    paths, so a teardown cannot forget one.
+  - `bootstrapSurrogateHelperDaemonForBoot`: the resolver's shape plus the
+    bindings-file pre-condition, wired into `startExclusiveEgressBootSupervisor`
+    between the resolver and gate bootstraps, with the resolver's
+    log-and-continue on failure.
+  - `verifySurrogateBindingsGenerationForCommit` in the BASE `commitGeneration`:
+    reads the bindings header as root through
+    `readSurrogateArtifactGeneration` and throws on a mismatch. Verify only.
+    An absent file is success.
+  - `restoreCoarseCompositionProduction`: step 0c bootout with the step 0b
+    throw, plus the plist and all three artifacts at step 3.
+  - `createUnprotectExclusiveEgressOps`: helper bootout after the resolver with
+    the same throw; `revokeCredential` also removes the placeholder file (it is
+    a credential surface, not a gate surface); `removeGateSurfaces` also
+    removes the plist and both `gate-surrogate` files.
+  - `gate-surrogate` root 0711 in `runtime-fs-plan.ts` and its ASCII layout,
+    with `GATE_SURROGATE_DIR_MODE` imported from the daemon (the
+    `AGENT_HARNESS_HOLD_DIR_MODE` precedent) so the plan and the daemon cannot
+    state two modes for one directory.
+  - `gateSurrogatePlaceholderPath` in `gate-credential.ts`, placed there rather
+    than with the helper because its writer/reader pair is root arming and the
+    release wrapper as the agent uid, which is the `.token` pair exactly.
+
+### one decision worth the code gate's eye
+
+**The fortress path IS the policy storage path.** `resolveSurrogateBringUpPlan`
+passes `input.fortressPath` to `loadSurrogatePolicyDocument` and
+`loadBrokerGrantsClassified`, which join `surrogate-policy.json` and
+`broker-policy.json` onto it. That matches the spawn prompt's
+`<fortress>/surrogate-policy.json` and the CLI's own `openSurrogateStore`
+threading, but it is an assumption a reader should confirm against a real
+fortress layout rather than infer from this ledger.
+
+### next (do these in this order)
+
+1. **The second half of scope item 7**: the `release-barrier.ts` wrapper. It
+   derives the surrogates path from its existing `TOKEN_FILE` argument (so the
+   argument contract does not change), exports a line only when the header
+   generation equals `EXPECTED_GENERATION` and every line matches
+   `^[A-Z_][A-Z0-9_]{0,63}=sanctuary_surrogate_[0-9a-f]{32}$`, exits 78
+   otherwise, and exports nothing for an absent file. The pin test named in
+   the `credential-surrogate/artifacts.ts` header is owed WITH it: run the
+   wrapper over a file `renderSurrogatePlaceholderFile` produced.
+2. **The wired-consumer and rule 8 and rule 12 tests for what Job 5 built.**
+   None were written this job, and they are the evidence: `productionBringUp`
+   with a policy mints the three artifacts and installs the helper before the
+   resolver reload; without a policy it creates none and removes a stale
+   helper; the boot supervisor reaches `bootstrapSurrogateHelperDaemonForBoot`,
+   starts nothing for an unresolvable agent, and continues on failure; arming
+   with 101 bindings refuses; the per-host cap refuses; `commitGeneration`
+   throws on a header mismatch. The `surrogateBindingsPresent` internals seam
+   and the `fsOps` / `statFn` seams exist for exactly these.
+3. **The rest of item 10**: `ASSURANCE_MATRIX.md` row, the remaining
+   `reorg-surface-manifest.md` notes, `.test-baseline` from the LINUX count.
+4. **The OWED fail-before witnesses** in the Job 3 and Job 4 tables.
+5. **The BUILD_REPORT.** Still nothing written.
+
+### open questions
+
+- None blocking.
+- The fortress-path-is-storage-path assumption above.
+
+### test results (Job 5, additive)
+
+- `npx vitest run test/egress-gate/runtime-fs-plan.test.ts
+  test/egress-gate/gate-credential.test.ts`: **28 passed**.
+- `npx vitest run test/egress-gate/arming-wiring.test.ts`: **116 passed**.
+- `npx vitest run test/egress-gate/boot-supervisor.test.ts`: **39 passed**
+  (unchanged by this job; run as a regression check).
+- `npm run typecheck`: green. The tests/scripts baseline was RE-RECORDED at the
+  same count, 979 to 979: adding ten import lines to
+  `test/egress-gate/arming-wiring.test.ts` shifted 24 pre-existing diagnostics
+  onto new line numbers, and the baseline stores `file(line,col)` strings. No
+  diagnostic was added or removed. Run `npm run typecheck:tests:update` after
+  any edit that shifts lines in a file that already carries diagnostics.
+- NOT RUN this job, still owed to the final job: `test/security`, `test/wrap`
+  and `test/structure` whole, `node scripts/check-assurance-matrix.mjs`,
+  `npm run check-import-cycles` (Job 5 added
+  `arming-wiring.ts` to `surrogate-helper-daemon.js`,
+  `runtime-fs-plan.ts` to `surrogate-helper-daemon.js`, and `arming-wiring.ts`
+  to `disclosure/broker/open.js` and `policy.js`, all of which MUST be
+  re-checked for a cycle), the `.test-baseline` recompute from the LINUX count,
+  and the full suite.
+
+### fail-before witnesses (Job 5): what was ACTUALLY observed
+
+| Guard | Command | Base result | Head result |
+|---|---|---|---|
+| The runtime-fs plan carries a `gate-surrogate` root 0711 entry | `npx vitest run test/egress-gate/runtime-fs-plan.test.ts` | FAILED, 2 tests: the ordered-plan deep equal, and `expected [...] to have a length of 21 but got 24` | **21 passed** after the three expected steps were added to the test |
+| Unprotect boots the helper out after the resolver | `npx vitest run test/egress-gate/arming-wiring.test.ts` | FAILED: `bootoutGateDaemon ... ALSO boots out the peer-resolver daemon, gate FIRST` saw a third `bootout system/ai.sanctuaryprotocol.surrogate-helper.601` call | **116 passed** after the expectation named it |
+| `revokeCredential` removes the agent-readable placeholder file | same command | FAILED: the credential teardown saw a fourth removed path | passed after the expectation named it |
+| `removeGateSurfaces` removes the plist and both `gate-surrogate` files | same command | FAILED: `removeGateSurfaces ... every surface goes` saw three extra removed paths in per-uid position | passed after the expectation named them |
+
+These four are genuine before/after witnesses on EXISTING guards (the tests
+were on the base tree and failed against the new behavior until re-recorded).
+They are NOT witnesses for the new behavior's own guards, which are owed with
+the tests in "next" item 2 above. The BUILD_REPORT must keep that distinction.
