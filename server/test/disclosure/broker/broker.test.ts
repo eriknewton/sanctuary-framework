@@ -67,6 +67,8 @@ async function makeBroker(seed: Record<string, string> = {}) {
   const auditLog = new AuditLog(storage, masterKey);
   const backend = makeFakeBackend(seed);
   const broker = new Broker({
+    // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+    surrogateBoundSecrets: new Set<string>(),
     backend,
     auditLog,
     principalIdentityId: "did:sanctuary:principal",
@@ -92,6 +94,8 @@ describe("Broker", () => {
     const auditLog = new AuditLog(storage, masterKey);
     const backend = makeFakeBackend();
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       principalIdentityId: "did:sanctuary:principal",

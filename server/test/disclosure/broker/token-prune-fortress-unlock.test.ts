@@ -76,6 +76,8 @@ describe("token expiry pruning fires on fortress-unlock (finding #86)", () => {
     const backend = makeFakeBackend({ "api-key": "value" });
     // We construct the issuer directly so we can advance the clock.
     const issuer = new TokenIssuer({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       grants: [grant],
@@ -85,6 +87,8 @@ describe("token expiry pruning fires on fortress-unlock (finding #86)", () => {
     // backend and grants, Broker's TokenIssuer is internal, but
     // pruneExpiredTokens() is the public verb.
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       grants: [grant],

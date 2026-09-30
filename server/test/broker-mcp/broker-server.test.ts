@@ -59,6 +59,8 @@ async function makeServer() {
   const auditLog = new AuditLog(storage, masterKey);
   const backend = makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" });
   const broker = new Broker({
+    // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+    surrogateBoundSecrets: new Set<string>(),
     backend,
     auditLog,
     grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -148,6 +150,8 @@ describe("Broker MCP Server", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" }),
         auditLog,
         grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -232,6 +236,8 @@ describe("Broker MCP Server", () => {
         );
       };
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend,
         auditLog,
         grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -292,6 +298,8 @@ describe("Broker MCP Server", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ", slack_token: "SLACK-SECRET-XYZ" }),
         auditLog,
         grants: [

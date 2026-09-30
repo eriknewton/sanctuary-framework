@@ -64,6 +64,8 @@ describe("broker-server startup — rc.2 require-path regression", () => {
 
   it("createBrokerMcpServer reports SANCTUARY_VERSION as its server version", () => {
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend: fakeBackend(),
       auditLog: new AuditLog(new MemoryStorage(), generateRandomKey()),
       grants: [],

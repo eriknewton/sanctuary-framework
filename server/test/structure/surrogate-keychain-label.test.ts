@@ -1,0 +1,91 @@
+/**
+ * Capability: the surrogate keychain service literal is declared in exactly one
+ * place, and the broker is never constructed with a service override. Those two
+ * facts together are what keeps a bound value out of the broker's reach: the
+ * separation is storage-level, so a second copy of the literal, or one
+ * `service:` option on the broker's backend, would collapse the two labels into
+ * one without any test of broker behavior noticing.
+ *
+ * Structural, not behavioral: it reads the source tree, because the failure it
+ * guards against is a future edit rather than a runtime path.
+ *
+ * Defect id: SURROGATE-LABEL-CONVERGENCE.
+ */
+
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+const SRC_ROOT = fileURLToPath(new URL("../../src/", import.meta.url));
+
+/** Must match `SURROGATE_SERVICE_PREFIX` in `disclosure/broker/surrogate-store.ts`. */
+const SURROGATE_SERVICE_PREFIX = "sanctuary-surrogate";
+
+/** The one file allowed to declare it, relative to `src/`. */
+const SOLE_DECLARATION = "disclosure/broker/surrogate-store.ts";
+
+async function typescriptFilesUnder(dir: string, prefix = ""): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const out: string[] = [];
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...(await typescriptFilesUnder(join(dir, entry.name), rel)));
+    } else if (entry.name.endsWith(".ts")) {
+      out.push(rel);
+    }
+  }
+  return out;
+}
+
+describe("the surrogate keychain label has exactly one declaration", () => {
+  it("no file under src/ besides the store declares the service literal", async () => {
+    const files = await typescriptFilesUnder(SRC_ROOT);
+    const offenders: string[] = [];
+    for (const rel of files) {
+      if (rel === SOLE_DECLARATION) continue;
+      const body = await readFile(join(SRC_ROOT, rel), "utf8");
+      // A quoted occurrence is a declaration. Prose that names the label in a
+      // comment is fine and is how the pin on the other side is written.
+      if (
+        body.includes(`"${SURROGATE_SERVICE_PREFIX}`) ||
+        body.includes(`'${SURROGATE_SERVICE_PREFIX}`) ||
+        body.includes(`\`${SURROGATE_SERVICE_PREFIX}`)
+      ) {
+        offenders.push(rel);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the store declares it exactly once", async () => {
+    const body = await readFile(join(SRC_ROOT, SOLE_DECLARATION), "utf8");
+    const quoted = body.match(new RegExp(`"${SURROGATE_SERVICE_PREFIX}"`, "g")) ?? [];
+    expect(quoted).toHaveLength(1);
+  });
+
+  it("openBroker constructs its keychain backend with NO service override", async () => {
+    const body = await readFile(join(SRC_ROOT, "disclosure/broker/open.ts"), "utf8");
+    const construction = body.match(/new KeychainBackend\(\{[^}]*\}\)/gs) ?? [];
+    expect(construction.length).toBeGreaterThan(0);
+    for (const site of construction) {
+      // A `service:` here would point the broker at whatever label the caller
+      // chose, including the surrogate one.
+      expect(site).not.toContain("service:");
+    }
+  });
+
+  it("the only service override in src/ is the store's own", async () => {
+    const files = await typescriptFilesUnder(SRC_ROOT);
+    const offenders: string[] = [];
+    for (const rel of files) {
+      if (rel === SOLE_DECLARATION) continue;
+      const body = await readFile(join(SRC_ROOT, rel), "utf8");
+      for (const site of body.match(/new KeychainBackend\(\{[^}]*\}\)/gs) ?? []) {
+        if (site.includes("service:")) offenders.push(rel);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});

@@ -696,6 +696,8 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, generateRandomKey());
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],

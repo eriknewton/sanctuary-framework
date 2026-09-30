@@ -81,6 +81,8 @@ async function makeIssuer(overrides: {
   const auditLog = new AuditLog(storage, masterKey);
   const backend = overrides.backend ?? makeFakeBackend({ gmail_oauth: "secret-value-xyz" });
   const issuer = new TokenIssuer({
+    // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+    surrogateBoundSecrets: new Set<string>(),
     backend,
     auditLog,
     grants: overrides.grants,
@@ -137,6 +139,8 @@ describe("TokenIssuer", () => {
     it("does not issue a live token when critical audit persistence fails", async () => {
       const auditLog = new AuditLog(new FailingAuditStorage(), generateRandomKey());
       const issuer = new TokenIssuer({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend: makeFakeBackend({ gmail_oauth: "secret-value-xyz" }),
         auditLog,
         grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],

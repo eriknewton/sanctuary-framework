@@ -19,6 +19,7 @@ import {
   type AgentAuditView,
 } from "../../operational/agent-audit-redaction.js";
 import {
+  BrokerDeniedError,
   TokenIssuer,
   type SkillSecretGrant,
   type IssueTokenRequest,
@@ -31,6 +32,14 @@ export interface BrokerOptions {
   auditLog: AuditLog;
   /** Initial grants from policy; can be augmented at runtime via grant/revoke. */
   grants?: SkillSecretGrant[];
+  /**
+   * REQUIRED (AGENTS.md rule 3): every surrogate-bound secret name, threaded
+   * straight to `TokenIssuer` and also enforced by `grant` below. Required here
+   * for the same reason it is required there: a default would let a caller
+   * construct a broker that grants a bound name. See the option's comment in
+   * `token-issuer.ts`.
+   */
+  surrogateBoundSecrets: ReadonlySet<string>;
   /** Principal identity_id to attribute administrative ops to. */
   principalIdentityId: string;
 }
@@ -69,6 +78,7 @@ export class Broker {
   private readonly backend: Backend;
   private readonly auditLog: AuditLog;
   private readonly issuer: TokenIssuer;
+  private readonly surrogateBoundSecrets: ReadonlySet<string>;
   private readonly principalIdentityId: string;
   /**
    * Per-secret-name mutex. Hardening wave 6 finding #64: two concurrent
@@ -91,10 +101,15 @@ export class Broker {
     this.backend = opts.backend;
     this.auditLog = opts.auditLog;
     this.principalIdentityId = opts.principalIdentityId;
+    // One set, shared with the issuer by reference, so `grant` and both token
+    // paths can never disagree about which names are bound. See the issuer's
+    // field for why it is a reference and not a snapshot.
+    this.surrogateBoundSecrets = opts.surrogateBoundSecrets;
     this.issuer = new TokenIssuer({
       backend: opts.backend,
       auditLog: opts.auditLog,
       grants: opts.grants,
+      surrogateBoundSecrets: this.surrogateBoundSecrets,
     });
   }
 
@@ -196,6 +211,27 @@ export class Broker {
   }
 
   grant(g: SkillSecretGrant): void {
+    if (this.surrogateBoundSecrets.has(g.secret)) {
+      // A grant for a bound name is refused at the point of writing, not merely
+      // at the point of use: leaving the row in the issuer would make the name
+      // visible in `list_grants` and in the operator inventory as though it
+      // worked, and every read against it would then fail as a missing secret.
+      // Thrown rather than silently dropped so the operator CLI can say why.
+      void this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SURROGATE_TOKEN_REFUSED,
+        identity_id: this.principalIdentityId,
+        result: "failure",
+        details: {
+          skill: g.skill,
+          secret: g.secret,
+          scope: g.scope,
+          reason: "surrogate_bound",
+          surface: "grant",
+        },
+      });
+      throw new BrokerDeniedError();
+    }
     this.issuer.setGrant(g);
     void this.auditLog.append(
       "l3",
