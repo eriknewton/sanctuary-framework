@@ -22,7 +22,6 @@
  */
 
 import {
-  MAX_SURROGATE_UNLOCK_SECONDS,
   MAX_SURROGATE_VALUE_BYTES,
 } from "./constants.js";
 import { isLegalHttpFieldValue, validateSurrogateSecretName } from "./binding.js";
@@ -159,11 +158,18 @@ export function parseSurrogateUnlockSocketRequest(raw: string): SurrogateUnlockS
   if (r.kind === "unlock") {
     if (!hasExactKeys(r, UNLOCK_KEYS)) return null;
     if (!isGenerationId(r.generation_id)) return null;
+    // SHAPE ONLY, deliberately. `ttl_seconds` is CLAMPED by the helper, not
+    // refused here (design 3.4.3, AGENTS.md rule 10: the relying side clamps),
+    // so a generous operator request becomes a bounded unlock rather than no
+    // unlock at all. What this parser refuses is a TTL that is not a positive
+    // integer number of seconds, which is a different request from a generous
+    // one and must not be clamped UP to something the caller never asked for.
+    // The upper bound lives in `clampSurrogateUnlockSeconds`
+    // (`egress-gate/surrogate-helper-daemon.ts`); must not be duplicated here.
     if (
       typeof r.ttl_seconds !== "number" ||
-      !Number.isInteger(r.ttl_seconds) ||
-      r.ttl_seconds <= 0 ||
-      r.ttl_seconds > MAX_SURROGATE_UNLOCK_SECONDS
+      !Number.isSafeInteger(r.ttl_seconds) ||
+      r.ttl_seconds <= 0
     ) {
       return null;
     }

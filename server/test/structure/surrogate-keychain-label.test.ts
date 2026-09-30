@@ -50,12 +50,20 @@ describe("the surrogate keychain label has exactly one declaration", () => {
       const body = await readFile(join(SRC_ROOT, rel), "utf8");
       // A quoted occurrence is a declaration. Prose that names the label in a
       // comment is fine and is how the pin on the other side is written.
-      if (
-        body.includes(`"${SURROGATE_SERVICE_PREFIX}`) ||
-        body.includes(`'${SURROGATE_SERVICE_PREFIX}`) ||
-        body.includes(`\`${SURROGATE_SERVICE_PREFIX}`)
-      ) {
-        offenders.push(rel);
+      // The literal is the KEYCHAIN SERVICE, which is either the bare prefix or
+      // the prefix plus a `-<hex digest>` per-fortress suffix. A quoted token
+      // that merely STARTS with the prefix and continues with a word (the
+      // `sanctuary-surrogate-bindings` artifact-format kind in
+      // `credential-surrogate/artifacts.ts`, for instance) is an on-disk file
+      // format, not a keychain service, and is not what this guard is about.
+      // Matching the prefix alone would make this test fail on every future file
+      // name that shares it, which trains a reader to widen the allow list.
+      for (const quote of ['"', "'", "`"]) {
+        const re = new RegExp(`${quote}${SURROGATE_SERVICE_PREFIX}(-[0-9a-f]+)?${quote}`);
+        if (re.test(body)) {
+          offenders.push(rel);
+          break;
+        }
       }
     }
     expect(offenders).toEqual([]);

@@ -62,6 +62,23 @@ export {
 } from "./binding.js";
 
 export {
+  SURROGATE_ARTIFACT_VERSION,
+  SURROGATE_BINDINGS_FILE_KIND,
+  SURROGATE_DESTINATIONS_FILE_KIND,
+  SURROGATE_PLACEHOLDER_FILE_KIND,
+  SURROGATE_PLACEHOLDER_LINE_RE,
+  SurrogateArtifactError,
+  parseSurrogateBindingsFile,
+  parseSurrogateDestinationsFile,
+  parseSurrogatePlaceholderFile,
+  readSurrogateArtifactGeneration,
+  renderSurrogateBindingsFile,
+  renderSurrogateDestinationsFile,
+  renderSurrogatePlaceholderFile,
+  type SurrogateArtifactRefusal,
+} from "./artifacts.js";
+
+export {
   SURROGATE_CORRELATION_ID_BYTES,
   SURROGATE_WIRE_VERSION,
   decodeSurrogateFrameRecord,

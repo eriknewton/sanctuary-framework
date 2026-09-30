@@ -2036,11 +2036,17 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/protection-claim.ts`]: 0,
   [`${EG}/release-barrier.ts`]: 15,
   [`${EG}/runtime-fs-plan.ts`]: 0,
-  // Zero, and it must stay zero while the helper is process surface only:
-  // the daemon renders a plist and parses an argv, and asserts nothing
-  // about what is enforced. A claim literal appearing here would mean the
-  // helper had started describing its own capability.
-  [`${EG}/surrogate-helper-daemon.ts`]: 0,
+  // One, and it is a CONCURRENCY-SLOT accounting return, not a claim: the
+  // affirmative early return inside `acquireSlot` says a query slot was free under
+  // `SURROGATE_HELPER_MAX_CONCURRENT_QUERIES`, exactly as the resolver's own
+  // slot acquirer does (`peer-resolver-daemon.ts`, counted there too). It
+  // asserts nothing about what is enforced, what is protected, or whether any
+  // value is held. Everything the helper says about its own state goes out as a
+  // closed-enum event code or a `deny` reason, never a claim-shaped boolean, and
+  // the status answer reports `unlocked` from the table rather than returning a
+  // literal. A SECOND literal appearing here would mean the helper had started
+  // describing its own capability, and belongs in this register with its basis.
+  [`${EG}/surrogate-helper-daemon.ts`]: 1,
 };
 
 /**

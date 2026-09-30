@@ -215,14 +215,20 @@ describe("unlock codec", () => {
     expect(parseSurrogateUnlockSocketRequest(JSON.stringify(unlockRequest({ value: twoByte })))).toBeNull();
   });
 
-  it("refuses an empty value, a zero TTL, and a TTL above the clamp", () => {
+  it("refuses an empty value and a non-positive TTL, and PASSES an over-clamp TTL to the helper", () => {
     expect(parseSurrogateUnlockSocketRequest(JSON.stringify(unlockRequest({ value: "" })))).toBeNull();
     expect(parseSurrogateUnlockSocketRequest(JSON.stringify(unlockRequest({ ttl_seconds: 0 })))).toBeNull();
-    expect(
-      parseSurrogateUnlockSocketRequest(
-        JSON.stringify(unlockRequest({ ttl_seconds: MAX_SURROGATE_UNLOCK_SECONDS + 1 })),
-      ),
-    ).toBeNull();
+    expect(parseSurrogateUnlockSocketRequest(JSON.stringify(unlockRequest({ ttl_seconds: -1 })))).toBeNull();
+    expect(parseSurrogateUnlockSocketRequest(JSON.stringify(unlockRequest({ ttl_seconds: 1.5 })))).toBeNull();
+    // An over-clamp TTL PARSES on purpose: the relying side clamps (design 3.4.3,
+    // AGENTS.md rule 10), so the helper turns a generous request into a bounded
+    // unlock rather than no unlock at all. A refusal here would move the bound
+    // into the wire grammar, where a second copy of it would have to be kept in
+    // step with `clampSurrogateUnlockSeconds`.
+    const generous = parseSurrogateUnlockSocketRequest(
+      JSON.stringify(unlockRequest({ ttl_seconds: MAX_SURROGATE_UNLOCK_SECONDS + 1 })),
+    );
+    expect(generous).toMatchObject({ ttl_seconds: MAX_SURROGATE_UNLOCK_SECONDS + 1 });
     expect(
       parseSurrogateUnlockSocketRequest(
         JSON.stringify(unlockRequest({ ttl_seconds: MAX_SURROGATE_UNLOCK_SECONDS })),

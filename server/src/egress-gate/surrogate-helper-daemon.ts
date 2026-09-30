@@ -27,20 +27,44 @@
  * value to disk, never log a value or a placeholder, and never answer a query
  * for a destination outside the binding the placeholder names.
  *
- * SLICE BOUND. Slice 1a builds the process surface below: the launchd identity,
- * both socket paths, the plist, and the argv contract with its refusals. The two
- * listeners and the decision loop land with the rest of design 3.4.2 and 3.4.3.
- * Nothing in the gate calls this yet; the gate-side client is slice 1b.
+ * SLICE BOUND. Slice 1a builds everything below: the launchd identity, the
+ * plist, the argv contract with its refusals, both listeners with one codec
+ * each, the table load, the caps, and the unlock validation and clamp. What is
+ * NOT here and is slice 1b: the GATE side. No gate code calls this yet, so no
+ * swap happens on any request; `surrogate-helper-client.ts` and the forward-mode
+ * handler are the next slice, and until they land the gate answers plain HTTP
+ * with today's 405 exactly as before.
  */
 
+import { chmod, chown, mkdir, readFile, rm } from "node:fs/promises";
+import { createServer, type Server, type Socket } from "node:net";
 import { isAbsolute, join } from "node:path";
 
+import {
+  SurrogateArtifactError,
+  parseSurrogateBindingsFile,
+} from "../credential-surrogate/artifacts.js";
+import type { MintedSurrogateBinding } from "../credential-surrogate/binding.js";
 import {
   MAX_SURROGATE_BINDINGS_PER_AGENT,
   MAX_SURROGATE_UNLOCK_SECONDS,
   MAX_SURROGATE_VALUE_BYTES,
   SURROGATE_HELPER_MAX_CONCURRENT_QUERIES,
+  SURROGATE_WIRE_MAX_FRAME_BYTES,
 } from "../credential-surrogate/constants.js";
+import {
+  encodeSurrogateQueryResponse,
+  parseSurrogateQueryRequest,
+  surrogateHeaderLocation,
+  type SurrogateDenyReason,
+} from "../credential-surrogate/query-codec.js";
+import { redactSurrogatePlaceholders } from "../credential-surrogate/redaction.js";
+import {
+  encodeSurrogateUnlockSocketResponse,
+  parseSurrogateUnlockSocketRequest,
+  type SurrogateUnlockDenyReason,
+} from "../credential-surrogate/unlock-codec.js";
+import { SURROGATE_WIRE_VERSION } from "../credential-surrogate/wire.js";
 
 // ---------------------------------------------------------------------------
 // Filesystem and launchd identity
@@ -185,13 +209,13 @@ export type SurrogateHelperEvent =
 export type SurrogateHelperDenyCode =
   | "malformed"
   | "unknown_placeholder"
+  | "unknown_secret"
   | "destination_not_bound"
   | "wrong_location"
   | "locked"
   | "expired"
   | "generation_mismatch"
   | "value_too_large"
-  | "illegal_value_bytes"
   | "rate_limited"
   | "unexpected_extra_bytes"
   | "socket_error";
@@ -434,3 +458,720 @@ export const SURROGATE_HELPER_BOUNDS = {
   maxUnlockSeconds: MAX_SURROGATE_UNLOCK_SECONDS,
   maxValueBytes: MAX_SURROGATE_VALUE_BYTES,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Runtime: the binding table, the two listeners, and the decision rules
+// ---------------------------------------------------------------------------
+
+/**
+ * One row of the helper's in-memory table.
+ *
+ * `value` is a `Buffer` and not a string so it can be overwritten on drop
+ * (design 3.4.5). It is `null` whenever the row is locked, which is the state a
+ * freshly started helper is in for every row.
+ */
+interface HelperTableRow {
+  readonly binding: MintedSurrogateBinding;
+  value: Buffer | null;
+  /** Epoch milliseconds the unlock expires at, or `null` when locked. */
+  expiresAt: number | null;
+}
+
+/**
+ * Overwrite then drop a held value.
+ *
+ * `Buffer.fill(0)` is the whole of the memory-hygiene claim, and it is a small
+ * one: the value also existed as a JSON string in the parsed frame, and JS
+ * strings cannot be zeroed. Design 3.4.5 states that residue rather than
+ * claiming it away.
+ */
+function dropRowValue(row: HelperTableRow): void {
+  if (row.value !== null) row.value.fill(0);
+  row.value = null;
+  row.expiresAt = null;
+}
+
+/** Injected clock, so the expiry rules are testable without waiting out a TTL. */
+export interface SurrogateHelperClock {
+  now(): number;
+}
+
+/** Injected filesystem seams, so no test touches a real root-owned path. */
+export interface SurrogateHelperFsOps {
+  mkdir(path: string): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  rm(path: string): Promise<void>;
+  readFile(path: string): Promise<string>;
+}
+
+/** Everything {@link runSurrogateHelperDaemon} needs. Host-free over these seams. */
+export interface SurrogateHelperDaemonDeps extends SurrogateHelperDaemonArgs {
+  /** Socket and artifact parent dir override (tests). */
+  surrogateDir?: string;
+  /** Concurrency cap override (tests only; production uses the constant). */
+  maxConcurrentQueries?: number;
+  /** Event sink. Default: one redacted JSON line per event on stderr. */
+  onEvent?: (event: SurrogateHelperEvent) => void;
+  clock?: SurrogateHelperClock;
+  fsOps?: SurrogateHelperFsOps;
+}
+
+/** A running helper. `close()` drops every value before the sockets go away. */
+export interface SurrogateHelperDaemonHandle {
+  querySocketPath: string;
+  unlockSocketPath: string;
+  /** Number of bindings loaded from the table. Never grows after start. */
+  bindingCount: number;
+  close(): Promise<void>;
+}
+
+/** Idle-connection reap, same reason and value as `PEER_RESOLVER_IDLE_TIMEOUT_MS`:
+ * a connection that never completes a frame must not hold a slot on a root
+ * process for longer than a local round trip plus slack. */
+export const SURROGATE_HELPER_IDLE_TIMEOUT_MS = 5_000;
+
+function realFsOps(): SurrogateHelperFsOps {
+  return {
+    async mkdir(path: string): Promise<void> {
+      await mkdir(path, { recursive: true, mode: 0o711 }).catch(() => undefined);
+    },
+    async chmod(path: string, mode: number): Promise<void> {
+      await chmod(path, mode);
+    },
+    async chown(path: string, uid: number, gid: number): Promise<void> {
+      await chown(path, uid, gid);
+    },
+    async rm(path: string): Promise<void> {
+      await rm(path, { force: true });
+    },
+    async readFile(path: string): Promise<string> {
+      return readFile(path, "utf8");
+    },
+  };
+}
+
+/**
+ * Read ONE newline-terminated frame from a connection and hand it to `onFrame`,
+ * then refuse every further byte.
+ *
+ * This is the shared half of both codecs' transport: identical framing, one
+ * frame each way, `unexpected_extra_bytes` on anything after it. What is NOT
+ * shared is which parser `onFrame` calls. Each socket passes exactly one, so a
+ * query frame on the unlock socket reaches only the unlock parser, which returns
+ * `null`, which is `malformed` (design v2.1 finding B2-B2). There is no
+ * fall-through to the other parser and no place to add one.
+ */
+function serveOneShotConnection(
+  socket: Socket,
+  ctx: {
+    onFrame: (line: string) => Buffer;
+    onExtraBytes: () => Buffer;
+    onOversize: () => Buffer;
+    onSocketError: () => void;
+  },
+): void {
+  let buffer = "";
+  let answered = false;
+  const reply = (frame: Buffer): void => {
+    if (answered) return;
+    answered = true;
+    try {
+      socket.end(frame);
+    } catch {
+      socket.destroy();
+    }
+  };
+  socket.setTimeout(SURROGATE_HELPER_IDLE_TIMEOUT_MS, () => socket.destroy());
+  socket.on("error", () => {
+    // A client that disconnects mid-frame is ordinary, not an incident: the
+    // helper has answered nothing and holds nothing for it. Recorded, never
+    // thrown, because an unhandled socket error in a root process is a crash.
+    ctx.onSocketError();
+  });
+  socket.on("data", (chunk: Buffer) => {
+    if (answered) {
+      // A byte after the first frame. `supervisor/socket-server.ts` answers and
+      // closes here rather than ignoring, so a client that pipelined learns its
+      // second request was never served.
+      reply(ctx.onExtraBytes());
+      return;
+    }
+    buffer += chunk.toString("utf8");
+    // The cap is checked on the ACCUMULATED buffer, before any parse, so an
+    // endless stream with no newline cannot pin memory on a root process.
+    if (Buffer.byteLength(buffer, "utf8") > SURROGATE_WIRE_MAX_FRAME_BYTES) {
+      reply(ctx.onOversize());
+      return;
+    }
+    const nl = buffer.indexOf("\n");
+    if (nl === -1) return; // bounded by the cap above
+    const line = buffer.slice(0, nl);
+    const rest = buffer.slice(nl + 1);
+    const frame = ctx.onFrame(line);
+    reply(frame);
+    if (rest.length > 0) {
+      // Extra bytes arrived in the SAME chunk as the frame. The reply above
+      // already went out for the frame that was legal; nothing further is
+      // served on this connection.
+      socket.destroy();
+    }
+  });
+}
+
+/**
+ * The query socket's handler: the gate asks, the helper decides.
+ *
+ * DECISION RULES (design 3.4.2), all four required, in this order:
+ *  1. the placeholder is in the CURRENT generation's table;
+ *  2. `(host, port)` is one of THAT binding's destinations;
+ *  3. `location` is `header:<the binding's own bound header, lowercased>`;
+ *  4. the binding is unlocked and not expired.
+ * The order is deliberate: membership first, so a caller that guessed a
+ * placeholder learns `unknown` and not whether some binding happens to be
+ * unlocked. The gate never decides membership; it reports only what it parsed.
+ */
+function answerQuery(
+  line: string,
+  ctx: {
+    agentUid: number;
+    table: Map<string, HelperTableRow>;
+    clock: SurrogateHelperClock;
+    onEvent: (event: SurrogateHelperEvent) => void;
+    acquireSlot: () => boolean;
+    releaseSlot: () => void;
+  },
+): Buffer {
+  const req = parseSurrogateQueryRequest(line);
+  if (req === null) {
+    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: "malformed" });
+    // No `id` to echo: the frame did not parse, so there is nothing trustworthy
+    // to correlate with. A synthetic id would be indistinguishable from an
+    // answer to a real query.
+    return encodeSurrogateQueryResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: MALFORMED_CORRELATION_ID,
+      kind: "deny",
+      reason: "malformed",
+    });
+  }
+  const deny = (reason: SurrogateDenyReason, code: SurrogateHelperDenyCode): Buffer => {
+    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: code });
+    return encodeSurrogateQueryResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: req.id,
+      kind: "deny",
+      reason,
+    });
+  };
+  // The concurrency cap is taken AFTER the frame parses and BEFORE any table
+  // work, and released on every path below, because a `rate_limited` answer must
+  // not depend on which decision the query would have reached.
+  if (!ctx.acquireSlot()) return deny("rate_limited", "rate_limited");
+  try {
+    const row = ctx.table.get(req.placeholder);
+    if (row === undefined) return deny("unknown", "unknown_placeholder");
+    const bound = row.binding.destinations.some(
+      (d) => d.host === req.host && d.port === req.port,
+    );
+    if (!bound) return deny("misroute", "destination_not_bound");
+    if (req.location !== surrogateHeaderLocation(row.binding.header)) {
+      return deny("wrong_location", "wrong_location");
+    }
+    if (row.value === null || row.expiresAt === null) return deny("locked", "locked");
+    if (ctx.clock.now() >= row.expiresAt) {
+      // Expiry is enforced on READ as well as by the timer, so a timer that a
+      // suspended host never fired cannot extend a value's life.
+      dropRowValue(row);
+      return deny("expired", "expired");
+    }
+    ctx.onEvent({ kind: "query_answered", agentUid: ctx.agentUid, binding: row.binding.ordinal });
+    return encodeSurrogateQueryResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: req.id,
+      kind: "swap",
+      value: row.value.toString("utf8"),
+    });
+  } finally {
+    ctx.releaseSlot();
+  }
+}
+
+/**
+ * The unlock socket's handler: the operator loads, drops or inspects.
+ *
+ * VALIDATION (design 3.4.3): the secret must be in this helper's own table, the
+ * generation must be this helper's own, the value must be 1 to
+ * `MAX_SURROGATE_VALUE_BYTES` bytes and every byte a legal HTTP field-value
+ * byte, and `ttl_seconds` is CLAMPED (the relying side clamps, AGENTS.md rule
+ * 10) rather than refused, so a generous operator request becomes a bounded
+ * unlock instead of no unlock at all.
+ */
+function answerUnlockSocket(
+  line: string,
+  ctx: {
+    agentUid: number;
+    generation: number;
+    table: Map<string, HelperTableRow>;
+    clock: SurrogateHelperClock;
+    onEvent: (event: SurrogateHelperEvent) => void;
+    armExpiryTimer: () => void;
+  },
+): Buffer {
+  const req = parseSurrogateUnlockSocketRequest(line);
+  if (req === null) {
+    ctx.onEvent({ kind: "unlock_denied", agentUid: ctx.agentUid, reason: "malformed" });
+    return encodeSurrogateUnlockSocketResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: MALFORMED_CORRELATION_ID,
+      kind: "deny",
+      reason: "malformed",
+    });
+  }
+  const deny = (
+    reason: SurrogateUnlockDenyReason,
+    code: SurrogateHelperDenyCode,
+  ): Buffer => {
+    ctx.onEvent({ kind: "unlock_denied", agentUid: ctx.agentUid, reason: code });
+    return encodeSurrogateUnlockSocketResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: req.id,
+      kind: "deny",
+      reason,
+    });
+  };
+  if (req.kind === "status") {
+    // A status answer carries NO value and NO placeholder, by construction of
+    // `SurrogateStatusBinding`. It is also the operator CLI's "is this agent
+    // armed" probe, so it must answer even when every row is locked.
+    return encodeSurrogateUnlockSocketResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: req.id,
+      kind: "status",
+      generation_id: ctx.generation,
+      bindings: [...ctx.table.values()]
+        .sort((a, b) => a.binding.ordinal - b.binding.ordinal)
+        .map((row) => {
+          const live = row.value !== null && row.expiresAt !== null && ctx.clock.now() < row.expiresAt;
+          return {
+            secret: row.binding.secret,
+            unlocked: live,
+            expires_at: live ? row.expiresAt : null,
+          };
+        }),
+    });
+  }
+  if (req.kind === "lock") {
+    let dropped = 0;
+    for (const row of ctx.table.values()) {
+      if (row.value !== null) dropped += 1;
+      dropRowValue(row);
+    }
+    // Recorded for EVERY lock regardless of which client sent it (design 3.4.4):
+    // the unlock socket is confined by filesystem permission only, so the
+    // helper's own log is the complete record of what it holds, and the fortress
+    // chain records only what went through the CLI.
+    ctx.onEvent({ kind: "lock_accepted", agentUid: ctx.agentUid, bindingsDropped: dropped });
+    return encodeSurrogateUnlockSocketResponse({
+      v: SURROGATE_WIRE_VERSION,
+      id: req.id,
+      kind: "ok",
+    });
+  }
+  if (req.generation_id !== ctx.generation) return deny("wrong_generation", "generation_mismatch");
+  let target: HelperTableRow | undefined;
+  for (const row of ctx.table.values()) {
+    if (row.binding.secret === req.secret) {
+      target = row;
+      break;
+    }
+  }
+  if (target === undefined) return deny("unknown_secret", "unknown_secret");
+  // VALUE RULES ARE ENFORCED BY THE PARSER, NOT HERE. `parseSurrogateUnlockSocketRequest`
+  // refuses a value that is empty, over `MAX_SURROGATE_VALUE_BYTES`, or carries a
+  // byte that is not a legal HTTP field value (CR, LF or NUL), so by this line no
+  // value that could split a header has ever existed in this process. Re-checking
+  // it here would be a second grammar to keep in step with the first, and the
+  // weaker of the two would be the one that eventually diverged. The pin is the
+  // `one codec per socket` test in
+  // `server/test/egress-gate/surrogate-helper-daemon-runtime.test.ts`, which
+  // drives those three refusals through the real socket and asserts `malformed`.
+  const valueBytes = Buffer.from(req.value, "utf8");
+  const ttlSeconds = clampSurrogateUnlockSeconds(req.ttl_seconds);
+  if (ttlSeconds === null) {
+    valueBytes.fill(0);
+    return deny("malformed", "malformed");
+  }
+  dropRowValue(target);
+  target.value = valueBytes;
+  target.expiresAt = ctx.clock.now() + ttlSeconds * 1000;
+  ctx.armExpiryTimer();
+  ctx.onEvent({
+    kind: "unlock_accepted",
+    agentUid: ctx.agentUid,
+    binding: target.binding.ordinal,
+    ttlSeconds,
+  });
+  return encodeSurrogateUnlockSocketResponse({
+    v: SURROGATE_WIRE_VERSION,
+    id: req.id,
+    kind: "ok",
+  });
+}
+
+/**
+ * Clamp a requested TTL to `MAX_SURROGATE_UNLOCK_SECONDS`, or refuse a shape
+ * that is not a positive number of seconds at all.
+ *
+ * Clamping rather than refusing an over-long TTL is AGENTS.md rule 10: the
+ * relying side decides the bound. A zero or negative TTL is a different thing
+ * from a generous one, so it is refused rather than clamped up to something the
+ * caller did not ask for.
+ */
+export function clampSurrogateUnlockSeconds(requested: number): number | null {
+  if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested <= 0) return null;
+  return Math.min(requested, MAX_SURROGATE_UNLOCK_SECONDS);
+}
+
+/**
+ * The correlation id used when there is nothing to echo.
+ *
+ * All zeroes, which `newSurrogateCorrelationId` cannot produce in practice and
+ * which every client compares against its own id and rejects. A `malformed`
+ * answer therefore reads as `malformed` on both ends rather than as a reply the
+ * client might match to an outstanding query.
+ */
+export const MALFORMED_CORRELATION_ID = "0".repeat(32);
+
+/**
+ * Load the helper's table from `gate-surrogate/<uid>.bindings` and refuse to
+ * start on anything it does not like.
+ *
+ * REFUSALS, all fail-closed (design 3.4.5): a header generation that differs
+ * from the argv generation, a body the shared parser rejects, and a table over
+ * `MAX_SURROGATE_BINDINGS_PER_AGENT`. The cap is checked here as well as at
+ * policy parse and at render because this is the check that runs after a reboot,
+ * when the only thing standing between a stale artifact and a root process is
+ * this read.
+ *
+ * A generation mismatch means the artifact and the argv came from different
+ * bring-ups. Refusing to start leaves the gate with connect failures, which it
+ * denies as 503, rather than a helper serving a generation nobody committed.
+ */
+export async function loadSurrogateHelperTable(
+  args: SurrogateHelperDaemonArgs,
+  fsOps: Pick<SurrogateHelperFsOps, "readFile">,
+  dir: string = GATE_SURROGATE_DIR,
+): Promise<Map<string, HelperTableRow>> {
+  const text = await fsOps.readFile(surrogateBindingsPath(args.agentUid, dir));
+  const parsed = parseSurrogateBindingsFile(text);
+  if (parsed.generationId !== args.generation) {
+    throw new SurrogateHelperStartError("generation_mismatch");
+  }
+  if (parsed.bindings.length > MAX_SURROGATE_BINDINGS_PER_AGENT) {
+    throw new SurrogateHelperStartError("too_many_bindings");
+  }
+  const table = new Map<string, HelperTableRow>();
+  for (const binding of parsed.bindings) {
+    table.set(binding.placeholder, { binding, value: null, expiresAt: null });
+  }
+  return table;
+}
+
+/** Why the helper refused to start. Fixed classes, never the offending bytes. */
+export type SurrogateHelperStartRefusal =
+  | "generation_mismatch"
+  | "too_many_bindings"
+  | "bindings_unreadable";
+
+export class SurrogateHelperStartError extends Error {
+  readonly refusal: SurrogateHelperStartRefusal;
+
+  constructor(refusal: SurrogateHelperStartRefusal) {
+    super(`surrogate helper refused to start: ${refusal}`);
+    this.name = "SurrogateHelperStartError";
+    this.refusal = refusal;
+  }
+}
+
+/**
+ * Create one one-shot listener: umask held across `listen()`, then chmod 0600,
+ * then chown to the ONE uid entitled to it.
+ *
+ * `chmod` BEFORE `chown` on purpose, the resolver's order: the window between
+ * `bind()` and the final permissions is then never connectable by a principal
+ * other than root, not even transiently. The umask makes the socket owner-only
+ * from its first byte; the chmod is belt on top, not the boundary.
+ */
+async function listenOneShot(
+  socketPath: string,
+  ownerUid: number,
+  fsOps: SurrogateHelperFsOps,
+  onConnection: (socket: Socket) => void,
+  onServerError: () => void,
+): Promise<Server> {
+  await fsOps.rm(socketPath); // a stale socket from a prior run is EADDRINUSE otherwise
+  const server = createServer(onConnection);
+  server.on("error", onServerError);
+  const priorUmask = process.umask(SURROGATE_HELPER_SOCKET_UMASK);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
+    });
+  } finally {
+    process.umask(priorUmask);
+  }
+  await fsOps.chmod(socketPath, 0o600);
+  await fsOps.chown(socketPath, ownerUid, -1);
+  return server;
+}
+
+/**
+ * Start the helper for ONE agent: load the table, open both sockets, serve.
+ *
+ * STARTS LOCKED, always. Nothing in this function can put a value in the table;
+ * only the unlock socket can, and only after an operator speaks to it. A helper
+ * that came back from a crash holding values would be a credential store that
+ * survives reboot without anyone deciding it should.
+ *
+ * SOCKET ORDER: the UNLOCK socket is opened first, then the query socket. The
+ * gate must never find a query socket for a helper whose unlock path is not yet
+ * reachable, because that is the window in which every query denies `locked`
+ * with no way for the operator to fix it.
+ */
+export async function runSurrogateHelperDaemon(
+  deps: SurrogateHelperDaemonDeps,
+): Promise<SurrogateHelperDaemonHandle> {
+  // The uid rules of design 3.4.5 are enforced by the argv parser, which is the
+  // one entry production uses. Re-asserted here because `runSurrogateHelperDaemon`
+  // is also reachable from tests and from a future caller, and a helper that
+  // guessed its own trust boundary is the failure this whole file exists to
+  // prevent.
+  parseSurrogateHelperDaemonArgs([
+    "--agent-uid",
+    String(deps.agentUid),
+    "--gate-uid",
+    String(deps.gateUid),
+    "--operator-uid",
+    String(deps.operatorUid),
+    "--generation",
+    String(deps.generation),
+  ]);
+
+  const dir = deps.surrogateDir ?? GATE_SURROGATE_DIR;
+  const fsOps = deps.fsOps ?? realFsOps();
+  const clock = deps.clock ?? { now: () => Date.now() };
+  const maxConcurrent = deps.maxConcurrentQueries ?? SURROGATE_HELPER_MAX_CONCURRENT_QUERIES;
+  const onEvent =
+    deps.onEvent ??
+    ((event: SurrogateHelperEvent): void => {
+      // Sink redaction, even though no event variant carries a placeholder
+      // field: the sink is the last line of defense and a future variant that
+      // did would otherwise leak silently.
+      process.stderr.write(
+        `[surrogate-helper] ${JSON.stringify(redactSurrogatePlaceholders(event))}\n`,
+      );
+    });
+
+  let table: Map<string, HelperTableRow>;
+  try {
+    table = await loadSurrogateHelperTable(deps, fsOps, dir);
+  } catch (err) {
+    if (err instanceof SurrogateHelperStartError) throw err;
+    // The over-cap refusal keeps its own class, because it is the one an
+    // operator can act on (the policy has more bindings than an agent may hold)
+    // rather than a corrupt or missing file.
+    if (err instanceof SurrogateArtifactError && err.refusal === "too_many_bindings") {
+      throw new SurrogateHelperStartError("too_many_bindings");
+    }
+    // Every other cause (ENOENT, EACCES, a parse refusal) is one class: the
+    // bindings file is not usable, so this helper must not serve. The cause is
+    // NOT carried into the message, because a parse refusal's text is derived
+    // from the file and the file names secrets.
+    throw new SurrogateHelperStartError("bindings_unreadable");
+  }
+
+  await fsOps.mkdir(dir);
+  await fsOps.chmod(dir, 0o711).catch(() => undefined);
+
+  let activeQueries = 0;
+  const acquireSlot = (): boolean => {
+    if (activeQueries >= maxConcurrent) return false;
+    activeQueries += 1;
+    return true;
+  };
+  const releaseSlot = (): void => {
+    activeQueries -= 1;
+  };
+
+  let expiryTimer: NodeJS.Timeout | null = null;
+  const sweepExpired = (): void => {
+    const now = clock.now();
+    for (const row of table.values()) {
+      if (row.expiresAt !== null && now >= row.expiresAt) dropRowValue(row);
+    }
+  };
+  const armExpiryTimer = (): void => {
+    if (expiryTimer !== null) return;
+    expiryTimer = setInterval(sweepExpired, SURROGATE_HELPER_EXPIRY_SWEEP_MS);
+    // The sweep must never hold the process open on its own: expiry is also
+    // enforced on read, so an unref'd timer that a suspended host skipped costs
+    // nothing but a later drop.
+    expiryTimer.unref();
+  };
+
+  const unlockSocketPath = surrogateUnlockSocketPath(deps.agentUid, dir);
+  const querySocketPath = surrogateQuerySocketPath(deps.agentUid, dir);
+
+  const unlockServer = await listenOneShot(
+    unlockSocketPath,
+    deps.operatorUid,
+    fsOps,
+    (socket) =>
+      serveOneShotConnection(socket, {
+        // ONE codec on this socket. A query frame here reaches only
+        // `parseSurrogateUnlockSocketRequest`, which returns null, which is
+        // `malformed`. There is no fall-through.
+        onFrame: (line) =>
+          answerUnlockSocket(line, {
+            agentUid: deps.agentUid,
+            generation: deps.generation,
+            table,
+            clock,
+            onEvent,
+            armExpiryTimer,
+          }),
+        onExtraBytes: () => {
+          onEvent({
+            kind: "unlock_denied",
+            agentUid: deps.agentUid,
+            reason: "unexpected_extra_bytes",
+          });
+          return encodeSurrogateUnlockSocketResponse({
+            v: SURROGATE_WIRE_VERSION,
+            id: MALFORMED_CORRELATION_ID,
+            kind: "deny",
+            reason: "malformed",
+          });
+        },
+        onOversize: () => {
+          // Refused on the accumulated byte count, BEFORE `JSON.parse`. An
+          // unlock frame is the one frame that legally carries a value, so it is
+          // also the one an attacker would grow.
+          onEvent({ kind: "unlock_denied", agentUid: deps.agentUid, reason: "value_too_large" });
+          return encodeSurrogateUnlockSocketResponse({
+            v: SURROGATE_WIRE_VERSION,
+            id: MALFORMED_CORRELATION_ID,
+            kind: "deny",
+            reason: "value_too_long",
+          });
+        },
+        onSocketError: () =>
+          onEvent({ kind: "unlock_denied", agentUid: deps.agentUid, reason: "socket_error" }),
+      }),
+    () => onEvent({ kind: "daemon_error", agentUid: deps.agentUid, reason: "socket_error" }),
+  );
+
+  const queryServer = await listenOneShot(
+    querySocketPath,
+    deps.gateUid,
+    fsOps,
+    (socket) =>
+      serveOneShotConnection(socket, {
+        // ONE codec on this socket, the mirror of the unlock side: an `unlock`
+        // frame here reaches only `parseSurrogateQueryRequest` and is
+        // `malformed`, so the gate uid can never load a value.
+        onFrame: (line) =>
+          answerQuery(line, {
+            agentUid: deps.agentUid,
+            table,
+            clock,
+            onEvent,
+            acquireSlot,
+            releaseSlot,
+          }),
+        onExtraBytes: () => {
+          onEvent({
+            kind: "query_denied",
+            agentUid: deps.agentUid,
+            reason: "unexpected_extra_bytes",
+          });
+          return encodeSurrogateQueryResponse({
+            v: SURROGATE_WIRE_VERSION,
+            id: MALFORMED_CORRELATION_ID,
+            kind: "deny",
+            reason: "malformed",
+          });
+        },
+        onOversize: () => {
+          onEvent({ kind: "query_denied", agentUid: deps.agentUid, reason: "malformed" });
+          return encodeSurrogateQueryResponse({
+            v: SURROGATE_WIRE_VERSION,
+            id: MALFORMED_CORRELATION_ID,
+            kind: "deny",
+            reason: "malformed",
+          });
+        },
+        onSocketError: () =>
+          onEvent({ kind: "query_denied", agentUid: deps.agentUid, reason: "socket_error" }),
+      }),
+    () => onEvent({ kind: "daemon_error", agentUid: deps.agentUid, reason: "socket_error" }),
+  );
+
+  onEvent({
+    kind: "listening",
+    agentUid: deps.agentUid,
+    generationId: deps.generation,
+    bindings: table.size,
+  });
+
+  return {
+    querySocketPath,
+    unlockSocketPath,
+    bindingCount: table.size,
+    async close(): Promise<void> {
+      // Values go FIRST, before either socket closes: a close that failed
+      // halfway must not leave a live query socket over a table that still
+      // holds values.
+      for (const row of table.values()) dropRowValue(row);
+      if (expiryTimer !== null) {
+        clearInterval(expiryTimer);
+        expiryTimer = null;
+      }
+      await new Promise<void>((resolve) => queryServer.close(() => resolve()));
+      await new Promise<void>((resolve) => unlockServer.close(() => resolve()));
+      await fsOps.rm(querySocketPath).catch(() => undefined);
+      await fsOps.rm(unlockSocketPath).catch(() => undefined);
+    },
+  };
+}
+
+/**
+ * How often the expiry sweep runs.
+ *
+ * Derivation: `MAX_SURROGATE_UNLOCK_SECONDS` is a day, and expiry is ALSO
+ * enforced on every read, so the sweep is only about not holding an expired
+ * value in memory longer than necessary. One second is far below any TTL an
+ * operator would set and costs one map walk bounded by
+ * `MAX_SURROGATE_BINDINGS_PER_AGENT`.
+ */
+export const SURROGATE_HELPER_EXPIRY_SWEEP_MS = 1_000;
+
+/**
+ * The composition root the `castle-wall surrogate-helper-daemon` verb calls.
+ *
+ * This is the ONE production entry: it parses argv with the validating parser
+ * (so every uid refusal of design 3.4.5 applies), then starts the daemon with
+ * real filesystem seams. Nothing here supplies a default for a uid or a
+ * generation, and nothing here can put a value in the table.
+ */
+export async function runSurrogateHelperDaemonFromArgv(
+  argv: readonly string[],
+): Promise<SurrogateHelperDaemonHandle> {
+  const args = parseSurrogateHelperDaemonArgs(argv);
+  return runSurrogateHelperDaemon(args);
+}
