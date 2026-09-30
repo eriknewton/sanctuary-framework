@@ -99,6 +99,11 @@ fn value_options() -> Vec<&'static str> {
         // the two entries above; a release build never carries them.
         value_options.push("--test-stop-guard-deadline-secs");
         value_options.push("--test-nft-binary");
+        // LINUX-SUPERVISOR-WEDGE-R1-01 (C2a3): the supervisor-wedge and
+        // pre-READY-delay seams take a value too. Must match the drain block in
+        // `run_daemon_main` (TS5 compares the two sets).
+        value_options.push("--test-wedge-health-pass-after");
+        value_options.push("--test-delay-before-ready-ms");
     }
     value_options
 }
@@ -343,6 +348,12 @@ fn run_daemon_main() -> ExitCode {
     // subprocess test waits about one second instead of the production eight.
     #[cfg(feature = "test-isolation")]
     let mut test_stop_guard_deadline_secs: Option<u32> = None;
+    // LINUX-SUPERVISOR-WEDGE-R1-01 (C2a3): the supervisor wedge (armed on the
+    // handle after boot) and the pre-READY delay (applied to `config` before boot).
+    #[cfg(feature = "test-isolation")]
+    let mut test_wedge_health_pass_after: Option<u32> = None;
+    #[cfg(feature = "test-isolation")]
+    let mut test_delay_before_ready_ms: Option<u64> = None;
 
     #[cfg(feature = "test-isolation")]
     {
@@ -415,6 +426,47 @@ fn run_daemon_main() -> ExitCode {
                     eprintln!(
                         "castle-wall-daemon: --test-stop-guard-deadline-secs requires a \
                          positive whole number of seconds"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // LINUX-SUPERVISOR-WEDGE-R1-01: drained before the run-config parser for
+        // the same reason as W1a. Zero is refused: the initial pass always counts
+        // as one completed pass, so zero could only mean "never pet", which the
+        // seam does not model.
+        if let Some(index) = args
+            .iter()
+            .position(|a| a == "--test-wedge-health-pass-after")
+        {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0) {
+                Some(passes) => test_wedge_health_pass_after = Some(passes),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-wedge-health-pass-after requires a \
+                         positive whole number of passes"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // LINUX-SUPERVISOR-WEDGE-R1-01 (harness leg HW3): same drain-before-parse.
+        if let Some(index) = args
+            .iter()
+            .position(|a| a == "--test-delay-before-ready-ms")
+        {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => test_delay_before_ready_ms = Some(ms),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-delay-before-ready-ms requires a numeric \
+                         millisecond value"
                     );
                     return ExitCode::from(2);
                 }
@@ -500,6 +552,12 @@ fn run_daemon_main() -> ExitCode {
     if test_shutdown_at.as_deref() == Some("boot-acquire") {
         config.test_boot_time_shutdown_requested = true;
     }
+    // LINUX-SUPERVISOR-WEDGE-R1-01: routed like `boot-acquire`, for the same
+    // reason: the delay runs inside `boot()`, before any handle exists.
+    #[cfg(feature = "test-isolation")]
+    {
+        config.test_delay_before_ready_ms = test_delay_before_ready_ms;
+    }
 
     // SAFETY: stdout is the CLI startup-banner contract here, not a log
     // channel. The banner is emitted before daemon::boot installs the audit
@@ -553,6 +611,13 @@ fn run_daemon_main() -> ExitCode {
     #[cfg(feature = "test-isolation")]
     if test_hang_teardown {
         handle.arm_test_hang_teardown();
+    }
+    // LINUX-SUPERVISOR-WEDGE-R1-01: armed after a successful boot, before the
+    // supervisor runs its initial pass. Must match
+    // `DaemonHandle::arm_test_wedge_health_pass_after`.
+    #[cfg(feature = "test-isolation")]
+    if let Some(passes) = test_wedge_health_pass_after {
+        handle.arm_test_wedge_health_pass_after(passes);
     }
     // W1b: armed only after a successful boot, so the seam cannot fire before a
     // handle exists to flip. `boot-acquire` is applied to `config` earlier

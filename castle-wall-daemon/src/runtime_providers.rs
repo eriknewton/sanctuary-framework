@@ -3014,8 +3014,11 @@ struct NftablesTableComponent {
 /// readiness poll. The proof runs on an isolated worker, so SIGTERM/supervision
 /// remains bounded even if fork/exec/netlink never returns. The service restart
 /// kills any still-wedged process in its systemd cgroup.
+///
+/// Must match `WATCHDOG_PROBE_WAIT` in `src/daemon.rs`: the systemd watchdog
+/// interval is derived from this wait (TD2 compares them).
 #[cfg(target_os = "linux")]
-const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Minimum spacing between REAL `nft` ownership proofs. Chosen well under
 /// `main.rs`'s 2-second supervisor `HEALTH_INTERVAL` so every supervisor tick
@@ -3041,10 +3044,12 @@ pub const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// up on it after `NFT_HEALTH_QUERY_TIMEOUT` (1s); readings 2 and 3 do NOT fork
 /// again — the worker still owns the in-flight slot, and observing it past its
 /// deadline is itself the indeterminate reading (see [`crate::health_probe`]).
-/// So the three readings land at t=0, t=2s, t=4s and the third returns a PROVEN
-/// `Lost`, which the supervisor acts on with no further grace: worst-case ~4s
-/// from the first reading, ~6s from onset, and exactly ONE `nft` child for the
-/// whole sequence.
+/// So the three readings land at t=0, t=2s, t=4s and the third latches
+/// `Indeterminate` (never a proven `Lost`: `note_indeterminate` in
+/// `src/health_probe.rs`), which the supervisor's `Indeterminate` arm acts on
+/// with no further grace after running the post-READY hook (the `Lost` arm runs
+/// no hook): worst-case ~4s from the first reading, ~6s from onset, and exactly
+/// ONE `nft` child for the whole sequence.
 #[cfg(target_os = "linux")]
 const NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE: u32 = 3;
 

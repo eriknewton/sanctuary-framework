@@ -15,6 +15,13 @@ Wants=network-pre.target
 # with margin. A 60-second window would never trip at all, because each attempt
 # alone outlasts it.
 #
+# The liveness watchdog (WatchdogSec below) adds a longer worst cycle, measured
+# start to start: an activation that reaches READY=1 at the TimeoutStartSec edge
+# (60 s), pets once after a first pass shorter than WatchdogSec (19 s), then
+# wedges and is killed WatchdogSec later (19 s), then waits RestartSec (2 s):
+# 60 + 19 + 19 + 2 = 100 s. Five of those span 500 s, still under 600 s, so a
+# watchdog crash wave also reaches the terminal failed state instead of looping.
+#
 # WHY NOT StartLimitIntervalSec=0 (unlimited): this unit declares
 # Before=network.target, so an activating Type=notify service that never reaches
 # READY=1 would restart forever while network.target, and sshd behind it, wait on
@@ -29,7 +36,9 @@ Wants=network-pre.target
 # PRESERVED, because ordinary process loss deletes neither. Recovery is
 # `systemctl reset-failed sanctuary-castle-wall` then `systemctl start`; a plain
 # `start` alone returns "start request repeated too quickly" and looks like a
-# broken unit file.
+# broken unit file. After a watchdog crash wave the owned table is preserved the
+# same way, but a table that another actor deletes after the limit trips is NOT
+# re-armed: no daemon runs until the unit is started again.
 StartLimitBurst=5
 StartLimitIntervalSec=600
 
@@ -76,6 +85,26 @@ TimeoutStartSec=60
 # so a wedged stop reads as an exit code, not as systemd's SIGKILL.
 TimeoutStopSec=10
 KillMode=control-group
+
+# Liveness watchdog (C2a3). The daemon's supervisor thread sends a liveness pet
+# after every completed health pass, from one site only. WatchdogSec is DERIVED,
+# not chosen: the longest bounded time from a pet to a terminal decision (8.4 s)
+# plus the stop guard's 8 s deadline and 2 s margin, rounded up, so a decided
+# exit code lands before this kill. Must match WATCHDOG_SEC in
+# castle-wall-daemon/src/daemon.rs.
+# SIGKILL, not the default SIGABRT: no core file of a process holding the audit
+# producer's private seed, and no user code runs in a process already proven not
+# to progress. A watchdog kill reads Result=watchdog and restarts
+# (Restart=on-failure); it is never a clean stop. Failure mode: a drop-in that
+# stretches the health interval (a test seam) without WatchdogSec=0 reads as a
+# watchdog kill 19 s after the first pet, not as a product defect.
+WatchdogSec=19
+# Must match TU3 in tests/systemd_unit.rs (no Rust constant mirrors it).
+WatchdogSignal=SIGKILL
+# Already the Type=notify default; pinned so an nft or owner child (which inherits
+# NOTIFY_SOCKET) can never pet or send READY. Must match WatchdogBeacon's
+# WATCHDOG_PID check in castle-wall-daemon/src/systemd_notify.rs.
+NotifyAccess=main
 
 # Runtime directory: systemd creates /run/sanctuary before ExecStart, owned by
 # the service user and cleaned up when the unit stops. It contains the ephemeral
