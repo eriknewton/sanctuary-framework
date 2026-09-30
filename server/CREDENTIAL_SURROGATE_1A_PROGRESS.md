@@ -90,44 +90,9 @@ This ledger is the resume point for the next job in the chain. Read the "next" l
   `SURROGATE_BOUND`, `SURROGATE_REMOVED`, `POLICY_LOAD_FAILED`), each commented with
   whether it is `append` or `appendCritical`.
 
-### next (do these in this order)
+### next
 
-1. **Finish scope item 1's wiring.** The PARSER and the FILE seam are built (see done
-   below). What remains is threading them through `openBroker`:
-   - call `loadSurrogatePolicyDocument` beside `loadBrokerGrants` (`open.ts:80`);
-   - on `failed`, write `BROKER_OPS.POLICY_LOAD_FAILED` via `append` (not
-     `appendCritical`) carrying the file (`broker` or `surrogate`) and the
-     `failureClass`, and yield ZERO grants and zero bindings;
-   - on `absent`, stay silent with zero bindings;
-   - run `findSurrogateGrantConflicts` against the parsed broker grants; on a
-     conflict, yield ZERO grants and audit `POLICY_LOAD_FAILED` with class
-     `conflict`;
-   - apply the SAME ENOENT-versus-broken split to `loadBrokerGrants`'s own bare
-     `catch` at `open.ts:116-125`, which still collapses both causes.
-   Note `loadBrokerGrants` has no `auditLog` today, so the split needs the audit log
-   threaded in or the load moved after the `AuditLog` construction at `open.ts:73`.
-   The `AuditLog` is already built before grants load, so moving the call is enough.
-2. **Scope item 2**, `disclosure/broker/surrogate-store.ts`. Confirmed seams:
-   `KeychainBackend` takes a `service` override (option declared in
-   `KeychainBackendOptions`, applied in the constructor), the broker's own derivation
-   is `legacyBrokerKeychainIdentity` plus `brokerKeychainIdentityFor` with
-   `storagePathDigest` (`keychain-backend.ts:349-386`), and `SERVICE` is the literal
-   `sanctuary-broker` at `:36`. NOTE: `storagePathDigest` is NOT exported, so the
-   surrogate derivation either exports it or derives its identity by calling
-   `brokerKeychainIdentityFor` and replacing the service prefix. Keep the same
-   keychain FILE (one passphrase unlock) and change only the service prefix, per
-   design 3.3. `openSurrogateStore` shares steps 1 to 4 of `openBroker`
-   (`open.ts:51-73`). Add the structural test that the surrogate service literal is
-   declared only in `surrogate-store.ts` and that `openBroker` never passes a service
-   override.
-3. **Scope item 3**, broker refusal. The pin comments are already in place. What
-   remains: required `surrogateBoundSecrets: ReadonlySet<string>` on
-   `TokenIssuerOptions`, refusal in `issueToken` and `readViaToken` with the generic
-   denial plus `appendCritical BROKER_OPS.SURROGATE_TOKEN_REFUSED`, `Broker.grant`
-   refusal (`broker.ts:198`), and the set threaded from `BrokerOptions`
-   (`broker.ts:29`) through the `new TokenIssuer` call (`broker.ts:94`). Use
-   `surrogateBoundSecretNames` from `policy.ts`, already built and tested.
-4. Then scope items 4 through 7 and 9, then the rest of item 10.
+Superseded by the Job 2 section below; read that one.
 
 ### open questions
 
@@ -182,3 +147,126 @@ This ledger is the resume point for the next job in the chain. Read the "next" l
   `git diff origin/main -- server/src/broker-mcp/broker-server.ts` is empty.
 - Gate 5: `.test-baseline` recomputed from the LINUX count. Current value `16496`;
   a macOS count is not the floor, so this must come from CI, not from this host.
+
+## Job 2 (2026-09-30, about 20 minutes of work)
+
+### done
+
+- **Scope item 1 COMPLETE.** `openBroker` now reads both policy files after the
+  audit log exists and reconciles them, in a new exported
+  `loadBrokerAndSurrogatePolicies` (`open.ts`). Broker grants got the SAME
+  absent-versus-present-and-broken split the surrogate loader already had, in a
+  new exported `loadBrokerGrantsClassified`, so the bare `catch` that collapsed
+  both causes is gone. A conflict, a broken broker file, or a broken surrogate
+  file each yields ZERO grants plus one `append` (not `appendCritical`)
+  `POLICY_LOAD_FAILED` line carrying `{ file, failure_class }` and, for a
+  conflict only, the sorted conflicting names. Absence stays silent.
+- **Scope item 2 COMPLETE.** `disclosure/broker/surrogate-store.ts`:
+  `SurrogateValueStore` over the SAME keychain file under service
+  `sanctuary-surrogate[-<digest>]`. The digest is NOT re-derived: the identity
+  comes from `brokerKeychainIdentityFor` with the prefix rewritten, so one digest
+  derivation exists in the tree and `storagePathDigest` stays unexported
+  (`keychain-backend.ts` is pin-comment-only and was not widened). It fails
+  closed if the broker identity ever stops starting with `sanctuary-broker`.
+  `hasValue` answers from the NAME list, never by reading the value.
+  `openSurrogateStore` is in `open.ts`, sharing steps 1 to 4 with `openBroker`
+  through one extracted `openFortressContext`.
+- **Scope item 3 COMPLETE.** `TokenIssuerOptions.surrogateBoundSecrets` and
+  `BrokerOptions.surrogateBoundSecrets` are REQUIRED (rule 3). `issueToken`
+  refuses FIRST, ahead of the grant lookup; `readViaToken` refuses ahead of the
+  expiry check; `Broker.grant` throws `BrokerDeniedError` and records nothing in
+  the issuer. All three write `appendCritical SURROGATE_TOKEN_REFUSED` with a
+  `surface` discriminator (`issue_token`, `read_via_token`, `grant`).
+  **Design decision worth the code gate's attention:** the set is held by
+  REFERENCE, not copied. A copy would make `readViaToken`'s branch unreachable
+  by construction (nothing rebinds a secret inside one broker process today), and
+  an unreachable required guard is the same as an unwritten one.
+- **Scope item 4, partial.** `secrets surrogate` dispatch with `add` and `list`,
+  `parseSurrogateAddFlags` (all four required flags named at once on a miss,
+  comma host list split before the shared parser judges it), and the `cmdGrant`
+  refusal, which fires BEFORE `broker-policy.json` is written. `surrogate add`
+  builds the candidate document and hands it to `parseSurrogatePolicyDocument`
+  rather than validating locally, refuses when the name already holds a value
+  under the broker label, writes the VALUE before the binding row, and appends
+  `SURROGATE_BOUND`.
+- **Scope item 10, partial.** `reorg-surface-manifest.md` row 77 records the
+  `secrets surrogate` additions, that `TOP_LEVEL_SUBCOMMANDS` is unchanged, the
+  re-recorded `secrets` help line, and that `secrets grant` now refuses a bound
+  name (a deliberate behavior change on a frozen row).
+- Commits `9c9276be` and the Job 2 tail, both pushed.
+
+### next (do these in this order)
+
+1. **Scope item 5, the root helper daemon**
+   (`egress-gate/surrogate-helper-daemon.ts`). Do this BEFORE the rest of the
+   CLI. `surrogate remove`, `cmdRevoke`, `unlock`, `lock` and `status` all need
+   the unlock-socket path, and rule 11 says one shared derivation: inventing a
+   path in `cli/secrets.ts` now and re-deriving it in the daemon later is exactly
+   the drift the rule forbids. Job 2 stopped at that boundary deliberately.
+   The daemon owns: the plist renderer (`Core = 0` in BOTH limit dictionaries,
+   `RunAtLoad=false`, `KeepAlive: { Crashed: true }`, argv
+   `--agent-uid --gate-uid --operator-uid --generation`), both socket paths,
+   both listeners (restrictive umask around `listen()`, chmod 0600, chown query
+   socket to the gate uid and unlock socket to the operator uid), each bound to
+   exactly ONE codec, and the refusal to start on a generation mismatch or an
+   `--operator-uid` of 0, the agent uid or the gate uid.
+2. **Finish scope item 4** against that daemon: the operator-side one-shot
+   unlock-socket client (`status` probe classified `unarmed` on socket ENOENT,
+   `armed` on a status answer, refuse on EACCES, timeout and malformed), then
+   `remove`, `unlock` (RLIMIT_CORE re-exec, order per design 3.4.4), `lock`,
+   `status`, `events` (root only), and the `cmdRevoke` refusal. `cli.ts` gets the
+   `castle-wall surrogate-helper-daemon` verb.
+3. Scope items 6 and 7 (arming twin membership, placeholder minting, release
+   barrier), then 9 (gate plist `Core = 0` only), then the rest of 10
+   (`ASSURANCE_MATRIX.md` row, the `egress-gate` module-map row, `.test-baseline`).
+
+### open questions
+
+- None blocking. The design and the tree agreed at every seam Job 2 read.
+- Job 1's deviation note (the env-name pin carried by a test rather than a
+  comment on `harness-daemon.ts`) still stands and still needs the code gate's eye.
+
+### out-of-owned-path edits made, flagged for the code gate
+
+Making `surrogateBoundSecrets` required (design 3.3, AGENTS.md rule 3) broke 14
+existing construction sites at the type level. Twelve are inside owned test
+paths. TWO are not: `server/test/security/agent-audit-allowlist.test.ts:698` and
+`server/test/structure/public-surface-extract.ts:210`. Each got exactly one
+added option line plus a one-line comment; nothing else in either file changed,
+and neither edit alters what those suites assert. Halting the build over two
+mechanical one-line compile fixes forced by a design-mandated required option
+would have been disproportionate, so they were made and are recorded here.
+`server/test/fixtures/typecheck-tests-baseline.txt` also moved by ONE line
+number (a shifted `@ts-expect-error` in a file Job 2 edited); the diagnostic
+COUNT is unchanged at 979.
+
+### test results so far (Job 2, additive to Job 1)
+
+- `npx vitest run test/disclosure/broker/surrogate-refusal.test.ts`: **6 passed**.
+- `npx vitest run test/disclosure/broker/surrogate-policy-reconcile.test.ts`: **11 passed**.
+- `npx vitest run test/disclosure/broker/surrogate-store.test.ts`: **7 passed**.
+- `npx vitest run test/broker-mcp/broker-server-surrogate-refusal.test.ts`: **3 passed**
+  (the wired-consumer test through the real `tools/call` handler).
+- `npx vitest run test/structure/surrogate-keychain-label.test.ts`: **4 passed**.
+- `npx vitest run test/cli/secrets-surrogate.test.ts`: **12 passed**.
+- `npx vitest run test/disclosure/broker test/broker-mcp test/audit test/credential-surrogate`:
+  37 files, **442 passed**, 0 failed.
+- `npx vitest run test/cli/secrets.test.ts test/cli/secrets-fortress-flag.test.ts test/cli/secrets-surrogate.test.ts`:
+  3 files, **34 passed**.
+- `npm run typecheck`: green; tests/scripts baseline unchanged at 979.
+- `scripts/check-ai-tells.sh server/reorg-surface-manifest.md`: 5 hits, ALL of
+  them present on the base tree too (verified against
+  `git show origin/main:server/reorg-surface-manifest.md`). Job 2 added zero.
+- Zero em-dashes on any added line.
+
+### fail-before witnesses captured (Job 2)
+
+| Guard | Command | Base or guard-removed result | Head result |
+|---|---|---|---|
+| required `surrogateBoundSecrets` (type level) | `npm run typecheck` | 14 new `TS2345` diagnostics naming `BrokerOptions` and `TokenIssuerOptions` | baseline unchanged, 979 |
+| `issueToken`, `readViaToken` and `Broker.grant` refusals | `npx vitest run test/disclosure/broker/surrogate-refusal.test.ts` with the three `.has()` checks stubbed false | 5 failed, 1 passed | 6 passed |
+| `cmdGrant` binding refusal | `npx vitest run test/cli/secrets-surrogate.test.ts` with the refusal call removed | 2 failed, 10 passed | 12 passed |
+
+Raw output for the three is in `/tmp/cs1a-evidence/` on the Mini2 host, which is
+NOT durable; the next job re-captures anything it needs for the BUILD_REPORT
+rather than citing that path.

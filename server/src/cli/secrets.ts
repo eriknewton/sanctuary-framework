@@ -36,9 +36,20 @@ import { createInterface } from "node:readline";
 import type { SecretScope } from "../disclosure/broker/backend-interface.js";
 import {
   openBroker,
+  openSurrogateStore,
   loadBrokerPolicyRaw,
+  loadSurrogatePolicyDocument,
   saveBrokerPolicy,
+  saveSurrogatePolicy,
 } from "../disclosure/broker/open.js";
+import {
+  SURROGATE_POLICY_VERSION,
+  parseSurrogatePolicyDocument,
+  surrogateBoundSecretNames,
+  type SurrogatePolicyDocument,
+} from "../disclosure/broker/policy.js";
+import { BROKER_OPS } from "../operational/audit-log.js";
+import { SURROGATE_BOUND_PORT } from "../credential-surrogate/binding.js";
 import { flagValue } from "./argv.js";
 import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 
@@ -108,6 +119,8 @@ export async function runSecretsCommand(args: SecretsArgs): Promise<number> {
         return await cmdRevoke(rest, { out, err, args });
       case "audit":
         return await cmdAudit(rest, { out, err, args });
+      case "surrogate":
+        return await cmdSurrogate(rest, { out, err, stdin, args });
       default:
         err.write(`Unknown subcommand: ${sub}\n`);
         printUsage(err);
@@ -139,6 +152,10 @@ function printUsage(s: NodeJS.WritableStream): void {
     --ttl <seconds>                  Token TTL cap (default: 900).
   revoke <skill> <secret>            Revoke a skill's access to a secret.
   audit [--since <iso>] [--limit N]  Show the broker-scoped audit trail.
+  surrogate <command> [args]         Bind a secret to a destination so the agent
+                                     is issued a placeholder and never the value.
+                                     Run \`sanctuary secrets surrogate\` for its
+                                     own command list.
 
 See also: \`sanctuary broker-server\` — run the Secret Broker as a separate
 MCP server so skills can request scoped ephemeral tokens over stdio.
@@ -265,9 +282,21 @@ async function cmdGrant(
   }
   const { scope, ttl } = flags;
 
+  const storagePathForCheck = ctx.args.storagePath ?? (await defaultStoragePath());
+  const boundRefusal = await refuseIfSurrogateBound(secret, storagePathForCheck, "grant");
+  if (boundRefusal !== undefined) {
+    // Checked BEFORE the policy file is rewritten, not after: a grant row
+    // written and then reported as refused would leave `broker-policy.json`
+    // naming a bound secret, which is exactly the conflict state that makes the
+    // broker serve zero grants at its next open.
+    ctx.err.write(boundRefusal);
+    return 1;
+  }
+
   // Update policy file + in-process broker (so running daemons pick up at next
-  // reload; the CLI-local broker gets the grant for audit purposes).
-  const storage = ctx.args.storagePath ?? (await defaultStoragePath());
+  // reload; the CLI-local broker gets the grant for audit purposes). Same path
+  // the binding check above used, so the two cannot land on different fortresses.
+  const storage = storagePathForCheck;
   const policy = await loadBrokerPolicyRaw(storage);
   let skillEntry = policy.skills.find((s) => s.name === skill);
   if (!skillEntry) {
@@ -333,6 +362,288 @@ async function cmdRevoke(
   } finally {
     await close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// secrets surrogate: bind a secret to a destination instead of granting it
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS FAMILY IS FOR. A granted secret is one the agent can ask the broker
+// for and then holds. A BOUND secret is one the agent is never issued: arming
+// mints a placeholder for it, the wrapper exports the placeholder under the
+// binding's env name, and only the gate and the root helper can put the real
+// value on the wire toward the bound destination.
+//
+// WHY IT IS A SEPARATE VERB FAMILY AND NOT A NEW `--scope`. `surrogate` is not a
+// token scope and must never become one: the broker's `scope` enum is a frozen
+// surface, and a scope would put surrogacy back on the token path the separate
+// keychain label and the separate policy file exist to keep it off. See the pin
+// comments on `SecretScope` and `SCOPE_RANK`.
+
+/**
+ * Operator-facing refusal when `secret` is surrogate-bound, or `undefined` when
+ * it is not.
+ *
+ * `verb` names the command in the message so the operator is told which of
+ * their own actions was refused. A load failure refuses too: a policy file that
+ * is present and broken must not read as "no bindings", which would let a grant
+ * land on a name a binding still claims.
+ */
+async function refuseIfSurrogateBound(
+  secret: string,
+  storagePath: string,
+  verb: string,
+): Promise<string | undefined> {
+  const result = await loadSurrogatePolicyDocument(storagePath);
+  if (result.outcome === "absent") return undefined;
+  if (result.outcome === "failed") {
+    return (
+      `sanctuary secrets ${verb}: the surrogate policy is present and could not be ` +
+      `read (${result.failureClass}), so whether "${secret}" is bound cannot be ` +
+      `decided. Refusing rather than guessing.\n` +
+      `  Repair or remove ${storagePath}/surrogate-policy.json, then retry.\n`
+    );
+  }
+  if (!surrogateBoundSecretNames(result.document.bindings).has(secret)) return undefined;
+  return (
+    `sanctuary secrets ${verb}: "${secret}" is bound as a surrogate, so the broker ` +
+    `never issues it and a grant for it would read as not-found.\n` +
+    `  Inspect the binding:  sanctuary secrets surrogate status\n` +
+    `  Remove it first:      sanctuary secrets surrogate remove ${secret}\n`
+  );
+}
+
+async function cmdSurrogate(
+  argv: string[],
+  ctx: {
+    out: NodeJS.WritableStream;
+    err: NodeJS.WritableStream;
+    stdin: NodeJS.ReadableStream & { isTTY?: boolean };
+    args: SecretsArgs;
+  },
+): Promise<number> {
+  const [sub, ...rest] = argv;
+  if (!sub || sub === "--help" || sub === "-h") {
+    printSurrogateUsage(ctx.out);
+    return 0;
+  }
+  switch (sub) {
+    case "add":
+      return await cmdSurrogateAdd(rest, ctx);
+    case "list":
+      return await cmdSurrogateList(rest, ctx);
+    default:
+      ctx.err.write(`Unknown surrogate subcommand: ${sub}\n`);
+      printSurrogateUsage(ctx.err);
+      return 2;
+  }
+}
+
+function printSurrogateUsage(s: NodeJS.WritableStream): void {
+  s.write(`Usage: sanctuary secrets surrogate <command> [args]
+
+  add <secret> [value]               Bind a secret to a destination. The agent is
+                                     issued a placeholder for it and never the
+                                     value. Value sources match \`secrets add\`.
+    --agent <id>                     Agent account the binding belongs to.
+    --env <NAME>                     Environment variable the wrapper exports.
+    --header <Name>                  Request header the gate writes the value into.
+    --host <host>[,<host>]           Destination host or hosts, port ${SURROGATE_BOUND_PORT} only.
+  list                               List bindings. Never prints a value.
+
+A bound secret cannot be granted, and a granted secret cannot be bound; run
+\`sanctuary secrets delete <name>\` first if the name already holds a broker value.
+`);
+}
+
+/** Flags `surrogate add` accepts, parsed as one grammar so a typo is refused
+ * rather than silently dropped the way an unread flag would be. */
+interface SurrogateAddFlags {
+  agent?: string;
+  env?: string;
+  header?: string;
+  hosts?: string[];
+  error?: string;
+}
+
+export function parseSurrogateAddFlags(argv: string[]): SurrogateAddFlags {
+  const agent = flagValue(argv, "--agent");
+  const env = flagValue(argv, "--env");
+  const header = flagValue(argv, "--header");
+  const host = flagValue(argv, "--host");
+  const missing = [
+    agent ? null : "--agent",
+    env ? null : "--env",
+    header ? null : "--header",
+    host ? null : "--host",
+  ].filter((v): v is string => v !== null);
+  if (missing.length > 0) {
+    return {
+      error:
+        `sanctuary secrets surrogate add: missing required ${missing.join(", ")}.\n` +
+        `  Every binding names an agent, an env name, a header and at least one host;\n` +
+        `  a binding missing any of them has no destination the gate could check.\n`,
+    };
+  }
+  // Split before validating: the shared parser owns the host grammar, so this
+  // only has to decide where one host ends and the next begins.
+  const hosts = host!.split(",").map((h) => h.trim()).filter((h) => h.length > 0);
+  return { agent, env, header, hosts };
+}
+
+async function cmdSurrogateAdd(
+  argv: string[],
+  ctx: {
+    out: NodeJS.WritableStream;
+    err: NodeJS.WritableStream;
+    stdin: NodeJS.ReadableStream & { isTTY?: boolean };
+    args: SecretsArgs;
+  },
+): Promise<number> {
+  const secret = requirePositional(argv, 0, "surrogate add <secret> [value]");
+  const argvValue = optionalPositional(argv, 1);
+  const flags = parseSurrogateAddFlags(argv);
+  if (flags.error) {
+    ctx.err.write(flags.error);
+    return 2;
+  }
+
+  const storagePath = ctx.args.storagePath ?? (await defaultStoragePath());
+
+  // Build the document the loader would accept and let the SHARED parser judge
+  // it, rather than validating here. One grammar, checked once, so the CLI can
+  // never write a binding root arming or the helper would refuse.
+  const existing = await loadSurrogatePolicyDocument(storagePath);
+  if (existing.outcome === "failed") {
+    ctx.err.write(
+      `sanctuary secrets surrogate add: the surrogate policy is present and could ` +
+        `not be read (${existing.failureClass}). Refusing to overwrite it.\n`,
+    );
+    return 1;
+  }
+  const bindings =
+    existing.outcome === "loaded" ? [...existing.document.bindings] : [];
+  const candidate: SurrogatePolicyDocument = {
+    surrogate_policy_version: SURROGATE_POLICY_VERSION,
+    bindings: [
+      ...bindings,
+      {
+        secret,
+        agent: flags.agent!,
+        env: flags.env!,
+        header: flags.header!,
+        destinations: flags.hosts!.map((host) => ({ host, port: SURROGATE_BOUND_PORT })),
+      },
+    ],
+  };
+  let validated: SurrogatePolicyDocument;
+  try {
+    validated = parseSurrogatePolicyDocument(candidate);
+  } catch {
+    // The parser's own message quotes the input, so it is not echoed. The
+    // operator is told which rule family they are against, not what they typed.
+    ctx.err.write(
+      `sanctuary secrets surrogate add: the binding was refused by the policy ` +
+        `grammar. Check the agent id, the env name (not a reserved one), the header ` +
+        `name, the host names, and that "${secret}" is not already bound.\n`,
+    );
+    return 1;
+  }
+
+  const { broker, close: closeBroker } = await openBroker({
+    passphrase: ctx.args.passphrase,
+    storagePath,
+  });
+  let brokerNames: string[];
+  try {
+    brokerNames = await broker.listSecretNames();
+  } finally {
+    await closeBroker();
+  }
+  if (brokerNames.includes(secret)) {
+    // A value under BOTH labels is the one state that makes the label split
+    // meaningless: the broker would serve its copy while the gate spends the
+    // other. Refused here so the operator deletes one deliberately.
+    ctx.err.write(
+      `sanctuary secrets surrogate add: "${secret}" already holds a value under the ` +
+        `broker label, and a name must never hold a value under both.\n` +
+        `  Delete it first:  sanctuary secrets delete ${secret}\n`,
+    );
+    return 1;
+  }
+
+  const { store, auditLog, close } = await openSurrogateStore({
+    passphrase: ctx.args.passphrase,
+    storagePath,
+  });
+  try {
+    const value = await resolveValue(
+      argvValue,
+      ctx.stdin,
+      ctx.err,
+      `Enter value for "${secret}"`,
+    );
+    if (!value) {
+      ctx.err.write("Aborted: empty value\n");
+      return 1;
+    }
+    // Value first, then the binding row. The other order would leave a binding
+    // arming could mint a placeholder for with no value behind it, so the agent
+    // would spend a placeholder the helper can never answer.
+    await store.bindValue(secret, value);
+    await saveSurrogatePolicy(storagePath, validated);
+    await auditLog.appendCritical({
+      layer: "l3",
+      operation: BROKER_OPS.SURROGATE_BOUND,
+      identity_id: "sanctuary-broker",
+      result: "success",
+      details: {
+        secret,
+        agent: flags.agent,
+        env: flags.env,
+        header: flags.header,
+        destinations: flags.hosts,
+      },
+    });
+    ctx.out.write(
+      `Bound: ${secret} -> ${flags.agent} (${flags.env}, ${flags.header}, ` +
+        `${flags.hosts!.join(", ")})\n` +
+        `The agent is issued a placeholder for this secret at the next arming, ` +
+        `never the value.\n`,
+    );
+    return 0;
+  } finally {
+    await close();
+  }
+}
+
+async function cmdSurrogateList(
+  argv: string[],
+  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; args: SecretsArgs },
+): Promise<number> {
+  void argv;
+  const storagePath = ctx.args.storagePath ?? (await defaultStoragePath());
+  const result = await loadSurrogatePolicyDocument(storagePath);
+  if (result.outcome === "failed") {
+    ctx.err.write(
+      `sanctuary secrets surrogate list: the surrogate policy is present and could ` +
+        `not be read (${result.failureClass}).\n`,
+    );
+    return 1;
+  }
+  if (result.outcome === "absent" || result.document.bindings.length === 0) {
+    ctx.out.write("No surrogate bindings.\n");
+    return 0;
+  }
+  for (const b of result.document.bindings) {
+    // Names, destinations and header only. Never a value, and never a
+    // placeholder: a placeholder is a live bearer surrogate for its generation.
+    ctx.out.write(
+      `${b.secret}  agent=${b.agent}  env=${b.env}  header=${b.header}  ` +
+        `hosts=${b.destinations.map((d) => `${d.host}:${d.port}`).join(",")}\n`,
+    );
+  }
+  return 0;
 }
 
 // ── audit ───────────────────────────────────────────────────────────
