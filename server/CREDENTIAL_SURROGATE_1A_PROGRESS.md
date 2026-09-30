@@ -873,9 +873,10 @@ this once CI reports the real Linux number on this branch.**
    `.test-baseline` old and new with the derivation above; and an honest
    residuals list. Run `scripts/check-ai-tells.sh` on it.
 2. **The OWED fail-before witnesses** still listed in the Job 3 and Job 4 tables.
-3. **The final gates**, in this order, in `server/`: `npm run typecheck` (green
-   as of this job), `test/security` whole and `test/wrap` whole (NOT run on this
-   branch yet by any job), then the push.
+3. **The final gates are already green** (see the section below): typecheck,
+   `test/structure`, `test/security`, `test/wrap`, the assurance-matrix script,
+   import cycles and the `broker-server.ts` zero diff all ran in job 6. Re-run
+   only what a further edit touches, then push.
 4. Only then print `RESULT_VERDICT: BRANCH_PUSHED <sha> COMPLETE`.
 
 ### gates ALREADY RUN on this branch (do not re-run unless something changed)
@@ -898,10 +899,16 @@ this once CI reports the real Linux number on this branch.**
   pre-existing lines in `reorg-surface-manifest.md` (lines 37, 48, 71, 74, 91),
   none in text this branch added.
 
-### still NOT run on this branch by any job
+### the two owed suites: BOTH NOW RUN AND GREEN (end of job 6)
 
-`test/security` whole and `test/wrap` whole. Both are named in the spawn prompt's
-gate 3 and both are owed before `COMPLETE`.
+- `npx vitest run test/security` WHOLE: **37 files, 436 passed**, 0 failed.
+- `npx vitest run test/wrap` WHOLE: **78 files, 1242 passed, 4 skipped**, 0 failed.
+  The 4 skips are pre-existing, not introduced by this branch.
+
+So EVERY named local gate in the spawn prompt has now run green on this branch.
+Nothing test-shaped is owed. What remains for the final job is the BUILD_REPORT
+and the Job 3 and Job 4 owed witnesses, both of which are writing, not running.
+Re-run only what a further edit touches.
 
 ### open questions
 
