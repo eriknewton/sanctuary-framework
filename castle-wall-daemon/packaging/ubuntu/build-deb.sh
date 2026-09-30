@@ -62,13 +62,18 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 crate_dir="$(cd -- "$script_dir/../.." && pwd -P)"
 repo_root="$(cd -- "$crate_dir/.." && pwd -P)"
 unit_source="$crate_dir/systemd/sanctuary-castle-wall.service"
+# The agent template unit ships beside the wall unit, copied byte for byte.
+# Must match AGENT_UNIT_PATH in lifecycle-guard.py and PAYLOAD_FILES in
+# assert-archive.py.
+agent_unit_source="$crate_dir/systemd/sanctuary-agent@.service"
 
 for command in cargo dpkg dpkg-deb dpkg-query git ldd python3 readlink rustc sha256sum tar; do
   command -v "$command" >/dev/null 2>&1 || die "required command missing: $command"
 done
 [[ "$(uname -s)" == "Linux" ]] || die "Ubuntu/Linux build host required"
 [[ "$(dpkg --print-architecture)" == "amd64" ]] || die "only Ubuntu amd64 is in scope"
-[[ -f "$crate_dir/Cargo.lock" && -f "$crate_dir/Cargo.toml" && -f "$unit_source" ]] || die "required source input missing"
+[[ -f "$crate_dir/Cargo.lock" && -f "$crate_dir/Cargo.toml" && -f "$unit_source" && -f "$agent_unit_source" ]] \
+  || die "required source input missing"
 # A package without a single source revision cannot be reviewed or reproduced.
 [[ -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" ]] \
   || die "refusing dirty or untracked source inputs"
@@ -179,6 +184,7 @@ install -d -m 0755 \
 install -m 0755 "$binary" "$stage_dir/usr/local/libexec/sanctuary/castle-wall-daemon"
 # The A119-owned unit is an input, never a packaging-maintained copy.
 install -m 0644 "$unit_source" "$stage_dir/etc/systemd/system/sanctuary-castle-wall.service"
+install -m 0644 "$agent_unit_source" "$stage_dir/etc/systemd/system/sanctuary-agent@.service"
 
 cat > "$stage_dir/DEBIAN/control" <<EOF
 Package: sanctuary-castle-wall-internal
@@ -196,6 +202,7 @@ EOF
 
 binary_sha256="$(sha256sum "$binary" | awk '{print $1}')"
 unit_sha256="$(sha256sum "$unit_source" | awk '{print $1}')"
+agent_unit_sha256="$(sha256sum "$agent_unit_source" | awk '{print $1}')"
 lock_sha256="$(sha256sum "$crate_dir/Cargo.lock" | awk '{print $1}')"
 for role in preinst prerm; do
   script="$stage_dir/DEBIAN/$role"
@@ -205,6 +212,10 @@ for role in preinst prerm; do
     printf 'PACKAGE_VERSION = "%s"\n' "$package_version"
     printf 'DAEMON_SHA256 = "%s"\n' "$binary_sha256"
     printf 'UNIT_SHA256 = "%s"\n' "$unit_sha256"
+    # Header order is pinned: ROLE, PACKAGE_VERSION, DAEMON_SHA256,
+    # UNIT_SHA256, AGENT_UNIT_SHA256. Must match the byte comparison in
+    # assert-archive.py.
+    printf 'AGENT_UNIT_SHA256 = "%s"\n' "$agent_unit_sha256"
     cat "$script_dir/lifecycle-guard.py"
   } > "$script"
   chmod 0755 "$script"
@@ -220,6 +231,8 @@ rustc_version=$(rustc --version)
 daemon_sha256=$binary_sha256
 unit_source=castle-wall-daemon/systemd/sanctuary-castle-wall.service
 unit_sha256=$unit_sha256
+agent_unit_source=castle-wall-daemon/systemd/sanctuary-agent@.service
+agent_unit_sha256=$agent_unit_sha256
 runtime_depends=$runtime_depends
 pre_depends=$pre_depends
 EOF
@@ -245,6 +258,8 @@ dpkg-deb --root-owner-group --build "$stage_dir" "$deb_path" >/dev/null
   echo "cargo_lock_sha256=$lock_sha256"
   echo "daemon_sha256=$binary_sha256"
   echo "unit_sha256=$unit_sha256"
+  echo "agent_unit_source=castle-wall-daemon/systemd/sanctuary-agent@.service"
+  echo "agent_unit_sha256=$agent_unit_sha256"
   echo "runtime_depends=$runtime_depends"
   echo "pre_depends=$pre_depends"
   echo "package_metadata:"

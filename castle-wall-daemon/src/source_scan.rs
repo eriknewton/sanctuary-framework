@@ -1,6 +1,7 @@
 //! Test-only source scanning shared by the C2a2 structural tests (T1, T4, T9,
-//! T12, T14, T15, T16). One helper set rather than a copy per test: a
-//! hand-mirrored scanner is the shape that drifts (AGENTS rule 5).
+//! T12, T14, T15, T16) and the C2a2b journal-writer parity tests (T2, T7, T-P1 to
+//! T-P3). One helper set rather than a copy per test: a hand-mirrored scanner is
+//! the shape that drifts (AGENTS rule 5).
 //!
 //! These read the crate's own source files from `CARGO_MANIFEST_DIR`; they never
 //! touch operator state.
@@ -79,7 +80,7 @@ pub(crate) fn cfg_test_module_ranges(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Index of the `}` matching the `{` at `open`.
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
@@ -236,6 +237,162 @@ pub(crate) fn offsets_of(text: &str, needle: &str) -> Vec<usize> {
     text.match_indices(needle).map(|(i, _)| i).collect()
 }
 
+/// Every byte offset of `needle` in `text` that is NOT preceded by an identifier
+/// character, a `.` or a `:`.
+///
+/// This is the "unqualified call" reading: `store(` matches a call of a local or
+/// injected `store`, while `.store(` (an atomic's method), `x_store(` (another
+/// function) and `journal::store(` (a path-qualified call) do not.
+pub(crate) fn offsets_of_unqualified(text: &str, needle: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    offsets_of(text, needle)
+        .into_iter()
+        .filter(|&at| {
+            at == 0 || {
+                let prev = bytes[at - 1];
+                !(is_ident_byte(prev) || prev == b'.' || prev == b':')
+            }
+        })
+        .collect()
+}
+
+/// The top-level parameters of the first parenthesised list in `signature`, as
+/// `(name, type)` pairs.
+///
+/// The list is split at commas at bracket depth zero, depth counted over `()`,
+/// `<>` and `[]`, where the `>` of a `->` is not a closing angle bracket; so a
+/// closure type such as `impl FnOnce(&Path, &Record) -> Result<(), Error>` stays one
+/// parameter. The name is the text before the first single `:` (never a `::`), and
+/// the type is the rest with every run of whitespace collapsed to one space. A
+/// receiver such as `&self` has an empty type. Empty entries (a trailing comma) are
+/// skipped.
+pub(crate) fn top_level_params(signature: &str) -> Vec<(String, String)> {
+    let Some(open) = signature.find('(') else {
+        return Vec::new();
+    };
+    let bytes = signature.as_bytes();
+    let mut out = Vec::new();
+    let mut push = |raw: &str| {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        let rb = raw.as_bytes();
+        let colon = (0..rb.len()).find(|&i| {
+            rb[i] == b':' && rb.get(i + 1) != Some(&b':') && (i == 0 || rb[i - 1] != b':')
+        });
+        let (name, ty) = match colon {
+            Some(i) => (&raw[..i], &raw[i + 1..]),
+            None => (raw, ""),
+        };
+        out.push((
+            name.split_whitespace().collect::<Vec<_>>().join(" "),
+            ty.split_whitespace().collect::<Vec<_>>().join(" "),
+        ));
+    };
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
+            b')' | b']' | b'>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    push(&signature[start..i]);
+                    break;
+                }
+            }
+            b',' if depth == 1 => {
+                push(&signature[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `text` with the CONTENTS of every string literal (plain, escaped, and raw
+/// `r"..."`/`r#"..."#`) replaced by spaces, quotes and newlines kept, so a word in a
+/// message is not read as an identifier. A `'"'` char literal is not a string.
+pub(crate) fn blank_string_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if bytes.get(i + 1) == Some(&b'"') && bytes.get(i + 2) == Some(&b'\'') => {
+                i += 3;
+                continue;
+            }
+            b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#'))
+                && (i == 0 || !is_ident_byte(bytes[i - 1])) =>
+            {
+                let mut hashes = 0;
+                let mut j = i + 1;
+                while bytes.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let from = j + 1;
+                    let end = text[from..]
+                        .find(&close)
+                        .map(|o| from + o)
+                        .unwrap_or(bytes.len());
+                    blank(&mut out, from, end);
+                    i = end + close.len();
+                    continue;
+                }
+            }
+            b'"' => {
+                let from = i + 1;
+                let mut j = from;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let end = j.min(bytes.len());
+                blank(&mut out, from, end);
+                i = end + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `(name, type)` fields of the struct declared by `decl` (for example
+/// `"pub struct Foo {"`) in `code`, via [`top_level_params`] over the brace-matched
+/// body. A field with a visibility modifier reads as `pub name`, so a field-set
+/// equality also pins "no visibility modifier".
+pub(crate) fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
+    let at = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("{decl} must exist"));
+    let open = at + decl.len() - 1;
+    // Safety: `open` is the `{` that ends `decl`, a struct declaration's opening brace
+    // found in the crate's own compiling source, so a matching `}` exists; this is a
+    // test-only scanner over source text and never runs in the shipped daemon.
+    let close = matching_brace(code, open).expect("the struct closes");
+    top_level_params(&format!("({})", &code[open + 1..close]))
+}
+
 /// Whether byte `offset` of `text` falls inside one of `ranges`.
 pub(crate) fn in_ranges(ranges: &[(usize, usize)], offset: usize) -> bool {
     ranges.iter().any(|(s, e)| (*s..*e).contains(&offset))
@@ -279,7 +436,88 @@ pub(crate) fn doc_block_of(text: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::receiver_before;
+    use super::{
+        blank_string_literals, offsets_of_unqualified, receiver_before, struct_fields,
+        top_level_params,
+    };
+
+    /// A struct's fields come back as `(name, type)` pairs, a generic type with a
+    /// comma stays whole, and a visibility modifier stays on the name.
+    #[test]
+    fn struct_fields_reads_names_types_and_visibility() {
+        let code = "struct Other { x: u8 }\npub struct Token {\n    path: PathBuf,\n    \
+                    pub map: Map<u32, Vec<u8>>,\n}\n";
+        assert_eq!(
+            struct_fields(code, "pub struct Token {"),
+            vec![
+                ("path".to_string(), "PathBuf".to_string()),
+                ("pub map".to_string(), "Map<u32, Vec<u8>>".to_string()),
+            ]
+        );
+    }
+
+    /// Words inside plain, escaped, multi-line and raw string literals are blanked;
+    /// code outside them, a `'"'` char literal, and line structure survive.
+    #[test]
+    fn blank_string_literals_hides_only_literal_contents() {
+        let text = "let a = journal; f(\"the journal key\", '\"', journal)\n\
+                    g(\"x \\\" journal \\\n  journal\")\n\
+                    h(r#\"raw journal \"quoted\" \"#, journal.path())";
+        let blanked = blank_string_literals(text);
+        assert_eq!(blanked.len(), text.len());
+        assert_eq!(blanked.lines().count(), text.lines().count());
+        assert_eq!(blanked.matches("journal").count(), 3, "{blanked}");
+        assert!(blanked.contains("'\"'"));
+        assert!(blanked.contains("journal.path()"));
+    }
+
+    /// The unqualified reading excludes a method call, a longer identifier and a
+    /// path-qualified call, and keeps a bare call. The needle is assembled with
+    /// `concat!` so this module's own source never reads as a journal writer.
+    #[test]
+    fn offsets_of_unqualified_keeps_only_a_bare_call() {
+        const NEEDLE: &str = concat!("sto", "re(");
+        let text = format!(
+            "flag.{NEEDLE}true); x_{NEEDLE}a); journal::{NEEDLE}b); {NEEDLE}c);\n{NEEDLE}d)"
+        );
+        let hits = offsets_of_unqualified(&text, NEEDLE);
+        let tails: Vec<&str> = hits
+            .iter()
+            .map(|&at| &text[at + NEEDLE.len()..at + NEEDLE.len() + 1])
+            .collect();
+        assert_eq!(tails, vec!["c", "d"], "{text}");
+    }
+
+    /// W2's signature yields its five parameters, and the injected store's closure
+    /// type is kept whole (its `->` does not close an angle bracket).
+    #[test]
+    fn top_level_params_splits_the_confined_writer_signature() {
+        let signature = "fn persist_confined_uid_write_ahead_with_store(
+    journal: &OwnedJournalHandle,
+    key: &JournalAuthKey,
+    uid: u32,
+    role: ConfinedRole,
+    store: impl FnOnce(&Path, &OwnershipJournal, &JournalAuthKey) -> Result<(), OwnershipJournalError>,
+) -> Result<WriteAheadReceipt, OwnershipJournalError> {";
+        let params = top_level_params(signature);
+        let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["journal", "key", "uid", "role", "store"]);
+        assert_eq!(params[0].1, "&OwnedJournalHandle");
+        assert_eq!(
+            params[4].1,
+            "impl FnOnce(&Path, &OwnershipJournal, &JournalAuthKey) -> Result<(), OwnershipJournalError>"
+        );
+        // A path type keeps its `::` and a receiver has an empty type.
+        let params = top_level_params("fn f(&self, p: &std::path::Path, m: Map<u32, Vec<u8>>)");
+        assert_eq!(
+            params,
+            vec![
+                ("&self".to_string(), String::new()),
+                ("p".to_string(), "&std::path::Path".to_string()),
+                ("m".to_string(), "Map<u32, Vec<u8>>".to_string()),
+            ]
+        );
+    }
 
     /// The one-line and the rustfmt-wrapped method-chain forms name the same
     /// receiver. The store token is assembled with `concat!` so this module's own

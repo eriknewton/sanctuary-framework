@@ -145,6 +145,44 @@ pub struct DaemonConfig {
     /// path that can pre-arm this.
     #[cfg(feature = "test-isolation")]
     pub test_boot_time_shutdown_requested: bool,
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01, harness leg HW3): when
+    /// set, `boot()` sleeps this many milliseconds immediately before sending
+    /// `READY=1`, to show systemd's watchdog is inactive while the unit is still
+    /// activating. Routed exactly like `test_boot_time_shutdown_requested`: set
+    /// via `--test-delay-before-ready-ms` in `main.rs` after `from_argv` and
+    /// before `daemon::boot`, because the sleep must run inside `boot()`, before
+    /// any handle exists. Compiled out of the shipped binary.
+    #[cfg(feature = "test-isolation")]
+    pub test_delay_before_ready_ms: Option<u64>,
+}
+
+/// Shortest fortress id the server profile accepts.
+#[cfg(any(target_os = "linux", test))]
+const FORTRESS_ID_MIN_LEN: usize = 8;
+/// Longest fortress id the server profile accepts: 64 = the hex length of a
+/// 32-byte identifier.
+#[cfg(any(target_os = "linux", test))]
+const FORTRESS_ID_MAX_LEN: usize = 64;
+
+/// THE fortress-id grammar, the one implementation: 8 to 64 lowercase
+/// hexadecimal characters. Called by [`DaemonConfig::validate_server_profile`]
+/// and by the agent start gate (`src/agent_start.rs`), so the wall and the gate
+/// can never disagree on which ids are well formed (TB7s pins the single
+/// grammar). Linux-or-test only, like both callers: a macOS release build has
+/// no caller and carries no dead code.
+#[cfg(any(target_os = "linux", test))]
+pub fn validate_fortress_id(fortress_id: &str) -> Result<(), String> {
+    if fortress_id.len() < FORTRESS_ID_MIN_LEN
+        || fortress_id.len() > FORTRESS_ID_MAX_LEN
+        || !fortress_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "server fortress id must be 8..64 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl DaemonConfig {
@@ -170,6 +208,8 @@ impl DaemonConfig {
             linux_runtime_paths: LinuxRuntimePaths::production(),
             #[cfg(feature = "test-isolation")]
             test_boot_time_shutdown_requested: false,
+            #[cfg(feature = "test-isolation")]
+            test_delay_before_ready_ms: None,
         }
     }
 
@@ -183,17 +223,7 @@ impl DaemonConfig {
         if self.linux_runtime_paths != LinuxRuntimePaths::production() {
             return Ok(());
         }
-        if self.fortress_id.len() < 8
-            || self.fortress_id.len() > 64
-            || !self
-                .fortress_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(
-                "server fortress id must be 8..64 lowercase hexadecimal characters".to_string(),
-            );
-        }
+        validate_fortress_id(&self.fortress_id)?;
         if unsafe { libc::geteuid() } != 0 {
             return Err(
                 "server enforcement daemon must run as root under the provisioned systemd unit"

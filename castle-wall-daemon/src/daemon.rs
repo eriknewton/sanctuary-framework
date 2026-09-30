@@ -8,6 +8,8 @@
 //! later checkpoints; this module is the orchestration spine they hang off.
 
 use std::path::PathBuf;
+#[cfg(feature = "test-isolation")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -60,10 +62,122 @@ pub const SUPERVISOR_SHUTDOWN_TICK: Duration = Duration::from_millis(200);
 /// one. `kernel_runtime_health` reaches it on runtime-mutex contention
 /// (`TryLockError::WouldBlock`), which never consults the nft probe. A wedged
 /// `nft` instead exhausts the probe's own
-/// `NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE` budget, which returns a PROVEN
-/// `Lost` and is acted on immediately by the no-grace arm below. Both routes end
-/// in `record_runtime_loss`; keep them both.
+/// `NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE` budget, which latches
+/// `Indeterminate` (never a proven `Lost`: `note_indeterminate` in
+/// `src/health_probe.rs`) and is acted on at once by the supervisor's
+/// `Indeterminate` arm, which runs the post-READY hook before its decision; the
+/// `Lost` arm runs no hook. Both routes end in `record_runtime_loss`; keep them
+/// both.
 const MAX_CONSECUTIVE_UNAVAILABLE_HEALTH_READINGS: u32 = 3;
+
+// ---- C2a3: systemd liveness watchdog, derived ------------------------------
+//
+// Two different quantities, kept apart:
+// * the PET GAP: the longest time between two liveness pets while the
+//   supervisor is live. It governs whether a healthy daemon is killed.
+// * the DECISION GAP: the longest BOUNDED time from the watchdog's reference
+//   point (the last pet, or `READY=1` when no pet was sent yet) to a terminal
+//   `decide_and_arm`. It governs whether the stop guard's decided exit code
+//   lands before the watchdog's SIGKILL.
+// Unbounded steps (WAL and journal `sync_all`, the audit-buffer and runtime
+// mutexes, the owner hook's release-log replays) are outside both bounds; the
+// watchdog is what bounds them, at the price of a kill.
+
+/// Longest wait of one nft ownership probe poll a supervisor pass can make.
+/// Must match `NFT_HEALTH_QUERY_TIMEOUT` in `src/runtime_providers.rs` (TD2).
+pub const WATCHDOG_PROBE_WAIT: Duration = Duration::from_secs(1);
+
+/// Probe polls a NON-terminal pass can wait on: the recovery gate read
+/// (`EnforcementRuntime::attempt_post_ready_recovery`), the retrying re-probe
+/// inside `recover_post_ready_loss`, and the status read. Three is a counted
+/// over-estimate (the latch, the min-interval cache and single-flight mean at
+/// most two block); TD3 counts the call sites so a fourth cannot land silently.
+pub const WATCHDOG_PASS_PROBE_WAITS: u32 = 3;
+
+/// The `Indeterminate` arm's one bounded nft call before its decision (the live
+/// table read inside `resolve_net_scope_at_site`): 2700 ms = the nft command
+/// timeout 2000 + kill grace 200 + reap grace 500. Written as the literal
+/// because the nft constant is test-only inside a private module. Must match
+/// `linux::NFT_CALL_WORST_CASE` in `src/nftables.rs` (TD2n pins that side).
+pub const WATCHDOG_HOOK_NFT_WAIT: Duration = Duration::from_millis(2700);
+
+/// Owner socket requests the `Indeterminate` hook can make before its decision:
+/// the completion pull and the signed stop-failure intent inside
+/// `stop_failure_for_hook_at` (TD2 counts the `request_to(` calls).
+pub const WATCHDOG_HOOK_OWNER_REQUESTS: u32 = 2;
+
+/// The owner requests' bounded wait: `WATCHDOG_HOOK_OWNER_REQUESTS` x 250 ms.
+/// 250 must match `CLIENT_DEADLINE` in `src/protected_agent/owner.rs` (TD2).
+pub const WATCHDOG_HOOK_OWNER_WAIT: Duration =
+    Duration::from_millis(WATCHDOG_HOOK_OWNER_REQUESTS as u64 * 250);
+
+/// Pet gap: `SUPERVISOR_HEALTH_INTERVAL + SUPERVISOR_SHUTDOWN_TICK +
+/// WATCHDOG_PASS_PROBE_WAITS * WATCHDOG_PROBE_WAIT` = 2000 + 200 + 3000 = 5200 ms.
+/// A pass starts at most one interval plus one tick after the previous pass
+/// ended, and waits on at most three probe polls.
+pub const WATCHDOG_PET_GAP_BOUND: Duration = Duration::from_millis(
+    SUPERVISOR_HEALTH_INTERVAL.as_millis() as u64
+        + SUPERVISOR_SHUTDOWN_TICK.as_millis() as u64
+        + WATCHDOG_PASS_PROBE_WAITS as u64 * WATCHDOG_PROBE_WAIT.as_millis() as u64,
+);
+
+/// Decision gap: `WATCHDOG_PET_GAP_BOUND + WATCHDOG_HOOK_NFT_WAIT +
+/// WATCHDOG_HOOK_OWNER_WAIT` = 5200 + 2700 + 500 = 8400 ms, reached only on the
+/// `Indeterminate` arm (the `Lost` and probe-budget arms run no hook).
+pub const WATCHDOG_DECISION_GAP_BOUND: Duration = Duration::from_millis(
+    WATCHDOG_PET_GAP_BOUND.as_millis() as u64
+        + WATCHDOG_HOOK_NFT_WAIT.as_millis() as u64
+        + WATCHDOG_HOOK_OWNER_WAIT.as_millis() as u64,
+);
+
+/// When, from the watchdog's reference point, the stop guard's `_exit(decided)`
+/// lands at the latest: `WATCHDOG_DECISION_GAP_BOUND + STOP_GUARD_DEADLINE_SECS
+/// + STOP_GUARD_MARGIN_SECS` = 8400 + 8000 + 2000 = 18400 ms.
+///
+/// `STOP_GUARD_MARGIN_SECS` is REUSED here for a different quantity: the stop
+/// guard defines it as two allowances (SIGTERM delivery at the guard's start,
+/// SIGALRM delivery and `exit_group` at its end); on a self-exit only the second
+/// exists, so the full 2 s over-covers. If that constant is ever split into its
+/// halves, this derivation must take the end-of-deadline half explicitly and be
+/// re-pinned.
+pub const WATCHDOG_DECIDED_EXIT_BOUND: Duration = Duration::from_millis(
+    WATCHDOG_DECISION_GAP_BOUND.as_millis() as u64
+        + (crate::exit_guard::STOP_GUARD_DEADLINE_SECS as u64
+            + crate::exit_guard::STOP_GUARD_MARGIN_SECS as u64)
+            * MILLIS_PER_SEC,
+);
+
+/// Milliseconds in one second, for the whole-second conversions below.
+const MILLIS_PER_SEC: u64 = 1000;
+
+/// The systemd watchdog interval, in whole seconds: the smallest whole second
+/// at or above `WATCHDOG_DECIDED_EXIT_BOUND` = ceil(18.4) = 19 (I2).
+/// Must match `WatchdogSec=` in `systemd/sanctuary-castle-wall.service` (TU1).
+pub const WATCHDOG_SEC: u32 = WATCHDOG_DECIDED_EXIT_BOUND
+    .as_millis()
+    .div_ceil(MILLIS_PER_SEC as u128) as u32;
+
+// The inequalities, in milliseconds; `WATCHDOG_SEC` is scaled inline in each
+// (a named const used only by `const _` assertions reads as dead code to the
+// MSRV compiler).
+// I1: the watchdog is never the tighter bound on a manager stop.
+const _: () = assert!(WATCHDOG_SEC > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS);
+// I2: a decision inside the decision-gap bound exits by the guard's code before
+// the watchdog's SIGKILL.
+const _: () = assert!(
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) >= WATCHDOG_DECIDED_EXIT_BOUND.as_millis()
+);
+// I3: at least two pets per watchdog interval (the sd_watchdog_enabled(3) rule).
+const _: () = assert!(
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) >= 2 * WATCHDOG_PET_GAP_BOUND.as_millis()
+);
+// I7: a manager stop of a healthy daemon lands at most one pet gap after a pet,
+// so even a watchdog systemd kept running through the stop fires only after
+// TimeoutStopSec has ended the stop.
+const _: () = assert!(
+    (WATCHDOG_SEC as u128 * MILLIS_PER_SEC as u128) - WATCHDOG_PET_GAP_BOUND.as_millis()
+        > crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS as u128 * MILLIS_PER_SEC as u128
+);
 
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
@@ -308,6 +422,20 @@ pub struct DaemonHandle {
     /// wedged stop path. Must match `--test-hang-teardown` in `main.rs`.
     #[cfg(feature = "test-isolation")]
     test_hang_teardown: AtomicBool,
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01). Zero is disarmed.
+    /// Set by `arm_test_wedge_health_pass_after`; after this many completed
+    /// health passes (the initial pass counts as one) the supervisor's next pass
+    /// parks forever right after `last_health` is reset, holding no lock, so no
+    /// liveness pet can follow and a subprocess test can prove the pet stops.
+    /// Must match `--test-wedge-health-pass-after` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    test_wedge_health_pass_after: AtomicU32,
+    /// The systemd liveness-watchdog beacon (C2a3). Required, never an
+    /// `Option`: whether it sends is decided by the `sd_watchdog_enabled(3)`
+    /// environment contract inside the beacon, so an unconfigured beacon is a
+    /// silent no-op only when no manager asked for pets. Petted from exactly one
+    /// site, in `supervise_until_shutdown_body`.
+    watchdog: crate::systemd_notify::WatchdogBeacon,
     started_at: Instant,
 }
 
@@ -730,6 +858,33 @@ impl DaemonHandle {
         if let RuntimeHealthState::Recovering(reason) = initial_health {
             self.record_runtime_loss(reason, true);
         }
+        // INVARIANT: only a live, completed reading earns a liveness pet. The
+        // initial pass reached `Continue`, but `recovery_call_decision` also
+        // returns `Continue` for a `Lost` or `Indeterminate` reading with no
+        // install result, and the terminal arms that act on those live in the
+        // loop's observation match below. So the initial observation is classified
+        // exactly as that match classifies it: a terminal reading leaves the flag
+        // false (no pet can precede its decision, even if the thread then stalls
+        // in an unbounded step) and forces the first loop pass to run at the first
+        // tick, so the decision lands through the loop's own terminal arm without
+        // waiting a health interval. Must match the fall-through arms of the
+        // observation match in this function (LINUX-SUPERVISOR-WEDGE-R1-01).
+        let initial_is_terminal = match initial_health {
+            // S_RUN_PASS_DONE: owes one pet at the loop top.
+            RuntimeHealthState::NoRuntime
+            | RuntimeHealthState::Ready
+            | RuntimeHealthState::ProbeUnavailable
+            | RuntimeHealthState::Recovering(_) => false,
+            // S_RUN_PASS still owed: the loop's terminal arms decide.
+            RuntimeHealthState::Lost(_) | RuntimeHealthState::Indeterminate => true,
+        };
+        let mut completed_health_pass = !initial_is_terminal;
+        let mut health_pass_due_now = initial_is_terminal;
+        // TEST-ISOLATION ONLY: completed passes, counted for the wedge seam; the
+        // initial pass is the first when it completed (a terminal one did not).
+        // Must match `test_wedge_health_pass_after`.
+        #[cfg(feature = "test-isolation")]
+        let mut completed_passes: u32 = u32::from(!initial_is_terminal);
         loop {
             // Fatal wins over normal shutdown even when the IPC handler sets
             // both atomics before this thread is scheduled.
@@ -741,6 +896,22 @@ impl DaemonHandle {
                 // not exit 0 ahead of a final health pass, or a proven loss racing this
                 // stop leaves the confined identity with no table and no net.
                 return self.stop_final_health_outcome();
+            }
+            // S_RUN_PASS_DONE -> S_RUN_TICK (the one liveness pet, C2a3).
+            // INVARIANT: the liveness pet certifies that THIS thread finished one
+            // bounded health pass and is about to loop again. It is sent only here,
+            // after the fatal and stop checks, so no pet follows a terminal decision
+            // or a stop request, and never from a helper thread, which could keep a
+            // wedged supervisor looking alive while a lost table goes un-re-armed
+            // (R1). It certifies liveness, not health: the arms below act on what
+            // the pass observed. A stop that lands between the check above and this
+            // line lets one pet through (LINUX-WD-POSTSTOP-PET-01); harmless,
+            // because a pet only moves the watchdog's deadline later and the stop
+            // guard never re-arms. Must match WATCHDOG_SEC in this file and
+            // WatchdogSec= in systemd/sanctuary-castle-wall.service.
+            if completed_health_pass {
+                self.watchdog.pet();
+                completed_health_pass = false;
             }
             std::thread::sleep(tick);
             if self.is_fatal_control_path_requested() {
@@ -754,8 +925,22 @@ impl DaemonHandle {
             if let Ok(mut buf) = self.audit_buffer.lock() {
                 buf.evict_expired(std::time::SystemTime::now());
             }
-            if last_health.elapsed() >= health_interval {
+            if health_pass_due_now || last_health.elapsed() >= health_interval {
+                health_pass_due_now = false;
+                // S_RUN_TICK -> S_RUN_PASS: a health pass is in flight; no pet.
                 last_health = Instant::now();
+                // TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01): park this pass
+                // forever, holding no lock, so no pet can follow. Must match
+                // `--test-wedge-health-pass-after` in `main.rs`.
+                #[cfg(feature = "test-isolation")]
+                {
+                    let wedge_after = self.test_wedge_health_pass_after.load(Ordering::SeqCst);
+                    if wedge_after > 0 && completed_passes >= wedge_after {
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }
                 let (previous_health, previous_tag) = match self
                     .runtime_health
                     .supervisor_snapshot()
@@ -882,6 +1067,14 @@ impl DaemonHandle {
                         self.record_runtime_loss(reason, false);
                         return outcome;
                     }
+                }
+                // S_RUN_PASS -> S_RUN_PASS_DONE: reached only through the arms that
+                // do not return (Ready/NoRuntime, ProbeUnavailable under budget,
+                // Recovering). The pet it owes is sent at the loop top.
+                completed_health_pass = true;
+                #[cfg(feature = "test-isolation")]
+                {
+                    completed_passes = completed_passes.saturating_add(1);
                 }
             }
         }
@@ -1128,6 +1321,16 @@ impl DaemonHandle {
     #[cfg(feature = "test-isolation")]
     pub fn arm_test_hang_teardown(&self) {
         self.test_hang_teardown.store(true, Ordering::SeqCst);
+    }
+
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01): arm the supervisor
+    /// wedge documented on the `test_wedge_health_pass_after` field. `passes`
+    /// must be at least one. Absent from release builds; must match the CLI
+    /// seam name `--test-wedge-health-pass-after` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    pub fn arm_test_wedge_health_pass_after(&self, passes: u32) {
+        self.test_wedge_health_pass_after
+            .store(passes, Ordering::SeqCst);
     }
 
     /// Test-only: attach an enforcement runtime so the readiness derivation can
@@ -1666,6 +1869,14 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // silent no-op. If a CONFIGURED `NOTIFY_SOCKET` is present but delivery
     // FAILS, we must NOT leave a false-started long-running process: unwind
     // enforcement-before-IPC and fail closed so systemd restarts promptly.
+    // TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01, harness leg HW3): hold
+    // the boot here, before READY=1, to show the watchdog is inactive while the
+    // unit is still activating. Must match `--test-delay-before-ready-ms` in
+    // `main.rs`, which sets it on `config` before `boot` runs.
+    #[cfg(feature = "test-isolation")]
+    if let Some(ms) = config.test_delay_before_ready_ms {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let readiness = signal_systemd_readiness(enforcement.as_ref());
     if let Err(err) = readiness {
         mutation_cancel_flag.store(true, Ordering::SeqCst);
@@ -1676,6 +1887,24 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         }
         ipc_server.stop_and_join();
         return Err(err);
+    }
+
+    // The liveness-watchdog beacon (C2a3), built once, beside READY=1. Its pets
+    // come only from the supervisor's one pet site, which runs after `boot`
+    // returns, so on a ready boot READY=1 precedes every pet.
+    let watchdog = crate::systemd_notify::WatchdogBeacon::from_env();
+    if let Some(line) = crate::systemd_notify::watchdog_boot_diagnostic(
+        watchdog.notify_configured(),
+        watchdog.watchdog_usec(),
+        watchdog.foreign_watchdog_pid(),
+        WATCHDOG_PET_GAP_BOUND,
+        WATCHDOG_DECIDED_EXIT_BOUND,
+        WATCHDOG_SEC,
+    ) {
+        // SAFETY: stderr is the boot-time diagnostic channel (systemd journals
+        // it). A host that disabled or resized the watchdog is told what that
+        // costs; this is never a refusal.
+        eprintln!("{line}");
     }
 
     let enforcement = enforcement.map(|runtime| Arc::new(Mutex::new(runtime)));
@@ -1724,6 +1953,9 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         test_shutdown_at_pre_recovery,
         #[cfg(feature = "test-isolation")]
         test_hang_teardown: AtomicBool::new(false),
+        #[cfg(feature = "test-isolation")]
+        test_wedge_health_pass_after: AtomicU32::new(0),
+        watchdog,
         started_at: Instant::now(),
     })
 }
@@ -2912,6 +3144,8 @@ mod tests {
             linux_runtime_paths: crate::config::LinuxRuntimePaths::isolated_under(dir.path()),
             #[cfg(feature = "test-isolation")]
             test_boot_time_shutdown_requested: false,
+            #[cfg(feature = "test-isolation")]
+            test_delay_before_ready_ms: None,
         };
         (config, signing)
     }
@@ -4200,5 +4434,558 @@ mod tests {
         release.store(true, std::sync::atomic::Ordering::SeqCst);
         holder.join().expect("holder thread");
         let _ = handle.stop();
+    }
+
+    // ---- C2a3: the watchdog derivation's inputs (LINUX-SUPERVISOR-WEDGE-R1-01) ----
+
+    /// TD1: the pet gap, the decision gap and `WATCHDOG_SEC` by their formulas,
+    /// and I2, I3 and I7 in milliseconds (the `const` asserts beside the
+    /// constants hold the same inequalities at compile time).
+    #[test]
+    fn td1_watchdog_constants_are_derived_from_their_inputs() {
+        let ms = |d: Duration| d.as_millis();
+        assert_eq!(
+            WATCHDOG_PET_GAP_BOUND,
+            SUPERVISOR_HEALTH_INTERVAL
+                + SUPERVISOR_SHUTDOWN_TICK
+                + WATCHDOG_PROBE_WAIT * WATCHDOG_PASS_PROBE_WAITS
+        );
+        assert_eq!(ms(WATCHDOG_PET_GAP_BOUND), 5200);
+        assert_eq!(
+            WATCHDOG_DECISION_GAP_BOUND,
+            WATCHDOG_PET_GAP_BOUND + WATCHDOG_HOOK_NFT_WAIT + WATCHDOG_HOOK_OWNER_WAIT
+        );
+        assert_eq!(ms(WATCHDOG_DECISION_GAP_BOUND), 8400);
+        let guard = Duration::from_secs(u64::from(
+            crate::exit_guard::STOP_GUARD_DEADLINE_SECS + crate::exit_guard::STOP_GUARD_MARGIN_SECS,
+        ));
+        assert_eq!(
+            WATCHDOG_DECIDED_EXIT_BOUND,
+            WATCHDOG_DECISION_GAP_BOUND + guard
+        );
+        assert_eq!(ms(WATCHDOG_DECIDED_EXIT_BOUND), 18_400);
+        // ceil_secs(8.4 s + 8 s + 2 s) = ceil(18.4) = 19.
+        assert_eq!(
+            u128::from(WATCHDOG_SEC),
+            ms(WATCHDOG_DECIDED_EXIT_BOUND).div_ceil(1000)
+        );
+        assert_eq!(WATCHDOG_SEC, 19);
+        let wd = Duration::from_secs(u64::from(WATCHDOG_SEC));
+        let stop = Duration::from_secs(u64::from(crate::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS));
+        assert!(wd > stop, "I1");
+        assert!(wd >= WATCHDOG_DECIDED_EXIT_BOUND, "I2");
+        assert!(wd >= WATCHDOG_PET_GAP_BOUND * 2, "I3");
+        assert!(wd - WATCHDOG_PET_GAP_BOUND > stop, "I7");
+    }
+
+    /// TD2 (runtime half, Linux only): the derivation's inputs are the
+    /// product's own budgets (I6). The nft half is TD2n in `src/nftables.rs`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn td2_watchdog_inputs_match_the_product_budgets() {
+        assert_eq!(
+            WATCHDOG_PROBE_WAIT,
+            crate::runtime_providers::NFT_HEALTH_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            WATCHDOG_HOOK_OWNER_WAIT,
+            crate::protected_agent::owner::CLIENT_DEADLINE * WATCHDOG_HOOK_OWNER_REQUESTS
+        );
+        assert_eq!(WATCHDOG_HOOK_NFT_WAIT, Duration::from_millis(2700));
+    }
+
+    /// The body of the first `fn <name>` (generic or not) in `code`.
+    fn watchdog_fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+        let start = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .filter_map(|needle| code.find(needle.as_str()))
+            .min()
+            .unwrap_or_else(|| panic!("fn {name} must exist"));
+        let open = start + code[start..].find('{').expect("a body");
+        let close = crate::source_scan::matching_brace(code, open).expect("a closed body");
+        &code[start..=close]
+    }
+
+    fn watchdog_production_source(path: &str) -> String {
+        let text = crate::source_scan::daemon_sources()
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text)
+            .unwrap_or_else(|| panic!("{path} must exist"));
+        crate::source_scan::without_comment_lines(&crate::source_scan::production_part(&text))
+    }
+
+    /// TD2 (structural half): the `Indeterminate` hook's bounded waits are the
+    /// ones the derivation counts. Two owner requests, one spawning nft call, and
+    /// the hook reaches the probe only through latch-first reads, so its own
+    /// per-component `health()` fan-out waits zero (I5).
+    #[test]
+    fn td2_the_indeterminate_hook_waits_only_where_the_derivation_counts() {
+        let owner = watchdog_production_source("src/protected_agent/owner.rs");
+        let hook = watchdog_fn_body(&owner, "stop_failure_for_hook_at");
+        assert_eq!(
+            hook.matches("request_to(").count(),
+            WATCHDOG_HOOK_OWNER_REQUESTS as usize,
+            "each owner request is one CLIENT_DEADLINE in WATCHDOG_HOOK_OWNER_WAIT"
+        );
+
+        let providers = watchdog_production_source("src/runtime_providers.rs");
+        let resolve = watchdog_fn_body(&providers, "resolve_net_scope_at_site");
+        assert_eq!(
+            resolve
+                .matches("crate::nftables::list_castle_table_json(")
+                .count(),
+            1,
+            "one live-table read is WATCHDOG_HOOK_NFT_WAIT"
+        );
+        // Every other nftables call in the resolution is a pure parse, never a spawn.
+        for (at, _) in resolve.match_indices("crate::nftables::") {
+            let call: String = resolve[at + "crate::nftables::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // A `use` group or a type path (upper-case) is not a call.
+            if call.is_empty() || call.starts_with(|c: char| c.is_uppercase()) {
+                continue;
+            }
+            assert!(
+                ["list_castle_table_json", "live_table_uid_bindings"].contains(&call.as_str()),
+                "a new nftables call in the hook's scope resolution: {call}"
+            );
+        }
+        for name in ["on_post_ready_indeterminate", "net_scope_from_retained_set"] {
+            let body = watchdog_fn_body(&providers, name);
+            assert!(
+                !body.contains("reprobe_after_latch("),
+                "{name} must not clear the latch (up to one more probe wait)"
+            );
+            assert!(!body.contains("health_fresh("), "{name}");
+        }
+        let health_impl = watchdog_fn_body(&providers, "health_impl");
+        assert!(health_impl.contains("self.probe.poll_result(check)"));
+
+        let enforcement = watchdog_production_source("src/enforcement.rs");
+        let fan_out = watchdog_fn_body(&enforcement, "hook_post_ready_indeterminate");
+        assert!(fan_out.contains("component.health()"));
+        assert!(!fan_out.contains("health_fresh("));
+
+        // `poll_result` reads both latches before any wait or foreign-check read.
+        let probe = watchdog_production_source("src/health_probe.rs");
+        let poll = watchdog_fn_body(&probe, "poll_result");
+        let latch = poll
+            .find("state.latched_indeterminate")
+            .expect("latch read");
+        let lost = poll.find("state.latched_lost").expect("lost latch read");
+        for wait in [".wait_timeout(", "observe_foreign_check(", ".spawn("] {
+            let at = poll
+                .find(wait)
+                .unwrap_or_else(|| panic!("{wait} in poll_result"));
+            assert!(latch < at && lost < at, "a latch read must precede {wait}");
+        }
+    }
+
+    /// A counting fake in the nftables slot: every entry that models a waited
+    /// probe (`health`, `health_fresh`, the retrying recovery call) is counted.
+    /// It has no cache or latch, so it counts CALLS; calls >= blocking waits, so
+    /// the bound it checks is conservative.
+    struct ProbeCountingComponent {
+        kind: crate::enforcement::ComponentKind,
+        health: Arc<Mutex<crate::enforcement::ComponentHealth>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ProbeCountingComponent {
+        fn count(&self) {
+            if self.kind == crate::enforcement::ComponentKind::NftablesTable {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl crate::enforcement::AcquiredComponent for ProbeCountingComponent {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.kind
+        }
+        fn is_ready(&self) -> bool {
+            self.health() == crate::enforcement::ComponentHealth::Ready
+        }
+        fn health(&self) -> crate::enforcement::ComponentHealth {
+            self.count();
+            *self.health.lock().unwrap()
+        }
+        fn health_fresh(&self) -> crate::enforcement::ComponentHealth {
+            self.health()
+        }
+        fn attempt_post_ready_recovery(
+            &self,
+            _shutting_down: &dyn Fn() -> bool,
+        ) -> crate::enforcement::PostReadyRecoveryResult {
+            self.count();
+            crate::enforcement::PostReadyRecoveryResult::NoInstall
+        }
+        fn release(&mut self) {}
+    }
+
+    struct ProbeCountingProvider(ProbeCountingComponent);
+    impl crate::enforcement::ComponentProvider for ProbeCountingProvider {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.0.kind
+        }
+        fn acquire(
+            self: Box<Self>,
+        ) -> Result<
+            Box<dyn crate::enforcement::AcquiredComponent>,
+            crate::enforcement::EnforcementError,
+        > {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// TD4 (LINUX-SUPERVISOR-WEDGE-R1-01, code gate round 1): an initial health
+    /// reading that is terminal (`Lost` or `Indeterminate`, with no install result)
+    /// earns no liveness pet. The supervisor acts on it through its terminal arms
+    /// without first resetting systemd's watchdog.
+    #[test]
+    fn td4_an_initial_terminal_reading_is_never_followed_by_a_pet() {
+        use crate::enforcement::{ComponentHealth, ComponentKind};
+        use std::os::unix::net::UnixDatagram;
+        // 19 000 000 us = the shipped WatchdogSec, so the beacon is enabled.
+        let usec = u64::from(WATCHDOG_SEC) * 1_000_000;
+        for reading in [ComponentHealth::Lost, ComponentHealth::Indeterminate] {
+            let dir = TempDir::new().unwrap();
+            let (config, _) = fresh_config_in(&dir);
+            let mut handle = boot(config).unwrap();
+            let health = Arc::new(Mutex::new(ComponentHealth::Ready));
+            let providers = ComponentKind::REQUIRED_IN_ORDER
+                .iter()
+                .copied()
+                .map(|kind| {
+                    Box::new(ProbeCountingProvider(ProbeCountingComponent {
+                        kind,
+                        health: if kind == ComponentKind::NftablesTable {
+                            Arc::clone(&health)
+                        } else {
+                            Arc::new(Mutex::new(ComponentHealth::Ready))
+                        },
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    })) as Box<dyn crate::enforcement::ComponentProvider>
+                })
+                .collect();
+            handle.set_enforcement_for_test(EnforcementRuntime::start(providers).unwrap());
+            *health.lock().unwrap() = reading;
+            let notify = dir.path().join("notify.sock");
+            let listener = UnixDatagram::bind(&notify).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            handle.watchdog =
+                crate::systemd_notify::WatchdogBeacon::for_socket(Some(notify), Some(usec));
+            // A short interval, so a regression that pets first still reaches the
+            // terminal arm and returns instead of hanging the test.
+            let outcome = handle
+                .supervise_until_shutdown(Duration::from_millis(10), Duration::from_millis(300));
+            assert!(
+                matches!(outcome, SupervisionOutcome::KernelRuntimeLost(_)),
+                "{reading:?}: {outcome:?}"
+            );
+            let mut buf = [0u8; 64];
+            let mut pets = 0;
+            while let Ok(n) = listener.recv(&mut buf) {
+                if &buf[..n] == crate::systemd_notify::WATCHDOG_DATAGRAM {
+                    pets += 1;
+                }
+            }
+            assert_eq!(
+                pets, 0,
+                "{reading:?}: a terminal initial reading was petted"
+            );
+            let _ = handle.stop();
+        }
+    }
+
+    /// TD3 (LINUX-SUPERVISOR-WEDGE-R1-01): a non-terminal supervisor pass makes at
+    /// most `WATCHDOG_PASS_PROBE_WAITS` probe calls, for every pass class that
+    /// pets; the Recovering pass reaches exactly that many. The structural half
+    /// pins one poll per `health_impl` call and one re-probe per recovery call.
+    #[test]
+    fn td3_a_non_terminal_pass_makes_at_most_the_counted_probe_waits() {
+        use crate::enforcement::{ComponentHealth, ComponentKind};
+        let cases = [
+            (ComponentHealth::Ready, RuntimeHealthState::Ready, 2usize),
+            (
+                ComponentHealth::ProbeUnavailable,
+                RuntimeHealthState::ProbeUnavailable,
+                2,
+            ),
+            (
+                ComponentHealth::Recovering,
+                RuntimeHealthState::Recovering(
+                    crate::enforcement::NotReadyReason::SafetyNetRecovering(
+                        ComponentKind::NftablesTable,
+                    ),
+                ),
+                WATCHDOG_PASS_PROBE_WAITS as usize,
+            ),
+        ];
+        for (reading, expected_state, expected_calls) in cases {
+            let dir = TempDir::new().unwrap();
+            let (config, _) = fresh_config_in(&dir);
+            let mut handle = boot(config).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let health = Arc::new(Mutex::new(ComponentHealth::Ready));
+            let providers = ComponentKind::REQUIRED_IN_ORDER
+                .iter()
+                .copied()
+                .map(|kind| {
+                    Box::new(ProbeCountingProvider(ProbeCountingComponent {
+                        kind,
+                        health: if kind == ComponentKind::NftablesTable {
+                            Arc::clone(&health)
+                        } else {
+                            Arc::new(Mutex::new(ComponentHealth::Ready))
+                        },
+                        calls: Arc::clone(&calls),
+                    })) as Box<dyn crate::enforcement::ComponentProvider>
+                })
+                .collect();
+            handle.set_enforcement_for_test(EnforcementRuntime::start(providers).unwrap());
+            *health.lock().unwrap() = reading;
+            calls.store(0, Ordering::SeqCst);
+            // One supervisor pass's probe traffic is one call of this function.
+            let (observed, _) = handle.kernel_runtime_health_with_recovery(false);
+            assert_eq!(observed, expected_state, "{reading:?}");
+            let made = calls.load(Ordering::SeqCst);
+            assert!(
+                made <= WATCHDOG_PASS_PROBE_WAITS as usize,
+                "{reading:?}: {made} probe calls in one pass, over the counted \
+                 WATCHDOG_PASS_PROBE_WAITS; re-derive WATCHDOG_SEC"
+            );
+            assert_eq!(made, expected_calls, "{reading:?}");
+            let _ = handle.stop();
+        }
+
+        let providers = watchdog_production_source("src/runtime_providers.rs");
+        let health_impl = watchdog_fn_body(&providers, "health_impl");
+        assert_eq!(
+            health_impl.matches("self.probe.poll_result(").count()
+                + health_impl
+                    .matches("self.probe.poll_bypassing_cache(")
+                    .count(),
+            2,
+            "one poll on each arm of the fresh/cached split"
+        );
+        let recover = watchdog_fn_body(&providers, "recover_post_ready_loss");
+        assert_eq!(recover.matches("reprobe_after_latch(").count(), 1);
+    }
+}
+
+/// Structural tests for the liveness watchdog's one pet site
+/// (LINUX-SUPERVISOR-WEDGE-R1-01, LINUX-WD-POSTSTOP-PET-01). They pin where the
+/// pet may be sent, that nothing else sends one, and that the watchdog and the
+/// stop guard stay independent. Needles are assembled with `concat!` so this
+/// module's own source never matches itself.
+#[cfg(test)]
+mod watchdog_structure {
+    use crate::source_scan::{
+        daemon_sources, enclosing_fn, fn_body, line_of, offsets_of, production_part,
+        receiver_before, without_comment_lines,
+    };
+    use std::collections::BTreeSet;
+
+    fn code_of(path: &str) -> String {
+        let text = daemon_sources()
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text)
+            .unwrap_or_else(|| panic!("{path} must exist"));
+        without_comment_lines(&production_part(&text))
+    }
+
+    /// TS1: the watchdog datagram literal appears in production code only as the
+    /// beacon's one const and the release-disabled stop-owner's own pinger.
+    #[test]
+    fn ts1_the_watchdog_datagram_literal_has_one_daemon_site() {
+        let needle = concat!("WATCH", "DOG=1");
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, needle) {
+                let site = if path == "src/systemd_notify.rs" {
+                    code[..at]
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .trim()
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    enclosing_fn(&code, at)
+                };
+                hits.push((path.clone(), site));
+            }
+        }
+        hits.sort();
+        let expected: Vec<(String, String)> = vec![
+            ("src/protected_agent/owner.rs", "watchdog_ping"),
+            ("src/protected_agent/owner.rs", "watchdog_ping"),
+            ("src/systemd_notify.rs", "pub const WATCHDOG_DATAGRAM"),
+        ]
+        .into_iter()
+        .map(|(p, f)| (p.to_string(), f.to_string()))
+        .collect();
+        assert_eq!(hits, expected);
+    }
+
+    /// TS2: exactly one production pet call, on the beacon field, inside the
+    /// supervisor body; the supervisor has exactly one production caller, the
+    /// daemon's `main`; the beacon is built once, in `boot`. Call syntax only: a
+    /// hit preceded by `fn ` is a definition.
+    #[test]
+    fn ts2_one_pet_site_one_supervisor_caller_one_beacon() {
+        let pet = concat!(".pe", "t(");
+        let mut pets = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, pet) {
+                pets.push((
+                    path.clone(),
+                    enclosing_fn(&code, at),
+                    receiver_before(&code, at),
+                    line_of(&code, at),
+                ));
+            }
+        }
+        assert_eq!(pets.len(), 1, "one pet call in production code: {pets:?}");
+        let (path, func, receiver, _) = &pets[0];
+        assert_eq!(path, "src/daemon.rs");
+        assert_eq!(func, "supervise_until_shutdown_body");
+        assert_eq!(receiver, "watchdog");
+
+        let supervise = concat!("supervise_until", "_shutdown(");
+        let mut callers = BTreeSet::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, supervise) {
+                if code[..at].ends_with("fn ") || code[..at].ends_with('_') {
+                    continue;
+                }
+                callers.insert((path.clone(), enclosing_fn(&code, at)));
+            }
+        }
+        let expected: BTreeSet<(String, String)> =
+            [("src/main.rs".to_string(), "run_daemon_main".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(callers, expected);
+
+        let from_env = concat!("WatchdogBeacon::from", "_env(");
+        let mut builders = Vec::new();
+        for (path, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, from_env) {
+                builders.push((path.clone(), enclosing_fn(&code, at)));
+            }
+        }
+        assert_eq!(
+            builders,
+            vec![("src/daemon.rs".to_string(), "boot".to_string())]
+        );
+    }
+
+    /// TS3: the pet follows the loop's fatal and stop checks and precedes the
+    /// tick sleep; nothing in the stop, teardown or decision paths pets, and
+    /// neither does the `Indeterminate` arm.
+    #[test]
+    fn ts3_the_pet_follows_the_loop_top_checks_and_never_the_stop_path() {
+        let code = code_of("src/daemon.rs");
+        let body = fn_body(&code, "supervise_until_shutdown_body");
+        let pet = concat!("self.watchdog.pe", "t()");
+        let loop_top = body.find("loop {").expect("the supervisor loop");
+        let in_loop = &body[loop_top..];
+        let pet_at = in_loop.find(pet).expect("the pet site");
+        let fatal = in_loop
+            .find("self.is_fatal_control_path_requested()")
+            .expect("fatal check");
+        let stop = in_loop
+            .find("self.is_shutdown_requested()")
+            .expect("stop check");
+        let sleep = in_loop
+            .find("std::thread::sleep(tick)")
+            .expect("tick sleep");
+        assert!(fatal < pet_at && stop < pet_at, "pet before the checks");
+        assert!(pet_at < sleep, "pet after the sleep");
+        // The pet is gated on a completed pass.
+        let gate = in_loop[..pet_at]
+            .rfind("if completed_health_pass {")
+            .expect("the completed-pass gate");
+        assert!(
+            in_loop[gate..pet_at].lines().count() <= 2,
+            "gate directly guards the pet"
+        );
+
+        let bare = concat!(".pe", "t(");
+        for name in [
+            "stop_final_health_outcome",
+            "teardown",
+            "stop",
+            "decide_and_arm",
+        ] {
+            assert!(
+                !fn_body(&code, name).contains(bare),
+                "{name} must never pet"
+            );
+        }
+        let arm = in_loop
+            .find("RuntimeHealthState::Indeterminate => {")
+            .expect("the Indeterminate arm");
+        let arm_end = arm
+            + crate::source_scan::matching_brace(in_loop, arm + in_loop[arm..].find('{').unwrap())
+                .map(|close| close - arm)
+                .expect("arm closes");
+        assert!(
+            !in_loop[arm..arm_end].contains(bare),
+            "the Indeterminate arm must not pet"
+        );
+    }
+
+    /// TS4: the watchdog and the stop guard are independent mechanisms.
+    #[test]
+    fn ts4_the_watchdog_and_the_stop_guard_do_not_reference_each_other() {
+        let all = |path: &str| {
+            daemon_sources()
+                .into_iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, t)| t)
+                .unwrap()
+        };
+        let guard = all("src/exit_guard.rs");
+        assert!(!guard.contains(concat!("pe", "t(")));
+        assert!(!guard.contains(concat!("systemd", "_notify")));
+        let notify = all("src/systemd_notify.rs");
+        assert!(!notify.contains(concat!("exit", "_guard")));
+    }
+
+    /// TS5: every `--test-*` value flag drained in `run_daemon_main` is listed in
+    /// `value_options`' test-isolation block, and vice
+    /// versa, so a seam added to one site only cannot swallow or leak a token.
+    #[test]
+    fn ts5_test_value_flags_are_listed_where_they_are_drained() {
+        let code = code_of("src/main.rs");
+        let flag_after = |text: &str, prefix: &str| -> BTreeSet<String> {
+            text.match_indices(prefix)
+                .map(|(at, _)| {
+                    let rest = &text[at + prefix.len()..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .filter(|flag| flag.starts_with("--test-"))
+                .collect()
+        };
+        let listed = flag_after(
+            fn_body(&code, "value_options"),
+            "value_options.push(\"",
+        );
+        let drained = flag_after(fn_body(&code, "run_daemon_main"), "position(|a| a == \"");
+        assert!(!listed.is_empty());
+        assert_eq!(listed, drained);
     }
 }

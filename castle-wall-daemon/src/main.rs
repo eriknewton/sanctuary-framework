@@ -58,9 +58,13 @@ fn print_help() {
     );
 }
 
-fn has_structural_flag(args: &[String], wanted: &str) -> bool {
+/// Every flag that takes a value, so a structural scan skips the value rather
+/// than reading it as a flag. Full-set parity with the value-taking flags the
+/// config parser, the agent verbs and the test seams recognize is pinned by
+/// `value_options_is_exactly_the_value_taking_flag_set` below (AGENTS rule 5).
+fn value_options() -> Vec<&'static str> {
     #[allow(unused_mut)]
-    let mut value_options: Vec<&str> = vec![
+    let mut value_options: Vec<&'static str> = vec![
         "--fortress-id",
         "--socket-path",
         "--policy-dir",
@@ -72,6 +76,9 @@ fn has_structural_flag(args: &[String], wanted: &str) -> bool {
         "--isolated-runtime-root",
         "--isolated-castle-table-tag",
     ];
+    // The two agent verbs take the instance uid. Must match
+    // `agent_start::AGENT_VERB_VALUE_FLAGS`.
+    value_options.extend(castle_wall_daemon::agent_start::AGENT_VERB_VALUE_FLAGS);
     // F5 (LINUX-STOP-LOSS-RACE-01, Claude F5, gate I5): the two W1a/W1b
     // value-taking test-isolation seams are listed here ONLY under
     // `test-isolation`, so this scan correctly skips their value while
@@ -92,7 +99,17 @@ fn has_structural_flag(args: &[String], wanted: &str) -> bool {
         // the two entries above; a release build never carries them.
         value_options.push("--test-stop-guard-deadline-secs");
         value_options.push("--test-nft-binary");
+        // LINUX-SUPERVISOR-WEDGE-R1-01 (C2a3): the supervisor-wedge and
+        // pre-READY-delay seams take a value too. Must match the drain block in
+        // `run_daemon_main` (TS5 compares the two sets).
+        value_options.push("--test-wedge-health-pass-after");
+        value_options.push("--test-delay-before-ready-ms");
     }
+    value_options
+}
+
+fn has_structural_flag(args: &[String], wanted: &str) -> bool {
+    let value_options = value_options();
     // Invariant: `args` is already `std::env::args().skip(1)` (the program name
     // is stripped by the caller), so scanning MUST start at index 0. Starting at
     // 1 silently skips a structural flag that is the FIRST argument, which is
@@ -244,6 +261,66 @@ fn install_isolated_castle_table(args: &[String]) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The structural verbs handled before the run-config parser, in their
+/// load-bearing order. Named states of the route: `AGENT_VERB`,
+/// `PREFLIGHT_MANIFEST`, `DISARM`, `DAEMON` (fall through to the parser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreParserRoute {
+    AgentVerb,
+    PreflightManifest,
+    Disarm,
+    Daemon,
+}
+
+/// Which pre-parser route `args` takes.
+///
+/// ORDER IS THE INVARIANT. The agent verbs come FIRST and match their flag
+/// ANYWHERE in argv: `--disarm` is found by a scan of the whole argv, so a
+/// verb invocation carrying a smuggled `--disarm` would otherwise delete the
+/// owned table. In verb mode the argv must then be exactly one verb shape or
+/// the process exits 64, touching nothing.
+fn pre_parser_route(args: &[String]) -> PreParserRoute {
+    if castle_wall_daemon::agent_start::argv_names_an_agent_verb(args) {
+        return PreParserRoute::AgentVerb;
+    }
+    // Pre-replacement check. Handled BEFORE `--disarm` and before the run-config
+    // parser, and deliberately NOT a mode of the daemon lifecycle: it takes no lock,
+    // touches no kernel state, and so is the one verb that is safe to run while the
+    // daemon is up. Must match `crate::policy::preflight_manifest`, which enforces
+    // that by construction.
+    if has_structural_flag(args, "--preflight-manifest") {
+        return PreParserRoute::PreflightManifest;
+    }
+    // Recovery action: `--disarm` is the ONE explicit, unmistakable path that
+    // deletes the owned nftables table and clears its ownership journal. It is
+    // deliberately handled BEFORE the run-config parser and is NOT a mode of the
+    // normal daemon lifecycle: ordinary shutdown / SIGTERM / systemd stop never
+    // disarm. It needs no fortress config (it operates on the host-global lock,
+    // journal, and table).
+    if has_structural_flag(args, "--disarm") {
+        return PreParserRoute::Disarm;
+    }
+    PreParserRoute::Daemon
+}
+
+/// The entry points a pre-parser route runs. Injected so TB6 can prove, with
+/// recording stubs, that a smuggled `--disarm` never reaches the disarm entry.
+struct PreParserEntries<'a> {
+    agent_verb: &'a mut dyn FnMut(&[String]) -> ExitCode,
+    preflight_manifest: &'a mut dyn FnMut(&[String]) -> ExitCode,
+    disarm: &'a mut dyn FnMut(&[String]) -> ExitCode,
+}
+
+/// Run the route `args` takes; `None` means continue to the daemon.
+fn run_pre_parser_route(args: &[String], entries: PreParserEntries<'_>) -> Option<ExitCode> {
+    match pre_parser_route(args) {
+        PreParserRoute::AgentVerb => Some((entries.agent_verb)(args)),
+        PreParserRoute::PreflightManifest => Some((entries.preflight_manifest)(args)),
+        PreParserRoute::Disarm => Some((entries.disarm)(args)),
+        PreParserRoute::Daemon => None,
+    }
+}
+
 /// The daemon's exit is claimed through the single exit gate
 /// (`exit_guard::claim_return`, LINUX-STOP-PATH-BUDGET-01): `main` either wins
 /// `EXIT_RETURNING`, cancels any pending stop-guard alarm and returns, or parks
@@ -271,6 +348,12 @@ fn run_daemon_main() -> ExitCode {
     // subprocess test waits about one second instead of the production eight.
     #[cfg(feature = "test-isolation")]
     let mut test_stop_guard_deadline_secs: Option<u32> = None;
+    // LINUX-SUPERVISOR-WEDGE-R1-01 (C2a3): the supervisor wedge (armed on the
+    // handle after boot) and the pre-READY delay (applied to `config` before boot).
+    #[cfg(feature = "test-isolation")]
+    let mut test_wedge_health_pass_after: Option<u32> = None;
+    #[cfg(feature = "test-isolation")]
+    let mut test_delay_before_ready_ms: Option<u64> = None;
 
     #[cfg(feature = "test-isolation")]
     {
@@ -348,6 +431,47 @@ fn run_daemon_main() -> ExitCode {
                 }
             }
         }
+        // LINUX-SUPERVISOR-WEDGE-R1-01: drained before the run-config parser for
+        // the same reason as W1a. Zero is refused: the initial pass always counts
+        // as one completed pass, so zero could only mean "never pet", which the
+        // seam does not model.
+        if let Some(index) = args
+            .iter()
+            .position(|a| a == "--test-wedge-health-pass-after")
+        {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0) {
+                Some(passes) => test_wedge_health_pass_after = Some(passes),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-wedge-health-pass-after requires a \
+                         positive whole number of passes"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // LINUX-SUPERVISOR-WEDGE-R1-01 (harness leg HW3): same drain-before-parse.
+        if let Some(index) = args
+            .iter()
+            .position(|a| a == "--test-delay-before-ready-ms")
+        {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => test_delay_before_ready_ms = Some(ms),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-delay-before-ready-ms requires a numeric \
+                         millisecond value"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
         // H4(d)/H5 seam: substitute the nft binary path. Applied before any nft
         // call; production keeps the absolute-path, no-PATH-fallback rule. Must
         // match `nftables::use_test_nft_binary`.
@@ -365,23 +489,18 @@ fn run_daemon_main() -> ExitCode {
         }
     }
 
-    // Recovery action: `--disarm` is the ONE explicit, unmistakable path that
-    // deletes the owned nftables table and clears its ownership journal. It is
-    // deliberately handled BEFORE the run-config parser and is NOT a mode of the
-    // normal daemon lifecycle: ordinary shutdown / SIGTERM / systemd stop never
-    // disarm. It needs no fortress config (it operates on the host-global lock,
-    // journal, and table).
-    // Pre-replacement check. Handled BEFORE `--disarm` and before the run-config
-    // parser, and deliberately NOT a mode of the daemon lifecycle: it takes no lock,
-    // touches no kernel state, and so is the one verb that is safe to run while the
-    // daemon is up. Must match `crate::policy::preflight_manifest`, which enforces
-    // that by construction.
-    if has_structural_flag(&args, "--preflight-manifest") {
-        return run_preflight_manifest(&args);
-    }
-
-    if has_structural_flag(&args, "--disarm") {
-        return run_disarm(&args);
+    // The pre-parser routes, AFTER the test-isolation strip above (so an
+    // isolated table tag is already installed and drained) and BEFORE the
+    // run-config parser and the stop guard. Every routed path returns here.
+    if let Some(code) = run_pre_parser_route(
+        &args,
+        PreParserEntries {
+            agent_verb: &mut |a| ExitCode::from(castle_wall_daemon::agent_start::run_agent_verb(a)),
+            preflight_manifest: &mut run_preflight_manifest,
+            disarm: &mut run_disarm,
+        },
+    ) {
+        return code;
     }
 
     let boot_and_exit = args.iter().any(|a| a == "--boot-and-exit");
@@ -432,6 +551,12 @@ fn run_daemon_main() -> ExitCode {
     #[cfg(feature = "test-isolation")]
     if test_shutdown_at.as_deref() == Some("boot-acquire") {
         config.test_boot_time_shutdown_requested = true;
+    }
+    // LINUX-SUPERVISOR-WEDGE-R1-01: routed like `boot-acquire`, for the same
+    // reason: the delay runs inside `boot()`, before any handle exists.
+    #[cfg(feature = "test-isolation")]
+    {
+        config.test_delay_before_ready_ms = test_delay_before_ready_ms;
     }
 
     // SAFETY: stdout is the CLI startup-banner contract here, not a log
@@ -486,6 +611,13 @@ fn run_daemon_main() -> ExitCode {
     #[cfg(feature = "test-isolation")]
     if test_hang_teardown {
         handle.arm_test_hang_teardown();
+    }
+    // LINUX-SUPERVISOR-WEDGE-R1-01: armed after a successful boot, before the
+    // supervisor runs its initial pass. Must match
+    // `DaemonHandle::arm_test_wedge_health_pass_after`.
+    #[cfg(feature = "test-isolation")]
+    if let Some(passes) = test_wedge_health_pass_after {
+        handle.arm_test_wedge_health_pass_after(passes);
     }
     // W1b: armed only after a successful boot, so the seam cannot fire before a
     // handle exists to flip. `boot-acquire` is applied to `config` earlier
@@ -664,5 +796,134 @@ mod tests {
             "a default (non-test-isolation) build must not treat the test-only seam name \
              as a value-taking flag; the argv scan here must match base exactly"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_verb_dispatch_tests {
+    //! TB6 (slice B): the pre-parser routing sends every argv that names an
+    //! agent verb to the verb, never to `--disarm`, and `value_options` is
+    //! exactly the value-taking flag set. Register id:
+    //! `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`.
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Which entries a route ran, recorded by stubs in place of the real
+    /// verb, preflight and disarm entry points.
+    fn route_with_recording_stubs(argv: &[String]) -> (bool, Vec<&'static str>) {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let record = |name: &'static str| {
+            ran.borrow_mut().push(name);
+            ExitCode::SUCCESS
+        };
+        let routed = run_pre_parser_route(
+            argv,
+            PreParserEntries {
+                agent_verb: &mut |_| record("agent_verb"),
+                preflight_manifest: &mut |_| record("preflight_manifest"),
+                disarm: &mut |_| record("disarm"),
+            },
+        )
+        .is_some();
+        (routed, ran.into_inner())
+    }
+
+    #[test]
+    fn tb6_a_smuggled_disarm_beside_an_agent_verb_never_reaches_the_disarm_entry() {
+        for smuggle in [
+            vec!["--agent-start-gate", "1500", "--disarm"],
+            vec!["--disarm", "--agent-credential-check", "1500"],
+            vec![
+                "--agent-credential-check",
+                "1500",
+                "--agent-start-gate",
+                "1500",
+            ],
+            vec!["--agent-start-gate", "1500", "--agent-start-gate", "1500"],
+            vec!["--preflight-manifest", "--agent-credential-check", "1500"],
+        ] {
+            let argv = args(&smuggle);
+            assert_eq!(
+                pre_parser_route(&argv),
+                PreParserRoute::AgentVerb,
+                "{smuggle:?}"
+            );
+            let (routed, ran) = route_with_recording_stubs(&argv);
+            assert!(routed, "{smuggle:?} must return from the route");
+            assert_eq!(ran, vec!["agent_verb"], "{smuggle:?} ran {ran:?}");
+            // And the real verb entry refuses it as usage, touching nothing.
+            assert_eq!(
+                castle_wall_daemon::agent_start::run_agent_verb(&argv),
+                castle_wall_daemon::agent_start::EXIT_USAGE,
+                "{smuggle:?} must exit 64"
+            );
+        }
+        // Control: a plain disarm still routes to disarm, and a daemon argv
+        // falls through.
+        assert_eq!(
+            route_with_recording_stubs(&args(&["--disarm"])).1,
+            vec!["disarm"]
+        );
+        assert_eq!(
+            pre_parser_route(&args(&["--fortress-id", "deadbeef"])),
+            PreParserRoute::Daemon
+        );
+    }
+
+    /// The value-taking flags `DaemonConfig::from_argv` recognizes: every
+    /// `ConfigError::MissingValue("--x")` in `src/config.rs`, read from source
+    /// so this list cannot be a hand-mirrored copy.
+    fn config_value_flags() -> BTreeSet<String> {
+        let text = include_str!("config.rs");
+        let needle = "ConfigError::MissingValue(\"";
+        text.match_indices(needle)
+            .map(|(at, _)| {
+                let rest = &text[at + needle.len()..];
+                rest[..rest.find('"').expect("closed literal")].to_string()
+            })
+            .collect()
+    }
+
+    /// The value-taking seams `main` itself drains or reads (a flag whose
+    /// `position` is followed by an `index + 1` read), read from source.
+    fn main_seam_value_flags() -> BTreeSet<String> {
+        let text = include_str!("main.rs");
+        let needle = "position(|a| a == \"";
+        text.match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = &text[at + needle.len()..];
+                let flag = rest[..rest.find('"')?].to_string();
+                let window: String = rest.lines().take(4).collect();
+                window.contains("index + 1").then_some(flag)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_options_is_exactly_the_value_taking_flag_set() {
+        let actual: BTreeSet<String> = value_options().into_iter().map(String::from).collect();
+        let mut expected: BTreeSet<String> = config_value_flags();
+        expected.extend(main_seam_value_flags());
+        expected.extend(
+            castle_wall_daemon::agent_start::AGENT_VERB_VALUE_FLAGS
+                .iter()
+                .map(|f| f.to_string()),
+        );
+        // Test-only `--test-*` seams are value options only in a test-isolation
+        // build; a release scan stays byte-identical to base (F5 above).
+        if !cfg!(feature = "test-isolation") {
+            expected.retain(|flag| !flag.starts_with("--test-"));
+        }
+        assert_eq!(
+            actual, expected,
+            "value_options must equal the value-taking flag set"
+        );
+        for flag in castle_wall_daemon::agent_start::AGENT_VERB_VALUE_FLAGS {
+            assert!(actual.contains(flag), "{flag} must be a value option");
+        }
     }
 }

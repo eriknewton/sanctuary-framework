@@ -15,11 +15,21 @@ import sys
 from pathlib import Path
 
 
+# Path constants below (every name ending in _PATH or _ROOT) must match the
+# declared partition in assert-source-constants.py: each is either in its
+# SOURCE_MIRRORED set (checked against daemon/unit source) or in its
+# NOT_SOURCE_MIRRORED dict with a reason. A new path constant here without a
+# decision there refuses the package assertion.
 PACKAGE = "sanctuary-castle-wall-internal"
 ARCHITECTURE = "amd64"
 UNIT_NAME = "sanctuary-castle-wall.service"
+# The agent template unit (slice B). Every agent rule below matches this exact
+# prefix, so it covers `sanctuary-agent@<uid>.service` instances only; the
+# cgroup-scope and stop-owner name grammars that share the stem are not shipped.
+AGENT_UNIT_PREFIX = "sanctuary-agent@"
 DAEMON_PATH = "/usr/local/libexec/sanctuary/castle-wall-daemon"
 UNIT_PATH = "/etc/systemd/system/sanctuary-castle-wall.service"
+AGENT_UNIT_PATH = "/etc/systemd/system/sanctuary-agent@.service"
 IDENTITY_PATH = "/usr/share/doc/sanctuary-castle-wall-internal/build-identity"
 ENV_PATH = "/etc/sanctuary/castle-wall.env"
 STATE_ROOT = "/var/lib/sanctuary"
@@ -31,7 +41,10 @@ NFT_FAMILY = "inet"
 NFT_TABLE = "sanctuary-castle"
 STATUS_PATH = "/var/lib/dpkg/status"
 INFO_PATH = "/var/lib/dpkg/info"
-PAYLOAD = (DAEMON_PATH, UNIT_PATH, IDENTITY_PATH)
+PAYLOAD = (DAEMON_PATH, UNIT_PATH, AGENT_UNIT_PATH, IDENTITY_PATH)
+# An agent instance in any of these states is a running or transitioning agent
+# process; no package operation may proceed under it.
+AGENT_BUSY_STATES = {"active", "activating", "deactivating", "reloading", "refreshing"}
 SYSTEMD_ROOTS = (
     "/etc/systemd/system.control", "/run/systemd/system.control",
     "/run/systemd/transient", "/run/systemd/generator.early",
@@ -60,6 +73,23 @@ def command(argv):
     except (OSError, subprocess.TimeoutExpired) as exc:
         refuse(f"probe unavailable: {argv[0]}: {exc}")
     if result.returncode != 0 or not result.stdout or len(result.stdout) > 2_000_000:
+        refuse(f"probe failed or incomplete: {argv[0]}")
+    return result.stdout
+
+
+def command_allow_empty(argv):
+    """`command()`'s exact environment, timeout and output cap, but an empty
+    stdout is a valid answer. Only for a probe whose "nothing matched" is
+    naturally empty; a nonzero return still refuses (fail-closed). Exactly one
+    caller, agent_instances_inactive, pinned by test-lifecycle-guard.py."""
+    try:
+        result = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=15, check=False, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        refuse(f"probe unavailable: {argv[0]}: {exc}")
+    if result.returncode != 0 or len(result.stdout) > 2_000_000:
         refuse(f"probe failed or incomplete: {argv[0]}")
     return result.stdout
 
@@ -220,12 +250,13 @@ def build_identity():
         if not key or key in fields or "\x00" in value:
             refuse("duplicate or malformed build identity field")
         fields[key] = value
-    required = {"artifact_kind", "install_ready", "package", "package_version", "source_commit", "daemon_sha256", "unit_sha256"}
+    required = {"artifact_kind", "install_ready", "package", "package_version", "source_commit", "daemon_sha256", "unit_sha256",
+                "agent_unit_source", "agent_unit_sha256"}
     if not required <= fields.keys() or fields["artifact_kind"] != "internal-structural-deb" or fields["install_ready"] != "false" or fields["package"] != PACKAGE:
         refuse("unbound build identity")
     if not re.fullmatch(r"[0-9a-f]{40}", fields["source_commit"]):
         refuse("malformed source identity")
-    for key in ("daemon_sha256", "unit_sha256"):
+    for key in ("daemon_sha256", "unit_sha256", "agent_unit_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", fields[key]):
             refuse("malformed payload hash")
     return fields
@@ -239,9 +270,11 @@ def installed_identity(fields, phase):
     identity = build_identity()
     if fields.get("Architecture") != ARCHITECTURE or not fields.get("Version") or identity["package_version"] != fields["Version"]:
         refuse("installed package/version identity mismatch")
-    if phase == "prerm" and (identity["package_version"] != PACKAGE_VERSION or identity["daemon_sha256"] != DAEMON_SHA256 or identity["unit_sha256"] != UNIT_SHA256):
+    if phase == "prerm" and (identity["package_version"] != PACKAGE_VERSION or identity["daemon_sha256"] != DAEMON_SHA256
+                             or identity["unit_sha256"] != UNIT_SHA256 or identity["agent_unit_sha256"] != AGENT_UNIT_SHA256):
         refuse("old hook does not match installed payload identity")
-    if hash_file(DAEMON_PATH) != identity["daemon_sha256"] or hash_file(UNIT_PATH) != identity["unit_sha256"]:
+    if (hash_file(DAEMON_PATH) != identity["daemon_sha256"] or hash_file(UNIT_PATH) != identity["unit_sha256"]
+            or hash_file(AGENT_UNIT_PATH) != identity["agent_unit_sha256"]):
         refuse("installed payload differs from bound identity")
     return identity
 
@@ -290,6 +323,18 @@ def systemd_files(installed):
                 if info is None:
                     refuse("systemd path changed during inventory")
                 relevant = name == UNIT_NAME or name == UNIT_NAME + ".d"
+                # Agent rules: the package's template is the ONLY entry named
+                # `sanctuary-agent@...` allowed anywhere. A template or instance
+                # drop-in directory, an alternate fragment or an instance
+                # enablement symlink would change what the agent unit runs, or
+                # start it at boot. BOUND: the prefix drop-in
+                # `sanctuary-.service.d/` and the top-level `service.d/` also
+                # apply to agent instances and are NOT refused here; host
+                # acceptance checks the unit's DropInPaths instead (README).
+                if name.startswith(AGENT_UNIT_PREFIX) and path != AGENT_UNIT_PATH:
+                    if name.endswith(".service.d"):
+                        refuse(f"agent unit drop-in directory present: {path}")
+                    refuse(f"alternate agent unit, alias or instance enablement: {path}")
                 if stat.S_ISLNK(info.st_mode):
                     # os.walk will not follow this directory, so it cannot
                     # establish that an alias is absent beneath it.
@@ -301,6 +346,8 @@ def systemd_files(installed):
                         refuse("unreadable systemd symlink")
                     if relevant or UNIT_NAME in target or os.path.realpath(path) == UNIT_PATH:
                         refuse(f"systemd alias or enablement symlink: {path}")
+                    if AGENT_UNIT_PREFIX in target:
+                        refuse(f"agent unit alias or enablement symlink: {path}")
                 elif name in dirs and (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022):
                     refuse(f"unsafe systemd directory: {path}")
                 elif relevant and path != UNIT_PATH:
@@ -309,6 +356,8 @@ def systemd_files(installed):
                 refuse("unit drop-in directory present")
     if not installed and lstat(UNIT_PATH) is not None:
         refuse("unit still exists on disk")
+    if not installed and lstat(AGENT_UNIT_PATH) is not None:
+        refuse("agent unit still exists on disk")
 
 
 def systemd_manager(installed):
@@ -345,6 +394,22 @@ def systemd_manager(installed):
     elif fields["LoadState"] != "not-found" or fields["FragmentPath"] or fields["UnitFileState"] not in ("", "not-found") or fields["NeedDaemonReload"] != "no":
         refuse("fresh unit is still effective or stale")
     return fields
+
+
+def agent_instances_inactive():
+    """No loaded agent instance may be running or transitioning. Empty output
+    with return code 0 means no instance is loaded (systemd 255 prints nothing
+    for a pattern with no match); a nonzero return refuses."""
+    output = command_allow_empty(["/usr/bin/systemctl", "list-units", "--all", "--plain", "--no-legend",
+                                  "--full", "--no-pager", AGENT_UNIT_PREFIX + "*.service"])
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) < 4 or not re.fullmatch(r"sanctuary-agent@[^ ]+\.service", fields[0]):
+            refuse("unparseable agent instance listing")
+        if fields[2] in AGENT_BUSY_STATES:
+            refuse(f"agent instance not inactive: {fields[0]} {fields[2]}")
 
 
 def empty_runtime_root(path):
@@ -431,6 +496,7 @@ def inspect(installed, phase, expected_old=None):
         identity = None
     systemd_files(installed)
     manager_first = systemd_manager(installed)
+    agent_instances_inactive()
     runtime_absent()
     nft_absent()
     # A second complete read catches ordinary observation churn. The manager
@@ -438,6 +504,7 @@ def inspect(installed, phase, expected_old=None):
     # LoadState/FragmentPath may make the documented not-found→loaded change.
     systemd_files(installed)
     manager_second = systemd_manager(installed)
+    agent_instances_inactive()
     stable_keys = set(manager_first) - {"LoadState", "FragmentPath"}
     if any(manager_first[key] != manager_second[key] for key in stable_keys):
         refuse("systemd manager state changed during observation")

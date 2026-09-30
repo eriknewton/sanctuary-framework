@@ -35,6 +35,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   runMemoryIngestCommand as runMemoryIngestCommandProduction,
+  runMemoryEmitCommand as runMemoryEmitCommandProduction,
+  runMemoryTranscodeCommand as runMemoryTranscodeCommandProduction,
+  runMemoryTranscodeRestoreCommand as runMemoryTranscodeRestoreCommandProduction,
 } from "../../src/cli/memory-file.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -347,3 +350,277 @@ describe("CLI memory_ingest owner-pin establishment (STEP1-F1)", () => {
     expect(await pinIsAbsent()).toBe(true);
   });
 });
+
+/**
+ * STEP1-F2: the same owner-pin rule STEP1-F1 wired into `memory_ingest`
+ * extended to the three sibling CLI verbs that also materialize SDW vault
+ * content onto disk or read the shared scope: `memory_emit`,
+ * `memory_transcode`, `memory_transcode_restore`. Each block below drives the
+ * REAL CLI entry point for its verb against a temp fortress with a real
+ * injected keychain-free unlock (never the login keychain), then reads
+ * through the same real persistent guard the MCP server constructs, exactly
+ * as the STEP1-F1 block above does for `memory_ingest`.
+ *
+ * Fail-before witness: every (a)/(b)/(c) test in these three blocks fails on
+ * the pre-STEP1-F2 tree (the commit immediately before this change) because
+ * none of `memory_emit`/`memory_transcode`/`memory_transcode_restore` ran any
+ * owner-pin check at all: a "different agent" run that should refuse with
+ * `owner_scope_conflict` instead proceeds and produces output, and a
+ * "drifted" store that should refuse with
+ * `owner_pin_missing_after_establishment` instead proceeds silently.
+ *
+ * STEP1-F2 fix round 1 added (d)/(e)/(f) to each block, for the non-default
+ * `--owner-ref` lockout the adversarial code gate on commit `0f0db45d` found.
+ * Of those three, only (d) is a fail-before witness of that round: it fails
+ * on `0f0db45d` for all three verbs. (e) and (f) already passed on
+ * `0f0db45d` — the protections they check (missing-identity refusal, and
+ * establishment happening only after approval) already existed there via
+ * `precheckOwnerPinOrRefuse` / `establishOwnerPinAfterApproval`; they are
+ * regression guards closing a prior test gap, not proof of that round's fix.
+ */
+for (const verbName of ["memory_emit", "memory_transcode", "memory_transcode_restore"] as const) {
+  describe(`CLI ${verbName} owner-pin establishment (STEP1-F2)`, () => {
+    let fortress: string;
+    let prevStoragePath: string | undefined;
+
+    beforeEach(async () => {
+      prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+      fortress = join(await tempDir(`memfile-owner-pin-${verbName}`), ".sanctuary");
+      await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase: PASSPHRASE,
+        bootstrap: true,
+        storagePathHint: fortress,
+      });
+      liveMasterKeys.push(masterKey);
+      const identities = new IdentityManager(storage, masterKey);
+      const { storedIdentity } = createIdentity(
+        `memory-file-owner-pin-${verbName}-test`,
+        derivePurposeKey(masterKey, "identity-encryption"),
+        "passphrase",
+      );
+      await identities.save(storedIdentity);
+    });
+
+    afterEach(async () => {
+      if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+      while (liveMasterKeys.length > 0) liveMasterKeys.pop()!.fill(0);
+      while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+    });
+
+    async function realStorageAndMasterKey(): Promise<{
+      storage: FilesystemStorage;
+      masterKey: Uint8Array;
+    }> {
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase: PASSPHRASE,
+        storagePathHint: fortress,
+      });
+      liveMasterKeys.push(masterKey);
+      return { storage, masterKey };
+    }
+
+    async function mcpReadGuardAllows(agentId: string | undefined): Promise<
+      { readonly allowed: true } | { readonly allowed: false; readonly reason: string }
+    > {
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const guard = createPersistentMultiAgentIsolationGuard({
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(fortress),
+        ownerRef: "fleet-self",
+        ownerIdentity: () => agentId,
+      });
+      return guard("memory_search");
+    }
+
+    /** Runs the verb under test with the given agent id and dialog, against a
+     * fresh output/restore/projection directory this test owns. */
+    async function runVerb(options: {
+      readonly agentId: string | undefined;
+      readonly dialogRunner?: () => { status: number; signal: null; stdout: Buffer };
+      readonly archiveId?: string;
+      /** STEP1-F2 fix round 1: an explicit --owner-ref override, to drive the
+       * pre-bootstrap owner-ref refusal in `refuseOwnerRefOrIdentityBeforeBootstrap`. */
+      readonly ownerRef?: string;
+    }): Promise<{ code: number; out: string; err: string; outputDir: string }> {
+      const outputDir = join(await tempDir(`memfile-owner-pin-${verbName}-out`), "materialized");
+      const out = makeSink();
+      const err = makeSink();
+      const env = options.agentId === undefined
+        ? { SANCTUARY_PASSPHRASE: PASSPHRASE }
+        : { SANCTUARY_PASSPHRASE: PASSPHRASE, SANCTUARY_AGENT_ID: options.agentId };
+      const dialogRunner = options.dialogRunner ?? APPROVE_DIALOG;
+      const ownerRefFlags = options.ownerRef !== undefined ? ["--owner-ref", options.ownerRef] : [];
+      let code: number;
+      if (verbName === "memory_emit") {
+        code = await runMemoryEmitCommandProduction({
+          argv: ["--harness", "claude-code", "--dir", outputDir, "--fortress", fortress, ...ownerRefFlags],
+          out: out.stream,
+          err: err.stream,
+          env,
+          dialogRunner,
+        });
+      } else if (verbName === "memory_transcode") {
+        code = await runMemoryTranscodeCommandProduction({
+          argv: [
+            "--from-harness", "claude-code",
+            "--to-harness", "codex",
+            "--mode", "reversible",
+            "--dir", outputDir,
+            "--fortress", fortress,
+            ...ownerRefFlags,
+          ],
+          out: out.stream,
+          err: err.stream,
+          env,
+          dialogRunner,
+        });
+      } else {
+        code = await runMemoryTranscodeRestoreCommandProduction({
+          argv: [
+            "--archive-id", options.archiveId ?? "0".repeat(32),
+            "--dir", outputDir,
+            "--fortress", fortress,
+            ...ownerRefFlags,
+          ],
+          out: out.stream,
+          err: err.stream,
+          env,
+          dialogRunner,
+        });
+      }
+      return { code, out: out.text(), err: err.text(), outputDir };
+    }
+
+    it("(a) a fresh store establishes the pin on the first run: a same-agent re-run never sees owner_scope_conflict, a different agent's run does, and the MCP guard agrees", async () => {
+      const agentId = `claude_code:owner-pin-fresh-${verbName}`;
+      // The verb's own business outcome does not matter here (an empty vault
+      // has nothing to transcode/restore/emit, so transcode/restore commonly
+      // fail after establishing the pin) — what this proves, driven entirely
+      // through two REAL CLI invocations (never the MCP guard doing the
+      // establishing itself, which would pass this assertion even on the
+      // unpatched base tree since the guard establishes on its own first
+      // call), is that the FIRST invocation's precheck/establish step, which
+      // runs strictly before that business logic, already committed the pin
+      // under this agent id.
+      const first = await runVerb({ agentId });
+      expect(first.err).not.toContain("owner_scope_conflict");
+      expect(first.err).not.toContain("owner_identity_missing");
+
+      const sameAgentAgain = await runVerb({ agentId });
+      expect(sameAgentAgain.err).not.toContain("owner_scope_conflict");
+
+      const differentAgent = await runVerb({ agentId: "codex:someone-else" });
+      expect(differentAgent.code).toBe(1);
+      expect(differentAgent.err).toContain("owner_scope_conflict");
+      await expect(readdir(differentAgent.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+      // The MCP persistent guard, reading the SAME real record the CLI wrote,
+      // agrees: this agent id reads through, a different one is refused.
+      expect(await mcpReadGuardAllows(agentId)).toEqual({ allowed: true });
+      expect(await mcpReadGuardAllows("codex:someone-else")).toEqual({
+        allowed: false,
+        reason: "owner_scope_conflict",
+      });
+    });
+
+    it("(b) established and pinned to another agent: the verb is refused with owner_scope_conflict and writes no output", async () => {
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const claim = await claimSdwOwnerForOperator({
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(fortress),
+        ownerRef: "fleet-self",
+        agentId: "claude_code:existing-owner",
+      });
+      expect(claim).toEqual({ status: "claimed" });
+
+      const result = await runVerb({ agentId: "claude_code:different-agent" });
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("owner_scope_conflict");
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("(c) established with content but no pin (the drifted state): the verb refuses with owner_pin_missing_after_establishment and prints the claim command; no output written", async () => {
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      await writeReplayAnchor(storage, masterKey, {
+        catalog: 0,
+        chain_head: [],
+        manifests: [],
+        tombstones: [],
+        export_state: 0,
+      });
+      const agentId = `claude_code:drifted-run-${verbName}`;
+      const result = await runVerb({ agentId });
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("owner_pin_missing_after_establishment");
+      expect(result.err).toContain(`sdw-owner claim --agent-id '${agentId}'`);
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+    });
+
+    it("(d) STEP1-F2 fix round 1: a non-default --owner-ref on a fresh store is refused before the dialog and leaves NO pin", async () => {
+      let dialogs = 0;
+      const countingApprove = () => {
+        dialogs += 1;
+        return APPROVE_DIALOG();
+      };
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const result = await runVerb({
+        agentId: `claude_code:owner-ref-${verbName}`,
+        ownerRef: "some-other-scope",
+        dialogRunner: countingApprove,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("fleet-self");
+      // The fortress's owner pin is ONE record, never keyed by owner_ref: a
+      // fresh store's precheck would report "fresh" for ANY owner_ref (scope
+      // is compared only once a pin exists), so without this pre-bootstrap
+      // refusal the verb would establish the fortress's only pin slot under
+      // a scope nothing else can ever read, claim, or transfer back.
+      expect(dialogs).toBe(0);
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("(e) regression guard, not a fail-before witness of this round: with no SANCTUARY_AGENT_ID, a fresh store refuses instead of pinning an unwrapped principal (this protection already existed via precheckOwnerPinOrRefuse before STEP1-F2 fix round 1; this case just was not tested for the three sibling verbs until now)", async () => {
+      let dialogs = 0;
+      const countingApprove = () => {
+        dialogs += 1;
+        return APPROVE_DIALOG();
+      };
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const result = await runVerb({ agentId: undefined, dialogRunner: countingApprove });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("SANCTUARY_AGENT_ID");
+      expect(dialogs).toBe(0);
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("(f) regression guard, not a fail-before witness of this round: a denied dialog on a fresh store leaves NO owner pin and writes nothing (this protection already existed via establishOwnerPinAfterApproval running only after ApprovalGate approval, before STEP1-F2 fix round 1; this case just was not tested for the three sibling verbs until now)", async () => {
+      const { storage, masterKey } = await realStorageAndMasterKey();
+      const agentId = `claude_code:owner-pin-denied-${verbName}`;
+      const result = await runVerb({ agentId, dialogRunner: DENY_DIALOG });
+      expect(result.code).not.toBe(0);
+      expect(result.err).toContain("not approved");
+      await expect(readdir(result.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+      // The invariant this proves: `establishOwnerPinAfterApproval` runs only
+      // after the ApprovalGate allows the request, so a denial never reaches
+      // it. Same discipline as memory_ingest's own authorize-branch
+      // establishment (STEP1-F1 fix round 1).
+      expect(await pinIsAbsentIn(storage, masterKey)).toBe(true);
+    });
+  });
+}
+
+async function pinIsAbsentIn(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+): Promise<boolean> {
+  return (await readSdwOwnerPin(storage, masterKey)).status === "absent";
+}

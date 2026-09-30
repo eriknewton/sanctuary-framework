@@ -42,7 +42,42 @@ from pathlib import Path
 # Refreshed for the round-2 polish (2026-09-27): ChildSlotTable::park refuses an id that is
 # not in flight, and the waiter-spawn failure path recovers a poisoned cell instead of
 # dropping the child. The rule grammar, parser, receipt mint and net script are unchanged.
-NFTABLES_SOURCE_SHA256 = "428c4a7017063d71b2c35dc309b587728f3525d83569504e6b38493a06aa4624"
+# Refreshed for C2a2b (2026-09-27): the only nftables.rs change is a doc-comment cross-file
+# pin on CastleTableOwnership ("must match JournalActivation in src/ownership_journal.rs").
+# No code line changed; the rule grammar, parser, receipt mint and net script are unchanged.
+# Refreshed for Linux slice B (2026-09-28, builder refresh, on top of C2a2b; the slice's two-family code gate
+# reviews it before merge): nftables.rs gained the extracted set rule binding_set_rule (with
+# owned_binding_inventory) now called by both owned_table_binding_set_from_json and the new
+# pure agent_start_gate_verdict with its AgentStartTableVerdict, two separate re-exports
+# (list_owned_castle_table_json_for_binding_set under target_os linux, NFT_CALL_WORST_CASE
+# under test and linux), the two doc-comment amendments naming the two provenances of
+# ExpectedAgentBinding::Confined (its variant doc and the seal doc), and TB5 tests. The rule
+# grammar, the owned-table parser and its enum variants, the receipt mint and the net script
+# are byte-unchanged. The guard constants it mirrors are unchanged.
+# Refreshed for C2a3 after the slice-B rebase: only the NFT_CALL_WORST_CASE
+# comment and its TD2n equality test changed. The test pins the 2700 ms nft
+# bound against WATCHDOG_HOOK_NFT_WAIT; the rule grammar, parser, receipt mint,
+# and net script remain unchanged.
+NFTABLES_SOURCE_SHA256 = "e38c212af0f0e15a791c25361d31355301016ef3336bdaf425060be286f44ea4"
+
+
+# The declared partition of the guard's path constants (every name in
+# lifecycle-guard.py ending in _PATH or _ROOT). Must match the path constants
+# in lifecycle-guard.py: each one is either SOURCE_MIRRORED (an `expected`
+# entry below derives its value from daemon or unit source) or
+# NOT_SOURCE_MIRRORED (with the reason no source constant exists). A new guard
+# path constant in neither set refuses, which forces a decision.
+SOURCE_MIRRORED = {
+    "ENV_PATH", "DAEMON_PATH", "RUN_ROOT", "STATE_ROOT", "JOURNAL_PATH",
+    "AUTH_KEY_PATH", "HOST_LOCK_PATH", "NFT_TABLE", "AGENT_UNIT_PATH",
+}
+NOT_SOURCE_MIRRORED = {
+    "UNIT_PATH": "checked by the literal first-slice unit-path contract below",
+    "IDENTITY_PATH": "a build output the package writes; no source constant to mirror",
+    "STATUS_PATH": "dpkg-owned status database path; no source constant",
+    "INFO_PATH": "dpkg-owned info directory path; no source constant",
+}
+PATH_SUFFIXES = ("_PATH", "_ROOT")
 
 
 def fail(message):
@@ -54,6 +89,42 @@ def one(pattern, text, label):
     if len(matches) != 1:
         fail(f"expected one parseable {label}; found {len(matches)}")
     return matches[0]
+
+
+def exactly(pattern, text, label, count):
+    """Plural sibling of one(): exactly `count` matches, in file order."""
+    matches = re.findall(pattern, text, re.MULTILINE)
+    if len(matches) != count:
+        fail(f"expected {count} parseable {label}; found {len(matches)}")
+    return matches
+
+
+def check_agent_unit(agent_unit, constants):
+    # Must match the agent unit's BindsTo=/ExecStartPre= lines in
+    # systemd/sanctuary-agent@.service and UNIT_NAME/DAEMON_PATH in
+    # lifecycle-guard.py.
+    binds = exactly(r"^BindsTo=(.+)$", agent_unit, "agent BindsTo", 1)[0].split()
+    if binds != [constants.get("UNIT_NAME")]:
+        fail(f"agent unit BindsTo= target differs from the guard's UNIT_NAME: {binds!r}")
+    check, gate = exactly(r"^ExecStartPre=(.+)$", agent_unit, "agent ExecStartPre", 2)
+    daemon = constants.get("DAEMON_PATH")
+    if check.split()[0] != daemon:
+        fail("agent credential-check ExecStartPre= path differs from DAEMON_PATH")
+    # The gate is the `+` (full privileges) line: exactly one leading `+` is
+    # required and stripped, so neither `++/usr/...` nor a missing prefix passes.
+    if gate.split()[0] != "+" + daemon:
+        fail("agent start-gate ExecStartPre= is not exactly '+' then DAEMON_PATH")
+
+
+def check_partition(constants, expected):
+    if set(expected) != SOURCE_MIRRORED:
+        fail(f"SOURCE_MIRRORED differs from the expected mirror set: {sorted(set(expected) ^ SOURCE_MIRRORED)}")
+    if SOURCE_MIRRORED & set(NOT_SOURCE_MIRRORED):
+        fail("a path constant is declared both source-mirrored and not source-mirrored")
+    guard_paths = {name for name in constants if name.endswith(PATH_SUFFIXES)}
+    declared = {name for name in SOURCE_MIRRORED if name.endswith(PATH_SUFFIXES)} | set(NOT_SOURCE_MIRRORED)
+    if guard_paths != declared:
+        fail(f"guard path constants outside the declared partition: {sorted(guard_paths ^ declared)}")
 
 
 def main():
@@ -68,6 +139,8 @@ def main():
             except (ValueError, TypeError):
                 pass
     unit = (crate / "systemd/sanctuary-castle-wall.service").read_text()
+    agent_unit_file = crate / "systemd/sanctuary-agent@.service"
+    agent_unit = agent_unit_file.read_text()
     config = (crate / "src/config.rs").read_text()
     journal = (crate / "src/ownership_journal.rs").read_text()
     lock = (crate / "src/runtime_lock.rs").read_text()
@@ -93,7 +166,11 @@ def main():
         "AUTH_KEY_PATH": one(r'^pub const DEFAULT_JOURNAL_AUTH_KEY_PATH: &str = "([^"]+)";', journal, "journal auth key"),
         "HOST_LOCK_PATH": one(r'^pub const DEFAULT_HOST_LOCK_PATH: &str = "([^"]+)";', lock, "host lock"),
         "NFT_TABLE": one(r'^pub const CASTLE_TABLE: &str = "([^"]+)";', nft, "nft table"),
+        # The package installs the agent template beside the wall unit.
+        "AGENT_UNIT_PATH": "/etc/systemd/system/" + agent_unit_file.name,
     }
+    check_partition(constants, expected)
+    check_agent_unit(agent_unit, constants)
     if runtime_root != expected["RUN_ROOT"] or state_root != expected["STATE_ROOT"]:
         fail("fortress roots differ from unit RuntimeDirectory/StateDirectory")
     if constants.get("UNIT_PATH") != "/etc/systemd/system/sanctuary-castle-wall.service":

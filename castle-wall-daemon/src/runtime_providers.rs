@@ -530,8 +530,179 @@ fn resolve_net_scope_at_site(
     resolve_safety_net_scope(&history, admitted, &live, overflow)
 }
 
-/// Write the kill set ((a) union (b)) to the journal AHEAD of a kernel step, and
-/// keep UNKNOWN HISTORY unknown.
+/// The acquisition's own journal load, as an opaque type the boot-time kill-set writer
+/// requires.
+///
+/// Rust privacy is the barrier here: the struct's fields are private to this
+/// submodule, so the parent module (including `NftablesTableComponent`'s methods)
+/// cannot write `AcquisitionJournal { .. }` and can only call `load_under_lock`. A
+/// structural test pins that constructor's call site to the one inside `acquire`.
+#[cfg(target_os = "linux")]
+mod acquisition_journal {
+    use std::path::{Path, PathBuf};
+
+    use crate::ownership_journal::{JournalAuthKey, OwnershipJournal, OwnershipJournalError};
+    use crate::runtime_lock::HostRuntimeLock;
+
+    /// INVARIANT: only the acquisition's step-2 load under the host lock constructs
+    /// this, it names the file it was loaded from (so the record and the file it is
+    /// stored back to cannot come from two different places), and
+    /// `NftablesTableComponent` has no field of this type, so the boot writer's
+    /// `Preparing` no-op is reachable only at boot.
+    pub(super) struct AcquisitionJournal {
+        path: PathBuf,
+        record: Option<OwnershipJournal>,
+    }
+
+    impl AcquisitionJournal {
+        /// Load and authenticate the journal at `path`. `_held` is a WITNESS that the
+        /// caller holds the host lock, not a barrier: the component owns the lock too,
+        /// which is why the call-site pin exists.
+        pub(super) fn load_under_lock(
+            _held: &HostRuntimeLock,
+            path: &Path,
+            key: Option<&JournalAuthKey>,
+        ) -> Result<Self, OwnershipJournalError> {
+            let record = crate::ownership_journal::load(path, key)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                record,
+            })
+        }
+
+        /// The record this acquisition loaded, or `None` when no journal was present.
+        pub(super) fn record(&self) -> Option<&OwnershipJournal> {
+            self.record.as_ref()
+        }
+
+        /// The file this record was loaded from.
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+}
+
+/// The result of unioning the admitted identity into a recorded history.
+///
+/// INVARIANT: UNKNOWN stays unknown; KNOWN is the recorded history unioned with the
+/// admitted identity. Never a bare `Vec`: an `Option`-less vector would read unknown
+/// as empty, which is the direction that lets a rotated-away uid out of the net.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum MergedHistory {
+    Unknown,
+    Known(Vec<crate::ownership_journal::ConfinedIdentity>),
+}
+
+/// THE ONE admitted-into-history merge. Both kill-set writers and
+/// [`owned_record_preserving_history`] call it; a second hand copy is what
+/// `t7_the_admitted_merge_has_one_site` refuses.
+///
+/// Union the recorded history with the currently admitted identity, tagging each
+/// new uid with the role the manifest gave it: agent first, then gate, each only if
+/// absent, so a uid already present keeps its recorded role. The union only grows
+/// within a boot; a uid leaves it on disarm or reboot.
+#[cfg(target_os = "linux")]
+fn merge_admitted_into_history(
+    confined: Option<Vec<crate::ownership_journal::ConfinedIdentity>>,
+    admitted: Option<(u32, Option<u32>)>,
+) -> MergedHistory {
+    use crate::ownership_journal::{ConfinedIdentity, ConfinedRole};
+    // UNKNOWN HISTORY stays unknown (memo D1b step 6): no admitted uid is written
+    // over an absent key.
+    let Some(mut merged) = confined else {
+        return MergedHistory::Unknown;
+    };
+    let mut add = |uid: u32, role: ConfinedRole| {
+        if !merged.iter().any(|e| e.uid == uid) {
+            merged.push(ConfinedIdentity { uid, role });
+        }
+    };
+    if let Some((agent, gate)) = admitted {
+        add(agent, ConfinedRole::Agent);
+        if let Some(g) = gate {
+            add(g, ConfinedRole::Gate);
+        }
+    }
+    MergedHistory::Known(merged)
+}
+
+/// Build the `Owned` record to store from a merge. Identity and both handles come
+/// from the record THIS writer loaded (or, for [`owned_record_preserving_history`],
+/// the activation being finalized). The cap refusal stays in
+/// `owned_with_known_history`; each caller keeps its own error mapping.
+#[cfg(target_os = "linux")]
+fn record_from_merged(
+    identity: crate::ownership_journal::JournalIdentity,
+    table_handle: u64,
+    base_chain_handle: u64,
+    merged: MergedHistory,
+) -> Result<
+    crate::ownership_journal::OwnershipJournal,
+    crate::ownership_journal::OwnershipJournalError,
+> {
+    use crate::ownership_journal::OwnershipJournal;
+    match merged {
+        // INVARIANT (D1b step 6): the key stays omitted, so unknown history is never
+        // materialised as known.
+        MergedHistory::Unknown => Ok(OwnershipJournal::owned_with_unknown_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+        )),
+        MergedHistory::Known(history) => OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            history,
+        ),
+    }
+}
+
+/// Write the kill set to the journal AFTER activation (the startup-loss and
+/// post-READY rows, through [`NftablesTableComponent::persist_boot_row_best_effort`]),
+/// and keep UNKNOWN HISTORY unknown.
+///
+/// Named write states: `W_RELOAD` + `W_VALIDATE` (the handle's
+/// `reload_for_activation`), `W_MUTATE` (the shared merge over the record THIS call
+/// loaded), `W_STORE`. The handle carries no record, so there is no caller-supplied
+/// snapshot to overwrite a uid another write recorded since (register
+/// `LINUX-JOURNAL-OWNED-WRITERS-01`).
+///
+/// Returns the error for a caller to RECORD. Every net-install row proceeds on a
+/// failed persist, because installing the net makes no uid live and so cannot outrun
+/// the journal.
+#[cfg(target_os = "linux")]
+fn persist_kill_set_post_ready(
+    journal: &crate::ownership_journal::OwnedJournalHandle,
+    key: &crate::ownership_journal::JournalAuthKey,
+    admitted: Option<(u32, Option<u32>)>,
+) -> Result<(), crate::ownership_journal::OwnershipJournalError> {
+    // INVARIANT: after activation, a `Preparing` or absent record means the journal
+    // regressed under this process: nothing in this process writes `Preparing` after
+    // `establish`, the host lock excludes every other process, and a released
+    // component is never asked to write only because `release_reverse` drops each
+    // component as it releases it (`enforcement.rs`, the pop and the drop in one
+    // iteration); a change that keeps a released component listed must revisit
+    // this. There is no history to extend, and returning `Ok` would hide that the
+    // confined history was not written. Refuse (`reload_for_activation` returns
+    // `NotOwnedForActivation`); the caller reports it, and the net install on this
+    // row is unaffected, whether it precedes or follows this persist. What the refusal costs is bounded in the C2a2b
+    // design packet section 8.
+    let now = journal.reload_for_activation(key)?;
+    // W_MUTATE over the history loaded in THIS call; a writer that reused an earlier
+    // load would overwrite uids recorded since.
+    let next = record_from_merged(
+        now.identity,
+        now.table_handle,
+        now.base_chain_handle,
+        merge_admitted_into_history(now.confined, admitted),
+    )?;
+    crate::ownership_journal::store_atomic(journal.path(), &next, key)
+}
+
+/// Write the kill set to the journal AHEAD of a boot-time kernel step (the drift and
+/// `ReArmLostOwned` rows inside `acquire`), and keep UNKNOWN HISTORY unknown.
 ///
 /// INVARIANT, state-indexed (memo D1b step 6): while the `confined` key is ABSENT
 /// on a same-boot `Owned` record, NO store may materialise it. Writing the current
@@ -545,19 +716,28 @@ fn resolve_net_scope_at_site(
 /// refuses, every net-install row proceeds, because installing the net makes no uid
 /// live and so cannot outrun the journal.
 #[cfg(target_os = "linux")]
-fn persist_kill_set_write_ahead(
-    journal_path: &std::path::Path,
+fn persist_kill_set_write_ahead_at_boot(
+    existing: &acquisition_journal::AcquisitionJournal,
     key: Option<&crate::ownership_journal::JournalAuthKey>,
-    record: &crate::ownership_journal::OwnershipJournal,
-    kill_set: &[u32],
     admitted: Option<(u32, Option<u32>)>,
 ) -> Result<(), String> {
-    use crate::ownership_journal::{ConfinedIdentity, ConfinedRole, OwnershipJournal};
+    use crate::ownership_journal::OwnershipJournal;
     let key = key.ok_or_else(|| {
         "no journal authentication key is available, so the confined history cannot be \
          written ahead of the kernel step"
             .to_string()
     })?;
+    // INVARIANT: an ABSENT record is a named refusal, never a silent `Ok`. Before the
+    // opaque type this writer took `&OwnershipJournal`, so absence was unrepresentable;
+    // both callers still skip it, and a future caller that drops that guard must get
+    // an error to record, not a no-op that reads as a written history.
+    let Some(record) = existing.record() else {
+        return Err(
+            "no ownership journal record was loaded at acquisition, so there is no confined \
+             history to write ahead of the kernel step"
+                .to_string(),
+        );
+    };
     let OwnershipJournal::Owned {
         identity,
         table_handle,
@@ -565,47 +745,27 @@ fn persist_kill_set_write_ahead(
         confined,
     } = record
     else {
-        // A `Preparing` record carries no history to extend; the write-ahead for a
-        // fresh create happens when the record becomes `Owned`.
+        // INVARIANT: only the acquisition's step-2 load under the host lock constructs
+        // an `AcquisitionJournal` (its fields are private to the `acquisition_journal`
+        // submodule, so the parent module cannot build one by hand), it names the file
+        // it was loaded from, and `NftablesTableComponent` has no field of that type,
+        // so this `Preparing` no-op is reachable only at boot, where a same-boot
+        // `Preparing` with no live table is the `ReArmLostOwned` route
+        // (`ownership_journal::decide`) and has no history yet; the write-ahead for a
+        // fresh create happens when the record becomes `Owned`. The caller's snapshot
+        // is sound here because nothing writes the journal between that load and this
+        // store on the acquisition stack.
         return Ok(());
     };
-    let next = match confined {
-        // UNKNOWN HISTORY stays unknown: re-store with the key omitted.
-        None => OwnershipJournal::owned_with_unknown_history(
-            identity.clone(),
-            *table_handle,
-            *base_chain_handle,
-        ),
-        Some(existing) => {
-            // Union the recorded history with the currently admitted identity,
-            // tagging each uid with the role the manifest gave it. The union only
-            // grows within a boot; a uid leaves it on disarm or reboot.
-            let mut merged = existing.clone();
-            let mut add = |uid: u32, role: ConfinedRole| {
-                if !merged.iter().any(|e| e.uid == uid) {
-                    merged.push(ConfinedIdentity { uid, role });
-                }
-            };
-            if let Some((agent, gate)) = admitted {
-                add(agent, ConfinedRole::Agent);
-                if let Some(g) = gate {
-                    add(g, ConfinedRole::Gate);
-                }
-            }
-            // Anything in the kill set that the manifest no longer names is an
-            // earlier admitted identity; it keeps its recorded role, and a uid that
-            // reached the kill set from source (a) is already present.
-            let _ = kill_set;
-            OwnershipJournal::owned_with_known_history(
-                identity.clone(),
-                *table_handle,
-                *base_chain_handle,
-                merged,
-            )
-            .map_err(|err| err.to_string())?
-        }
-    };
-    crate::ownership_journal::store_atomic(journal_path, &next, key).map_err(|err| err.to_string())
+    let next = record_from_merged(
+        identity.clone(),
+        *table_handle,
+        *base_chain_handle,
+        merge_admitted_into_history(confined.clone(), admitted),
+    )
+    .map_err(|err| err.to_string())?;
+    crate::ownership_journal::store_atomic(existing.path(), &next, key)
+        .map_err(|err| err.to_string())
 }
 
 /// Build the `Owned` record to store, PRESERVING this boot's history state.
@@ -617,10 +777,10 @@ fn persist_kill_set_write_ahead(
 /// processes it never terminated) would then be omitted from the net.
 ///
 /// Otherwise the history is known and the currently admitted identity is UNIONED
-/// into it, tagged with the role the manifest gave each uid. This is the write-ahead
-/// itself: it runs under the host lock BEFORE the kernel step that makes the uid
-/// live, so a crash between the two leaves the journal naming MORE than the kernel
-/// does, never less.
+/// into it through the one shared merge, tagged with the role the manifest gave
+/// each uid. This is the write-ahead itself: it runs under the host lock BEFORE the
+/// kernel step that makes the uid live, so a crash between the two leaves the
+/// journal naming MORE than the kernel does, never less.
 #[cfg(target_os = "linux")]
 fn owned_record_preserving_history(
     journal_path: &std::path::Path,
@@ -630,47 +790,36 @@ fn owned_record_preserving_history(
     base_chain_handle: u64,
     admitted: Option<(u32, Option<u32>)>,
 ) -> Result<crate::ownership_journal::OwnershipJournal, EnforcementError> {
-    use crate::ownership_journal::{
-        self as journal, ConfinedIdentity, ConfinedRole, OwnershipJournal,
-    };
-    // A read failure here must not be turned into "history is known": that is the
-    // direction that loses a rotated-away uid. Treat it as unknown.
+    use crate::ownership_journal::{self as journal, OwnershipJournal};
+    // A read failure here reads as KNOWN-EMPTY, not as unknown: `.ok().flatten()`
+    // turns a load error into `None`, and the arm below maps `None` to an empty
+    // known history. DEBT(LINUX-JOURNAL-LOAD-ERROR-READS-EMPTY-01): that is harmless
+    // on this tree only because every call is preceded, in the same acquisition, by
+    // a `Preparing` store that has already replaced any prior history
+    // (`fresh_acquire` and `recover_from_deny_all_net` store `Preparing` first) or by
+    // a `FinalizeInterrupted` decision on a `Preparing` load; the one call that can
+    // reload an `Owned` record is the second `finalize_owned` after the GF1.1
+    // recovery, which re-adds the same admitted identity that is that record's only
+    // entry. A future caller that reaches this WITHOUT first storing `Preparing`
+    // could drop a uid here.
     let existing = journal::load(journal_path, Some(key)).ok().flatten();
-    let prior = match existing.as_ref() {
-        Some(OwnershipJournal::Owned { confined, .. }) => confined.clone(),
+    let prior = match existing {
+        Some(OwnershipJournal::Owned { confined, .. }) => confined,
         // A `Preparing` record or no record means no history has been recorded yet,
         // which is known-empty, not unknown.
         _ => Some(Vec::new()),
     };
-    let Some(mut history) = prior else {
-        return Ok(OwnershipJournal::owned_with_unknown_history(
-            identity,
-            table_handle,
-            base_chain_handle,
-        ));
-    };
-    if let Some((agent, gate)) = admitted {
-        if !history.iter().any(|e| e.uid == agent) {
-            history.push(ConfinedIdentity {
-                uid: agent,
-                role: ConfinedRole::Agent,
-            });
-        }
-        if let Some(g) = gate {
-            if !history.iter().any(|e| e.uid == g) {
-                history.push(ConfinedIdentity {
-                    uid: g,
-                    role: ConfinedRole::Gate,
-                });
-            }
-        }
-    }
-    OwnershipJournal::owned_with_known_history(identity, table_handle, base_chain_handle, history)
-        .map_err(|err| {
-            acquire_failed(format!(
-                "this boot's confined identity history cannot take another binding: {err}"
-            ))
-        })
+    record_from_merged(
+        identity,
+        table_handle,
+        base_chain_handle,
+        merge_admitted_into_history(prior, admitted),
+    )
+    .map_err(|err| {
+        acquire_failed(format!(
+            "this boot's confined identity history cannot take another binding: {err}"
+        ))
+    })
 }
 
 /// Source (b) alone: the identity this process armed at boot, agent uid and gate
@@ -1551,6 +1700,38 @@ pub fn force_next_agent_binding_write_ahead_error_for_test() -> ForcedAgentBindi
     ForcedAgentBindingWriteAheadError { _private: () }
 }
 
+/// Fault-injection seam: forces the NEXT journal proof-token `establish` inside the
+/// nftables `acquire` to fail, so the Linux integration suite can drive the
+/// PRODUCTION refusal that follows (the bind's net-on-refusal rule over the
+/// pre-match evidence) without corrupting a real journal mid-boot. Same convention as
+/// [`AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR`]: compiled only under `test-isolation`,
+/// consumed by exactly the next `establish`, and cleared by the RAII guard.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static JOURNAL_ESTABLISH_FORCE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above; see
+/// [`force_next_journal_establish_error_for_test`].
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ForcedJournalEstablishError {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedJournalEstablishError {
+    fn drop(&mut self) {
+        JOURNAL_ESTABLISH_FORCE_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next `establish`. Bind the returned guard
+/// (not `let _ = ...`, which drops it and clears the latch before the acquisition).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_journal_establish_error_for_test() -> ForcedJournalEstablishError {
+    JOURNAL_ESTABLISH_FORCE_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedJournalEstablishError { _private: () }
+}
+
 /// A7 fail-before test seam: forces the NEXT readback inside
 /// [`bind_admitted_uid_before_ready`] to read as a mismatch, regardless of what
 /// the kernel actually holds, so the Linux integration suite can drive the
@@ -1664,13 +1845,25 @@ fn bind_admitted_uid_before_ready(
     // `refuse_after_owned_table`, which loads it live after scope resolution.
     // The `Arc`, never a `bool`: see that function's own parameter doc.
     shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    journal_path: &std::path::Path,
+    // WRITE ONLY. The proof token (or the reason `establish` could not build it) is
+    // for the write-ahead and never sources the net decision. The net decision is
+    // `existing`, the PRE-MATCH record, and it must stay that: a re-read after a fresh
+    // create already names the admitted uid, which is the fail-open shape the
+    // invariant on `history_for_net_decision` below exists to prevent. `establish`
+    // discards its own load for a different reason: a token that carried the record
+    // would turn every later write into a stale overwrite (C2a2 gate F4). A failed
+    // `establish` is a refusal AFTER the ownership proof, so it is taken below through
+    // the one net-on-refusal rule, never returned bare.
+    journal: Result<
+        crate::ownership_journal::OwnedJournalHandle,
+        crate::ownership_journal::OwnershipJournalError,
+    >,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
     boot_id: &str,
-) -> Result<(), EnforcementError> {
+) -> Result<crate::ownership_journal::OwnedJournalHandle, EnforcementError> {
     use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
-    use crate::ownership_journal::{self as journal, ConfinedRole};
+    use crate::ownership_journal::ConfinedRole;
 
     // H, computed ONCE from the PRE-MATCH record and scoped to this boot id, and
     // the whole reason it is named here rather than inlined: it decides WHETHER a
@@ -1758,13 +1951,54 @@ fn bind_admitted_uid_before_ready(
     // tests run on any platform. Below this line the code only executes a plan.
     let plan = plan_admitted_binding(identity, &live, &history_for_net_decision);
 
+    // THE NET DECISION FOR A FAILURE THAT HAPPENS OUTSIDE THE PLAN'S OWN REFUSALS
+    // (the proof token below, and the kernel steps further down). Computed from the
+    // same predicate and the same two inputs the plan's own refusals used, so such a
+    // failure cannot answer the question differently from a refusal the plan itself
+    // took. A literal here would be the fail-open answer: H can name a uid whose jump
+    // was deleted, and that uid is left over `policy accept` if the net is skipped.
+    let net_required_mid_plan = net_required_on_refusal(&history_for_net_decision, &live);
+
+    // INVARIANT: the ownership journal must hold the Owned record for this exact
+    // activation before anything is bound. A failed `establish` is a refusal after
+    // the table was proven ours, so it goes through the ONE net-on-refusal rule (the
+    // `refuse` closure into `refuse_after_owned_table`) with the plan's own uncovered
+    // uids when it computed any: a this-boot uid whose jump is gone gets its net
+    // exactly as the plan's own refusal would give it.
+    let journal = match journal {
+        Ok(handle) => handle,
+        Err(err) => {
+            // When the plan had already refused with a net, keep its own reason visible
+            // beside this one: same net, same refusal class, both causes named.
+            let (uncovered, plan_reason): (&[u32], String) = match &plan {
+                BindPlan::RefuseWithNet {
+                    uncovered_uids,
+                    reason,
+                } => (
+                    uncovered_uids,
+                    format!(" The binding plan also refused: {reason}"),
+                ),
+                _ => (&[], String::new()),
+            };
+            return Err(refuse(
+                net_required_mid_plan,
+                uncovered,
+                format!(
+                    "the ownership journal does not hold the Owned record for the activation \
+                     this process just made ({err}), so its confined history cannot be \
+                     proven; refusing readiness.{plan_reason}"
+                ),
+            ));
+        }
+    };
+
     let (agent_uid, ceiling, install_required) = match plan {
         BindPlan::RefuseWithNet {
             reason,
             uncovered_uids,
         } => return Err(refuse(true, &uncovered_uids, reason)),
         BindPlan::RefuseWithoutNet { reason } => return Err(refuse(false, &[], reason)),
-        BindPlan::NothingToBind => return Ok(()),
+        BindPlan::NothingToBind => return Ok(journal),
         BindPlan::Adopt { agent_uid } => (agent_uid, 0, false),
         BindPlan::Install { agent_uid, ceiling } => (agent_uid, ceiling, true),
     };
@@ -1776,16 +2010,8 @@ fn bind_admitted_uid_before_ready(
         ));
     };
 
-    // THE NET DECISION FOR A FAILURE THAT HAPPENS WHILE EXECUTING THE PLAN.
-    // Computed from the same predicate and the same two inputs the plan's own
-    // refusals used, so a failure at the kernel step cannot answer the question
-    // differently from a refusal the plan itself took. A literal here would be
-    // the fail-open answer: H can name a uid whose jump was deleted, and that uid
-    // is left over `policy accept` if the net is skipped.
-    let net_required_mid_plan = net_required_on_refusal(&history_for_net_decision, &live);
-
     if install_required {
-        let key = match journal::load_or_generate_auth_key(key_path) {
+        let key = match crate::ownership_journal::load_or_generate_auth_key(key_path) {
             Ok(key) => key,
             Err(err) => {
                 // NOTHING has been written and nothing bound, so the same two
@@ -1814,13 +2040,15 @@ fn bind_admitted_uid_before_ready(
         #[cfg(not(all(target_os = "linux", feature = "test-isolation")))]
         let forced_write_ahead_error = false;
         let persisted = if forced_write_ahead_error {
-            Err(journal::OwnershipJournalError::UnsafeJournal {
-                path: journal_path.to_path_buf(),
-                reason: "test-isolation: confined-uid write-ahead forced to fail".to_string(),
-            })
+            Err(
+                crate::ownership_journal::OwnershipJournalError::UnsafeJournal {
+                    path: journal.path().to_path_buf(),
+                    reason: "test-isolation: confined-uid write-ahead forced to fail".to_string(),
+                },
+            )
         } else {
-            journal::persist_confined_uid_write_ahead(
-                journal_path,
+            crate::ownership_journal::persist_confined_uid_write_ahead(
+                &journal,
                 &key,
                 agent_uid,
                 ConfinedRole::Agent,
@@ -1931,7 +2159,7 @@ fn bind_admitted_uid_before_ready(
         "{AGENT_BINDING_READBACK_LINE_PREFIX} uid={agent_uid} agent={}",
         crate::nftables::confined_agent_id(agent_uid)
     );
-    Ok(())
+    Ok(journal)
 }
 
 impl ComponentProvider for NftablesTableProvider {
@@ -1988,7 +2216,11 @@ impl ComponentProvider for NftablesTableProvider {
             // key, a MAC mismatch, or a corrupt record is a HARD ERROR here
             // (blocker 3): it fails the acquisition closed rather than falling
             // through to a fresh create that could clobber live owned state.
-            let existing = match journal::load(journal_path, key_opt.as_ref()) {
+            let existing = match acquisition_journal::AcquisitionJournal::load_under_lock(
+                &lock,
+                journal_path,
+                key_opt.as_ref(),
+            ) {
                 Ok(j) => j,
                 Err(err) => {
                     drop(lock);
@@ -2021,9 +2253,9 @@ impl ComponentProvider for NftablesTableProvider {
             // the recognised net must still reach disarm's `ReclaimOwned` arm to be
             // cleared. Putting the rule in `decide` would take that arm away. Must match
             // the `ReclaimOwned` arm in `disarm_castle_runtime`, which PR-2 extends.
-            let decision = journal::decide(existing.as_ref(), table_present, &boot_id, &source);
+            let decision = journal::decide(existing.record(), table_present, &boot_id, &source);
             let history_unknown_this_boot = matches!(
-                existing.as_ref(),
+                existing.record(),
                 Some(crate::ownership_journal::OwnershipJournal::Owned { confined: None, .. })
             );
             let decision = match (&decision, history_unknown_this_boot) {
@@ -2097,20 +2329,21 @@ impl ComponentProvider for NftablesTableProvider {
                         // persist is skipped by checking that reason, not by a second
                         // read of the journal.
                         let resolution =
-                            resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine);
+                            resolve_net_scope_at_site(existing.record(), &self.decision_engine);
                         let mut persist_failure: Option<String> = None;
-                        if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
-                            if let Some(record) = existing.as_ref() {
-                                let admitted = admitted_identity(&self.decision_engine);
-                                if let Err(err) = persist_kill_set_write_ahead(
-                                    journal_path,
-                                    key_opt.as_ref(),
-                                    record,
-                                    &resolution.kill_set,
-                                    admitted,
-                                ) {
-                                    persist_failure = Some(err);
-                                }
+                        // An absent record has nothing to extend, so the persist is skipped (the
+                        // boot writer would refuse it by name); the unknown-history reason never
+                        // persists at all.
+                        if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory
+                            && existing.record().is_some()
+                        {
+                            let admitted = admitted_identity(&self.decision_engine);
+                            if let Err(err) = persist_kill_set_write_ahead_at_boot(
+                                &existing,
+                                key_opt.as_ref(),
+                                admitted,
+                            ) {
+                                persist_failure = Some(err);
                             }
                         }
                         let scope_sentence = crate::nftables::safety_net_scope_sentence(
@@ -2289,20 +2522,21 @@ impl ComponentProvider for NftablesTableProvider {
                     // REGARDLESS of the persist result, except that a requested stop
                     // with HostWide scope takes the A155 skip below instead of installing.
                     let resolution =
-                        resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine);
+                        resolve_net_scope_at_site(existing.record(), &self.decision_engine);
                     let mut persist_failure: Option<String> = None;
-                    if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
-                        if let Some(record) = existing.as_ref() {
-                            let admitted = admitted_identity(&self.decision_engine);
-                            if let Err(err) = persist_kill_set_write_ahead(
-                                journal_path,
-                                key_opt.as_ref(),
-                                record,
-                                &resolution.kill_set,
-                                admitted,
-                            ) {
-                                persist_failure = Some(err);
-                            }
+                    // An absent record has nothing to extend, so the persist is skipped (the
+                    // boot writer would refuse it by name); the unknown-history reason never
+                    // persists at all.
+                    if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory
+                        && existing.record().is_some()
+                    {
+                        let admitted = admitted_identity(&self.decision_engine);
+                        if let Err(err) = persist_kill_set_write_ahead_at_boot(
+                            &existing,
+                            key_opt.as_ref(),
+                            admitted,
+                        ) {
+                            persist_failure = Some(err);
                         }
                     }
                     let scope_sentence = crate::nftables::safety_net_scope_sentence(
@@ -2399,29 +2633,77 @@ impl ComponentProvider for NftablesTableProvider {
                 ))
             })?;
 
+            // H_ESTABLISHED: the journal's proof token, built exactly once, here, after
+            // `activate_runtime_ownership` accepted this exact identity and before the
+            // bind. INVARIANT: `establish` reloads and returns `Ok` only if the record
+            // is `Owned` for this activation, so the token can only name the activation
+            // this process runs under. A record that is not means the proof this
+            // acquisition just wrote or confirmed is not on disk; that is a refusal
+            // AFTER the table was proven ours, so its `Err` is handed to the bind, which
+            // refuses through the one net-on-refusal rule (`refuse_after_owned_table`)
+            // over the same evidence as every other slice-A refusal, never a bare
+            // `AcquireFailed` that would skip the net. The key is resolved by the same
+            // call the bind makes, so no new key path appears.
+            //
+            // TEST-ISOLATION SEAM: a forced error is folded into the SAME `Result` the
+            // real `establish` returns, so a test that arms it exercises the production
+            // refusal. See `force_next_journal_establish_error_for_test`.
+            #[cfg(feature = "test-isolation")]
+            let forced_establish_error =
+                JOURNAL_ESTABLISH_FORCE_ERROR.swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(feature = "test-isolation"))]
+            let forced_establish_error = false;
+            let established = if forced_establish_error {
+                Err(
+                    crate::ownership_journal::OwnershipJournalError::UnsafeJournal {
+                        path: journal_path.to_path_buf(),
+                        reason: "test-isolation: the journal proof token was forced to fail"
+                            .to_string(),
+                    },
+                )
+            } else {
+                crate::ownership_journal::load_or_generate_auth_key(key_path).and_then(|key| {
+                    crate::ownership_journal::OwnedJournalHandle::establish(
+                        journal_path,
+                        &key,
+                        crate::ownership_journal::JournalActivation::new(
+                            ownership.marker.clone(),
+                            ownership.table_handle,
+                            ownership.base_chain_handle,
+                            boot_id.clone(),
+                            source.clone(),
+                        ),
+                    )
+                })
+            };
+
             // SLICE A: bind the admitted uid and read it back from the kernel.
             // Everything after this point runs only if the wall is holding the
             // identity it was armed with, so the readiness beacon below can mean
-            // "an agent started now starts confined".
-            if let Err(err) = bind_admitted_uid_before_ready(
+            // "an agent started now starts confined". The bind returns the proof token
+            // it was handed, for the component to own.
+            let owned_journal = match bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
                 &self.shutdown_requested,
-                journal_path,
+                established,
                 key_path,
-                existing.as_ref(),
+                existing.record(),
                 &boot_id,
             ) {
-                drop(lock);
-                return Err(err);
-            }
+                Ok(handle) => handle,
+                Err(err) => {
+                    drop(lock);
+                    return Err(err);
+                }
+            };
 
             // Seed the retained deny set from the resolution this acquisition just
             // computed, so a later loss installs the net from an IN-MEMORY set rather
             // than depending on a journal read that may itself be failing.
             // A host-wide scope has no rules, but its full union must survive
             // for every later retry in this process.
-            let seeded = resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine)
+            let seeded = resolve_net_scope_at_site(existing.record(), &self.decision_engine)
                 .retained_deny_uids()
                 .to_vec();
             Ok(Box::new(NftablesTableComponent {
@@ -2430,7 +2712,7 @@ impl ComponentProvider for NftablesTableProvider {
                 decision_engine: Arc::clone(&self.decision_engine),
                 probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
                 released: false,
-                journal_path: journal_path.to_path_buf(),
+                journal: owned_journal,
                 journal_key_path: key_path.to_path_buf(),
                 retained_deny_uids: std::sync::Mutex::new(seeded),
                 recovering: std::sync::atomic::AtomicBool::new(false),
@@ -2692,10 +2974,12 @@ struct NftablesTableComponent {
     /// poller from stacking `nft` forks. See [`crate::health_probe`].
     probe: crate::health_probe::BoundedHealthProbe,
     released: bool,
-    /// Where this component's own journal record lives, so a startup-loss or
-    /// post-READY recovery can run the boot rows' persist without re-deriving the
-    /// path. Must match the paths `acquire` resolved.
-    journal_path: PathBuf,
+    /// The proof token for this component's own journal record, so a startup-loss
+    /// or post-READY recovery can run the persist without re-deriving the path. It
+    /// carries the path and the activation and NO record: every write through it
+    /// re-loads and re-validates (register `LINUX-JOURNAL-OWNED-WRITERS-01`). Built
+    /// once in `acquire` from the paths it resolved.
+    journal: crate::ownership_journal::OwnedJournalHandle,
     journal_key_path: PathBuf,
     /// The net's scope as this process last resolved it, retained for the life of the
     /// component.
@@ -2730,8 +3014,11 @@ struct NftablesTableComponent {
 /// readiness poll. The proof runs on an isolated worker, so SIGTERM/supervision
 /// remains bounded even if fork/exec/netlink never returns. The service restart
 /// kills any still-wedged process in its systemd cgroup.
+///
+/// Must match `WATCHDOG_PROBE_WAIT` in `src/daemon.rs`: the systemd watchdog
+/// interval is derived from this wait (TD2 compares them).
 #[cfg(target_os = "linux")]
-const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Minimum spacing between REAL `nft` ownership proofs. Chosen well under
 /// `main.rs`'s 2-second supervisor `HEALTH_INTERVAL` so every supervisor tick
@@ -2757,10 +3044,12 @@ pub const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// up on it after `NFT_HEALTH_QUERY_TIMEOUT` (1s); readings 2 and 3 do NOT fork
 /// again — the worker still owns the in-flight slot, and observing it past its
 /// deadline is itself the indeterminate reading (see [`crate::health_probe`]).
-/// So the three readings land at t=0, t=2s, t=4s and the third returns a PROVEN
-/// `Lost`, which the supervisor acts on with no further grace: worst-case ~4s
-/// from the first reading, ~6s from onset, and exactly ONE `nft` child for the
-/// whole sequence.
+/// So the three readings land at t=0, t=2s, t=4s and the third latches
+/// `Indeterminate` (never a proven `Lost`: `note_indeterminate` in
+/// `src/health_probe.rs`), which the supervisor's `Indeterminate` arm acts on
+/// with no further grace after running the post-READY hook (the `Lost` arm runs
+/// no hook): worst-case ~4s from the first reading, ~6s from onset, and exactly
+/// ONE `nft` child for the whole sequence.
 #[cfg(target_os = "linux")]
 const NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE: u32 = 3;
 
@@ -2819,7 +3108,7 @@ impl NftablesTableComponent {
             crate::ownership_journal::load_or_generate_auth_key(&self.journal_key_path)
                 .ok()
                 .and_then(|key| {
-                    crate::ownership_journal::load(&self.journal_path, Some(&key))
+                    crate::ownership_journal::load(self.journal.path(), Some(&key))
                         .ok()
                         .flatten()
                 });
@@ -2913,8 +3202,11 @@ impl NftablesTableComponent {
     /// outrun the journal, and the next start retries the write.
     ///
     /// INVARIANT: a record whose `confined` key is ABSENT is NOT written here at all.
-    /// `persist_kill_set_write_ahead` keeps such a record's key absent, and the caller
-    /// skips this entirely on the unknown-history reason.
+    /// `persist_kill_set_post_ready` keeps such a record's key absent, and the caller
+    /// skips this entirely on the unknown-history reason. The load happens INSIDE the
+    /// writer, through the component's proof token, so an absent, `Preparing` or
+    /// foreign record is a reported refusal here, never a silent no-op or a write
+    /// into a record this process does not own.
     fn persist_boot_row_best_effort(&self, resolution: &SafetyNetResolution) -> Option<String> {
         if resolution.reason == crate::nftables::SafetyNetReason::UnknownHistory {
             return None;
@@ -2926,20 +3218,13 @@ impl NftablesTableComponent {
             Ok(key) => key,
             Err(err) => return Some(err.to_string()),
         };
-        let record = match crate::ownership_journal::load(&self.journal_path, Some(&key)) {
-            Ok(Some(record)) => record,
-            // No record at all is not a failure: there is nothing to extend.
-            Ok(None) => return None,
-            Err(err) => return Some(err.to_string()),
-        };
-        persist_kill_set_write_ahead(
-            &self.journal_path,
-            Some(&key),
-            &record,
-            &resolution.kill_set,
+        persist_kill_set_post_ready(
+            &self.journal,
+            &key,
             admitted_identity(&self.decision_engine),
         )
         .err()
+        .map(|err| err.to_string())
     }
 
     /// STARTUP LOST (memo D1b step 7): a COMPLETED negative ownership proof at either
@@ -5435,6 +5720,14 @@ mod tests {
         }
     }
 
+    /// A boot id in the kernel's formatted-UUID shape, which the journal grammar
+    /// accepts, for fixture records that are stored and reloaded.
+    #[cfg(target_os = "linux")]
+    const FIXTURE_JOURNAL_BOOT_ID: &str = "3f2b91c0-7d4e-4a18-b6c2-0e15a9d83b77";
+    /// A daemon path inside the journal's source grammar, for fixture records.
+    #[cfg(target_os = "linux")]
+    const FIXTURE_JOURNAL_SOURCE: &str = "/usr/local/bin/castle-wall-daemon";
+
     /// A hand-built [`NftablesTableComponent`] bypassing `acquire` (no real host
     /// lock or kernel table), for U2/U2b below. `net_scope_from_retained_set`
     /// still shells out to `nft` to read live table bindings, so these tests
@@ -5450,6 +5743,46 @@ mod tests {
         journal_dir: &Path,
         retained_deny_uids: Vec<u32>,
     ) -> NftablesTableComponent {
+        // The component's journal is a proof token, obtainable only through
+        // `establish` over an `Owned` record for its activation. Build one over a
+        // fixture record matching `ownership` below, then REMOVE the record, so these
+        // fixtures keep reading "no journal" exactly as the path-only field did (a
+        // post-activation persist now reports the absent record instead of skipping).
+        let journal_path = journal_dir.join("nonexistent-ownership.json");
+        let key_path = journal_dir.join("nonexistent-ownership.key");
+        let key = crate::ownership_journal::load_or_generate_auth_key(&key_path)
+            .expect("fixture journal key");
+        let identity = crate::ownership_journal::JournalIdentity {
+            schema_version: crate::ownership_journal::JOURNAL_SCHEMA_VERSION,
+            marker: "test-marker".to_string(),
+            boot_id: FIXTURE_JOURNAL_BOOT_ID.to_string(),
+            source: FIXTURE_JOURNAL_SOURCE.to_string(),
+        };
+        crate::ownership_journal::store_atomic(
+            &journal_path,
+            &crate::ownership_journal::OwnershipJournal::owned_with_known_history(
+                identity,
+                1,
+                2,
+                Vec::new(),
+            )
+            .expect("empty history"),
+            &key,
+        )
+        .expect("fixture journal record");
+        let journal = crate::ownership_journal::OwnedJournalHandle::establish(
+            &journal_path,
+            &key,
+            crate::ownership_journal::JournalActivation::new(
+                "test-marker".to_string(),
+                1,
+                2,
+                FIXTURE_JOURNAL_BOOT_ID.to_string(),
+                FIXTURE_JOURNAL_SOURCE.to_string(),
+            ),
+        )
+        .expect("fixture handle");
+        std::fs::remove_file(&journal_path).expect("remove the fixture record");
         NftablesTableComponent {
             lock: None,
             ownership: crate::nftables::CastleTableOwnership {
@@ -5460,8 +5793,8 @@ mod tests {
             decision_engine,
             probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
             released: false,
-            journal_path: journal_dir.join("nonexistent-ownership.json"),
-            journal_key_path: journal_dir.join("nonexistent-ownership.key"),
+            journal,
+            journal_key_path: key_path,
             retained_deny_uids: std::sync::Mutex::new(retained_deny_uids),
             recovering: std::sync::atomic::AtomicBool::new(false),
             last_recovery_attempt: std::sync::Mutex::new(None),
@@ -6831,8 +7164,9 @@ mod tests {
         let body = bind_function_source();
         assert_eq!(
             body.matches("net_required_mid_plan,").count(),
-            2,
-            "the key-load and write-ahead failure arms both pass the predicate"
+            3,
+            "the proof-token (establish), key-load and write-ahead failure arms all pass \
+             the predicate"
         );
         // ANCHORED, not distance-measured: find the plan's own no-net arm by its
         // match pattern and require the ONE literal-false refusal in the whole
@@ -6866,10 +7200,15 @@ mod tests {
         // evidence already in hand, so there is no read that can fail and narrow
         // the net and no write that can restore a superseded record.
         //
-        // DERIVATION of the needles: `persist_kill_set_write_ahead` is the only
-        // function that writes a confined-history record from a caller-supplied
-        // record, and `journal::load(` / `ownership_journal::load(` is the only
-        // authenticated read. `journal::load_or_generate_auth_key` shares the
+        // DERIVATION of the needles: `persist_kill_set_write_ahead_at_boot` is the
+        // only function that writes a confined-history record from a caller-supplied
+        // record, `persist_kill_set_post_ready` and `persist_confined_uid_write_ahead`
+        // are the two writers that take the journal's proof token
+        // (`OwnedJournalHandle`), and `journal::load(` / `ownership_journal::load(` is
+        // the only authenticated read. `"journal"`, `"Journal"` and `".path()"` close
+        // the rename: the bind's handle parameter is named `journal`, so the old
+        // `"journal_path"` needle alone would pass vacuously while a future
+        // `journal.path()` in the refusal path evaded every check. `journal::load_or_generate_auth_key` shares the
         // `journal::load` prefix and is NOT a record read, which is why both
         // needles carry the opening parenthesis.
         let whole = fs::read_to_string(
@@ -6889,13 +7228,25 @@ mod tests {
             .find("\n/// Fault-injection seam")
             .expect("the refusal helper must be followed by the write-ahead seam")
             + helper_start;
-        let helper = &production[helper_start..helper_end];
+        // Whole-line comments are blanked before the needle check (as the T-P1
+        // scanner does), so the helper's doc prose, which names the journal, can sit
+        // anywhere around the signature without deciding this test.
+        let helper =
+            crate::source_scan::without_comment_lines(&production[helper_start..helper_end]);
+        let helper = helper.as_str();
         for needle in [
             "persist_kill_set_write_ahead",
+            "persist_kill_set_write_ahead_at_boot",
+            "persist_kill_set_post_ready",
+            "persist_confined_uid_write_ahead",
+            "OwnedJournalHandle",
             "journal::load(",
             "ownership_journal::load(",
             "journal_path",
             "key_path",
+            "journal",
+            "Journal",
+            ".path()",
         ] {
             assert!(
                 !helper.contains(needle),
@@ -6919,8 +7270,15 @@ mod tests {
         let closure = &body[closure_start..closure_end];
         for needle in [
             "persist_kill_set_write_ahead",
+            "persist_kill_set_write_ahead_at_boot",
+            "persist_kill_set_post_ready",
+            "persist_confined_uid_write_ahead",
+            "OwnedJournalHandle",
             "journal::load(",
             "ownership_journal::load(",
+            "journal",
+            "Journal",
+            ".path()",
         ] {
             assert!(
                 !closure.contains(needle),
@@ -6961,7 +7319,7 @@ mod tests {
             .find("crate::nftables::activate_runtime_ownership(&ownership)")
             .expect("the acquisition must activate runtime ownership");
         let bind = source
-            .find("if let Err(err) = bind_admitted_uid_before_ready(")
+            .find("let owned_journal = match bind_admitted_uid_before_ready(")
             .expect("the acquisition must call the bind");
         assert!(
             activate < bind,
@@ -7013,5 +7371,1069 @@ mod tests {
             "every expectation reader now reads the frozen identity cell; a `try_lock` on the \
              store is an indeterminate answer where a definite one exists: {offenders:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // C2a2b: journal-writer parity (LINUX-JOURNAL-OWNED-WRITERS-01). These read
+    // the crate's own source through `crate::source_scan`, so they run on every
+    // platform; the Linux-only unit tests follow in `c2a2b_linux`.
+    // ---------------------------------------------------------------------
+
+    /// What a journal writer is, for readability. T-P2 asserts the `HandleWriter`
+    /// and `AcquisitionWriter` signatures; the other labels are asserted by no test.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WriterClass {
+        HandleWriter,
+        AcquisitionWriter,
+        ActivationCreator,
+        ActivationBuilder,
+        Acquisition,
+        DisarmClear,
+        RecordPrimitive,
+        KeyPrimitive,
+    }
+
+    /// Every production function that stores, clears, or loads-and-stores the
+    /// ownership journal record. Count: 3 `HandleWriter` + 1 `AcquisitionWriter` +
+    /// 3 `ActivationCreator` + 1 `ActivationBuilder` + 1 `Acquisition` + 2
+    /// `DisarmClear` = 11.
+    const JOURNAL_WRITERS: &[(&str, &str, WriterClass)] = &[
+        (
+            "src/ownership_journal.rs",
+            "persist_confined_uid_write_ahead",
+            WriterClass::HandleWriter,
+        ),
+        (
+            "src/ownership_journal.rs",
+            "persist_confined_uid_write_ahead_with_store",
+            WriterClass::HandleWriter,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "persist_kill_set_post_ready",
+            WriterClass::HandleWriter,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "persist_kill_set_write_ahead_at_boot",
+            WriterClass::AcquisitionWriter,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "fresh_acquire",
+            WriterClass::ActivationCreator,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "recover_from_deny_all_net",
+            WriterClass::ActivationCreator,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "finalize_owned",
+            WriterClass::ActivationCreator,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "owned_record_preserving_history",
+            WriterClass::ActivationBuilder,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "acquire",
+            WriterClass::Acquisition,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "disarm_recover_deny_all_net",
+            WriterClass::DisarmClear,
+        ),
+        (
+            "src/runtime_providers.rs",
+            "disarm_castle_runtime",
+            WriterClass::DisarmClear,
+        ),
+    ];
+
+    /// The private write primitives, pinned so a writer that bypasses the public API
+    /// and calls them directly is caught. `store_atomic` and `write_secret_file_atomic`
+    /// reach `write_private_file_atomic`; `clear` reaches `clear_with_parent_sync`.
+    const JOURNAL_PRIMITIVES: &[(&str, &str, WriterClass)] = &[
+        (
+            "src/ownership_journal.rs",
+            "store_atomic",
+            WriterClass::RecordPrimitive,
+        ),
+        (
+            "src/ownership_journal.rs",
+            "write_secret_file_atomic",
+            WriterClass::KeyPrimitive,
+        ),
+        (
+            "src/ownership_journal.rs",
+            "clear",
+            WriterClass::RecordPrimitive,
+        ),
+    ];
+
+    /// A production function, keyed by file, name, and the byte offset of its own
+    /// signature, so two same-named functions in one file stay distinct.
+    type FnKey = (String, String, usize);
+
+    /// The needle classes of section 7.1 of the C2a2b design packet, computed over
+    /// the production part of every daemon source file.
+    struct JournalScan {
+        /// (file, production code without whole-line comments).
+        files: Vec<(String, String)>,
+        store: std::collections::BTreeSet<FnKey>,
+        load: std::collections::BTreeSet<FnKey>,
+        builds: std::collections::BTreeSet<FnKey>,
+    }
+
+    /// The function enclosing `offset`, keyed by its signature's offset; `None` at
+    /// module level.
+    fn enclosing_key(file: &str, code: &str, offset: usize) -> Option<FnKey> {
+        let name = crate::source_scan::enclosing_fn(code, offset);
+        if name.is_empty() {
+            return None;
+        }
+        let sig = code[..offset]
+            .rfind(&format!("fn {name}("))
+            .or_else(|| code[..offset].rfind(&format!("fn {name}<")))
+            .unwrap_or_else(|| panic!("{file}: the signature of {name} precedes its body"));
+        Some((file.to_string(), name, sig))
+    }
+
+    /// Whether the occurrence at `offset` is the name in its own `fn NAME(`
+    /// declaration (so `pub fn store_atomic(` does not attribute to the function
+    /// before it).
+    fn is_declaration(code: &str, offset: usize) -> bool {
+        code[..offset].ends_with("fn ")
+    }
+
+    /// Offsets of `needle` preceded by no identifier character (a `::` or `.`
+    /// qualifier is allowed), so `journal::store_atomic(` counts and
+    /// `x_store_atomic` does not.
+    fn offsets_of_word(code: &str, needle: &str) -> Vec<usize> {
+        let bytes = code.as_bytes();
+        crate::source_scan::offsets_of(code, needle)
+            .into_iter()
+            .filter(|&at| {
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_')
+            })
+            .collect()
+    }
+
+    fn journal_scan() -> JournalScan {
+        use crate::source_scan::{
+            daemon_sources, offsets_of_unqualified, production_part, without_comment_lines,
+        };
+        let mut scan = JournalScan {
+            files: Vec::new(),
+            store: Default::default(),
+            load: Default::default(),
+            builds: Default::default(),
+        };
+        for (file, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            let hits = |set: &mut std::collections::BTreeSet<FnKey>, offsets: Vec<usize>| {
+                for at in offsets {
+                    if is_declaration(&code, at) {
+                        continue;
+                    }
+                    if let Some(key) = enclosing_key(&file, &code, at) {
+                        set.insert(key);
+                    }
+                }
+            };
+            // STORE: the record store (as a call or as a value), the injected store,
+            // the disarm clear, and the two private write primitives.
+            let mut store = std::collections::BTreeSet::new();
+            hits(&mut store, offsets_of_word(&code, "store_atomic"));
+            hits(&mut store, offsets_of_unqualified(&code, "store("));
+            hits(&mut store, offsets_of_word(&code, "journal::clear("));
+            hits(
+                &mut store,
+                offsets_of_word(&code, "ownership_journal::clear("),
+            );
+            hits(
+                &mut store,
+                offsets_of_word(&code, "write_private_file_atomic("),
+            );
+            hits(
+                &mut store,
+                offsets_of_word(&code, "clear_with_parent_sync("),
+            );
+            // LOAD: the authenticated record read, qualified; bare inside the journal
+            // module; and the acquisition's typed load.
+            let mut load = std::collections::BTreeSet::new();
+            hits(&mut load, offsets_of_word(&code, "journal::load("));
+            hits(
+                &mut load,
+                offsets_of_word(&code, "ownership_journal::load("),
+            );
+            if file == "src/ownership_journal.rs" {
+                hits(&mut load, offsets_of_unqualified(&code, "load("));
+            }
+            hits(
+                &mut load,
+                offsets_of_word(&code, "AcquisitionJournal::load_under_lock("),
+            );
+            // BUILDS: constructs an `Owned` record to be stored.
+            let mut builds = std::collections::BTreeSet::new();
+            for needle in [
+                "owned_with_known_history(",
+                "owned_with_unknown_history(",
+                "record_from_merged(",
+            ] {
+                hits(&mut builds, offsets_of_word(&code, needle));
+            }
+            scan.store.extend(store);
+            scan.load.extend(load);
+            scan.builds.extend(builds);
+            scan.files.push((file, code));
+        }
+        scan
+    }
+
+    impl JournalScan {
+        /// Functions that call a function in `{STORE}` by name (unqualified by `.`).
+        fn names_a_store_fn(&self) -> std::collections::BTreeSet<FnKey> {
+            let names: std::collections::BTreeSet<&str> = self
+                .store
+                .iter()
+                .map(|(_, name, _)| name.as_str())
+                .collect();
+            let mut out = std::collections::BTreeSet::new();
+            for (file, code) in &self.files {
+                let bytes = code.as_bytes();
+                for name in &names {
+                    for at in crate::source_scan::offsets_of(code, &format!("{name}(")) {
+                        let prev = if at == 0 { b' ' } else { bytes[at - 1] };
+                        if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' {
+                            continue;
+                        }
+                        if is_declaration(code, at) {
+                            continue;
+                        }
+                        if let Some(key) = enclosing_key(file, code, at) {
+                            out.insert(key);
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// `{STORE}` union `{LOAD and (names a STORE function or BUILDS)}`.
+        fn writers(&self) -> std::collections::BTreeSet<FnKey> {
+            let named = self.names_a_store_fn();
+            let mut out = self.store.clone();
+            for key in &self.load {
+                if named.contains(key) || self.builds.contains(key) {
+                    out.insert(key.clone());
+                }
+            }
+            out
+        }
+
+        fn code_of(&self, file: &str) -> &str {
+            &self
+                .files
+                .iter()
+                .find(|(f, _)| f == file)
+                .unwrap_or_else(|| panic!("{file} is a daemon source"))
+                .1
+        }
+    }
+
+    fn file_and_name(keys: &std::collections::BTreeSet<FnKey>) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = keys
+            .iter()
+            .map(|(file, name, _)| (file.clone(), name.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// T-P1 (LINUX-JOURNAL-OWNED-WRITERS-01): the set of production functions that
+    /// store, clear, or load-and-store the ownership journal equals the declared
+    /// writer list plus the private primitives, EXACTLY (a multiset, so a second
+    /// same-named function that also qualifies is a failure, not a silent merge).
+    /// The private primitives' callers are pinned, and no executable under `src/bin`
+    /// names the journal module.
+    ///
+    /// BOUND: journal mutation is seen only through the named needles. A writer that
+    /// reaches the journal FILE by another route (raw `std::fs` on the journal path)
+    /// is invisible to this test; the primitive caller pins narrow that to raw
+    /// `std::fs` use. A needle in a trailing comment is counted (a false positive,
+    /// which fails loudly).
+    #[test]
+    fn tp1_the_journal_writer_set_is_exactly_the_declared_list() {
+        let scan = journal_scan();
+        let computed = file_and_name(&scan.writers());
+        let mut expected: Vec<(String, String)> = JOURNAL_WRITERS
+            .iter()
+            .chain(JOURNAL_PRIMITIVES.iter())
+            .map(|(file, name, _)| (file.to_string(), name.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            expected.len(),
+            11 + 3,
+            "11 writers plus 3 primitives, per the derivation on the list"
+        );
+        assert_eq!(
+            computed, expected,
+            "a journal writer was added, renamed or removed without updating \
+             JOURNAL_WRITERS; decide whether it must take the proof token"
+        );
+
+        let journal_code = scan.code_of("src/ownership_journal.rs");
+        for (primitive, callers) in [
+            (
+                "write_private_file_atomic(",
+                vec!["store_atomic", "write_secret_file_atomic"],
+            ),
+            ("clear_with_parent_sync(", vec!["clear"]),
+        ] {
+            let mut got = std::collections::BTreeSet::new();
+            for (file, code) in &scan.files {
+                for at in offsets_of_word(code, primitive) {
+                    if is_declaration(code, at) {
+                        continue;
+                    }
+                    let (_, name, _) =
+                        enclosing_key(file, code, at).expect("a primitive call is inside a fn");
+                    got.insert(format!("{file}::{name}"));
+                }
+            }
+            let want: std::collections::BTreeSet<String> = callers
+                .iter()
+                .map(|name| format!("src/ownership_journal.rs::{name}"))
+                .collect();
+            assert_eq!(got, want, "the callers of {primitive}");
+        }
+        assert!(journal_code.contains("fn write_private_file_atomic("));
+
+        for (path, text) in crate::source_scan::rust_files_under("src/bin") {
+            assert!(
+                !text.contains("ownership_journal"),
+                "{path}: an executable must not reach the ownership journal directly"
+            );
+        }
+    }
+
+    /// T-P3 (LINUX-JOURNAL-OWNED-WRITERS-01): the production functions that load
+    /// the journal record and are not writers are exactly the named readers. A new
+    /// raw reader must be named here, which is the prompt to ask whether it should be
+    /// a writer that takes the proof token.
+    #[test]
+    fn tp3_the_journal_reader_set_is_exactly_the_named_readers() {
+        let scan = journal_scan();
+        let writers = scan.writers();
+        let readers: std::collections::BTreeSet<FnKey> =
+            scan.load.difference(&writers).cloned().collect();
+        let mut want = vec![
+            (
+                "src/ownership_journal.rs".to_string(),
+                "establish".to_string(),
+            ),
+            (
+                "src/ownership_journal.rs".to_string(),
+                "reload_for_activation".to_string(),
+            ),
+            (
+                "src/runtime_providers.rs".to_string(),
+                "load_under_lock".to_string(),
+            ),
+            (
+                "src/runtime_providers.rs".to_string(),
+                "net_scope_from_retained_set".to_string(),
+            ),
+        ];
+        want.sort();
+        assert_eq!(file_and_name(&readers), want);
+    }
+
+    /// The region of the production text that is the nftables provider's `impl`,
+    /// where "inside `acquire`" pins look: three providers declare a byte-identical
+    /// `fn acquire(self: Box<Self>)`, so `find("fn acquire(")` would be ambiguous.
+    fn nftables_acquire_region(code: &str) -> (usize, usize) {
+        let impl_at = code
+            .find("\nimpl ComponentProvider for NftablesTableProvider {")
+            .expect("the nftables provider impl");
+        let fn_at = impl_at
+            + code[impl_at..]
+                .find("fn acquire(")
+                .expect("the nftables provider declares acquire");
+        let open = fn_at + code[fn_at..].find('{').expect("acquire has a body");
+        let close =
+            crate::source_scan::matching_brace(code, open).expect("the acquire body closes");
+        (fn_at, close + 1)
+    }
+
+    /// Whether every production call of the boot writer is inside the nftables
+    /// provider's `fn acquire` body (not merely its impl or the functions after it).
+    fn boot_writer_calls_are_inside_acquire(code: &str) -> (usize, bool) {
+        let (start, end) = nftables_acquire_region(code);
+        let calls: Vec<usize> = offsets_of_word(code, "persist_kill_set_write_ahead_at_boot(")
+            .into_iter()
+            .filter(|&at| !is_declaration(code, at))
+            .collect();
+        let inside = calls.iter().all(|&at| (start..end).contains(&at));
+        (calls.len(), inside)
+    }
+
+    /// The parameters of `fn <name>(` in `code`.
+    fn params_of(code: &str, name: &str) -> Vec<(String, String)> {
+        let at = code
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} must exist"));
+        crate::source_scan::top_level_params(&code[at..])
+    }
+
+    const FORBIDDEN_WRITER_PARAMS: &[&str] = &[
+        "&Path",
+        "&std::path::Path",
+        "&OwnershipJournal",
+        "&crate::ownership_journal::OwnershipJournal",
+    ];
+
+    /// T-P2 (LINUX-JOURNAL-OWNED-WRITERS-01): the writers' signatures carry their
+    /// class, and each constructor has exactly its one production site. A handle
+    /// writer takes the proof token and no caller-supplied path or record; the boot
+    /// writer takes the acquisition's opaque load and no path; the bind uses its
+    /// handle only to write ahead; `establish` and `load_under_lock` are each called
+    /// once, inside the nftables `acquire`, in the pinned order; the acquisition
+    /// type has one constructor and private fields; and the component holds a proof
+    /// token and no record-carrying field.
+    #[test]
+    fn tp2_writer_signatures_and_constructor_sites_are_pinned() {
+        let scan = journal_scan();
+        let rp = scan.code_of("src/runtime_providers.rs");
+        let oj = scan.code_of("src/ownership_journal.rs");
+
+        // HandleWriter signatures (exact top-level type match, so W2's injected
+        // closure type, which merely mentions `&Path`, is not a match).
+        for (file, name, class) in JOURNAL_WRITERS {
+            if *class != WriterClass::HandleWriter {
+                continue;
+            }
+            let params = params_of(scan.code_of(file), name);
+            assert!(
+                params
+                    .iter()
+                    .any(|(_, ty)| ty.ends_with("OwnedJournalHandle")),
+                "{name} must take the proof token: {params:?}"
+            );
+            for (param, ty) in &params {
+                assert!(
+                    !FORBIDDEN_WRITER_PARAMS.contains(&ty.as_str()),
+                    "{name} must not take a caller-supplied path or record ({param}: {ty})"
+                );
+            }
+        }
+        // The injected store is the one declared exception, and it is only ever
+        // handed the handle's own path.
+        let w2 = crate::source_scan::fn_body(oj, "persist_confined_uid_write_ahead_with_store");
+        let store_calls = crate::source_scan::offsets_of_unqualified(w2, "store(");
+        assert_eq!(store_calls.len(), 1, "one injected store call");
+        assert!(
+            w2[store_calls[0]..].starts_with("store(journal.path(),"),
+            "the injected store receives the handle's path"
+        );
+
+        // The boot writer.
+        let boot = params_of(rp, "persist_kill_set_write_ahead_at_boot");
+        assert!(
+            boot.iter()
+                .any(|(_, ty)| ty.ends_with("AcquisitionJournal")),
+            "the boot writer takes the acquisition's load: {boot:?}"
+        );
+        for (param, ty) in &boot {
+            assert!(
+                ty != "&Path" && ty != "&std::path::Path",
+                "the boot writer's path comes from the token, not a parameter ({param}: {ty})"
+            );
+        }
+        let (region_start, region_end) = nftables_acquire_region(rp);
+        let (boot_call_count, boot_calls_inside) = boot_writer_calls_are_inside_acquire(rp);
+        assert_eq!(boot_call_count, 2, "two boot call sites");
+        assert!(
+            boot_calls_inside,
+            "both boot call sites are inside the nftables provider's fn acquire body"
+        );
+        // Negative case: the same check refuses a boot-writer call placed in
+        // `finalize_owned`, a function after `acquire` in the same provider region.
+        let finalize_at = rp
+            .find("fn finalize_owned(")
+            .expect("finalize_owned exists");
+        let finalize_open = finalize_at + rp[finalize_at..].find('{').expect("body");
+        let mutated = format!(
+            "{}\n    let _ = persist_kill_set_write_ahead_at_boot(&existing, None, None);{}",
+            &rp[..=finalize_open],
+            &rp[finalize_open + 1..]
+        );
+        let (mutated_count, mutated_inside) = boot_writer_calls_are_inside_acquire(&mutated);
+        assert_eq!(mutated_count, 3);
+        assert!(
+            !mutated_inside,
+            "a boot-writer call in finalize_owned must fail the inside-acquire pin"
+        );
+
+        // The bind's proof token is WRITE ONLY: every use of the identifier `journal`
+        // in its body (string literal contents blanked, so a word in a message is not
+        // a use) is the parameter declaration, the unwrap of the `establish` result
+        // (the binding and the scrutinee), the path in the test-isolation seam's
+        // error, the first argument of the confined write-ahead, or the token handed
+        // back to `acquire` for the component to own.
+        let bind_raw = crate::source_scan::fn_body(rp, "bind_admitted_uid_before_ready");
+        let bind = crate::source_scan::blank_string_literals(bind_raw);
+        let bind = bind.as_str();
+        let bytes = bind.as_bytes();
+        let mut uses = Vec::new();
+        for at in crate::source_scan::offsets_of(bind, "journal") {
+            let prev = if at == 0 { b' ' } else { bytes[at - 1] };
+            let next = bytes.get(at + "journal".len()).copied().unwrap_or(b' ');
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b':' || prev == b'.' {
+                continue;
+            }
+            if next.is_ascii_alphanumeric() || next == b'_' || bind[at..].starts_with("journal::") {
+                continue;
+            }
+            let after = &bind[at + "journal".len()..];
+            let before = bind[..at].trim_end();
+            let before_ref = before
+                .strip_suffix('&')
+                .map(str::trim_end)
+                .unwrap_or(before);
+            let class = if after.starts_with(": Result<") {
+                "declaration"
+            } else if before.ends_with("let") && after.starts_with(" = match journal {") {
+                "unwrap binding"
+            } else if before.ends_with("match") && after.starts_with(" {") {
+                "unwrap scrutinee"
+            } else if after.starts_with(".path().to_path_buf()") && before.ends_with("path:") {
+                "forced-error path"
+            } else if after.starts_with(',')
+                && before_ref.ends_with("persist_confined_uid_write_ahead(")
+            {
+                "write-ahead first argument"
+            } else if before.ends_with("Ok(") && after.starts_with(')') {
+                "handed back"
+            } else {
+                panic!("the bind uses its journal token outside the write-ahead: {after:.60}")
+            };
+            uses.push(class);
+        }
+        assert_eq!(
+            uses,
+            vec![
+                "declaration",
+                "unwrap binding",
+                "unwrap scrutinee",
+                "handed back",
+                "forced-error path",
+                "write-ahead first argument",
+                "handed back",
+            ],
+            "the bind's token feeds the write-ahead only, never the net decision"
+        );
+        assert!(
+            !bind.contains("net_scope_for_refusal(journal") && !bind.contains("refuse(journal"),
+            "the handle never reaches the refusal scope"
+        );
+
+        // `establish`: one production site, inside the nftables acquire, after the
+        // activation and before the bind.
+        let establish_sites: Vec<(String, usize)> = scan
+            .files
+            .iter()
+            .flat_map(|(file, code)| {
+                offsets_of_word(code, "OwnedJournalHandle::establish(")
+                    .into_iter()
+                    .map(move |at| (file.clone(), at))
+            })
+            .collect();
+        assert_eq!(establish_sites.len(), 1, "{establish_sites:?}");
+        let (file, at) = &establish_sites[0];
+        assert_eq!(file, "src/runtime_providers.rs");
+        assert!((region_start..region_end).contains(at));
+        let region = &rp[region_start..region_end];
+        let local = at - region_start;
+        let activated = region
+            .find("activate_runtime_ownership(&ownership)")
+            .expect("the activation is inside acquire");
+        let bound = region
+            .find("bind_admitted_uid_before_ready(")
+            .expect("the bind is inside acquire");
+        assert!(
+            activated < local && local < bound,
+            "the token is built after the activation and before the bind"
+        );
+
+        // `load_under_lock`: one production site, inside the nftables acquire.
+        let load_sites: Vec<(String, usize)> = scan
+            .files
+            .iter()
+            .flat_map(|(file, code)| {
+                offsets_of_word(code, "AcquisitionJournal::load_under_lock(")
+                    .into_iter()
+                    .map(move |at| (file.clone(), at))
+            })
+            .collect();
+        assert_eq!(load_sites.len(), 1, "{load_sites:?}");
+        assert_eq!(load_sites[0].0, "src/runtime_providers.rs");
+        assert!((region_start..region_end).contains(&load_sites[0].1));
+
+        // The acquisition type: one constructor, private fields.
+        let module_at = rp
+            .find("mod acquisition_journal {")
+            .expect("the private acquisition submodule");
+        let module_open = module_at + "mod acquisition_journal ".len();
+        let module_close =
+            crate::source_scan::matching_brace(rp, module_open).expect("the submodule closes");
+        let module = &rp[module_open..=module_close];
+        let mut constructors = Vec::new();
+        for at in crate::source_scan::offsets_of(module, "fn ") {
+            let header_end = module[at..]
+                .find('{')
+                .map(|o| at + o)
+                .unwrap_or(module.len());
+            let header = &module[at..header_end];
+            let returns = header.split("->").nth(1).unwrap_or("");
+            if returns.contains("Self") || returns.contains("AcquisitionJournal") {
+                constructors.push(crate::source_scan::enclosing_fn(module, header_end));
+            }
+        }
+        assert_eq!(constructors, vec!["load_under_lock".to_string()]);
+        let fields = crate::source_scan::struct_fields(module, "struct AcquisitionJournal {");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["path", "record"], "no visibility modifier");
+
+        // The component holds the proof token and nothing that carries a record.
+        let component = crate::source_scan::struct_fields(rp, "struct NftablesTableComponent {");
+        assert!(
+            component
+                .iter()
+                .any(|(_, ty)| ty.ends_with("OwnedJournalHandle")),
+            "{component:?}"
+        );
+        for (name, ty) in &component {
+            for snapshot in ["AcquisitionJournal", "OwnershipJournal", "OwnedRecordNow"] {
+                let token = ty
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|word| word == snapshot);
+                assert!(!token, "the component field {name}: {ty} carries a record");
+            }
+        }
+    }
+
+    /// T7, structural half (LINUX-JOURNAL-OWNED-WRITERS-01): the admitted-into-
+    /// history merge has ONE site. The set of production functions that push a
+    /// `ConfinedIdentity` is exactly the shared merge and the confined writer's
+    /// single-uid push, counted by enclosing function, not by a local variable name,
+    /// so a hand-copied merge is caught whatever its vector is called.
+    #[test]
+    fn t7_the_admitted_merge_has_one_site() {
+        use crate::source_scan::{
+            daemon_sources, enclosing_fn, offsets_of, production_part, without_comment_lines,
+        };
+        let mut sites = std::collections::BTreeSet::new();
+        for (_file, text) in daemon_sources() {
+            let code = without_comment_lines(&production_part(&text));
+            for at in offsets_of(&code, "push(ConfinedIdentity") {
+                sites.insert(enclosing_fn(&code, at));
+            }
+        }
+        let want: std::collections::BTreeSet<String> = [
+            "merge_admitted_into_history",
+            "persist_confined_uid_write_ahead_with_store",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(sites, want);
+    }
+
+    /// C2a2b unit tests over the journal writers' bodies. Linux-only because the
+    /// writers are (they run only on the nftables acquisition path).
+    #[cfg(target_os = "linux")]
+    mod c2a2b_linux {
+        use super::super::acquisition_journal::AcquisitionJournal;
+        use super::super::{
+            merge_admitted_into_history, owned_record_preserving_history,
+            persist_kill_set_post_ready, persist_kill_set_write_ahead_at_boot, record_from_merged,
+            MergedHistory,
+        };
+        use super::{FIXTURE_JOURNAL_BOOT_ID, FIXTURE_JOURNAL_SOURCE};
+        use crate::ownership_journal::{
+            load, load_or_generate_auth_key, persist_confined_uid_write_ahead, store_atomic,
+            ActivationMismatch, ConfinedIdentity, ConfinedRole, JournalActivation, JournalAuthKey,
+            JournalIdentity, OwnedJournalHandle, OwnershipJournal, OwnershipJournalError,
+            JOURNAL_SCHEMA_VERSION, MAX_CONFINED_HISTORY,
+        };
+        use std::path::{Path, PathBuf};
+
+        const MARKER: &str = "c2a2b-marker";
+        const TABLE: u64 = 7;
+        const CHAIN: u64 = 9;
+
+        fn ident(marker: &str) -> JournalIdentity {
+            JournalIdentity {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                marker: marker.to_string(),
+                boot_id: FIXTURE_JOURNAL_BOOT_ID.to_string(),
+                source: FIXTURE_JOURNAL_SOURCE.to_string(),
+            }
+        }
+
+        fn activation() -> JournalActivation {
+            JournalActivation::new(
+                MARKER.to_string(),
+                TABLE,
+                CHAIN,
+                FIXTURE_JOURNAL_BOOT_ID.to_string(),
+                FIXTURE_JOURNAL_SOURCE.to_string(),
+            )
+        }
+
+        fn owned(marker: &str, confined: Option<Vec<ConfinedIdentity>>) -> OwnershipJournal {
+            match confined {
+                Some(h) => {
+                    OwnershipJournal::owned_with_known_history(ident(marker), TABLE, CHAIN, h)
+                        .unwrap()
+                }
+                None => OwnershipJournal::owned_with_unknown_history(ident(marker), TABLE, CHAIN),
+            }
+        }
+
+        fn agent(uid: u32) -> ConfinedIdentity {
+            ConfinedIdentity {
+                uid,
+                role: ConfinedRole::Agent,
+            }
+        }
+
+        fn gate(uid: u32) -> ConfinedIdentity {
+            ConfinedIdentity {
+                uid,
+                role: ConfinedRole::Gate,
+            }
+        }
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            path: PathBuf,
+            lock_path: PathBuf,
+            key: JournalAuthKey,
+        }
+
+        fn fixture() -> Fixture {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("nft-ownership.json");
+            let lock_path = dir.path().join("castle-wall.nft.lock");
+            let key = load_or_generate_auth_key(&dir.path().join("nft-journal-auth.key")).unwrap();
+            Fixture {
+                _dir: dir,
+                path,
+                lock_path,
+                key,
+            }
+        }
+
+        fn fingerprint(path: &Path) -> (u64, Vec<u8>) {
+            use std::os::unix::fs::MetadataExt;
+            (
+                std::fs::metadata(path).unwrap().ino(),
+                std::fs::read(path).unwrap(),
+            )
+        }
+
+        fn history(path: &Path, key: &JournalAuthKey) -> Vec<ConfinedIdentity> {
+            load(path, Some(key))
+                .unwrap()
+                .unwrap()
+                .confined()
+                .expect("known history")
+                .to_vec()
+        }
+
+        /// The authenticated RECORD bytes on disk, for golden comparison.
+        fn record_json(path: &Path) -> String {
+            use base64::Engine;
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(envelope["record_b64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn golden(confined: &str) -> String {
+            format!(
+                "{{\"state\":\"owned\",\"identity\":{{\"schema_version\":{JOURNAL_SCHEMA_VERSION},\
+                 \"marker\":\"{MARKER}\",\"boot_id\":\"{FIXTURE_JOURNAL_BOOT_ID}\",\
+                 \"source\":\"{FIXTURE_JOURNAL_SOURCE}\"}},\"table_handle\":{TABLE},\
+                 \"base_chain_handle\":{CHAIN}{confined}}}"
+            )
+        }
+
+        fn is_mismatch(err: &OwnershipJournalError, expected: ActivationMismatch) -> bool {
+            matches!(err, OwnershipJournalError::NotOwnedForActivation { observed, .. } if *observed == expected)
+        }
+
+        /// T4 (LINUX-JOURNAL-OWNED-WRITERS-01), ADVERSARIAL ORDERING: through one
+        /// proof token, a confined write, a kill-set write and a second confined
+        /// write each extend the history they reload, so every uid survives; and a
+        /// second confined uid recorded by an external same-activation store between
+        /// the token's construction and the first write survives every later write.
+        /// A token that carried the record would lose B at the kill-set write and D at
+        /// the first write.
+        #[test]
+        fn t4_no_sequence_of_post_activation_writes_drops_a_uid() {
+            let fx = fixture();
+            store_atomic(&fx.path, &owned(MARKER, Some(vec![agent(60200)])), &fx.key).unwrap();
+            let handle = OwnedJournalHandle::establish(&fx.path, &fx.key, activation()).unwrap();
+            persist_confined_uid_write_ahead(&handle, &fx.key, 60201, ConfinedRole::Gate).unwrap();
+            persist_kill_set_post_ready(&handle, &fx.key, Some((60200, None))).unwrap();
+            persist_confined_uid_write_ahead(&handle, &fx.key, 60203, ConfinedRole::Agent).unwrap();
+            assert_eq!(
+                history(&fx.path, &fx.key),
+                vec![agent(60200), gate(60201), agent(60203)]
+            );
+
+            // Variant: an external same-activation store of [A, B, D] lands between
+            // the token's construction and its first write.
+            let fx = fixture();
+            store_atomic(&fx.path, &owned(MARKER, Some(vec![agent(60200)])), &fx.key).unwrap();
+            let handle = OwnedJournalHandle::establish(&fx.path, &fx.key, activation()).unwrap();
+            store_atomic(
+                &fx.path,
+                &owned(MARKER, Some(vec![agent(60200), gate(60201), agent(60204)])),
+                &fx.key,
+            )
+            .unwrap();
+            let d_survives = |stage: &str| {
+                assert!(
+                    history(&fx.path, &fx.key).contains(&agent(60204)),
+                    "the externally recorded uid survives {stage}"
+                );
+            };
+            persist_confined_uid_write_ahead(&handle, &fx.key, 60201, ConfinedRole::Gate).unwrap();
+            d_survives("the first confined write");
+            persist_kill_set_post_ready(&handle, &fx.key, Some((60200, None))).unwrap();
+            d_survives("the kill-set write");
+            persist_confined_uid_write_ahead(&handle, &fx.key, 60203, ConfinedRole::Agent).unwrap();
+            d_survives("the second confined write");
+            assert_eq!(
+                history(&fx.path, &fx.key),
+                vec![agent(60200), gate(60201), agent(60204), agent(60203)]
+            );
+        }
+
+        /// T5 (LINUX-JOURNAL-OWNED-WRITERS-01): after activation, the kill-set writer
+        /// refuses a `Preparing` record, an absent record, and another activation's
+        /// `Owned` record, each with its typed reason, and stores nothing.
+        #[test]
+        fn t5_the_post_activation_kill_set_writer_refuses_a_regressed_journal() {
+            let fx = fixture();
+            store_atomic(&fx.path, &owned(MARKER, Some(Vec::new())), &fx.key).unwrap();
+            let handle = OwnedJournalHandle::establish(&fx.path, &fx.key, activation()).unwrap();
+
+            store_atomic(
+                &fx.path,
+                &OwnershipJournal::Preparing {
+                    identity: ident(MARKER),
+                },
+                &fx.key,
+            )
+            .unwrap();
+            let before = fingerprint(&fx.path);
+            let err = persist_kill_set_post_ready(&handle, &fx.key, Some((60300, None)))
+                .expect_err("a Preparing record after activation refuses");
+            assert!(is_mismatch(&err, ActivationMismatch::Preparing), "{err}");
+            assert_eq!(
+                fingerprint(&fx.path),
+                before,
+                "nothing stored over Preparing"
+            );
+
+            std::fs::remove_file(&fx.path).unwrap();
+            let err = persist_kill_set_post_ready(&handle, &fx.key, Some((60300, None)))
+                .expect_err("an absent record after activation refuses");
+            assert!(is_mismatch(&err, ActivationMismatch::Absent), "{err}");
+            assert!(!fx.path.exists(), "nothing stored over an absent record");
+
+            store_atomic(&fx.path, &owned("other-marker", Some(Vec::new())), &fx.key).unwrap();
+            let before = fingerprint(&fx.path);
+            let err = persist_kill_set_post_ready(&handle, &fx.key, Some((60300, None)))
+                .expect_err("another activation's record refuses");
+            assert!(
+                is_mismatch(&err, ActivationMismatch::OtherActivation),
+                "{err}"
+            );
+            assert_eq!(
+                fingerprint(&fx.path),
+                before,
+                "another activation's record is untouched"
+            );
+        }
+
+        /// T6 (LINUX-JOURNAL-OWNED-WRITERS-01), non-regression: the boot writer keeps
+        /// its `Preparing` no-op and stores the same bytes the pre-C2a2b writer stored
+        /// (golden records); and `owned_record_preserving_history`, now on the shared
+        /// merge, returns the same record it returned before the fold for a
+        /// `Preparing`, a known-history and an unknown-history prior.
+        #[test]
+        fn t6_the_boot_writers_are_byte_identical() {
+            let fx = fixture();
+            let lock = crate::runtime_lock::HostRuntimeLock::acquire(&fx.lock_path).unwrap();
+
+            // Preparing: Ok, nothing stored.
+            store_atomic(
+                &fx.path,
+                &OwnershipJournal::Preparing {
+                    identity: ident(MARKER),
+                },
+                &fx.key,
+            )
+            .unwrap();
+            let before = fingerprint(&fx.path);
+            let acq = AcquisitionJournal::load_under_lock(&lock, &fx.path, Some(&fx.key)).unwrap();
+            persist_kill_set_write_ahead_at_boot(&acq, Some(&fx.key), Some((60400, Some(60401))))
+                .expect("the boot Preparing no-op stays Ok");
+            assert_eq!(
+                fingerprint(&fx.path),
+                before,
+                "nothing stored at boot over Preparing"
+            );
+
+            // Known history: the admitted pair is unioned (a uid already present keeps
+            // its recorded role), golden bytes.
+            store_atomic(
+                &fx.path,
+                &owned(MARKER, Some(vec![gate(60400), agent(60399)])),
+                &fx.key,
+            )
+            .unwrap();
+            let acq = AcquisitionJournal::load_under_lock(&lock, &fx.path, Some(&fx.key)).unwrap();
+            persist_kill_set_write_ahead_at_boot(&acq, Some(&fx.key), Some((60400, Some(60401))))
+                .unwrap();
+            assert_eq!(
+                record_json(&fx.path),
+                golden(
+                    ",\"confined\":[{\"uid\":60400,\"role\":\"gate\"},\
+                     {\"uid\":60399,\"role\":\"agent\"},{\"uid\":60401,\"role\":\"gate\"}]"
+                )
+            );
+
+            // Unknown history: re-stored with the key omitted, golden bytes.
+            store_atomic(&fx.path, &owned(MARKER, None), &fx.key).unwrap();
+            let acq = AcquisitionJournal::load_under_lock(&lock, &fx.path, Some(&fx.key)).unwrap();
+            persist_kill_set_write_ahead_at_boot(&acq, Some(&fx.key), Some((60400, None))).unwrap();
+            assert_eq!(record_json(&fx.path), golden(""));
+
+            // No key: refused before anything is read or stored, as before.
+            let before = fingerprint(&fx.path);
+            assert!(persist_kill_set_write_ahead_at_boot(&acq, None, Some((60400, None))).is_err());
+            assert_eq!(fingerprint(&fx.path), before);
+
+            // Absent record: a named refusal, never a silent Ok, and nothing is created.
+            std::fs::remove_file(&fx.path).unwrap();
+            let acq = AcquisitionJournal::load_under_lock(&lock, &fx.path, Some(&fx.key)).unwrap();
+            let err =
+                persist_kill_set_write_ahead_at_boot(&acq, Some(&fx.key), Some((60400, None)))
+                    .expect_err("an absent record at boot is refused by name");
+            assert!(err.contains("no ownership journal record"), "{err}");
+            assert!(!fx.path.exists());
+            drop(lock);
+
+            // The W8 sibling: owned_record_preserving_history over each prior.
+            let build = |prior: Option<OwnershipJournal>| -> String {
+                let fx = fixture();
+                if let Some(record) = prior {
+                    store_atomic(&fx.path, &record, &fx.key).unwrap();
+                }
+                let record = owned_record_preserving_history(
+                    &fx.path,
+                    &fx.key,
+                    ident(MARKER),
+                    TABLE,
+                    CHAIN,
+                    Some((60500, Some(60501))),
+                )
+                .unwrap_or_else(|_| panic!("the builder succeeds"));
+                serde_json::to_string(&record).unwrap()
+            };
+            let fresh = golden(
+                ",\"confined\":[{\"uid\":60500,\"role\":\"agent\"},{\"uid\":60501,\"role\":\"gate\"}]",
+            );
+            assert_eq!(
+                build(Some(OwnershipJournal::Preparing {
+                    identity: ident(MARKER)
+                })),
+                fresh,
+                "a Preparing prior is known-empty"
+            );
+            assert_eq!(build(None), fresh, "no prior is known-empty");
+            assert_eq!(
+                build(Some(owned(MARKER, Some(vec![gate(60500)])))),
+                golden(
+                    ",\"confined\":[{\"uid\":60500,\"role\":\"gate\"},{\"uid\":60501,\"role\":\"gate\"}]"
+                ),
+                "a known prior is unioned; a uid already present keeps its role"
+            );
+            assert_eq!(
+                build(Some(owned(MARKER, None))),
+                golden(""),
+                "an unknown prior stays unknown"
+            );
+        }
+
+        /// T7, unit half (LINUX-JOURNAL-OWNED-WRITERS-01): the one merge keeps
+        /// unknown history unknown, unions agent then gate, keeps a recorded role,
+        /// never duplicates a uid, and the record builder refuses over the cap.
+        #[test]
+        fn t7_the_shared_merge_and_record_builder() {
+            assert_eq!(
+                merge_admitted_into_history(None, Some((1, Some(2)))),
+                MergedHistory::Unknown
+            );
+            assert_eq!(
+                merge_admitted_into_history(Some(Vec::new()), Some((60600, Some(60601)))),
+                MergedHistory::Known(vec![agent(60600), gate(60601)])
+            );
+            assert_eq!(
+                merge_admitted_into_history(Some(vec![gate(60600)]), Some((60600, None))),
+                MergedHistory::Known(vec![gate(60600)]),
+                "a uid already present keeps its recorded role"
+            );
+            assert_eq!(
+                merge_admitted_into_history(Some(Vec::new()), Some((60600, Some(60600)))),
+                MergedHistory::Known(vec![agent(60600)]),
+                "a gate equal to the agent is not added twice"
+            );
+            assert_eq!(
+                merge_admitted_into_history(Some(vec![agent(1)]), None),
+                MergedHistory::Known(vec![agent(1)])
+            );
+
+            // One entry over the cap: refused, never truncated.
+            let over: Vec<ConfinedIdentity> = (0..=MAX_CONFINED_HISTORY as u32)
+                .map(|i| agent(60700 + i))
+                .collect();
+            assert!(matches!(
+                record_from_merged(ident(MARKER), TABLE, CHAIN, MergedHistory::Known(over)),
+                Err(OwnershipJournalError::ConfinedHistoryFull { .. })
+            ));
+            assert_eq!(
+                record_from_merged(ident(MARKER), TABLE, CHAIN, MergedHistory::Unknown).unwrap(),
+                owned(MARKER, None)
+            );
+        }
     }
 }
