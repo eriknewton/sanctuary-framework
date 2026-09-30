@@ -4,7 +4,7 @@ Branch `feat/credential-surrogate-1a-2026-09-30`, base `origin/main` at `94bc9d4
 Design: `Review/Sanctuary/Credential_Surrogacy_Design_v2.1_2026-09-30.md` (coordinator repo).
 Dispositions: `Review/Sanctuary/Credential_Surrogacy_Design_Gate_2026-09-30/ROUND2_DISPOSITIONS.md`.
 This ledger is the resume point for the next job in the chain. Read the LAST
-`### next` list in the file first (currently the one under "Job 5").
+`### next` list in the file first (currently the one under "Job 6").
 
 ## Read this before you do anything (host facts job 1 learned the hard way)
 
@@ -779,3 +779,169 @@ These four are genuine before/after witnesses on EXISTING guards (the tests
 were on the base tree and failed against the new behavior until re-recorded).
 They are NOT witnesses for the new behavior's own guards, which are owed with
 the tests in "next" item 2 above. The BUILD_REPORT must keep that distinction.
+
+## Job 6 (2026-09-30, about 40 minutes of work)
+
+### done
+
+- **Scope item 7 COMPLETE.** The `release-barrier.ts` exec wrapper now exports
+  the agent's surrogate placeholders for the generation being released.
+  - The path is DERIVED from the wrapper's existing `TOKEN_FILE` argument, so
+    the launchd `ProgramArguments` contract and the argv digest that pins it do
+    not change when a fortress starts or stops using surrogacy. A test pins the
+    derivation against `gateSurrogatePlaceholderPath`.
+  - **Two escaping traps a future editor of that script must know.** The
+    wrapper body is a TypeScript template literal, so (a) a BACKTICK anywhere in
+    it terminates the literal (the first draft used backticks in shell comments
+    and the file stopped parsing), and (b) a single backslash is eaten by the
+    literal, so `sed 's/\.token$/'` in the source renders as `s/.token$/` and
+    the suffix anchor silently matches any character. Double every backslash.
+  - **`${` is FORBIDDEN in that script**, enforced by the pre-existing test "has
+    no render-time template interpolation in the wrapper body", which greps the
+    raw source inside the backticks. So no POSIX parameter expansion at all: no
+    `${VAR%suffix}`, no `${#VAR}`. The block uses `case` for suffix tests,
+    `sed` for the two substitutions, `wc -l` for the count and `$((...))` for
+    arithmetic (which is `$((`, not `${`, and is allowed).
+  - Validation is all-or-nothing and bounded: a line cap (1024, pinned by test
+    strictly above `MAX_SURROGATE_BINDINGS_PER_AGENT`) and ONE anchored grammar
+    over the whole body BEFORE the first `export`, so a malformed last line
+    cannot leave earlier lines in the environment. The loop reads the file
+    directly (`done < "$FILE"`), never through a pipe, because a
+    `tail | while read` loop runs its body in a subshell and discards every
+    export silently.
+  - Three fixed-code observations added to the diagnostic refusal record
+    (`surrogate_file`, `surrogate_generation`, `surrogate_lines`). The record
+    never carries a placeholder, a line or the path.
+  - The pin test the `credential-surrogate/artifacts.ts` header promised now
+    exists: six live tests run the real wrapper (via the existing
+    `renderLinuxVisibleWrapperScript` + `runSh` harness) over files
+    `renderSurrogatePlaceholderFile` produced.
+- **Scope item 6's evidence (next item 2 of Job 5) DONE.** 31 tests.
+  - NEW `test/egress-gate/surrogate-arming-wiring.test.ts`, 27 tests, covering
+    `resolveSurrogateBringUpPlan` (mint, fresh-per-call, the two `none` cases,
+    the present-and-broken refusal, the conflict refusal), rule 8 (the per-agent
+    cap at +1 AND arming at exactly the cap, the per-host cap at +1 spread
+    across agents so only the total is wrong), `installSurrogateHelperForBringUp`
+    (write order, per-file owner and mode, each reader gets only what it is
+    entitled to asserted by parsing all three files back, the LOCKED plist with
+    Core 0 in both dictionaries, reload failure throws, an artifact write
+    failure throws before the agent-readable file exists),
+    `removeSurrogateHelperForAgent` (all four paths, not-loaded still tears
+    down, an untolerated bootout throws and removes nothing),
+    `bootstrapSurrogateHelperDaemonForBoot` and
+    `verifySurrogateBindingsGenerationForCommit` (including a wrong-KIND file).
+  - `boot-supervisor.test.ts` 39 to 43: the helper goes up between the resolver
+    and the gate for a uid with a table, nothing at all for a uid without one, a
+    bootstrap failure logs and continues with the gate still up, and an
+    unresolvable agent starts nothing.
+  - **ONE SOURCE CHANGE was required for rule 4**: `installSurrogateHelperForBringUp`
+    wrote the helper plist through the un-seamed `atomicRootWrite`, which no test
+    can reach without writing into `/Library`. It now routes through the SAME
+    injected `fsOps.writeFileAs(path, content, 0, 0o644)` as the three
+    artifacts. `writeFileAs` with uid 0 is `atomicRootWrite` plus a chown to
+    root, which is a no-op for a file root just created.
+- **Scope item 10 COMPLETE**: the `ASSURANCE_MATRIX.md` row (partial, macOS,
+  with the echo bound stated alongside the claim and the gate-events residual),
+  the `server/src/README.md` `egress-gate` row (deferred since job 1, now that
+  the helper file exists), the `reorg-surface-manifest.md` row 77 correction
+  (its note still said only `add` and `list` shipped in 1a), and `.test-baseline`.
+
+### the .test-baseline number, and why it is what it is
+
+16496 to **16769**. The delta is exactly the **273** tests in the **eighteen**
+test files this branch ADDS, measured on this host with `npx vitest run` over
+that file list, and confirmed to contain no `skipIf`, no `process.platform` and
+no `darwin` gate, so all 273 run on Linux too. It DELIBERATELY excludes the
+tests the branch adds to files that already existed (release-barrier +13,
+boot-supervisor +4, and whatever jobs 2 to 5 added to the broker, arming-wiring
+and runtime-fs-plan files), so the value is a floor KNOWN to sit below the true
+Linux count rather than a guess at it. The guard is a floor, so undershooting is
+safe and overshooting breaks CI. A full suite cannot run here (cargo absent) and
+the spawn prompt says a macOS count is not the floor. **The next job may tighten
+this once CI reports the real Linux number on this branch.**
+
+### next (do these in this order)
+
+1. **The BUILD_REPORT.** Still nothing written, and it is now the single largest
+   remaining item. `Review/Sanctuary/Credential_Surrogacy_Slice1a_BUILD_REPORT_2026-09-30.md`
+   in the COORDINATOR repo (`/Users/mini2/Code/Claude/`), frontmatter
+   `disclosure: internal`. It needs: base SHA `94bc9d41` and head SHA; files
+   changed; the per-guard fail-before witness table assembled from the tables in
+   the Job 3, Job 4, Job 5 and Job 6 sections of THIS ledger; wired-consumer test
+   names; the rule 8 and rule 12 test names and what they assert; plist render
+   evidence; gate command outputs; the empty `broker-server.ts` diff;
+   `.test-baseline` old and new with the derivation above; and an honest
+   residuals list. Run `scripts/check-ai-tells.sh` on it.
+2. **The OWED fail-before witnesses** still listed in the Job 3 and Job 4 tables.
+3. **The final gates**, in this order, in `server/`: `npm run typecheck` (green
+   as of this job), `test/security` whole and `test/wrap` whole (NOT run on this
+   branch yet by any job), then the push.
+4. Only then print `RESULT_VERDICT: BRANCH_PUSHED <sha> COMPLETE`.
+
+### gates ALREADY RUN on this branch (do not re-run unless something changed)
+
+- `npm run typecheck`: **green**. Baseline 979, unchanged. Note: editing a test
+  file that already carries diagnostics SHIFTS them onto new line numbers and the
+  baseline stores `file(line,col)`, so `npm run typecheck:tests:update` is needed
+  after such an edit even when no diagnostic was added or removed. It happened
+  twice this job; both times the counts were 14 added / 14 resolved.
+- `npx vitest run test/structure` WHOLE: **68 files, 518 passed.** This covers the
+  frozen-surface and public-surface-snapshot tests with NO fixture edits, and it
+  was run AFTER the `README.md` and `reorg-surface-manifest.md` edits.
+- `node scripts/check-assurance-matrix.mjs`: **OK, 28 rows**, all evidence links
+  resolve, every proven enforcement claim cites a drill.
+- `npm run check-import-cycles`: **exit 0, 10 cycles**, the pre-existing baseline
+  set. ZERO of them mention any surrogate module, so the new module adds no cycle.
+- `git diff origin/main -- server/src/broker-mcp/broker-server.ts`: **0 bytes.**
+- `bash ~/Code/Claude/scripts/check-ai-tells.sh` over `ASSURANCE_MATRIX.md`,
+  `server/src/README.md`, `server/reorg-surface-manifest.md`: 5 hits, ALL of them
+  pre-existing lines in `reorg-surface-manifest.md` (lines 37, 48, 71, 74, 91),
+  none in text this branch added.
+
+### still NOT run on this branch by any job
+
+`test/security` whole and `test/wrap` whole. Both are named in the spawn prompt's
+gate 3 and both are owed before `COMPLETE`.
+
+### open questions
+
+- None blocking.
+- The fortress-path-is-storage-path assumption recorded under Job 5 still stands
+  and still wants a reader's confirmation against a real fortress layout.
+
+### test results (Job 6, additive)
+
+- `npx vitest run test/egress-gate/release-barrier.test.ts`: 94 to **107 passed**.
+- `npx vitest run test/egress-gate/surrogate-arming-wiring.test.ts`: **27 passed**.
+- `npx vitest run test/egress-gate/boot-supervisor.test.ts`: 39 to **43 passed**.
+- `npx vitest run` over the 18 new test files: **273 passed**.
+- `npx vitest run test/structure`: **518 passed**.
+- Regression check re-run this job: `test/egress-gate/surrogate-helper-daemon-plist.test.ts`
+  (**15 passed**, and it already covers BOTH plists' `Core` keys, so the spawn
+  prompt's plist-render item is done), `surrogate-helper-daemon-runtime.test.ts`
+  and `test/credential-surrogate/` together: **131 passed**. Job 3 and 4 already
+  wrote the rule 8 and rule 12 helper-socket tests; do not write them again.
+
+### fail-before witnesses (Job 6): what was ACTUALLY observed
+
+| Guard | Command | Base result | Head result |
+|---|---|---|---|
+| The release wrapper exports this generation's placeholders (all 13 new tests) | `git stash push -- server/src/egress-gate/release-barrier.ts` then `npx vitest run test/egress-gate/release-barrier.test.ts` | **13 failed**, 94 passed: 7 static pins could not find their literals, 6 live runs got no export and no refusal | **107 passed** after the stash pop |
+| The boot supervisor reaches the helper bootstrap | deleted ONLY the `bootstrapSurrogateHelperDaemonForBoot` try/catch from `arming-wiring.ts`, then `npx vitest run test/egress-gate/boot-supervisor.test.ts` | **2 failed**, 41 passed: exactly the two that assert it runs. The two that assert it does NOT run still passed, which is the point | **43 passed** after restore |
+| The helper plist write is reachable by a test | reverted the plist write to `atomicRootWrite`, then `npx vitest run test/egress-gate/surrogate-arming-wiring.test.ts` | **4 failed**, 23 passed: the plist never appears in the recorded writes | **27 passed** after restore |
+| The whole surrogate arming surface | `git show origin/main:server/src/egress-gate/arming-wiring.ts \| grep -c` the four function names | **0 occurrences** on the base tree, so all 27 tests in the new file are new-guard coverage | 27 passed at head |
+
+The first three are true before/after witnesses with the guard removed from the
+head tree. The fourth is an absence proof on the base tree, which is weaker and
+the BUILD_REPORT must say so.
+
+### one thing the BUILD_REPORT must state as a weaker witness
+
+`productionBringUp` is module-private and every step in it mutates a root-owned
+path, so NO test may call it. Its composition order is pinned by a source-order
+assertion in the last describe of `surrogate-arming-wiring.test.ts` (bearer mint
+before the surrogate plan, install before the resolver reload, the no-bindings
+branch reaching a real teardown, and exactly one `mintSurrogatePlaceholder(` call
+site in the whole of `arming-wiring.ts`). That is a text assertion, not a runtime
+witness, and the report must not present it as one.
+
