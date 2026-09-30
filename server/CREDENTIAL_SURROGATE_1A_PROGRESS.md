@@ -3,7 +3,9 @@
 Branch `feat/credential-surrogate-1a-2026-09-30`, base `origin/main` at `94bc9d41`.
 Design: `Review/Sanctuary/Credential_Surrogacy_Design_v2.1_2026-09-30.md` (coordinator repo).
 Dispositions: `Review/Sanctuary/Credential_Surrogacy_Design_Gate_2026-09-30/ROUND2_DISPOSITIONS.md`.
-This ledger is the resume point for the next job in the chain. Read the "next" line first.
+This ledger is the resume point for the next job in the chain. Read the LAST
+`### next` list in the file first (currently the one under "Job 2"), then the
+"Job 2 addendum" section, which records what landed after that list was written.
 
 ## Read this before you do anything (host facts job 1 learned the hard way)
 
