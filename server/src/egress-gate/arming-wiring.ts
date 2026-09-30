@@ -1674,7 +1674,15 @@ export async function installSurrogateHelperForBringUp(input: {
     ],
     fortressPath: input.fortressPath,
   });
-  await atomicRootWrite(paths.plist, plistContent, 0o644);
+  // Root 0644, through the SAME injected surface as the three artifacts rather
+  // than through `atomicRootWrite`. Two reasons, both load-bearing: the plist is
+  // the fourth file this step owns and a teardown that forgot it would leave
+  // launchd able to restart a helper whose table is gone, so it belongs in the
+  // one list; and routing it here is what makes the whole step reachable by a
+  // wired-consumer test (rule 4) without writing into /Library on a real host.
+  // `writeFileAs` with uid 0 is `atomicRootWrite` plus an explicit chown to
+  // root, which is a no-op for a file root just created.
+  await fs.writeFileAs(paths.plist, plistContent, 0, 0o644);
   await reloadLaunchdDaemonForBringUp({
     label: surrogateHelperDaemonLabel(input.agentUid),
     plistPath: paths.plist,

@@ -40,6 +40,11 @@ import {
   type PfAnchorRegistryState,
 } from "../../src/egress-gate/anchor-registry.js";
 import { AGENT_HARNESS_DAEMON_LABEL, harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
+import {
+  surrogateBindingsPath,
+  surrogateHelperDaemonLabel,
+  surrogateHelperDaemonPlistPath,
+} from "../../src/egress-gate/surrogate-helper-daemon.js";
 import { GateLivenessOracle } from "../../src/egress-gate/liveness-oracle.js";
 import {
   runReleaseBarrierSequence,
@@ -2006,5 +2011,143 @@ describe("startExclusiveEgressBootSupervisor (fix-round-6 F2: malformed generati
     // ...and the withholding names the uid and the dirty fail-closed rule.
     const withheldLines = printed.filter((l) => l.includes("WITHHELD") && l.includes("uid 502"));
     expect(withheldLines).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Credential surrogacy slice 1a (design 3.4.1, boot row): the surrogate helper
+// is a member of the boot path, between the resolver and the gate, and ONLY for
+// a uid that has a binding table on disk. It starts LOCKED -- a reboot is the
+// event that must lose every unlocked value -- and the boot path never mints.
+// ---------------------------------------------------------------------------
+describe("startExclusiveEgressBootSupervisor (credential surrogacy: the helper's boot membership)", () => {
+  const SURROGATE_LABEL = surrogateHelperDaemonLabel(ENTRY.agent_uid);
+  const SURROGATE_PLIST = surrogateHelperDaemonPlistPath(ENTRY.agent_uid);
+  const RESOLVER_PLIST = `/Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate-peer-resolver.${ENTRY.agent_uid}.plist`;
+  const GATE_PLIST = egressGateDaemonPlistPath(ENTRY.agent_uid);
+
+  function recording(): { events: string[]; fn: ExclusiveEgressBootSupervisorInternals["runLaunchctlFn"] } {
+    const events: string[] = [];
+    return {
+      events,
+      fn: async (args) => {
+        events.push(`launchctl ${args.join(" ")}`);
+        if (args[0] === "print") return { code: 113, stdout: "", stderr: "Could not find service" };
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+  }
+
+  it("starts the helper BETWEEN the resolver and the gate when this uid has a binding table", async () => {
+    const { events, fn } = recording();
+    const probed: string[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runLaunchctlFn: fn,
+        surrogateBindingsPresent: async (path) => {
+          probed.push(path);
+          return true;
+        },
+        gateReloadSleepMs: async () => undefined,
+      }),
+    });
+    handle.stopOracleLoop();
+
+    // The pre-condition is read from the production path, not from a literal.
+    expect(probed).toEqual([surrogateBindingsPath(ENTRY.agent_uid)]);
+
+    const resolverIdx = events.indexOf(`launchctl bootstrap system ${RESOLVER_PLIST}`);
+    const surrogateIdx = events.indexOf(`launchctl bootstrap system ${SURROGATE_PLIST}`);
+    const gateIdx = events.indexOf(`launchctl bootstrap system ${GATE_PLIST}`);
+    expect(resolverIdx).toBeGreaterThanOrEqual(0);
+    expect(surrogateIdx).toBeGreaterThan(resolverIdx);
+    // Before the gate: a gate that dialed a query socket the helper had not
+    // created yet would deny every surrogate request for the whole window,
+    // which reads to an operator as a policy that is not in force.
+    expect(gateIdx).toBeGreaterThan(surrogateIdx);
+    expect(events).toContain(`launchctl kickstart system/${SURROGATE_LABEL}`);
+    // Started, never unlocked: nothing on the boot path hands the helper a
+    // value, so it comes up LOCKED by construction.
+    expect(events.filter((e) => e.includes("unlock"))).toEqual([]);
+  });
+
+  it("starts NOTHING for a uid with no binding table, and still brings the gate up", async () => {
+    const { events, fn } = recording();
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runLaunchctlFn: fn,
+        surrogateBindingsPresent: async () => false,
+        gateReloadSleepMs: async () => undefined,
+      }),
+    });
+    handle.stopOracleLoop();
+    // Not even a status probe against the surrogate label: bootstrapping a
+    // plist that is absent would turn "never used surrogacy" into a loud
+    // boot failure for every agent on the host.
+    expect(events.filter((e) => e.includes(SURROGATE_LABEL))).toEqual([]);
+    expect(events.filter((e) => e.includes("surrogate"))).toEqual([]);
+    expect(events).toContain(`launchctl bootstrap system ${GATE_PLIST}`);
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("LOGS AND CONTINUES when the helper bootstrap fails: CONNECT egress is unaffected", async () => {
+    const events: string[] = [];
+    const printed: string[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runLaunchctlFn: async (args) => {
+          events.push(`launchctl ${args.join(" ")}`);
+          if (args[0] === "print") return { code: 113, stdout: "", stderr: "Could not find service" };
+          // Only the SURROGATE bootstrap fails, so a failure there cannot be
+          // confused with a failure of the resolver or the gate.
+          if (args[0] === "bootstrap" && args[2] === SURROGATE_PLIST) {
+            return { code: 5, stdout: "", stderr: "Load failed: 5: Input/output error" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        surrogateBindingsPresent: async () => true,
+        gateReloadSleepMs: async () => undefined,
+      }),
+    });
+    handle.stopOracleLoop();
+    // The gate still came up and the agent was still released: a helper that
+    // did not load denies surrogate requests fail-closed and nothing else.
+    expect(events).toContain(`launchctl bootstrap system ${GATE_PLIST}`);
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+    expect(printed.join("\n")).toContain("surrogate helper daemon bootstrap failed");
+    expect(printed.join("\n")).toContain("CONNECT egress is unaffected");
+  });
+
+  it("starts nothing at all for an UNRESOLVABLE agent (the park path never reaches the helper)", async () => {
+    const { events, fn } = recording();
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => ({ kind: "unresolvable", reason: "no marker for uid 502" }),
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runLaunchctlFn: fn,
+        // Even claiming a table exists must not start a helper for a uid whose
+        // agent could not be resolved: there is no gate to serve and no
+        // generation to trust.
+        surrogateBindingsPresent: async () => true,
+        gateReloadSleepMs: async () => undefined,
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(events.filter((e) => e.includes(SURROGATE_LABEL))).toEqual([]);
+    expect(events.some((e) => e.startsWith(`launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`))).toBe(true);
   });
 });
