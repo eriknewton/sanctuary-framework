@@ -418,7 +418,13 @@ export type ReleaseRefusalObservationKey =
   | "token_file_exists"
   | "token_file_readable"
   | "token_generation"
-  | "token_secret_shape";
+  | "token_secret_shape"
+  // Credential surrogacy (design 3.2). Fixed codes only: the record must never
+  // carry a placeholder, so there is no `surrogate_placeholder` observation and
+  // no observation whose value is read out of the file.
+  | "surrogate_file"
+  | "surrogate_generation"
+  | "surrogate_lines";
 
 export type ReleaseRefusalObservations = Record<ReleaseRefusalObservationKey, string>;
 
@@ -451,6 +457,9 @@ const RELEASE_REFUSAL_OBSERVATION_KEYS: readonly ReleaseRefusalObservationKey[] 
   "token_file_readable",
   "token_generation",
   "token_secret_shape",
+  "surrogate_file",
+  "surrogate_generation",
+  "surrogate_lines",
 ];
 
 const SAFE_REFUSAL_RECORD_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -541,6 +550,9 @@ OBS_TOKEN_FILE_EXISTS="not_checked"
 OBS_TOKEN_FILE_READABLE="not_checked"
 OBS_TOKEN_GENERATION="not_checked"
 OBS_TOKEN_SECRET_SHAPE="not_checked"
+OBS_SURROGATE_FILE="not_checked"
+OBS_SURROGATE_GENERATION="not_checked"
+OBS_SURROGATE_LINES="not_checked"
 
 record_refusal() {
   [ -n "$REFUSAL_RECORD_FILE" ] || return 0
@@ -571,6 +583,9 @@ record_refusal() {
       printf 'token_file_readable=%s\\n' "$OBS_TOKEN_FILE_READABLE"
       printf 'token_generation=%s\\n' "$OBS_TOKEN_GENERATION"
       printf 'token_secret_shape=%s\\n' "$OBS_TOKEN_SECRET_SHAPE"
+      printf 'surrogate_file=%s\\n' "$OBS_SURROGATE_FILE"
+      printf 'surrogate_generation=%s\\n' "$OBS_SURROGATE_GENERATION"
+      printf 'surrogate_lines=%s\\n' "$OBS_SURROGATE_LINES"
     } > "$tmp" &&
     mv "$tmp" "$REFUSAL_RECORD_FILE"
   ) 2>/dev/null || {
@@ -713,6 +728,117 @@ export HTTPS_PROXY="$PROXY_URL"
 export HTTP_PROXY="$PROXY_URL"
 export https_proxy="$PROXY_URL"
 export http_proxy="$PROXY_URL"
+
+# ---------------------------------------------------------------------------
+# Credential surrogacy (design 3.2): export this generation's PLACEHOLDERS.
+#
+# The wrapper exports NAMES bound to PLACEHOLDERS, never values: the value only
+# ever exists inside the root helper, and the gate swaps the placeholder for it
+# on the wire. So there is nothing here to keep out of the agent's environment;
+# the placeholder IS what the agent is meant to hold.
+#
+# The path is DERIVED from TOKEN_FILE rather than passed as a tenth argument, so
+# the launchd ProgramArguments contract and the argv digest that pins it do not
+# change when a fortress starts or stops using surrogacy. Must match
+# gateSurrogatePlaceholderPath in gate-credential.ts, which spells the same
+# <dir>/<uid>.surrogates beside this <dir>/<uid>.token.
+#
+# Placement: LAST, after every release check and after the proxy export. A
+# refusal here therefore exits 78 with no exec, so the agent never starts with a
+# half-built environment, and a placeholder file left behind by an earlier
+# generation can never be exported (the generation check below is the same
+# equality the hold file and the bearer token already get).
+#
+# TRUST BOUND: this file is owned by the AGENT uid at 0600, so the agent can
+# rewrite it. These checks are self-integrity, not authorization: they turn a
+# corrupt file into a loud refusal instead of a mangled environment. Nothing
+# downstream trusts them, because the helper resolves a placeholder against its
+# own root-owned table and not against anything the agent presents.
+case "$TOKEN_FILE" in
+  *.token) ;;
+  *) fail "gate credential token path does not end in .token; cannot derive the surrogate placeholder path" ;;
+esac
+SURROGATE_FILE=$(printf '%s' "$TOKEN_FILE" | sed 's/\\.token$/.surrogates/')
+if [ -e "$SURROGATE_FILE" ]; then
+  OBS_SURROGATE_FILE="present"
+  [ -f "$SURROGATE_FILE" ] || {
+    OBS_SURROGATE_FILE="not_regular"
+    fail "surrogate placeholder path is not a regular file"
+  }
+  [ -r "$SURROGATE_FILE" ] || {
+    OBS_SURROGATE_FILE="unreadable"
+    fail "surrogate placeholder file unreadable"
+  }
+  SURROGATE_HEADER=$(head -n 1 "$SURROGATE_FILE") || fail "surrogate placeholder file unreadable"
+  case "$SURROGATE_HEADER" in
+    "sanctuary-surrogate-placeholders v1 generation="*) ;;
+    *)
+      OBS_SURROGATE_GENERATION="malformed"
+      fail "surrogate placeholder file header mismatch"
+      ;;
+  esac
+  SURROGATE_GEN=$(printf '%s' "$SURROGATE_HEADER" | sed 's/^sanctuary-surrogate-placeholders v1 generation=//')
+  case "$SURROGATE_GEN" in
+    ""|*[!0-9]*)
+      OBS_SURROGATE_GENERATION="malformed"
+      fail "surrogate placeholder generation missing or malformed"
+      ;;
+  esac
+  # String equality, exactly like the hold and token generation checks above: a
+  # non-canonical integer ("007", "7.0") is a mismatch rather than a coercion,
+  # and the renderer only ever emits the canonical form.
+  if [ "$SURROGATE_GEN" = "$EXPECTED_GENERATION" ]; then
+    OBS_SURROGATE_GENERATION="match"
+  else
+    OBS_SURROGATE_GENERATION="mismatch"
+    fail "surrogate placeholder generation does not match expected generation"
+  fi
+  # Bound the body before iterating it. 1024 total lines is far above
+  # MAX_SURROGATE_BINDINGS_PER_AGENT (100) in credential-surrogate/constants.ts;
+  # the wrapper cannot import that constant, so a test pins this literal strictly
+  # above it. wc -l counts newline-terminated lines, so an unterminated final
+  # line is not counted, which only ever makes this bound stricter by one.
+  SURROGATE_LINE_COUNT=$(wc -l < "$SURROGATE_FILE" | tr -d " ")
+  case "$SURROGATE_LINE_COUNT" in
+    ""|*[!0-9]*)
+      OBS_SURROGATE_LINES="malformed"
+      fail "surrogate placeholder file line count unreadable"
+      ;;
+  esac
+  [ "$SURROGATE_LINE_COUNT" -le 1024 ] || {
+    OBS_SURROGATE_LINES="over_cap"
+    fail "surrogate placeholder file exceeds the placeholder line cap"
+  }
+  # One anchored grammar for the whole body, checked BEFORE a single export, so a
+  # malformed line at the end cannot leave earlier lines exported. Must match
+  # SURROGATE_PLACEHOLDER_LINE_RE in credential-surrogate/artifacts.ts
+  # character for character; that file carries the other half of the pin and a
+  # test compares the two literals.
+  if tail -n +2 "$SURROGATE_FILE" | grep -qvE '^[A-Z_][A-Z0-9_]{0,63}=sanctuary_surrogate_[0-9a-f]{32}$'; then
+    OBS_SURROGATE_LINES="malformed"
+    fail "surrogate placeholder file has a malformed line"
+  fi
+  OBS_SURROGATE_LINES="valid"
+  # Read from the file (not a pipe) so the loop body runs in THIS shell and the
+  # exports survive it. The header is skipped by line number rather than by
+  # matching its text, so a body line that happened to look like a header could
+  # never shadow it. Every line reaching export already matched the anchored
+  # grammar above, so it carries no whitespace, no quote and no glob character.
+  SURROGATE_LINE=""
+  SURROGATE_LINE_NO=0
+  while IFS= read -r SURROGATE_LINE || [ -n "$SURROGATE_LINE" ]; do
+    SURROGATE_LINE_NO=$((SURROGATE_LINE_NO + 1))
+    if [ "$SURROGATE_LINE_NO" -eq 1 ]; then
+      continue
+    fi
+    export "$SURROGATE_LINE"
+  done < "$SURROGATE_FILE"
+else
+  # No surrogate policy for this uid, or arming removed the file: export nothing
+  # and release normally. Surrogacy is opt-in per fortress and its absence is
+  # not a release condition.
+  OBS_SURROGATE_FILE="absent"
+fi
 
 exec "$@"
 `;
