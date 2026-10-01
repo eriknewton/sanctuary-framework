@@ -4,9 +4,10 @@
  * absent socket with no installed helper artifact, and reach no keychain until
  * after they have refused. The verbs that remove a binding check the helper of
  * the binding's OWN agent (an operator-named uid can only confirm it) and record
- * a refusal on the chain. An unlock that fails part-way locks the helper before
- * it exits, and the chain records a successful unlock only after the helper
- * accepted it. Covers `surrogate remove`, `secrets revoke` on a bound name,
+ * a refusal on the chain. An unlock loads exactly one value per run, the chain
+ * records a successful unlock only after the helper accepted it, and an outcome
+ * the helper never answered is recorded as unknown with the commands that
+ * settle it. Covers `surrogate remove`, `secrets revoke` on a bound name,
  * `unlock`'s no-core rule and its helper-first step order, `lock`, `status`
  * and the root-only `events`.
  *
@@ -543,7 +544,7 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
     await writePolicy([BINDING]);
     const noCore = noCoreOps("0", { reexeced: false });
     const transport = armedTransport();
-    const result = await run(["surrogate", "unlock", "--agent-uid", String(AGENT_UID)], {
+    const result = await run(["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID)], {
       surrogateNoCore: noCore,
       surrogateUnlock: transport,
       surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
@@ -559,7 +560,7 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
   it("refuses, reading nothing, when the verified hard core limit is not 0", async () => {
     await writePolicy([BINDING]);
     const transport = armedTransport();
-    const result = await run(["surrogate", "unlock", "--agent-uid", String(AGENT_UID)], {
+    const result = await run(["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID)], {
       surrogateNoCore: noCoreOps("unlimited"),
       surrogateUnlock: transport,
       surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
@@ -573,7 +574,7 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
 
   it("refuses with helper-not-running BEFORE any keychain read when the socket is absent", async () => {
     await writePolicy([BINDING]);
-    const result = await run(["surrogate", "unlock", "--agent-uid", String(AGENT_UID)], {
+    const result = await run(["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID)], {
       surrogateNoCore: noCoreOps("0"),
       surrogateUnlock: absentTransport(),
       surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
@@ -588,7 +589,7 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
 
   it("refuses on an indeterminate answer, also before any keychain read", async () => {
     await writePolicy([BINDING]);
-    const result = await run(["surrogate", "unlock", "--agent-uid", String(AGENT_UID)], {
+    const result = await run(["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID)], {
       surrogateNoCore: noCoreOps("0"),
       surrogateUnlock: fixedTransport({ outcome: "unreachable", failureClass: "permission_denied" }),
       surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
@@ -598,11 +599,11 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
     expect(keychainReads).toHaveLength(0);
   });
 
-  it("sends one value per connection for the secrets the helper reports", async () => {
+  it("sends the one named value when the helper serves it", async () => {
     await writePolicy([BINDING]);
     const transport = armedTransport();
     const result = await run(
-      ["surrogate", "unlock", "--agent-uid", String(AGENT_UID), "--ttl", "120"],
+      ["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID), "--ttl", "120"],
       {
         surrogateNoCore: noCoreOps("0"),
         surrogateUnlock: transport,
@@ -613,14 +614,14 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
     expect(transport.unlocked).toEqual([BOUND_VALUE]);
     expect(keychainReads).toEqual([SECRET]);
     // Counts and the generation only. The operator line never carries a value.
-    expect(result.out).toContain("Unlocked 1 of 1");
+    expect(result.out).toContain(`Unlocked "${SECRET}"`);
     expect(result.out).not.toContain(BOUND_VALUE);
   });
 
   it("refuses a non-integer --ttl rather than sending an unbounded request", async () => {
     await writePolicy([BINDING]);
     const result = await run(
-      ["surrogate", "unlock", "--agent-uid", String(AGENT_UID), "--ttl", "forever"],
+      ["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID), "--ttl", "forever"],
       { surrogateNoCore: noCoreOps("0"), surrogateUnlock: armedTransport() },
     );
     expect(result.code).toBe(2);
@@ -636,43 +637,33 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
 });
 
 // ---------------------------------------------------------------------------
-// unlock: a partial unlock fails closed, and the chain records only acceptance.
+// unlock: one value per run; the chain row follows the helper's answer.
 // ---------------------------------------------------------------------------
 
-const SECOND = "anthropic-api-key";
-const SECOND_VALUE = Buffer.from(generateRandomKey()).toString("base64url");
-
 /**
- * A helper with two bindings that accepts the first unlock and answers the
- * second with `second`. Records every request kind in order, and how many
- * success rows the chain held at the moment each unlock frame was sent.
+ * A helper that serves SECRET and answers the one unlock with `answer`.
+ * Records every request kind in order, and how many success rows the chain
+ * held at the moment the unlock frame was sent.
  */
-function twoBindingTransport(
-  second: (id: string) => SurrogateUnlockOutcome,
-  opts: { lock?: (id: string) => SurrogateUnlockOutcome } = {},
+function oneBindingTransport(
+  answer: (id: string) => SurrogateUnlockOutcome,
 ): SurrogateUnlockTransport & { kinds: string[]; successRowsAtSend: number[] } {
   const kinds: string[] = [];
   const successRowsAtSend: number[] = [];
-  let unlocks = 0;
   return {
     kinds,
     successRowsAtSend,
     async send(_uid, request) {
       kinds.push(request.kind);
       if (request.kind === "status") {
-        return statusOutcome([
-          { secret: SECRET, unlocked: false, expires_at: null },
-          { secret: SECOND, unlocked: false, expires_at: null },
-        ])(request.id);
+        return statusOutcome([{ secret: SECRET, unlocked: false, expires_at: null }])(request.id);
       }
-      if (request.kind === "lock" && opts.lock !== undefined) return opts.lock(request.id);
       if (request.kind === "unlock") {
         successRowsAtSend.push(
           (await chainRows(BROKER_OPS.SURROGATE_UNLOCKED)).filter((r) => r.result === "success")
             .length,
         );
-        unlocks += 1;
-        if (unlocks === 2) return second(request.id);
+        return answer(request.id);
       }
       return {
         outcome: "answered",
@@ -682,6 +673,10 @@ function twoBindingTransport(
   };
 }
 
+function okOutcome(id: string): SurrogateUnlockOutcome {
+  return { outcome: "answered", response: { v: SURROGATE_WIRE_VERSION, id, kind: "ok" } };
+}
+
 function denyOutcome(reason: "unknown_secret" | "malformed") {
   return (id: string): SurrogateUnlockOutcome => ({
     outcome: "answered",
@@ -689,41 +684,53 @@ function denyOutcome(reason: "unknown_secret" | "malformed") {
   });
 }
 
-describe("surrogate unlock fails closed on a partial unlock", () => {
-  const unlockArgv = ["surrogate", "unlock", "--agent-uid", String(AGENT_UID)];
-  const seeded = () => memoryBackend({ [SECRET]: BOUND_VALUE, [SECOND]: SECOND_VALUE });
+describe("surrogate unlock loads one value and records the helper's answer", () => {
+  const unlockArgv = ["surrogate", "unlock", SECRET, "--agent-uid", String(AGENT_UID)];
+  const seeded = () => memoryBackend({ [SECRET]: BOUND_VALUE });
 
-  it("locks the helper after a refusal that follows an accepted unlock, and records the refusal", async () => {
+  it("writes the success row only after the helper's ok", async () => {
     await writePolicy([BINDING]);
-    const transport = twoBindingTransport(denyOutcome("unknown_secret"));
+    const transport = oneBindingTransport(okOutcome);
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(0);
+    // At the moment the unlock frame left, the chain held NO success row.
+    expect(transport.successRowsAtSend).toEqual([0]);
+    expect(transport.kinds).toEqual(["status", "unlock"]);
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      result: "success",
+      details: { agent_uid: AGENT_UID, generation_id: 7, secret: SECRET },
+    });
+    expect(JSON.stringify(rows[0])).not.toContain(BOUND_VALUE);
+  });
+
+  it("records a refusal on deny and sends no lock, because the helper stored nothing", async () => {
+    await writePolicy([BINDING]);
+    const transport = oneBindingTransport(denyOutcome("unknown_secret"));
     const result = await run(unlockArgv, {
       surrogateNoCore: noCoreOps("0"),
       surrogateUnlock: transport,
       surrogateBackend: seeded(),
     });
     expect(result.code).toBe(1);
-    // probe status, status, unlock (accepted), unlock (refused), then LOCK.
-    expect(transport.kinds).toEqual(["status", "status", "unlock", "unlock", "lock"]);
-    expect(result.err).toContain("The helper was locked");
+    expect(transport.kinds).not.toContain("lock");
+    expect(result.err).toContain("Nothing was stored");
     const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       result: "failure",
-      details: {
-        accepted: [SECRET],
-        refused_secret: SECOND,
-        outcome: "refused",
-        reason: "unknown_secret",
-        lock: "acknowledged",
-      },
+      details: { secret: SECRET, outcome: "refused", reason: "unknown_secret" },
     });
-    expect(JSON.stringify(rows[0])).not.toContain(BOUND_VALUE);
-    expect(JSON.stringify(rows[0])).not.toContain(SECOND_VALUE);
   });
 
-  it("locks after a timed-out reply even with nothing confirmed, because the helper may have stored it", async () => {
+  it("records an unknown outcome on a timeout and names the status and lock commands", async () => {
     await writePolicy([BINDING]);
-    const transport = twoBindingTransport(() => ({
+    const transport = oneBindingTransport(() => ({
       outcome: "unreachable",
       failureClass: "timed_out",
     }));
@@ -733,77 +740,29 @@ describe("surrogate unlock fails closed on a partial unlock", () => {
       surrogateBackend: seeded(),
     });
     expect(result.code).toBe(1);
-    expect(transport.kinds.at(-1)).toBe("lock");
-    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
-    expect(rows[0]).toMatchObject({ result: "failure", details: { reason: "timed_out" } });
-  });
-
-  it("says the helper may still hold values, and names the command, when the lock is not acknowledged", async () => {
-    await writePolicy([BINDING]);
-    const transport = twoBindingTransport(denyOutcome("unknown_secret"), {
-      lock: () => ({ outcome: "unreachable", failureClass: "connect_failed" }),
-    });
-    const result = await run(unlockArgv, {
-      surrogateNoCore: noCoreOps("0"),
-      surrogateUnlock: transport,
-      surrogateBackend: seeded(),
-    });
-    expect(result.code).toBe(1);
-    expect(result.err).toContain("MAY STILL HOLD VALUES");
-    expect(result.err).toContain(`sanctuary secrets surrogate lock --agent-uid ${AGENT_UID}`);
-    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
-    expect(rows[0]).toMatchObject({ details: { lock: "failed:connect_failed" } });
-  });
-
-  it("writes the success row only after every unlock was accepted", async () => {
-    await writePolicy([BINDING]);
-    const transport = twoBindingTransport((id) => ({
-      outcome: "answered",
-      response: { v: SURROGATE_WIRE_VERSION, id, kind: "ok" },
-    }));
-    const result = await run(unlockArgv, {
-      surrogateNoCore: noCoreOps("0"),
-      surrogateUnlock: transport,
-      surrogateBackend: seeded(),
-    });
-    expect(result.code).toBe(0);
-    // At the moment each unlock frame left, the chain held NO success row.
-    expect(transport.successRowsAtSend).toEqual([0, 0]);
     expect(transport.kinds).not.toContain("lock");
-    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      result: "success",
-      details: { agent_uid: AGENT_UID, generation_id: 7, secrets: [SECRET, SECOND] },
-    });
-  });
-
-  it("records a refusal, and no success, when the helper refuses the first value", async () => {
-    await writePolicy([BINDING]);
-    const kinds: string[] = [];
-    const transport: SurrogateUnlockTransport = {
-      async send(_uid, request) {
-        kinds.push(request.kind);
-        if (request.kind === "status") {
-          return statusOutcome([{ secret: SECRET, unlocked: false, expires_at: null }])(request.id);
-        }
-        return denyOutcome("malformed")(request.id);
-      },
-    };
-    const result = await run(unlockArgv, {
-      surrogateNoCore: noCoreOps("0"),
-      surrogateUnlock: transport,
-      surrogateBackend: seeded(),
-    });
-    expect(result.code).toBe(1);
-    // An answered deny on the first value means nothing was stored: no lock.
-    expect(kinds).not.toContain("lock");
+    expect(result.err).toContain(`sanctuary secrets surrogate status --agent-uid ${AGENT_UID}`);
+    expect(result.err).toContain(`sanctuary secrets surrogate lock --agent-uid ${AGENT_UID}`);
     const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       result: "failure",
-      details: { accepted: [], outcome: "refused", reason: "malformed", lock: "not_needed" },
+      details: { secret: SECRET, outcome: "unknown", reason: "timed_out" },
     });
+    expect(rows.filter((r) => r.result === "success")).toHaveLength(0);
+  });
+
+  it("refuses a name the helper does not serve before any keychain read", async () => {
+    await writePolicy([BINDING]);
+    const transport = oneBindingTransport(okOutcome);
+    const result = await run(
+      ["surrogate", "unlock", "not-a-served-secret", "--agent-uid", String(AGENT_UID)],
+      { surrogateNoCore: noCoreOps("0"), surrogateUnlock: transport, surrogateBackend: seeded() },
+    );
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("does not serve");
+    expect(transport.kinds).not.toContain("unlock");
+    expect(keychainReads).toHaveLength(0);
   });
 });
 

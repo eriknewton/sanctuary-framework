@@ -606,9 +606,12 @@ function printSurrogateUsage(s: NodeJS.WritableStream): void {
   remove <secret> [--agent-uid <N>]  Remove a binding and its stored value.
                                      Refuses while the binding's own agent is
                                      armed. --agent-uid is only a cross-check.
-  unlock --agent-uid <N> [--ttl S]   Send every bound value to that agent's
-                                     helper, which holds them in memory only.
-                                     TTL is clamped by the helper.
+  unlock <secret> --agent-uid <N> [--ttl S]
+                                     Send one bound value to that agent's
+                                     helper, which holds it in memory only.
+                                     One secret per run. TTL is clamped by
+                                     the helper. An unknown outcome names the
+                                     status and lock commands to run.
   lock --agent-uid <N>               Drop every value the helper holds.
   status --agent-uid <N>             Show which bindings are unlocked. Never
                                      prints a value or a placeholder.
@@ -1357,10 +1360,9 @@ async function cmdSurrogateRemove(
 // one: no-core is established and verified first, then the helper is proved to
 // be answering, and only then is a value read. Reordering any two of them makes
 // a refusal happen after a value already exists in a process that might dump
-// core. The audit row comes LAST, after the helper's own acceptance, so the
-// chain never says `success` for an unlock the helper refused; a run that fails
-// part-way, or whose success row cannot be written, locks the helper before it
-// exits.
+// core. The audit row comes LAST, after the helper's own answer, so the chain
+// never says `success` for an unlock the helper refused. One value per
+// invocation: there is no part-way state to clean up.
 
 /** Marker the re-executed child carries. Never trusted on its own: the child
  * re-reads the actual hard limit before it does anything (3.4.6, "an
@@ -1419,6 +1421,12 @@ async function cmdSurrogateUnlock(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; args: SecretsArgs },
 ): Promise<number> {
+  // ONE VALUE PER INVOCATION, so a failure can never hide a value that an
+  // earlier iteration loaded. There is no loop over bindings and no "all
+  // bindings" form: a run either sees the helper's `ok` for this one value,
+  // sees an answered `deny` (the helper stored nothing), or does not know, and
+  // in that last case it says so and names the commands that settle it.
+  const secret = requirePositional(argv, 0, "surrogate unlock <secret> --agent-uid <N> [--ttl S]");
   const uid = parseSurrogateAgentUid(argv, "unlock");
   if (uid.error) {
     ctx.err.write(uid.error);
@@ -1470,176 +1478,149 @@ async function cmdSurrogateUnlock(
     );
     return 1;
   }
-  const statusResult = await transport.send(uid.agentUid!, {
-    v: SURROGATE_WIRE_VERSION,
-    id: newSurrogateCorrelationId(),
-    kind: "status",
-  });
-  if (statusResult.outcome !== "answered" || statusResult.response.kind !== "status") {
+  const generationId = probe.generationId!;
+  // The helper's own table decides whether this name is unlockable, not the
+  // policy file: the policy may already have moved on, while the helper holds
+  // exactly the generation that is armed right now. A name it does not serve
+  // is refused here, before the keychain is opened.
+  if (!(probe.servedSecrets ?? []).includes(secret)) {
     ctx.err.write(
-      "sanctuary secrets surrogate unlock: the helper stopped answering. Nothing was read.\n",
+      `sanctuary secrets surrogate unlock: the helper for agent uid ${uid.agentUid} ` +
+        `does not serve "${secret}" at generation ${generationId}. Nothing was read.\n`,
     );
     return 1;
   }
-  const generationId = statusResult.response.generation_id;
-  // The helper's own table is the list of secrets to unlock, not the policy
-  // file: the policy names agent IDs and may already have moved on, while the
-  // helper holds exactly the generation that is armed right now.
-  const secrets = statusResult.response.bindings.map((b) => b.secret);
-  if (secrets.length === 0) {
-    ctx.out.write("The helper holds no bindings for this generation. Nothing to unlock.\n");
-    return 0;
-  }
 
-  // Step 3: fortress context. Step 4: values, one per connection. Step 5: the
-  // chain row, which records what the HELPER ACCEPTED and nothing earlier.
+  // Step 3: fortress context. Step 4: the one value. Step 5: the chain row,
+  // which records what the HELPER ANSWERED and nothing earlier.
   const { store, auditLog, close } = await openSurrogateStore({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
     backend: ctx.args.surrogateBackend,
   });
   try {
-    // One value per connection. Never batched: the one-value rule is what keeps
-    // a single accepted frame from carrying two credentials. The loop stops at
-    // the FIRST failure, because everything after it is about to be locked.
-    const accepted: string[] = [];
-    let failure: { secret: string; reason: string; ambiguous: boolean } | null = null;
-    for (const secret of secrets) {
-      let value: string;
-      try {
-        value = await store.readValue(secret);
-      } catch {
-        failure = { secret, reason: "value_unreadable", ambiguous: false };
-        break;
-      }
-      const result = await transport.send(uid.agentUid!, {
-        v: SURROGATE_WIRE_VERSION,
-        id: newSurrogateCorrelationId(),
-        kind: "unlock",
-        generation_id: generationId,
-        ttl_seconds: ttlSeconds ?? MAX_SURROGATE_UNLOCK_SECONDS,
+    let value: string;
+    try {
+      value = await store.readValue(secret);
+    } catch {
+      // Nothing was sent, so nothing can be resident: a plain refusal.
+      return await recordUnlockFailure(ctx, auditLog, {
+        agentUid: uid.agentUid!,
+        generationId,
         secret,
-        value,
+        outcome: "refused",
+        reason: "value_unreadable",
       });
-      if (result.outcome === "answered" && result.response.kind === "ok") {
-        accepted.push(secret);
-        continue;
-      }
-      // AMBIGUOUS means the helper may have stored the value even though we
-      // never saw it say so: a timeout, a dropped connection or a malformed
-      // reply can all follow an accepted unlock. Only an answered `deny` is the
-      // helper saying, in its own words, that it stored nothing.
-      const ambiguous = !(result.outcome === "answered" && result.response.kind === "deny");
-      failure = { secret, reason: describeUnlockOutcome(result), ambiguous };
-      // The secret NAME is safe to print (it is in the policy file the operator
-      // wrote); the value and the deny detail are not summarised beyond the
-      // fixed reason the helper returned.
-      ctx.err.write(
-        `sanctuary secrets surrogate unlock: the helper refused "${secret}" ` +
-          `(${failure.reason}).\n`,
-      );
-      break;
     }
+    const result = await transport.send(uid.agentUid!, {
+      v: SURROGATE_WIRE_VERSION,
+      id: newSurrogateCorrelationId(),
+      kind: "unlock",
+      generation_id: generationId,
+      ttl_seconds: ttlSeconds ?? MAX_SURROGATE_UNLOCK_SECONDS,
+      secret,
+      value,
+    });
 
-    if (failure === null) {
+    if (result.outcome === "answered" && result.response.kind === "ok") {
+      // The success row is written only AFTER the helper's `ok`, so the chain
+      // never says `success` for a value the helper did not accept.
       try {
         await auditLog.appendCritical({
           layer: "l3",
           operation: BROKER_OPS.SURROGATE_UNLOCKED,
           identity_id: "sanctuary-broker",
           result: "success",
-          details: { agent_uid: uid.agentUid, generation_id: generationId, secrets },
+          details: { agent_uid: uid.agentUid, generation_id: generationId, secret },
         });
       } catch (e) {
-        // A value the chain did not record must not stay resident: an unlock
-        // nobody can account for later is the failure the chain exists for. So
-        // the helper is locked and the command fails.
-        const lock = await lockAfterFailedUnlock(transport, uid.agentUid!);
+        // The value IS loaded and the chain does not record it. Said plainly,
+        // with the command that drops it; never reported as a success.
         ctx.err.write(
-          `sanctuary secrets surrogate unlock: the audit entry could not be written ` +
+          `sanctuary secrets surrogate unlock: the helper accepted "${secret}" but the ` +
+            `audit entry could not be written ` +
             `(${e instanceof Error ? e.message : String(e)}).\n` +
-            describeLockAfterFailure(lock, uid.agentUid!),
+            describeUnlockSettleCommands(uid.agentUid!),
         );
         return 1;
       }
       ctx.out.write(
-        `Unlocked ${accepted.length} of ${secrets.length} binding(s) for agent uid ${uid.agentUid} ` +
-          `at generation ${generationId}.\n`,
+        `Unlocked "${secret}" for agent uid ${uid.agentUid} at generation ${generationId}.\n`,
       );
       return 0;
     }
 
-    // FAIL CLOSED ON A PARTIAL UNLOCK. A run that loaded some values and then
-    // failed must not leave those values resident until their TTL: the operator
-    // sees a failed command and would reasonably believe nothing is held. Lock
-    // drops EVERY value this helper holds for the agent, which is the only
-    // drop the codec has; a prior run's values go too, and that is the safe
-    // direction for a command that has just failed.
-    const lock: SurrogateLockAfterFailure =
-      accepted.length > 0 || failure.ambiguous
-        ? await lockAfterFailedUnlock(transport, uid.agentUid!)
-        : "not_needed";
-    try {
-      await auditLog.appendCritical({
-        layer: "l3",
-        operation: BROKER_OPS.SURROGATE_UNLOCKED,
-        identity_id: "sanctuary-broker",
-        result: "failure",
-        // Names and fixed classes only. Never a value.
-        details: {
-          agent_uid: uid.agentUid,
-          generation_id: generationId,
-          secrets,
-          accepted,
-          refused_secret: failure.secret,
-          outcome: "refused",
-          reason: failure.reason,
-          lock,
-        },
-      });
-    } catch (e) {
-      ctx.err.write(
-        `  The failed unlock could not be recorded on the audit chain ` +
-          `(${e instanceof Error ? e.message : String(e)}).\n`,
-      );
-    }
-    ctx.out.write(
-      `Unlocked ${accepted.length} of ${secrets.length} binding(s) for agent uid ${uid.agentUid} ` +
-        `at generation ${generationId} before a failure.\n`,
-    );
-    ctx.err.write(describeLockAfterFailure(lock, uid.agentUid!));
-    return 1;
+    // Only an answered `deny` is the helper saying, in its own words, that it
+    // stored nothing. A timeout, a dropped connection or a malformed reply can
+    // all follow an accepted unlock, so they are reported as UNKNOWN, with the
+    // commands that settle it, and never as a refusal.
+    const refused = result.outcome === "answered" && result.response.kind === "deny";
+    return await recordUnlockFailure(ctx, auditLog, {
+      agentUid: uid.agentUid!,
+      generationId,
+      secret,
+      outcome: refused ? "refused" : "unknown",
+      reason: describeUnlockOutcome(result),
+    });
   } finally {
     await close();
   }
 }
 
-/** What the post-failure lock did. Fixed tokens, recorded on the chain. */
-type SurrogateLockAfterFailure = "acknowledged" | "not_needed" | `failed:${string}`;
-
-async function lockAfterFailedUnlock(
-  transport: SurrogateUnlockTransport,
-  agentUid: number,
-): Promise<SurrogateLockAfterFailure> {
-  const result = await transport.send(agentUid, {
-    v: SURROGATE_WIRE_VERSION,
-    id: newSurrogateCorrelationId(),
-    kind: "lock",
-  });
-  if (result.outcome === "answered" && result.response.kind === "ok") return "acknowledged";
-  return `failed:${describeUnlockOutcome(result)}`;
+/** Writes the `failure` row for a one-value unlock and the operator lines.
+ * `refused` means the helper holds nothing from this run; `unknown` means it
+ * may, and the message names the `status` and `lock` commands that settle it. */
+async function recordUnlockFailure(
+  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
+  auditLog: Awaited<ReturnType<typeof openSurrogateStore>>["auditLog"],
+  f: {
+    agentUid: number;
+    generationId: number;
+    secret: string;
+    outcome: "refused" | "unknown";
+    reason: string;
+  },
+): Promise<number> {
+  // The secret NAME is safe to print (it is in the policy file the operator
+  // wrote); the value and the deny detail are never summarised beyond the
+  // fixed reason class.
+  ctx.err.write(
+    f.outcome === "refused"
+      ? `sanctuary secrets surrogate unlock: the helper refused "${f.secret}" (${f.reason}). ` +
+          `Nothing was stored.\n`
+      : `sanctuary secrets surrogate unlock: the outcome for "${f.secret}" is unknown ` +
+          `(${f.reason}); the helper may hold the value.\n` +
+          describeUnlockSettleCommands(f.agentUid),
+  );
+  try {
+    await auditLog.appendCritical({
+      layer: "l3",
+      operation: BROKER_OPS.SURROGATE_UNLOCKED,
+      identity_id: "sanctuary-broker",
+      result: "failure",
+      // Names and fixed classes only. Never a value.
+      details: {
+        agent_uid: f.agentUid,
+        generation_id: f.generationId,
+        secret: f.secret,
+        outcome: f.outcome,
+        reason: f.reason,
+      },
+    });
+  } catch (e) {
+    ctx.err.write(
+      `  The failed unlock could not be recorded on the audit chain ` +
+        `(${e instanceof Error ? e.message : String(e)}).\n`,
+    );
+  }
+  return 1;
 }
 
-function describeLockAfterFailure(lock: SurrogateLockAfterFailure, agentUid: number): string {
-  if (lock === "not_needed") {
-    return "  The helper refused the first value, so nothing was loaded by this run.\n";
-  }
-  if (lock === "acknowledged") {
-    return "  The helper was locked: every value it held for this agent was dropped.\n";
-  }
+/** The two commands that settle an unknown unlock outcome. Fixed text. */
+function describeUnlockSettleCommands(agentUid: number): string {
   return (
-    `  The helper did not acknowledge the lock (${lock.slice("failed:".length)}), so it MAY STILL ` +
-    `HOLD VALUES.\n  Drop them now:  sanctuary secrets surrogate lock --agent-uid ${agentUid}\n`
+    `  Check:  sanctuary secrets surrogate status --agent-uid ${agentUid}\n` +
+    `  Drop:   sanctuary secrets surrogate lock --agent-uid ${agentUid}\n`
   );
 }
 
