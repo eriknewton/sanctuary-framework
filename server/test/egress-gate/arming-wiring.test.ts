@@ -253,6 +253,83 @@ describe("restoreCoarseCompositionProduction (fix-round M5: gate daemon stopped 
     // bootout failure AND removed files before attempting the stop).
     expect(calls).toEqual(["launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502"]);
   });
+
+  // Credential surrogacy, design section 5 item 16 (degrade row of 3.4.1).
+  // Only agentUid is reached before the point each case stops, so the rest of
+  // the wiring input stays untouched and the cases stay host-free.
+  const DEGRADE_INPUT = { agentUid: 502, agentId: "hermes", fortressPath: "/tmp/fortress-x" } as ExclusiveEgressWiringInput;
+  const HELPER_BOOTOUT = "launchctl bootout system/ai.sanctuaryprotocol.surrogate-helper.502";
+
+  it("stops the surrogate helper after the gate and resolver, BEFORE the first surface is removed", async () => {
+    const calls: string[] = [];
+    // The first removeFile throws a sentinel so the flow halts before any
+    // un-seamed host operation (the anchor registry) can run.
+    const SENTINEL = "test-sentinel: first surface removal reached";
+    await expect(
+      restoreCoarseCompositionProduction(DEGRADE_INPUT, "test-reason", {
+        runLaunchctl: async (args) => {
+          calls.push(`launchctl ${args.join(" ")}`);
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        removeFile: async (path) => {
+          calls.push(`rm ${path}`);
+          throw new Error(SENTINEL);
+        },
+      }),
+    ).rejects.toThrow(SENTINEL);
+    expect(calls.slice(0, 3)).toEqual([
+      "launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502",
+      "launchctl bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502",
+      HELPER_BOOTOUT,
+    ]);
+    expect(calls[3]?.startsWith("rm ")).toBe(true);
+  });
+
+  it("THROWS with nothing removed when the surrogate helper cannot be stopped (fails closed)", async () => {
+    const calls: string[] = [];
+    await expect(
+      restoreCoarseCompositionProduction(DEGRADE_INPUT, "test-reason", {
+        runLaunchctl: async (args) => {
+          calls.push(`launchctl ${args.join(" ")}`);
+          if (args.join(" ").includes("surrogate-helper")) {
+            return { code: 5, stdout: "", stderr: "Boot-out failed: 5: Input/output error" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        removeFile: async (path) => {
+          // Halts the flow if a regression ever lets it past the helper, so the
+          // test can never reach the un-seamed anchor registry on the host.
+          calls.push(`rm ${path}`);
+          throw new Error("test-sentinel: surface removal reached under a live helper");
+        },
+      }),
+    ).rejects.toThrow(/could not stop the surrogate helper daemon \(launchctl bootout exited 5/);
+    // The helper bootout was the LAST side effect: no surface came off under a
+    // root process that may still hold credential values.
+    expect(calls[calls.length - 1]).toBe(HELPER_BOOTOUT);
+    expect(calls.some((c) => c.startsWith("rm "))).toBe(false);
+  });
+
+  it("treats a not-loaded helper as stopped and continues to the surface removal", async () => {
+    const calls: string[] = [];
+    const SENTINEL = "test-sentinel: first surface removal reached";
+    await expect(
+      restoreCoarseCompositionProduction(DEGRADE_INPUT, "test-reason", {
+        runLaunchctl: async (args) => {
+          calls.push(`launchctl ${args.join(" ")}`);
+          if (args.join(" ").includes("surrogate-helper")) {
+            return { code: 3, stdout: "", stderr: "Boot-out failed: 3: No such process" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        removeFile: async (path) => {
+          calls.push(`rm ${path}`);
+          throw new Error(SENTINEL);
+        },
+      }),
+    ).rejects.toThrow(SENTINEL);
+    expect(calls[2]).toBe(HELPER_BOOTOUT);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1150,26 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     await expect(ops.bootoutGateDaemon()).rejects.toThrow(
       /bootout ai\.sanctuaryprotocol\.egress-gate-peer-resolver\.601 exited 5/,
     );
+  });
+
+  it("bootoutGateDaemon: a surrogate-helper-only failure THROWS with the helper label named (design 5 item 16)", async () => {
+    // Gate and resolver stop cleanly; only the helper, a root process that may
+    // still hold credential values, fails to stop. Unprotect must refuse to
+    // continue rather than report the agent unprotected over a live helper.
+    const calls: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      runLaunchctl: async (args) => {
+        calls.push(args.join(" "));
+        if (args.join(" ").includes("surrogate-helper")) {
+          return { code: 5, stdout: "", stderr: "Boot-out failed: 5: Input/output error" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(ops.bootoutGateDaemon()).rejects.toThrow(
+      /bootout ai\.sanctuaryprotocol\.surrogate-helper\.601 exited 5/,
+    );
+    expect(calls[calls.length - 1]).toBe("bootout system/ai.sanctuaryprotocol.surrogate-helper.601");
   });
 
   it("credential + oracle teardown removes EXACTLY the single-source uid-keyed paths (no constructed authority needed)", async () => {

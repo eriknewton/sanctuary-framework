@@ -978,3 +978,22 @@ witness, and the report must not present it as one.
 - All local gates re-run on this host; the fail-before witnesses re-captured and the
   OWED ones from the Job 3 and Job 4 tables run in guard-removed form. Results are in
   the coordinator repo, `Review/Sanctuary/Credential_Surrogacy_Slice1a_BUILD_REPORT_2026-10-01.md`.
+
+## Fix round before push (2026-10-01, coordinator's Mac)
+
+- Design section 5 item 16 witnesses added to `test/egress-gate/arming-wiring.test.ts`
+  (+4): degrade stops the helper after the gate and resolver and before the first
+  surface removal; degrade THROWS with nothing removed when the helper cannot be
+  stopped; degrade treats a not-loaded helper as stopped; unprotect THROWS naming the
+  helper label when only the helper fails to stop. Each degrade case halts the flow
+  with a sentinel at the first `removeFile`, so even a regressed guard can never reach
+  the un-seamed anchor registry on the host.
+- New `test/egress-gate/surrogate-helper-real-wire.test.ts` (4): the operator CLI's
+  real unlock-socket client against a real helper over a temp-dir socket; the argv
+  entry `runSurrogateHelperDaemonFromArgv` (uid refusal, and absent-table refusal);
+  the `castle-wall surrogate-helper-daemon` verb in the built CLI.
+- `server/src/README.md` `egress-gate` row: the stale "NOT built yet" sentence now
+  describes the built listeners.
+- `.test-baseline` 16787 to 16795 (+8 tests, none platform-gated).
+- `test/fixtures/typecheck-tests-baseline.txt` re-recorded at the same count (979):
+  the inserted tests shifted 24 existing diagnostics' line numbers.
