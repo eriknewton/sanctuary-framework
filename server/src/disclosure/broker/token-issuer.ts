@@ -138,6 +138,22 @@ export interface TokenIssuerOptions {
   backend: Backend;
   /** Required: AuditLog for attestation. */
   auditLog: AuditLog;
+  /**
+   * REQUIRED (AGENTS.md rule 3): every secret name bound as a surrogate.
+   *
+   * Not optional and with no default, because a default would be `new Set()`
+   * and a caller that forgot to pass the set would compile into a broker that
+   * issues tokens for bound secrets. Callers with no bindings pass an empty set
+   * explicitly. Built by `surrogateBoundSecretNames` in `policy.ts` from the
+   * bindings `parseSurrogatePolicyDocument` returned.
+   *
+   * This is defense in depth, not the mechanism: the value of a bound secret
+   * lives under the surrogate keychain label (`surrogate-store.ts`), which this
+   * issuer's backend never reads, so a token that slipped past this check would
+   * still read not-found. The check exists so the refusal is explicit and
+   * audited rather than looking like a missing secret.
+   */
+  surrogateBoundSecrets: ReadonlySet<string>;
   /** Clock, injectable for testing. Defaults to Date.now. */
   now?: () => number;
   /** Global live-token cap override. See MAX_LIVE_TOKENS_GLOBAL for the default and its derivation. */
@@ -146,6 +162,14 @@ export interface TokenIssuerOptions {
   maxLiveTokensPerCaller?: number;
 }
 
+/**
+ * Scope ordering: `rotate` implies `read`.
+ *
+ * PIN: `surrogate` is NOT a token scope; it must not be added here. Surrogate
+ * bindings live in `surrogate-policy.json`, parsed by
+ * `parseSurrogatePolicyDocument` in `policy.ts`. Must stay in step with
+ * `SecretScope` in `backend-interface.ts`.
+ */
 const SCOPE_RANK: Record<SecretScope, number> = { read: 1, rotate: 2 };
 
 function scopeSatisfies(requested: SecretScope, grant: SecretScope): boolean {
@@ -157,6 +181,7 @@ export class TokenIssuer {
   private readonly tokens = new Map<string, TokenBinding>();
   private readonly backend: Backend;
   private readonly auditLog: AuditLog;
+  private readonly surrogateBoundSecrets: ReadonlySet<string>;
   private readonly defaultTtlSeconds: number;
   private readonly maxTtlSeconds: number;
   private readonly maxLiveTokensGlobal: number;
@@ -175,6 +200,13 @@ export class TokenIssuer {
   constructor(opts: TokenIssuerOptions) {
     this.backend = opts.backend;
     this.auditLog = opts.auditLog;
+    // Held by REFERENCE, not copied. `issueToken`'s check alone would be
+    // satisfied by a snapshot, since nothing rebinds a secret inside one broker
+    // process today. `readViaToken`'s check exists for the case a snapshot
+    // cannot cover: a token minted while a name was free, still live when the
+    // name becomes bound. Copying here would make that branch unreachable by
+    // construction, which is the same as not having written it.
+    this.surrogateBoundSecrets = opts.surrogateBoundSecrets;
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS;
     this.maxTtlSeconds = opts.maxTtlSeconds ?? MAX_TOKEN_TTL_SECONDS;
     this.maxLiveTokensGlobal = opts.maxLiveTokensGlobal ?? MAX_LIVE_TOKENS_GLOBAL;
@@ -238,6 +270,34 @@ export class TokenIssuer {
     this.pruneExpired();
 
     const requestedScope: SecretScope = req.requestedScope ?? "read";
+
+    if (this.surrogateBoundSecrets.has(req.secret)) {
+      // FIRST check in the method, ahead of grant lookup and scope comparison:
+      // a surrogate-bound secret must not be reachable by ANY token path, so it
+      // must not depend on what a policy file happens to say about it. The
+      // denial the caller sees is the generic one (`BrokerDeniedError`), the
+      // same shape a missing grant produces, so the MCP surface cannot be used
+      // to enumerate which names are bound.
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SURROGATE_TOKEN_REFUSED,
+        identity_id: req.caller.identity_id,
+        result: "failure",
+        details: {
+          skill: req.caller.skill,
+          secret: req.secret,
+          requested_scope: requestedScope,
+          reason: "surrogate_bound",
+          surface: "issue_token",
+          agent: req.caller.agent,
+          tenant_id: req.caller.tenant_id,
+          fortress_id: req.caller.fortress_id,
+          audience: req.caller.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+
     if (req.skill !== req.caller.skill) {
       // Skill identity is taken from verified caller claims; an MCP argument cannot mint a token for another skill.
       await this.auditLog.appendCritical({
@@ -462,6 +522,33 @@ export class TokenIssuer {
       });
       throw new BrokerTokenUnknownError();
     }
+    if (this.surrogateBoundSecrets.has(binding.secret)) {
+      // A token minted before the binding existed (policy is reloaded at broker
+      // open, tokens are in-memory and outlive nothing else) must not survive
+      // the binding. Checked ahead of expiry so a bound name reads as refused
+      // rather than as expired, which would tell a caller the token was once
+      // good for it.
+      this.tokens.delete(token);
+      await this.auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SURROGATE_TOKEN_REFUSED,
+        identity_id: binding.identity_id,
+        result: "failure",
+        details: {
+          skill: binding.skill,
+          secret: binding.secret,
+          scope: binding.scope,
+          reason: "surrogate_bound",
+          surface: "read_via_token",
+          agent: binding.agent,
+          tenant_id: binding.tenant_id,
+          fortress_id: binding.fortress_id,
+          audience: binding.audience,
+        },
+      });
+      throw new BrokerDeniedError();
+    }
+
     const nowMs = this.now();
     if (nowMs >= Date.parse(binding.expires_at)) {
       // Expiry is enforced again at read time, so pruning is only hygiene and never the security boundary.

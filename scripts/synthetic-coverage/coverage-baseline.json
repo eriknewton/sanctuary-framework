@@ -331,6 +331,14 @@
       "fixtures_passed": 0,
       "coverage_state": "no_fixture",
       "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "28",
+      "label": "Credential surrogacy at the egress gate (agent is never issued a bound secret)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
     }
   ]
 }

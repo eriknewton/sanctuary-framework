@@ -208,6 +208,8 @@ export async function extractToolSurface(): Promise<ToolSurfaceEntry[]> {
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(new MemoryStorage(), masterKey);
   const broker = new Broker({
+    // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+    surrogateBoundSecrets: new Set<string>(),
     backend: makeFakeBackend({ snapshot_secret: "x" }),
     auditLog,
     grants: [{ skill: "snapshot-skill", secret: "snapshot_secret", scope: "read" }],

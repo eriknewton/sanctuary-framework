@@ -1569,6 +1569,58 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     }
   }
 
+  if (command === "surrogate-helper-daemon") {
+    // The ROOT per-agent credential-surrogate helper (design 3.4). It holds
+    // bound credential values in memory only after an operator unlock, answers
+    // the gate's value queries on one socket and the operator's unlock, lock and
+    // status requests on another, and starts LOCKED every time. Spawned by
+    // launchd as root, one per agent that has surrogate bindings, alongside that
+    // agent's gate daemon and peer resolver.
+    //
+    // Every uid and the generation come from THIS argv, which root baked into
+    // the plist at arming time (`renderSurrogateHelperDaemonPlist`), never from
+    // anything a caller says over either socket. The parse and the refusals live
+    // in `parseSurrogateHelperDaemonArgs`, so this verb adds no second grammar;
+    // a refusal here exits non-zero and the gate then denies every surrogate
+    // request rather than passing a placeholder through.
+    const { runSurrogateHelperDaemonFromArgv } = await import(
+      "./egress-gate/surrogate-helper-daemon.js"
+    );
+    try {
+      const handle = await runSurrogateHelperDaemonFromArgv(args.slice(1));
+      const stop = async (): Promise<void> => {
+        try {
+          // `close()` overwrites and drops every held value before either
+          // socket goes away; see the handle's own comment.
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      // Socket paths and a binding COUNT only: never a secret name, an env name,
+      // a placeholder or a value.
+      console.error(
+        `[surrogate-helper] serving ${handle.bindingCount} binding(s), locked, on ${handle.querySocketPath}`,
+      );
+      // Holds the event loop open; shutdown exits via the signal handlers above.
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      // The refusal classes this prints are fixed strings from
+      // `SurrogateHelperStartError` and `SurrogateHelperArgvError`; neither
+      // carries policy content or a value.
+      console.error(`surrogate helper daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`

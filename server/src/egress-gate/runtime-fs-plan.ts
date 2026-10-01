@@ -41,6 +41,14 @@
  *   ¦                                     the GATE uid 0600 by peer-resolver-daemon.ts itself
  *   ¦                                     at listen time -- 2026-07-24 S5-3 fix, see that
  *   ¦                                     module; this dir only needs to pre-exist traversable)
+ *   +- gate-surrogate                     root 0711  (traversal w/o listing; credential
+ *   ¦                                     surrogacy, design 3.4.1. <agent_uid>.bindings ->
+ *   ¦                                     ROOT 0600 (only the root helper and root at release
+ *   ¦                                     commit read it), <agent_uid>.destinations -> GATE uid
+ *   ¦                                     0600, and the two sockets .query.sock / .unlock.sock
+ *   ¦                                     are bound + chowned by surrogate-helper-daemon.ts
+ *   ¦                                     itself at listen time, the peer-resolver pattern
+ *   ¦                                     above; this dir only needs to pre-exist traversable)
  *   +- agent-harness                      root 0755  (agent uid reads hold file + wrapper)
  *
  * Applied by ROOT at arming time (install + repair, `productionBringUp`) and
@@ -52,6 +60,7 @@
 import { basename, join } from "node:path";
 
 import { AGENT_HARNESS_HOLD_DIR, AGENT_HARNESS_HOLD_DIR_MODE } from "./release-barrier.js";
+import { GATE_SURROGATE_DIR, GATE_SURROGATE_DIR_MODE } from "./surrogate-helper-daemon.js";
 
 /** The root of every exclusive-egress runtime surface. */
 export const SANCTUARY_VAR_DB_DIR = "/var/db/sanctuary";
@@ -130,6 +139,19 @@ export function planExclusiveEgressRuntimeFs(input: GateRuntimeFsPlanInput): Gat
     // only owns the parent directory, so a resolver daemon that has not
     // started yet still has somewhere traversable to bind into.
     ...rootDir(dir("gate-peer-resolver"), 0o711),
+    // Surrogate dir (credential surrogacy, design 3.4.1): same traversal
+    // model, and for a sharper reason than the resolver's. The two FILES root
+    // arming writes inside it have DIFFERENT readers (`<uid>.bindings` is root
+    // 0600, `<uid>.destinations` is gate uid 0600), so the directory must not
+    // be listable: 0711 lets the gate open the one file it can name and gives
+    // it no way to discover that the other exists. The agent uid can traverse
+    // here too and can open neither file; its own surrogate artifact is the
+    // placeholder file under `gate-cred`. The per-agent sockets inside are
+    // created, chmodded and chowned by the helper daemon itself at listen
+    // time (see `surrogate-helper-daemon.ts`), so this plan owns only the
+    // parent and a helper that has not started yet still has somewhere
+    // traversable to bind into.
+    ...rootDir(dir(basename(GATE_SURROGATE_DIR)), GATE_SURROGATE_DIR_MODE),
     // Hold dir: agent uid reads the hold file + exec wrapper (integrity by
     // root ownership; no secret content). Name AND mode come from the
     // release-barrier constants, so this plan and the parked install's
