@@ -32,8 +32,9 @@
  * letting it through. See that function for the reproduction.
  */
 
+import { statSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { connect } from "node:net";
 import { createInterface } from "node:readline";
 import type { Backend, SecretScope } from "../disclosure/broker/backend-interface.js";
@@ -1004,10 +1005,28 @@ export interface SurrogateArmingView {
   hasHelperArtifacts(agentUid: number): Promise<boolean>;
 }
 
-/** Plist basename shape for one helper; must match `surrogateHelperDaemonPlistPath`. */
-const SURROGATE_HELPER_PLIST_RE = new RegExp(
-  `^${SURROGATE_HELPER_DAEMON_LABEL_PREFIX.replace(/\./g, "\\.")}\\.(\\d+)\\.plist$`,
-);
+/** File-name suffix of every helper plist; must match `surrogateHelperDaemonPlistPath`
+ * in `egress-gate/surrogate-helper-daemon.ts`. */
+const SURROGATE_HELPER_PLIST_SUFFIX = ".plist";
+
+/**
+ * The agent uid a helper plist basename names, or `undefined` when the name is
+ * not `<prefix>.<decimal uid>.plist`. Shape must match `surrogateHelperDaemonPlistPath`.
+ *
+ * Built from literal string comparisons, never from a regex assembled out of
+ * the prefix: the prefix is matched byte for byte, so no character in it can
+ * act as a pattern and widen the match to a different label.
+ */
+export function parseSurrogateHelperPlistUid(
+  name: string,
+  prefix: string = SURROGATE_HELPER_DAEMON_LABEL_PREFIX,
+): number | undefined {
+  const head = `${prefix}.`;
+  if (!name.startsWith(head) || !name.endsWith(SURROGATE_HELPER_PLIST_SUFFIX)) return undefined;
+  const middle = name.slice(head.length, name.length - SURROGATE_HELPER_PLIST_SUFFIX.length);
+  if (!/^\d+$/.test(middle)) return undefined;
+  return Number(middle);
+}
 
 export function createRealSurrogateArmingView(): SurrogateArmingView {
   return {
@@ -1026,8 +1045,8 @@ export function createRealSurrogateArmingView(): SurrogateArmingView {
       const names = await readdir(plistDir);
       const uids: number[] = [];
       for (const name of names) {
-        const m = SURROGATE_HELPER_PLIST_RE.exec(name);
-        if (m !== null) uids.push(Number(m[1]));
+        const uid = parseSurrogateHelperPlistUid(name);
+        if (uid !== undefined) uids.push(uid);
       }
       return uids;
     },
@@ -1370,7 +1389,8 @@ async function cmdSurrogateRemove(
 export const SURROGATE_NO_CORE_MARKER_ENV = "SANCTUARY_SURROGATE_NO_CORE";
 
 /** The shell that drops both core limits and then becomes the real process.
- * Must match the string in `test/cli/secrets-surrogate-unlock.test.ts`. */
+ * Must match the string pinned in `test/cli/secrets-surrogate-operator.test.ts`
+ * ("pins the no-core shell script both sides of the re-exec agree on"). */
 export const SURROGATE_NO_CORE_SHELL_SCRIPT =
   'ulimit -H -c 0 && ulimit -S -c 0 && exec "$@"';
 
@@ -1386,7 +1406,36 @@ export interface SurrogateNoCoreOps {
   reexecWithoutCore(): Promise<number>;
 }
 
-export function createSurrogateNoCoreOps(): SurrogateNoCoreOps {
+/**
+ * Why the re-exec refuses to start, or `null` when it may. The exec path must
+ * be an absolute path to an existing regular file, and every argv element must
+ * be a string with no NUL or newline byte.
+ */
+export function surrogateReexecRefusal(execPath: unknown, argv: readonly unknown[]): string | null {
+  if (typeof execPath !== "string" || !isAbsolute(execPath)) return "exec_path_not_absolute";
+  try {
+    if (!statSync(execPath).isFile()) return "exec_path_not_a_file";
+  } catch {
+    return "exec_path_missing";
+  }
+  for (const arg of argv) {
+    if (typeof arg !== "string" || arg.includes("\0") || arg.includes("\n")) {
+      return "argv_element_rejected";
+    }
+  }
+  return null;
+}
+
+/** What the production re-exec reads and calls; tests replace any of them. */
+export interface SurrogateNoCoreProcess {
+  execPath: string;
+  argv: readonly string[];
+  spawn?: typeof import("node:child_process").spawn;
+}
+
+export function createSurrogateNoCoreOps(
+  proc: SurrogateNoCoreProcess = { execPath: process.execPath, argv: process.argv },
+): SurrogateNoCoreOps {
   return {
     alreadyReexeced: () => process.env[SURROGATE_NO_CORE_MARKER_ENV] === "1",
     readHardCoreLimit: async () => {
@@ -1395,11 +1444,25 @@ export function createSurrogateNoCoreOps(): SurrogateNoCoreOps {
       return (r.stdout ?? "").trim();
     },
     reexecWithoutCore: async () => {
-      const { spawn } = await import("node:child_process");
+      // ARGV REACH THE CHILD ONLY AS POSITIONAL PARAMETERS OF A FIXED SCRIPT;
+      // THEY ARE NEVER PART OF THE COMMAND STRING. `exec "$@"` expands them as
+      // separate words and never re-parses them. The validator below is the
+      // second layer: anything that is not an absolute path to a real file, or
+      // an argv element carrying a NUL or newline, refuses before any spawn.
+      const childArgv = proc.argv.slice(1);
+      const refusal = surrogateReexecRefusal(proc.execPath, childArgv);
+      if (refusal !== null) {
+        process.stderr.write(
+          `sanctuary secrets surrogate unlock: refusing to re-execute (${refusal}). ` +
+            `Nothing was read.\n`,
+        );
+        return 1;
+      }
+      const spawn = proc.spawn ?? (await import("node:child_process")).spawn;
       return await new Promise<number>((resolve) => {
         const child = spawn(
           "/bin/sh",
-          ["-c", SURROGATE_NO_CORE_SHELL_SCRIPT, "sh", process.execPath, ...process.argv.slice(1)],
+          ["-c", SURROGATE_NO_CORE_SHELL_SCRIPT, "sh", proc.execPath, ...childArgv],
           {
             stdio: "inherit",
             env: { ...process.env, [SURROGATE_NO_CORE_MARKER_ENV]: "1" },

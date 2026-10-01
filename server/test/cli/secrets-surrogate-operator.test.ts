@@ -7,7 +7,9 @@
  * a refusal on the chain. An unlock loads exactly one value per run, the chain
  * records a successful unlock only after the helper accepted it, and an outcome
  * the helper never answered is recorded as unknown with the commands that
- * settle it. Covers `surrogate remove`, `secrets revoke` on a bound name,
+ * settle it. The no-core re-exec passes argv only as positional parameters of a
+ * fixed script and refuses an exec path or argv it cannot vouch for, and the
+ * installed-helper scan matches its label prefix literally. Covers `surrogate remove`, `secrets revoke` on a bound name,
  * `unlock`'s no-core rule and its helper-first step order, `lock`, `status`
  * and the root-only `events`.
  *
@@ -17,12 +19,14 @@
  * socket is created under a root-owned path, and no helper is started.
  *
  * Defect id: SURROGATE-BROKER-REACHABLE, SURROGATE-ARMED-UID,
- * SURROGATE-UNLOCK-PARTIAL, SURROGATE-UNLOCK-CHAIN-ORDER.
+ * SURROGATE-UNLOCK-PARTIAL, SURROGATE-UNLOCK-CHAIN-ORDER, SURROGATE-REEXEC-ARGV,
+ * SURROGATE-PLIST-MATCH.
  */
 
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -32,6 +36,9 @@ import {
   probeSurrogateHelperArmed,
   type SurrogateArmingView,
   SURROGATE_NO_CORE_SHELL_SCRIPT,
+  createSurrogateNoCoreOps,
+  parseSurrogateHelperPlistUid,
+  surrogateReexecRefusal,
   type SurrogateNoCoreOps,
   type SurrogateUnlockOutcome,
   type SurrogateUnlockTransport,
@@ -41,6 +48,7 @@ import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interfa
 import { openSurrogateStore, surrogatePolicyPath } from "../../src/disclosure/broker/open.js";
 import { SURROGATE_POLICY_VERSION } from "../../src/disclosure/broker/policy.js";
 import { SURROGATE_WIRE_VERSION } from "../../src/credential-surrogate/wire.js";
+import { SURROGATE_HELPER_DAEMON_LABEL_PREFIX } from "../../src/egress-gate/surrogate-helper-daemon.js";
 import { SURROGATE_PLACEHOLDER_REDACTION } from "../../src/credential-surrogate/redaction.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { BROKER_OPS } from "../../src/operational/audit-log.js";
@@ -633,6 +641,96 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
     // string in `surrogate-helper-daemon.ts`'s plist reasoning: hard THEN soft,
     // then exec, so the limits are in force for the process that holds a value.
     expect(SURROGATE_NO_CORE_SHELL_SCRIPT).toBe('ulimit -H -c 0 && ulimit -S -c 0 && exec "$@"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The no-core re-exec: argv are positional parameters, and bad input refuses.
+// ---------------------------------------------------------------------------
+
+/** A spawn stand-in that records its call and exits 0 on the next tick. */
+function recordingSpawn() {
+  const calls: { file: string; args: string[] }[] = [];
+  const spawn = ((file: string, args: string[]) => {
+    calls.push({ file, args });
+    const child = new EventEmitter();
+    setImmediate(() => child.emit("exit", 0));
+    return child;
+  }) as unknown as typeof import("node:child_process").spawn;
+  return { calls, spawn };
+}
+
+describe("the no-core re-exec validates what it hands the shell", () => {
+  it("passes argv only as positional parameters after the fixed script", async () => {
+    const rec = recordingSpawn();
+    const ops = createSurrogateNoCoreOps({
+      execPath: process.execPath,
+      argv: [process.execPath, "cli.js", "secrets", "surrogate", "unlock", "k; echo x"],
+      spawn: rec.spawn,
+    });
+    expect(await ops.reexecWithoutCore()).toBe(0);
+    expect(rec.calls).toEqual([
+      {
+        file: "/bin/sh",
+        args: [
+          "-c",
+          SURROGATE_NO_CORE_SHELL_SCRIPT,
+          "sh",
+          process.execPath,
+          "cli.js",
+          "secrets",
+          "surrogate",
+          "unlock",
+          "k; echo x",
+        ],
+      },
+    ]);
+  });
+
+  it("refuses, with exit 1 and no spawn, an argv element carrying a newline", async () => {
+    const rec = recordingSpawn();
+    const ops = createSurrogateNoCoreOps({
+      execPath: process.execPath,
+      argv: [process.execPath, "cli.js", "unlock\nk"],
+      spawn: rec.spawn,
+    });
+    expect(await ops.reexecWithoutCore()).toBe(1);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("refuses, with exit 1 and no spawn, a relative exec path", async () => {
+    const rec = recordingSpawn();
+    const ops = createSurrogateNoCoreOps({ execPath: "node", argv: ["node", "cli.js"], spawn: rec.spawn });
+    expect(await ops.reexecWithoutCore()).toBe(1);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("names each refusal class", () => {
+    expect(surrogateReexecRefusal(process.execPath, ["a", "b"])).toBeNull();
+    expect(surrogateReexecRefusal("node", [])).toBe("exec_path_not_absolute");
+    expect(surrogateReexecRefusal(join(storagePath, "no-such-binary"), [])).toBe("exec_path_missing");
+    expect(surrogateReexecRefusal(storagePath, [])).toBe("exec_path_not_a_file");
+    expect(surrogateReexecRefusal(process.execPath, ["a\0b"])).toBe("argv_element_rejected");
+    expect(surrogateReexecRefusal(process.execPath, ["a\nb"])).toBe("argv_element_rejected");
+  });
+});
+
+describe("the installed-helper scan matches its label prefix literally", () => {
+  it("reads the uid from a helper plist name and nothing else", () => {
+    const prefix = SURROGATE_HELPER_DAEMON_LABEL_PREFIX;
+    expect(parseSurrogateHelperPlistUid(`${prefix}.502.plist`)).toBe(502);
+    expect(parseSurrogateHelperPlistUid(`${prefix}.502.plist.bak`)).toBeUndefined();
+    expect(parseSurrogateHelperPlistUid(`${prefix}.5a2.plist`)).toBeUndefined();
+    expect(parseSurrogateHelperPlistUid(`${prefix}..plist`)).toBeUndefined();
+    expect(parseSurrogateHelperPlistUid(`x${prefix}.502.plist`)).toBeUndefined();
+  });
+
+  it("a prefix containing a regex metacharacter cannot match a different label", () => {
+    // `+` and `.` would both widen a regex built from the prefix.
+    expect(parseSurrogateHelperPlistUid("a+b.5.plist", "a+b")).toBe(5);
+    expect(parseSurrogateHelperPlistUid("aab.5.plist", "a+b")).toBeUndefined();
+    expect(parseSurrogateHelperPlistUid("a.b.5.plist", "a.b")).toBe(5);
+    expect(parseSurrogateHelperPlistUid("aXb.5.plist", "a.b")).toBeUndefined();
   });
 });
 
