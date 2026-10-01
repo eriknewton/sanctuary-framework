@@ -952,3 +952,29 @@ branch reaching a real teardown, and exactly one `mintSurrogatePlaceholder(` cal
 site in the whole of `arming-wiring.ts`). That is a text assertion, not a runtime
 witness, and the report must not present it as one.
 
+
+## Job 7 (2026-10-01, coordinator's Mac, verification and BUILD_REPORT)
+
+### done
+
+- **`.test-baseline` corrected 16769 to 16787.** Job 6's reasoning ("undershooting
+  is safe") is wrong for this repo: `.github/workflows/test-baseline-guard.yml`
+  Gate 2c FAILS when the passing count is ABOVE the floor as well as below it, so
+  16769 would have failed CI by 18. 16787 is the main CI count at `94bc9d41`
+  (16496 passed, 40 skipped, read from run 36736882367) plus the 291 tests this
+  branch adds: 273 in the eighteen new files and 18 in existing files
+  (`release-barrier.test.ts` 93 to 107, `boot-supervisor.test.ts` 39 to 43). The
+  delta was derived by diffing `npx vitest list --json` over the WHOLE tree at the
+  base and at head (collection only, no execution): +291 test ids added, 0 removed
+  once the worktree-path artifact on `scripts/synthetic-coverage` and one
+  host-environmental PyYAML-gated block in `test/wrap/hermes-yaml-parse-parity.test.ts`
+  (present or absent by probe, unrelated to this branch) are set aside. None of the
+  291 sits behind a platform gate. CI on Linux remains the authority; if it reports
+  a different count, that number goes into `.test-baseline` in this PR.
+- **Raw NUL byte removed from `test/egress-gate/surrogate-helper-daemon-plist.test.ts`**
+  (line 140, inside the control-character refusal case), replaced by the `\u0000`
+  escape, which is the same string value. The raw byte made git classify the file
+  as binary, so no diff of it was reviewable. 15 of 15 still pass.
+- All local gates re-run on this host; the fail-before witnesses re-captured and the
+  OWED ones from the Job 3 and Job 4 tables run in guard-removed form. Results are in
+  the coordinator repo, `Review/Sanctuary/Credential_Surrogacy_Slice1a_BUILD_REPORT_2026-10-01.md`.
