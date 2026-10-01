@@ -509,11 +509,11 @@ below is inferred; an owed row is owed.
 | value byte and length rules refused at the shared parser | the runtime test's three unlock cases FAILED against the helper's own duplicated checks (they answered `malformed` where the test expected `illegal_value_byte` and `value_too_long`), which is what showed the parser was the real enforcement site | **CAPTURED as a discovery**, not as a guard-removed witness |
 | `too_many_bindings` distinguished from `bindings_unreadable` | the cap case FAILED with `bindings_unreadable` before the refusal was mapped through, and passes after | **CAPTURED** |
 | claim-literal ratchet, surrogate keychain label guard | both FAILED on the tree before they were re-recorded, with the exact drift lines quoted in this session | **CAPTURED** |
-| one codec per socket (query frame on the unlock socket and the reverse) | not attempted | **OWED**: rewire the unlock listener to the query parser and record the failure |
+| one codec per socket (query frame on the unlock socket and the reverse) | fix round 1: each listener rewired to fall through into the other codec when its own parser returns null; `npx vitest run test/egress-gate/surrogate-helper-daemon-runtime.test.ts -t "one codec per socket"` **2 failed**: `expected null to deeply equal { v: 1, ... }` (a valid query on the unlock socket got a `swap` the unlock codec cannot parse) and `expected null to match object { kind: 'deny', reason: 'malformed' }` | **CAPTURED** (guard-removed), fix round 1 |
 | helper refuses a generation mismatch | not attempted | **OWED**: remove the header-versus-argv check and record the failure |
-| over-cap unlock frame refused before `JSON.parse` | not attempted | **OWED**: remove the accumulated-buffer cap check and record the failure |
+| over-cap unlock frame refused before `JSON.parse` | fix round 1: the accumulated-buffer cap check deleted from `serveOneShotConnection`, then `npx vitest run test/egress-gate/surrogate-helper-daemon-runtime.test.ts -t "over-cap frame before JSON.parse"` **1 failed**: `expected { v: 1, ... } to match object { kind: 'deny', ... }`, received `"reason": "malformed"` where `"value_too_long"` was expected (the shared decoder answered instead of the helper's cap); passes after restore | **CAPTURED** (guard-removed), fix round 1 |
 | helper refuses a bad `--operator-uid` | not attempted this job (the argv parser and its test landed in Job 2, also without a witness) | **OWED** |
-| the four query conditions, the rate limit, the fault schedule | not attempted | **OWED**: each needs its guard-removed form |
+| the four query conditions, the rate limit, the fault schedule | the fault schedule only, fix round 1: the slot release deleted from `answerQuery`'s `finally`, then `-t "holds and releases the query cap"` **1 failed**: the probe query answered `deny` / `rate_limited` where `swap` was expected. The four query conditions and the rate-limit guard-removed runs are in the Job 7 BUILD_REPORT, not in this file | fault schedule **CAPTURED** (guard-removed), fix round 1 |
 
 The helper-plist and argv guards still have no base tree to fail against (the
 file is new), so their witness must be the guard-removed form. Everything marked
@@ -642,11 +642,11 @@ mis-answered.
 | Guard | Observed this job | Status |
 |---|---|---|
 | CLI argv chokepoint rejects a hand-rolled `indexOf` in `src/cli/` | `npx vitest run test/structure/cli-argv-parser-chokepoint.test.ts` FAILED with the offender line quoted (`src/cli/secrets.ts:891`), failed again with the marker four lines above the call, and passes with the marker adjacent | **CAPTURED**, a genuine three-state before/after |
-| `revoke` and `remove` reach a keychain on the success path | both ENOENT cases FAILED (exit 1, not 0) before the `brokerBackend` seam was threaded, which is what showed `cmdRevoke` continues into `openBroker` after the surrogate half | **CAPTURED as a discovery**, not as a guard-removed witness |
-| unlock refuses without a verified hard core limit of 0 | not attempted in guard-removed form | **OWED**: delete the `hardLimit !== NO_CORE_HARD_LIMIT` arm and record the failure |
+| `revoke` and `remove` reach a keychain on the success path | both ENOENT cases FAILED (exit 1, not 0) before the `brokerBackend` seam was threaded, which is what showed `cmdRevoke` continues into `openBroker` after the surrogate half | **CAPTURED as a discovery**, not as a guard-removed witness. **Fix round 1: this row's tests PINNED A DEFECT.** They asserted that an absent socket on the operator-named uid lets the row go; that is the gate finding fixed in round 1 (the binding's own agent decides). The tests were rewritten to the correct expectation and the trigger added |
+| unlock refuses without a verified hard core limit of 0 | fix round 1: the `hardLimit !== NO_CORE_HARD_LIMIT` condition replaced by a constant false, then `npx vitest run test/cli/secrets-surrogate-operator.test.ts -t "verified hard core limit is not 0"` **1 failed**: `expected +0 to be 1` (the unlock proceeded and exited 0); passes after restore | **CAPTURED** (guard-removed), fix round 1 |
 | unlock refuses before any keychain read when the helper is absent | not attempted in guard-removed form | **OWED**: move the probe below `openSurrogateStore` and record `keychainReads` going non-empty |
 | `events` refuses when not root | not attempted in guard-removed form | **OWED** |
-| remove and revoke refuse on EACCES, timeout and malformed | not attempted in guard-removed form | **OWED**: make `indeterminate` fall through to `unarmed` and record the four failures |
+| remove and revoke refuse on EACCES, timeout and malformed | fix round 1: both refusal sites changed from `probe.state !== "unarmed"` to `probe.state === "armed"` (indeterminate proceeds), then the whole operator file **8 failed**: the four `refuses on <class>` cases (`expected 'sanctuary secrets: Secret not found: ...' to contain 'could not establish'`, the verb proceeded past the probe), both `--agent-uid names a uid with no socket` cases (`expected +0 to be 1`), `socket absent but artifacts installed` and `directory service cannot answer`; 44 of 44 after restore | **CAPTURED** (guard-removed), fix round 1 |
 
 Everything marked OWED is work for a later job. The BUILD_REPORT must not claim
 a witness that no run produced.
@@ -926,8 +926,13 @@ Re-run only what a further edit touches.
 - Regression check re-run this job: `test/egress-gate/surrogate-helper-daemon-plist.test.ts`
   (**15 passed**, and it already covers BOTH plists' `Core` keys, so the spawn
   prompt's plist-render item is done), `surrogate-helper-daemon-runtime.test.ts`
-  and `test/credential-surrogate/` together: **131 passed**. Job 3 and 4 already
-  wrote the rule 8 and rule 12 helper-socket tests; do not write them again.
+  and `test/credential-surrogate/` together: **131 passed**. Correction (fix round
+  1): Job 3 and 4 wrote the rule 8 tests and a partial rule 12 set (two frames in
+  one write, a mid-frame disconnect, concurrent waves, drop on close). The Job 3
+  table above shows the fault-schedule witness was never captured, and the
+  "two frames in one write" test pinned the defect (it expected the first frame
+  served). Fix round 1 replaced that test and added the stalled-reader and
+  mid-write-disconnect schedule; see the fix round 1 section.
 
 ### fail-before witnesses (Job 6): what was ACTUALLY observed
 
@@ -1006,3 +1011,41 @@ the new matrix row and the new module move: `EXPECTED_ASSURANCE_ROW_COUNT` 27 to
 62 to 63 modules and 54 to 55 barrels; `scripts/synthetic-coverage/coverage-baseline.json`
 regenerated with `npm run synthetic-coverage:baseline` (adds row 28, `partial`,
 `no_fixture`). No test was added or removed, so `.test-baseline` stays 16795.
+
+## Fix round 1 (2026-10-01, code gate round 1: Codex lens A, Grok lens B)
+
+- **One frame, judged whole.** `serveOneShotConnection` now refuses a frame that
+  has any byte after its newline in the same read, or a second chunk inside the
+  one-turn judging window, BEFORE `onFrame` runs; the refusal echoes the first
+  frame's parsed id (parse only) and records `unexpected_extra_bytes` in the
+  helper event (the wire reason stays `malformed`, the closed deny enum). The
+  listener is `allowHalfOpen` so a client that half-closes after its frame still
+  gets its one reply. The runtime test that expected the first pipelined frame
+  served was replaced (it pinned the defect).
+- **Partial unlock fails closed; chain after acceptance.** `surrogate unlock`
+  stops at the first refused, timed-out, malformed or dropped reply, sends
+  `lock` when any value was accepted or the failure is ambiguous, reports
+  whether the lock was acknowledged (and names the manual command if not), and
+  writes `SURROGATE_UNLOCKED` with `result: "success"` only after every unlock
+  was accepted; a failure writes `result: "failure"`, `outcome: "refused"`, the
+  reason class, the accepted names and the lock outcome. A success row that
+  cannot be written locks the helper.
+- **Remove and revoke probe the binding's own agent.** The uid comes from the
+  binding's agent id through the arming twin's lookup (`deriveAgentAccountName`
+  then the directory service); `--agent-uid` is optional and must equal it. Every
+  helper with an installed plist is probed too (a renamed account), a `status`
+  answer is `armed` only when it lists the secret, and an absent socket is
+  unarmed only when none of that uid's four artifacts exists. Refusals are
+  recorded on the chain (`result: "failure"`, `outcome: "refused"`). No policy or
+  bindings schema changed.
+- **Rule 12 disposition at the query cap**: no deadline, no detached write, no
+  re-queue; the stalled-reader and mid-write-disconnect schedule is tested.
+- **Witness-shape re-check.** Every row of the Job 3, Job 4 and Job 6 witness
+  tables was re-read for a test that pins the defect rather than the guard. Two
+  did: the Job 4 `revoke`/`remove` ENOENT row (marked above) and the runtime
+  "two frames in one write" test. Both are rewritten. The remaining rows assert
+  the refusing or correct behavior.
+- **verify-fail-before**: the seven existing test files that only gained the
+  required `surrogateBoundSecrets: new Set()` constructor option carry a
+  per-change `fail-before-exempt` marker naming that source change.
+

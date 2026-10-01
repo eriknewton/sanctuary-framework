@@ -1,17 +1,22 @@
 /**
  * Capability: the operator verbs that address a running helper decide "armed"
  * from the helper's own answer, refuse on every outcome that is not a clean
- * absent socket, and reach no keychain until after they have refused. Covers
- * `surrogate remove`, `secrets revoke` on a bound name, `unlock`'s no-core
- * rule and its helper-first step order, `lock`, `status` and the root-only
- * `events`.
+ * absent socket with no installed helper artifact, and reach no keychain until
+ * after they have refused. The verbs that remove a binding check the helper of
+ * the binding's OWN agent (an operator-named uid can only confirm it) and record
+ * a refusal on the chain. An unlock that fails part-way locks the helper before
+ * it exits, and the chain records a successful unlock only after the helper
+ * accepted it. Covers `surrogate remove`, `secrets revoke` on a bound name,
+ * `unlock`'s no-core rule and its helper-first step order, `lock`, `status`
+ * and the root-only `events`.
  *
  * Host-free: the unlock socket and the core-limit check are injected seams, the
  * keychain is an in-memory backend through the store's chokepoint, and the gate
  * log is a fixture file in a temp directory. No `security` subprocess runs, no
  * socket is created under a root-owned path, and no helper is started.
  *
- * Defect id: SURROGATE-BROKER-REACHABLE.
+ * Defect id: SURROGATE-BROKER-REACHABLE, SURROGATE-ARMED-UID,
+ * SURROGATE-UNLOCK-PARTIAL, SURROGATE-UNLOCK-CHAIN-ORDER.
  */
 
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -22,7 +27,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   runSecretsCommand,
+  probeSurrogateBindingArmed,
   probeSurrogateHelperArmed,
+  type SurrogateArmingView,
   SURROGATE_NO_CORE_SHELL_SCRIPT,
   type SurrogateNoCoreOps,
   type SurrogateUnlockOutcome,
@@ -30,11 +37,12 @@ import {
 } from "../../src/cli/secrets.js";
 import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
 import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
-import { surrogatePolicyPath } from "../../src/disclosure/broker/open.js";
+import { openSurrogateStore, surrogatePolicyPath } from "../../src/disclosure/broker/open.js";
 import { SURROGATE_POLICY_VERSION } from "../../src/disclosure/broker/policy.js";
 import { SURROGATE_WIRE_VERSION } from "../../src/credential-surrogate/wire.js";
 import { SURROGATE_PLACEHOLDER_REDACTION } from "../../src/credential-surrogate/redaction.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { BROKER_OPS } from "../../src/operational/audit-log.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -48,6 +56,8 @@ class StringWritable extends Writable {
 }
 
 const AGENT_UID = 502;
+/** A second uid with no helper socket: a mistyped or stale --agent-uid. */
+const OTHER_UID = 777;
 const SECRET = "openai-api-key";
 const BINDING = {
   secret: SECRET,
@@ -133,6 +143,54 @@ function armedTransport(): SurrogateUnlockTransport & { unlocked: string[] } {
   };
 }
 
+/**
+ * The arming twin's installed state, injected. Defaults: the binding's agent
+ * resolves to AGENT_UID, no helper plist is installed anywhere, and no
+ * artifact exists for any uid.
+ */
+function armingView(opts: {
+  agentUid?: number | undefined | "throws";
+  installed?: number[];
+  artifactsFor?: number[];
+} = {}): SurrogateArmingView {
+  return {
+    async resolveAgentUid() {
+      if (opts.agentUid === "throws") throw new Error("directory service unavailable");
+      return "agentUid" in opts ? (opts.agentUid as number | undefined) : AGENT_UID;
+    },
+    async installedHelperUids() {
+      return opts.installed ?? [];
+    },
+    async hasHelperArtifacts(uid) {
+      return (opts.artifactsFor ?? []).includes(uid);
+    },
+  };
+}
+
+/** A transport that routes by uid; an unlisted uid has no socket (ENOENT). */
+function perUidTransport(byUid: Record<number, SurrogateUnlockTransport>): SurrogateUnlockTransport {
+  return {
+    async send(uid, request) {
+      const t = byUid[uid];
+      return t === undefined ? { outcome: "absent" } : t.send(uid, request);
+    },
+  };
+}
+
+/** Every chain row for one broker operation, read back through the same store. */
+async function chainRows(operation: string) {
+  const { auditLog, close } = await openSurrogateStore({
+    passphrase: PASSPHRASE,
+    storagePath,
+    backend: memoryBackend(),
+  });
+  try {
+    return (await auditLog.query({ operation_type: operation, limit: 100 })).entries;
+  } finally {
+    await close();
+  }
+}
+
 async function writePolicy(bindings: unknown[]): Promise<void> {
   await writeFile(
     surrogatePolicyPath(storagePath),
@@ -150,6 +208,10 @@ async function run(argv: string[], extra: Record<string, unknown> = {}) {
     err,
     storagePath,
     passphrase: PASSPHRASE,
+    // Defaults every verb can be refused or recorded under without touching a
+    // real keychain or the real directory service; a test overrides either.
+    surrogateArming: armingView(),
+    surrogateBackend: memoryBackend(),
     ...extra,
   } as Parameters<typeof runSecretsCommand>[0]);
   return { code, out: out.text, err: err.text };
@@ -170,8 +232,28 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("probeSurrogateHelperArmed classifies every outcome", () => {
-  it("an absent socket is unarmed, and only an absent socket is", async () => {
+  it("an absent socket is unarmed at the transport only; with any artifact installed the binding is indeterminate", async () => {
+    // The transport-level classification is unchanged: ENOENT means no socket.
     expect((await probeSurrogateHelperArmed(absentTransport(), AGENT_UID)).state).toBe("unarmed");
+    // The BINDING-level decision is what the destructive verbs use, and there
+    // an absent socket is unarmed only when no installed artifact remains.
+    const withArtifacts = await probeSurrogateBindingArmed({
+      transport: absentTransport(),
+      arming: armingView({ artifactsFor: [AGENT_UID] }),
+      secret: SECRET,
+      agentId: "hermes",
+    });
+    expect(withArtifacts).toMatchObject({
+      state: "indeterminate",
+      refusal: "socket_absent_with_artifacts",
+    });
+    const clean = await probeSurrogateBindingArmed({
+      transport: absentTransport(),
+      arming: armingView(),
+      secret: SECRET,
+      agentId: "hermes",
+    });
+    expect(clean).toMatchObject({ state: "unarmed", agentUid: AGENT_UID });
   });
 
   it("a status answer is armed and carries the generation", async () => {
@@ -215,8 +297,8 @@ describe("surrogate remove refuses unless the bound agent is unarmed", () => {
       { surrogateUnlock: armedTransport() },
     );
     expect(result.code).toBe(1);
-    expect(result.err).toContain("its agent is armed");
-    expect(result.err).toContain("surrogate lock");
+    expect(result.err).toContain("is serving that binding now");
+    expect(result.err).toContain(`surrogate lock --agent-uid ${AGENT_UID}`);
     const after = JSON.parse(await readFile(surrogatePolicyPath(storagePath), "utf8"));
     expect(after.bindings).toHaveLength(1);
   });
@@ -237,7 +319,7 @@ describe("surrogate remove refuses unless the bound agent is unarmed", () => {
     },
   );
 
-  it("succeeds on a socket ENOENT, dropping the row and the stored value", async () => {
+  it("succeeds on a socket ENOENT with no installed artifact, dropping the row and the stored value", async () => {
     await writePolicy([BINDING]);
     const result = await run(
       ["surrogate", "remove", SECRET, "--agent-uid", String(AGENT_UID)],
@@ -252,13 +334,145 @@ describe("surrogate remove refuses unless the bound agent is unarmed", () => {
     expect(after.bindings).toHaveLength(0);
   });
 
-  it("requires --agent-uid: there is no uid to probe without one", async () => {
+  it("derives the uid from the binding's own agent when --agent-uid is omitted", async () => {
     await writePolicy([BINDING]);
+    const asked: number[] = [];
     const result = await run(["surrogate", "remove", SECRET], {
+      surrogateUnlock: {
+        async send(uid: number) {
+          asked.push(uid);
+          return { outcome: "absent" } as SurrogateUnlockOutcome;
+        },
+      },
+      surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
+    });
+    expect(result.code).toBe(0);
+    expect(asked).toEqual([AGENT_UID]);
+  });
+
+  it("refuses a malformed --agent-uid rather than ignoring it", async () => {
+    await writePolicy([BINDING]);
+    const result = await run(["surrogate", "remove", SECRET, "--agent-uid", "abc"], {
       surrogateUnlock: absentTransport(),
     });
     expect(result.code).toBe(2);
-    expect(result.err).toContain("--agent-uid");
+    expect(result.err).toContain("--agent-uid must be a positive integer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The binding's own agent decides which helper is checked.
+// ---------------------------------------------------------------------------
+
+describe("remove and revoke probe the binding's own agent, never only the operator's uid", () => {
+  /** uid A (AGENT_UID) is armed and serving SECRET; every other uid is absent. */
+  function armedOnAgentUid(): SurrogateUnlockTransport {
+    return perUidTransport({ [AGENT_UID]: armedTransport() });
+  }
+
+  it.each([
+    ["surrogate remove", ["surrogate", "remove", SECRET, "--agent-uid", String(OTHER_UID)]],
+    ["revoke", ["revoke", "mailer", SECRET, "--agent-uid", String(OTHER_UID)]],
+  ] as const)(
+    "%s refuses when --agent-uid names a uid with no socket while the real agent is armed",
+    async (verb, argv) => {
+      await writePolicy([BINDING]);
+      const backend = memoryBackend({ [SECRET]: BOUND_VALUE });
+      const result = await run([...argv], {
+        surrogateUnlock: armedOnAgentUid(),
+        surrogateBackend: backend,
+        brokerBackend: memoryBackend(),
+      });
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("does not match");
+      const after = JSON.parse(await readFile(surrogatePolicyPath(storagePath), "utf8"));
+      expect(after.bindings).toHaveLength(1);
+      expect(await backend.listSecretNames()).toContain(SECRET);
+      const rows = await chainRows(BROKER_OPS.SURROGATE_REMOVED);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        result: "failure",
+        details: { secret: SECRET, verb, outcome: "refused", reason: "agent_uid_mismatch" },
+      });
+    },
+  );
+
+  it.each([
+    ["surrogate remove", ["surrogate", "remove", SECRET]],
+    ["revoke", ["revoke", "mailer", SECRET]],
+  ] as const)(
+    "%s with no flag refuses when the real agent's helper is serving the secret",
+    async (verb, argv) => {
+      await writePolicy([BINDING]);
+      const backend = memoryBackend({ [SECRET]: BOUND_VALUE });
+      const result = await run([...argv], {
+        surrogateUnlock: armedOnAgentUid(),
+        surrogateBackend: backend,
+        brokerBackend: memoryBackend(),
+      });
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("is serving that binding now");
+      const after = JSON.parse(await readFile(surrogatePolicyPath(storagePath), "utf8"));
+      expect(after.bindings).toHaveLength(1);
+      expect(await backend.listSecretNames()).toContain(SECRET);
+      const rows = await chainRows(BROKER_OPS.SURROGATE_REMOVED);
+      expect(rows[0]).toMatchObject({
+        result: "failure",
+        details: { verb, outcome: "refused", reason: "armed", agent_uid: AGENT_UID },
+      });
+    },
+  );
+
+  it("refuses when the account no longer resolves but an installed helper serves the secret", async () => {
+    // An account rename breaks the id-to-uid lookup without stopping the
+    // helper armed under the old uid; its own status table still decides.
+    await writePolicy([BINDING]);
+    const result = await run(["surrogate", "remove", SECRET], {
+      surrogateUnlock: armedOnAgentUid(),
+      surrogateArming: armingView({ agentUid: undefined, installed: [AGENT_UID] }),
+      surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
+    });
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("is serving that binding now");
+  });
+
+  it("refuses when the socket is absent but the helper's artifacts are installed", async () => {
+    await writePolicy([BINDING]);
+    const result = await run(["surrogate", "remove", SECRET], {
+      surrogateUnlock: absentTransport(),
+      surrogateArming: armingView({ artifactsFor: [AGENT_UID] }),
+      surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
+    });
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("socket_absent_with_artifacts");
+    const after = JSON.parse(await readFile(surrogatePolicyPath(storagePath), "utf8"));
+    expect(after.bindings).toHaveLength(1);
+  });
+
+  it("refuses when the directory service cannot answer", async () => {
+    await writePolicy([BINDING]);
+    const result = await run(["surrogate", "remove", SECRET], {
+      surrogateUnlock: absentTransport(),
+      surrogateArming: armingView({ agentUid: "throws" }),
+    });
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("account_lookup_failed");
+  });
+
+  it("proceeds when the agent's helper answers but does not hold this secret", async () => {
+    await writePolicy([BINDING]);
+    const other: SurrogateUnlockTransport = {
+      async send(_uid, request) {
+        return statusOutcome([{ secret: "some-other-secret", unlocked: true, expires_at: 1 }])(
+          request.id,
+        );
+      },
+    };
+    const result = await run(["surrogate", "remove", SECRET, "--agent-uid", String(AGENT_UID)], {
+      surrogateUnlock: other,
+      surrogateBackend: memoryBackend({ [SECRET]: BOUND_VALUE }),
+    });
+    expect(result.code).toBe(0);
   });
 });
 
@@ -270,12 +484,12 @@ describe("secrets revoke on a bound secret", () => {
       { surrogateUnlock: armedTransport() },
     );
     expect(result.code).toBe(1);
-    expect(result.err).toContain("its agent is armed");
+    expect(result.err).toContain("is serving that binding now");
     const after = JSON.parse(await readFile(surrogatePolicyPath(storagePath), "utf8"));
     expect(after.bindings).toHaveLength(1);
   });
 
-  it("removes the binding row on ENOENT and keeps the stored value", async () => {
+  it("removes the binding row on ENOENT with no installed artifact and keeps the stored value", async () => {
     await writePolicy([BINDING]);
     const backend = memoryBackend({ [SECRET]: BOUND_VALUE });
     const result = await run(
@@ -418,6 +632,178 @@ describe("surrogate unlock establishes the no-core rule before anything else", (
     // string in `surrogate-helper-daemon.ts`'s plist reasoning: hard THEN soft,
     // then exec, so the limits are in force for the process that holds a value.
     expect(SURROGATE_NO_CORE_SHELL_SCRIPT).toBe('ulimit -H -c 0 && ulimit -S -c 0 && exec "$@"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unlock: a partial unlock fails closed, and the chain records only acceptance.
+// ---------------------------------------------------------------------------
+
+const SECOND = "anthropic-api-key";
+const SECOND_VALUE = Buffer.from(generateRandomKey()).toString("base64url");
+
+/**
+ * A helper with two bindings that accepts the first unlock and answers the
+ * second with `second`. Records every request kind in order, and how many
+ * success rows the chain held at the moment each unlock frame was sent.
+ */
+function twoBindingTransport(
+  second: (id: string) => SurrogateUnlockOutcome,
+  opts: { lock?: (id: string) => SurrogateUnlockOutcome } = {},
+): SurrogateUnlockTransport & { kinds: string[]; successRowsAtSend: number[] } {
+  const kinds: string[] = [];
+  const successRowsAtSend: number[] = [];
+  let unlocks = 0;
+  return {
+    kinds,
+    successRowsAtSend,
+    async send(_uid, request) {
+      kinds.push(request.kind);
+      if (request.kind === "status") {
+        return statusOutcome([
+          { secret: SECRET, unlocked: false, expires_at: null },
+          { secret: SECOND, unlocked: false, expires_at: null },
+        ])(request.id);
+      }
+      if (request.kind === "lock" && opts.lock !== undefined) return opts.lock(request.id);
+      if (request.kind === "unlock") {
+        successRowsAtSend.push(
+          (await chainRows(BROKER_OPS.SURROGATE_UNLOCKED)).filter((r) => r.result === "success")
+            .length,
+        );
+        unlocks += 1;
+        if (unlocks === 2) return second(request.id);
+      }
+      return {
+        outcome: "answered",
+        response: { v: SURROGATE_WIRE_VERSION, id: request.id, kind: "ok" },
+      };
+    },
+  };
+}
+
+function denyOutcome(reason: "unknown_secret" | "malformed") {
+  return (id: string): SurrogateUnlockOutcome => ({
+    outcome: "answered",
+    response: { v: SURROGATE_WIRE_VERSION, id, kind: "deny", reason },
+  });
+}
+
+describe("surrogate unlock fails closed on a partial unlock", () => {
+  const unlockArgv = ["surrogate", "unlock", "--agent-uid", String(AGENT_UID)];
+  const seeded = () => memoryBackend({ [SECRET]: BOUND_VALUE, [SECOND]: SECOND_VALUE });
+
+  it("locks the helper after a refusal that follows an accepted unlock, and records the refusal", async () => {
+    await writePolicy([BINDING]);
+    const transport = twoBindingTransport(denyOutcome("unknown_secret"));
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(1);
+    // probe status, status, unlock (accepted), unlock (refused), then LOCK.
+    expect(transport.kinds).toEqual(["status", "status", "unlock", "unlock", "lock"]);
+    expect(result.err).toContain("The helper was locked");
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      result: "failure",
+      details: {
+        accepted: [SECRET],
+        refused_secret: SECOND,
+        outcome: "refused",
+        reason: "unknown_secret",
+        lock: "acknowledged",
+      },
+    });
+    expect(JSON.stringify(rows[0])).not.toContain(BOUND_VALUE);
+    expect(JSON.stringify(rows[0])).not.toContain(SECOND_VALUE);
+  });
+
+  it("locks after a timed-out reply even with nothing confirmed, because the helper may have stored it", async () => {
+    await writePolicy([BINDING]);
+    const transport = twoBindingTransport(() => ({
+      outcome: "unreachable",
+      failureClass: "timed_out",
+    }));
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(1);
+    expect(transport.kinds.at(-1)).toBe("lock");
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows[0]).toMatchObject({ result: "failure", details: { reason: "timed_out" } });
+  });
+
+  it("says the helper may still hold values, and names the command, when the lock is not acknowledged", async () => {
+    await writePolicy([BINDING]);
+    const transport = twoBindingTransport(denyOutcome("unknown_secret"), {
+      lock: () => ({ outcome: "unreachable", failureClass: "connect_failed" }),
+    });
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("MAY STILL HOLD VALUES");
+    expect(result.err).toContain(`sanctuary secrets surrogate lock --agent-uid ${AGENT_UID}`);
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows[0]).toMatchObject({ details: { lock: "failed:connect_failed" } });
+  });
+
+  it("writes the success row only after every unlock was accepted", async () => {
+    await writePolicy([BINDING]);
+    const transport = twoBindingTransport((id) => ({
+      outcome: "answered",
+      response: { v: SURROGATE_WIRE_VERSION, id, kind: "ok" },
+    }));
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(0);
+    // At the moment each unlock frame left, the chain held NO success row.
+    expect(transport.successRowsAtSend).toEqual([0, 0]);
+    expect(transport.kinds).not.toContain("lock");
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      result: "success",
+      details: { agent_uid: AGENT_UID, generation_id: 7, secrets: [SECRET, SECOND] },
+    });
+  });
+
+  it("records a refusal, and no success, when the helper refuses the first value", async () => {
+    await writePolicy([BINDING]);
+    const kinds: string[] = [];
+    const transport: SurrogateUnlockTransport = {
+      async send(_uid, request) {
+        kinds.push(request.kind);
+        if (request.kind === "status") {
+          return statusOutcome([{ secret: SECRET, unlocked: false, expires_at: null }])(request.id);
+        }
+        return denyOutcome("malformed")(request.id);
+      },
+    };
+    const result = await run(unlockArgv, {
+      surrogateNoCore: noCoreOps("0"),
+      surrogateUnlock: transport,
+      surrogateBackend: seeded(),
+    });
+    expect(result.code).toBe(1);
+    // An answered deny on the first value means nothing was stored: no lock.
+    expect(kinds).not.toContain("lock");
+    const rows = await chainRows(BROKER_OPS.SURROGATE_UNLOCKED);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      result: "failure",
+      details: { accepted: [], outcome: "refused", reason: "malformed", lock: "not_needed" },
+    });
   });
 });
 

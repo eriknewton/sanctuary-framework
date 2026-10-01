@@ -12,15 +12,19 @@
  *
  * Every connection in this file is a real Unix-domain socket round trip against
  * the real listeners, so the one-frame-per-connection contract is exercised
- * rather than asserted about.
+ * rather than asserted about. The one exception is the two-chunks-in-one-turn
+ * schedule, which only a fake socket can deliver on demand. A frame followed by
+ * any further byte is refused as a whole and never served, and the query cap
+ * holds and releases under stalled readers and mid-write disconnects.
  *
  * Defect id: SURROGATE-HELPER-QUERY, SURROGATE-HELPER-UNLOCK,
- * SURROGATE-HELPER-CODEC-SPLIT, SURROGATE-HELPER-CAPS.
+ * SURROGATE-HELPER-CODEC-SPLIT, SURROGATE-HELPER-CAPS, SURROGATE-HELPER-EXTRA-BYTES.
  */
 
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm as rmReal, writeFile } from "node:fs/promises";
-import { connect } from "node:net";
+import { EventEmitter } from "node:events";
+import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +56,7 @@ import {
   SurrogateHelperStartError,
   clampSurrogateUnlockSeconds,
   runSurrogateHelperDaemon,
+  serveOneShotConnection,
   surrogateBindingsPath,
   type SurrogateHelperDaemonHandle,
   type SurrogateHelperEvent,
@@ -235,6 +240,22 @@ async function query(
   return parseSurrogateQueryResponse((await roundTrip(h.handle.querySocketPath, frame)).trimEnd());
 }
 
+/** The `unlocked` flag of every binding, read through the operator's status frame. */
+async function statusUnlocked(h: Harness): Promise<boolean[]> {
+  const statusReq = {
+    v: SURROGATE_WIRE_VERSION,
+    id: newSurrogateCorrelationId(),
+    kind: "status",
+  } as const;
+  const resp = parseSurrogateUnlockSocketResponse(
+    (
+      await roundTrip(h.handle.unlockSocketPath, encodeSurrogateUnlockSocketRequest(statusReq))
+    ).trimEnd(),
+  );
+  if (resp?.kind !== "status") throw new Error("status probe did not answer status");
+  return resp.bindings.map((row) => row.unlocked);
+}
+
 describe("surrogate helper daemon: start and table load", () => {
   it("starts LOCKED with the table loaded and both sockets confined to one uid each", async () => {
     const b = binding(0);
@@ -354,14 +375,29 @@ describe("surrogate helper daemon: the four query conditions", () => {
 });
 
 describe("surrogate helper daemon: one codec per socket", () => {
-  it("answers malformed to a query frame on the unlock socket", async () => {
+  it("answers malformed to a query frame on the unlock socket, never a query answer", async () => {
     const b = binding(0);
     const h = await startHelper({ bindings: [b] });
-    const { frame } = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
-    const resp = parseSurrogateUnlockSocketResponse(
-      (await roundTrip(h.handle.unlockSocketPath, frame)).trimEnd(),
+    // UNLOCKED first, and the frame is a fully valid query: if the unlock
+    // socket ever fell through into `answerQuery`, this exact frame would get
+    // `swap` with the value, or `locked`/`unknown` on a lesser fall-through.
+    const value = freshTestValue();
+    await unlock(h, b.secret, value);
+    const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
+    const raw = (await roundTrip(h.handle.unlockSocketPath, q.frame)).trimEnd();
+    expect(parseSurrogateUnlockSocketResponse(raw)).toEqual({
+      v: 1,
+      id: "0".repeat(32),
+      kind: "deny",
+      reason: "malformed",
+    });
+    expect(raw).not.toContain(value);
+    for (const queryOnly of ["swap", "locked", "unknown", "misroute", "wrong_location"]) {
+      expect(raw).not.toContain(`"${queryOnly}"`);
+    }
+    expect(h.events.some((e) => e.kind === "query_answered" || e.kind === "query_denied")).toBe(
+      false,
     );
-    expect(resp).toMatchObject({ kind: "deny", reason: "malformed" });
   });
 
   it("answers malformed to an unlock frame on the query socket, and loads nothing", async () => {
@@ -369,7 +405,10 @@ describe("surrogate helper daemon: one codec per socket", () => {
     const h = await startHelper({ bindings: [b] });
     const { frame } = unlockFrame({ secret: b.secret, value: freshTestValue() });
     expect(await query(h, frame)).toMatchObject({ kind: "deny", reason: "malformed" });
-    // The gate uid could not load a value: the binding is still locked.
+    // The gate uid could not load a value: the operator's own status frame on
+    // the UNLOCK socket says so, and the query side agrees.
+    expect(await statusUnlocked(h)).toEqual([false]);
+    expect(h.events.some((e) => e.kind === "unlock_accepted")).toBe(false);
     const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
     expect(await query(h, q.frame)).toMatchObject({ kind: "deny", reason: "locked" });
   });
@@ -608,15 +647,168 @@ describe("surrogate helper daemon: rule 8, the table and the caps", () => {
 });
 
 describe("surrogate helper daemon: rule 12, the fault schedule on both sockets", () => {
-  it("serves exactly one frame per connection and never a second", async () => {
+  it("refuses a frame with trailing bytes on the unlock socket and loads nothing", async () => {
     const b = binding(0);
     const h = await startHelper({ bindings: [b] });
-    const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
-    // Two frames in one write: the first is answered, the second never is.
-    const raw = await roundTrip(h.handle.querySocketPath, Buffer.concat([q.frame, q.frame]));
+    const u = unlockFrame({ secret: b.secret, value: freshTestValue() });
+    // One write: a valid unlock frame, then junk after its newline. The frame
+    // is judged whole before it is acted on, so this is ONE malformed request.
+    const raw = await roundTrip(
+      h.handle.unlockSocketPath,
+      Buffer.concat([u.frame, Buffer.from("junk")]),
+    );
     const frames = raw.trimEnd().split("\n").filter((line) => line.length > 0);
     expect(frames).toHaveLength(1);
-    expect(parseSurrogateQueryResponse(frames[0]!)?.id).toBe(q.id);
+    expect(parseSurrogateUnlockSocketResponse(frames[0]!)).toEqual({
+      v: 1,
+      id: u.id,
+      kind: "deny",
+      reason: "malformed",
+    });
+    expect(h.events).toContainEqual({
+      kind: "unlock_denied",
+      agentUid: AGENT_UID,
+      reason: "unexpected_extra_bytes",
+    });
+    expect(h.events.some((e) => e.kind === "unlock_accepted")).toBe(false);
+    expect(await statusUnlocked(h)).toEqual([false]);
+  });
+
+  it("refuses a frame with trailing bytes on the query socket and serves nothing", async () => {
+    const b = binding(0);
+    const h = await startHelper({ bindings: [b] });
+    const value = freshTestValue();
+    await unlock(h, b.secret, value);
+    const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
+    for (const trailer of [Buffer.from("junk"), q.frame]) {
+      const raw = await roundTrip(h.handle.querySocketPath, Buffer.concat([q.frame, trailer]));
+      const frames = raw.trimEnd().split("\n").filter((line) => line.length > 0);
+      expect(frames).toHaveLength(1);
+      expect(parseSurrogateQueryResponse(frames[0]!)).toEqual({
+        v: 1,
+        id: q.id,
+        kind: "deny",
+        reason: "malformed",
+      });
+      expect(raw).not.toContain(value);
+    }
+    expect(h.events.some((e) => e.kind === "query_answered")).toBe(false);
+  });
+
+  it("refuses a second chunk that arrives before the held frame is acted on", async () => {
+    const b = binding(0);
+    const u = unlockFrame({ secret: b.secret, value: freshTestValue() });
+    // A fake socket, because only a fake can deliver two chunks inside one
+    // event-loop turn on demand; a real socket may coalesce them into one.
+    const written: Buffer[] = [];
+    const fake = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      setTimeout: () => undefined,
+      end: (frame: Buffer) => {
+        written.push(frame);
+      },
+      destroy: () => {
+        fake.destroyed = true;
+      },
+    });
+    let served = 0;
+    serveOneShotConnection(fake as unknown as Socket, {
+      onFrame: () => {
+        served += 1;
+        return Buffer.from("served\n");
+      },
+      onExtraBytes: (firstLine) => Buffer.from(`refused:${firstLine.length}\n`),
+      onOversize: () => Buffer.from("oversize\n"),
+      onSocketError: () => undefined,
+    });
+    fake.emit("data", u.frame);
+    fake.emit("data", Buffer.from("junk"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(served).toBe(0);
+    expect(written.map((w) => w.toString("utf8"))).toEqual([
+      `refused:${u.frame.length - 1}\n`,
+    ]);
+  });
+
+  it("still answers a client that writes its frame and then half-closes", async () => {
+    const b = binding(0);
+    const h = await startHelper({ bindings: [b] });
+    const statusReq = {
+      v: SURROGATE_WIRE_VERSION,
+      id: newSurrogateCorrelationId(),
+      kind: "status",
+    } as const;
+    const raw = await new Promise<string>((resolve, reject) => {
+      const socket = connect(h.handle.unlockSocketPath);
+      let out = "";
+      socket.on("error", reject);
+      socket.on("connect", () => socket.end(encodeSurrogateUnlockSocketRequest(statusReq)));
+      socket.on("data", (chunk: Buffer) => {
+        out += chunk.toString("utf8");
+      });
+      socket.on("close", () => resolve(out));
+    });
+    expect(parseSurrogateUnlockSocketResponse(raw.trimEnd())).toMatchObject({
+      id: statusReq.id,
+      kind: "status",
+    });
+  });
+
+  it("holds and releases the query cap under stalled readers and mid-write disconnects", async () => {
+    const b = binding(0);
+    // A cap of ONE: any slot held across a stalled write or leaked by a
+    // disconnect makes the next query `rate_limited`.
+    const h = await startHelper({ bindings: [b], maxConcurrentQueries: 1 });
+    const value = freshTestValue();
+    await unlock(h, b.secret, value);
+    const stalled: Socket[] = [];
+    cleanups.push(async () => {
+      for (const s of stalled) s.destroy();
+    });
+    const wave = async (): Promise<void> => {
+      const opened: Promise<void>[] = [];
+      for (let i = 0; i < 6; i += 1) {
+        const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
+        opened.push(
+          new Promise<void>((resolve) => {
+            const socket = connect(h.handle.querySocketPath, () => {
+              // A client that never reads: paused, so its reply sits unread.
+              socket.pause();
+              socket.write(q.frame, () => resolve());
+            });
+            socket.on("error", () => resolve());
+            stalled.push(socket);
+          }),
+        );
+      }
+      for (let i = 0; i < 6; i += 1) {
+        const q = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
+        opened.push(
+          new Promise<void>((resolve) => {
+            const socket = connect(h.handle.querySocketPath, () => {
+              // A client that disconnects while its request is in flight.
+              socket.write(q.frame, () => {
+                socket.destroy();
+                resolve();
+              });
+            });
+            socket.on("error", () => resolve());
+          }),
+        );
+      }
+      await Promise.all(opened);
+    };
+    for (let round = 0; round < 3; round += 1) {
+      await wave();
+      // Let the helper act on every held frame before the probe query.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      const probe = queryFrame({ placeholder: b.placeholder, host: b.destinations[0]!.host });
+      expect(await query(h, probe.frame)).toEqual({ v: 1, id: probe.id, kind: "swap", value });
+    }
+    expect(
+      h.events.some((e) => e.kind === "query_denied" && e.reason === "rate_limited"),
+    ).toBe(false);
   });
 
   it("survives a client that disconnects mid-frame on either socket", async () => {

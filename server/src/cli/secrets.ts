@@ -32,7 +32,8 @@
  * letting it through. See that function for the reproduction.
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import { connect } from "node:net";
 import { createInterface } from "node:readline";
 import type { Backend, SecretScope } from "../disclosure/broker/backend-interface.js";
@@ -63,7 +64,11 @@ import {
 import { SURROGATE_WIRE_VERSION, newSurrogateCorrelationId } from "../credential-surrogate/wire.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
 import { egressGateDaemonLogPaths } from "../egress-gate/gate-daemon.js";
-import { surrogateUnlockSocketPath } from "../egress-gate/surrogate-helper-daemon.js";
+import {
+  SURROGATE_HELPER_DAEMON_LABEL_PREFIX,
+  surrogateHelperDaemonPlistPath,
+  surrogateUnlockSocketPath,
+} from "../egress-gate/surrogate-helper-daemon.js";
 import { flagValue } from "./argv.js";
 import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 
@@ -86,6 +91,13 @@ export interface SecretsArgs {
    * keychain (AGENTS.md "Test isolation").
    */
   surrogateUnlock?: SurrogateUnlockTransport;
+  /**
+   * The arming twin's installed state as the operator can see it (tests).
+   * Production reads the directory service and the helper's artifact paths;
+   * a test injects both so no `dscl` runs and no path under `/Library` or
+   * `/var/db/sanctuary` is touched.
+   */
+  surrogateArming?: SurrogateArmingView;
   /** Re-exec and core-limit seam for `surrogate unlock` (tests). */
   surrogateNoCore?: SurrogateNoCoreOps;
   /** Effective uid for the root-only `surrogate events` check (tests). */
@@ -444,21 +456,30 @@ async function removeSurrogateRowForRevoke(
   const bindings = loaded.document.bindings;
   if (!bindings.some((b) => b.secret === secret)) return 0;
 
-  const uid = parseSurrogateAgentUid(argv, "revoke");
-  if (uid.error) {
-    ctx.err.write(
-      `sanctuary secrets revoke: "${secret}" is bound as a surrogate, so this revoke ` +
-        `also removes the binding and needs --agent-uid <N> to check that the agent ` +
-        `is unarmed.\n`,
-    );
+  const row = bindings.find((b) => b.secret === secret)!;
+  const crossCheck = parseOptionalSurrogateAgentUid(argv, "revoke");
+  if (crossCheck.error) {
+    ctx.err.write(crossCheck.error);
     return 2;
   }
-  const probe = await probeSurrogateHelperArmed(surrogateTransportFor(ctx.args), uid.agentUid!);
-  const refusal = refuseUnlessUnarmed(probe, "revoke", secret);
-  if (refusal !== undefined) {
-    ctx.err.write(refusal);
+  const probe = await probeSurrogateBindingArmed({
+    transport: surrogateTransportFor(ctx.args),
+    arming: surrogateArmingFor(ctx.args),
+    secret,
+    agentId: row.agent,
+    operatorAgentUid: crossCheck.agentUid,
+  });
+  if (probe.state !== "unarmed") {
+    ctx.err.write(describeBindingArmedRefusal(probe, "revoke", secret));
+    await recordSurrogateRemovalRefused(ctx, storage, {
+      secret,
+      agent: row.agent,
+      probe,
+      verb: "revoke",
+    });
     return 1;
   }
+  const uid = { agentUid: probe.agentUid ?? null };
 
   await saveSurrogatePolicy(storage, {
     surrogate_policy_version: SURROGATE_POLICY_VERSION,
@@ -582,8 +603,9 @@ function printSurrogateUsage(s: NodeJS.WritableStream): void {
     --header <Name>                  Request header the gate writes the value into.
     --host <host>[,<host>]           Destination host or hosts, port ${SURROGATE_BOUND_PORT} only.
   list                               List bindings. Never prints a value.
-  remove <secret> --agent-uid <N>    Remove a binding and its stored value.
-                                     Refuses while that agent is armed.
+  remove <secret> [--agent-uid <N>]  Remove a binding and its stored value.
+                                     Refuses while the binding's own agent is
+                                     armed. --agent-uid is only a cross-check.
   unlock --agent-uid <N> [--ttl S]   Send every bound value to that agent's
                                      helper, which holds them in memory only.
                                      TTL is clamped by the helper.
@@ -929,7 +951,13 @@ export type SurrogateArmedState = "armed" | "unarmed" | "indeterminate";
 export async function probeSurrogateHelperArmed(
   transport: SurrogateUnlockTransport,
   agentUid: number,
-): Promise<{ state: SurrogateArmedState; generationId?: number; failureClass?: SurrogateUnlockFailureClass }> {
+): Promise<{
+  state: SurrogateArmedState;
+  generationId?: number;
+  /** Secret NAMES the helper's own table holds; present only for `armed`. */
+  servedSecrets?: string[];
+  failureClass?: SurrogateUnlockFailureClass;
+}> {
   const result = await transport.send(agentUid, {
     v: SURROGATE_WIRE_VERSION,
     id: newSurrogateCorrelationId(),
@@ -944,43 +972,267 @@ export async function probeSurrogateHelperArmed(
     // the codec we think it does. Treated as indeterminate, not as unarmed.
     return { state: "indeterminate", failureClass: "malformed_reply" };
   }
-  return { state: "armed", generationId: result.response.generation_id };
+  return {
+    state: "armed",
+    generationId: result.response.generation_id,
+    servedSecrets: result.response.bindings.map((b) => b.secret),
+  };
 }
 
-/** The refusal text shared by `secrets revoke` and `surrogate remove`, or
- * `undefined` when the agent is unarmed and the caller may proceed. */
-function refuseUnlessUnarmed(
-  probe: { state: SurrogateArmedState; failureClass?: SurrogateUnlockFailureClass },
+/**
+ * The arming twin's installed state, read as the OPERATOR can read it.
+ *
+ * Both answers come from the same sources the arming twin itself uses, so the
+ * armed check and the arming path cannot disagree about which helper belongs to
+ * which agent: the agent uid is the directory-service account
+ * `deriveAgentAccountName(agentId)` (the lookup protect uses to find the uid it
+ * arms), and the artifacts are `surrogateArtifactPaths(uid)` in
+ * `egress-gate/arming-wiring.ts` (must match: the plist, bindings, destinations
+ * and placeholder files `installSurrogateHelperForBringUp` writes).
+ */
+export interface SurrogateArmingView {
+  /** The agent's uid, or `undefined` when no such account exists. Throws when
+   * the directory service cannot answer, which is never read as "absent". */
+  resolveAgentUid(agentId: string): Promise<number | undefined>;
+  /** Every uid with an installed helper plist. Throws when the scan fails. */
+  installedHelperUids(): Promise<number[]>;
+  /** Whether ANY of the four installed artifacts for this uid exists. Throws on
+   * a stat failure other than ENOENT. */
+  hasHelperArtifacts(agentUid: number): Promise<boolean>;
+}
+
+/** Plist basename shape for one helper; must match `surrogateHelperDaemonPlistPath`. */
+const SURROGATE_HELPER_PLIST_RE = new RegExp(
+  `^${SURROGATE_HELPER_DAEMON_LABEL_PREFIX.replace(/\./g, "\\.")}\\.(\\d+)\\.plist$`,
+);
+
+export function createRealSurrogateArmingView(): SurrogateArmingView {
+  return {
+    async resolveAgentUid(agentId) {
+      // Dynamic imports: the account lookup and the artifact list live with the
+      // arming code, and loading those modules for every `secrets` verb would
+      // cost every verb what only these two pay for.
+      const { deriveAgentAccountName } = await import("../castle-wall/provision/account.js");
+      const { realAccountProvisionOps } = await import("../wrap/auto-provision.js");
+      return realAccountProvisionOps().lookupAccountUid(deriveAgentAccountName(agentId));
+    },
+    async installedHelperUids() {
+      // The directory every helper plist is written into, derived from the one
+      // path function the arming twin writes through rather than restated.
+      const plistDir = dirname(surrogateHelperDaemonPlistPath(0));
+      const names = await readdir(plistDir);
+      const uids: number[] = [];
+      for (const name of names) {
+        const m = SURROGATE_HELPER_PLIST_RE.exec(name);
+        if (m !== null) uids.push(Number(m[1]));
+      }
+      return uids;
+    },
+    async hasHelperArtifacts(agentUid) {
+      const { surrogateArtifactPaths } = await import("../egress-gate/arming-wiring.js");
+      const paths = surrogateArtifactPaths(agentUid);
+      for (const path of [paths.plist, paths.bindings, paths.destinations, paths.placeholders]) {
+        try {
+          await stat(path);
+          return true;
+        } catch (e) {
+          // ENOENT is the only "absent". EACCES or anything else is an artifact
+          // we could not rule out, so it propagates and the caller refuses.
+          if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+        }
+      }
+      return false;
+    },
+  };
+}
+
+function surrogateArmingFor(args: SecretsArgs): SurrogateArmingView {
+  return args.surrogateArming ?? createRealSurrogateArmingView();
+}
+
+/** Why a destructive verb could not establish that a binding is unserved.
+ * Fixed classes, never a path or an errno string. */
+export type SurrogateBindingRefusal =
+  | "armed"
+  | "agent_uid_mismatch"
+  | "account_lookup_failed"
+  | "artifact_scan_failed"
+  | "socket_absent_with_artifacts"
+  | SurrogateUnlockFailureClass;
+
+export interface SurrogateBindingProbe {
+  state: SurrogateArmedState;
+  /** The uid derived from the binding's own agent, when the account exists. */
+  agentUid?: number;
+  /** The helper uid the refusal is about, when there is one. */
+  refusingUid?: number;
+  refusal?: SurrogateBindingRefusal;
+}
+
+/**
+ * Is THIS binding being served by any helper right now?
+ *
+ * THE ROW'S OWN AGENT DECIDES; AN OPERATOR-NAMED UID CAN ONLY NARROW, NEVER
+ * WIDEN. The uid probed is derived from the binding's agent id through the
+ * arming twin's own lookup, never taken from `--agent-uid`; a flag that does not
+ * EQUAL the derived uid refuses. A mistyped, stale or wrong uid used to read as
+ * an absent socket, which read as unarmed, which let the row and value go while
+ * a live helper on the real uid kept serving them.
+ *
+ * Every helper with an installed plist is probed as well as the derived uid,
+ * because an account rename or deletion breaks the id-to-uid lookup without
+ * stopping the helper that was armed under the old uid; the helper's own
+ * `status` table is what says whether it holds this secret.
+ *
+ * Per helper: a `status` answer listing the secret is `armed`; a `status`
+ * answer that does not list it is that helper not serving it; an absent socket
+ * is unarmed ONLY when none of that uid's installed artifacts exists, and is
+ * `indeterminate` otherwise (an installed helper whose socket is gone may be
+ * restarting); every other outcome is `indeterminate`.
+ */
+export async function probeSurrogateBindingArmed(input: {
+  transport: SurrogateUnlockTransport;
+  arming: SurrogateArmingView;
+  secret: string;
+  agentId: string;
+  operatorAgentUid?: number;
+}): Promise<SurrogateBindingProbe> {
+  let derived: number | undefined;
+  try {
+    derived = await input.arming.resolveAgentUid(input.agentId);
+  } catch {
+    return { state: "indeterminate", refusal: "account_lookup_failed" };
+  }
+  if (input.operatorAgentUid !== undefined && input.operatorAgentUid !== derived) {
+    // Narrow-only: the flag may confirm the derived uid, never replace it.
+    return { state: "indeterminate", agentUid: derived, refusal: "agent_uid_mismatch" };
+  }
+  let installed: number[];
+  try {
+    installed = await input.arming.installedHelperUids();
+  } catch {
+    return { state: "indeterminate", agentUid: derived, refusal: "artifact_scan_failed" };
+  }
+  const candidates = [...new Set([...(derived === undefined ? [] : [derived]), ...installed])];
+  for (const uid of candidates) {
+    const probe = await probeSurrogateHelperArmed(input.transport, uid);
+    if (probe.state === "armed") {
+      if (probe.servedSecrets?.includes(input.secret)) {
+        return { state: "armed", agentUid: derived, refusingUid: uid, refusal: "armed" };
+      }
+      continue;
+    }
+    if (probe.state === "indeterminate") {
+      return {
+        state: "indeterminate",
+        agentUid: derived,
+        refusingUid: uid,
+        refusal: probe.failureClass ?? "connect_failed",
+      };
+    }
+    // An absent socket proves nothing while any installed artifact for that
+    // uid remains: the helper may be restarting, or its socket was removed out
+    // from under it. Only "no socket AND no artifact" is unarmed.
+    let artifacts: boolean;
+    try {
+      artifacts = await input.arming.hasHelperArtifacts(uid);
+    } catch {
+      return { state: "indeterminate", agentUid: derived, refusingUid: uid, refusal: "artifact_scan_failed" };
+    }
+    if (artifacts) {
+      return {
+        state: "indeterminate",
+        agentUid: derived,
+        refusingUid: uid,
+        refusal: "socket_absent_with_artifacts",
+      };
+    }
+  }
+  return { state: "unarmed", agentUid: derived };
+}
+
+/** The refusal text shared by `secrets revoke` and `surrogate remove`. */
+function describeBindingArmedRefusal(
+  probe: SurrogateBindingProbe,
   verb: string,
   secret: string,
-): string | undefined {
-  if (probe.state === "unarmed") return undefined;
-  if (probe.state === "armed") {
+): string {
+  if (probe.refusal === "armed") {
     return (
-      `sanctuary secrets ${verb}: "${secret}" is bound as a surrogate and its agent is ` +
-      `armed, so the helper is serving that binding now.\n` +
-      `  Drop the values now:  sanctuary secrets surrogate lock --agent-uid <N>\n` +
+      `sanctuary secrets ${verb}: "${secret}" is bound as a surrogate and the helper for ` +
+      `agent uid ${probe.refusingUid} is serving that binding now.\n` +
+      `  Drop the values now:  sanctuary secrets surrogate lock --agent-uid ${probe.refusingUid}\n` +
       `  The binding's placeholder goes away at the next unprotect or re-arm.\n`
+    );
+  }
+  if (probe.refusal === "agent_uid_mismatch") {
+    return (
+      `sanctuary secrets ${verb}: --agent-uid does not match the uid of "${secret}"'s own ` +
+      `agent (${probe.agentUid === undefined ? "no such account" : `uid ${probe.agentUid}`}).\n` +
+      `  The binding's agent decides which helper is checked; the flag can only confirm it.\n`
     );
   }
   return (
     `sanctuary secrets ${verb}: could not establish that "${secret}"'s agent is unarmed ` +
-    `(${probe.failureClass ?? "connect_failed"}).\n` +
+    `(${probe.refusal ?? "connect_failed"}).\n` +
     `  A helper may be serving the binding, so the row is left in place.\n`
   );
 }
 
-/** Read `--agent-uid` as the verbs that address one helper all require it.
+/**
+ * Record a refused `remove` or `revoke` on the chain.
  *
- * WHY THE OPERATOR TYPES THE UID AND IT IS NOT DERIVED FROM THE BINDING. A
- * binding names an agent ID (`"hermes"`), and the helper, its sockets and its
- * artifacts are all keyed by agent UID. Resolving one to the other here would
- * be a second resolver beside the arming path's, and after an account rename
- * the two would disagree about which helper to speak to: the CLI would probe a
- * uid no helper owns, read `unarmed`, and remove a row a live helper is
- * serving. The operator names the uid, and a wrong uid reads as `unarmed` for
- * an agent that has no helper, which is the safe direction only because the
- * verbs that use it also refuse on every non-ENOENT outcome. */
+ * A refusal is evidence too: an operator who tried to drop a binding while it
+ * was being served should find that attempt in the same place the success
+ * would have been. `result: "failure"` is the chain's closed vocabulary;
+ * `outcome: "refused"` and the fixed refusal class say why. A chain write that
+ * fails does not turn the refusal into anything else; it is reported.
+ */
+async function recordSurrogateRemovalRefused(
+  ctx: { err: NodeJS.WritableStream; args: SecretsArgs },
+  storagePath: string,
+  input: { secret: string; agent: string; probe: SurrogateBindingProbe; verb: string },
+): Promise<void> {
+  try {
+    const { auditLog, close } = await openSurrogateStore({
+      passphrase: ctx.args.passphrase,
+      storagePath,
+      backend: ctx.args.surrogateBackend,
+    });
+    try {
+      await auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SURROGATE_REMOVED,
+        identity_id: "sanctuary-broker",
+        result: "failure",
+        details: {
+          secret: input.secret,
+          agent: input.agent,
+          agent_uid: input.probe.agentUid ?? null,
+          verb: input.verb,
+          outcome: "refused",
+          reason: input.probe.refusal ?? "connect_failed",
+        },
+      });
+    } finally {
+      await close();
+    }
+  } catch (e) {
+    ctx.err.write(
+      `  The refusal itself could not be recorded on the audit chain ` +
+        `(${e instanceof Error ? e.message : String(e)}).\n`,
+    );
+  }
+}
+
+/** Read `--agent-uid` as the verbs that ADDRESS one helper (`unlock`, `lock`,
+ * `status`, `events`) all require it: those verbs talk to a helper, not about a
+ * binding row, so the uid is the address itself.
+ *
+ * The verbs that remove a binding row (`surrogate remove`, `secrets revoke`)
+ * do NOT take their probe target from here: the row's own agent decides
+ * (`probeSurrogateBindingArmed`), and an operator-named uid can only narrow,
+ * never widen. They read the flag through `parseOptionalSurrogateAgentUid`. */
 export function parseSurrogateAgentUid(argv: string[], verb: string): { agentUid?: number; error?: string } {
   const raw = flagValue(argv, "--agent-uid");
   if (raw === undefined) {
@@ -990,6 +1242,20 @@ export function parseSurrogateAgentUid(argv: string[], verb: string): { agentUid
         `  The helper, its sockets and its tables are keyed by the agent's uid.\n`,
     };
   }
+  return parsePositiveAgentUid(raw, verb);
+}
+
+/** `--agent-uid` as an optional cross-check: absent is fine, malformed is not. */
+export function parseOptionalSurrogateAgentUid(
+  argv: string[],
+  verb: string,
+): { agentUid?: number; error?: string } {
+  const raw = flagValue(argv, "--agent-uid");
+  if (raw === undefined) return {};
+  return parsePositiveAgentUid(raw, verb);
+}
+
+function parsePositiveAgentUid(raw: string, verb: string): { agentUid?: number; error?: string } {
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     return {
@@ -1009,10 +1275,10 @@ async function cmdSurrogateRemove(
   argv: string[],
   ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream; args: SecretsArgs },
 ): Promise<number> {
-  const secret = requirePositional(argv, 0, "surrogate remove <secret> --agent-uid <N>");
-  const uid = parseSurrogateAgentUid(argv, "remove");
-  if (uid.error) {
-    ctx.err.write(uid.error);
+  const secret = requirePositional(argv, 0, "surrogate remove <secret> [--agent-uid <N>]");
+  const crossCheck = parseOptionalSurrogateAgentUid(argv, "remove");
+  if (crossCheck.error) {
+    ctx.err.write(crossCheck.error);
     return 2;
   }
   const storagePath = ctx.args.storagePath ?? (await defaultStoragePath());
@@ -1025,17 +1291,30 @@ async function cmdSurrogateRemove(
     return 1;
   }
   const bindings = loaded.outcome === "absent" ? [] : loaded.document.bindings;
-  if (!bindings.some((b) => b.secret === secret)) {
+  const row = bindings.find((b) => b.secret === secret);
+  if (row === undefined) {
     ctx.err.write(`sanctuary secrets surrogate remove: "${secret}" is not bound.\n`);
     return 1;
   }
 
-  const probe = await probeSurrogateHelperArmed(surrogateTransportFor(ctx.args), uid.agentUid!);
-  const refusal = refuseUnlessUnarmed(probe, "surrogate remove", secret);
-  if (refusal !== undefined) {
-    ctx.err.write(refusal);
+  const probe = await probeSurrogateBindingArmed({
+    transport: surrogateTransportFor(ctx.args),
+    arming: surrogateArmingFor(ctx.args),
+    secret,
+    agentId: row.agent,
+    operatorAgentUid: crossCheck.agentUid,
+  });
+  if (probe.state !== "unarmed") {
+    ctx.err.write(describeBindingArmedRefusal(probe, "surrogate remove", secret));
+    await recordSurrogateRemovalRefused(ctx, storagePath, {
+      secret,
+      agent: row.agent,
+      probe,
+      verb: "surrogate remove",
+    });
     return 1;
   }
+  const uid = { agentUid: probe.agentUid ?? null };
 
   // Row first, then the value. This is the reverse of `add` and for the same
   // reason: the state that must never exist between the two writes is a binding
@@ -1076,9 +1355,12 @@ async function cmdSurrogateRemove(
 // STEP ORDER IS THE POINT (design v2.1 section 3.4.4). Every step that could
 // bring a value into this process sits BEHIND a check that can refuse without
 // one: no-core is established and verified first, then the helper is proved to
-// be answering, then the audit entry is written, and only then is a value read.
-// Reordering any two of them makes a refusal happen after a value already
-// exists in a process that might dump core.
+// be answering, and only then is a value read. Reordering any two of them makes
+// a refusal happen after a value already exists in a process that might dump
+// core. The audit row comes LAST, after the helper's own acceptance, so the
+// chain never says `success` for an unlock the helper refused; a run that fails
+// part-way, or whose success row cannot be written, locks the helper before it
+// exits.
 
 /** Marker the re-executed child carries. Never trusted on its own: the child
  * re-reads the actual hard limit before it does anything (3.4.6, "an
@@ -1209,36 +1491,27 @@ async function cmdSurrogateUnlock(
     return 0;
   }
 
-  // Steps 3 and 4: fortress context, then the audit entry, then values.
+  // Step 3: fortress context. Step 4: values, one per connection. Step 5: the
+  // chain row, which records what the HELPER ACCEPTED and nothing earlier.
   const { store, auditLog, close } = await openSurrogateStore({
     passphrase: ctx.args.passphrase,
     storagePath: ctx.args.storagePath,
     backend: ctx.args.surrogateBackend,
   });
   try {
-    try {
-      await auditLog.appendCritical({
-        layer: "l3",
-        operation: BROKER_OPS.SURROGATE_UNLOCKED,
-        identity_id: "sanctuary-broker",
-        result: "success",
-        details: { agent_uid: uid.agentUid, generation_id: generationId, secrets },
-      });
-    } catch (e) {
-      // Aborts BEFORE any value is read: an unlock the chain did not record is
-      // an unlock nobody can account for later.
-      ctx.err.write(
-        `sanctuary secrets surrogate unlock: the audit entry could not be written ` +
-          `(${e instanceof Error ? e.message : String(e)}). No value was read.\n`,
-      );
-      return 1;
-    }
-
-    // Step 5: one value per connection. Never batched: the one-value rule is
-    // what keeps a single accepted frame from carrying two credentials.
-    let sent = 0;
+    // One value per connection. Never batched: the one-value rule is what keeps
+    // a single accepted frame from carrying two credentials. The loop stops at
+    // the FIRST failure, because everything after it is about to be locked.
+    const accepted: string[] = [];
+    let failure: { secret: string; reason: string; ambiguous: boolean } | null = null;
     for (const secret of secrets) {
-      const value = await store.readValue(secret);
+      let value: string;
+      try {
+        value = await store.readValue(secret);
+      } catch {
+        failure = { secret, reason: "value_unreadable", ambiguous: false };
+        break;
+      }
       const result = await transport.send(uid.agentUid!, {
         v: SURROGATE_WIRE_VERSION,
         id: newSurrogateCorrelationId(),
@@ -1249,25 +1522,125 @@ async function cmdSurrogateUnlock(
         value,
       });
       if (result.outcome === "answered" && result.response.kind === "ok") {
-        sent += 1;
+        accepted.push(secret);
         continue;
       }
+      // AMBIGUOUS means the helper may have stored the value even though we
+      // never saw it say so: a timeout, a dropped connection or a malformed
+      // reply can all follow an accepted unlock. Only an answered `deny` is the
+      // helper saying, in its own words, that it stored nothing.
+      const ambiguous = !(result.outcome === "answered" && result.response.kind === "deny");
+      failure = { secret, reason: describeUnlockOutcome(result), ambiguous };
       // The secret NAME is safe to print (it is in the policy file the operator
       // wrote); the value and the deny detail are not summarised beyond the
       // fixed reason the helper returned.
       ctx.err.write(
         `sanctuary secrets surrogate unlock: the helper refused "${secret}" ` +
-          `(${describeUnlockOutcome(result)}).\n`,
+          `(${failure.reason}).\n`,
+      );
+      break;
+    }
+
+    if (failure === null) {
+      try {
+        await auditLog.appendCritical({
+          layer: "l3",
+          operation: BROKER_OPS.SURROGATE_UNLOCKED,
+          identity_id: "sanctuary-broker",
+          result: "success",
+          details: { agent_uid: uid.agentUid, generation_id: generationId, secrets },
+        });
+      } catch (e) {
+        // A value the chain did not record must not stay resident: an unlock
+        // nobody can account for later is the failure the chain exists for. So
+        // the helper is locked and the command fails.
+        const lock = await lockAfterFailedUnlock(transport, uid.agentUid!);
+        ctx.err.write(
+          `sanctuary secrets surrogate unlock: the audit entry could not be written ` +
+            `(${e instanceof Error ? e.message : String(e)}).\n` +
+            describeLockAfterFailure(lock, uid.agentUid!),
+        );
+        return 1;
+      }
+      ctx.out.write(
+        `Unlocked ${accepted.length} of ${secrets.length} binding(s) for agent uid ${uid.agentUid} ` +
+          `at generation ${generationId}.\n`,
+      );
+      return 0;
+    }
+
+    // FAIL CLOSED ON A PARTIAL UNLOCK. A run that loaded some values and then
+    // failed must not leave those values resident until their TTL: the operator
+    // sees a failed command and would reasonably believe nothing is held. Lock
+    // drops EVERY value this helper holds for the agent, which is the only
+    // drop the codec has; a prior run's values go too, and that is the safe
+    // direction for a command that has just failed.
+    const lock: SurrogateLockAfterFailure =
+      accepted.length > 0 || failure.ambiguous
+        ? await lockAfterFailedUnlock(transport, uid.agentUid!)
+        : "not_needed";
+    try {
+      await auditLog.appendCritical({
+        layer: "l3",
+        operation: BROKER_OPS.SURROGATE_UNLOCKED,
+        identity_id: "sanctuary-broker",
+        result: "failure",
+        // Names and fixed classes only. Never a value.
+        details: {
+          agent_uid: uid.agentUid,
+          generation_id: generationId,
+          secrets,
+          accepted,
+          refused_secret: failure.secret,
+          outcome: "refused",
+          reason: failure.reason,
+          lock,
+        },
+      });
+    } catch (e) {
+      ctx.err.write(
+        `  The failed unlock could not be recorded on the audit chain ` +
+          `(${e instanceof Error ? e.message : String(e)}).\n`,
       );
     }
     ctx.out.write(
-      `Unlocked ${sent} of ${secrets.length} binding(s) for agent uid ${uid.agentUid} ` +
-        `at generation ${generationId}.\n`,
+      `Unlocked ${accepted.length} of ${secrets.length} binding(s) for agent uid ${uid.agentUid} ` +
+        `at generation ${generationId} before a failure.\n`,
     );
-    return sent === secrets.length ? 0 : 1;
+    ctx.err.write(describeLockAfterFailure(lock, uid.agentUid!));
+    return 1;
   } finally {
     await close();
   }
+}
+
+/** What the post-failure lock did. Fixed tokens, recorded on the chain. */
+type SurrogateLockAfterFailure = "acknowledged" | "not_needed" | `failed:${string}`;
+
+async function lockAfterFailedUnlock(
+  transport: SurrogateUnlockTransport,
+  agentUid: number,
+): Promise<SurrogateLockAfterFailure> {
+  const result = await transport.send(agentUid, {
+    v: SURROGATE_WIRE_VERSION,
+    id: newSurrogateCorrelationId(),
+    kind: "lock",
+  });
+  if (result.outcome === "answered" && result.response.kind === "ok") return "acknowledged";
+  return `failed:${describeUnlockOutcome(result)}`;
+}
+
+function describeLockAfterFailure(lock: SurrogateLockAfterFailure, agentUid: number): string {
+  if (lock === "not_needed") {
+    return "  The helper refused the first value, so nothing was loaded by this run.\n";
+  }
+  if (lock === "acknowledged") {
+    return "  The helper was locked: every value it held for this agent was dropped.\n";
+  }
+  return (
+    `  The helper did not acknowledge the lock (${lock.slice("failed:".length)}), so it MAY STILL ` +
+    `HOLD VALUES.\n  Drop them now:  sanctuary secrets surrogate lock --agent-uid ${agentUid}\n`
+  );
 }
 
 /** One fixed token for an outcome, for an operator line. Never a value. */

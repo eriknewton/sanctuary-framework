@@ -128,6 +128,9 @@ describe("the operator's real unlock-socket client against a real helper", () =>
     expect(await probeSurrogateHelperArmed(transport, AGENT_UID)).toEqual({
       state: "armed",
       generationId: GENERATION,
+      // The helper's own table, by secret NAME: what the destructive verbs
+      // check a binding against. Never a value and never a placeholder.
+      servedSecrets: [b.secret],
     });
 
     const unlockId = newSurrogateCorrelationId();
@@ -165,6 +168,7 @@ describe("the operator's real unlock-socket client against a real helper", () =>
     expect(await probeSurrogateHelperArmed(transport, AGENT_UID + 250)).toEqual({
       state: "armed",
       generationId: GENERATION,
+      servedSecrets: [],
     });
 
     // A correct answer followed by a second frame breaks one-frame-each-way:

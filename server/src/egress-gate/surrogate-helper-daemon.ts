@@ -562,30 +562,47 @@ function realFsOps(): SurrogateHelperFsOps {
 }
 
 /**
- * Read ONE newline-terminated frame from a connection and hand it to `onFrame`,
- * then refuse every further byte.
+ * Read ONE newline-terminated frame from a connection, judge it WHOLE, and only
+ * then hand it to `onFrame`.
  *
  * This is the shared half of both codecs' transport: identical framing, one
- * frame each way, `unexpected_extra_bytes` on anything after it. What is NOT
- * shared is which parser `onFrame` calls. Each socket passes exactly one, so a
- * query frame on the unlock socket reaches only the unlock parser, which returns
- * `null`, which is `malformed` (design v2.1 finding B2-B2). There is no
- * fall-through to the other parser and no place to add one.
+ * frame each way, and a refusal for anything after it. What is NOT shared is
+ * which parser `onFrame` calls. Each socket passes exactly one, so a query frame
+ * on the unlock socket reaches only the unlock parser, which returns `null`,
+ * which is `malformed` (design v2.1 finding B2-B2). There is no fall-through to
+ * the other parser and no place to add one.
+ *
+ * STATES, in order, each named because the order is the whole contract:
+ *  - `state_READING`: bytes accumulate under the frame cap; nothing is parsed.
+ *  - `state_JUDGING`: a newline arrived with nothing after it in that chunk. The
+ *    frame is held for ONE `setImmediate` turn so that any chunk the client
+ *    already sent behind it is seen before the frame is acted on.
+ *  - `state_ANSWERED`: exactly one reply has been written. Any later byte only
+ *    closes the connection; there is nobody left to answer.
+ *
+ * Exported for the fault-schedule test, which drives two chunks into one
+ * connection inside one event-loop turn; a real socket cannot schedule that
+ * deterministically. Production reaches it only through `runSurrogateHelperDaemon`.
  */
-function serveOneShotConnection(
+export function serveOneShotConnection(
   socket: Socket,
   ctx: {
     onFrame: (line: string) => Buffer;
-    onExtraBytes: () => Buffer;
+    /** The refusal for trailing bytes. Receives the first frame's text so the
+     * handler can echo that frame's parsed id; it must parse only, never act. */
+    onExtraBytes: (firstLine: string) => Buffer;
     onOversize: () => Buffer;
     onSocketError: () => void;
   },
 ): void {
   let buffer = "";
   let answered = false;
+  /** The frame awaiting judgement (`state_JUDGING`), or null in any other state. */
+  let judging: string | null = null;
   const reply = (frame: Buffer): void => {
     if (answered) return;
     answered = true;
+    judging = null;
     try {
       socket.end(frame);
     } catch {
@@ -601,10 +618,17 @@ function serveOneShotConnection(
   });
   socket.on("data", (chunk: Buffer) => {
     if (answered) {
-      // A byte after the first frame. `supervisor/socket-server.ts` answers and
-      // closes here rather than ignoring, so a client that pipelined learns its
-      // second request was never served.
-      reply(ctx.onExtraBytes());
+      // state_ANSWERED: the one reply is already on the wire, so there is no
+      // second answer to give; the connection simply ends here.
+      socket.destroy();
+      return;
+    }
+    if (judging !== null) {
+      // state_JUDGING: a second chunk arrived before the held frame was acted
+      // on. The request is malformed as a whole, and the held frame is NEVER
+      // served: refusing here, before `onFrame`, is what keeps a pipelined
+      // unlock from loading a value.
+      reply(ctx.onExtraBytes(judging));
       return;
     }
     buffer += chunk.toString("utf8");
@@ -618,14 +642,41 @@ function serveOneShotConnection(
     if (nl === -1) return; // bounded by the cap above
     const line = buffer.slice(0, nl);
     const rest = buffer.slice(nl + 1);
-    const frame = ctx.onFrame(line);
-    reply(frame);
+    buffer = "";
+    // The frame is judged whole before it is acted on; trailing bytes are a
+    // refusal, never a served first frame. A byte after the newline in the SAME
+    // chunk refuses here, before `onFrame` has run, so no side effect of the
+    // first frame (an unlock storing a value) can precede the refusal.
     if (rest.length > 0) {
-      // Extra bytes arrived in the SAME chunk as the frame. The reply above
-      // already went out for the frame that was legal; nothing further is
-      // served on this connection.
-      socket.destroy();
+      reply(ctx.onExtraBytes(line));
+      return;
     }
+    judging = line;
+    setImmediate(() => {
+      if (answered || judging === null) return;
+      if (socket.destroyed) {
+        // The client went away while the frame was held. Nobody can receive
+        // the answer, so the frame is not acted on at all.
+        judging = null;
+        answered = true;
+        return;
+      }
+      reply(ctx.onFrame(line));
+    });
+  });
+  socket.on("end", () => {
+    // The client half-closed: no further byte can arrive, so a held frame is
+    // now provably whole and is acted on at once. The listener is created with
+    // `allowHalfOpen` (see `listenOneShot`) precisely so this reply can still be
+    // written after the client's FIN.
+    if (answered) return;
+    if (judging !== null) {
+      reply(ctx.onFrame(judging));
+      return;
+    }
+    // Half-closed with no complete frame: there is nothing to answer.
+    answered = true;
+    socket.destroy();
   });
 }
 
@@ -677,6 +728,18 @@ function answerQuery(
   // The concurrency cap is taken AFTER the frame parses and BEFORE any table
   // work, and released on every path below, because a `rate_limited` answer must
   // not depend on which decision the query would have reached.
+  //
+  // RULE 12 DISPOSITION (AGENTS.md): this critical section has NO deadline, NO
+  // cancellation, NO detached write and NO re-queue. The slot is taken and
+  // released inside this one synchronous call, and the reply bytes are handed
+  // to the socket only AFTER `finally` has released it, so a client that never
+  // reads (the write stalls) or that disconnects mid-write holds a socket, which
+  // the idle timeout bounds, and never a slot. The timeout-then-late-completion
+  // schedule rule 12 names therefore cannot occur here; the realistic schedule
+  // (stalled readers plus mid-write disconnects) is pinned by the rule-12 test
+  // in `test/egress-gate/surrogate-helper-daemon-runtime.test.ts`. If a deadline
+  // or an async step is ever added inside this section, that test must grow the
+  // delayed-completion schedule in the same change.
   if (!ctx.acquireSlot()) return deny("rate_limited", "rate_limited");
   try {
     const row = ctx.table.get(req.placeholder);
@@ -921,7 +984,10 @@ async function listenOneShot(
   onServerError: () => void,
 ): Promise<Server> {
   await fsOps.rm(socketPath); // a stale socket from a prior run is EADDRINUSE otherwise
-  const server = createServer(onConnection);
+  // `allowHalfOpen`: a client that writes its one frame and then half-closes
+  // must still receive its one reply. Must match the `end` handling in
+  // `serveOneShotConnection`, which acts on a held frame when the FIN arrives.
+  const server = createServer({ allowHalfOpen: true }, onConnection);
   server.on("error", onServerError);
   const priorUmask = process.umask(SURROGATE_HELPER_SOCKET_UMASK);
   try {
@@ -1055,15 +1121,21 @@ export async function runSurrogateHelperDaemon(
             onEvent,
             armExpiryTimer,
           }),
-        onExtraBytes: () => {
+        onExtraBytes: (firstLine) => {
           onEvent({
             kind: "unlock_denied",
             agentUid: deps.agentUid,
             reason: "unexpected_extra_bytes",
           });
+          // PARSE ONLY, never `answerUnlockSocket`: the first frame's id is
+          // echoed so the client can correlate the refusal, and nothing the
+          // frame asked for (an unlock, a lock) is carried out. The wire reason
+          // is `malformed` because the unlock deny enum is closed; the
+          // `unexpected_extra_bytes` class lives in the helper's own event.
+          const parsed = parseSurrogateUnlockSocketRequest(firstLine);
           return encodeSurrogateUnlockSocketResponse({
             v: SURROGATE_WIRE_VERSION,
-            id: MALFORMED_CORRELATION_ID,
+            id: parsed?.id ?? MALFORMED_CORRELATION_ID,
             kind: "deny",
             reason: "malformed",
           });
@@ -1104,15 +1176,18 @@ export async function runSurrogateHelperDaemon(
             acquireSlot,
             releaseSlot,
           }),
-        onExtraBytes: () => {
+        onExtraBytes: (firstLine) => {
           onEvent({
             kind: "query_denied",
             agentUid: deps.agentUid,
             reason: "unexpected_extra_bytes",
           });
+          // PARSE ONLY, never `answerQuery`: echo the first frame's id, serve
+          // nothing. Same closed-enum reasoning as the unlock socket's twin.
+          const parsed = parseSurrogateQueryRequest(firstLine);
           return encodeSurrogateQueryResponse({
             v: SURROGATE_WIRE_VERSION,
-            id: MALFORMED_CORRELATION_ID,
+            id: parsed?.id ?? MALFORMED_CORRELATION_ID,
             kind: "deny",
             reason: "malformed",
           });

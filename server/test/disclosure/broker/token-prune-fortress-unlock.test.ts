@@ -1,3 +1,4 @@
+// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker and TokenIssuer constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
 /**
  * Hardening wave 6 finding #86, token expiry pruning hooked into the
  * fortress-unlock initialization path.

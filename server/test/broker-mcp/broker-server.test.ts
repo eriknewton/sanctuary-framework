@@ -1,3 +1,4 @@
+// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
 /**
  * Broker MCP Server Tests
  *
