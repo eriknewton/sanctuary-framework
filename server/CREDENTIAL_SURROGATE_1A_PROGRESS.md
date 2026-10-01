@@ -997,3 +997,12 @@ witness, and the report must not present it as one.
 - `.test-baseline` 16787 to 16795 (+8 tests, none platform-gated).
 - `test/fixtures/typecheck-tests-baseline.txt` re-recorded at the same count (979):
   the inserted tests shifted 24 existing diagnostics' line numbers.
+
+## Suite pins (2026-10-01)
+
+The coordinator's pre-push full suite failed 7 tests in 5 files, all consistency pins
+the new matrix row and the new module move: `EXPECTED_ASSURANCE_ROW_COUNT` 27 to 28 in
+`scripts/synthetic-coverage/assurance-matrix.ts`; `CONTRIBUTING.md` module-map counts
+62 to 63 modules and 54 to 55 barrels; `scripts/synthetic-coverage/coverage-baseline.json`
+regenerated with `npm run synthetic-coverage:baseline` (adds row 28, `partial`,
+`no_fixture`). No test was added or removed, so `.test-baseline` stays 16795.
