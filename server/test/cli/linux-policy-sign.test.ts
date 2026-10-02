@@ -46,8 +46,8 @@ describe("install policy signer", () => {
 });
 
 // The package's real executable is the consumer: npm-style links and inherited fd 3 must work.
-import { mkdtempSync, writeFileSync, openSync, closeSync, readFileSync, symlinkSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, writeFileSync, openSync, closeSync, readFileSync, symlinkSync, existsSync, rmSync, chmodSync, mkdirSync, statSync, realpathSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 it("the packaged entry signs through an npm-style link and refuses key/output custody faults", () => {
@@ -129,4 +129,67 @@ it("direct invocation requires both inherited core limits to be zero", () => {
       expect(existsSync(join(dir, "out"))).toBe(dumpsPermanentlyDisabled);
     } finally { closeSync(fd); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// These resolver fixtures keep OS installations untouched. Only ownership and
+// ancestors outside the disposable tree are modeled; access checks remain real.
+function resolverFixture(launcher: string, dir: string): string {
+  const perl = launcher.split("exec /usr/bin/perl -T -e '\n")[1]!.split("my @candidates")[0]!;
+  const prefix = JSON.stringify(dir);
+  return perl.replace("my ($path) = @_;", `my ($path) = @_; return 1 unless index($path, ${prefix}) == 0;`)
+    .replace("$s[4] == 0", "$s[4] == $>");
+}
+
+it.skipIf(process.platform !== "darwin" || process.getuid?.() === 0)("kernel access checks refuse ACL-writable interpreter files and ancestors", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "signer-acl-")));
+  const launcher = readFileSync(resolve("bin/sanctuary-linux-policy-sign"), "utf8");
+  const perl = resolverFixture(launcher, dir);
+  const aclPaths: string[] = [];
+  try {
+    const node = join(dir, "node");
+    writeFileSync(node, "fixture", { mode: 0o555 });
+    for (const path of [node, dir]) {
+      chmodSync(path, 0o555);
+      const rights = path === dir ? "add_file,add_subdirectory,delete_child" : "write,append";
+      const acl = spawnSync("/bin/chmod", ["+a", `user:${userInfo().username} allow ${rights}`, path], { encoding: "utf8" });
+      expect(acl.status, acl.stderr).toBe(0);
+      aclPaths.push(path);
+      expect(statSync(path).mode & 0o222).toBe(0);
+      const access = spawnSync("/usr/bin/perl", ["-e", 'print((-w $ARGV[0]) ? "mode-write" : "mode-read"); { use filetest "access"; print((-w $ARGV[0]) ? ":access-write" : ":access-read"); }', path], { encoding: "utf8" });
+      expect(access.stdout).toBe("mode-read:access-write");
+      // Prove the ACL grants an actual mutation, not just a metadata observation.
+      if (path === node) writeFileSync(node, "rewritten");
+      else writeFileSync(join(dir, "child"), "created");
+      const checked = spawnSync("/usr/bin/perl", ["-e", perl + '\nexit(trusted_entry($ARGV[0]) ? 91 : 0);', path], { encoding: "utf8" });
+      expect(checked.status, checked.stderr).toBe(0);
+      spawnSync("/bin/chmod", ["-N", path]);
+    }
+  } finally {
+    for (const path of aclPaths) spawnSync("/bin/chmod", ["-N", path]);
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("the resolver checks intermediate symlink ancestors before canonicalizing", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "signer-hops-")));
+  const launcher = readFileSync(resolve("bin/sanctuary-linux-policy-sign"), "utf8");
+  const perl = resolverFixture(launcher, dir);
+  try {
+    const safe = join(dir, "safe"); mkdirSync(safe);
+    const hop = join(dir, "hop"); mkdirSync(hop);
+    const node = join(safe, "node"); writeFileSync(node, "fixture", { mode: 0o555 });
+    symlinkSync("../safe/node", join(hop, "node"));
+    symlinkSync("hop/node", join(dir, "candidate"));
+    const check = () => spawnSync("/usr/bin/perl", ["-e", perl + '\nexit(defined(trusted_path($ARGV[0])) ? 0 : 1);', join(dir, "candidate")], { encoding: "utf8" });
+    chmodSync(dir, 0o555); chmodSync(safe, 0o555); chmodSync(hop, 0o555);
+    expect(check().status).toBe(0);
+    // Group/other writes are always refused, including when tests run as root.
+    chmodSync(hop, 0o777);
+    const refused = check();
+    expect(refused.status, refused.stderr).toBe(1);
+  } finally {
+    chmodSync(dir, 0o700); chmodSync(join(dir, "safe"), 0o700); chmodSync(join(dir, "hop"), 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

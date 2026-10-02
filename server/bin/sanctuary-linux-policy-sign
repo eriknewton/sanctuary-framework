@@ -13,28 +13,57 @@ unset PERL5OPT PERL5LIB PERLLIB
 exec /usr/bin/perl -T -e '
 use strict;
 use warnings;
-use Cwd qw(abs_path);
 use Fcntl qw(:mode);
+use filetest "access";
+sub trusted_entry {
+    my ($path) = @_;
+    my @s = lstat($path); # POSIX stat slots: mode = 2, owner uid = 4.
+    return 0 unless @s && $s[4] == 0;
+    # Symlink permissions are inert; its already-verified parent protects replacement.
+    return 1 if S_ISLNK($s[2]);
+    # 0022 selects group/other write; filetest access asks the kernel about ACLs.
+    # Root is trusted, but ordinary invokers must not be able to rewrite this inode.
+    return ($s[2] & 0022) == 0 && ($> == 0 || !-w $path);
+}
 sub trusted_path {
     my ($path) = @_;
-    while (1) {
-        my @s = lstat($path); # POSIX stat slots: mode = 2, owner uid = 4.
-        return 0 unless @s && $s[4] == 0;
-        # 0022 selects group/other write bits; -w also checks invoking-user ACLs.
-        # Symlink modes do not control writes; its protected parent does.
-        return 0 unless S_ISLNK($s[2]) || (($s[2] & 0022) == 0 && ($> == 0 || !-w $path));
-        last if $path eq "/";
-        $path =~ s{/[^/]+$}{};
-        $path = "/" if $path eq "";
+    return unless $path =~ m{\A/};
+    my @pending = split m{/}, $path;
+    my $resolved = "/";
+    my $links = 0;
+    # Match the Linux traversal ceiling; finite expansion also refuses link cycles.
+    my $max_links = 40;
+    return unless trusted_entry($resolved);
+    while (@pending) {
+        my $part = shift @pending;
+        next if $part eq "" || $part eq ".";
+        if ($part eq "..") {
+            $resolved =~ s{/[^/]+$}{};
+            $resolved = "/" if $resolved eq "";
+            next;
+        }
+        my $next = ($resolved eq "/" ? "" : $resolved) . "/" . $part;
+        return unless trusted_entry($next);
+        if (-l $next) {
+            return if ++$links > $max_links;
+            my $target = readlink($next);
+            return unless defined($target);
+            # Inspect every hop before following it: realpath alone hides replaceable
+            # intermediate links, even when the final executable is root-custodied.
+            $resolved = "/" if $target =~ m{\A/};
+            unshift @pending, split m{/}, $target;
+        } else {
+            return if @pending && !-d $next;
+            $resolved = $next;
+        }
     }
-    return 1;
+    return $resolved;
 }
 my @candidates = $^O eq "darwin" ? qw(/usr/local/bin/node /opt/homebrew/bin/node)
                : $^O eq "linux" ? qw(/usr/bin/node /usr/local/bin/node) : ();
 for my $candidate (@candidates) {
-    next unless trusted_path($candidate);
-    my $node = abs_path($candidate);
-    next unless defined($node) && trusted_path($node) && -f $node && -x $node;
+    my $node = trusted_path($candidate);
+    next unless defined($node) && -f $node && -x $node;
     # Untaint only after custody verification; taint mode excludes Perl env hooks.
     ($node) = $node =~ m{\A(/[^\0\r\n]+)\z};
     next unless defined($node);
