@@ -36,10 +36,16 @@ export const MAX_FRAME_BYTES = loadMaxFrameBytes();
 
 const HEADER_END = "\r\n\r\n";
 const HEADER_END_BYTES = new TextEncoder().encode(HEADER_END);
+// The wire header is one Content-Length line, a decimal length and its terminator.
+// Must match frame's header construction below; body bytes have their own cap.
+const MAX_FRAME_HEADER_BYTES = new TextEncoder().encode(
+  `${CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER}: ${MAX_MAX_FRAME_BYTES}${HEADER_END}`,
+).length;
 
 /** Encode an already-serialized JSON body into an LSP-framed buffer. */
 export function frame(jsonBody: string): Uint8Array {
   const bodyBytes = new TextEncoder().encode(jsonBody);
+  // Must match MAX_FRAME_HEADER_BYTES above so every supported length fits the header cap.
   const header = `${CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER}: ${bodyBytes.length}\r\n\r\n`;
   const headerBytes = new TextEncoder().encode(header);
   const out = new Uint8Array(headerBytes.length + bodyBytes.length);
@@ -90,8 +96,11 @@ function findHeaderEnd(buf: Uint8Array): number {
  * (negative length, malformed header). For partial frames, returns "need_more".
  */
 export function parseFrame(buf: Uint8Array): ParseStep {
-  const headerEnd = findHeaderEnd(buf);
+  // Search only the largest valid header; an unterminated header must never
+  // accumulate unbounded bytes or scan an arbitrarily large body as a header.
+  const headerEnd = findHeaderEnd(buf.subarray(0, MAX_FRAME_HEADER_BYTES));
   if (headerEnd === -1) {
+    if (buf.length >= MAX_FRAME_HEADER_BYTES) return { kind: "error", reason: "frame header exceeds max bytes" };
     return { kind: "need_more" };
   }
 
