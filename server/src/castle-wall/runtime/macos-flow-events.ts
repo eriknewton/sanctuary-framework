@@ -582,7 +582,8 @@ export class MacOSFlowEventConsumer {
   /** Record discarded input without retaining its payload or spawning one write per drop. */
   noteIngressDrop(reason: MacOSIngressDropReason, count = 1): void {
     if (this.ingressDrops[reason] === 0) {
-      // The operator must see loss even when the audit backend cannot persist.
+      // SAFETY: stderr is the daemon operator log; the operator must see loss
+      // even when the audit backend cannot persist, once per reason per window.
       console.error(`[castle-wall] ingress discarded reason=${reason}; counts pending audit`);
     }
     this.ingressDrops[reason] += count;
