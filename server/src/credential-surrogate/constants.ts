@@ -163,3 +163,7 @@ export const MAX_SURROGATE_UNLOCK_SECONDS = 86400;
  * unscanned and emits an event saying so rather than scanning without a bound.
  */
 export const MAX_SURROGATE_ECHO_SCAN_BYTES = 256 * MAX_SURROGATE_VALUE_BYTES;
+
+/** TCP plus TLS gets twice the local helper round-trip budget, with an explicit
+ * wall-clock bound independent of Node defaults. Enforced before header writes. */
+export const SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS = 2 * SURROGATE_QUERY_TIMEOUT_MS;

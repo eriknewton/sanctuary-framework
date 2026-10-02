@@ -430,3 +430,5 @@ export {
   type SurrogateHelperFsOps,
   type SurrogateHelperStartRefusal,
 } from "./surrogate-helper-daemon.js";
+
+export { createSurrogateHelperClient, type SurrogateHelperClient, type SurrogateHelperResult } from "./surrogate-helper-client.js";
