@@ -626,7 +626,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     let deadline: ReturnType<typeof setTimeout> | undefined;
     // The placeholder admission cap bounds retained join keys; the request closure owns their lifetime.
     const queryIds = new Set<SurrogateCorrelationId>();
-    let committed = false;
+    let swapSentUpstream = false;
     const emit = (kind: SurrogateGateEvent["kind"], code: SurrogateGateEvent["code"], status: number, correlationId?: SurrogateCorrelationId): void => {
       // DEBT(SURROGATE-GATE-EVENTS-CHAIN): per-request events reach the root-readable gate log only, not the fortress chain; assurance stays partial.
       // Binding attribution joins correlationId with the helper event; the gate never asserts which binding answered.
@@ -667,7 +667,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     };
     response.once("finish", () => {
       // A committed swap's completion records final body octets and upstream status; a refused request cannot become a success.
-      if (state !== "DONE" && committed) for (const id of queryIds) emit("surrogate_swap", "swap", response.statusCode, id);
+      if (state !== "DONE" && swapSentUpstream) for (const id of queryIds) emit("surrogate_swap", "swap", response.statusCode, id);
       state_DONE();
     });
     response.once("close", () => {
@@ -759,8 +759,8 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
         });
       } catch { return refuse("header_write_failed"); }
       const recordCommit = (): void => {
-        if (committed) return;
-        committed = true;
+        if (swapSentUpstream) return;
+        swapSentUpstream = true;
         // The first successful write/end commits headers to TLS; status 0 means no upstream response exists yet.
         for (const swap of swaps) emit("surrogate_swap", "swap", 0, swap.correlationId);
       };
