@@ -5,7 +5,7 @@
 //! Capability: an agent started by this unit runs only after the Castle Wall
 //! unit is ready, only as the uid named by the instance, only when a
 //! credential self-check and a root kernel gate both exit 0, and it is stopped
-//! and never restarted when the wall stops or its process ends. These tests
+//! on wall loss; an explicit wall restart propagates a fresh activation. These tests
 //! prove the unit CARRIES exactly the directives that sentence depends on; the
 //! real-manager behaviour is proven by TB0a, TB0b (tests/systemd_unit.rs) and
 //! TB10 (tests/integration_linux_runtime_activation.rs).
@@ -22,16 +22,16 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The audited agent unit digest. Pinned only after TB0a and TB0b passed on a
-/// systemd 255 PID 1 host; any byte change, including a comment, needs a fresh
-/// review of the effective unit before this value moves.
-const AGENT_UNIT_SHA256: &str = "859d6e3cd65e0025aad423b4b74513628d26f80a61d2fe3667bb43c4f1180e34";
+/// The unit digest, pinned after the actual-manager P3 lifecycle/isolation
+/// capture on systemd 255 PID 1. Any byte change, including a comment, requires
+/// another review of the effective unit before this value moves.
+const AGENT_UNIT_SHA256: &str = "736d206cfbbabf5bee0b971de0ab01e49d69d633f511104df16bfa209ba9aadd";
 
 /// The installed daemon path both `ExecStartPre=` lines execute.
 /// Must match `DAEMON_PATH` in packaging/ubuntu/lifecycle-guard.py.
 const DAEMON_PATH: &str = "/usr/local/libexec/sanctuary/castle-wall-daemon";
 
-/// The complete directive set of section 5.1 of the slice B design, as
+/// The complete directive set of section 4.3 of the install design, as
 /// (section, key, value) triples in file order. TB1b compares the unit's
 /// multiset against exactly this, so any extra directive (a supplementary
 /// group, an ambient capability, a second dependency edge, an
@@ -39,7 +39,9 @@ const DAEMON_PATH: &str = "/usr/local/libexec/sanctuary/castle-wall-daemon";
 const EXPECTED_DIRECTIVES: &[(&str, &str, &str)] = &[
     ("Unit", "Description", "Sanctuary confined agent (uid %i)"),
     ("Unit", "BindsTo", "sanctuary-castle-wall.service"),
-    ("Unit", "After", "sanctuary-castle-wall.service"),
+    ("Unit", "After", "sanctuary-castle-wall.service network-online.target var-lib-sanctuary\\x2dagent\\x2dworkspace.mount"),
+    ("Unit", "Wants", "network-online.target"),
+    ("Unit", "Requires", "var-lib-sanctuary\\x2dagent\\x2dworkspace.mount"),
     ("Service", "Type", "exec"),
     ("Service", "User", "%i"),
     ("Service", "Group", "%i"),
@@ -66,12 +68,26 @@ const EXPECTED_DIRECTIVES: &[(&str, &str, &str)] = &[
     ("Service", "SendSIGKILL", "yes"),
     ("Service", "NoNewPrivileges", "yes"),
     ("Service", "CapabilityBoundingSet", ""),
-    ("Service", "StateDirectory", "sanctuary-agent-%i"),
-    ("Service", "StateDirectoryMode", "0700"),
-    ("Service", "RuntimeDirectory", "sanctuary-agent-%i"),
-    ("Service", "RuntimeDirectoryMode", "0700"),
-    ("Service", "WorkingDirectory", "%S/sanctuary-agent-%i"),
-    ("Service", "Environment", "HOME=%S/sanctuary-agent-%i"),
+    ("Service", "WorkingDirectory", "/var/lib/sanctuary-agent-workspace"),
+    ("Service", "Environment", "HOME=/var/lib/sanctuary-agent-workspace"),
+    ("Service", "ProtectSystem", "strict"),
+    ("Service", "ProtectHome", "yes"),
+    ("Service", "ReadWritePaths", "/var/lib/sanctuary-agent-workspace"),
+    ("Service", "InaccessiblePaths", "/tmp /var/tmp /dev/shm /run/user"),
+    ("Service", "PrivateDevices", "yes"),
+    ("Service", "ProtectKernelTunables", "yes"),
+    ("Service", "ProtectKernelModules", "yes"),
+    ("Service", "ProtectControlGroups", "yes"),
+    ("Service", "RestrictAddressFamilies", "AF_INET AF_INET6"),
+    ("Service", "RestrictNamespaces", "yes"),
+    ("Service", "SystemCallArchitectures", "native"),
+    ("Service", "MemoryMax", "512M"),
+    ("Service", "TasksMax", "64"),
+    ("Service", "LimitCORE", "0"),
+    ("Service", "StandardInput", "null"),
+    ("Service", "StandardOutput", "null"),
+    ("Service", "StandardError", "null"),
+    ("Install", "WantedBy", "multi-user.target"),
 ];
 
 fn crate_root() -> PathBuf {
@@ -88,7 +104,7 @@ fn agent_unit_text() -> String {
 
 /// Every canonical-form violation in `text` (empty means canonical).
 ///
-/// The form: exactly one `[Unit]` then one `[Service]` and no other section;
+/// The form: exactly one `[Unit]` then one `[Service]` then one `[Install]` and no other section;
 /// comments start at column 0 with `#` and never contain `[`; every other
 /// non-blank line is `Key=value` with an ASCII-letter key and no whitespace
 /// before `=`; no line has leading whitespace, a carriage return or a trailing
@@ -120,7 +136,7 @@ fn canonical_form_violations(text: &str) -> Vec<String> {
         }
         if line.starts_with('[') {
             match line {
-                "[Unit]" | "[Service]" => sections.push(line),
+                "[Unit]" | "[Service]" | "[Install]" => sections.push(line),
                 other => violations.push(format!("line {n}: section {other} not allowed")),
             }
             continue;
@@ -135,9 +151,9 @@ fn canonical_form_violations(text: &str) -> Vec<String> {
             _ => violations.push(format!("line {n}: not Key=value: {line:?}")),
         }
     }
-    if sections != ["[Unit]", "[Service]"] {
+    if sections != ["[Unit]", "[Service]", "[Install]"] {
         violations.push(format!(
-            "sections must be exactly [Unit] then [Service], got {sections:?}"
+            "sections must be exactly [Unit] then [Service] then [Install], got {sections:?}"
         ));
     }
     for (key, count) in &key_counts {
@@ -284,7 +300,7 @@ fn tb1a_decoys_are_refused_by_the_canonical_form() {
             shipped.replace("Restart=no\n", "  Restart=no\n"),
         ),
         (
-            "an Install section",
+            "a repeated Install section",
             format!("{shipped}\n[Install]\nWantedBy=multi-user.target\n"),
         ),
         (
@@ -531,4 +547,60 @@ fn tb2_literal_identities_and_instance_names_are_refused() {
     }
     assert!(!hard_coded_instances("x sanctuary-agent@1500.service").is_empty());
     assert!(hard_coded_instances("sanctuary-agent@.service sanctuary-agent@<uid>").is_empty());
+}
+
+#[test]
+fn install_target_and_every_security_directive_are_exact() {
+    let shipped = agent_unit_text();
+    for (section, key, value) in EXPECTED_DIRECTIVES {
+        let line = format!("{key}={value}\n");
+        assert!(shipped.contains(&line), "missing {section}/{key}");
+        let mutant = shipped.replacen(&line, "", 1);
+        assert!(
+            !canonical_form_violations(&mutant).is_empty()
+                || !directive_set_differences(&mutant).is_empty(),
+            "removed {key}"
+        );
+    }
+    for mutant in [
+        shipped.replace("WantedBy=multi-user.target", "WantedBy=default.target"),
+        shipped.replace(
+            "WantedBy=multi-user.target",
+            "WantedBy=multi-user.target\nAlias=other.service",
+        ),
+        shipped.replace(
+            "WantedBy=multi-user.target",
+            "WantedBy=multi-user.target\nWantedBy=multi-user.target",
+        ),
+    ] {
+        assert!(
+            !canonical_form_violations(&mutant).is_empty()
+                || !directive_set_differences(&mutant).is_empty()
+        );
+    }
+}
+
+#[test]
+fn workspace_mount_is_mandatory_and_has_the_entire_fixed_budget() {
+    // Must match WORKSPACE_MOUNT_UNIT in src/linux_install/contract.rs.
+    const WORKSPACE_MOUNT_UNIT: &str = "var-lib-sanctuary\\x2dagent\\x2dworkspace.mount";
+    let text =
+        std::fs::read_to_string(crate_root().join("systemd").join(WORKSPACE_MOUNT_UNIT)).unwrap();
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "[Unit]",
+            "Description=Sanctuary bounded agent workspace",
+            "[Mount]",
+            "What=tmpfs",
+            "Where=/var/lib/sanctuary-agent-workspace",
+            "Type=tmpfs",
+            "Options=size=64M,nr_inodes=4096,mode=1777,nosuid,nodev,noexec",
+            "DirectoryMode=0755",
+        ]
+    );
 }
