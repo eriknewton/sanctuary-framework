@@ -91,6 +91,8 @@ import {
   SURROGATE_STATUS, SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS, SURROGATE_BOUND_PORT,
   parseSurrogateForwardTarget, reconcileSurrogateHost, checkSurrogateRawHeaders,
   scanSurrogateRequest, surrogateContentLength, buildSurrogateUpstreamHeaders, isSurrogateQueryLocation,
+  SurrogateEchoScanner, SURROGATE_ECHO_BLOCKED,
+  type SurrogateEchoCause, type SurrogateEchoCode,
   type SurrogateCorrelationId, type SurrogateRefusal,
 } from "../credential-surrogate/index.js";
 import type { SurrogateHelperClient } from "./surrogate-helper-client.js";
@@ -115,6 +117,16 @@ export type SurrogateGateEvent = {
   code: SurrogateRefusal | "swap";
   reason?: SurrogateRefusal;
 };
+/** Echo outcomes join the same helper query IDs as swap events, never a binding ordinal.
+ * Fixed codes and causes must match credential-surrogate/echo-scanner.ts. */
+export type SurrogateEchoEvent = {
+  authority: string;
+  correlationId: SurrogateCorrelationId;
+  requestBytes: number;
+  responseBytes: number;
+  status: number;
+} & ({ kind: "surrogate_echo_blocked"; code: Extract<SurrogateEchoCode, "echo_blocked"> }
+  | { kind: "surrogate_echo_unscanned"; code: Extract<SurrogateEchoCode, "echo_unscanned">; cause: SurrogateEchoCause });
 import type { Duplex } from "node:stream";
 
 import {
@@ -207,6 +219,7 @@ export interface GateLivenessProbe {
 /** Events the gate emits for audit/posture wiring. */
 export type EgressGateEvent =
   | SurrogateGateEvent
+  | SurrogateEchoEvent
   | { kind: "liveness_refused"; authority: string; reasons: string[] }
   | { kind: "peer_uid_mismatch"; authority: string; peerUid: number; peerPid: number; agentUid: number }
   | { kind: "peer_unresolved"; authority: string }
@@ -746,11 +759,69 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
         }, (incoming) => {
           if (state === "DONE") { incoming.destroy(); return; }
           try {
-            // Slice 1b-i streams swapped responses unscanned; the echo guard belongs to 1b-ii.
             incoming.on("error", () => refuse("upstream_reset"));
+            if (!swaps.length) {
+              response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+              incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
+              incoming.pipe(response);
+              return;
+            }
+            const scanner = new SurrogateEchoScanner(swaps.map(swap => swap.value));
+            const emitEcho = (cause?: SurrogateEchoCause): void => {
+              // Every sent swap gets a join key; the helper, not response content, supplies binding attribution.
+              for (const swap of swaps) onEvent?.({ authority, correlationId: swap.correlationId,
+                requestBytes, responseBytes, status: response.statusCode,
+                ...(cause ? { kind: "surrogate_echo_unscanned", code: "echo_unscanned", cause } as const
+                  : { kind: "surrogate_echo_blocked", code: "echo_blocked" } as const) });
+            };
+            const blockEcho = (header: boolean): void => {
+              // Mark terminal before destroying either peer so transport callbacks cannot report success.
+              state = "DONE";
+              scanner.abort();
+              incoming.destroy();
+              upstream?.destroy();
+              if (header) {
+                const [status, code] = SURROGATE_ECHO_BLOCKED;
+                response.writeHead(status, { "Connection": "close", "X-Sanctuary-Gate": code });
+                emitEcho();
+                response.end();
+              } else {
+                emitEcho();
+                response.destroy();
+              }
+            };
+            if (scanner.headersEcho(incoming.rawHeaders)) { blockEcho(true); return; }
             response.writeHead(incoming.statusCode ?? 502, incoming.headers);
-            incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
-            incoming.pipe(response);
+            const encoding = incoming.headers["content-encoding"];
+            if (encoding !== undefined && (typeof encoding !== "string" || encoding.trim().toLowerCase() !== "identity")) {
+              scanner.abort();
+              emitEcho("encoding");
+              incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
+              incoming.pipe(response);
+              return;
+            }
+            // No response deadline or retry is added. Existing client cancellation now owns
+            // carry disposal; late end/data/drain callbacks must never write after that abort.
+            const resume = (): void => { if (!stopped()) incoming.resume(); };
+            response.on("drain", resume);
+            response.once("close", () => {
+              scanner.abort();
+              response.removeListener("drain", resume);
+              incoming.destroy();
+            });
+            incoming.once("error", () => scanner.abort());
+            incoming.on("data", (chunk: Buffer) => {
+              if (stopped()) { scanner.abort(); return; }
+              responseBytes += chunk.length;
+              const result = scanner.scan(chunk);
+              if (result.blocked) { blockEcho(false); return; }
+              if (result.ceiling) emitEcho("ceiling");
+              if (result.output.length && !response.write(result.output)) incoming.pause();
+            });
+            incoming.once("end", () => {
+              if (stopped()) { scanner.abort(); return; }
+              response.end(scanner.finish());
+            });
           } catch {
             // Response callbacks run outside the dial's try; upstream-controlled metadata must not kill the gate.
             incoming.destroy();
