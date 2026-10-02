@@ -117,6 +117,8 @@ jobs:
           deb=("$RUNNER_TEMP"/install/*.deb)
           [[ ${#deb[@]} == 1 ]]
           sudo env PYTHONDONTWRITEBYTECODE=1 python3 "$source/test-install-archive.py" "${deb[0]}" "$INSTALL_SOURCE_SHA"
+          # The builder owns the staging directory as root; the runner adds CI evidence.
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/install"
           mkdir "$RUNNER_TEMP/install/internal"
           cp "$RUNNER_TEMP"/internal/*.deb "$RUNNER_TEMP/install/internal/"
           python3 "$source/record-install-ci.py" "$RUNNER_TEMP/install/build-context.json"
