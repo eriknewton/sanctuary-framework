@@ -69,7 +69,15 @@ def provision(witness, argv):
     require(refused.returncode != 0 and 'identical provision request' in refused.stderr, 'changed request admitted')
     # The operator may change across a resume; the current audit principal must
     # remain excluded even when that uid has no passwd entry.
-    refused = witness.run(['/bin/sh', '-c', 'printf 60124 > /proc/self/loginuid; exec "$@"', 'resume-test', *argv], expected=None)
+    # Root-owned input ancestry lets the second principal reach that guard;
+    # the original operator's home would instead refuse at input custody.
+    operator_argv = list(argv)
+    stage_index = operator_argv.index('--stage-file') + 1
+    shared_input = witness.path / 'resume-endpoints.json'
+    shared_input.write_bytes(Path(operator_argv[stage_index]).read_bytes())
+    shared_input.chmod(0o644)
+    operator_argv[stage_index] = str(shared_input)
+    refused = witness.run(['/bin/sh', '-c', 'printf 60124 > /proc/self/loginuid; exec "$@"', 'resume-test', *operator_argv], expected=None)
     require(refused.returncode != 0 and 'current operator' in refused.stderr, 'current operator collision admitted')
     invalid = subprocess.run([os.fsencode(CLI), b'\xff'], capture_output=True, timeout=10)
     require(invalid.returncode == 1 and b'non-UTF-8 argument refused' in invalid.stderr, 'argv refusal not bounded')
