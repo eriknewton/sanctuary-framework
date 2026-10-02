@@ -136,9 +136,70 @@ it("direct invocation requires both inherited core limits to be zero", () => {
 function resolverFixture(launcher: string, dir: string): string {
   const perl = launcher.split("exec /usr/bin/perl -T -e '\n")[1]!.split("my @candidates")[0]!;
   const prefix = JSON.stringify(dir);
-  return perl.replace("my ($path) = @_;", `my ($path) = @_; return 1 unless index($path, ${prefix}) == 0;`)
+  return perl.replace("sub trusted_entry {\n    my ($path) = @_;", `sub trusted_entry {\n    my ($path) = @_; return 1 unless index($path, ${prefix}) == 0;`)
     .replace("$s[4] == 0", "$s[4] == $>");
 }
+
+it.skipIf(process.platform !== "darwin").each(["file", "directory"])("refuses other-group write ACLs on interpreter %s before exec", (kind) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "signer-other-acl-")));
+  const perl = resolverFixture(readFileSync(resolve("bin/sanctuary-linux-policy-sign"), "utf8"), dir);
+  const node = join(dir, "node");
+  const target = kind === "file" ? node : dir;
+  try {
+    writeFileSync(node, "#!/bin/sh\nprintf interpreter-executed\n", { mode: 0o555 });
+    chmodSync(dir, 0o555);
+    const check = () => spawnSync("/usr/bin/perl", ["-e", perl + '\nmy $node = trusted_path($ARGV[0]); exit 1 unless defined($node); exec {$node} $node;', node], { encoding: "utf8" });
+    expect(check().stdout).toBe("interpreter-executed");
+    for (const ace of [`group:daemon allow ${kind === "file" ? "read" : "list"}`, "group:everyone deny delete"]) {
+      const added = spawnSync("/bin/chmod", ["+a", ace, target], { encoding: "utf8" });
+      expect(added.status, added.stderr).toBe(0);
+      expect(check().stdout).toBe("interpreter-executed");
+      expect(spawnSync("/bin/chmod", ["-N", target]).status).toBe(0);
+    }
+    const rights = ["writeattr", "writeextattr", "delete", "chown", "writesecurity", ...(kind === "file" ? ["write", "append"] : ["add_file", "add_subdirectory", "delete_child"])];
+    for (const principal of ["group:daemon", "user:root"]) for (const right of rights) {
+      const acl = spawnSync("/bin/chmod", ["+a", `${principal} allow ${right}`, target], { encoding: "utf8" });
+      expect(acl.status, acl.stderr).toBe(0);
+      expect(statSync(target).mode & 0o222).toBe(0);
+      const refused = check();
+      expect(refused.status, `${principal} ${right}: ${refused.stderr}`).toBe(1);
+      expect(refused.stdout).toBe("");
+      expect(spawnSync("/bin/chmod", ["-N", target]).status).toBe(0);
+    }
+  } finally {
+    spawnSync("/bin/chmod", ["-N", target]);
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it.skipIf(process.platform !== "darwin")("refuses malformed ACL output before interpreter exec", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "signer-malformed-acl-")));
+  const node = join(dir, "node");
+  const listing = join(dir, "listing");
+  const helper = join(dir, "ls");
+  try {
+    writeFileSync(node, "#!/bin/sh\nprintf interpreter-executed\n", { mode: 0o555 });
+    writeFileSync(helper, `#!/bin/sh\nexec /bin/cat '${listing}'\n`, { mode: 0o555 });
+    const perl = resolverFixture(readFileSync(resolve("bin/sanctuary-linux-policy-sign"), "utf8"), dir)
+      .replace('"/bin/ls"', JSON.stringify(helper));
+    const header = `dr-xr-xr-x+ 1 root wheel 0 Oct  2 12:00 ${dir}\n`;
+    const malformed = ["", "not a listing\n", header, header + "garbled ACE\n", header + " 0: group:daemon allow unknown_right\n", header + " 0: group:daemon allow read,\n", header + " 1: group:daemon allow read\n", header + " 0: group:daemon permit read\n"];
+    chmodSync(dir, 0o555);
+    for (const output of malformed) {
+      // The helper models unreadable ACL metadata; the production walker and exec remain intact.
+      chmodSync(dir, 0o755);
+      writeFileSync(listing, output);
+      chmodSync(dir, 0o555);
+      const refused = spawnSync("/usr/bin/perl", ["-e", perl + '\nmy $node = trusted_path($ARGV[0]); exit 1 unless defined($node); exec {$node} $node;', node], { encoding: "utf8" });
+      expect(refused.status, output + refused.stderr).toBe(1);
+      expect(refused.stdout).toBe("");
+    }
+  } finally {
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 it.skipIf(process.platform !== "darwin" || process.getuid?.() === 0)("kernel access checks refuse ACL-writable interpreter files and ancestors", () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "signer-acl-")));

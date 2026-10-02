@@ -4,8 +4,8 @@ ulimit -S -c 0 || exit 1
 ulimit -H -c 0 || exit 1
 # /bin/sh and /usr/bin/perl are OS-trusted interpreters on both workstations.
 # Resolve only fixed candidates before handing Node the key fd: root owns every
-# link, resolved file and ancestor; mode/ACL checks exclude invoking-user writes
-# (root itself is trusted). Execute the
+# link, resolved file and ancestor; macOS also refuses write-class ACL grants
+# to every principal. Execute the
 # resolved path so a user-managed alias cannot replace it between check and exec.
 # User-writable package-manager installs deliberately fail closed.
 unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
@@ -15,12 +15,42 @@ use strict;
 use warnings;
 use Fcntl qw(:mode);
 use filetest "access";
+sub trusted_macos_acl {
+    my ($path) = @_;
+    # Use only the OS reader and a fixed locale; malformed metadata is not custody evidence.
+    ($path) = $path =~ m{\A(/[^\0\r\n]*)\z};
+    return 0 unless defined($path);
+    local %ENV = (PATH => "/usr/bin:/bin", LC_ALL => "C");
+    open(my $acl, "-|", "/bin/ls", "-led", $path) or return 0;
+    my @lines = <$acl>;
+    return 0 unless close($acl);
+    my $header = shift @lines;
+    return 0 unless defined($header) && $header =~ m{\A[d-][rwxstST-]{9}([+@]?) +[0-9]+ +\S+ +\S+ +[0-9]+ +[A-Z][a-z]{2} +[0-9]{1,2} +(?:[0-9]{2}:[0-9]{2}|[0-9]{4}) +\Q$path\E\n\z};
+    return 0 if $1 eq "+" && !@lines;
+    return 0 if $1 eq "" && @lines;
+    # Darwin chmod/ls permission vocabulary, including directory aliases and inheritance flags.
+    my %write = map { $_ => 1 } qw(write append writeattr writeextattr add_file add_subdirectory delete delete_child chown writesecurity);
+    my %known = (%write, map { $_ => 1 } qw(read execute list search readattr readextattr readsecurity file_inherit directory_inherit limit_inherit only_inherit));
+    my $index = 0;
+    for my $line (@lines) {
+        return 0 unless $line =~ m{\A +([0-9]+): (?:user|group):\S+ (?:inherited )?(allow|deny) ([a-z_]+(?:,[a-z_]+)*)\n\z};
+        my ($number, $type, $rights) = ($1, $2, $3);
+        return 0 unless $number eq "" . $index++;
+        for my $right (split /,/, $rights) {
+            return 0 unless $known{$right};
+            # Any allow-write ACE can break custody, regardless of principal or effective access.
+            return 0 if $type eq "allow" && $write{$right};
+        }
+    }
+    return 1;
+}
 sub trusted_entry {
     my ($path) = @_;
     my @s = lstat($path); # POSIX stat slots: mode = 2, owner uid = 4.
     return 0 unless @s && $s[4] == 0;
     # Symlink permissions are inert; its already-verified parent protects replacement.
     return 1 if S_ISLNK($s[2]);
+    return 0 if $^O eq "darwin" && !trusted_macos_acl($path);
     # 0022 selects group/other write; filetest access asks the kernel about ACLs.
     # Root is trusted, but ordinary invokers must not be able to rewrite this inode.
     return ($s[2] & 0022) == 0 && ($> == 0 || !-w $path);
