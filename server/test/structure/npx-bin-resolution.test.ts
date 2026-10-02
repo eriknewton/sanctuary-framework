@@ -1,3 +1,4 @@
+// fail-before-exempt: this change pins the added package bin; the guard restores server/src only and leaves package.json at HEAD.
 /**
  * Structural gate: bare-npx executable resolution (v1.6.1 install-path
  * hardening, F1).

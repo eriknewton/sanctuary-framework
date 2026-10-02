@@ -218,6 +218,7 @@ fn executable(path: &str) -> io::Result<File> {
     let mut header = [0u8; 64]; // ELF64_Ehdr length, not a file-size limit.
     file.read_exact(&mut header)?;
     require(native_elf(&header), "native amd64 ELF required")?;
+    // Safety: this fixed attribute name contains no NUL byte.
     let attr = CString::new("security.capability").expect("literal");
     // Capability-bearing files are outside this profile even with NoNewPrivs;
     // querying the held fd avoids inspecting a different executable pathname.
@@ -252,8 +253,9 @@ fn workspace() -> io::Result<File> {
     let vfs = unsafe { vfs.assume_init() };
     let safety_flags = libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC;
     // The root-owned unmounted directory cannot serve as a writable fallback.
+    // libc uses signed f_type on glibc and unsigned f_type on musl; TMPFS_MAGIC fits both.
     require(
-        fs.f_type == libc::TMPFS_MAGIC
+        i128::from(fs.f_type) == i128::from(libc::TMPFS_MAGIC)
             && vfs.f_flag & safety_flags == safety_flags
             && vfs.f_blocks > 0
             && vfs.f_frsize > 0
@@ -306,6 +308,7 @@ fn exec_second(file: File, command: &CommandV1) -> io::Result<()> {
     } else {
         cvt(unsafe { libc::fcntl(exec_fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
     }
+    // Safety: this fixed device path contains no NUL byte.
     let null = CString::new("/dev/null").expect("literal");
     let opened_null = cvt(unsafe {
         libc::open(

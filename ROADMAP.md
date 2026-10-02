@@ -146,6 +146,8 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 ### Recent additions (October 2026)
 
+- **Linux install package candidate.** The opt-in install variant adds observed-state install commands, a workstation policy signer, and an agent launch path gated by Castle Wall enforcement. Required CI covers package lifecycle refusals and cold-install composition. Delivery acceptance and reboot evidence remain pending; this is not a supported-release or completed-install claim.
+
 - **Credential surrogacy:** slice 1b-i built; not yet bound to a real secret.
 
 - **Credential surrogacy, operator side (slice 1a).** A secret an operator binds as a surrogate for one wrapped agent is never issued to that agent: the agent's environment carries a placeholder, the Secret Broker refuses to issue a read or rotate token for a bound secret, and the real value is held only by a root-owned helper process per agent that the operator unlocks explicitly and that forgets everything at degrade, unprotect and reboot. **What it does not do yet:** the egress gate does not swap the placeholder for the value on the way out, so a bound secret cannot be used by the agent until slice 1b (forward mode, the swap, the misroute refusal) lands; the assurance-matrix row reads `partial` and no capability claim moves until the macOS drill. **Why it matters:** an agent that never holds a credential cannot leak it, whatever a prompt injection tells it to do.

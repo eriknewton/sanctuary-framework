@@ -153,8 +153,13 @@ class InstallTests(unittest.TestCase):
         module = runpy.run_path(str(HERE / 'record-install-ci.py'))
         head = 'a' * 40
         good = {job: {'result': 'success'} for job in module['PACKAGE_JOBS']}
-        env = {'INSTALL_SOURCE_SHA': head, 'INSTALL_ARTIFACT_ID': '123', 'INSTALL_ARTIFACT_DIGEST': 'b' * 64}
-        with tempfile.TemporaryDirectory() as temp, patch.object(module['subprocess'], 'check_output', return_value=head), patch.dict(os.environ, env):
+        env = {'INSTALL_SOURCE_SHA': head, 'INSTALL_ARTIFACT_ID': '123', 'INSTALL_ARTIFACT_DIGEST': 'b' * 64,
+               'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_WORKFLOW_SHA': 'd' * 40}
+        workflow = (module['REPO'] / module['WORKFLOW']).read_bytes()
+        # Model git's text SHA and binary workflow separately; never inherit the runner event.
+        def git_output(argv, **kwargs):
+            return head if argv[-2:] == ['rev-parse', 'HEAD'] else workflow
+        with tempfile.TemporaryDirectory() as temp, patch.object(module['subprocess'], 'check_output', side_effect=git_output), patch.dict(os.environ, env, clear=True):
             output = Path(temp) / 'record.json'
             for bad in ('skipped', 'cancelled', 'failure', None):
                 needs = {k: dict(v) for k, v in good.items()}
@@ -167,6 +172,9 @@ class InstallTests(unittest.TestCase):
                         module['record'](output, True)
             with patch.dict(os.environ, {'INSTALL_NEEDS': __import__('json').dumps(good)}):
                 module['record'](output, True)
+                with patch.object(module['subprocess'], 'check_output', side_effect=[head, workflow + b'\n']):
+                    with self.assertRaisesRegex(ValueError, 'executed workflow differs'):
+                        module['record'](output, True)
                 with patch.dict(os.environ, {'INSTALL_ARTIFACT_DIGEST': ''}):
                     with self.assertRaisesRegex(ValueError, 'digest missing'):
                         module['record'](output, True)

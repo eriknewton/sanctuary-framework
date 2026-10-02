@@ -198,10 +198,8 @@ jobs:
           packages: python3-cryptography tcpdump
       - name: Build the exact-head workstation signer and public CI inputs
         run: |
-          node_path="$(command -v node)"
-          if [[ "$node_path" != /usr/bin/node ]]; then
-            sudo ln -sf "$node_path" /usr/bin/node
-          fi
+          # A tool-cache symlink is runner-writable and must fail the signer's custody check.
+          sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
           cd server
           npm ci
           npm run build
