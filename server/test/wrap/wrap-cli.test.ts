@@ -593,7 +593,7 @@ describe("port fallback", () => {
 //
 // End-to-end-lite test: invoke `runWrap` against a temp config file and assert
 // that a user-supplied `--passphrase` value is never passed to the config
-// rewrite. See Archive/DELTA_REVIEW_V0.9.0_RC1.md SEC-061 / CLEAN-018.
+// rewrite. Regression guard for private findings SEC-061 / CLEAN-018.
 
 describe("runWrap — SEC-061 passphrase leak regression", () => {
   let tempHome: string;

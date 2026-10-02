@@ -127,7 +127,7 @@ highest-value files to read:
 
 ## Disclosure History
 
-Structured review artifacts and remediation history live under
-[`docs/audit/`](docs/audit/). Note that `docs/audit/SECURITY_AUDIT.md` is a
-historical baseline audit; current trust claims are tracked in
-[`ASSURANCE_MATRIX.md`](ASSURANCE_MATRIX.md).
+Drill records and postmortems live under [`docs/audit/`](docs/audit/).
+Findings from security reviews are tracked privately and are not published,
+per the non-disclosure rule in [`AGENTS.md`](AGENTS.md); current trust claims
+and their bounds are tracked in [`ASSURANCE_MATRIX.md`](ASSURANCE_MATRIX.md).
