@@ -146,7 +146,7 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 ### Recent additions (October 2026)
 
-- **Linux install package candidate.** The opt-in install variant adds observed-state install commands, a workstation policy signer, and an agent launch path gated by Castle Wall enforcement. Required CI covers package lifecycle refusals and cold-install composition. Delivery acceptance and reboot evidence remain pending; this is not a supported-release or completed-install claim.
+- **Linux install package candidate.** The opt-in install variant adds observed-state install commands, a workstation policy signer, and an agent launch path that refuses to start unless Castle Wall is ready and the kernel binding for the agent's uid is observed. Required CI covers package lifecycle refusals and cold-install composition. Delivery acceptance and reboot evidence remain pending; this is not a supported-release or completed-install claim.
 
 - **Credential surrogacy:** slice 1b-i built; not yet bound to a real secret.
 
