@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-08-18. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-02. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -146,9 +146,9 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 ### Recent additions (October 2026)
 
-- **Credential surrogacy:** slice 1b-i built; not yet bound to a real secret.
+- **Credential surrogacy:** slices 1b-i and 1b-ii built and test-proven; the real-secret macOS drill remains owed.
 
-- **Credential surrogacy, operator side (slice 1a).** A secret an operator binds as a surrogate for one wrapped agent is never issued to that agent: the agent's environment carries a placeholder, the Secret Broker refuses to issue a read or rotate token for a bound secret, and the real value is held only by a root-owned helper process per agent that the operator unlocks explicitly and that forgets everything at degrade, unprotect and reboot. **What it does not do yet:** the egress gate does not swap the placeholder for the value on the way out, so a bound secret cannot be used by the agent until slice 1b (forward mode, the swap, the misroute refusal) lands; the assurance-matrix row reads `partial` and no capability claim moves until the macOS drill. **Why it matters:** an agent that never holds a credential cannot leak it, whatever a prompt injection tells it to do.
+- **Credential surrogacy (slices 1a, 1b-i and 1b-ii).** The agent's environment carries a placeholder for an operator-bound secret, the Secret Broker refuses to issue a read or rotate token for that name, and a root-owned helper per agent releases the value only while explicitly unlocked. Forward-mode HTTP substitutes the value only for its bound destination and header and refuses misroutes. A bounded response guard checks header names and values and identity bodies for credential echoes, aborting on a match; unsupported encodings, reaching the scan ceiling, and scan failures stop further delivery. **Bounds:** CONNECT tunnels do not swap placeholders; transformed values inside identity bodies and values returned in a later response remain outside detection. Misuse through authenticated calls to the bound destination remains possible. The [credential-surrogacy assurance-matrix row](ASSURANCE_MATRIX.md) remains `partial`: tests establish these paths, and the real-secret macOS drill is still owed. **Why it matters:** this limits the agent's exposure to operator-bound credentials.
 
 ### Concordia and Verascore composition (optional, default off)
 
