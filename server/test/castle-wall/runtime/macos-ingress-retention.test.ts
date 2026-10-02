@@ -1,6 +1,6 @@
 /** Bounded daemon ingestion under slow persistence, reconnects and expired approvals. */
 import { describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -40,6 +40,86 @@ function fixture(sink: AuditSink) {
 }
 
 describe("macOS ingress retention", () => {
+  it("bounds shutdown discard draining by the write deadline while keeping unflushed counts", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const home = await mkdtemp(join(tmpdir(), "cw-stop-deadline-"));
+    vi.stubEnv("HOME", home);
+    const writeDeadlineMs = 500; // Short fault-injection deadline with room for healthy startup writes.
+    const schedulingSlackMs = 1_000; // Allow local filesystem and timer scheduling during shutdown.
+    const key = ed25519.utils.randomPrivateKey();
+    const storage = new FilesystemStorage(join(home, "state"));
+    const audit = new AuditLog(storage, key, {
+      checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: writeDeadlineMs,
+    });
+    let options!: MacOSCastleWallListenerOptions;
+    let handle: Awaited<ReturnType<typeof startMacOSCastleWallDaemon>> | undefined;
+    let stopping: Promise<void> | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let hungWriteActive = false;
+    let hangNextWrite = true;
+    const activeConfigPath = join(home, "active.json");
+    try {
+      handle = await startMacOSCastleWallDaemon({
+        fortressPath: home, fortressId: "retention-test", masterKey: key, auditLog: audit,
+        platform: "darwin", daemonMode: "safe",
+        socketPath: join(home, "castle.sock"), activeConfigPath,
+        globalPinnedPublicKeyPath: join(home, "pin"), auditProducerPublicKeyPath: join(home, "producer"), auditProducerStatePath: null,
+        systemResolverProvider: async () => [], agentEgressProbe: async () => true,
+        signerClientInvoke: async (args, data) => ({ code: 0, stderr: "", stdout: Buffer.from(args[0] === "get-pubkey" ? ed25519.getPublicKey(key) : ed25519.sign(data!, key)).toString("base64url") }),
+        listenerFactory(opts) { options = opts; return { async start() {}, async stop() {}, async broadcastManifestUpdate() { return 0; }, async broadcastDecisionResponse() { return 0; }, async broadcastArmLease() { return 0; }, recycleConnection() { return false; } }; },
+      });
+      await readFile(activeConfigPath);
+      await options.consumer.handleFlowPendingApproval({
+        type: "flow_pending_approval", request_id: "stop-pending", surface: "egress", agent: { id: SUBJECT, template: "test" },
+        destination: { ip: "192.0.2.1", port: 443, protocol: "tcp", host: null, hostname_source: null, opaque: false }, expires_in_seconds: 30,
+      });
+      const write = storage.writeDurable.bind(storage);
+      vi.spyOn(storage, "writeDurable").mockImplementation(async (namespace, entryKey, data) => {
+        if (hangNextWrite && namespace === "_audit" && entryKey.startsWith("entry-")) {
+          hangNextWrite = false;
+          hungWriteActive = true;
+          try { await gate; throw new Error("released fixture write"); }
+          finally { hungWriteActive = false; }
+        }
+        await write(namespace, entryKey, data);
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const timeout = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("stop exceeded write deadline plus slack")), writeDeadlineMs + schedulingSlackMs);
+        });
+        stopping = handle.stop();
+        await Promise.race([stopping, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      expect(hungWriteActive).toBe(true);
+      expect(audit.getWriteLockRecoveryCount()).toBe(1);
+      expect((await audit.query({ layer: "l1" })).entries.some((entry) => entry.operation === "filter_stopped")).toBe(true);
+      await expect(readFile(activeConfigPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await options.adminHandler!.handleDecision({ type: "decision_response", request_id: "stop-pending", decision: "allow_once" })).ok).toBe(false);
+      // The storage promise stays unsettled throughout shutdown; release only for fixture cleanup.
+      release();
+      await options.consumer.drainIngressDrops();
+      await options.consumer.flushIngressDrops();
+      const discards = (await audit.query({ layer: "l1" })).entries.filter((entry) => entry.operation === "castle_wall_ingress_discarded");
+      expect(discards.reduce((sum, entry) => sum + (entry.details?.counts as Record<string, number>).approval_shutdown!, 0)).toBe(1);
+    } finally {
+      hangNextWrite = false;
+      release();
+      try {
+        await (stopping ?? handle?.stop());
+        await options?.consumer.drainIngressDrops();
+        await audit.flush();
+      } finally {
+        await rm(home, { recursive: true, force: true });
+        vi.unstubAllEnvs();
+        vi.restoreAllMocks();
+      }
+    }
+  });
+
   it("keeps real audit writes charged across hold deadlines and repeated admission waves", async () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
     const home = await mkdtemp(join(tmpdir(), "cw-deadline-retention-"));

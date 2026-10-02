@@ -2064,8 +2064,21 @@ export async function startMacOSCastleWallDaemon(
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
-        // Loss records precede the final stop record, including arrivals during teardown.
-        await consumer.drainIngressDrops();
+        let discardDrainTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          // A hung discard write must not block filter_stopped or finally cleanup:
+          // use the same deadline as audit appends, keeping unflushed counts (including
+          // the in-flight reservation) in memory. A late commit may report a count
+          // twice, but it must never be lost or turned into an allow.
+          await Promise.race([
+            consumer.drainIngressDrops(),
+            new Promise<void>((resolve) => {
+              discardDrainTimer = setTimeout(resolve, input.auditLog.writeLockHoldDeadlineMs);
+            }),
+          ]);
+        } finally {
+          if (discardDrainTimer) clearTimeout(discardDrainTimer);
+        }
         // #912 MED-1: carry any still-pending degraded-write count into the
         // shutdown audit write too, not only the next heartbeat -- a reload
         // that drops its audit write shortly before `stop()` must not lose the

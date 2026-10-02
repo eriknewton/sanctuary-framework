@@ -2242,8 +2242,8 @@ export class AuditLog {
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
   private readonly idlessStaleLockMs: number;
-  /** Deadline-bounds a single acquired lock hold; see {@link withAuditWriteLock}. */
-  private readonly writeLockHoldDeadlineMs: number;
+  /** Bound shutdown waits by the same resolved deadline as each acquired audit write lock. */
+  readonly writeLockHoldDeadlineMs: number;
   /** Same-pid stale-lock breaker bound; must exceed {@link writeLockHoldDeadlineMs}. */
   private readonly selfHeldStaleLockMs: number;
   /** Process-local count of forced audit-write-lock recovery events. */
