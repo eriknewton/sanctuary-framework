@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-08-18. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-02. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -38,7 +38,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
 
-*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04**.*
+*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04**. The gate that moves this row is the install-grade proof described under "Current priority" below.*
 
 ### Castle Wall on macOS: signed system extension, enforced and attended-reboot-surviving
 
@@ -160,6 +160,14 @@ Concordia adds structured negotiation between agents with binding commitments an
 
 ## What's coming, and why it matters
 
+### Current priority
+
+**Linux Castle Wall, install-grade.** The next public claim to move is Linux egress enforcement, and it moves only on an install-grade proof: a cold install of a shipped artifact, per-uid allow and deny observed at the kernel, survival across five reboots, three independent runs, and adjudication by a reviewer who did not build it. Until that drill is captured the Linux row stays `not_implemented` and nothing here, in the README, or in release copy says otherwise. Source slices land on `main` as they pass their gates (the agent unit template, the systemd watchdog, the journal proof token are merged); host legs run on a disposable machine and are recorded under `docs/audit/` when they pass.
+
+**After Linux:** one dashboard across operating-system families (the "One console for many machines" item below), so an operator with a Mac and a Linux box sees one wall, one record, one set of keys.
+
+**Running alongside, without taking review priority from Linux:** credential surrogacy slices 1b and 2 (below), and Concordia local receipts on by default with an off switch (below).
+
 ### Coming next
 
 Concrete, scoped, on the engineering path. Each item has named decision artifacts, ratified scope, and a sequenced position in the build queue.
@@ -234,6 +242,14 @@ Operator protection is shipped and proven; agent-side protections are roadmap, b
 - **Three-tier identity and universal floor.** Operator, persona, and sub-agent as distinct guarantee bundles, with the persona as the lineage anchor for keys, reputation, and exit. Architecture design pass, sequenced behind the key-custody foundation work now in flight.
 
 *Status: ratified 2026-06-12; the distress channel fires first, after the custody foundation lands.*
+
+#### Credential surrogacy, slices 1b and 2
+
+Slice 1a (October 2026, above) binds a secret to one wrapped agent and keeps the agent's environment to a placeholder. Slice 1b teaches the per-agent egress gate to swap the placeholder for the real value on requests to the operator-bound destination only, to refuse and audit a placeholder headed anywhere else, and to scrub the value from responses on the way back; it works for HTTP clients that send through the gate in forward mode. Slice 2 adds TLS termination for tool code with hardcoded `https://`, excluding pinned and mutual-TLS hosts. The assurance-matrix row stays `partial` until the macOS drill: a secret bound, an agent instructed by injected content to send it to a second allowed host, the refusal observed at the gate, the value observed only toward the bound host, and the agent's environment and memory holding only the placeholder, repeated after reboot. Linux inherits the Linux bound above. *Why it matters: an agent that never holds a credential cannot leak it, whatever a prompt injection tells it to do.*
+
+#### Concordia local receipts on by default
+
+A fresh install will record Concordia negotiation receipts locally by default, with a documented off switch in the policy file. Receipts stay on the operator's machine, so the default sends nothing anywhere. Verascore publication stays opt-in because it transmits data, which Sanctuary's first must-never rule forbids as a default. Small build under the normal two-family gate; docs and the composition claim update in the same PR.
 
 ### On the horizon
 
