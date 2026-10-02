@@ -281,11 +281,24 @@ def main(args):
         fault = json.loads((inputs / 'endpoints.json').read_text())
         for index, endpoint in enumerate(fault['endpoints']):
             endpoint['attempts'] = int(index == 0)
-        fault_path = inputs / 'fault-endpoints.json'
-        fault_path.write_text(json.dumps(fault))
-        fault_path.chmod(0o644)
-        probe = json.loads(w.run(['systemd-run', '--quiet', '--wait', '--pipe', '--collect', '--unit=p4-fault-probe',
-            '--uid=60123', STANDIN, '--fault-probe', '--endpoints', str(fault_path)], timeout=15).stdout)
+        # The probe runs as U, which cannot traverse the runner-owned input
+        # ancestry. Give it one public file under root-owned /run custody.
+        run_parent = Path('/run')
+        require(run_parent.is_dir() and not run_parent.is_symlink()
+                and run_parent.stat().st_uid == 0
+                and run_parent.stat().st_mode & 0o022 == 0,
+                'root-owned fault input parent required')
+        with tempfile.TemporaryDirectory(prefix='sanctuary-fault-ci-', dir='/run') as scratch:
+            scratch_path = Path(scratch)
+            scratch_path.chmod(0o755)
+            require(scratch_path.stat().st_uid == 0 and scratch_path.stat().st_mode & 0o777 == 0o755,
+                    'fault input directory custody changed')
+            fault_path = scratch_path / 'endpoints.json'
+            with fault_path.open('xb') as stream:
+                os.fchmod(stream.fileno(), 0o644)
+                stream.write(json.dumps(fault).encode())
+            probe = json.loads(w.run(['systemd-run', '--quiet', '--wait', '--pipe', '--collect', '--unit=p4-fault-probe',
+                '--uid=60123', STANDIN, '--fault-probe', '--endpoints', str(fault_path)], timeout=15).stdout)
         require(probe['attempt_count'] == 1 and probe['uid'] == 60123, 'composition invariant failed')
         w.save('fault-probe.json', probe)
         require(not pids_for_uid(60123), 'composition invariant failed')
