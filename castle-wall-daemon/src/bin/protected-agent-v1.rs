@@ -1,9 +1,9 @@
-//! Phase 0 scaffold; no installation or workload launch is performed.
-
-use castle_wall_daemon::linux_install::{NOT_BUILT_EXIT_CODE, NOT_BUILT_MESSAGE};
+//! Fixed install-profile trampoline; successful launch replaces this process.
 
 fn main() -> std::process::ExitCode {
-    // Must match the fixed stub contract in src/linux_install/mod.rs.
-    eprintln!("{NOT_BUILT_MESSAGE}");
-    std::process::ExitCode::from(NOT_BUILT_EXIT_CODE)
+    #[cfg(target_os = "linux")]
+    if let Err(error) = castle_wall_daemon::agent_launch::launch() {
+        eprintln!("protected-agent-v1: refused: {error}");
+    }
+    std::process::ExitCode::FAILURE
 }
