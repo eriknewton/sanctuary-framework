@@ -165,12 +165,19 @@ jobs:
           [[ ${#deb[@]} == 1 ]]
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           printf 'disposable\n' | sudo tee /root/.sanctuary-host-role >/dev/null
-          # The shipped guard refused /usr/share on a hosted runner. Record its
-          # custody, then remove write bits on this disposable CI fixture only.
-          [[ ! -L /usr/share && "$(stat -c %u /usr/share)" == 0 ]]
-          stat -c 'CI /usr/share before install: owner=%u mode=%a type=%F' /usr/share
-          sudo chmod go-w /usr/share
-          stat -c 'CI /usr/share after normalization: owner=%u mode=%a type=%F' /usr/share
+          # Mirror linux-package-structure's bounded hosted-runner exception.
+          # Only these two root-owned doc parents may arrive as 0777; refuse
+          # any other type, owner or mode rather than weakening the shipped guard.
+          [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "${RUNNER_OS:-}" == Linux ]]
+          for parent in /usr/share /usr/share/doc; do
+            stat -c "CI $parent before install: owner=%u group=%g mode=%a type=%F" "$parent"
+            [[ ! -L "$parent" && -d "$parent" && "$(stat -c %u:%g "$parent")" == 0:0 ]]
+            mode="$(stat -c %a "$parent")"
+            [[ "$mode" == 755 || "$mode" == 777 ]]
+            if [[ "$mode" == 777 ]]; then sudo chmod 0755 -- "$parent"; fi
+            [[ "$(stat -c %u:%g:%a "$parent")" == 0:0:755 ]]
+            stat -c "CI $parent after normalization: owner=%u group=%g mode=%a type=%F" "$parent"
+          done
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             python3 castle-wall-daemon/packaging/ubuntu/ci-install-lifecycle.py \
               --scenario '${{ matrix.scenario }}' --deb "${deb[0]}" --evidence "$RUNNER_TEMP/lifecycle"
@@ -229,10 +236,17 @@ jobs:
           [[ -f "$witness" ]] || { echo 'P4 composed install witness is required; package-only evidence is insufficient' >&2; exit 1; }
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           printf 'disposable\n' | sudo tee /root/.sanctuary-host-role >/dev/null
-          [[ ! -L /usr/share && "$(stat -c %u /usr/share)" == 0 ]]
-          stat -c 'CI /usr/share before install: owner=%u mode=%a type=%F' /usr/share
-          sudo chmod go-w /usr/share
-          stat -c 'CI /usr/share after normalization: owner=%u mode=%a type=%F' /usr/share
+          # Match the lifecycle fixture and the established package workflow.
+          [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "${RUNNER_OS:-}" == Linux ]]
+          for parent in /usr/share /usr/share/doc; do
+            stat -c "CI $parent before install: owner=%u group=%g mode=%a type=%F" "$parent"
+            [[ ! -L "$parent" && -d "$parent" && "$(stat -c %u:%g "$parent")" == 0:0 ]]
+            mode="$(stat -c %a "$parent")"
+            [[ "$mode" == 755 || "$mode" == 777 ]]
+            if [[ "$mode" == 777 ]]; then sudo chmod 0755 -- "$parent"; fi
+            [[ "$(stat -c %u:%g:%a "$parent")" == 0:0:755 ]]
+            stat -c "CI $parent after normalization: owner=%u group=%g mode=%a type=%F" "$parent"
+          done
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             python3 "$witness" --artifact-dir "$RUNNER_TEMP/install" --evidence "$RUNNER_TEMP/composition" \
               --inputs "$RUNNER_TEMP/composition-inputs" --operator-uid "$(id -u)"
