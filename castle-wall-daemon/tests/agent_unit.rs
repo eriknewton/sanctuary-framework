@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// The unit digest, pinned after the actual-manager P3 lifecycle/isolation
 /// capture on systemd 255 PID 1. Any byte change, including a comment, requires
 /// another review of the effective unit before this value moves.
-const AGENT_UNIT_SHA256: &str = "736d206cfbbabf5bee0b971de0ab01e49d69d633f511104df16bfa209ba9aadd";
+const AGENT_UNIT_SHA256: &str = "8dba2311a163530179281a077cb7199268bf7fea5fc98d32c9b0881d2a4beeaa";
 
 /// The installed daemon path both `ExecStartPre=` lines execute.
 /// Must match `DAEMON_PATH` in packaging/ubuntu/lifecycle-guard.py.
@@ -75,6 +75,8 @@ const EXPECTED_DIRECTIVES: &[(&str, &str, &str)] = &[
     ("Service", "ReadWritePaths", "/var/lib/sanctuary-agent-workspace"),
     ("Service", "InaccessiblePaths", "/tmp /var/tmp /dev/shm /run/user"),
     ("Service", "PrivateDevices", "yes"),
+    ("Service", "PrivateIPC", "yes"),
+    ("Service", "RemoveIPC", "yes"),
     ("Service", "ProtectKernelTunables", "yes"),
     ("Service", "ProtectKernelModules", "yes"),
     ("Service", "ProtectControlGroups", "yes"),
@@ -605,5 +607,13 @@ fn workspace_mount_is_mandatory_and_has_the_entire_fixed_budget() {
             "Options=size=64M,nr_inodes=4096,mode=1777,nosuid,nodev,noexec",
             "DirectoryMode=0755",
         ]
+    );
+}
+
+#[test]
+fn install_listing_refuses_the_pre_install_unit() {
+    let old = include_str!("fixtures/agent-unit-pre-install.service");
+    assert!(
+        !canonical_form_violations(old).is_empty() || !directive_set_differences(old).is_empty()
     );
 }

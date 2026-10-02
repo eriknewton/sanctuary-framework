@@ -4,10 +4,9 @@
 # What this unit declares: the agent starts only after the Castle Wall unit has
 # signalled READY=1 (which it does only once the admitted uid is bound and read
 # back from the kernel), only when the uid-matching credential check and the
-# kernel gate below both exit 0, and it stops when the wall stops or its process ends. An explicit wall restart
-# propagates a new activation behind READY; Restart=no forbids failure retries.
-# Boot intent is the single multi-user target link.
-# Must match EXPECTED_DIRECTIVES in tests/agent_unit.rs (install design 4.3).
+# kernel gate below both exit 0, and it is stopped, never restarted, whenever the
+# wall stops or its process ends. It has no Install section, so nothing starts it
+# at boot; an operator starts each instance explicitly.
 #
 # FAILURE MODE an operator will meet: starting an instance while the wall is
 # stopped or failed PULLS a wall start (BindsTo= is a stronger Requires=). After
@@ -26,9 +25,7 @@ Description=Sanctuary confined agent (uid %i)
 # sanctuary-castle-wall.service and UNIT_NAME in
 # packaging/ubuntu/lifecycle-guard.py.
 BindsTo=sanctuary-castle-wall.service
-After=sanctuary-castle-wall.service network-online.target var-lib-sanctuary\x2dagent\x2dworkspace.mount
-Wants=network-online.target
-Requires=var-lib-sanctuary\x2dagent\x2dworkspace.mount
+After=sanctuary-castle-wall.service
 
 [Service]
 # exec, not simple: the start job fails if execve of the agent fails, so a
@@ -55,13 +52,13 @@ EnvironmentFile=/etc/sanctuary/castle-wall.env
 # expanding the variable and the gate would then refuse every start.
 ExecStartPre=/usr/local/libexec/sanctuary/castle-wall-daemon --agent-credential-check %i
 ExecStartPre=+/usr/local/libexec/sanctuary/castle-wall-daemon --agent-start-gate %i --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}
-# Fixed packaged trampoline, no caller argv; the required Configured record
-# selects a root-custodied ELF and literal arguments for a second exec.
-# Must match EXECUTABLE_PATH in src/protected_agent/profile.rs.
-# Must match LAUNCHER_PATH in src/linux_install/contract.rs.
+# Fixed path, no arguments, so there is no operator argv and no quoting layer.
+# Must match EXECUTABLE_PATH in src/protected_agent/profile.rs. The package does
+# not ship this executable; the operator installs it root-owned. Failure mode:
+# when it is absent the start fails with 203/EXEC and nothing runs.
 ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1
-# Failure does not trigger retries. An operator wall restart propagates through
-# BindsTo; every activation re-runs both checks above.
+# Nothing brings the agent back after a wall stop or failure; every new start
+# re-runs both checks above.
 Restart=no
 # Policy, not a derivation. The only derived part is the inequality pinned in
 # src/agent_start.rs: this must exceed one bounded nft call (NFT_CALL_WORST_CASE
@@ -82,31 +79,14 @@ SendSIGKILL=yes
 # U; the credential check proves both at every start.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
-# The mount is mandatory: the underlying root directory is never U-writable.
-# Must match WORKSPACE_PATH and the fixed budgets in src/linux_install/contract.rs.
-WorkingDirectory=/var/lib/sanctuary-agent-workspace
-Environment=HOME=/var/lib/sanctuary-agent-workspace
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/sanctuary-agent-workspace
-InaccessiblePaths=/tmp /var/tmp /dev/shm /run/user
-PrivateDevices=yes
-# Code-gate amendment A-IPC: per-unit IPC and removal bound activation residue.
-PrivateIPC=yes
-RemoveIPC=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6
-RestrictNamespaces=yes
-SystemCallArchitectures=native
-# Fixed bounded-v1 policy: 512 MiB aggregate memory, 64 tasks, no core dumps.
-MemoryMax=512M
-TasksMax=64
-LimitCORE=0
-StandardInput=null
-StandardOutput=null
-StandardError=null
-
-[Install]
-WantedBy=multi-user.target
+# The agent's home and runtime directories, created by systemd owned by the
+# instance uid before any command runs, at /var/lib/sanctuary-agent-<uid> and
+# /run/sanctuary-agent-<uid>. The state directory survives stop, package removal
+# and purge, and nothing bounds its size; the operator decides whether to keep
+# it (register id LINUX-AGENT-STATE-DIR-UNBOUNDED-01).
+StateDirectory=sanctuary-agent-%i
+StateDirectoryMode=0700
+RuntimeDirectory=sanctuary-agent-%i
+RuntimeDirectoryMode=0700
+WorkingDirectory=%S/sanctuary-agent-%i
+Environment=HOME=%S/sanctuary-agent-%i

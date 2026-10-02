@@ -15,6 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/msg.h>
 #include <sys/syscall.h>
 int main(void) {
   FILE *f=fopen("/var/lib/sanctuary-agent-workspace/p3-sandbox.tmp","w");
@@ -35,6 +38,10 @@ int main(void) {
   const char *api[]={"/proc/sys/kernel/hostname","/proc/sysrq-trigger","/sys/fs/cgroup/cgroup.procs"};
   for(int i=0;i<3;i++){errno=0;int fd=open(api[i],O_WRONLY|O_NONBLOCK);int saved=errno;if(fd>=0)close(fd);fprintf(f,"api_write %s fd %d errno %d\n",api[i],fd,saved);}
   errno=0;int r=setuid(0);fprintf(f,"setuid0 result %d errno %d\n",r,errno);
+  /* One page and one queue witness activation-local IPC lifetime. */
+  int shm=shmget(IPC_PRIVATE,4096,IPC_CREAT|0600);
+  int msg=msgget(IPC_PRIVATE,IPC_CREAT|0600);
+  fprintf(f,"ipc shm %d msg %d\n",shm,msg);
   fflush(f);
   pid_t p=fork();if(p==0){
     /* int 0x80 dispatches an alternate x86 ABI. getpid=20 has no pointers. */

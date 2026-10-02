@@ -18,7 +18,8 @@ mod linux {
     const ROLES: usize = ATTEMPTS_PER_ENDPOINT as usize; // Parent, child, grandchild.
     const NONCE_BYTES: usize = 32; // 256 bits from the OS RNG, one per logical attempt.
     const RESPONSE_BYTES: usize = NONCE_BYTES + ed25519_dalek::SIGNATURE_LENGTH;
-    const COLLECTION_SLACK_MS: u64 = 5000; // Fixed post-schedule pipe/reap deadline.
+    const COLLECTION_SLACK_MS: u64 = ATTEMPT_TIMEOUT_MS as u64 + 2_000; // One 3s attempt plus 2s pipe/reap allowance.
+    const PROC_STAT_MAX_BYTES: u64 = 4 * KIB as u64; // One /proc stat row including the bounded comm field.
     const OBSERVATION: &str = "observations.json"; // Must match P2 evidence allow-list.
 
     fn bad(message: &'static str) -> io::Error {
@@ -281,7 +282,11 @@ mod linux {
                         let received = (|| {
                             wait_fd(socket.as_raw_fd(), libc::POLLIN, deadline)?;
                             let mut buf = [0; MAX_RESPONSE_BYTES as usize + 1];
-                            socket.recv_from(&mut buf).map(|(n, _)| n)
+                            let (n, _) = socket.recv_from(&mut buf)?;
+                            if n > MAX_RESPONSE_BYTES as usize {
+                                return Err(bad("UDP response exceeds quota"));
+                            }
+                            Ok(n)
                         })();
                         row.recv_errno = Some(errno(&received));
                         row.received_bytes = received.unwrap_or(0);
@@ -397,7 +402,7 @@ mod linux {
         let stat = std::fs::read_to_string("/proc/self/stat")?;
         let ticks = stat
             .rsplit_once(')')
-            .and_then(|(_, s)| s.split_whitespace().nth(19))
+            .and_then(|(_, s)| s.split_whitespace().nth(22 - 3) /* starttime is field 22; suffix begins at field 3. */)
             .ok_or_else(|| bad("start ticks"))?;
         let record = serde_json::json!({"version":VERSION,"phase":"idle","boot_id":boot.trim(),
             "invocation":{"leader_pid":leader,"start_ticks":ticks,"start_monotonic_ns":start_ns},
@@ -414,7 +419,7 @@ mod linux {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(0o600) // Owner read/write only; the root evidence reader remains able to inspect it.
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&temp)?;
             file.write_all(&bytes)?;
@@ -450,9 +455,9 @@ mod linux {
         if role == 2 {
             let mut text = String::new();
             File::open(format!("/proc/{parent}/stat"))?
-                .take(COMMAND_MAX_BYTES as u64 + 1)
+                .take(PROC_STAT_MAX_BYTES + 1)
                 .read_to_string(&mut text)?;
-            if text.len() > COMMAND_MAX_BYTES {
+            if text.len() as u64 > PROC_STAT_MAX_BYTES {
                 return Err(bad("worker parent status cap"));
             }
             // After comm (field 2), state is field 3 and ppid is field 4.
@@ -470,7 +475,7 @@ mod linux {
     fn instrument_endpoints(path: &str, purpose: EndpointPurpose) -> io::Result<EndpointsV1> {
         // The ordinary-operator control runs before provisioning. Its supplied
         // file is bounded input testimony, never Configured or launch authority.
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
@@ -478,11 +483,30 @@ mod linux {
         if !before.is_file() || before.len() > ENDPOINTS_MAX_BYTES as u64 {
             return Err(bad("control endpoint file type or size"));
         }
+        let bytes = instrument_snapshot(file, before, path)?;
+        EndpointsV1::parse_for(&bytes, purpose).map_err(io::Error::other)
+    }
+
+    fn instrument_snapshot(
+        mut file: File,
+        before: std::fs::Metadata,
+        path: &str,
+    ) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         (&mut file)
             .take(ENDPOINTS_MAX_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        EndpointsV1::parse_for(&bytes, purpose).map_err(io::Error::other)
+        if bytes.len() > ENDPOINTS_MAX_BYTES
+            || bytes.len() as u64 != before.len()
+            || !castle_wall_daemon::agent_launch::same_file(&before, &file.metadata()?)
+            || !castle_wall_daemon::agent_launch::same_file(
+                &before,
+                &std::fs::symlink_metadata(path)?,
+            )
+        {
+            return Err(bad("control endpoints changed during read"));
+        }
+        Ok(bytes)
     }
 
     fn control_endpoints(path: &str) -> io::Result<EndpointsV1> {
@@ -536,7 +560,7 @@ mod linux {
         let record = serde_json::json!({"version":VERSION,"phase":"fault-probe-complete",
             "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
             "pid":std::process::id(),"uid":unsafe {libc::geteuid()},
-            "start_ticks":std::fs::read_to_string("/proc/self/stat")?.rsplit_once(')').and_then(|(_, tail)| tail.split_whitespace().nth(19)).ok_or_else(|| bad("start ticks"))?,
+            "start_ticks":std::fs::read_to_string("/proc/self/stat")?.rsplit_once(')').and_then(|(_, tail)| tail.split_whitespace().nth(22 - 3) /* starttime is field 22; suffix begins at field 3. */).ok_or_else(|| bad("start ticks"))?,
             "start_monotonic_ns":start,"end_monotonic_ns":monotonic_ns()?,
             "attempt_count":1,"attempts":[row]});
         let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
@@ -702,6 +726,47 @@ mod linux {
             let elapsed = start.elapsed();
             server.join().unwrap();
             (row, elapsed)
+        }
+        #[test]
+        fn oversized_udp_response_is_not_complete() {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let address = socket.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut nonce = [0; NONCE_BYTES];
+                let (_, peer) = socket.recv_from(&mut nonce).unwrap();
+                socket
+                    .send_to(&[0; MAX_RESPONSE_BYTES as usize + 1], peer)
+                    .unwrap();
+            });
+            let ep = Endpoint {
+                family: Family::Ipv4,
+                role: Role::Deny,
+                protocol: Protocol::Udp,
+                ip: address.ip().to_string(),
+                port: address.port(),
+                attempts: ATTEMPTS_PER_ENDPOINT,
+                response_public_key_hex: None,
+            };
+            let row = attempt(0, 0, &ep).unwrap();
+            server.join().unwrap();
+            assert_eq!(row.recv_errno, Some(libc::EIO));
+            assert_eq!(row.received_bytes, 0);
+        }
+        #[test]
+        fn control_snapshot_refuses_same_inode_rewrites_and_growth() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("input");
+            for changed in [b"bbbb".as_slice(), b"longer".as_slice()] {
+                std::fs::write(&path, b"aaaa").unwrap();
+                let file = File::open(&path).unwrap();
+                let before = file.metadata().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+                std::fs::write(&path, changed).unwrap();
+                assert!(instrument_snapshot(file, before, path.to_str().unwrap()).is_err());
+            }
         }
         #[test]
         fn oversized_response_is_bounded_and_is_not_complete() {

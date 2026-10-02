@@ -38,7 +38,7 @@ fn cstr(s: &OsStr) -> io::Result<CString> {
 }
 
 fn protected_directory(m: &Metadata) -> bool {
-    m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0
+    m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 // 022: group/other write bits may not delegate custody.
 }
 
 /// Walk from a pinned root descriptor: neither a symlink nor a writable parent
@@ -78,10 +78,11 @@ fn open_custodied(path: &str, directory: bool) -> io::Result<File> {
 }
 
 fn regular_custody(m: &Metadata) -> bool {
-    m.is_file() && m.nlink() == 1 && m.uid() == 0 && m.mode() & 0o7022 == 0
+    m.is_file() && m.nlink() == 1 && m.uid() == 0 && m.mode() & 0o7022 == 0 // 7000: setid/sticky; 022: group/other write.
 }
 
-fn same_file(a: &Metadata, b: &Metadata) -> bool {
+/// Compare the complete bounded-read inode snapshot, including same-size rewrites.
+pub fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev()
         && a.ino() == b.ino()
         && a.len() == b.len()
@@ -120,10 +121,10 @@ fn read_open_record(mut file: File, limit: usize) -> io::Result<Vec<u8>> {
 fn kernel_text(path: &str) -> io::Result<String> {
     let mut text = String::new();
     File::open(path)?
-        .take(COMMAND_MAX_BYTES as u64 + 1)
+        .take(crate::agent_start::MAX_PROC_STATUS_BYTES + 1)
         .read_to_string(&mut text)?;
     require(
-        text.len() <= COMMAND_MAX_BYTES,
+        text.len() as u64 <= crate::agent_start::MAX_PROC_STATUS_BYTES,
         "kernel observation exceeds bound",
     )?;
     Ok(text)
@@ -161,10 +162,14 @@ fn credentials(uid: u32) -> io::Result<()> {
         credential_verdict(uid, &snapshot) == CredentialVerdict::Match,
         "credential confinement",
     )?;
+    supplemental_credentials(&status, uid)
+}
+
+fn supplemental_credentials(status: &str, uid: u32) -> io::Result<()> {
     // Filesystem ids and inheritable capabilities also survive decisions the old
     // precheck cannot observe; all four ids must name the configured principal.
     require(
-        status_ids(&status, "Uid", uid) && status_ids(&status, "Gid", uid),
+        status_ids(status, "Uid", uid) && status_ids(status, "Gid", uid),
         "filesystem identity",
     )?;
     let inh: Vec<_> = status
@@ -207,7 +212,7 @@ fn executable(path: &str) -> io::Result<File> {
     let mut file = open_custodied(path, false)?;
     let before = file.metadata()?;
     require(
-        regular_custody(&before) && before.mode() & 0o111 != 0,
+        regular_custody(&before) && before.mode() & 0o111 != 0, // 111: at least one execute permission.
         "executable custody",
     )?;
     let mut header = [0u8; 64]; // ELF64_Ehdr length, not a file-size limit.
@@ -263,6 +268,16 @@ fn workspace() -> io::Result<File> {
     Ok(file)
 }
 
+fn null_identity(st: &libc::stat) -> io::Result<()> {
+    // Linux devices.txt assigns mem major 1, minor 3 to /dev/null.
+    require(
+        st.st_mode & libc::S_IFMT == libc::S_IFCHR
+            && libc::major(st.st_rdev) == 1
+            && libc::minor(st.st_rdev) == 3,
+        "null device identity",
+    )
+}
+
 fn exec_second(file: File, command: &CommandV1) -> io::Result<()> {
     let argv: Vec<CString> = std::iter::once(&command.executable)
         .chain(command.argv.iter())
@@ -309,12 +324,7 @@ fn exec_second(file: File, command: &CommandV1) -> io::Result<()> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     cvt(unsafe { libc::fstat(null_fd, st.as_mut_ptr()) })?;
     let st = unsafe { st.assume_init() };
-    require(
-        st.st_mode & libc::S_IFMT == libc::S_IFCHR
-            && libc::major(st.st_rdev) == 1
-            && libc::minor(st.st_rdev) == 3,
-        "null device identity",
-    )?;
+    null_identity(&st)?;
     for target in 0..=2 {
         cvt(unsafe { libc::dup2(null_fd, target) })?;
     }
@@ -377,6 +387,10 @@ pub fn installed_endpoints() -> io::Result<EndpointsV1> {
     let marker = ConfiguredV1::parse(&read_record(CONFIGURED_PATH, CONFIGURED_MAX_BYTES)?)
         .map_err(io::Error::other)?;
     require(
+        marker.agent_uid == unsafe { libc::geteuid() },
+        "Configured workload uid differs",
+    )?;
+    require(
         format!("{:x}", Sha256::digest(&bytes)) == marker.endpoints_sha256,
         "Configured endpoint digest differs",
     )?;
@@ -418,6 +432,115 @@ mod tests {
         }
         marker.command_sha256 = format!("{:x}", Sha256::digest(&cb));
         assert!(record_binding(&command, &marker, &[cb.as_slice(), b" "].concat(), eb).is_err());
+    }
+
+    #[test]
+    fn live_credentials_reject_filesystem_ids_before_exec_resets_them() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        // Each fork is isolated from the test runner. exec would reset fsuid/fsgid,
+        // so call the production credential admission before any second exec.
+        for filesystem_gid in [false, true] {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let outcome = (|| -> io::Result<()> {
+                    #[repr(C)]
+                    struct Header {
+                        version: u32,
+                        pid: i32,
+                    }
+                    let mut header = Header {
+                        version: 0x2008_0522,
+                        pid: 0,
+                    }; // Linux UAPI capability version 3.
+                    let mut caps = [0u32; 6]; // Two __user_cap_data_struct rows: effective, permitted, inheritable.
+                    let pointer = (&mut header as *mut Header).cast::<libc::c_void>();
+                    cvt(
+                        unsafe { libc::syscall(libc::SYS_capget, pointer, caps.as_mut_ptr()) }
+                            as i32,
+                    )?;
+                    // Drop every supported bounding capability before dropping root.
+                    for cap in 0..64 {
+                        // Version 3 has two 32-bit capability words.
+                        let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+                        if rc != 0
+                            && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                        {
+                            cvt(rc)?;
+                        }
+                    }
+                    cvt(unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) })?;
+                    cvt(unsafe { libc::setgroups(0, std::ptr::null()) })?;
+                    const U: u32 = 60123; // Disposable fixture uid; no account or storage is created.
+                    cvt(unsafe { libc::setresgid(U, U, U) })?;
+                    cvt(unsafe { libc::setresuid(U, U, U) })?;
+                    caps = [0; 6];
+                    caps[0] = (1 << 6) | (1 << 7); // Linux CAP_SETGID=6 and CAP_SETUID=7.
+                    caps[1] = caps[0];
+                    cvt(unsafe { libc::syscall(libc::SYS_capset, pointer, caps.as_ptr()) } as i32)?;
+                    if filesystem_gid {
+                        unsafe {
+                            libc::setfsgid(U + 1);
+                        }
+                    } else {
+                        unsafe {
+                            libc::setfsuid(U + 1);
+                        }
+                    }
+                    caps = [0; 6];
+                    cvt(unsafe { libc::syscall(libc::SYS_capset, pointer, caps.as_ptr()) } as i32)?;
+                    cvt(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
+                    let result = credentials(U);
+                    require(
+                        result.is_err_and(|e| e.to_string() == "filesystem identity"),
+                        "filesystem guard not reached",
+                    )
+                })();
+                unsafe {
+                    libc::_exit(if outcome.is_ok() { 0 } else { 1 });
+                }
+            }
+            let mut status = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5); // Bound even a stuck test child.
+            while unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+                if std::time::Instant::now() >= deadline {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    panic!("credential fixture timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10)); // At most 100 waits/second.
+            }
+            assert_eq!(status, 0, "live filesystem guard failed");
+        }
+    }
+
+    #[test]
+    fn supplemental_credential_guards_reject_fsids_and_inheritable_caps() {
+        let good = "Uid: 42 42 42 42\nGid: 42 42 42 42\nCapInh: 0000000000000000\n";
+        assert!(supplemental_credentials(good, 42).is_ok());
+        for bad in [
+            good.replace("Uid: 42 42 42 42", "Uid: 42 42 42 7"),
+            good.replace("Gid: 42 42 42 42", "Gid: 42 42 42 7"),
+            good.replace("0000000000000000", "0000000000000001"),
+        ] {
+            assert!(supplemental_credentials(&bad, 42).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn null_guard_rejects_other_character_devices_and_regular_files() {
+        for path in ["/dev/null", "/dev/zero", "/etc/passwd"] {
+            let file = File::open(path).unwrap();
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) }, 0);
+            assert_eq!(
+                null_identity(&unsafe { st.assume_init() }).is_ok(),
+                path == "/dev/null"
+            );
+        }
     }
 
     #[test]

@@ -83,15 +83,7 @@ impl Fixture {
         assert_eq!(unsafe { libc::geteuid() }, 0);
         let marked = fs::read_to_string("/root/.sanctuary-host-role")
             .is_ok_and(|role| role.trim() == "disposable");
-        // The CI job explicitly opts in on its disposable hosted VM. An
-        // unmarked local/root host still has no authority to run this fixture.
-        let hosted = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
-            && std::env::var("RUNNER_OS").as_deref() == Ok("Linux");
-        assert!(
-            marked || hosted,
-            "positively disposable manager host required"
-        );
+        assert!(marked, "positively disposable manager host required");
         assert_eq!(
             fs::read_to_string("/proc/1/comm").unwrap().trim(),
             "systemd"
@@ -517,6 +509,14 @@ fn installed_launcher_and_real_manager_lifecycle() {
     assert_eq!(field("fork_flood", 4), libc::EAGAIN as u64);
     assert_eq!(property(AGENT, "MemoryMax"), MEMORY_MAX_BYTES.to_string());
 
+    assert!(field("ipc shm", 2) < i32::MAX as u64);
+    assert!(field("ipc shm", 4) < i32::MAX as u64);
+    let private_ipc = fs::read_link(format!("/proc/{pid}/ns/ipc")).unwrap();
+    assert_ne!(
+        private_ipc,
+        fs::read_link("/proc/1/ns/ipc").unwrap(),
+        "workload shares host IPC"
+    );
     f.snapshot("before-restart");
     ok("systemctl", &["restart", WALL]);
     wait(|| {
@@ -543,6 +543,27 @@ fn installed_launcher_and_real_manager_lifecycle() {
     ok("systemctl", &["stop", WALL]);
     assert_eq!(property(AGENT, "ActiveState"), "inactive");
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    // A stopped activation has no namespace member and leaves no U-owned host
+    // SysV objects. Each activation creates both a segment and a queue above.
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        {
+            assert_ne!(
+                fs::read_link(entry.path().join("ns/ipc")).ok(),
+                Some(private_ipc.clone())
+            );
+        }
+    }
+    let ipc = String::from_utf8(ok("ipcs", &["-m", "-q"]).stdout).unwrap();
+    assert!(
+        !ipc.split_whitespace().any(|word| word == "p3-agent"),
+        "IPC survived stop: {ipc}"
+    );
+    fs::write(f.evidence.join("ipc-after-stop.txt"), ipc).unwrap();
     f.snapshot("after-stop");
     // The shipped stand-in owns all 18 slots across its three processes.
     let sentinels = Sentinels::start();
@@ -979,9 +1000,131 @@ fn installed_launcher_negative_records_and_inherited_socket() {
     fs::write(f.evidence.join("second-exec-before.txt"), before).unwrap();
     fs::write(f.evidence.join("second-exec-after.txt"), after).unwrap();
 
+    let credential_probe = "/usr/local/libexec/sanctuary/p3-credential-probe";
+    ok(
+        "cc",
+        &[
+            "-Wall",
+            "-Wextra",
+            "-O2",
+            f.source
+                .join("tests/linux_agent_launch_credentials_probe.c")
+                .to_str()
+                .unwrap(),
+            "-o",
+            credential_probe,
+        ],
+    );
+    // Inheritable caps survive exec. Filesystem ids are reset by exec itself;
+    // their live guard is exercised by the in-process fork test in agent_launch.
+    for (mode, expected) in [("inh", "inheritable capabilities")] {
+        let out = Command::new(credential_probe)
+            .arg(mode)
+            .env_clear()
+            .env("SANCTUARY_FORTRESS_ID", FORTRESS)
+            .env("SANCTUARY_TRUSTED_SERVICE_UID", SERVICE_UID.to_string())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{mode}: {out:?}"
+        );
+        fs::write(
+            f.evidence.join(format!("credential-{mode}.txt")),
+            out.stderr,
+        )
+        .unwrap();
+    }
+    for (fortress, service, expected) in [
+        (None, Some(SERVICE_UID.to_string()), "unit fortress absent"),
+        (Some(FORTRESS), None, "unit service uid absent"),
+        (
+            Some("ffffffffffffffff"),
+            Some(SERVICE_UID.to_string()),
+            "unit identity differs",
+        ),
+        (
+            Some(FORTRESS),
+            Some(UID.to_string()),
+            "unit identity differs",
+        ),
+    ] {
+        let mut c = Command::new("setpriv");
+        c.args([
+            "--reuid=60123",
+            "--regid=60123",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--no-new-privs",
+            LAUNCHER_PATH,
+        ])
+        .env_clear();
+        if let Some(value) = fortress {
+            c.env("SANCTUARY_FORTRESS_ID", value);
+        }
+        if let Some(value) = service {
+            c.env("SANCTUARY_TRUSTED_SERVICE_UID", value);
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{out:?}"
+        );
+    }
     let command = fs::read(COMMAND_PATH).unwrap();
     let marker = fs::read(CONFIGURED_PATH).unwrap();
     let endpoints = fs::read(ENDPOINTS_PATH).unwrap();
+    // Five seconds is below the first product slot, so a removed identity guard
+    // cannot turn this negative into an unbounded root workload.
+    let direct = run(
+        "timeout",
+        &["5", STANDIN_PATH, "--endpoints", ENDPOINTS_PATH],
+    );
+    assert!(!direct.status.success());
+    assert!(String::from_utf8_lossy(&direct.stderr).contains("Configured workload uid differs"));
+    let overflow = fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut overflow_command: Value = serde_json::from_slice(&command).unwrap();
+    overflow_command["agent_uid"] = json!(overflow.parse::<u32>().unwrap());
+    let overflow_bytes = serde_json::to_vec(&overflow_command).unwrap();
+    let mut overflow_marker: Value = serde_json::from_slice(&marker).unwrap();
+    overflow_marker["agent_uid"] = overflow_command["agent_uid"].clone();
+    overflow_marker["command_sha256"] = json!(sha(&overflow_bytes));
+    write(COMMAND_PATH, overflow_bytes, 0o644);
+    write(
+        CONFIGURED_PATH,
+        serde_json::to_vec(&overflow_marker).unwrap(),
+        0o644,
+    );
+    let out = Command::new("setpriv")
+        .args([
+            format!("--reuid={overflow}"),
+            format!("--regid={overflow}"),
+            "--clear-groups".into(),
+            "--bounding-set=-all".into(),
+            "--inh-caps=-all".into(),
+            "--ambient-caps=-all".into(),
+            "--no-new-privs".into(),
+            LAUNCHER_PATH.into(),
+        ])
+        .env_clear()
+        .env("SANCTUARY_FORTRESS_ID", FORTRESS)
+        .env("SANCTUARY_TRUSTED_SERVICE_UID", SERVICE_UID.to_string())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unit identity differs"),
+        "{out:?}"
+    );
+    write(COMMAND_PATH, &command, 0o644);
+    write(CONFIGURED_PATH, &marker, 0o644);
     let negative = |label: &str| {
         let child = spawn(LAUNCHER_PATH, false);
         let output = child.wait_with_output().unwrap();
