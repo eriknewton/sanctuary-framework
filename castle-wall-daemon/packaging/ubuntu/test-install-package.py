@@ -308,6 +308,21 @@ class InstallTests(unittest.TestCase):
                 fn(name, flag, status, stderr)
 
 
+    def test_manager_names_use_systemd_255_escaped_array_rendering(self):
+        fn = GUARD['systemd_manager']
+        name = GUARD['MOUNT_NAME']
+        fields = dict(Id=name, Names=json.dumps(name), Following='', LoadState='not-found',
+                      ActiveState='inactive', SubState='dead', UnitFileState='', FragmentPath='',
+                      DropInPaths='', Job='', NeedDaemonReload='no')
+        def output(_):
+            return ''.join(key + '=' + value + '\n' for key, value in fields.items())
+        with patch.dict(fn.__globals__, {'Path': lambda _: SimpleNamespace(read_text=lambda: 'systemd\n'), 'command': output}):
+            self.assertEqual(fn(False, name, GUARD['MOUNT_PATH']), fields)
+            fields['Names'] += ' unrelated.mount'
+            with self.assertRaises(GUARD['Refusal']):
+                fn(False, name, GUARD['MOUNT_PATH'])
+
+
 
 if __name__ == '__main__':
     unittest.main()

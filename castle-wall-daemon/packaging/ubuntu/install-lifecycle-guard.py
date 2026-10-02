@@ -392,7 +392,10 @@ def systemd_manager(installed, unit_name=UNIT_NAME, unit_path=UNIT_PATH):
         fields[key] = value
     if set(fields) != set(properties):
         refuse("incomplete systemctl output")
-    if fields["Id"] not in ("", unit_name) or fields["Names"] not in ("", unit_name) or fields["Following"] or fields["DropInPaths"] or fields["Job"] not in ("", "0"):
+    # systemd 255 prints string arrays with C-quoted backslashes, while scalar
+    # Id/FragmentPath stay literal. Match the one fixed name, never a loose list.
+    expected_names = json.dumps(unit_name) if "\\" in unit_name else unit_name
+    if fields["Id"] not in ("", unit_name) or fields["Names"] not in ("", expected_names) or fields["Following"] or fields["DropInPaths"] or fields["Job"] not in ("", "0"):
         refuse("unit aliases, drop-ins or jobs present")
     if fields["ActiveState"] != "inactive" or fields["SubState"] != "dead":
         refuse("unit not positively inactive")
