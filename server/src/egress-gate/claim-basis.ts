@@ -2047,6 +2047,10 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // literal. A SECOND literal appearing here would mean the helper had started
   // describing its own capability, and belongs in this register with its basis.
   [`${EG}/surrogate-helper-daemon.ts`]: 1,
+  // The gate-side helper client (slice 1b-i) speaks only the frozen query codec
+  // and returns the helper's answer; it describes no capability of its own, so
+  // its count is zero and any claim-shaped literal added here needs a basis row.
+  [`${EG}/surrogate-helper-client.ts`]: 0,
 };
 
 /**

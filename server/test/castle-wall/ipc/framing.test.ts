@@ -10,6 +10,7 @@ import {
   frame,
   parseFrame,
   parseSingleFrame,
+  MAX_FRAME_BYTES,
 } from "../../../src/castle-wall/ipc/framing.js";
 import { IpcFramingError } from "../../../src/castle-wall/errors.js";
 
@@ -33,6 +34,19 @@ describe("castle-wall/ipc/framing : encode + decode", () => {
   it("returns need_more for an incomplete header", () => {
     const partial = new TextEncoder().encode("Content-Length: 5");
     expect(parseFrame(partial)).toEqual({ kind: "need_more" });
+  });
+
+  it("bounds header bytes without counting the body against the header limit", () => {
+    const validHeader = `Content-Length: ${MAX_FRAME_BYTES}\r\n\r\n`;
+    // One GiB is the largest supported frame-size setting, with ten decimal digits.
+    const maxHeader = `Content-Length: ${1024 ** 3}\r\n\r\n`.length;
+    const longestHeader = validHeader.replace(": ", `: ${"0".repeat(maxHeader - validHeader.length)}`);
+    const encode = (text: string) => new TextEncoder().encode(text);
+    expect(parseFrame(encode("x".repeat(longestHeader.length))).kind).toBe("error");
+    expect(parseFrame(encode(`Content-Length: ${" ".repeat(longestHeader.length)}0\r\n\r\n`)).kind).toBe("error");
+    expect(parseFrame(encode(longestHeader))).toEqual({ kind: "need_more" });
+    expect(parseFrame(encode(longestHeader.slice(0, -1)))).toEqual({ kind: "need_more" });
+    expect(parseSingleFrame(frame("x".repeat(longestHeader.length * 2)))).toBe("x".repeat(longestHeader.length * 2));
   });
 
   it("returns need_more when body bytes have not all arrived", () => {

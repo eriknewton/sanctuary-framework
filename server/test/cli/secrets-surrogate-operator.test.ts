@@ -917,17 +917,21 @@ describe("surrogate events", () => {
   });
 
   it("prints only surrogate lines, with placeholders redacted", async () => {
-    // The gate emits no surrogate events in slice 1a, so the fixture stands in
-    // for the lines slice 1b will write. Redaction is the property under test.
     const logPath = join(storagePath, "egress-gate-502.err.log");
     const placeholder = `sanctuary_surrogate_${"a1b2c3d4".repeat(4)}`;
     await writeFile(
       logPath,
       [
         "gate_started uid=502",
-        `surrogate_swap_applied host=api.openai.com placeholder=${placeholder}`,
+        `[egress-gate] ${JSON.stringify({ kind: "surrogate_swap", authority: placeholder })}`,
         "gate_denied reason=plain-http",
-        `surrogate_denied reason=surrogate-locked placeholder=${placeholder}`,
+        `[egress-gate] ${JSON.stringify({ kind: "surrogate_denied", authority: placeholder })}`,
+        '[egress-gate] {"kind":"other","reason":"surrogate_in_unrelated_event"}',
+        '[egress-gate] malformed surrogate_line',
+        'untrusted {"kind":"surrogate_wrong_prefix"}',
+        '[egress-gate] {"kind":4}',
+        '[egress-gate] null',
+        '[egress-gate] ["surrogate_array"]',
       ].join("\n"),
       "utf8",
     );
@@ -936,7 +940,11 @@ describe("surrogate events", () => {
       { effectiveUid: 0, gateLogPathOverride: logPath },
     );
     expect(result.code).toBe(0);
-    expect(result.out).toContain("surrogate_swap_applied");
+    expect(result.out).toContain("surrogate_swap");
+    expect(result.out).not.toContain("surrogate_in_unrelated_event");
+    expect(result.out).not.toContain("surrogate_line");
+    expect(result.out).not.toContain("surrogate_wrong_prefix");
+    expect(result.out).not.toContain("surrogate_array");
     expect(result.out).toContain("surrogate_denied");
     expect(result.out).not.toContain("gate_started");
     expect(result.out).not.toContain("gate_denied reason=plain-http");

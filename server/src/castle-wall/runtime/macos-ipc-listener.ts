@@ -48,6 +48,7 @@ import { randomBytes } from "node:crypto";
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
+import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import type {
   AuditEmitNotification,
   CastleWallMessage,
@@ -64,6 +65,15 @@ import type {
   ArmLeaseNotification,
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
+
+// Eight MiB for retained telemetry work, with one eighth per connection.
+// Reconnecting producers share the global cap, not a per-producer quota. Charge 4 KiB per task
+// (rounded up from a 2.6 KiB retained-task measurement), plus eight bytes per
+// JSON character for decoded strings, object slots and envelope bookkeeping.
+const TELEMETRY_MEMORY_BUDGET_BYTES = 8 * 1024 * 1024;
+const TELEMETRY_CONNECTION_BUDGET_BYTES = TELEMETRY_MEMORY_BUDGET_BYTES / 8;
+const TELEMETRY_TASK_OVERHEAD_BYTES = 4 * 1024;
+const TELEMETRY_JSON_CHARACTER_BYTES = 8;
 
 function sanitizeLogValue(value: string): string {
   let sanitized = "";
@@ -283,6 +293,7 @@ interface ConnectionState {
    * as an extension subscriber. Admin-only connections stay unregistered.
    */
   registered: boolean;
+  telemetryBytes?: number;
 }
 
 /**
@@ -330,6 +341,7 @@ export interface MacOSFlowIpcListenerStats {
  *    continues serving the rest.
  */
 export class MacOSFlowIpcListener {
+  private telemetryBytes = 0;
   private readonly socketPath: string;
   private readonly consumer: MacOSFlowEventConsumer;
   private readonly socketMode: number;
@@ -815,6 +827,7 @@ export class MacOSFlowIpcListener {
       }
       if (step.kind === "error") {
         this.stats.framesRejected += 1;
+        state.inbound = new Uint8Array(0);
         state.socket.destroy();
         return;
       }
@@ -844,7 +857,30 @@ export class MacOSFlowIpcListener {
     }
     const message = envelope.params as CastleWallMessage;
     this.stats.framesDecoded += 1;
-    void this.routeMessage(state, message).catch((error) => {
+    const telemetry = message.type === "flow_decision_recorded" ||
+      message.type === "flow_pending_approval" || message.type === "audit_emit";
+    const charge = telemetry
+      ? TELEMETRY_TASK_OVERHEAD_BYTES + jsonBody.length * TELEMETRY_JSON_CHARACTER_BYTES
+      : 0;
+    if (
+      charge > 0 &&
+      (this.telemetryBytes + charge > TELEMETRY_MEMORY_BUDGET_BYTES ||
+        (state.telemetryBytes ?? 0) + charge > TELEMETRY_CONNECTION_BUDGET_BYTES)
+    ) {
+      // Observations may be discarded under pressure; operator control remains
+      // routable, and loss is audited without queuing another copy of the frame.
+      this.stats.framesRejected += 1;
+      this.consumer.noteIngressDrop("audit_backpressure");
+      return;
+    }
+    this.telemetryBytes += charge;
+    state.telemetryBytes = (state.telemetryBytes ?? 0) + charge;
+    // Must match withAuditWriteSettlement in operational/audit-log.ts: await
+    // actual storage settlement even when the audit caller's deadline expires.
+    const routed = charge > 0
+      ? withAuditWriteSettlement(() => this.routeMessage(state, message))
+      : this.routeMessage(state, message);
+    void routed.catch((error) => {
       const type = sanitizeLogValue(String(message.type));
       const reason = sanitizeLogValue(
         error instanceof Error ? error.message : String(error),
@@ -853,6 +889,11 @@ export class MacOSFlowIpcListener {
       console.error(
         `[castle-wall] listener routeMessage failed for type=${type}: ${reason}`,
       );
+    }).finally(() => {
+      // Disconnects and audit deadlines retain the charge until the scoped
+      // storage operations settle; a permanently hung write keeps its charge.
+      this.telemetryBytes -= charge;
+      state.telemetryBytes = (state.telemetryBytes ?? 0) - charge;
     });
   }
 

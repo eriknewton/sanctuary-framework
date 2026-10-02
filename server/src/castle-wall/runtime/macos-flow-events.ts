@@ -26,6 +26,7 @@
  */
 
 import type { AllowlistRule } from "../allowlist/schema.js";
+import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import {
   CASTLE_WALL_AUDIT_LAYER,
@@ -81,6 +82,13 @@ interface DuplicateReplayRollup {
   maxFloor: number | null;
 }
 
+export type MacOSIngressDropReason =
+  | "audit_backpressure"
+  | "approval_capacity"
+  | "approval_expired"
+  | "approval_shutdown"
+  | "approval_id_too_large";
+
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
   /** Stable identifier for the subscriber connection. */
@@ -109,13 +117,14 @@ export interface MacOSApprovalQueue {
    * Enqueue a pending approval surfaced from the macOS extension. The
    * existing approval pipeline coalesces, rate-limits, and surfaces to the
    * dashboard; the operator's decision returns via the existing IPC path.
+   * Return false when admission is refused; void preserves legacy queues.
    */
   enqueue(input: {
     requestId: string;
     destination: IpcDestination;
     agent: IpcAgentAttribution;
     expiresInSeconds: number;
-  }): Promise<void>;
+  }): Promise<void | boolean>;
 }
 
 /** Diagnostic counters for observability. */
@@ -202,6 +211,15 @@ export interface MacOSFlowEventConsumerInput {
  * standing up a real IPC transport.
  */
 export class MacOSFlowEventConsumer {
+  // Fixed reason vocabulary: discarded packets never become a second queue.
+  private readonly ingressDrops: Record<MacOSIngressDropReason, number> = {
+    audit_backpressure: 0,
+    approval_capacity: 0,
+    approval_expired: 0,
+    approval_shutdown: 0,
+    approval_id_too_large: 0,
+  };
+  private ingressDropWrite: Promise<void> | null = null;
   private readonly subscribers = new Map<string, MacOSSubscriber>();
   private readonly manifestProvider: MacOSManifestProvider;
   private readonly approvalQueue: MacOSApprovalQueue;
@@ -494,13 +512,14 @@ export class MacOSFlowEventConsumer {
       notification.expires_in_seconds > 0
         ? notification.expires_in_seconds
         : this.defaultApprovalTimeoutSeconds;
-    await this.approvalQueue.enqueue({
+    const admitted = await this.approvalQueue.enqueue({
       requestId: notification.request_id,
       destination: notification.destination,
       agent: notification.agent,
       expiresInSeconds: expires,
     });
-    this.stats.pendingApprovalsEnqueued += 1;
+    if (admitted === false) this.stats.pendingApprovalsRejected += 1;
+    else this.stats.pendingApprovalsEnqueued += 1;
   }
 
   /**
@@ -558,6 +577,59 @@ export class MacOSFlowEventConsumer {
 
   getStats(): MacOSFlowEventStats {
     return { ...this.stats };
+  }
+
+  /** Record discarded input without retaining its payload or spawning one write per drop. */
+  noteIngressDrop(reason: MacOSIngressDropReason, count = 1): void {
+    if (this.ingressDrops[reason] === 0) {
+      // SAFETY: stderr is the daemon operator log; the operator must see loss
+      // even when the audit backend cannot persist, once per reason per window.
+      console.error(`[castle-wall] ingress discarded reason=${reason}; counts pending audit`);
+    }
+    this.ingressDrops[reason] += count;
+    void this.flushIngressDrops();
+  }
+
+  /** Persist a coalesced discard record; failed writes remain counted for a later retry. */
+  flushIngressDrops(): Promise<void> {
+    if (this.ingressDropWrite) return this.ingressDropWrite;
+    if (!Object.values(this.ingressDrops).some((count) => count > 0)) return Promise.resolve();
+    const reserved = { ...this.ingressDrops };
+    for (const reason of Object.keys(reserved) as MacOSIngressDropReason[]) {
+      this.ingressDrops[reason] = 0;
+    }
+    let persisted = false;
+    // Reserve counts before yielding so drops during a slow write survive it.
+    // Must match withAuditWriteSettlement in operational/audit-log.ts: the
+    // single discard-write slot includes storage abandoned at a lock deadline.
+    const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
+      await this.auditSink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "castle_wall_ingress_discarded",
+        this.fortressId,
+        { counts: reserved },
+        "failure",
+      );
+      persisted = true;
+    })).catch(() => {
+      for (const reason of Object.keys(reserved) as MacOSIngressDropReason[]) {
+        this.ingressDrops[reason] += reserved[reason];
+      }
+    }).finally(() => {
+      this.ingressDropWrite = null;
+      // Retry only after success or a new caller; a failed store must not spin.
+      if (persisted) void this.flushIngressDrops();
+    });
+    this.ingressDropWrite = write;
+    return write;
+  }
+
+  /** Await coalesced loss records at shutdown; failed persistence stays counted without a retry loop. */
+  async drainIngressDrops(): Promise<void> {
+    await this.flushIngressDrops();
+    // A successful write can start the next batch before its callers resume.
+    // Wait iteratively so continuous drops cannot retain a recursive promise chain.
+    while (this.ingressDropWrite) await this.ingressDropWrite;
   }
 
   handleEnforcementAvailabilityReport(
