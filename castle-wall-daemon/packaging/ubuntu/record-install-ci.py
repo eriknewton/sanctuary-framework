@@ -12,12 +12,12 @@ import sys
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = '.github/workflows/linux-install-package.yml'
 # Must match the unconditional jobs and evidence needs in linux-install-package.yml.
-PACKAGE_JOBS = ['install-rust', 'install-package-build', 'install-package-lifecycle', 'install-cold-composition']
+PACKAGE_JOBS = ['install-rust', 'install-agent-manager', 'install-package-build', 'install-package-lifecycle', 'install-cold-composition']
 # P4 must resolve matrix instances, check the unfiltered exact-head check view,
 # and freeze every actual required job before any proof-host mutation. These
 # categories cannot be silently removed by path filters or renamed workflows.
 EXTERNAL_JOBS = {
-    '.github/workflows/castle-wall-linux.yml': ['castle-wall-linux-integration', 'sanctuary-jail-static'],
+    '.github/workflows/castle-wall-linux.yml': ['castle-wall-msrv', 'castle-wall-linux-integration', 'sanctuary-jail-static'],
     '.github/workflows/linux-package-structure.yml': ['internal-package-structure', 'internal-package-lifecycle'],
     '.github/workflows/ci.yml': ['test', 'lint'],
     '.github/workflows/test-baseline-guard.yml': ['test-baseline-guard'],

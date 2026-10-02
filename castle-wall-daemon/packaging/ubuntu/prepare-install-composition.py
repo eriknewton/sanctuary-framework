@@ -24,7 +24,7 @@ def prepare(signer, output):
     (output / 'endpoints.json').write_text(json.dumps(dict(version=1, initial_delay_ms=60000,
         attempt_timeout_ms=3000, max_response_bytes=256, endpoints=endpoints)))
     (output / 'rules.json').write_text(json.dumps([dict(id='composition-allow', schema_version=1,
-        created_at='2026-10-01T00:00:00Z', match=dict(ip=['127.0.0.1', '::1'], port=[41003], protocol='tcp'), disposition='allow')]))
+        created_at='2026-10-01T00:00:00Z', match=dict(ip=['127.0.0.1', '::1'], port=[41003], protocol='tcp'), scope={}, disposition='allow')]))
     # Never retain or transfer the test signing seed; only the public bundle leaves.
     with tempfile.NamedTemporaryFile() as seed:
         seed.write(os.urandom(32))

@@ -81,11 +81,16 @@ impl Fixture {
             Ok("1")
         );
         assert_eq!(unsafe { libc::geteuid() }, 0);
-        assert_eq!(
-            fs::read_to_string("/root/.sanctuary-host-role")
-                .unwrap()
-                .trim(),
-            "disposable"
+        let marked = fs::read_to_string("/root/.sanctuary-host-role")
+            .is_ok_and(|role| role.trim() == "disposable");
+        // The CI job explicitly opts in on its disposable hosted VM. An
+        // unmarked local/root host still has no authority to run this fixture.
+        let hosted = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
+            && std::env::var("RUNNER_OS").as_deref() == Ok("Linux");
+        assert!(
+            marked || hosted,
+            "positively disposable manager host required"
         );
         assert_eq!(
             fs::read_to_string("/proc/1/comm").unwrap().trim(),

@@ -47,6 +47,41 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --lib --bins
 
+  install-agent-manager:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables gcc
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+      - name: Require real-manager launch and isolation tests
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          cd castle-wall-daemon
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
+            env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            SANCTUARY_P3_MANAGER_TEST=1 SANCTUARY_P3_EVIDENCE_DIR=/root/build/p4-manager-evidence \
+            cargo test --locked --test linux_agent_launch_manager -- --ignored --test-threads=1
+      - name: Copy public manager evidence
+        if: always()
+        run: |
+          sudo cp -a /root/build/p4-manager-evidence "$RUNNER_TEMP/manager-evidence"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/manager-evidence"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-install-agent-manager-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/manager-evidence
+          if-no-files-found: error
+          retention-days: 7
+
   install-package-build:
     needs: install-rust
     runs-on: ubuntu-24.04
@@ -149,7 +184,7 @@ jobs:
           artifact-ids: ${{ needs.install-package-build.outputs.artifact-id }}
           path: ${{ runner.temp }}/install
           merge-multiple: true
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
       - uses: ./.github/actions/apt-install-resilient
@@ -187,7 +222,7 @@ jobs:
 
   install-package-evidence:
     if: always()
-    needs: [install-rust, install-package-build, install-package-lifecycle, install-cold-composition]
+    needs: [install-rust, install-agent-manager, install-package-build, install-package-lifecycle, install-cold-composition]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

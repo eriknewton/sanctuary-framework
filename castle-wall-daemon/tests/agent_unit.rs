@@ -434,11 +434,14 @@ fn tb1c_prefix_order_and_argv_mutations_are_refused() {
 
 /// Paths excluded from TB2's instance-name scan, BY EXACT PATH relative to the
 /// crate root: test fixtures may name a concrete instance, shipped artifacts
-/// may not. Two of the three live under `packaging/`, which is why the rule is
-/// a path list and not a directory convention.
+/// may not. Packaging test drivers are named individually; product files
+/// and documentation retain the same literal-instance prohibition.
 const INSTANCE_NAME_EXCLUSIONS: &[&str] = &[
     "tests/",
     "packaging/ubuntu/test-lifecycle-guard.py",
+    // Exact test-only inventories select their own disposable principal.
+    "packaging/ubuntu/test-install-package.py",
+    "packaging/ubuntu/ci-install-composition.py",
     "packaging/ubuntu/ci-lifecycle.sh",
 ];
 

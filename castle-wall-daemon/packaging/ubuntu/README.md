@@ -99,7 +99,8 @@ Failure mode: NSS timeout or incomplete output is uncertainty, not absence.
    sudo sanctuary-linux enable
    /usr/local/libexec/sanctuary/network-agent-standin --control --endpoints endpoints.json
    sudo sanctuary-linux status --json
-   systemctl show sanctuary-agent@60123.service --property=InvocationID,ActiveState,SubState,Result,MainPID,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ExecMainStatus,NRestarts,ControlGroup,FragmentPath,DropInPaths
+   U=60123
+   systemctl show "sanctuary-agent@${U}.service" --property=InvocationID,ActiveState,SubState,Result,MainPID,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ExecMainStatus,NRestarts,ControlGroup,FragmentPath,DropInPaths
    sudo nft -a list table inet sanctuary-castle
    sudo sanctuary-linux evidence --output evidence/boot-0
    ```

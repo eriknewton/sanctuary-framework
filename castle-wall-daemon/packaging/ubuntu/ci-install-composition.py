@@ -147,6 +147,13 @@ def main(args):
     operator_uid = args.operator_uid
     operator = pwd.getpwuid(operator_uid)
     assert 1000 <= operator_uid < 60123 and operator_uid != 60124
+    # CI has no SSH/PAM login ceremony. Establish this disposable driver's audit
+    # session explicitly; the product still reads the kernel loginuid, never an
+    # environment claim. Real operators obtain the same identity from PAM/sudo.
+    Path('/proc/self/loginuid').write_text(str(operator_uid))
+    assert Path('/proc/self/loginuid').read_text().strip() == str(operator_uid)
+    w.save('operator-session.json', dict(uid=operator_uid, loginuid=operator_uid,
+        setup='explicit disposable CI audit session; normal operator uses PAM'))
     w.save('freeze.json', dict(source_commit=source, deb_sha256=sha, deb_bytes=deb.stat().st_size,
         u_attempts=U_ATTEMPTS, operator_attempts=CONTROL_ATTEMPTS, reboot_claim=False,
         authority='ephemeral CI test authority; not owner-custody A3',
@@ -174,7 +181,6 @@ def main(args):
         capture = subprocess.Popen(['tcpdump', '-U', '-n', '-i', 'lo', '-w', str(args.evidence / 'network.pcap'),
             'portrange', '41001-41003'], stdout=subprocess.DEVNULL, stderr=(args.evidence / 'tcpdump.log').open('w'))
         w.run(['apt-get', 'install', '-y', str(deb)])
-        w.run(['systemctl', 'daemon-reload'])
         LIFECYCLE['inert']()
         control_cmd = ['runuser', '-u', operator.pw_name, '--', STANDIN, '--control', '--endpoints', str(inputs / 'endpoints.json')]
         def control(name):
@@ -208,8 +214,20 @@ def main(args):
         nft = json.loads(w.run(['nft', '-a', '-j', 'list', 'table', 'inet', 'sanctuary-castle']).stdout)
         w.save('nft-running.json', nft)
         # Kernel uid and mark observations accompany WAL decisions; testimony alone cannot pass.
-        raw_nft = json.dumps(nft)
-        assert 'skuid' in raw_nft and '60123' in raw_nft and 'mark' in raw_nft and 'handle' in raw_nft
+        rules = [row['rule'] for row in nft['nftables'] if 'rule' in row]
+        uid_match = {'match': {'left': {'meta': {'key': 'skuid'}}, 'op': '==', 'right': 60123}}
+        jumps = [r for r in rules if r['chain'] == 'output' and uid_match in r['expr']]
+        assert len(jumps) == 1 and isinstance(jumps[0]['handle'], int)
+        targets = [e['goto']['target'] for e in jumps[0]['expr'] if 'goto' in e]
+        assert len(targets) == 1
+        bodies = [r for r in rules if r['chain'] == targets[0] and uid_match in r['expr']]
+        assert len(bodies) == 1 and isinstance(bodies[0]['handle'], int)
+        assert {'queue': {'num': 0}} in bodies[0]['expr']
+        marks = [e['mangle']['value'] for e in bodies[0]['expr']
+                 if e.get('mangle', {}).get('key') == {'meta': {'key': 'mark'}}]
+        assert len(marks) == 1 and isinstance(marks[0], int) and marks[0] > 0
+        w.save('binding.json', dict(uid=60123, jump_handle=jumps[0]['handle'],
+            chain=targets[0], queue_handle=bodies[0]['handle'], mark=marks[0]))
         result = json.loads(w.run([CLI, 'evidence', '--output', str(args.evidence / 'boot-0')]).stdout)
         assert result['complete'] is True
         # Tail exceeds the sender's deadline, and listener health remains positive.
