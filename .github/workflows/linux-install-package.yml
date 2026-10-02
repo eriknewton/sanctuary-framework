@@ -131,8 +131,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # P4 supplies the composed witness after the P2/P3 consumers land. Missing
-  # source is deliberately red, never a skipped or fixture-only composition pass.
+  # Composition consumes the same downloaded artifact as the lifecycle jobs.
   install-cold-composition:
     needs: install-package-build
     runs-on: ubuntu-24.04
@@ -150,6 +149,20 @@ jobs:
           artifact-ids: ${{ needs.install-package-build.outputs.artifact-id }}
           path: ${{ runner.temp }}/install
           merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: python3-cryptography tcpdump
+      - name: Build the exact-head workstation signer and public CI inputs
+        run: |
+          cd server
+          npm ci
+          npm run build
+          cd "$GITHUB_WORKSPACE"
+          python3 castle-wall-daemon/packaging/ubuntu/prepare-install-composition.py \
+            --signer server/bin/sanctuary-linux-policy-sign --output "$RUNNER_TEMP/composition-inputs"
       - name: Require actual-manager composed install witness
         run: |
           [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
@@ -162,7 +175,8 @@ jobs:
           [[ -f "$witness" ]] || { echo 'P4 composed install witness is required; package-only evidence is insufficient' >&2; exit 1; }
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
-            python3 "$witness" --artifact-dir "$RUNNER_TEMP/install" --evidence "$RUNNER_TEMP/composition"
+            python3 "$witness" --artifact-dir "$RUNNER_TEMP/install" --evidence "$RUNNER_TEMP/composition" \
+              --inputs "$RUNNER_TEMP/composition-inputs" --operator-uid "$(id -u)"
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
