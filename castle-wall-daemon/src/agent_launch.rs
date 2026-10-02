@@ -498,9 +498,7 @@ mod tests {
                         "filesystem guard not reached",
                     )
                 })();
-                unsafe {
-                    libc::_exit(if outcome.is_ok() { 0 } else { 1 });
-                }
+                crate::exit_guard::exit_forked_test_child(if outcome.is_ok() { 0 } else { 1 });
             }
             let mut status = 0;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5); // Bound even a stuck test child.
