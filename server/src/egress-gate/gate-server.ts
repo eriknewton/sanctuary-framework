@@ -643,6 +643,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       const [status, code] = SURROGATE_STATUS[reason];
       if (correlationId) queryIds.add(correlationId);
       const kind = unavailable ? "surrogate_helper_unavailable" : "surrogate_denied";
+      // This code describes the whole request outcome, including for earlier answered ids; the helper row owns each query's outcome.
       if (queryIds.size) for (const id of queryIds) emit(kind, reason, status, id);
       else emit(kind, reason, status);
       if (response.destroyed || request.socket.destroyed) return;
@@ -664,7 +665,11 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       if (bodyRefusals.get(request.socket) === bodyOwner) bodyRefusals.delete(request.socket);
       upstream?.destroy();
     };
-    response.once("finish", state_DONE);
+    response.once("finish", () => {
+      // A committed swap's completion records final body octets and upstream status; a refused request cannot become a success.
+      if (state !== "DONE" && committed) for (const id of queryIds) emit("surrogate_swap", "swap", response.statusCode, id);
+      state_DONE();
+    });
     response.once("close", () => {
       // A client close before response finish is a terminal failure even after a value was committed.
       if (!response.writableFinished) refuse("socket_error");
@@ -698,6 +703,8 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
         const result = await helperQuery!({ placeholder: occurrence.placeholder, host: target.host, port: SURROGATE_BOUND_PORT, location: occurrence.location }, id => {
           // Must match surrogate-helper-client.ts onSent: capture the sent id before any terminal callback.
           queryIds.add(id);
+          // A client can close before helper connect; the later send still needs a joinable denial without resuming forwarding.
+          if (stopped()) emit("surrogate_denied", "socket_error", SURROGATE_STATUS.socket_error[0], id);
         });
         if (result.correlationId) queryIds.add(result.correlationId);
         if (stopped()) return;

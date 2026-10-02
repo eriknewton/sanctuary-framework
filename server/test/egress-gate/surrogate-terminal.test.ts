@@ -12,6 +12,75 @@ import { clean, cleanup, directory, binding, helper, tlsUpstream, daemon, direct
 
 afterEach(clean);
 
+it("joins every helper query when the client disconnects before helper connect", async () => {
+  const dir = await directory(); const b = binding(); const h = await helper(dir, [b]);
+  await h.unlock(b, randomBytes(20).toString("hex"));
+  const dial = vi.fn<SurrogateUpstreamRequest>(); const gate = await daemon(dir, { upstreamRequest: dial });
+  let release!: () => void;
+  let connected!: () => void; const pendingConnect = new Promise<void>(r => { connected = r; });
+  const realEmit = net.Socket.prototype.emit;
+  const emitSpy = vi.spyOn(net.Socket.prototype, "emit").mockImplementation(function (this: net.Socket, event, ...values) {
+    if (event !== "connect" || this.remoteAddress !== undefined) return realEmit.call(this, event, ...values);
+    // The only outbound Unix socket after unlock is the real helper query; TCP client events pass through.
+    const helperSocket = this;
+    release = () => { emitSpy.mockRestore(); realEmit.call(helperSocket, event, ...values); };
+    cleanup.push(async () => { helperSocket.destroy(); });
+    connected();
+    return true;
+  });
+  cleanup.push(async () => { emitSpy.mockRestore(); });
+  const socket = net.connect(gate.port, "127.0.0.1", () => socket.write(request(gate.header, `Authorization: ${b.placeholder}\r\n`)));
+  socket.on("error", () => {}); cleanup.push(async () => { socket.destroy(); });
+  await pendingConnect;
+  expect(h.events.some(e => e.kind === "query_answered" || e.kind === "query_denied")).toBe(false);
+  socket.destroy();
+  await vi.waitFor(() => expect(gate.events.some(e => e.kind === "surrogate_denied" && e.code === "socket_error")).toBe(true));
+  release();
+  await vi.waitFor(() => expect(h.events.some(e => e.kind === "query_answered")).toBe(true));
+  const queries = h.events.filter(e => e.kind === "query_answered" || e.kind === "query_denied");
+  expect(queries).toHaveLength(1);
+  for (const query of queries) {
+    expect(query.correlationId).toBeDefined();
+    expect(gate.events.some(e => e.kind === "surrogate_denied" && e.code === "socket_error" && e.correlationId === query.correlationId)).toBe(true);
+  }
+  expect(gate.events.some(e => e.kind === "surrogate_swap")).toBe(false);
+  expect(gate.resolver.resolve).not.toHaveBeenCalled(); expect(dial).not.toHaveBeenCalled();
+});
+
+it("records successful swap completion status and body byte counts for every query", async () => {
+  const dir = await directory(); const bindings = [binding(), binding(2, "X-Api-Key")];
+  const h = await helper(dir, bindings);
+  for (const b of bindings) await h.unlock(b, randomBytes(20).toString("hex"));
+  const upstream = await tlsUpstream(dir);
+  const body = "request \u00e9"; const reply = "response \u2603";
+  upstream.server.removeAllListeners("request");
+  upstream.server.on("request", (incoming, response) => {
+    const chunks: Buffer[] = []; incoming.on("data", c => chunks.push(c));
+    incoming.on("end", () => {
+      expect(Buffer.concat(chunks).toString()).toBe(body);
+      response.writeHead(201, { "Content-Length": Buffer.byteLength(reply) });
+      response.write(reply.slice(0, -1)); response.end(reply.slice(-1));
+    });
+  });
+  const gate = await daemon(dir, { upstreamRequest: upstream.dial });
+  const result = await raw(gate.port, request(gate.header,
+    `Authorization: ${bindings[0]!.placeholder}\r\nX-Api-Key: ${bindings[1]!.placeholder}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n`) + body);
+  expect(result).toContain("201 Created"); expect(result).toContain(reply);
+  const ids = h.events.filter(e => e.kind === "query_answered").map(e => e.correlationId).sort();
+  expect(ids).toHaveLength(bindings.length);
+  const swaps = gate.events.filter((e): e is SurrogateGateEvent => e.kind === "surrogate_swap");
+  const commits = swaps.filter(e => e.status === 0);
+  const completed = swaps.filter(e => e.status === 201);
+  expect(commits.map(e => e.correlationId).sort()).toEqual(ids);
+  expect(completed.map(e => e.correlationId).sort()).toEqual(ids);
+  for (const event of completed) {
+    expect(event.requestBytes).toBe(Buffer.byteLength(body));
+    expect(event.responseBytes).toBe(Buffer.byteLength(reply));
+    expect(gate.events.indexOf(event)).toBeGreaterThan(gate.events.indexOf(commits.at(-1)!));
+  }
+  expect(gate.events.some(e => e.kind === "surrogate_denied")).toBe(false);
+});
+
 it.each(["reset", "disconnect", "policy", "response_reset"])("joins every answered query on %s and records commitment before response", async mode => {
   const dir = await directory(); const bindings = [binding(), binding(2, "X-Api-Key")];
   const h = await helper(dir, bindings);
