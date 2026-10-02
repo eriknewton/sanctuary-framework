@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 import type { Socket } from "node:net";
-import { AuditLog } from "../../../src/operational/audit-log.js";
+import { AuditLog, AuditLockHoldDeadlineError } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { frame } from "../../../src/castle-wall/ipc/framing.js";
 import { MacOSFlowEventConsumer } from "../../../src/castle-wall/runtime/macos-flow-events.js";
@@ -121,11 +121,12 @@ describe("macOS ingress retention", () => {
   });
 
   it("keeps real audit writes charged across hold deadlines and repeated admission waves", async () => {
-    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
     const home = await mkdtemp(join(tmpdir(), "cw-deadline-retention-"));
     const storage = new FilesystemStorage(join(home, "state"));
+    const writeDeadlineMs = 101; // Distinct from the 100 ms lock retry; fired only after storage blocks.
     const log = new AuditLog(storage, ed25519.utils.randomPrivateKey(), {
-      checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: 100,
+      checkpointInterval: 0, integrityMode: "lenient", writeLockHoldDeadlineMs: writeDeadlineMs,
     });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -135,11 +136,51 @@ describe("macOS ingress retention", () => {
     const f = fixture(log);
     const retained = () => (f.listener as unknown as { telemetryBytes: number }).telemetryBytes;
     const pending = () => (log as unknown as { pendingWrites: Set<Promise<void>> }).pendingWrites.size;
+    const outcomes: Promise<PromiseSettledResult<void>>[] = [];
+    const deadlines = new Map<ReturnType<typeof setTimeout>, () => void>();
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    let notifyWriteStarted!: () => void;
+    const nextWrite = () => new Promise<void>((resolve) => { notifyWriteStarted = resolve; });
+    let writeStarted = nextWrite();
+    let expiredWrites = 0;
+    const expireBlockedWrites = async () => {
+      while (pending() > 0) {
+        // Real filesystem setup must reach the blocked write before its deadline fires.
+        await writeStarted;
+        writeStarted = nextWrite();
+        expect(deadlines.size).toBe(1);
+        const fireDeadline = [...deadlines.values()][0]!;
+        fireDeadline();
+        const outcome = await outcomes[expiredWrites++];
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status === "rejected") expect(outcome.reason).toBeInstanceOf(AuditLockHoldDeadlineError);
+      }
+    };
+    // Control only hold deadlines; filesystem read-consistency retries still need real timers.
+    // Setup and cleanup deadlines stay inert so healthy writes have no wall-clock race either.
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, ms, ...args) => {
+      if (ms !== writeDeadlineMs) return realSetTimeout(callback, ms, ...args);
+      const timer = { unref() {} } as ReturnType<typeof setTimeout>;
+      deadlines.set(timer, () => { deadlines.delete(timer); callback(...args); });
+      return timer;
+    });
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      if (!deadlines.delete(timer as ReturnType<typeof setTimeout>)) realClearTimeout(timer);
+    });
     try {
       await log.append("l1", "seed", "fixture");
+      const append = log.append.bind(log);
+      vi.spyOn(log, "append").mockImplementation((...args) => {
+        const result = append(...args);
+        // Attach rejection handling before advancing time, including on assertion-failure cleanup.
+        outcomes.push(Promise.allSettled([result]).then(([outcome]) => outcome!));
+        return result;
+      });
       vi.spyOn(storage, "writeDurable").mockImplementation(async (namespace, key, data) => {
         if (hang && namespace === "_audit" && key.startsWith("entry-")) {
           activeWrites++;
+          notifyWriteStarted();
           try { await gate; throw new Error("released fixture write"); }
           finally { activeWrites--; }
         }
@@ -150,7 +191,7 @@ describe("macOS ingress retention", () => {
       for (let i = 0; i < 16; i++) f.dispatch(state(`initial-${i}`), large);
       const reserved = retained();
       expect(reserved).toBeGreaterThan(0);
-      await vi.waitFor(() => expect(pending()).toBe(0), { timeout: 5_000 });
+      await expireBlockedWrites();
       const abandonedWrites = activeWrites;
       for (let wave = 0; wave < 3; wave++) {
         expect(log.getWriteLockRecoveryCount()).toBeGreaterThan(0);
@@ -158,22 +199,35 @@ describe("macOS ingress retention", () => {
         expect(retained()).toBe(reserved);
         for (let i = 0; i < 16; i++) f.dispatch(state(`wave-${wave}-${i}`), large);
         await turn();
-        await vi.waitFor(() => expect(pending()).toBe(0), { timeout: 5_000 });
+        await expireBlockedWrites();
         expect(activeWrites).toBe(abandonedWrites);
       }
       hang = false;
       release();
-      await vi.waitFor(() => { expect(activeWrites).toBe(0); expect(retained()).toBe(0); });
+      await f.consumer.drainIngressDrops();
+      await log.flush();
+      await turn();
+      expect(activeWrites).toBe(0);
+      expect(retained()).toBe(0);
+      expect(log.getWriteLockRecoveryCount()).toBe(expiredWrites);
       f.dispatch(state("after-settlement"));
+      expect(await outcomes.at(-1)).toEqual({ status: "fulfilled", value: undefined });
       await vi.waitFor(() => expect(f.consumer.getStats().decisionsRecorded).toBe(1));
     } finally {
       hang = false;
       release();
-      await vi.waitFor(() => { expect(activeWrites).toBe(0); expect(pending()).toBe(0); expect(retained()).toBe(0); });
-      await f.consumer.flushIngressDrops();
-      await log.flush().catch(() => {});
-      await rm(home, { recursive: true, force: true });
-      stderr.mockRestore();
+      try {
+        await f.consumer.drainIngressDrops();
+        await log.flush();
+        await Promise.all(outcomes);
+        await turn();
+        expect(activeWrites).toBe(0);
+        expect(pending()).toBe(0);
+        expect(retained()).toBe(0);
+      } finally {
+        vi.restoreAllMocks();
+        await rm(home, { recursive: true, force: true });
+      }
     }
   });
 
