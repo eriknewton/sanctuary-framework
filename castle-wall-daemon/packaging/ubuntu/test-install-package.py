@@ -277,6 +277,37 @@ class InstallTests(unittest.TestCase):
                 fn(False, 'install')
 
 
+    def test_guard_path_set_matches_canonical_sources(self):
+        LAYOUT['check_guard_paths'](HERE)
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)
+            for file in ('install-lifecycle-guard.py', 'lifecycle-guard.py'):
+                (target / file).write_bytes((HERE / file).read_bytes())
+            guard = target / 'install-lifecycle-guard.py'
+            original = guard.read_text()
+            for changed in (original.replace('NFT_TABLE = "sanctuary-castle"', 'NFT_TABLE = "other"'),
+                            original + '\nEXTRA_PATH = "/unexpected"\n'):
+                guard.write_text(changed)
+                with self.assertRaises(ValueError):
+                    LAYOUT['check_guard_paths'](target)
+
+
+    def test_runtime_refusal_cannot_be_a_generic_startup_failure(self):
+        runtime = runpy.run_path(str(HERE / 'assert-install-runtime.py'))
+        fn = runtime['classify_refusal']
+        flag = '--isolated-runtime-root'
+        self.assertEqual(fn('castle-wall-daemon', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
+        self.assertEqual(fn('sanctuary-linux', flag, 69, 'not built in this commit\n'), 'phase-0-unavailable')
+        self.assertEqual(fn('sanctuary-linux', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
+        for name, status, stderr in (('castle-wall-daemon', 2, 'configuration missing'),
+                                     ('sanctuary-linux', 78, 'configuration missing'),
+                                     ('sanctuary-linux', 0, 'unknown argument: ' + flag),
+                                     ('sanctuary-linux', 69, 'other error'),
+                                     ('sanctuary-linux', -9, 'unknown argument: ' + flag)):
+            with self.subTest(name=name, status=status), self.assertRaises(ValueError):
+                fn(name, flag, status, stderr)
+
+
 
 if __name__ == '__main__':
     unittest.main()

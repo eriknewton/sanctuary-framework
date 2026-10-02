@@ -45,6 +45,8 @@ def check_contract(crate):
     expected = dict(zip(('DAEMON_PATH', 'LAUNCHER_PATH', 'STANDIN_PATH', 'CLI_PATH'),
                         ('/' + p for p in BINARIES.values())))
     expected['WORKSPACE_MOUNT_UNIT'] = MOUNT_NAME
+    expected['WORKSPACE_PATH'] = '/' + WORKSPACE_DIRECTORY
+    check_guard_paths(crate / 'packaging/ubuntu')
     for name, value in expected.items():
         matches = re.findall(r'^pub const ' + name + r': &str = (".*");$', source, re.M)
         if len(matches) != 1 or json.loads(matches[0]) != value:
@@ -78,3 +80,21 @@ def control_bytes(version, depends):
         'Maintainer: Erik Newton <eriknewton@gmail.com>\n'
         'Description: Castle Wall cold-install package\n Installation is inert; provisioning and activation are explicit operator actions.\n'
     ).encode()
+
+
+def check_guard_paths(here):
+    import runpy
+    # The internal source assertion already binds the daemon's fixed paths.
+    # Check the whole corresponding install set, including future additions,
+    # instead of allowing a second hand-maintained runtime path inventory.
+    internal = runpy.run_path(str(here / 'lifecycle-guard.py'))
+    install = runpy.run_path(str(here / 'install-lifecycle-guard.py'), init_globals={'PAYLOAD_MODES': PAYLOAD_FILES})
+    mirrored = {key: value for key, value in internal.items() if key.endswith(('_PATH', '_ROOT'))}
+    mirrored.update({key: internal[key] for key in ('NFT_FAMILY', 'NFT_TABLE', 'UNIT_NAME', 'AGENT_UNIT_PREFIX', 'SYSTEMD_ROOTS')})
+    mirrored.update({'IDENTITY_PATH': '/' + IDENTITY, 'MOUNT_PATH': '/etc/systemd/system/' + MOUNT_NAME,
+                     'WORKSPACE_PATH': '/' + WORKSPACE_DIRECTORY, 'CONFIG_ROOT': '/etc/sanctuary'})
+    actual = {key for key in install if key.endswith(('_PATH', '_ROOT'))}
+    if actual != {key for key in mirrored if key.endswith(('_PATH', '_ROOT'))}:
+        raise ValueError('install guard path inventory drifted')
+    if any(install[key] != value for key, value in mirrored.items()):
+        raise ValueError('install guard differs from shared source paths')

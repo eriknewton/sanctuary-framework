@@ -102,7 +102,8 @@ mkdir -p -- "$output_dir"
 [[ -z "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]] || die "output directory must be empty"
 
 build_root="$(mktemp -d "${TMPDIR:-/tmp}/sanctuary-linux-package.XXXXXX")"
-trap 'rm -rf -- "$build_root"' EXIT
+# Remove only the private directory created by mktemp above.
+trap 'rm -r -- "$build_root"' EXIT
 target_dir="$build_root/target"
 stage_dir="$build_root/stage"
 
