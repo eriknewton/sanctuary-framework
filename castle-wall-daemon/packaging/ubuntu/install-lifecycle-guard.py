@@ -364,6 +364,7 @@ def systemd_files(installed):
                         refuse(f"agent unit drop-in directory present: {path}")
                     refuse(f"alternate agent unit, alias or instance enablement: {path}")
                 if stat.S_ISLNK(info.st_mode):
+                    # Must match inspect_unit_tree in src/linux_install/command.rs:
                     # os.walk will not follow this directory, so it cannot
                     # establish that an alias is absent beneath it.
                     if name in dirs:

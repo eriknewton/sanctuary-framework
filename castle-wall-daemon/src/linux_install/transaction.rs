@@ -166,7 +166,8 @@ impl Root {
         parent.sync_all()?;
         Ok(Self { dir })
     }
-    /// Classify a directory without following a leaf link; traversal rechecks custody.
+    /// Classify a directory, including a leaf link's target, without opening its contents.
+    /// Traversal still refuses links and rechecks custody through `entries`.
     pub fn is_directory(&self, path: &str) -> Result<bool> {
         let (parent, name) = self.parent(path)?;
         let name = component(&name)?;
@@ -181,6 +182,19 @@ impl Root {
         } != 0
         {
             return Err(std::io::Error::last_os_error().into());
+        }
+        let kind = unsafe { meta.assume_init() }.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFLNK {
+            return Ok(kind == libc::S_IFDIR);
+        }
+        // Must match install-lifecycle-guard.py's symlinked-directory refusal;
+        // classify the target only so an unwalked directory cannot hide unit links.
+        if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), meta.as_mut_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false); // A dangling unit-file alias has no directory to inventory.
+            }
+            return Err(error.into());
         }
         Ok(unsafe { meta.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR)
     }

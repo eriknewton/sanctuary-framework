@@ -42,6 +42,90 @@ fn every_dependency_suffix_is_inventoried() {
     }
 }
 
+#[test]
+fn symlinked_unit_directories_are_refused() {
+    let mut admitted = Vec::new();
+    for name in [
+        "other.target.wants",
+        "other.target.requires",
+        "other.target.upholds",
+        "other.service.d",
+        "unrelated/nested",
+    ] {
+        for absolute in [false, true] {
+            for populated in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = Root::open(dir.path()).unwrap();
+                let units = dir.path().join("etc/systemd/system");
+                let link = units.join(name);
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                let destination = dir.path().join("dependency-target");
+                std::fs::create_dir(&destination).unwrap();
+                if populated {
+                    std::os::unix::fs::symlink(
+                        "/etc/systemd/system/sanctuary-agent@.service",
+                        destination.join("helper.service"),
+                    )
+                    .unwrap();
+                }
+                let target = if absolute {
+                    destination
+                } else {
+                    // Three parents leave etc/systemd/system; nested names add their own depth.
+                    let parents = 3 + name.matches('/').count();
+                    std::path::PathBuf::from("../".repeat(parents)).join("dependency-target")
+                };
+                std::os::unix::fs::symlink(target, &link).unwrap();
+                assert!(link.is_dir());
+                for fresh in [false, true] {
+                    let result = inspect_unit_tree(&root, "etc/systemd/system", &[], fresh);
+                    match result {
+                        Ok(()) => admitted.push((name, absolute, populated, fresh)),
+                        Err(error) => {
+                            assert_eq!(error.to_string(), "symlinked systemd directory");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "admitted directory aliases: {admitted:?}"
+    );
+}
+
+#[test]
+fn ordinary_unit_file_aliases_and_canonical_enablement_remain_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::open(dir.path()).unwrap();
+    let units = dir.path().join("etc/systemd/system");
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::write(
+        units.join("other.service"),
+        "[Service]\nExecStart=/bin/true\n",
+    )
+    .unwrap();
+    for (name, target) in [
+        ("alias.service", "other.service"),
+        ("dangling.service", "absent.service"),
+        ("masked.service", "/dev/null"),
+    ] {
+        std::os::unix::fs::symlink(target, units.join(name)).unwrap();
+    }
+    assert!(inspect_unit_tree(&root, "etc/systemd/system", &[], true).is_ok());
+    let wants = units.join("multi-user.target.wants");
+    std::fs::create_dir(&wants).unwrap();
+    let wall = "sanctuary-castle-wall.service";
+    std::fs::write(units.join(wall), "[Service]\nExecStart=/bin/true\n").unwrap();
+    let target = format!("../{wall}");
+    std::os::unix::fs::symlink(&target, wants.join(wall)).unwrap();
+    assert!(
+        inspect_unit_tree(&root, "etc/systemd/system", &[(wall.into(), target)], false).is_ok()
+    );
+    assert!(inspect_unit_tree(&root, "etc/systemd/system", &[], true).is_err());
+}
+
 fn transaction() -> castle_wall_daemon::linux_install::transaction::Transaction {
     use castle_wall_daemon::linux_install::{
         account::AccountStep,

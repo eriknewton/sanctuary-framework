@@ -819,7 +819,11 @@ pub fn inspect_unit_tree(
             {
                 return Err("inherited unit override".into());
             }
-            if target.is_none() && root.is_directory(&path)? {
+            if root.is_directory(&path)? {
+                // Must match install-lifecycle-guard.py: an unwalked directory cannot prove aliases absent.
+                if target.is_some() {
+                    return Err("symlinked systemd directory".into());
+                }
                 pending.push((path, depth + 1));
             }
         }
