@@ -1017,7 +1017,8 @@ fn installed_launcher_negative_records_and_inherited_socket() {
     );
     // Inheritable caps survive exec. Filesystem ids are reset by exec itself;
     // their live guard is exercised by the in-process fork test in agent_launch.
-    for (mode, expected) in [("inh", "inheritable capabilities")] {
+    {
+        let (mode, expected) = ("inh", "inheritable capabilities");
         let out = Command::new(credential_probe)
             .arg(mode)
             .env_clear()

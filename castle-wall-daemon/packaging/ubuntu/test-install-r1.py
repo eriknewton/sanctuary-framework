@@ -18,6 +18,15 @@ G = BASE['GUARD']
 LAYOUT = BASE['LAYOUT']
 
 class Repairs(unittest.TestCase):
+    def test_installed_canonical_agent_unit_is_not_a_shadow(self):
+        fn = G['systemd_files']
+        root = '/etc/systemd/system'
+        directory = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+        regular = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+        with patch.dict(fn.__globals__, {'SYSTEMD_ROOTS': (root,), 'command': lambda _: root,
+            'check_ancestors': lambda _: True, 'lstat': lambda p: regular if p == G['AGENT_UNIT_PATH'] else directory}), patch.object(os, 'walk', return_value=[(root, [], ['sanctuary-agent@.service'])]):
+            fn(True)
+
     def test_dependency_directories_and_sibling_activation_units_refuse(self):
         fn = G['systemd_files']
         root = '/etc/systemd/system'

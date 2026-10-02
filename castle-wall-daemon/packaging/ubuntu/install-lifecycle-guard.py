@@ -378,7 +378,7 @@ def systemd_files(installed):
                         refuse(f"agent unit alias or enablement symlink: {path}")
                 elif name in dirs and (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022):
                     refuse(f"unsafe systemd directory: {path}")
-                elif relevant and path not in (UNIT_PATH, MOUNT_PATH):
+                elif relevant and path not in (UNIT_PATH, MOUNT_PATH, AGENT_UNIT_PATH):
                     refuse(f"alternate systemd unit or drop-in: {path}")
             if directory == root and UNIT_NAME + ".d" in dirs:
                 refuse("unit drop-in directory present")
