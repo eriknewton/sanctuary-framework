@@ -1,4 +1,4 @@
-/** Capability: exact-byte echo screening bounds work and retained response state. */
+/** Capability: exact-byte echo screening bounds work and retained response state. SURROGATE-1B-II-CLAUDE-F1 */
 import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { SurrogateEchoScanner, MAX_PLACEHOLDERS_PER_REQUEST, MAX_SURROGATE_ECHO_SCAN_BYTES, MAX_SURROGATE_VALUE_BYTES } from "../../src/credential-surrogate/index.js";
@@ -165,6 +165,36 @@ describe("surrogate echo scanner", () => {
     // Each KMP view needs at most two comparisons per delivered byte and value.
     expect(scanner.metrics.comparisons).toBeLessThanOrEqual(4 * scanner.metrics.scannedBytes);
     expect(scanner.metrics.comparisons).toBeGreaterThan(scanner.metrics.scannedBytes);
+  });
+  it.each([
+    ["space before extension", " ;ext\r\n"],
+    ["tab before extension", "\t;ext\r\n"],
+    ["trailing space", " \r\n"],
+    ["bare LF", "\n"],
+    ["space in extension", ";ext \r\n"],
+    ["tab in extension", ";ext\t\r\n"],
+  ])("refuses a begun size line with %s", (_name, suffix) => {
+    const secret = value();
+    const hexRadix = 16;
+    const sizeLine = Buffer.from(`${secret.length.toString(hexRadix)}${suffix}`);
+    for (let split = 1; split < sizeLine.length; split++) {
+      const scanner = new SurrogateEchoScanner([secret], true);
+      const first = scanner.scan(sizeLine.subarray(0, split));
+      const last = scanner.scan(sizeLine.subarray(split));
+      expect(first.blocked ? first : last).toEqual({ blocked: true, cause: "encoding" });
+      expect(output(first).length + output(last).length).toBe(0);
+      expect(scanner.encodingFailed).toBe(true);
+      expect(scanner.metrics.carryBytes).toBe(0);
+      expect(scanner.scan(Buffer.from(secret)).blocked).toBe(true);
+      expect(scanner.finish().length).toBe(0);
+    }
+  });
+  it("refuses an unfinished size line without releasing its carry", () => {
+    const scanner = new SurrogateEchoScanner([value()], true);
+    expect(output(scanner.scan(Buffer.from("a"))).length).toBe(0);
+    expect(scanner.finish().length).toBe(0);
+    expect(scanner.encodingFailed).toBe(true);
+    expect(scanner.metrics.carryBytes).toBe(0);
   });
   it("refuses framing that would release a retained stripped prefix", () => {
     const secret = value();

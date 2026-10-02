@@ -13,6 +13,8 @@ type FrameState = "PROBE" | "SIZE" | "EXTENSION" | "SIZE_LF" | "DATA" |
 const CR = 0x0d;
 const LF = 0x0a;
 const SEMICOLON = 0x3b;
+const SP = 0x20; // ASCII space.
+const HTAB = 0x09; // ASCII horizontal tab.
 const HEX_RADIX = 16;
 const HEX_DIGITS = "0123456789abcdef";
 
@@ -140,12 +142,15 @@ export class SurrogateEchoScanner {
         const digit = HEX_DIGITS.indexOf(String.fromCharCode(byte).toLowerCase());
         if (digit >= 0) {
           this.frameDigits = true;
+          // A begun size line can never become an ordinary body: framing deviations
+          // must refuse, since unparsed framing in a non-dechunked body splits a secret across views.
+          // Cost, accepted: a dechunked body that opens with a hex digit is refused too (availability, never a leak).
+          this.frameCommitted = true;
           // Saturation prevents attacker-selected size digits from overflowing numeric state.
           this.frameSize = Math.min(MAX_SURROGATE_ECHO_SCAN_BYTES + 1, this.frameSize * HEX_RADIX + digit);
           return "SKIP";
         }
         if (this.frameDigits && (byte === SEMICOLON || byte === CR)) {
-          this.frameCommitted = true;
           this.frameState = byte === SEMICOLON ? "EXTENSION" : "SIZE_LF";
           return "SKIP";
         }
@@ -155,7 +160,8 @@ export class SurrogateEchoScanner {
         return "FAIL";
       }
       case "EXTENSION":
-        if (byte === LF) return "FAIL";
+        // The strict size-line view refuses whitespace even after the extension delimiter.
+        if (byte === LF || byte === SP || byte === HTAB) return "FAIL";
         if (byte === CR) this.frameState = "SIZE_LF";
         return "SKIP";
       case "SIZE_LF":

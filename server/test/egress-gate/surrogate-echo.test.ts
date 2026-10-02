@@ -1,4 +1,4 @@
-/** Capability: swapped forward responses use the bounded echo guard through the daemon. */
+/** Capability: swapped forward responses use the bounded echo guard through the daemon. SURROGATE-1B-II-CLAUDE-F1 */
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -331,6 +331,26 @@ describe("wired surrogate echo consumer", () => {
     expect(result.complete).toBe(true);
     expect(result.body.equals(body)).toBe(true);
     expect(fixture.echoes()).toHaveLength(0);
+  });
+  it.each([" ", "\t"])("refuses size-line whitespace %j through the daemon", async whitespace => {
+    const fixture = await setup((request, _response) => {
+      const secret = String(request.headers["x-credential-0"]);
+      const halves = 2; // Two frames exercise a value crossing a frame boundary.
+      const split = Math.floor(secret.length / halves);
+      const hexRadix = 16;
+      const payload = [secret.slice(0, split), secret.slice(split)]
+        .map(part => `${Buffer.byteLength(part).toString(hexRadix)}${whitespace};ext\r\n${part}\r\n`).join("");
+      request.socket.end(`HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\t\r\nConnection: close\r\n\r\n${payload}0\r\n\r\n`);
+    });
+    const result = await fixture.run();
+    expect(result.body.length).toBe(0);
+    expect(result.complete).toBe(false);
+    expect(fixture.echoes()).toHaveLength(1);
+    expect(fixture.echoes()[0]).toMatchObject({
+      kind: "surrogate_echo_unscanned", code: "echo_unscanned", cause: "encoding",
+    });
+    expect(fixture.events.some(e => e.kind === "surrogate_swap" && e.status !== 0)).toBe(false);
+    fixture.assertSafeEvents();
   });
   it.each(["invalid separator", "incomplete frame"])("refuses a stripped-view framing failure: %s", async fault => {
     const fixture = await setup((request, _response) => {
