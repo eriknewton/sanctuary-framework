@@ -28,6 +28,9 @@ SOURCES = {
 IDENTITY = DOC + '/build-identity'
 PAYLOAD_FILES = {**{p: 0o755 for p in BINARIES.values()}, **{p: 0o644 for p in SOURCES}, IDENTITY: 0o644}
 PAYLOAD_DIRS = {str(parent) for p in PAYLOAD_FILES for parent in Path(p).parents if str(parent) != '.'}
+# The package owns an empty root-only-writable mountpoint; no unmounted U fallback.
+WORKSPACE_DIRECTORY = 'var/lib/sanctuary-agent-workspace'
+PAYLOAD_DIRS |= {'var', 'var/lib', WORKSPACE_DIRECTORY}
 CONTROL_FILES = {'control': 0o644, 'preinst': 0o755, 'prerm': 0o755}
 PRE_DEPENDS = 'systemd, nftables, python3'
 # Runtime command closure for provisioning, accounts, manager and mount control.
@@ -57,4 +60,10 @@ def guard_bytes(role, version, identity_bytes, hashes, here):
     header = ('#!/usr/bin/python3\n' + f'ROLE = {role!r}\nPACKAGE_VERSION = {version!r}\n'
               + f'IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n'
               + f'PAYLOAD_MODES = {PAYLOAD_FILES!r}\nPAYLOAD_HASHES = {hashes!r}\n')
-    return header.encode() + (here / 'install-lifecycle-guard.py').read_bytes()
+    return header.encode() + guard_source(here)
+
+
+def guard_source(here):
+    # Both low-level process bounds and install policy are embedded verbatim;
+    # no mutable helper is imported from the target host.
+    return (here / 'bounded-process.py').read_bytes() + b'\n' + (here / 'install-lifecycle-guard.py').read_bytes()

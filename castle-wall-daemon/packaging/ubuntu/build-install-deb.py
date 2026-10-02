@@ -93,7 +93,7 @@ def build(revision, output):
             'artifact_kind': LAYOUT['KIND'], 'install_ready': True, 'package': LAYOUT['PACKAGE'],
             'package_version': version, 'source_commit': head, 'cargo_lock_sha256': sha(CRATE / 'Cargo.lock'),
             'rustc_version': rustc, 'target': LAYOUT['TARGET'], 'features': [], 'payload_sha256': hashes,
-            'guard_sha256': sha(HERE / 'install-lifecycle-guard.py'), 'runtime_depends': depends,
+            'guard_sha256': hashlib.sha256(LAYOUT['guard_source'](HERE)).hexdigest(), 'runtime_depends': depends,
             'pre_depends': LAYOUT['PRE_DEPENDS'],
         }
         identity_bytes = (json.dumps(identity, sort_keys=True, indent=2) + '\n').encode()

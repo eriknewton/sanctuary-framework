@@ -53,9 +53,12 @@ def inert():
     agents = run(['systemctl', 'list-units', '--all', '--plain', '--no-legend', '--full', 'sanctuary-agent@*.service'])
     if agents.stdout.strip():
         raise ValueError('unexpected loaded agent instance')
-    for path in ('/etc/sanctuary', '/var/lib/sanctuary', '/run/sanctuary', '/var/lib/sanctuary-agent-workspace'):
+    for path in ('/etc/sanctuary', '/var/lib/sanctuary', '/run/sanctuary'):
         if os.path.lexists(path):
             raise ValueError('install created operator state: ' + path)
+    workspace = Path('/' + LAYOUT['WORKSPACE_DIRECTORY'])
+    if not workspace.is_dir() or workspace.is_symlink() or any(workspace.iterdir()) or workspace.stat().st_mode & 0o7777 != 0o755:
+        raise ValueError('packaged underlying workspace is not empty and root-only-writable')
     tables = json.loads(run(['nft', '-j', 'list', 'tables']).stdout)
     if any(row.get('table', {}).get('name') == 'sanctuary-castle' for row in tables['nftables']):
         raise ValueError('install created product table')

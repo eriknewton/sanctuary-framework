@@ -12,6 +12,7 @@ import tarfile
 
 HERE = Path(__file__).resolve().parent
 LAYOUT = runpy.run_path(str(HERE / 'install-layout.py'))
+bounded_capture = runpy.run_path(str(HERE / 'bounded-process.py'))['bounded_capture']
 # Share low-level metadata parsers only; neither variant selects the other's policy.
 COMMON = runpy.run_path(str(HERE / 'assert-archive.py'))
 field = COMMON['field']
@@ -26,12 +27,12 @@ def fail(message):
 
 
 def archive(deb, option):
-    result = subprocess.run(['dpkg-deb', option, str(deb)], capture_output=True, check=True, timeout=30)
-    if len(result.stdout) > MAX_ARCHIVE_BYTES:
-        fail('archive exceeds unpacked budget')
+    status, raw, error = bounded_capture(['dpkg-deb', option, str(deb)], timeout=30, limit=MAX_ARCHIVE_BYTES)
+    if status or error:
+        fail('archive extraction failed')
     answer = {}
     saw_root = False
-    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode='r:') as tar:
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
         for entry in tar:
             # PAX metadata can override custody or confer capabilities outside
             # ordinary mode bits. The builder needs none, so admit none.
@@ -118,7 +119,9 @@ def main(deb, expected_source):
         # ELF64 little-endian x86-64, not a fixture shell script or wrong target.
         if data[:6] != b'\x7fELF\x02\x01' or data[18:20] != b'\x3e\x00':
             fail('install executable is not an amd64 ELF: ' + path)
-    for key, source in (('cargo_lock_sha256', crate / 'Cargo.lock'), ('guard_sha256', HERE / 'install-lifecycle-guard.py')):
+    if identity['guard_sha256'] != hashlib.sha256(LAYOUT['guard_source'](HERE)).hexdigest():
+        fail('install guard source hash mismatch')
+    for key, source in (('cargo_lock_sha256', crate / 'Cargo.lock'),):
         if identity[key] != hashlib.sha256(source.read_bytes()).hexdigest():
             fail('install source hash mismatch: ' + key)
     for role in ('preinst', 'prerm'):

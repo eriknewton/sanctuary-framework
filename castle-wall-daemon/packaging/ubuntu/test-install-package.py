@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import runpy
 import stat
+import sys
+import tempfile
 import tarfile
 import unittest
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ ARCHIVE = runpy.run_path(str(HERE / 'assert-install-archive.py'))
 HEADER = {'ROLE': 'preinst', 'PACKAGE_VERSION': '0.1.0-1',
           'IDENTITY_SHA256': 'a' * 64, 'PAYLOAD_MODES': LAYOUT['PAYLOAD_FILES'],
           'PAYLOAD_HASHES': {p: 'b' * 64 for p in LAYOUT['PAYLOAD_FILES']}}
+HEADER.update(runpy.run_path(str(HERE / 'bounded-process.py')))
 GUARD = runpy.run_path(str(HERE / 'install-lifecycle-guard.py'), init_globals=HEADER)
 
 
@@ -74,7 +77,7 @@ class InstallTests(unittest.TestCase):
 
     def test_product_config_and_workspace_refuse_even_when_stopped(self):
         fn = GUARD['runtime_absent']
-        for retained in ('/etc/sanctuary', '/var/lib/sanctuary', '/run/sanctuary'):
+        for retained in ('/etc/sanctuary', '/var/lib/sanctuary', '/run/sanctuary', '/var/lib/sanctuary-agent-workspace'):
             seen = []
             def empty(path):
                 seen.append(path)
@@ -84,10 +87,6 @@ class InstallTests(unittest.TestCase):
                 'empty_runtime_root': empty, 'lstat': lambda _: None, 'mount_absent': lambda: None}):
                 with self.assertRaises(GUARD['Refusal']):
                     fn()
-        with patch.dict(fn.__globals__, {'empty_runtime_root': lambda _: None,
-                                        'lstat': lambda _: SimpleNamespace(), 'mount_absent': lambda: None}):
-            with self.assertRaises(GUARD['Refusal']):
-                fn()
 
     def test_conflicting_internal_package_refuses(self):
         fn = GUARD['dpkg_status']
@@ -105,9 +104,71 @@ class InstallTests(unittest.TestCase):
                 entry.mode = 0o644
                 entry.pax_headers = pax
                 tar.addfile(entry, io.BytesIO())
-            with self.subTest(name=name, pax=pax), patch.object(fn.__globals__['subprocess'], 'run', return_value=SimpleNamespace(stdout=stream.getvalue())):
+            with self.subTest(name=name, pax=pax), patch.dict(fn.__globals__, {'bounded_capture': lambda *a, **k: (0, stream.getvalue(), b'')}):
                 with self.assertRaises(ValueError):
                     fn(Path('fixture.deb'), '--fsys-tarfile')
+
+    def test_probe_output_and_time_are_bounded(self):
+        capture = HEADER['bounded_capture']
+        self.assertEqual(capture([sys.executable, '-c', 'print("ok")'], timeout=2, limit=4096), (0, b'ok\n', b''))
+        for script in ('print("x" * 4097)', 'import sys; sys.stderr.write("x" * 4097)'):
+            with self.assertRaisesRegex(ValueError, 'output cap'):
+                capture([sys.executable, '-c', script], timeout=2, limit=4096)
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            capture([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=0.1, limit=4096)
+
+    def test_stable_read_refuses_links_and_oversize(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'file'
+            path.write_bytes(b'12345')
+            self.assertEqual(GUARD['stable_read'](path, 5), b'12345')
+            with self.assertRaises(GUARD['Refusal']):
+                GUARD['stable_read'](path, 4)
+            link = Path(temp) / 'link'
+            link.symlink_to(path)
+            with self.assertRaises(GUARD['Refusal']):
+                GUARD['stable_read'](link, 5)
+
+    def test_jobs_and_mounts_require_positive_absence(self):
+        fn = GUARD['no_queued_jobs']
+        for text in ('1 sanctuary-agent@60123.service start waiting\n', '1 ' + GUARD['MOUNT_NAME'] + ' start running\n', 'incomplete'):
+            with patch.dict(fn.__globals__, {'command_allow_empty': lambda _: text}):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn()
+        with patch.dict(fn.__globals__, {'command_allow_empty': lambda _: ''}):
+            fn()
+        fn = GUARD['mount_absent']
+        for raw in (b'1 0 0:1 / /var/lib/sanctuary-agent-workspace rw - tmpfs tmpfs rw\n', b'bad'):
+            with patch.dict(fn.__globals__, {'stable_read': lambda *_: raw}):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn()
+
+
+    def test_ci_inventory_rejects_missing_skipped_cancelled_and_wrong_head(self):
+        module = runpy.run_path(str(HERE / 'record-install-ci.py'))
+        head = 'a' * 40
+        good = {job: {'result': 'success'} for job in module['PACKAGE_JOBS']}
+        env = {'INSTALL_SOURCE_SHA': head, 'INSTALL_ARTIFACT_ID': '123', 'INSTALL_ARTIFACT_DIGEST': 'b' * 64}
+        with tempfile.TemporaryDirectory() as temp, patch.object(module['subprocess'], 'check_output', return_value=head), patch.dict(os.environ, env):
+            output = Path(temp) / 'record.json'
+            for bad in ('skipped', 'cancelled', 'failure', None):
+                needs = {k: dict(v) for k, v in good.items()}
+                if bad is None:
+                    needs.pop('install-rust')
+                else:
+                    needs['install-rust']['result'] = bad
+                with patch.dict(os.environ, {'INSTALL_NEEDS': __import__('json').dumps(needs)}):
+                    with self.assertRaisesRegex(ValueError, 'required package job'):
+                        module['record'](output, True)
+            with patch.dict(os.environ, {'INSTALL_NEEDS': __import__('json').dumps(good)}):
+                module['record'](output, True)
+                with patch.dict(os.environ, {'INSTALL_ARTIFACT_DIGEST': ''}):
+                    with self.assertRaisesRegex(ValueError, 'digest missing'):
+                        module['record'](output, True)
+                with patch.dict(os.environ, {'INSTALL_SOURCE_SHA': 'c' * 40}):
+                    with self.assertRaisesRegex(ValueError, 'exact source head'):
+                        module['record'](output, True)
+
 
 
 if __name__ == '__main__':

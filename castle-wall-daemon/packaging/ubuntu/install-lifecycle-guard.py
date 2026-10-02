@@ -41,7 +41,7 @@ STATUS_PATH = "/var/lib/dpkg/status"
 INFO_PATH = "/var/lib/dpkg/info"
 # Immutable inventory is supplied by build-install-deb.py, never by host state.
 # Must match install-layout.py and src/linux_install/contract.rs.
-PAYLOAD = tuple("/" + path for path in PAYLOAD_MODES)
+PAYLOAD = tuple("/" + path for path in PAYLOAD_MODES) + ("/var/lib/sanctuary-agent-workspace",)
 MOUNT_NAME = r"var-lib-sanctuary\x2dagent\x2dworkspace.mount"
 MOUNT_PATH = "/etc/systemd/system/" + MOUNT_NAME
 WORKSPACE_PATH = "/var/lib/sanctuary-agent-workspace"
@@ -68,34 +68,24 @@ def refuse(reason):
     raise Refusal(reason)
 
 
-def command(argv):
+def probe(argv, allow_empty):
     try:
-        result = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=15, check=False, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        status, raw, error = bounded_capture(argv, timeout=15, limit=2_000_000,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+        output = raw.decode("utf-8")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         refuse(f"probe unavailable: {argv[0]}: {exc}")
-    if result.returncode != 0 or not result.stdout or len(result.stdout) > 2_000_000:
+    if status != 0 or error or (not allow_empty and not output):
         refuse(f"probe failed or incomplete: {argv[0]}")
-    return result.stdout
+    return output
+
+
+def command(argv):
+    return probe(argv, False)
 
 
 def command_allow_empty(argv):
-    """`command()`'s exact environment, timeout and output cap, but an empty
-    stdout is a valid answer. Only for a probe whose "nothing matched" is
-    naturally empty; a nonzero return still refuses (fail-closed). Exactly one
-    caller, agent_instances_inactive, pinned by test-lifecycle-guard.py."""
-    try:
-        result = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=15, check=False, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        refuse(f"probe unavailable: {argv[0]}: {exc}")
-    if result.returncode != 0 or len(result.stdout) > 2_000_000:
-        refuse(f"probe failed or incomplete: {argv[0]}")
-    return result.stdout
+    return probe(argv, True)
 
 
 def lstat(path):
@@ -127,6 +117,10 @@ def checked_file(path, required):
         if required:
             refuse(f"required package file absent: {path}")
         return None
+    if path == WORKSPACE_PATH:
+        if not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o755):
+            refuse("unsafe underlying workspace directory")
+        return info
     # Multiple links, non-root group, or privilege bits can change custody even
     # when content still hashes correctly; payload modes are an exact contract.
     expected_mode = PAYLOAD_MODES.get(str(path).lstrip("/"))
@@ -140,18 +134,30 @@ def checked_file(path, required):
 
 
 def stable_read(path, limit=2_000_000):
+    descriptor = None
     try:
-        before = os.stat(path, follow_symlinks=False)
-        with open(path, "rb") as stream:
+        # Read a pinned descriptor without following a replaced leaf; pathname
+        # metadata alone cannot prove which inode supplied the bytes.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            refuse(f"non-regular read input: {path}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
             data = stream.read(limit + 1)
-        after = os.stat(path, follow_symlinks=False)
+            after = os.fstat(stream.fileno())
+        named = os.stat(path, follow_symlinks=False)
+        def snapshot(item):
+            return (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+                    item.st_ctime_ns, item.st_mode, item.st_uid, item.st_gid, item.st_nlink)
+        if len(data) > limit or snapshot(before) != snapshot(after) or snapshot(after) != snapshot(named):
+            refuse(f"unstable or oversized file: {path}")
+        return data
     except OSError as exc:
         refuse(f"cannot read {path}: {exc}")
-    if len(data) > limit or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
-    ):
-        refuse(f"unstable or oversized file: {path}")
-    return data
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def dpkg_status():
@@ -223,11 +229,15 @@ def package_owners():
         refuse(f"cannot list dpkg info directory: {exc}")
     if len(entries) > 100_000:
         refuse("dpkg info directory exceeds inventory bound")
+    total_bytes = 0
     for entry in entries:
         if not entry.name.endswith(".list"):
             continue
         checked_file(entry.path, True)
         content = stable_read(entry.path, 10_000_000)
+        total_bytes += len(content)
+        if total_bytes > 128 * 1024 * 1024:  # Bound total inventory work, not merely each leaf.
+            refuse("dpkg ownership inventory exceeds total byte budget")
         try:
             lines = content.decode("utf-8").splitlines()
         except UnicodeDecodeError:
@@ -446,11 +456,10 @@ def mount_absent():
 
 
 def runtime_absent():
-    for root in (CONFIG_ROOT, STATE_ROOT, RUN_ROOT):
+    for root in (CONFIG_ROOT, STATE_ROOT, RUN_ROOT, WORKSPACE_PATH):
         empty_runtime_root(root)
-    # Even an empty workspace is provisioner-owned state; removal is unsupported.
-    if lstat(WORKSPACE_PATH) is not None:
-        refuse("agent workspace footprint present")
+    # The packaged empty root-owned mountpoint is inert; retained contents or
+    # any live mount are provisioned state even after an explicit service stop.
     mount_absent()
 
 
