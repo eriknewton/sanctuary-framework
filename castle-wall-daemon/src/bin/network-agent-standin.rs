@@ -834,7 +834,7 @@ fn main() -> std::process::ExitCode {
     match linux::run() {
         Ok(()) => return std::process::ExitCode::SUCCESS,
         Err(error) => {
-            // SAFETY: this fixed CLI refusal is the stand-in's operator-visible stderr contract.
+            // SAFETY: launch errors use the stand-in's operator-visible stderr channel.
             eprintln!("network-agent-standin: {error}");
         }
     }
