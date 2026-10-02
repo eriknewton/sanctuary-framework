@@ -40,6 +40,7 @@ pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;
 pub mod launcher;
+pub mod linux_install;
 pub mod live_status;
 pub mod manifest;
 pub mod nfqueue;

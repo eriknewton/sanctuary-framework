@@ -46,6 +46,18 @@ name = "castle-wall-prestart-socket-probe"
 path = "src/bin/castle-wall-prestart-socket-probe.rs"
 required-features = ["test-isolation"]
 
+[[bin]]
+name = "sanctuary-linux"
+path = "src/bin/sanctuary-linux.rs"
+
+[[bin]]
+name = "protected-agent-v1"
+path = "src/bin/protected-agent-v1.rs"
+
+[[bin]]
+name = "network-agent-standin"
+path = "src/bin/network-agent-standin.rs"
+
 [features]
 # Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
 # and `nftables::use_isolated_castle_table`. Integration tests that drive the real
