@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 HERE = Path(__file__).resolve().parent
 LIFECYCLE = runpy.run_path(str(HERE / 'ci-install-lifecycle.py'))
+REGRESSIONS = runpy.run_path(str(HERE / 'install-cli-regressions.py'))
 CLI = '/usr/sbin/sanctuary-linux'
 STANDIN = '/usr/local/libexec/sanctuary/network-agent-standin'
 WALL = 'sanctuary-castle-wall.service'
@@ -39,6 +40,11 @@ ACTIVATION_SECONDS = 60 + 18 * 3 + 30
 BACKSTOP = 'p4-composition-backstop'
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
 class Witness:
     def __init__(self, path):
         self.path = path
@@ -51,7 +57,7 @@ class Witness:
             end_ns=time.monotonic_ns(), exit=result.returncode, stdout=result.stdout, stderr=result.stderr)) + '\n')
         self.log.flush()
         if expected is not None:
-            assert result.returncode == expected, f'command failed: {argv}: {result.stderr}'
+            require(result.returncode == expected, f'command failed: {argv}: {result.stderr}')
         return result
 
     def save(self, name, value):
@@ -109,7 +115,7 @@ class Sentinels:
     def close(self):
         self.stop.set()
         self.thread.join(timeout=4)
-        assert not self.thread.is_alive(), 'sentinel did not stop'
+        require(not self.thread.is_alive(), 'sentinel did not stop')
         for item in list(self.selector.get_map().values()):
             item.fileobj.close()
         self.selector.close()
@@ -133,11 +139,11 @@ def main(args):
     # Inherit the same positive disposable/real-manager gate as inert lifecycle.
     LIFECYCLE['preflight']()
     artifacts = list(args.artifact_dir.glob('*.deb'))
-    assert len(artifacts) == 1, 'one final artifact required'
+    require(len(artifacts) == 1, 'one final artifact required')
     deb = artifacts[0].resolve()
     sha = hashlib.sha256(deb.read_bytes()).hexdigest()
     metadata = json.loads(Path(str(deb) + '.build.json').read_text())
-    assert metadata['deb_sha256'] == sha and metadata['deb_bytes'] == deb.stat().st_size
+    require(metadata['deb_sha256'] == sha and metadata['deb_bytes'] == deb.stat().st_size, 'composition invariant failed')
     source = metadata['source_commit']
     w.run([sys.executable, str(HERE / 'assert-install-archive.py'), str(deb), source])
     with tempfile.TemporaryDirectory(prefix='p4-preinst-') as control:
@@ -146,12 +152,12 @@ def main(args):
         w.run([str(Path(control) / 'preinst'), 'install'])
     operator_uid = args.operator_uid
     operator = pwd.getpwuid(operator_uid)
-    assert 1000 <= operator_uid < 60123 and operator_uid != 60124
+    require(1000 <= operator_uid < 60123 and operator_uid != 60124, 'composition invariant failed')
     # CI has no SSH/PAM login ceremony. Establish this disposable driver's audit
     # session explicitly; the product still reads the kernel loginuid, never an
     # environment claim. Real operators obtain the same identity from PAM/sudo.
     Path('/proc/self/loginuid').write_text(str(operator_uid))
-    assert Path('/proc/self/loginuid').read_text().strip() == str(operator_uid)
+    require(Path('/proc/self/loginuid').read_text().strip() == str(operator_uid), 'composition invariant failed')
     w.save('operator-session.json', dict(uid=operator_uid, loginuid=operator_uid,
         setup='explicit disposable CI audit session; normal operator uses PAM'))
     w.save('freeze.json', dict(source_commit=source, deb_sha256=sha, deb_bytes=deb.stat().st_size,
@@ -170,7 +176,7 @@ def main(args):
     # Inputs are public and operator-readable; no policy seed exists on this host.
     inputs = args.inputs.resolve()
     for name in ['endpoints.json', 'rules.json', 'policy.bundle.json', 'policy-key-sha256']:
-        assert (inputs / name).is_file()
+        require((inputs / name).is_file(), 'composition invariant failed')
     sentinels = Sentinels()
     capture = None
     started = False
@@ -185,18 +191,19 @@ def main(args):
         control_cmd = ['runuser', '-u', operator.pw_name, '--', STANDIN, '--control', '--endpoints', str(inputs / 'endpoints.json')]
         def control(name):
             record = json.loads(w.run(control_cmd, timeout=25).stdout)
-            assert record['attempt_count'] == 6
-            assert all(row['sent_bytes'] == 32 for row in record['attempts'])
-            assert all(row['authenticated'] for row in record['attempts'] if row['endpoint']['role'] == 'allow')
+            require(record['attempt_count'] == 6, 'composition invariant failed')
+            require(all(row['sent_bytes'] == 32 for row in record['attempts']), 'composition invariant failed')
+            require(all(row['authenticated'] for row in record['attempts'] if row['endpoint']['role'] == 'allow'), 'composition invariant failed')
             w.save(name, record)
             return record
         control('control-before.json')
-        w.run([CLI, 'provision', '--agent-uid', '60123', '--service-uid', '60124', '--fortress-id', FORTRESS,
-            '--stage-file', str(inputs / 'endpoints.json'), '--', STANDIN, '--endpoints', '/etc/sanctuary/agent/endpoints.json'],
-            env={**os.environ, 'SUDO_UID': str(operator_uid)})
-        assert not Path('/etc/sanctuary/agent/configured-v1.json').exists()
+        REGRESSIONS['provision'](w, [CLI, 'provision', '--agent-uid', '60123', '--service-uid', '60124', '--fortress-id', FORTRESS,
+            '--stage-file', str(inputs / 'endpoints.json'), '--', STANDIN, '--endpoints', '/etc/sanctuary/agent/endpoints.json'])
+        require(not Path('/etc/sanctuary/agent/configured-v1.json').exists(), 'composition invariant failed')
         pin = (inputs / 'policy-key-sha256').read_text().strip()
-        w.run([CLI, 'policy-install', '--bundle', str(inputs / 'policy.bundle.json'), '--expected-key-sha256', pin])
+        policy_argv = [CLI, 'policy-install', '--bundle', str(inputs / 'policy.bundle.json'), '--expected-key-sha256', pin]
+        w.run(policy_argv)
+        REGRESSIONS['policy'](w, policy_argv)
         w.run([CLI, 'status', '--json'])
         w.run([CLI, 'start'])
         started = True
@@ -204,12 +211,12 @@ def main(args):
         during = control('control-during.json')
         deadline = time.monotonic() + ACTIVATION_SECONDS
         while not (WORKSPACE / 'observations.json').exists():
-            assert time.monotonic() < deadline, 'finite activation did not complete'
-            assert capture.poll() is None and not sentinels.errors, 'capture lost'
+            require(time.monotonic() < deadline, 'finite activation did not complete')
+            require(capture.poll() is None and not sentinels.errors, 'capture lost')
             time.sleep(.2)
         record = json.loads((WORKSPACE / 'observations.json').read_text())
-        assert record['attempt_count'] == 18 and len(record['attempts']) == 18
-        assert during['end_monotonic_ns'] < min(row['start_ns'] for row in record['attempts'])
+        require(record['attempt_count'] == 18 and len(record['attempts']) == 18, 'composition invariant failed')
+        require(during['end_monotonic_ns'] < min(row['start_ns'] for row in record['attempts']), 'composition invariant failed')
         w.run([CLI, 'status', '--json'])
         nft = json.loads(w.run(['nft', '-a', '-j', 'list', 'table', 'inet', 'sanctuary-castle']).stdout)
         w.save('nft-running.json', nft)
@@ -217,42 +224,54 @@ def main(args):
         rules = [row['rule'] for row in nft['nftables'] if 'rule' in row]
         uid_match = {'match': {'left': {'meta': {'key': 'skuid'}}, 'op': '==', 'right': 60123}}
         jumps = [r for r in rules if r['chain'] == 'output' and uid_match in r['expr']]
-        assert len(jumps) == 1 and isinstance(jumps[0]['handle'], int)
+        require(len(jumps) == 1 and isinstance(jumps[0]['handle'], int), 'composition invariant failed')
         targets = [e['goto']['target'] for e in jumps[0]['expr'] if 'goto' in e]
-        assert len(targets) == 1
+        require(len(targets) == 1, 'composition invariant failed')
         bodies = [r for r in rules if r['chain'] == targets[0] and uid_match in r['expr']]
-        assert len(bodies) == 1 and isinstance(bodies[0]['handle'], int)
-        assert {'queue': {'num': 0}} in bodies[0]['expr']
+        require(len(bodies) == 1 and isinstance(bodies[0]['handle'], int), 'composition invariant failed')
+        require({'queue': {'num': 0}} in bodies[0]['expr'], 'composition invariant failed')
         marks = [e['mangle']['value'] for e in bodies[0]['expr']
                  if e.get('mangle', {}).get('key') == {'meta': {'key': 'mark'}}]
-        assert len(marks) == 1 and isinstance(marks[0], int) and marks[0] > 0
+        require(len(marks) == 1 and isinstance(marks[0], int) and marks[0] > 0, 'composition invariant failed')
         w.save('binding.json', dict(uid=60123, jump_handle=jumps[0]['handle'],
             chain=targets[0], queue_handle=bodies[0]['handle'], mark=marks[0]))
         result = json.loads(w.run([CLI, 'evidence', '--output', str(args.evidence / 'boot-0')]).stdout)
-        assert result['complete'] is True
+        require(result['complete'] is True, 'composition invariant failed')
         # Tail exceeds the sender's deadline, and listener health remains positive.
         time.sleep(4)
-        assert sentinels.thread.is_alive() and not sentinels.errors
+        require(sentinels.thread.is_alive() and not sentinels.errors, 'composition invariant failed')
         receipts = {row['nonce_hex'] for row in sentinels.receipts}
         for row in record['attempts']:
             if row['endpoint']['role'] == 'allow':
-                assert row['authenticated'] and row['nonce_hex'] in receipts
+                require(row['authenticated'] and row['nonce_hex'] in receipts, 'composition invariant failed')
             else:
-                assert row['nonce_hex'] not in receipts
+                require(row['nonce_hex'] not in receipts, 'composition invariant failed')
         wal = (args.evidence / 'boot-0/filter-events.wal').read_bytes()
         rows = [json.loads(line) for line in wal.splitlines()]
         events = [json.loads(row['event_canonical_json']) for row in rows]
         for endpoint in json.loads((inputs / 'endpoints.json').read_text())['endpoints']:
             operation = 'egress_approved' if endpoint['role'] == 'allow' else 'egress_blocked'
-            assert any(event.get('operation') == operation and event.get('details', {}).get('dest_ip') == endpoint['ip']
+            require(any(event.get('operation') == operation and event.get('details', {}).get('dest_ip') == endpoint['ip']
                 and event['details'].get('dest_port') == endpoint['port'] and event['details'].get('dest_protocol') == endpoint['protocol']
-                and event['details'].get('agent_id') == 'uid-60123' for event in events), 'missing endpoint WAL join'
+                and event['details'].get('agent_id') == 'uid-60123' for event in events), 'missing endpoint WAL join')
+        observation = WORKSPACE / 'observations.json'
+        saved_observation = observation.read_bytes()
+        try:
+            observation.write_bytes(b'not-json')
+            malformed = json.loads(w.run([CLI, 'evidence', '--output', str(args.evidence / 'malformed-testimony')], expected=1).stdout)
+            require(malformed['complete'] is False and 'stand-in observation' in malformed['missing'], 'malformed testimony did not produce incomplete evidence')
+        finally:
+            observation.write_bytes(saved_observation)
+        # A refused remove changes dpkg selection; safety retirement must remain available.
+        refused = w.run(['dpkg', '--remove', 'sanctuary-castle-wall'], expected=None)
+        require(refused.returncode != 0, 'provisioned removal admitted')
+        require(w.run(['dpkg-query', '-W', '-f=${Status}', 'sanctuary-castle-wall']).stdout == 'deinstall ok installed', 'refusal state differs')
         w.run([CLI, 'disable'])
-        assert w.run(['systemctl', 'is-active', AGENT]).stdout.strip() == 'active'
-        assert w.run(['systemctl', 'is-enabled', WALL]).stdout.strip() == 'enabled'
+        require(w.run(['systemctl', 'is-active', AGENT]).stdout.strip() == 'active', 'composition invariant failed')
+        require(w.run(['systemctl', 'is-enabled', WALL]).stdout.strip() == 'enabled', 'composition invariant failed')
         w.run([CLI, 'stop'])
-        assert not pids_for_uid(60123), 'uid workload survived stop'
-        assert w.run(['systemctl', 'is-active', WALL]).stdout.strip() == 'active'
+        require(not pids_for_uid(60123), 'uid workload survived stop')
+        require(w.run(['systemctl', 'is-active', WALL]).stdout.strip() == 'active', 'composition invariant failed')
         fault = json.loads((inputs / 'endpoints.json').read_text())
         for index, endpoint in enumerate(fault['endpoints']):
             endpoint['attempts'] = int(index == 0)
@@ -261,9 +280,9 @@ def main(args):
         fault_path.chmod(0o644)
         probe = json.loads(w.run(['systemd-run', '--quiet', '--wait', '--pipe', '--collect', '--unit=p4-fault-probe',
             '--uid=60123', STANDIN, '--fault-probe', '--endpoints', str(fault_path)], timeout=15).stdout)
-        assert probe['attempt_count'] == 1 and probe['uid'] == 60123
+        require(probe['attempt_count'] == 1 and probe['uid'] == 60123, 'composition invariant failed')
         w.save('fault-probe.json', probe)
-        assert not pids_for_uid(60123)
+        require(not pids_for_uid(60123), 'composition invariant failed')
         w.run(['systemctl', 'stop', WALL])
         # Workload identity is honestly unavailable after stop; preserve that result.
         w.run([CLI, 'evidence', '--output', str(args.evidence / 'final')], expected=1)
@@ -272,25 +291,28 @@ def main(args):
         w.run(['systemctl', 'stop', MOUNT])
         control('control-after.json')
         time.sleep(4)
-        assert not sentinels.errors and probe['attempts'][0]['nonce_hex'] not in {r['nonce_hex'] for r in sentinels.receipts}
-        assert len(sentinels.receipts) == CONTROL_ATTEMPTS + 6, 'receiver count differs from declared phase ledger'
+        require(not sentinels.errors and probe['attempts'][0]['nonce_hex'] not in {r['nonce_hex'] for r in sentinels.receipts}, 'composition invariant failed')
+        require(len(sentinels.receipts) == CONTROL_ATTEMPTS + 6, 'receiver count differs from declared phase ledger')
         for verb in ['--remove', '--purge']:
             refused = w.run(['dpkg', verb, 'sanctuary-castle-wall'], expected=None)
-            assert refused.returncode != 0 and 'refus' in refused.stderr.lower()
-        assert Path('/etc/sanctuary/agent/configured-v1.json').exists()
+            require(refused.returncode != 0 and 'refus' in refused.stderr.lower(), 'composition invariant failed')
+        require(Path('/etc/sanctuary/agent/configured-v1.json').exists(), 'composition invariant failed')
         final_wal = (args.evidence / 'final/filter-events.wal').read_bytes()
+        # Must match contract.rs EMAX=4 KiB and PLANNED_WAL_MAX_BYTES=
+        # AMAX(1024) * PMAX(16) * EMAX(4096) + CMAX(4 MiB) = 68 MiB;
+        # lib.rs::constants::DEFAULT_WAL_SIZE_CAP_BYTES is 100 MiB.
         max_row = max(map(len, final_wal.splitlines(keepends=True)))
-        assert max_row <= 4096 and len(final_wal) < 71303168
+        require(max_row <= 4 * 1024 and len(final_wal) < 68 * 1024 * 1024, 'composition invariant failed')
         w.save('result.json', dict(result='PASS', source_commit=source, deb_sha256=sha,
             normal_attempts=18, fault_attempts=1, operator_attempts=CONTROL_ATTEMPTS,
             receipts=len(sentinels.receipts), wal_bytes=len(final_wal), maximum_encoded_row=max_row,
-            wal_remaining_bytes=104857600 - len(final_wal), reboot_claim=False,
+            wal_remaining_bytes=100 * 1024 * 1024 - len(final_wal), reboot_claim=False,
             budget_scope='observed finite composition only; A3 refusal-wave and packet ceiling remain separately substantiated'))
     finally:
         # Finite backstop never clears firewall state. Always stop workloads first.
         if started:
             w.run(['systemctl', 'stop', AGENT, WALL], expected=None)
-            assert not pids_for_uid(60123), 'cleanup left uid processes'
+            require(not pids_for_uid(60123), 'cleanup left uid processes')
         if capture:
             capture.send_signal(signal.SIGINT)
             try:

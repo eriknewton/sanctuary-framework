@@ -193,3 +193,7 @@ canonical mount; a stub or absent consumer refuses. Both hooks are bounded,
 read-only admission guards: they do not provision, start, stop, reload, disarm or
 clean host state. Source identity and runtime library closure bind the final
 payload; metadata is not an independent CI attestation.
+
+A refused remove or purge can change dpkg selection while keeping the package installed. The CLI still permits `stop`, `disable`, and evidence capture. Before activation, recover selection with `printf 'sanctuary-castle-wall install\n' | sudo dpkg --set-selections`; otherwise start/enable refuse. Provisioned package removal remains unsupported. The CLI requires an authenticated audit login session (`/proc/self/loginuid` must not be `4294967295`); `SUDO_UID` cannot replace it.
+
+The workstation signer uses `/usr/bin/node` on Linux or `/opt/homebrew/bin/node` on Apple Silicon macOS. Install the trusted interpreter at that fixed path before passing a signing descriptor. It never resolves an interpreter or path helper through PATH.

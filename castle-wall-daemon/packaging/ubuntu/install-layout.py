@@ -59,7 +59,7 @@ def check_contract(crate):
 def guard_bytes(role, version, identity_bytes, hashes, here):
     import hashlib
     # Must match the constants consumed by install-lifecycle-guard.py.
-    header = ('#!/usr/bin/python3\n' + f'ROLE = {role!r}\nPACKAGE_VERSION = {version!r}\n'
+    header = ('#!/usr/bin/python3 -I\n' + f'ROLE = {role!r}\nPACKAGE_VERSION = {version!r}\n'
               + f'IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n'
               + f'PAYLOAD_MODES = {PAYLOAD_FILES!r}\nPAYLOAD_HASHES = {hashes!r}\n')
     return header.encode() + guard_source(here)

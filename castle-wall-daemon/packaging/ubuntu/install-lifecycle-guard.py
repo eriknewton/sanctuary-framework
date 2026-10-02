@@ -58,6 +58,14 @@ SYSTEMD_ROOTS = (
     "/usr/lib/systemd/system", "/run/systemd/generator.late",
 )
 STATUS_WANTS = {"install", "deinstall", "purge"}
+# Fixed inventory ceilings: 2 MB probe/file, 40 MB status, 10 MB ownership
+# leaf, 100 MB ELF and 100,000 directory entries. These bound host observation
+# work and refuse larger installations; they are not protocol maxima.
+OBSERVATION_BYTES = 2_000_000
+STATUS_BYTES = 40_000_000
+OWNERSHIP_LEAF_BYTES = 10_000_000
+PAYLOAD_BYTES = 100_000_000
+INVENTORY_ENTRIES = 100_000
 
 
 class Refusal(Exception):
@@ -70,7 +78,7 @@ def refuse(reason):
 
 def probe(argv, allow_empty):
     try:
-        status, raw, error = bounded_capture(argv, timeout=15, limit=2_000_000,
+        status, raw, error = bounded_capture(argv, timeout=15, limit=OBSERVATION_BYTES,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
         output = raw.decode("utf-8")
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -133,7 +141,7 @@ def checked_file(path, required):
     return info
 
 
-def stable_read(path, limit=2_000_000):
+def stable_read(path, limit=OBSERVATION_BYTES):
     descriptor = None
     try:
         # Read a pinned descriptor without following a replaced leaf; pathname
@@ -161,9 +169,14 @@ def stable_read(path, limit=2_000_000):
 
 
 def dpkg_status():
+    # dpkg holds its database lock while invoking us. Refuse pending numbered
+    # journal records rather than treating a stale status snapshot as absence.
+    updates = Path("/var/lib/dpkg/updates")
+    if updates.exists() and any(p.name.isdecimal() for p in updates.iterdir()):
+        refuse("pending dpkg status updates require recovery")
     checked_file(STATUS_PATH, True)
-    first = stable_read(STATUS_PATH, 40_000_000)
-    if first != stable_read(STATUS_PATH, 40_000_000):
+    first = stable_read(STATUS_PATH, STATUS_BYTES)
+    if first != stable_read(STATUS_PATH, STATUS_BYTES):
         refuse("dpkg status changed during observation")
     try:
         text = first.decode("utf-8")
@@ -227,14 +240,14 @@ def package_owners():
         entries = list(os.scandir(INFO_PATH))
     except OSError as exc:
         refuse(f"cannot list dpkg info directory: {exc}")
-    if len(entries) > 100_000:
+    if len(entries) > INVENTORY_ENTRIES:
         refuse("dpkg info directory exceeds inventory bound")
     total_bytes = 0
     for entry in entries:
         if not entry.name.endswith(".list"):
             continue
         checked_file(entry.path, True)
-        content = stable_read(entry.path, 10_000_000)
+        content = stable_read(entry.path, OWNERSHIP_LEAF_BYTES)
         total_bytes += len(content)
         if total_bytes > 128 * 1024 * 1024:  # Bound total inventory work, not merely each leaf.
             refuse("dpkg ownership inventory exceeds total byte budget")
@@ -278,10 +291,10 @@ def build_identity():
 
 
 def hash_file(path):
-    return hashlib.sha256(stable_read(path, 100_000_000)).hexdigest()
+    return hashlib.sha256(stable_read(path, PAYLOAD_BYTES)).hexdigest()
 
 
-def installed_identity(fields, phase):
+def installed_identity(fields):
     identity = build_identity()
     if fields.get("Architecture") != ARCHITECTURE or fields.get("Version") != PACKAGE_VERSION:
         refuse("installed package/version identity mismatch")
@@ -327,14 +340,16 @@ def systemd_files(installed):
                     or directory_info.st_uid != 0 or directory_info.st_mode & 0o022):
                 refuse(f"unsafe traversed systemd directory: {directory}")
             count += len(dirs) + len(files)
-            if count > 100_000:
+            if count > INVENTORY_ENTRIES:
                 refuse("systemd unit inventory exceeds bound")
             for name in dirs + files:
                 path = os.path.join(directory, name)
                 info = lstat(path)
                 if info is None:
                     refuse("systemd path changed during inventory")
-                relevant = name in (UNIT_NAME, UNIT_NAME + ".d", MOUNT_NAME, MOUNT_NAME + ".d")
+                # Dependency directories and sibling activation units are product
+                # footprints too, even when their leaves have unrelated names.
+                relevant = name.startswith(("sanctuary-castle-wall.", MOUNT_NAME, AGENT_UNIT_PREFIX))
                 # Generic drop-ins also affect effective units without sharing
                 # their full names, so the install lifecycle admits none.
                 if name in ("service.d", "mount.d", "sanctuary-.service.d", "sanctuary-castle-.service.d", "var-.mount.d", "var-lib-.mount.d"):
@@ -358,7 +373,7 @@ def systemd_files(installed):
                         target = os.readlink(path)
                     except OSError:
                         refuse("unreadable systemd symlink")
-                    if relevant or UNIT_NAME in target or MOUNT_NAME in target or os.path.realpath(path) in (UNIT_PATH, MOUNT_PATH, AGENT_UNIT_PATH):
+                    if relevant or "sanctuary-castle-wall." in target or MOUNT_NAME in target or os.path.realpath(path) in (UNIT_PATH, MOUNT_PATH, AGENT_UNIT_PATH):
                         refuse(f"systemd alias or enablement symlink: {path}")
                     if AGENT_UNIT_PREFIX in target:
                         refuse(f"agent unit alias or enablement symlink: {path}")
@@ -447,7 +462,7 @@ def empty_runtime_root(path):
 
 def mount_absent():
     # A stopped service is insufficient: a retained mount can still expose agent state.
-    raw = stable_read("/proc/self/mountinfo", 2_000_000).decode("utf-8")
+    raw = stable_read("/proc/self/mountinfo", OBSERVATION_BYTES).decode("utf-8")
     for line in raw.splitlines():
         parts = line.split()
         if len(parts) < 10 or "-" not in parts:
@@ -457,6 +472,21 @@ def mount_absent():
 
 
 def accounts_absent():
+    # Both NSS inventories must be complete: a removed shared group does not
+    # erase a provisioner's no-home agent account or its private group.
+    for database, width in (("passwd", 7), ("group", 4)):
+        text = command_allow_empty(["/usr/bin/getent", database])
+        if text and not text.endswith("\n"):
+            refuse("incomplete NSS inventory")
+        rows = text.splitlines()
+        if len(rows) > 4096:  # Must match account.rs::MAX_NSS_ROWS.
+            refuse("NSS inventory exceeds quota")
+        for line in rows:
+            fields = line.split(":")
+            if len(fields) != width:
+                refuse("malformed NSS inventory")
+            if fields[0] == "sanctuary" or fields[0].startswith("sanctuary-agent-"):
+                refuse("product account footprint present")
     # The provisioner creates this fixed group first. A stopped installation
     # retaining it is provisioned state even if its configuration was moved.
     try:
@@ -514,20 +544,15 @@ def nft_absent():
             refuse("Castle Wall nft table exists")
 
 
-def version_is_newer(old, new):
-    try:
-        result = subprocess.run(["/usr/bin/dpkg", "--compare-versions", old, "lt", new], timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        refuse("dpkg version comparison unavailable")
-    if result.returncode == 1:
-        refuse("target package version is not newer")
-    if result.returncode != 0:
-        refuse("dpkg version comparison failed")
-
-
 def inspect(installed, phase, expected_old=None):
     status = dpkg_status()
     owners = package_owners()
+    # Relocations and unpack-time mode overrides are not an inert footprint.
+    for database in ("/var/lib/dpkg/diversions", "/var/lib/dpkg/statoverride"):
+        if lstat(database) is not None:
+            text = stable_read(database).decode("utf-8")
+            if any(path in text.split() for path in PAYLOAD):
+                refuse("product diversion or stat override present")
     if installed:
         if status is None:
             refuse("installed package status absent")
@@ -539,7 +564,7 @@ def inspect(installed, phase, expected_old=None):
         for path in PAYLOAD:
             checked_file(path, True)
         require_owners(owners, True)
-        identity = installed_identity(fields, "prerm" if ROLE == "prerm" else "preinst")
+        identity = installed_identity(fields)
     else:
         if status is not None:
             fields, parts = status
@@ -583,7 +608,7 @@ def inspect(installed, phase, expected_old=None):
         checked_file(path, installed)
         if not installed and lstat(path) is not None:
             refuse("fresh payload appeared during observation")
-    if installed and installed_identity(fields, "prerm") != identity:
+    if installed and installed_identity(fields) != identity:
         refuse("installed identity changed during observation")
     return identity
 

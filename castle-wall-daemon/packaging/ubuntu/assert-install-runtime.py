@@ -17,21 +17,37 @@ SEAMS = {'--isolated-runtime-root': '/nonexistent/package-seam', '--isolated-cas
          '--test-health-interval-ms': '1', '--test-shutdown-at': 'pre-recovery',
          '--test-stop-guard-deadline-secs': '1', '--test-nft-binary': '/bin/false',
          '--test-wedge-health-pass-after': '1', '--test-delay-before-ready-ms': '1',
-         '--test-trigger-nfqueue-deadline-fail-stop': None}
+         '--test-trigger-nfqueue-deadline-fail-stop': None,
+         '--test-trigger-fatal-control-path': None, '--test-hang-teardown': None}
 
 
 def classify_refusal(name, flag, status, stderr):
-    if name == 'castle-wall-daemon':
-        if status == 2 and ('unknown argument: ' + flag) in stderr:
-            return 'unknown-argument'
-    elif status in (1, 2, 64, 78) and flag in stderr and re.search(r'unknown|unexpected|unsupported|unrecognized|invalid', stderr, re.I):
-        # A config/startup error alone would also occur after accepting a test
-        # flag. Require the parser to identify that exact rejected argument.
+    # Exact parser diagnostics only: a value-validation failure after accepting
+    # the seam is not evidence that the production parser rejects the flag.
+    shapes = {
+        'castle-wall-daemon': (2, ('unknown argument: ' + flag, 'castle-wall-daemon: unknown argument: ' + flag)),
+        'sanctuary-linux': (1, ('sanctuary-linux: unknown command: ' + flag,)),
+        'protected-agent-v1': (1, ('protected-agent-v1: refused: unknown argument: ' + flag,)),
+        'network-agent-standin': (1, ('network-agent-standin: unknown or invalid argument: ' + flag,)),
+    }
+    expected_status, diagnostics = shapes[name]
+    if status == expected_status and stderr.strip() in diagnostics:
         return 'unknown-argument'
     raise ValueError('binary did not demonstrate argument refusal: ' + name + ': ' + flag)
 
 
+def check_seam_parity():
+    # Full-set equality catches new source seams even if this caller forgets them.
+    source = HERE.parents[1] / 'src'
+    actual = set()
+    for path in source.rglob('*.rs'):
+        actual.update(re.findall(r'"(--(?:test|isolated)-[a-z0-9-]+)"', path.read_text()))
+    if actual != set(SEAMS):
+        raise ValueError('test seam registry differs from production source: ' + repr(actual ^ set(SEAMS)))
+
+
 def main(deb, source):
+    check_seam_parity()
     subprocess.run([sys.executable, str(HERE / 'assert-install-archive.py'), str(deb), source], check=True)
     with tempfile.TemporaryDirectory(prefix='sanctuary-install-runtime-') as scratch:
         root = Path(scratch)

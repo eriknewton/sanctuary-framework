@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import tempfile
 import subprocess
 import sys
 import time
@@ -25,10 +26,9 @@ def run(argv, success=True):
 
 
 def preflight():
-    hosted = (os.environ.get('GITHUB_ACTIONS'), os.environ.get('RUNNER_ENVIRONMENT'), os.environ.get('RUNNER_OS')) == ('true', 'github-hosted', 'Linux')
     marker = Path('/root/.sanctuary-host-role')
     marked = marker.is_file() and [s.strip() for s in marker.read_text().splitlines() if s.strip() and not s.lstrip().startswith('#')] == ['disposable']
-    if os.geteuid() != 0 or not (hosted or marked):
+    if os.geteuid() != 0 or not marked:
         raise ValueError('requires root on a positively disposable VM')
     if Path('/proc/1/comm').read_text().strip() != 'systemd':
         raise ValueError('real PID 1 systemd required')
@@ -76,6 +76,19 @@ def main(args):
         before_accounts = hashlib.sha256(Path('/etc/passwd').read_bytes() + Path('/etc/group').read_bytes()).hexdigest()
         deb_hash = hashlib.sha256(args.deb.read_bytes()).hexdigest()
         print(json.dumps({'source_commit': source, 'deb_sha256': deb_hash, 'scenario': args.scenario}), flush=True)
+        if args.scenario == 'internal-conversion':
+            internal = list((args.deb.parent / 'internal').glob('*.deb'))
+            if len(internal) != 1:
+                raise ValueError('one internal variant archive required')
+            run(['dpkg', '--install', str(internal[0])])
+            daemon = Path('/usr/local/libexec/sanctuary/castle-wall-daemon')
+            before = hashlib.sha256(daemon.read_bytes()).hexdigest()
+            run(['dpkg', '--install', str(args.deb)], False)
+            if run(['dpkg-query', '-W', '-f=${Status}', 'sanctuary-castle-wall-internal']).stdout != 'install ok installed' or hashlib.sha256(daemon.read_bytes()).hexdigest() != before:
+                raise ValueError('refused conversion changed internal installation')
+            run(['dpkg', '--purge', 'sanctuary-castle-wall-internal'])
+            print(json.dumps({'result':'PASS','scenario':args.scenario}), flush=True)
+            return
         run(['dpkg', '--install', str(args.deb)])
         inert()
         if before_accounts != hashlib.sha256(Path('/etc/passwd').read_bytes() + Path('/etc/group').read_bytes()).hexdigest():
@@ -88,12 +101,32 @@ def main(args):
                     raise ValueError('payload survived inert purge: ' + path)
         elif args.scenario == 'upgrade':
             before = {path: hashlib.sha256(Path('/' + path).read_bytes()).hexdigest() for path in LAYOUT['PAYLOAD_FILES']}
-            run(['dpkg', '--install', str(args.deb)], False)
+            # A higher-version test archive reuses the exact payload and binds
+            # newly generated hook/control identities; it is never delivery output.
+            with tempfile.TemporaryDirectory(prefix='install-upgrade-') as temp:
+                stage = Path(temp) / 'stage'
+                run(['dpkg-deb', '--raw-extract', str(args.deb), str(stage)])
+                identity = json.loads((stage / LAYOUT['IDENTITY']).read_bytes())
+                version = identity['package_version'].split('-')[0] + '-999'
+                identity['package_version'] = version
+                raw = (json.dumps(identity, sort_keys=True, indent=2) + '\n').encode()
+                (stage / LAYOUT['IDENTITY']).write_bytes(raw)
+                for role in ('preinst','prerm'):
+                    (stage / 'DEBIAN' / role).write_bytes(LAYOUT['guard_bytes'](role,version,raw,identity['payload_sha256'],HERE))
+                (stage / 'DEBIAN/control').write_bytes(LAYOUT['control_bytes'](version,identity['runtime_depends']))
+                higher = Path(temp) / 'higher.deb'
+                run(['dpkg-deb','--build','--root-owner-group',str(stage),str(higher)])
+                refused = run(['dpkg','--debug=2','--install',str(higher)],False)
+                if '( upgrade ' not in refused.stderr or '( failed-upgrade ' not in refused.stderr:
+                    raise ValueError('dpkg did not exercise both upgrade refusal hooks')
+                # No old postinst exists: dpkg's abort-upgrade unwind is a no-op.
+                # Exercise the shipped preinst abort grammar without a synthetic hook.
+                run([str(stage/'DEBIAN/preinst'),'abort-upgrade',identity['package_version']])
             after = {path: hashlib.sha256(Path('/' + path).read_bytes()).hexdigest() for path in LAYOUT['PAYLOAD_FILES']}
-            if before != after:
-                raise ValueError('refused reinstall changed payload')
-            # Refused upgrade can leave dpkg selection/state requiring operator
-            # recovery. Do not force removal to turn unwind evidence into green.
+            if before != after or run(['dpkg-query','-W','-f=${Status}',PACKAGE]).stdout != 'install ok installed':
+                raise ValueError('refused upgrade changed payload or configured status')
+            run(['dpkg','--remove',PACKAGE])
+            run(['dpkg','--purge',PACKAGE])
         elif args.scenario == 'provisioned-refusal':
             # A retained provisioner marker is a package-lifecycle fixture, not
             # evidence that the stub CLI provisions successfully (P4 owns that).
@@ -114,7 +147,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--scenario', choices=('inert', 'upgrade', 'provisioned-refusal'), required=True)
+    parser.add_argument('--scenario', choices=('inert', 'upgrade', 'provisioned-refusal', 'internal-conversion'), required=True)
     parser.add_argument('--deb', type=Path, required=True)
     parser.add_argument('--evidence', type=Path, required=True)
     try:

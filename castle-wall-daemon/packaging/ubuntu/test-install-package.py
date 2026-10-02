@@ -181,7 +181,7 @@ class InstallTests(unittest.TestCase):
             with patch.dict(fn.__globals__, {'bounded_capture': lambda *a, **k: result}):
                 with self.assertRaises(GUARD['Refusal']):
                     fn()
-        with patch.dict(fn.__globals__, {'bounded_capture': lambda *a, **k: (2, b'', b'')}):
+        with patch.dict(fn.__globals__, {'command_allow_empty': lambda _: '', 'bounded_capture': lambda *a, **k: (2, b'', b'')}):
             fn()
 
     def test_agent_unknown_or_failed_state_is_not_inactive(self):
@@ -299,7 +299,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(fn('castle-wall-daemon', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
         with self.assertRaises(ValueError):
             fn('sanctuary-linux', flag, 69, 'not built in this commit\n')
-        self.assertEqual(fn('sanctuary-linux', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
+        self.assertEqual(fn('sanctuary-linux', flag, 1, 'sanctuary-linux: unknown command: ' + flag), 'unknown-argument')
         for name, status, stderr in (('castle-wall-daemon', 2, 'configuration missing'),
                                      ('sanctuary-linux', 78, 'configuration missing'),
                                      ('sanctuary-linux', 0, 'unknown argument: ' + flag),

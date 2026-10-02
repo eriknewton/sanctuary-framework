@@ -116,7 +116,14 @@ fn no_jobs() -> Result<()> {
 pub fn admitted_package_status(status: &[u8], retiring: bool) -> bool {
     // Retirement remains available after a refused removal; activation still requires install intent.
     status == b"install ok installed"
-        || (retiring && matches!(status, b"deinstall ok installed" | b"purge ok installed" | b"hold ok installed" | b"unknown ok installed"))
+        || (retiring
+            && matches!(
+                status,
+                b"deinstall ok installed"
+                    | b"purge ok installed"
+                    | b"hold ok installed"
+                    | b"unknown ok installed"
+            ))
 }
 fn package(root: &Root) -> Result<()> {
     package_for(root, false)

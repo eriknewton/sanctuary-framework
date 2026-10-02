@@ -41,6 +41,7 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
           python3 castle-wall-daemon/packaging/ubuntu/test-lifecycle-guard.py
           python3 castle-wall-daemon/packaging/ubuntu/test-install-package.py
+          python3 castle-wall-daemon/packaging/ubuntu/test-install-r1.py
           python3 castle-wall-daemon/packaging/ubuntu/assert-source-constants.py
           cd castle-wall-daemon
           cargo fmt --all -- --check
@@ -65,6 +66,7 @@ jobs:
         run: |
           [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
           sudo install -d -m 0700 /root/build
+          printf 'disposable\n' | sudo tee /root/.sanctuary-host-role >/dev/null
           cd castle-wall-daemon
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
@@ -115,6 +117,8 @@ jobs:
           deb=("$RUNNER_TEMP"/install/*.deb)
           [[ ${#deb[@]} == 1 ]]
           sudo env PYTHONDONTWRITEBYTECODE=1 python3 "$source/test-install-archive.py" "${deb[0]}" "$INSTALL_SOURCE_SHA"
+          mkdir "$RUNNER_TEMP/install/internal"
+          cp "$RUNNER_TEMP"/internal/*.deb "$RUNNER_TEMP/install/internal/"
           python3 "$source/record-install-ci.py" "$RUNNER_TEMP/install/build-context.json"
       - name: Retain exact package bytes for required downstream jobs
         id: upload
@@ -132,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [inert, upgrade, provisioned-refusal]
+        scenario: [inert, upgrade, provisioned-refusal, internal-conversion]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,6 +159,7 @@ jobs:
           deb=("$RUNNER_TEMP"/install/*.deb)
           [[ ${#deb[@]} == 1 ]]
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          printf 'disposable\n' | sudo tee /root/.sanctuary-host-role >/dev/null
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             python3 castle-wall-daemon/packaging/ubuntu/ci-install-lifecycle.py \
               --scenario '${{ matrix.scenario }}' --deb "${deb[0]}" --evidence "$RUNNER_TEMP/lifecycle"
@@ -193,6 +198,7 @@ jobs:
           packages: python3-cryptography tcpdump
       - name: Build the exact-head workstation signer and public CI inputs
         run: |
+          sudo ln -sf "$(command -v node)" /usr/bin/node
           cd server
           npm ci
           npm run build
@@ -210,6 +216,7 @@ jobs:
           witness=castle-wall-daemon/packaging/ubuntu/ci-install-composition.py
           [[ -f "$witness" ]] || { echo 'P4 composed install witness is required; package-only evidence is insufficient' >&2; exit 1; }
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          printf 'disposable\n' | sudo tee /root/.sanctuary-host-role >/dev/null
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             python3 "$witness" --artifact-dir "$RUNNER_TEMP/install" --evidence "$RUNNER_TEMP/composition" \
               --inputs "$RUNNER_TEMP/composition-inputs" --operator-uid "$(id -u)"
@@ -237,6 +244,9 @@ jobs:
           INSTALL_ARTIFACT_ID: ${{ needs.install-package-build.outputs.artifact-id }}
           INSTALL_ARTIFACT_DIGEST: ${{ needs.install-package-build.outputs.artifact-digest }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            git fetch --no-tags --depth=1 origin "$GITHUB_WORKFLOW_SHA"
+          fi
           python3 castle-wall-daemon/packaging/ubuntu/record-install-ci.py "$RUNNER_TEMP/install-ci.json" --require-package-jobs
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

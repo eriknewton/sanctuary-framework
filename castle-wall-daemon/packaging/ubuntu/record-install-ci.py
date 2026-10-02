@@ -27,6 +27,24 @@ REQUIRED_CATEGORIES = ['Linux Rust fmt/clippy/locked tests', 'internal/install a
                        'typecheck and affected server tests', 'full required baseline suite']
 
 
+def check_workflow(raw, required, path):
+    # Parse the closed YAML subset used for job inventory. Unsupported compact
+    # mappings or indentation refuse, never imply unconditional job execution.
+    text = raw.decode()
+    if re.search(r'^\s+(?:paths|paths-ignore):', text, re.M):
+        raise ValueError('required workflow has path filters: ' + path)
+    if '\njobs:\n' not in text:
+        raise ValueError('required workflow jobs mapping absent: ' + path)
+    job_text = text.split('\njobs:\n', 1)[1]
+    jobs = dict((m.group(1), m.group(2)) for m in re.finditer(r'^  ([a-z][a-z0-9-]*):[ \t]*\n((?:(?:    .*|)[\n])*)', job_text, re.M))
+    if not set(required) <= jobs.keys():
+        raise ValueError('required job disappeared from workflow: ' + path)
+    for job in required:
+        conditions = re.findall(r'^    if:[ \t]*(.*)$', jobs[job], re.M)
+        if conditions and not (job == 'install-package-evidence' and conditions == ['always()']):
+            raise ValueError('required job has conditional admission: ' + path + ':' + job)
+
+
 def record(destination, require):
     source = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip()
     if source != os.environ.get('INSTALL_SOURCE_SHA') or not re.fullmatch(r'[0-9a-f]{40}', source):
@@ -35,12 +53,15 @@ def record(destination, require):
     inventory = {}
     for path, jobs in files.items():
         raw = (REPO / path).read_bytes()
-        # Closed indentation pins job IDs without depending on a YAML package.
-        # YAML syntax itself is checked by the repository's workflow parse gate.
-        actual = re.findall(r'^  ([a-z][a-z0-9-]*):\s*$', raw.decode(), re.M)
-        if not set(jobs) <= set(actual):
-            raise ValueError('required job disappeared from workflow: ' + path)
+        check_workflow(raw, jobs, path)
         inventory[path] = {'sha256': hashlib.sha256(raw).hexdigest(), 'required_job_ids': jobs}
+    workflow_sha = os.environ.get('GITHUB_WORKFLOW_SHA')
+    if require and os.environ.get('GITHUB_EVENT_NAME') == 'pull_request':
+        if not re.fullmatch(r'[0-9a-f]{40}', workflow_sha or ''):
+            raise ValueError('workflow provenance unavailable')
+        executed = subprocess.check_output(['git', '-C', str(REPO), 'show', workflow_sha + ':' + WORKFLOW])
+        if executed != (REPO / WORKFLOW).read_bytes():
+            raise ValueError('executed workflow differs from source workflow')
     needs = json.loads(os.environ.get('INSTALL_NEEDS', '{}'))
     record = {'source_commit': source, 'workflow': WORKFLOW,
               'workflow_ref': os.environ.get('GITHUB_WORKFLOW_REF'),
