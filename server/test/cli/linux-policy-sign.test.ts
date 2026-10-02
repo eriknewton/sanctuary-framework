@@ -61,7 +61,8 @@ it("the packaged entry signs through an npm-style link and refuses key/output cu
     const run = (fd: number, args = argv) => spawnSync(entry, args, { stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
     const fd = openSync(key, "r");
     try {
-      expect(run(fd).status).toBe(0);
+      const signedResult = run(fd);
+      expect(signedResult.status, signedResult.stderr?.toString()).toBe(0);
       const bundle = JSON.parse(readFileSync(output, "utf8"));
       const signed = JSON.parse(Buffer.from(bundle.manifest_b64url, "base64url").toString()) as SignedManifest;
       expect(verifyManifestSignature(signed, publicKey).ok).toBe(true);
@@ -89,7 +90,7 @@ it("the packaged signer ignores PATH helpers while holding the key descriptor", 
   const dir = mkdtempSync(join(tmpdir(), "signer-path-"));
   try {
     const marker = join(dir, "helper-ran");
-    for (const name of ["node", "readlink", "dirname"]) writeFileSync(join(dir, name), `#!/bin/sh\nprintf leaked > '${marker}'\nexit 91\n`, { mode: 0o755 });
+    for (const name of ["node", "perl", "readlink", "dirname", "stat", "uname"]) writeFileSync(join(dir, name), `#!/bin/sh\nprintf leaked > '${marker}'\nexit 91\n`, { mode: 0o755 });
     const key = join(dir, "seed"); writeFileSync(key, seed, { mode: 0o600 });
     const rules = join(dir, "rules"); writeFileSync(rules, "[]");
     const fd = openSync(key, "r");
@@ -97,6 +98,16 @@ it("the packaged signer ignores PATH helpers while holding the key descriptor", 
       const result = spawnSync(resolve("bin/sanctuary-linux-policy-sign"), ["--fortress-id", input.fortressId, "--agent-uid", "60123", "--system-uid-ceiling", "1000", "--generation", "10", "--rules", rules, "--key-fd", "3", "--output", join(dir, "out")], { env: { ...process.env, PATH: dir }, stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
       expect(existsSync(marker)).toBe(false);
       expect(result.status, result.stderr?.toString()).toBe(0);
+      // Exercise the packaged resolver with a private candidate, without changing
+      // system installations: writable/user-owned ancestors must never grant custody.
+      const launcher = readFileSync(resolve("bin/sanctuary-linux-policy-sign"), "utf8");
+      const unsafeEntry = join(dir, "unsafe-sign");
+      const candidates = `qw(${join(dir, "node")})`;
+      writeFileSync(unsafeEntry, launcher.replace(/qw\(\/usr\/local\/bin\/node \/opt\/homebrew\/bin\/node\)/, candidates)
+        .replace(/qw\(\/usr\/bin\/node \/usr\/local\/bin\/node\)/, candidates), { mode: 0o755 });
+      const refused = spawnSync(unsafeEntry, [], { stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
+      expect(refused.status).toBe(1);
+      expect(existsSync(marker)).toBe(false);
     } finally { closeSync(fd); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -2,14 +2,51 @@
 # The hard limit prevents another same-user process restoring dump permission.
 ulimit -S -c 0 || exit 1
 ulimit -H -c 0 || exit 1
-# The pinned interpreter verifies both inherited limits before reading the seed.
-# Fixed installation paths, never PATH lookup. All path resolution occurs inside
-# this interpreter, so no helper program inherits the owner's key descriptor.
-node=/usr/bin/node
-if [ ! -x "$node" ]; then node=/opt/homebrew/bin/node; fi
-[ -x "$node" ] || exit 1
+# /bin/sh and /usr/bin/perl are OS-trusted interpreters on both workstations.
+# Resolve only fixed candidates before handing Node the key fd: root owns every
+# link, resolved file and ancestor; mode/ACL checks exclude invoking-user writes
+# (root itself is trusted). Execute the
+# resolved path so a user-managed alias cannot replace it between check and exec.
+# User-writable package-manager installs deliberately fail closed.
 unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
-exec "$node" --input-type=module -e '
+unset PERL5OPT PERL5LIB PERLLIB
+exec /usr/bin/perl -T -e '
+use strict;
+use warnings;
+use Cwd qw(abs_path);
+use Fcntl qw(:mode);
+sub trusted_path {
+    my ($path) = @_;
+    while (1) {
+        my @s = lstat($path); # POSIX stat slots: mode = 2, owner uid = 4.
+        return 0 unless @s && $s[4] == 0;
+        # 0022 selects group/other write bits; -w also checks invoking-user ACLs.
+        # Symlink modes do not control writes; its protected parent does.
+        return 0 unless S_ISLNK($s[2]) || (($s[2] & 0022) == 0 && ($> == 0 || !-w $path));
+        last if $path eq "/";
+        $path =~ s{/[^/]+$}{};
+        $path = "/" if $path eq "";
+    }
+    return 1;
+}
+my @candidates = $^O eq "darwin" ? qw(/usr/local/bin/node /opt/homebrew/bin/node)
+               : $^O eq "linux" ? qw(/usr/bin/node /usr/local/bin/node) : ();
+for my $candidate (@candidates) {
+    next unless trusted_path($candidate);
+    my $node = abs_path($candidate);
+    next unless defined($node) && trusted_path($node) && -f $node && -x $node;
+    # Untaint only after custody verification; taint mode excludes Perl env hooks.
+    ($node) = $node =~ m{\A(/[^\0\r\n]+)\z};
+    next unless defined($node);
+    $ENV{PATH} = "/usr/bin:/bin";
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+    # Arguments stay literal (no shell); the signing CLI validates their grammar.
+    my @args = map { /\A(.*)\z/s; $1 } @ARGV;
+    exec {$node} $node, @args;
+    exit 1;
+}
+exit 1;
+' -- --input-type=module -e '
 import { realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";

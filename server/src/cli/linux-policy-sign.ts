@@ -65,7 +65,7 @@ function options(argv: string[]): Map<string, string> {
 /** The packaged entry sets both core limits before Node exists; direct invocation verifies both. */
 export async function main(argv: string[]): Promise<void> {
   const args = options(argv);
-  // A child inherits this process's core limit; never trust an environment marker claiming dumps are disabled.
+  // The fixed OS shell queries inherited soft/hard limits on Darwin and Linux; Node closes extra fds in this child, so it receives no key descriptor.
   const core = execFileSync("/bin/sh", ["-c", "ulimit -S -c; ulimit -H -c"], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" }, timeout: 1000, maxBuffer: KIB }).trim();
   if (core !== "0\n0") throw new Error("use the packaged sanctuary-linux-policy-sign entry to disable core dumps");
   const number = (name: string): number => { const raw = args.get(name)!; if (!/^(0|[1-9][0-9]*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("invalid integer option"); return Number(raw); };
