@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runSecretsCommand } from "../../src/cli/secrets.js";
 import { randomBytes } from "node:crypto";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SurrogateEchoScanner, MAX_SURROGATE_ECHO_SCAN_BYTES, MAX_PLACEHOLDERS_PER_REQUEST,
@@ -104,6 +104,106 @@ describe("wired surrogate echo consumer", () => {
     fixture.assertSafeEvents();
     await fixture.assertCliEvents();
   });
+  it.each([
+    ["duplicate identity", ["identity", "identity"]],
+    ["identity list", "identity, IDENTITY"],
+    ["empty identity", ""],
+  ] as const)("screens plaintext with %s coding", async (_name, encoding) => {
+    const fixture = await setup((request, response) => {
+      response.setHeader("Content-Encoding", [...(typeof encoding === "string" ? [encoding] : encoding)]);
+      response.end(String(request.headers["x-credential-0"]));
+    });
+    const result = await fixture.run();
+    expect(result.body.length).toBe(0);
+    expect(result.complete && result.status === 200).toBe(false);
+    expect(fixture.echoes()).toHaveLength(1);
+    fixture.assertSafeEvents();
+  });
+  it.each([false, true])("screens response field names after normalization: %s", async uppercase => {
+    const fixture = await setup((request, response) => {
+      const value = String(request.headers["x-credential-0"]);
+      response.setHeader(uppercase ? value.toUpperCase() : value, "1");
+      response.end();
+    });
+    const result = await fixture.run();
+    expect(result.status).toBe(502);
+    expect(Object.keys(result.headers).some(name => name.includes(fixture.values[0]!))).toBe(false);
+    expect(result.body.length).toBe(0);
+    expect(fixture.echoes()).toHaveLength(1);
+    expect(fixture.echoes()[0]?.kind).toBe("surrogate_echo_blocked");
+    fixture.assertSafeEvents();
+  });
+  it("fails closed with a cause when header scanning throws", async () => {
+    const fixture = await setup((request, response) => { response.end(String(request.headers["x-credential-0"])); });
+    vi.spyOn(SurrogateEchoScanner.prototype, "headersEcho").mockImplementation(() => { throw new Error("scan fault"); });
+    const result = await fixture.run();
+    expect(result.body.length).toBe(0);
+    expect(result.status).toBe(502);
+    expect(fixture.echoes()).toHaveLength(1);
+    const event = fixture.echoes()[0];
+    expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe("scan_error");
+    fixture.assertSafeEvents();
+  });
+  it("screens the normalized header values that are forwarded", async () => {
+    const parts = [secretValue(), secretValue()];
+    const fixture = await setup((_request, response) => {
+      response.setHeader("X-Reflection", parts);
+      response.end();
+    });
+    fixture.values[0] = parts.join(", ");
+    await fixture.h.unlock(fixture.bindings[0]!, fixture.values[0]!);
+    const result = await fixture.run();
+    expect(result.status).toBe(502);
+    expect(result.body.length).toBe(0);
+    expect(result.headers["x-reflection"]).toBeUndefined();
+    expect(fixture.echoes()[0]?.kind).toBe("surrogate_echo_blocked");
+    fixture.assertSafeEvents();
+  });
+  it("delivers non-echo identity lists byte for byte", async () => {
+    const body = randomBytes(secretValue().length);
+    const fixture = await setup((_request, response) => {
+      response.setHeader("Content-Encoding", ["identity", "IDENTITY"]);
+      response.end(body);
+    });
+    const result = await fixture.run();
+    expect(result.complete).toBe(true);
+    expect(result.body.equals(body)).toBe(true);
+    expect(fixture.echoes()).toHaveLength(0);
+  });
+  it.each(["br", "identity, gzip", "identity,"])("refuses unsupported or malformed coding %s", async encoding => {
+    const fixture = await setup((request, response) => {
+      response.setHeader("Content-Encoding", encoding);
+      response.end(String(request.headers["x-credential-0"]));
+    });
+    const result = await fixture.run();
+    expect(result.status).toBe(502);
+    expect(result.body.length).toBe(0);
+    expect(fixture.echoes()).toHaveLength(1);
+    const event = fixture.echoes()[0];
+    expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe("encoding");
+    fixture.assertSafeEvents();
+  });
+  it.each(["scan", "finish"] as const)("fails closed on asynchronous %s failure and ignores late callbacks", async method => {
+    let incoming: IncomingMessage | undefined;
+    let scanner: SurrogateEchoScanner | undefined;
+    const fixture = await setup((_request, response) => { response.end(Buffer.from("!")); }, 1, response => { incoming = response; });
+    vi.spyOn(SurrogateEchoScanner.prototype, method).mockImplementation(function (this: SurrogateEchoScanner) {
+      scanner = this;
+      throw new Error("scan fault");
+    });
+    const result = await fixture.run();
+    expect(result.complete && result.status === 200).toBe(false);
+    expect(result.body.length).toBe(0);
+    expect(scanner?.metrics.state).toBe("ABORTED");
+    expect(scanner?.metrics.carryBytes).toBe(0);
+    incoming!.emit("data", Buffer.from(fixture.values[0]!));
+    incoming!.emit("end");
+    expect(fixture.echoes()).toHaveLength(1);
+    const event = fixture.echoes()[0];
+    expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe("scan_error");
+    expect(fixture.events.some(e => e.kind === "surrogate_swap" && e.status !== 0)).toBe(false);
+    fixture.assertSafeEvents();
+  });
   it("identity body truncates with zero value bytes at every upstream split offset", async () => {
     let split = 1;
     let releaseTail: (() => void) | undefined;
@@ -132,31 +232,32 @@ describe("wired surrogate echo consumer", () => {
     expect(fixture.echoes().every(e => e.kind === "surrogate_echo_blocked" && e.code === "echo_blocked")).toBe(true);
     fixture.assertSafeEvents();
   });
-  it("past-ceiling echo passes intact with one ceiling event", async () => {
+  it("past-ceiling echo is refused with one ceiling event", async () => {
     let expected = Buffer.alloc(0);
     const fixture = await setup((request, response) => {
       expected = Buffer.concat([Buffer.alloc(MAX_SURROGATE_ECHO_SCAN_BYTES, "!"), Buffer.from(String(request.headers["x-credential-0"]))]);
       response.end(expected);
     });
     const result = await fixture.run();
-    expect(result.complete).toBe(true);
-    expect(result.body.equals(expected)).toBe(true);
+    expect(result.complete).toBe(false);
+    expect(result.body.length).toBeLessThan(MAX_SURROGATE_ECHO_SCAN_BYTES);
+    expect(result.body.includes(Buffer.from(fixture.values[0]!))).toBe(false);
     expect(fixture.echoes()).toHaveLength(1);
     const event = fixture.echoes()[0];
     expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe("ceiling");
     fixture.assertSafeEvents();
   });
-  it("gzip echo passes encoded bytes intact with an encoding event", async () => {
+  it.each(["Content-Encoding", "Transfer-Encoding"])("gzip echo is refused before headers with an encoding event via %s", async header => {
     let expected = Buffer.alloc(0);
     const fixture = await setup((request, response) => {
       expected = gzipSync(String(request.headers["x-credential-0"]));
-      response.setHeader("Content-Encoding", "gzip");
+      response.setHeader(header, header === "Transfer-Encoding" ? "gzip, chunked" : "gzip");
       response.end(expected);
     });
     const result = await fixture.run();
-    expect(result.complete).toBe(true);
-    expect(result.body.equals(expected)).toBe(true);
-    expect(gunzipSync(result.body).equals(Buffer.from(fixture.values[0]!))).toBe(true);
+    expect(result.status).toBe(502);
+    expect(result.body.length).toBe(0);
+    expect(result.headers["content-encoding"]).toBeUndefined();
     expect(fixture.echoes()).toHaveLength(1);
     const event = fixture.echoes()[0];
     expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe("encoding");
@@ -206,7 +307,7 @@ describe("wired surrogate echo consumer", () => {
     // Four simultaneous responses fit the unchanged peer lookup cap; four waves exercise reuse.
     for (let wave = 0; wave < MAX_PLACEHOLDERS_PER_REQUEST; wave++) {
       const results = await Promise.all(Array.from({ length: MAX_PLACEHOLDERS_PER_REQUEST }, () => fixture.run()));
-      expect(results.every(r => r.complete && r.body.length === MAX_SURROGATE_ECHO_SCAN_BYTES + 1)).toBe(true);
+      expect(results.every(r => !r.complete && r.body.length < MAX_SURROGATE_ECHO_SCAN_BYTES)).toBe(true);
     }
     expect(seen.size).toBe(MAX_PLACEHOLDERS_PER_REQUEST ** 2);
     expect(fixture.echoes()).toHaveLength(seen.size);
@@ -260,6 +361,9 @@ describe("echo carry fault scheduling", () => {
       expect(scanner?.metrics.carryBytes).toBe(0);
       expect(writes.length).toBe(0);
       expect(fixture.events.some(e => e.kind === "surrogate_swap" && e.status !== 0)).toBe(false);
+      expect(fixture.echoes()).toHaveLength(1);
+      const event = fixture.echoes()[0];
+      expect(event?.kind === "surrogate_echo_unscanned" && event.cause).toBe(mode === "client disconnect" ? "client_abort" : "upstream_reset");
       fixture.assertSafeEvents();
     } finally { client.destroy(); heldResponse?.destroy(); }
   });

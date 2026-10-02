@@ -4,12 +4,12 @@ import {
 } from "./constants.js";
 
 /** Fixed response outcomes; must match SurrogateEchoEvent in egress-gate/gate-server.ts. */
-export type SurrogateEchoCause = "ceiling" | "encoding";
+export type SurrogateEchoCause = "ceiling" | "encoding" | "scan_error" | "upstream_reset" | "client_abort";
 export type SurrogateEchoCode = "echo_blocked" | "echo_unscanned";
 export const SURROGATE_ECHO_BLOCKED = [502, "surrogate-echo-blocked"] as const;
 
 type ScanState = "SCANNING" | "PAST_CEILING" | "ABORTED" | "FINISHED";
-/** A blocked chunk releases nothing; ceiling is true only on the transition to unscanned. */
+/** A blocked chunk releases nothing; ceiling requires terminal refusal with no output. */
 export type SurrogateEchoScanResult =
   | { blocked: true }
   | { blocked: false; output: Buffer; ceiling: boolean };
@@ -47,11 +47,13 @@ export class SurrogateEchoScanner {
     this.carry = Buffer.alloc(Math.max(...this.values.map(value => value.length)) - 1);
   }
 
-  /** Inspect raw field values independently, including duplicate header fields. */
+  /** Inspect field names and values independently, including duplicate header fields. */
   headersEcho(rawHeaders: readonly string[]): boolean {
-    for (let i = 1; i < rawHeaders.length; i += 2) {
+    for (let i = 0; i < rawHeaders.length; i++) {
       const value = Buffer.from(rawHeaders[i]!, "latin1");
       if (this.values.some(secret => value.includes(secret))) return true;
+      // Node forwards lowercase names, so that representation must be screened too.
+      if (i % 2 === 0 && this.values.some(secret => Buffer.from(rawHeaders[i]!.toLowerCase(), "latin1").includes(secret))) return true;
     }
     return false;
   }
@@ -65,7 +67,7 @@ export class SurrogateEchoScanner {
   /** Screen before returning any bytes from a chunk; a match discards the whole pending chunk. */
   scan(chunk: Buffer): SurrogateEchoScanResult {
     if (this.state === "ABORTED" || this.state === "FINISHED") return { blocked: true };
-    if (this.state === "PAST_CEILING") return { blocked: false, output: chunk, ceiling: false };
+    if (this.state === "PAST_CEILING") return { blocked: false, output: Buffer.alloc(0), ceiling: true };
     const count = Math.min(chunk.length, MAX_SURROGATE_ECHO_SCAN_BYTES - this.scanned);
     // Prefix matching processes each new byte once per value, even for one-byte chunks.
     for (let i = 0; i < count; i++) {
@@ -85,12 +87,11 @@ export class SurrogateEchoScanner {
       }
     }
     if (this.scanned === MAX_SURROGATE_ECHO_SCAN_BYTES) {
-      // Design section 1's echo bound ends here: transformed, compressed, later-response
-      // and past-ceiling echoes are outside it, so flush the carry and report unscanned bytes.
+      // Design section 1 bounds detection here. The fail-closed response contract refuses
+      // at that bound: neither the carry nor any unscanned suffix may leave the scanner.
+      this.abort();
       this.state = "PAST_CEILING";
-      const output = this.release(chunk, true);
-      this.carry.fill(0);
-      return { blocked: false, output, ceiling: true };
+      return { blocked: false, output: Buffer.alloc(0), ceiling: true };
     }
     return { blocked: false, output: this.release(chunk, false), ceiling: false };
   }

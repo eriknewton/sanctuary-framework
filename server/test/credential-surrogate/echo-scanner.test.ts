@@ -51,13 +51,14 @@ describe("surrogate echo scanner", () => {
       expect(scanner.scan(Buffer.from(secret.slice(-1))).blocked).toBe(true);
     }
   });
-  it("checks every raw header value including duplicate fields and the last binding", () => {
+  it("checks every header name and value including duplicates and the last binding", () => {
     const values = Array.from({ length: MAX_PLACEHOLDERS_PER_REQUEST }, value);
     const scanner = new SurrogateEchoScanner(values);
     expect(scanner.headersEcho(["X-Test", "safe", "X-Test", values.at(-1)!])).toBe(true);
-    expect(scanner.headersEcho([values[0]!, "safe"])).toBe(false);
+    expect(scanner.headersEcho([values[0]!, "safe"])).toBe(true);
+    expect(scanner.headersEcho([values[0]!.toUpperCase(), "safe"])).toBe(true);
   });
-  it("flushes at the exact ceiling and reports it once while later echoes pass", () => {
+  it("discards carry at the exact ceiling and never releases later bytes", () => {
     const secret = value();
     const scanner = new SurrogateEchoScanner([secret]);
     const prefix = Buffer.alloc(MAX_SURROGATE_ECHO_SCAN_BYTES, "!");
@@ -65,14 +66,16 @@ describe("surrogate echo scanner", () => {
     const last = scanner.scan(prefix.subarray(-1));
     expect(!first.blocked && first.ceiling).toBe(false);
     expect(!last.blocked && last.ceiling).toBe(true);
-    expect(Buffer.concat([output(first), output(last)]).equals(prefix)).toBe(true);
+    expect(output(last).length).toBe(0);
+    expect(output(first).length).toBe(prefix.length - secret.length);
     const past = scanner.scan(Buffer.from(secret));
-    expect(!past.blocked && past.ceiling).toBe(false);
-    expect(output(past).equals(Buffer.from(secret))).toBe(true);
+    expect(!past.blocked && past.ceiling).toBe(true);
+    expect(output(past).length).toBe(0);
+    expect(scanner.finish().length).toBe(0);
     expect(scanner.metrics.scannedBytes).toBe(MAX_SURROGATE_ECHO_SCAN_BYTES);
     expect(scanner.metrics.carryBytes).toBe(0);
   });
-  it("scans only the prefix of a chunk crossing the ceiling", () => {
+  it("releases nothing from a chunk crossing the ceiling", () => {
     // A one-byte value allows the requested ceiling-plus-one body to contain a whole later echo.
     const secret = randomBytes(1).toString("hex").slice(0, 1);
     const scanner = new SurrogateEchoScanner([secret]);
@@ -80,10 +83,10 @@ describe("surrogate echo scanner", () => {
     const result = scanner.scan(body);
     expect(body.length).toBe(MAX_SURROGATE_ECHO_SCAN_BYTES + 1);
     expect(!result.blocked && result.ceiling).toBe(true);
-    expect(output(result).equals(body)).toBe(true);
+    expect(output(result).length).toBe(0);
     expect(scanner.metrics.scannedBytes).toBe(MAX_SURROGATE_ECHO_SCAN_BYTES);
   });
-  it("blocks a match ending at the ceiling and passes one crossing it", () => {
+  it("blocks a match ending at the ceiling and refuses one crossing it", () => {
     const secret = value();
     for (const extra of [0, 1]) {
       const scanner = new SurrogateEchoScanner([secret]);
@@ -91,7 +94,8 @@ describe("surrogate echo scanner", () => {
       const first = scanner.scan(prefix);
       const last = scanner.scan(Buffer.from(secret));
       expect(last.blocked).toBe(extra === 0);
-      if (extra) expect(Buffer.concat([output(first), output(last)]).equals(Buffer.concat([prefix, Buffer.from(secret)]))).toBe(true);
+      expect(output(last).length).toBe(0);
+      expect(Buffer.concat([output(first), output(last)]).includes(Buffer.from(secret))).toBe(false);
     }
   });
   it("bounds carry allocations and comparisons under concurrent adversarial chunking", () => {
