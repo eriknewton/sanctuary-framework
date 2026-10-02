@@ -4,6 +4,7 @@ import selectors
 import signal
 import subprocess
 import time
+import sys
 
 
 def bounded_capture(argv, *, timeout, limit, env=None):
@@ -35,13 +36,30 @@ def bounded_capture(argv, *, timeout, limit, env=None):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ValueError('probe capture deadline exceeded')
-                status = child.wait(timeout=remaining)
-            return status, bytes(output[0]), bytes(output[1])
+                if hasattr(os, 'waitid'):
+                    # Linux hooks keep the exited leader unreaped until group
+                    # cleanup, so a recycled PID cannot name an unrelated group.
+                    while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ValueError('probe capture deadline exceeded')
+                        time.sleep(min(0.01, remaining))  # Ten-millisecond readiness polling budget.
+                else:
+                    # Portable local tests lack waitid; success with both pipes
+                    # closed needs no process-group signal after the child is reaped.
+                    child.wait(timeout=remaining)
         finally:
             # A probe may leave a descendant holding a pipe after its parent
             # exits. The process group, not only the immediate PID, is reaped.
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if child.returncode is None:
+                try:
+                    if sys.platform == 'linux':
+                        os.killpg(child.pid, signal.SIGKILL)
+                    elif child.poll() is None:
+                        # Non-Linux runs exercise parser tests only; macOS's
+                        # managed sandbox denies killpg. Production is Linux.
+                        child.kill()
+                except ProcessLookupError:
+                    pass
             child.wait()
+        return child.returncode, bytes(output[0]), bytes(output[1])
