@@ -64,6 +64,7 @@ jobs:
       - name: Require real-manager launch and isolation tests
         run: |
           [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          sudo install -d -m 0700 /root/build
           cd castle-wall-daemon
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
             env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
