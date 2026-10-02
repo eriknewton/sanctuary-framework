@@ -3,7 +3,7 @@ import net from "node:net";
 import { randomBytes } from "node:crypto";
 import http from "node:http";
 import { afterEach, expect, it, vi } from "vitest";
-import { clean, directory, daemon, direct, tlsUpstream, request, HOST, UID } from "./surrogate-forward-fixture.js";
+import { clean, directory, daemon, direct, listen, raw, tlsUpstream, request, HOST, UID } from "./surrogate-forward-fixture.js";
 
 afterEach(clean);
 // Separate writes by one scheduling window; the deadline bounds every fixture socket and timer.
@@ -88,14 +88,26 @@ it("oversized fragmented headers exhaust one header budget without helper admiss
   expect(query).not.toHaveBeenCalled(); expect(gate.resolver.resolve).not.toHaveBeenCalled();
 });
 
-it("accepted separator-heavy headers do not exhaust the next request's provenance", async () => {
+it("separator-heavy headers preserve native overflow or the next request's provenance", async () => {
   const gate = await daemon(await directory());
-  // 1800 short unique names fit llhttp's field-byte budget while raw separators exceed it.
+  // 1800 short unique names fit older llhttp field-byte budgets but exceed the raw-byte limit.
   const fields = Array.from({ length: 1800 }, (_, i) => `X-${i}: \r\n`).join("");
   const first = request(gate.header, fields).replaceAll(HOST, "unbound.example.test").replace("Connection: close", "Connection: keep-alive");
   expect(first.length).toBeGreaterThan(http.maxHeaderSize);
+  // Node releases differ in separator accounting; the native parser defines admission.
+  const reference = http.createServer((_request, response) => {
+    response.writeHead(405, { Connection: "close" });
+    response.end();
+  });
+  const native = await raw(await listen(reference), first);
   const next = request(gate.header, "Content-Length: 0\r\nContent-Length: 0\r\n");
   const result = await exchange(gate.port, first, next);
-  expect(result).toContain("405 Method Not Allowed");
-  expect(result).toContain("surrogate-duplicate-header");
+  if (native.startsWith("HTTP/1.1 431")) {
+    expect(result).toBe(native);
+  } else {
+    expect(native).toContain("405 Method Not Allowed");
+    expect(result).toContain("405 Method Not Allowed");
+    expect(result).toContain("surrogate-duplicate-header");
+  }
+  expect(gate.resolver.resolve).not.toHaveBeenCalled();
 });

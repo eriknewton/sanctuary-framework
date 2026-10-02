@@ -46,9 +46,11 @@ export interface SurrogateForwardTarget { host: string; authority: string; path:
 /** Parse before URL normalization so userinfo, fragments and port spelling cannot disappear. */
 export function parseSurrogateForwardTarget(raw: string): SurrogateForwardTarget | null {
   const match = /^http:\/\/([^/?#]+)([^#]*)$/i.exec(raw);
+  // Reject control bytes before URL normalization can discard them.
+  // eslint-disable-next-line no-control-regex
   if (!match || /[\s\\\x00-\x1f\x7f]/.test(raw)) return null;
   const authority = match[1]!;
-  const hostMatch = /^([^:@\[\]]+)(?::80)?$/.exec(authority);
+  const hostMatch = /^([^:@[\]]+)(?::80)?$/.exec(authority);
   if (!hostMatch) return null;
   const host = hostMatch[1]!.toLowerCase();
   if (validateSurrogateHost(host) !== null || isIP(host)) return null;
