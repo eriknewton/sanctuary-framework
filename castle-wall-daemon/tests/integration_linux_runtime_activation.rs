@@ -3230,7 +3230,10 @@ mod tb10_agent_unit_against_real_systemd {
     impl Tb10Units {
         pub(super) fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::Builder::new().prefix("sanctuary-tb10-").tempdir_in("/var/lib").expect("visible scratch dir");
+            let dir = tempfile::Builder::new()
+                .prefix("sanctuary-tb10-")
+                .tempdir_in("/var/lib")
+                .expect("visible scratch dir");
             // Scripts remain root-custodied outside hidden temporary paths; only
             // the separately mounted workspace admits fixture writes.
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
@@ -3336,14 +3339,30 @@ mod tb10_agent_unit_against_real_systemd {
             std::fs::create_dir(&path).expect("workspace backing");
             let out = Command::new("systemd-escape")
                 .args(["--path", "--suffix=mount", path.to_str().unwrap()])
-                .output().expect("escape fixture mount");
+                .output()
+                .expect("escape fixture mount");
             assert!(out.status.success());
             let name = String::from_utf8(out.stdout).unwrap().trim().to_string();
             let mount = include_str!("../systemd/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount");
-            let mount = substitute(mount, "/var/lib/sanctuary-agent-workspace", path.to_str().unwrap(), 1);
+            let mount = substitute(
+                mount,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                1,
+            );
             self.write_unit(&name, &mount);
-            let derived = substitute(agent, "/var/lib/sanctuary-agent-workspace", path.to_str().unwrap(), 3);
-            let derived = substitute(&derived, r"var-lib-sanctuary\x2dagent\x2dworkspace.mount", &name, 2);
+            let derived = substitute(
+                agent,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                3,
+            );
+            let derived = substitute(
+                &derived,
+                r"var-lib-sanctuary\x2dagent\x2dworkspace.mount",
+                &name,
+                2,
+            );
             (derived, name)
         }
 

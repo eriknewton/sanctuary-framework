@@ -520,9 +520,15 @@ mod linux {
         let schedule = instrument_endpoints(path, EndpointPurpose::FaultInstrument)?;
         // The separate instrument consumes exactly one denied IPv4 TCP attempt;
         // reduced schedules never authorize a product activation or retries.
-        if schedule.endpoints.iter().enumerate().any(|(index, endpoint)|
-            endpoint.attempts != u8::from(index == 0)) {
-            return Err(bad("fault probe requires exactly one IPv4 denied TCP attempt"));
+        if schedule
+            .endpoints
+            .iter()
+            .enumerate()
+            .any(|(index, endpoint)| endpoint.attempts != u8::from(index == 0))
+        {
+            return Err(bad(
+                "fault probe requires exactly one IPv4 denied TCP attempt",
+            ));
         }
         let start = monotonic_ns()?;
         let mut row = attempt(0, 0, &schedule.endpoints[0])?;
@@ -562,7 +568,13 @@ mod linux {
                 validate_worker_lineage(role, start, leader)?;
                 worker(role, start, leader)
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown or invalid argument: {}", args.first().map(String::as_str).unwrap_or("<missing>")))),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown or invalid argument: {}",
+                    args.first().map(String::as_str).unwrap_or("<missing>")
+                ),
+            )),
         }
     }
 

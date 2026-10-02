@@ -331,8 +331,10 @@ fn exec_second(file: File, command: &CommandV1) -> io::Result<()> {
 pub fn launch() -> io::Result<()> {
     // state RECORDS: every required record is descriptor-bounded and root-custodied.
     if let Some(argument) = std::env::args_os().nth(1) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("unknown argument: {}", argument.to_string_lossy())));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown argument: {}", argument.to_string_lossy()),
+        ));
     }
     let command_bytes = read_record(COMMAND_PATH, COMMAND_MAX_BYTES)?;
     let endpoint_bytes = read_record(ENDPOINTS_PATH, ENDPOINTS_MAX_BYTES)?;
