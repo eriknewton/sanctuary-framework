@@ -70,7 +70,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_payload_custody_control_and_hash_counterexamples(self):
         for kind in ('missing-binary', 'extra-config', 'hardlink', 'symlink', 'setuid', 'group-owner',
-                     'wrong-unit', 'wrong-schema', 'guard-change', 'missing-dependency', 'wrong-architecture', 'wrong-conflict'):
+                     'wrong-unit', 'wrong-schema', 'guard-change', 'missing-dependency', 'wrong-architecture', 'wrong-conflict', 'extra-control-field'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='install-negative-') as tmp:
                 root = Path(tmp) / 'stage'
                 subprocess.run(['dpkg-deb', '--raw-extract', str(DEB), str(root)], check=True, stdout=subprocess.DEVNULL)
@@ -102,6 +102,8 @@ class ArchiveTests(unittest.TestCase):
                     control.write_text('\n'.join('Depends: libc6' if line.startswith('Depends:') else line for line in control.read_text().splitlines()) + '\n')
                 elif kind == 'wrong-architecture':
                     control.write_text(control.read_text().replace('Architecture: amd64', 'Architecture: arm64'))
+                elif kind == 'extra-control-field':
+                    control.write_text(control.read_text() + 'Protected: yes\n')
                 elif kind == 'wrong-conflict':
                     control.write_text(control.read_text().replace('Conflicts: sanctuary-castle-wall-internal', 'Conflicts: other'))
                 mutated = Path(tmp) / 'mutated.deb'

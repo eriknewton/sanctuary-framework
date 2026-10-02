@@ -101,10 +101,12 @@ def main(deb, expected_source):
     if (field(deb, 'Package') != LAYOUT['PACKAGE'] or field(deb, 'Architecture') != 'amd64'
             or identity['package_version'] != version or not re.fullmatch(r'[0-9][0-9A-Za-z.+~-]*-[1-9][0-9]*', version)
             or field(deb, 'Conflicts') != 'sanctuary-castle-wall-internal'
-            or field(deb, 'Replaces') or field(deb, 'Provides') or field(deb, 'Essential')):
+            or field(deb, 'Replaces') or field(deb, 'Provides') or field(deb, 'Essential') != 'no'):
         fail('install control identity mismatch')
     if identity['pre_depends'] != LAYOUT['PRE_DEPENDS'] or field(deb, 'Pre-Depends') != LAYOUT['PRE_DEPENDS']:
         fail('install pre-dependency mismatch')
+    if control['control'][1] != LAYOUT['control_bytes'](version, identity['runtime_depends']):
+        fail('install control fields differ from closed source metadata')
     names = validate_runtime_depends(field(deb, 'Depends'))
     if names != validate_runtime_depends(identity['runtime_depends']) or not LAYOUT['RUNTIME_PACKAGES'] <= {n.removesuffix(':amd64') for n in names}:
         fail('runtime tool dependency closure mismatch')

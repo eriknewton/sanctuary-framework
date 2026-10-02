@@ -102,11 +102,7 @@ def build(revision, output):
         for role in ('preinst', 'prerm'):
             (stage / 'DEBIAN' / role).write_bytes(LAYOUT['guard_bytes'](role, version, identity_bytes, hashes, HERE))
             (stage / 'DEBIAN' / role).chmod(0o755)
-        (stage / 'DEBIAN/control').write_text(
-            f'Package: {LAYOUT["PACKAGE"]}\nVersion: {version}\nSection: admin\nPriority: optional\nArchitecture: amd64\n'
-            f'Pre-Depends: {LAYOUT["PRE_DEPENDS"]}\nDepends: {depends}\nConflicts: sanctuary-castle-wall-internal\n'
-            'Maintainer: Erik Newton <eriknewton@gmail.com>\n'
-            'Description: Castle Wall cold-install package\n Installation is inert; provisioning and activation are explicit operator actions.\n')
+        (stage / 'DEBIAN/control').write_bytes(LAYOUT['control_bytes'](version, depends))
         (stage / 'DEBIAN/control').chmod(0o644)
         if clean_head() != head:
             raise ValueError('source changed during package build')

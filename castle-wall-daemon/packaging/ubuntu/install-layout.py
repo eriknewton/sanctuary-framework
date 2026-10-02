@@ -67,3 +67,14 @@ def guard_source(here):
     # Both low-level process bounds and install policy are embedded verbatim;
     # no mutable helper is imported from the target host.
     return (here / 'bounded-process.py').read_bytes() + b'\n' + (here / 'install-lifecycle-guard.py').read_bytes()
+
+
+def control_bytes(version, depends):
+    # Exact metadata is shared by the builder and assertion; extra relationship
+    # or lifecycle-affecting fields must not be accepted merely as unknown text.
+    return (
+        f'Package: {PACKAGE}\nVersion: {version}\nSection: admin\nPriority: optional\nArchitecture: amd64\n'
+        f'Pre-Depends: {PRE_DEPENDS}\nDepends: {depends}\nConflicts: sanctuary-castle-wall-internal\n'
+        'Maintainer: Erik Newton <eriknewton@gmail.com>\n'
+        'Description: Castle Wall cold-install package\n Installation is inert; provisioning and activation are explicit operator actions.\n'
+    ).encode()

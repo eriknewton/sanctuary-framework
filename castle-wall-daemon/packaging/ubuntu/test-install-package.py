@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import json
+from contextlib import nullcontext
 import tarfile
 import unittest
 from types import SimpleNamespace
@@ -219,6 +220,61 @@ class InstallTests(unittest.TestCase):
         }), patch.object(os, 'walk', return_value=[(root, [], ['unrelated.service'])]), patch.object(os, 'readlink', return_value='/outside/alias'), patch.object(os.path, 'realpath', return_value=GUARD['AGENT_UNIT_PATH']):
             with self.assertRaises(GUARD['Refusal']):
                 fn(True)
+
+
+    def test_legacy_agent_state_refuses(self):
+        fn = GUARD['legacy_agent_state_absent']
+        for parent in ('/var/lib', '/run'):
+            def scan(path):
+                entries = [SimpleNamespace(name='sanctuary-agent-60123', path=parent + '/sanctuary-agent-60123')] if path == parent else []
+                return nullcontext(iter(entries))
+            with patch.object(os, 'scandir', side_effect=scan):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn()
+
+    def test_inherited_dropins_refuse_before_manager_reload(self):
+        fn = GUARD['systemd_files']
+        root = '/etc/systemd/system'
+        info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+        for name in ('service.d', 'mount.d', 'sanctuary-.service.d', 'sanctuary-castle-.service.d', 'var-.mount.d', 'var-lib-.mount.d'):
+            with self.subTest(name=name), patch.dict(fn.__globals__, {
+                'SYSTEMD_ROOTS': (root,), 'command': lambda _: root,
+                'check_ancestors': lambda _: True, 'lstat': lambda _: info,
+            }), patch.object(os, 'walk', return_value=[(root, [name], [])]):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn(True)
+
+    def inspect_fixtures(self, installed):
+        return {
+            'ROLE': 'prerm' if installed else 'preinst',
+            'dpkg_status': lambda: ({'Version': '0.1.0-1'}, ['install', 'ok', 'installed']) if installed else None,
+            'package_owners': lambda: {}, 'checked_file': lambda *a: None, 'require_owners': lambda *a: None,
+            'installed_identity': lambda *a: {'fixture': 'stable'}, 'systemd_files': lambda *a: None,
+            'systemd_manager': lambda *a: {'NeedDaemonReload': 'no'}, 'agent_instances_inactive': lambda: None,
+            'no_queued_jobs': lambda: None, 'runtime_absent': lambda: None, 'nft_absent': lambda: None,
+            'lstat': lambda *a: None,
+        }
+
+    def test_second_observation_refuses_manager_or_payload_churn(self):
+        fn = GUARD['inspect']
+        with patch.dict(fn.__globals__, self.inspect_fixtures(True)):
+            self.assertEqual(fn(True, 'remove', '0.1.0-1'), {'fixture': 'stable'})
+        for site in ('mount', 'wall', 'identity'):
+            fixture = self.inspect_fixtures(True)
+            if site == 'identity':
+                fixture['installed_identity'] = unittest.mock.Mock(side_effect=[{'fixture': 'stable'}, {'fixture': 'changed'}])
+            else:
+                rows = [{'NeedDaemonReload': 'no'} for _ in range(4)]
+                rows[3 if site == 'mount' else 2] = {'NeedDaemonReload': 'yes'}
+                fixture['systemd_manager'] = unittest.mock.Mock(side_effect=rows)
+            with self.subTest(site=site), patch.dict(fn.__globals__, fixture):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn(True, 'remove', '0.1.0-1')
+        fixture = self.inspect_fixtures(False)
+        fixture['lstat'] = unittest.mock.Mock(side_effect=[None] * len(GUARD['PAYLOAD']) + [SimpleNamespace()])
+        with patch.dict(fn.__globals__, fixture):
+            with self.assertRaises(GUARD['Refusal']):
+                fn(False, 'install')
 
 
 
