@@ -100,7 +100,9 @@ class Repairs(unittest.TestCase):
                 fn(repo/'record.json',True)
                 p=repo/'.github/workflows/linux-package-structure.yml';original=p.read_text()
                 for mutant in [original.replace('  push: {}','  push:\n    paths: [castle-wall-daemon/src/**]'),
-                               original.replace('    runs-on:', '    if: false\n    runs-on:')]:
+                               original.replace('    runs-on:', '    if: false\n    runs-on:'),
+                               original.replace('  push: {}', '  push: {\"paths\": [castle-wall-daemon/src/**]}'),
+                               original.replace('    runs-on:', '    \"if\" : false\n    runs-on:')]:
                     with self.subTest(workflow=mutant):
                         p.write_text(mutant)
                         with self.assertRaises(ValueError):fn(repo/'record.json',True)

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = '.github/workflows/linux-install-package.yml'
@@ -28,20 +29,29 @@ REQUIRED_CATEGORIES = ['Linux Rust fmt/clippy/locked tests', 'internal/install a
 
 
 def check_workflow(raw, required, path):
-    # Parse the closed YAML subset used for job inventory. Unsupported compact
-    # mappings or indentation refuse, never imply unconditional job execution.
-    text = raw.decode()
-    if re.search(r'^\s+(?:paths|paths-ignore):', text, re.M):
-        raise ValueError('required workflow has path filters: ' + path)
-    if '\njobs:\n' not in text:
-        raise ValueError('required workflow jobs mapping absent: ' + path)
-    job_text = text.split('\njobs:\n', 1)[1]
-    jobs = dict((m.group(1), m.group(2)) for m in re.finditer(r'^  ([a-z][a-z0-9-]*):[ \t]*\n((?:(?:    .*|)[\n])*)', job_text, re.M))
-    if not set(required) <= jobs.keys():
+    # BaseLoader keeps YAML keys such as "on" as strings and constructs no
+    # executable tags. Real parsing covers quoted keys, flow maps and aliases.
+    try:
+        document = yaml.load(raw, Loader=yaml.BaseLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError('required workflow is not valid YAML: ' + path) from exc
+    if not isinstance(document, dict):
+        raise ValueError('required workflow mapping absent: ' + path)
+    triggers = document.get('on')
+    if isinstance(triggers, dict):
+        for settings in triggers.values():
+            if isinstance(settings, dict) and {'paths', 'paths-ignore'} & settings.keys():
+                raise ValueError('required workflow has path filters: ' + path)
+    elif not isinstance(triggers, (list, str)):
+        raise ValueError('required workflow triggers absent: ' + path)
+    jobs = document.get('jobs')
+    if not isinstance(jobs, dict) or not set(required) <= jobs.keys():
         raise ValueError('required job disappeared from workflow: ' + path)
     for job in required:
-        conditions = re.findall(r'^    if:[ \t]*(.*)$', jobs[job], re.M)
-        if conditions and not (job == 'install-package-evidence' and conditions == ['always()']):
+        spec = jobs[job]
+        if not isinstance(spec, dict):
+            raise ValueError('required job mapping absent: ' + path + ':' + job)
+        if 'if' in spec and not (job == 'install-package-evidence' and spec['if'] == 'always()'):
             raise ValueError('required job has conditional admission: ' + path + ':' + job)
 
 

@@ -31,7 +31,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/apt-install-resilient
         with:
-          packages: libnetfilter-queue-dev libnfnetlink-dev nftables
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables python3-yaml
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: 1.95.0
@@ -99,7 +99,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/apt-install-resilient
         with:
-          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: 1.95.0
@@ -241,6 +241,9 @@ jobs:
         with:
           ref: ${{ env.INSTALL_SOURCE_SHA }}
           persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: python3-yaml
       - name: Record service digest and require every package job
         env:
           INSTALL_NEEDS: ${{ toJSON(needs) }}
