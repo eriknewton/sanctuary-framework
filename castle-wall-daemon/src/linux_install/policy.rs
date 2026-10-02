@@ -173,6 +173,13 @@ pub fn identity(t: &Transaction, overflow: u32) -> IdentityConstraints<'_> {
     }
 }
 pub fn install(root: &Root, t: &mut Transaction, bytes: &[u8], pin: &str) -> Result<()> {
+    // Account completion and staged launch inputs precede every policy mutation.
+    if t.account_step != account::AccountStep::Complete {
+        return Err("provision accounts incomplete".into());
+    }
+    let command = root.read(COMMAND_PATH.trim_start_matches('/'), COMMAND_MAX_BYTES)?;
+    CommandV1::parse(&command)?.validate_identity(&identity(t, account::overflow_uid()?))?;
+    EndpointsV1::parse(&root.read(ENDPOINTS_PATH.trim_start_matches('/'), ENDPOINTS_MAX_BYTES)?)?;
     account::verify(root, t)?;
     let admitted = admit_bundle(bytes, pin, &identity(t, account::overflow_uid()?))?;
     let config = DaemonConfig::defaults_for_fortress(&t.fortress_id);

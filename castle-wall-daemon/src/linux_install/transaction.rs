@@ -166,6 +166,24 @@ impl Root {
         parent.sync_all()?;
         Ok(Self { dir })
     }
+    /// Classify a directory without following a leaf link; traversal rechecks custody.
+    pub fn is_directory(&self, path: &str) -> Result<bool> {
+        let (parent, name) = self.parent(path)?;
+        let name = component(&name)?;
+        let mut meta = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                meta.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { meta.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
         let (dir, name) = self.parent(path)?;
         let c = component(&name)?;

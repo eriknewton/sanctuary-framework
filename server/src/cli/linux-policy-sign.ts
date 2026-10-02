@@ -22,6 +22,7 @@ export interface PolicyBundle { public_key_hex: string; manifest_b64url: string;
 export async function buildInstallBundle(input: BuildSignedManifestInput, publicKey: Uint8Array): Promise<PolicyBundle> {
   const origin = validateAgentOrigin(input.agentOrigin);
   if (!origin || origin.mode !== "uid" || origin.agent_uid === undefined || origin.gate_uid !== undefined) throw new Error("explicit uid agent_origin required");
+  if (origin.agent_uid <= origin.system_uid_allow_ceiling) throw new Error("agent uid must exceed system uid ceiling");
   if (!/^[a-f0-9]{8,64}$/.test(input.fortressId)) throw new Error("invalid fortress id");
   if (!Number.isSafeInteger(input.generation) || (input.generation ?? 0) <= 0) throw new Error("positive safe integer generation required");
   for (const rule of input.rules) if (validateRule(rule).length !== 0) throw new Error("invalid policy rule");
@@ -61,12 +62,12 @@ function options(argv: string[]): Map<string, string> {
   for (let i = 0; i < argv.length; i += 2) { if (!names.includes(argv[i]) || out.has(argv[i])) throw new Error("unknown or duplicate option"); out.set(argv[i], argv[i + 1]); }
   return out;
 }
-/** The packaged shell entry lowers core limits before Node exists; direct invocation rechecks inheritance. */
+/** The packaged entry sets both core limits before Node exists; direct invocation verifies both. */
 export async function main(argv: string[]): Promise<void> {
   const args = options(argv);
   // A child inherits this process's core limit; never trust an environment marker claiming dumps are disabled.
-  const core = execFileSync("/bin/sh", ["-c", "ulimit -c"], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" }, timeout: 1000, maxBuffer: KIB }).trim();
-  if (core !== "0") throw new Error("use the packaged sanctuary-linux-policy-sign entry to disable core dumps");
+  const core = execFileSync("/bin/sh", ["-c", "ulimit -S -c; ulimit -H -c"], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" }, timeout: 1000, maxBuffer: KIB }).trim();
+  if (core !== "0\n0") throw new Error("use the packaged sanctuary-linux-policy-sign entry to disable core dumps");
   const number = (name: string): number => { const raw = args.get(name)!; if (!/^(0|[1-9][0-9]*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("invalid integer option"); return Number(raw); };
   const fd = number("--key-fd");
   if (fd < 3) throw new Error("key descriptor must be separate from standard streams");

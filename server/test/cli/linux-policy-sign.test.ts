@@ -81,3 +81,35 @@ it("the packaged entry signs through an npm-style link and refuses key/output cu
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it("refuses the install profile's inclusive system uid ceiling", async () => {
+  await expect(buildInstallBundle({ ...input, agentOrigin: { mode: "uid", agent_uid: 1000, system_uid_allow_ceiling: 1000 } }, publicKey)).rejects.toThrow("uid");
+});
+it("the packaged signer ignores PATH helpers while holding the key descriptor", () => {
+  const dir = mkdtempSync(join(tmpdir(), "signer-path-"));
+  try {
+    const marker = join(dir, "helper-ran");
+    for (const name of ["node", "readlink", "dirname"]) writeFileSync(join(dir, name), `#!/bin/sh\nprintf leaked > '${marker}'\nexit 91\n`, { mode: 0o755 });
+    const key = join(dir, "seed"); writeFileSync(key, seed, { mode: 0o600 });
+    const rules = join(dir, "rules"); writeFileSync(rules, "[]");
+    const fd = openSync(key, "r");
+    try {
+      const result = spawnSync(resolve("bin/sanctuary-linux-policy-sign"), ["--fortress-id", input.fortressId, "--agent-uid", "60123", "--system-uid-ceiling", "1000", "--generation", "10", "--rules", rules, "--key-fd", "3", "--output", join(dir, "out")], { env: { ...process.env, PATH: dir }, stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
+      expect(existsSync(marker)).toBe(false);
+      expect(result.status, result.stderr?.toString()).toBe(0);
+    } finally { closeSync(fd); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it("direct invocation refuses a zero soft but nonzero hard core limit", () => {
+  const dir = mkdtempSync(join(tmpdir(), "signer-core-"));
+  try {
+    const key = join(dir, "seed"); writeFileSync(key, seed, { mode: 0o600 });
+    const rules = join(dir, "rules"); writeFileSync(rules, "[]");
+    const fd = openSync(key, "r");
+    try {
+      const result = spawnSync("/bin/sh", ["-c", 'ulimit -S -c 0; exec "$@"', "core-test", process.execPath, resolve("dist/linux-policy-sign.js"), "--fortress-id", input.fortressId, "--agent-uid", "60123", "--system-uid-ceiling", "1000", "--generation", "10", "--rules", rules, "--key-fd", "3", "--output", join(dir, "out")], { stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
+      expect(result.status).toBe(1);
+      expect(existsSync(join(dir, "out"))).toBe(false);
+    } finally { closeSync(fd); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

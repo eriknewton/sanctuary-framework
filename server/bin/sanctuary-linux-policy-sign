@@ -1,16 +1,24 @@
 #!/bin/sh
-# Disable dumps before the managed runtime can receive the owner's seed descriptor.
-ulimit -c 0 || exit 1
-# npm installs bin symlinks; resolve a bounded chain before locating the bundled entry.
-script=$0
-links=0
-max_links=16 # One npm link is usual; the finite ceiling also refuses link cycles.
-while [ -L "$script" ]; do
-  links=$((links + 1))
-  [ "$links" -le "$max_links" ] || exit 1
-  base=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd) || exit 1
-  link=$(readlink "$script") || exit 1
-  case "$link" in /*) script=$link ;; *) script=$base/$link ;; esac
-done
-base=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd) || exit 1
-exec node "$base/../dist/linux-policy-sign.js" "$@"
+# The hard limit prevents another same-user process restoring dump permission.
+ulimit -S -c 0 || exit 1
+ulimit -H -c 0 || exit 1
+# The pinned interpreter verifies both inherited limits before reading the seed.
+# Fixed installation paths, never PATH lookup. All path resolution occurs inside
+# this interpreter, so no helper program inherits the owner's key descriptor.
+node=/usr/bin/node
+if [ ! -x "$node" ]; then node=/opt/homebrew/bin/node; fi
+[ -x "$node" ] || exit 1
+unset NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
+exec "$node" --input-type=module -e '
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+try {
+  const entry = resolve(dirname(realpathSync(process.argv[1])), "../dist/linux-policy-sign.js");
+  const { main } = await import(pathToFileURL(entry).href);
+  await main(process.argv.slice(2));
+} catch {
+  console.error("sanctuary-linux-policy-sign: signing refused");
+  process.exitCode = 1;
+}
+' "$0" "$@"

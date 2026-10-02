@@ -734,3 +734,9 @@ bypass resistance, audit drain durability, and disarm on the reference host.
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a
 substitute for the Linux enforcement path. The Linux kernel-routing claim
 becomes publishable only after that drill passes and its evidence is reviewed.
+
+The install CLI requires a kernel audit login uid (normally established by SSH/PAM and retained through sudo). Check `cat /proc/self/loginuid` in the operator session before provisioning or evidence capture. An unset value of `4294967295` refuses; a `SUDO_UID` environment variable does not establish identity. Use an authenticated login session when automation has no audit identity.
+
+If package removal is refused, `sanctuary-linux stop` and `sanctuary-linux disable` remain available. Restore installation selection with `printf 'sanctuary-castle-wall install\n' | sudo dpkg --set-selections` before another start or enable. This changes dpkg selection only; it does not remove retained state or make provisioned removal supported. Without restoring selection, activation refuses even though the payload remains installed.
+
+The finite network stand-in deliberately retains a SIGTERM-ignoring descendant. Its normal stop can take the full 10-second unit deadline and finish with `Result=timeout` and an empty cgroup. Status and evidence preserve those manager facts; this is the expected stop witness, not an enforcement claim. Budget that deadline into wall restart and shutdown timing.

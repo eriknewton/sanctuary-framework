@@ -5,7 +5,7 @@ use super::{
     transaction::{checked, run_bounded, sha256, Root, Transaction},
     Result,
 };
-use crate::audit::WalEntry;
+use crate::audit::{validate_wal_line, WalValidationState};
 use serde_json::{json, Value};
 use std::{
     fs::OpenOptions,
@@ -17,58 +17,15 @@ const WAL_MAX: usize = crate::constants::DEFAULT_WAL_SIZE_CAP_BYTES as usize;
 const PUBLIC_MAX: usize = crate::manifest::store::MAX_PUBLISH_BUNDLE_BYTES;
 
 /// Validate exactly the on-disk writer encoding, including a retained ACK anchor.
-/// Semantics must match audit.rs::validate_wal_line; this path never opens WalWriter.
+/// Uses the writer's read-only validator; this path never opens WalWriter.
 pub fn verify_wal(bytes: &[u8]) -> Result<usize> {
     if bytes.is_empty() || bytes.last() != Some(&b'\n') || bytes.len() > WAL_MAX {
         return Err("WAL prefix is empty, incomplete, or oversized".into());
     }
-    let mut previous: Option<WalEntry> = None;
+    let mut state = WalValidationState::default();
     let mut count = 0;
-    for line in bytes[..bytes.len() - 1].split(|b| *b == b'\n') {
-        let entry: WalEntry = serde_json::from_slice(line)?;
-        if serde_json::to_vec(&entry)? != line {
-            return Err("WAL writer encoding mismatch".into());
-        }
-        if let Some(hash) = &entry.prior_sha256_hex {
-            if hash.len() != SHA256_HEX_BYTES
-                || !hash
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            {
-                return Err("WAL prior digest shape".into());
-            }
-        }
-        if let Some(prior) = &previous {
-            if prior.seq.checked_add(1) != Some(entry.seq)
-                || entry.prior_sha256_hex.as_deref()
-                    != Some(&sha256(prior.event_canonical_json.as_bytes()))
-                || entry.acked_anchor
-            {
-                return Err("WAL continuity refused".into());
-            }
-        } else if !((entry.seq == 0 && entry.prior_sha256_hex.is_none())
-            || (entry.seq > 0 && entry.prior_sha256_hex.is_some() && entry.acked_anchor))
-        {
-            return Err("WAL root is unavailable".into());
-        }
-        // Match audit.rs::validate_wal_line: the inner canonical event and outer chain describe the same row.
-        let event: Value = serde_json::from_str(&entry.event_canonical_json)?;
-        if !event.is_object()
-            || crate::manifest::canonical_json::canonicalize(&event)? != entry.event_canonical_json
-        {
-            return Err("WAL event encoding refused".into());
-        }
-        let details = event
-            .get("details")
-            .and_then(Value::as_object)
-            .ok_or("WAL event details absent")?;
-        if details.get("seq").and_then(Value::as_u64) != Some(entry.seq)
-            || details.get("prior_sha256_hex") != Some(&json!(entry.prior_sha256_hex))
-            || entry.seq == u64::MAX
-        {
-            return Err("WAL event identity refused".into());
-        }
-        previous = Some(entry);
+    for (index, line) in bytes[..bytes.len() - 1].split(|b| *b == b'\n').enumerate() {
+        validate_wal_line(std::str::from_utf8(line)?, index as u64 + 1, &mut state)?;
         count += 1;
     }
     Ok(count)
@@ -219,7 +176,10 @@ pub fn capture(root: &Root, t: &Transaction, output: &Path) -> Result<Value> {
             dest.write(&format!("rules/{}", rule.file), &bytes, 0o600)?;
         }
     }
-    match root.read("var/lib/sanctuary/nft-ownership.json", 16 * KIB) {
+    match root.read(
+        "var/lib/sanctuary/nft-ownership.json",
+        crate::ownership_journal::MAX_ENVELOPE_BYTES as usize,
+    ) {
         Ok(envelope) => {
             use base64::Engine;
             let raw: Value = serde_json::from_slice(&envelope)?;
@@ -228,7 +188,7 @@ pub fn capture(root: &Root, t: &Transaction, output: &Path) -> Result<Value> {
                     .as_str()
                     .ok_or("ownership record missing")?,
             )?;
-            if decoded.len() > 4 * KIB {
+            if decoded.len() > crate::ownership_journal::MAX_RECORD_BYTES {
                 return Err("ownership public record quota".into());
             }
             let record: crate::ownership_journal::OwnershipJournal =
@@ -256,9 +216,11 @@ pub fn capture(root: &Root, t: &Transaction, output: &Path) -> Result<Value> {
             Value::Null
         }
     };
-    let record = match observation(t) {
-        Ok((bytes, meta)) => {
-            let record: Value = serde_json::from_slice(&bytes)?;
+    let record = match observation(t).and_then(|(bytes, meta)| {
+        let record: Value = serde_json::from_slice(&bytes)?;
+        Ok((bytes, meta, record))
+    }) {
+        Ok((bytes, meta, record)) => {
             let current_boot = checked("/usr/bin/cat", &["/proc/sys/kernel/random/boot_id"])?;
             let matches = workload_before.as_ref().is_ok_and(|(pid, ticks, _)| {
                 record["invocation"]["leader_pid"].as_u64() == Some(u64::from(*pid))
@@ -343,7 +305,7 @@ pub fn capture(root: &Root, t: &Transaction, output: &Path) -> Result<Value> {
             "--output=json",
             "--no-pager",
         ],
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(10), // Fixed 10-second evidence latency ceiling; expiry records incomplete.
         CMAX,
     ) {
         Ok(result) if result.code == Some(0) && !result.stdout.is_empty() => {

@@ -103,7 +103,7 @@ const MAC_DOMAIN: &[u8] = b"sanctuary.castle-wall.nft-ownership-journal.v1\n";
 /// coordinated bound change, and a file larger than this is malformed or hostile
 /// and is rejected before any parse, bounding the work an attacker who can write
 /// the StateDirectory could force.
-const MAX_ENVELOPE_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_ENVELOPE_BYTES: u64 = 16 * 1024;
 
 /// Upper bound on the decoded record bytes (the canonical `OwnershipJournal`
 /// JSON).
@@ -120,7 +120,7 @@ const MAX_ENVELOPE_BYTES: u64 = 16 * 1024;
 /// worst case is 512 + 64 + 58 + 50 + 545 + 150 = 1379 bytes. Rounded up to 4 KiB
 /// for headroom; `record_worst_case_fits_the_byte_bound` serialises the maximal
 /// record and asserts it, so the derivation is checked and not just asserted.
-const MAX_RECORD_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 4 * 1024;
 
 /// Largest confined-uid history one boot's journal record may carry.
 ///

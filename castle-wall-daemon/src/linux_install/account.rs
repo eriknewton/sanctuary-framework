@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 const SYSTEM_GID_FIRST: u32 = 100; // Ubuntu's dynamically allocated system group range.
 const SYSTEM_GID_LAST: u32 = 999;
-const MAX_NSS_ROWS: usize = 4096; // Fixed enumeration ceiling; larger directories require an explicit future profile.
+const MAX_NSS_ROWS: usize = 4096; // Must match accounts_absent in packaging/ubuntu/install-lifecycle-guard.py; fixed enumeration ceiling.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AccountStep {
     Fresh,
@@ -139,6 +139,12 @@ pub fn operator_uid() -> Result<u32> {
         return Err("operator loginuid unavailable".into());
     }
     Ok(login)
+}
+pub fn validate_current_operator(t: &Transaction, current: u32) -> Result<()> {
+    if current == u32::MAX || [t.agent_uid, t.service_uid].contains(&current) {
+        return Err("current operator collides with installation identity".into());
+    }
+    Ok(())
 }
 pub fn validate_ids(t: &Transaction, overflow: u32) -> Result<()> {
     for uid in [t.agent_uid, t.service_uid] {

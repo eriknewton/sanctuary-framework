@@ -112,12 +112,21 @@ fn no_jobs() -> Result<()> {
     }
     Ok(())
 }
+/// dpkg selection may record a refused removal while the configured payload remains installed.
+pub fn admitted_package_status(status: &[u8], retiring: bool) -> bool {
+    // Retirement remains available after a refused removal; activation still requires install intent.
+    status == b"install ok installed"
+        || (retiring && matches!(status, b"deinstall ok installed" | b"purge ok installed" | b"hold ok installed" | b"unknown ok installed"))
+}
 fn package(root: &Root) -> Result<()> {
+    package_for(root, false)
+}
+fn package_for(root: &Root, retiring: bool) -> Result<()> {
     let installed = checked(
         "/usr/bin/dpkg-query",
         &["--show", "--showformat=${Status}", PACKAGE],
     )?;
-    if installed != b"install ok installed" {
+    if !admitted_package_status(&installed, retiring) {
         return Err("install package is not configured".into());
     }
     let verification = checked("/usr/bin/dpkg", &["--verify", PACKAGE])?;
@@ -224,8 +233,8 @@ pub fn verify_unit_observation(
     }
     Ok(())
 }
-fn units(root: &Root, t: &Transaction) -> Result<()> {
-    package(root)?;
+fn units(root: &Root, t: &Transaction, retiring: bool) -> Result<()> {
+    package_for(root, retiring)?;
     for (unit, fragment) in [
         (WALL.to_owned(), WALL.to_owned()),
         (instance(t), "sanctuary-agent@.service".into()),
@@ -382,6 +391,9 @@ pub fn provision(root: &Root, args: &[String]) -> Result<()> {
             t
         }
     };
+    // Resumption retains the recorded operator and also excludes the current
+    // login principal; a new audit session cannot become the workload identity.
+    account::validate_current_operator(&t, account::operator_uid()?)?;
     if t.policy_complete {
         configured(root, &t)?;
         return Ok(());
@@ -455,10 +467,10 @@ pub fn manager_action(root: &Root, t: &mut Transaction, action: &str) -> Result<
         "start" | "enable" => {
             let command = configured(root, t)?;
             systemctl(&["daemon-reload"])?;
-            units(root, t)?;
+            units(root, t, false)?;
             if action == "enable" {
                 systemctl(&["enable", WALL, &unit])?;
-                units(root, t)?;
+                units(root, t, false)?;
                 for enabled in [WALL, &unit] {
                     if prop(&properties(enabled)?, "UnitFileState")? != "enabled" {
                         return Err("enablement not observed".into());
@@ -499,7 +511,7 @@ pub fn manager_action(root: &Root, t: &mut Transaction, action: &str) -> Result<
             }
         }
         "disable" | "stop" => {
-            units(root, t)?;
+            units(root, t, true)?;
             // Reboot intent is removed before stop, so interruption cannot re-enable a workload.
             systemctl(&["disable", &unit])?;
             if prop(&properties(&unit)?, "UnitFileState")? != "disabled" {
@@ -550,7 +562,7 @@ pub fn status(root: &Root, t: &Transaction) -> Result<Value> {
     let wall = properties(WALL);
     let group = account::sanctuary_group_observation();
     let config = configured(root, t);
-    let effective_units = units(root, t);
+    let effective_units = units(root, t, true);
     let marker = root
         .read(relative(CONFIGURED_PATH), CONFIGURED_MAX_BYTES)
         .ok()
@@ -747,46 +759,61 @@ fn unit_links(root: &Root, t: &Transaction, fresh: bool) -> Result<()> {
         }
     }
     for dir in UNIT_ROOTS {
-        let entries = match root.entries(dir, HELPER_MAX_BYTES) {
+        inspect_unit_tree(root, dir, &allowed, fresh)?;
+    }
+    Ok(())
+}
+
+/// Walk every dependency suffix, including Upholds, through custodied directories.
+pub fn inspect_unit_tree(
+    root: &Root,
+    initial: &str,
+    allowed: &[(String, String)],
+    fresh: bool,
+) -> Result<()> {
+    let mut pending = vec![(initial.to_owned(), 0usize)];
+    let mut count = 0usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let entries = match root.entries(&dir, HELPER_MAX_BYTES) {
             Ok(entries) => entries,
             Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                if depth == 0
+                    && e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
                 continue
             }
             Err(e) => return Err(e),
         };
+        count += entries.len();
+        // Same 100,000-entry host inventory ceiling as install-lifecycle-guard.py;
+        // 16 levels bound recursive dependency trees without following symlinks.
+        if count > 100_000 || depth > 16 {
+            return Err("unit inventory quota".into());
+        }
         for name in entries {
             let path = format!("{dir}/{name}");
-            let relevant = name.contains("sanctuary");
-            if relevant
-                && !(dir == "etc/systemd/system"
-                    && [WALL, "sanctuary-agent@.service", WORKSPACE_MOUNT_UNIT]
-                        .contains(&name.as_str()))
+            let target = root.link_target(&path)?;
+            let relevant = name.contains("sanctuary")
+                || target.as_ref().is_some_and(|v| v.contains("sanctuary"));
+            let canonical = !fresh
+                && dir == "etc/systemd/system/multi-user.target.wants"
+                && allowed
+                    .iter()
+                    .any(|(n, d)| *n == name && target.as_ref() == Some(d));
+            let fragment = dir == "etc/systemd/system"
+                && target.is_none()
+                && [WALL, "sanctuary-agent@.service", WORKSPACE_MOUNT_UNIT]
+                    .contains(&name.as_str());
+            if relevant && !canonical && !fragment {
+                return Err("unexpected Sanctuary unit or enablement link".into());
+            }
+            if ["service.d", "mount.d", "var-.mount.d", "var-lib-.mount.d"].contains(&name.as_str())
             {
-                return Err("unexpected Sanctuary unit or override".into());
+                return Err("inherited unit override".into());
             }
-            if let Some(target) = root.link_target(&path)? {
-                if relevant || target.contains("sanctuary") {
-                    return Err("unit alias refused".into());
-                }
-            }
-            if name.ends_with(".wants") || name.ends_with(".requires") {
-                for leaf in root.entries(&path, HELPER_MAX_BYTES)? {
-                    let target = root.link_target(&format!("{path}/{leaf}"))?;
-                    let relevant = leaf.contains("sanctuary")
-                        || target.as_ref().is_some_and(|v| v.contains("sanctuary"));
-                    let canonical = !fresh
-                        && dir == "etc/systemd/system"
-                        && name == "multi-user.target.wants"
-                        && allowed
-                            .iter()
-                            .any(|(n, d)| *n == leaf && target.as_ref() == Some(d));
-                    if relevant && !canonical {
-                        return Err("unexpected Sanctuary enablement link".into());
-                    }
-                }
+            if target.is_none() && root.is_directory(&path)? {
+                pending.push((path, depth + 1));
             }
         }
     }
