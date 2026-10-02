@@ -12,6 +12,7 @@ if (!/^[a-f0-9]{40}$/.test(sourceSha)) {
 
 export default defineConfig({
   entry: {
+    // Must match the file entries in scripts/sealed-cli-runtime-entries.mjs.
     index: "src/index.ts",
     "intelligence/index": "src/intelligence/index.ts",
     cli: "src/cli.ts",

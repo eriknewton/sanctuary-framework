@@ -85,5 +85,6 @@ export async function main(argv: string[]): Promise<void> {
   } finally { seed?.fill(0); closeSync(fd); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // SAFETY: stderr is the operator CLI contract; emit a fixed refusal without key, policy, or error contents.
   main(process.argv.slice(2)).catch(() => { console.error("sanctuary-linux-policy-sign: signing refused"); process.exitCode = 1; });
 }
