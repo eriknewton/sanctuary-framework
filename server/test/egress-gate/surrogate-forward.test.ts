@@ -180,6 +180,7 @@ describe("late TLS completion", () => {
     socket.emit("secureConnect");
     await new Promise<void>(r => setImmediate(r));
     expect(outgoing.destroy).toHaveBeenCalled();
+    expect(outgoing.listenerCount("drain")).toBe(0);
     expect(outgoing.write).not.toHaveBeenCalled(); expect(outgoing.end).not.toHaveBeenCalled();
   }, 10_000);
 });

@@ -561,6 +561,7 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
 
   const onEvent = (event: EgressGateEvent): void => sink(redactSurrogatePlaceholders(event));
   let forwardMode: ExclusiveEgressGateOptions["forwardMode"];
+  let forwardUnavailable: ExclusiveEgressGateOptions["forwardUnavailable"];
   try {
     const text = await readFile(surrogateDestinationsPath(deps.agentUid, deps.surrogateDir), "utf8");
     const artifact = parseSurrogateDestinationsFile(text);
@@ -571,8 +572,13 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
         helperClient: createSurrogateHelperClient(deps.agentUid, deps.surrogateDir),
       };
     }
-  } catch {
-    // Absent or malformed means no forward capability; CONNECT retains its original policy.
+  } catch (error) {
+    // Only ENOENT means unconfigured; a present but broken artifact must be visible and deny forwarding.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      forwardUnavailable = "destinations_unavailable";
+      onEvent({ kind: "surrogate_denied", authority: "", status: 503, code: forwardUnavailable,
+        reason: forwardUnavailable, requestBytes: 0, responseBytes: 0 });
+    }
   }
 
   // 2026-07-24 fix (Option 1): the default peer runner dials the PRIVILEGED
@@ -600,6 +606,7 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     clientAuth,
     onEvent,
     ...(forwardMode ? { forwardMode } : {}),
+    ...(forwardUnavailable ? { forwardUnavailable } : {}),
     ...(deps.upstreamRequest ? { upstreamRequest: deps.upstreamRequest } : {}),
     ...(deps.resolver ? { resolver: deps.resolver } : {}),
     ...(deps.isRoutable ? { isRoutable: deps.isRoutable } : {}),

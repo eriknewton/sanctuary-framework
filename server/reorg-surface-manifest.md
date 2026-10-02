@@ -115,7 +115,7 @@ Credential surrogacy slice 1b-i internal response codes (2026-10-01): the new
 `surrogate-helper-unavailable`, `header_write_failed`, `upstream_tls_failed`,
 `upstream_reset`, `body_length_mismatch`, `socket_error`, `surrogate-invalid-target`,
 `surrogate-duplicate-header`, `surrogate-transfer-encoding`, `surrogate-host-mismatch`,
-`surrogate-upgrade`, and `surrogate-not-live`. These are internal forward-mode
+`surrogate-upgrade`, `surrogate-not-live`, and `surrogate-destinations-unavailable`. These are internal forward-mode
 artifacts, not frozen display strings. Existing CONNECT codes and bytes stay
 unchanged. `surrogate events` now accepts only `[egress-gate] ` lines with valid
 JSON and a `kind` beginning `surrogate_`; its help strings did not change.

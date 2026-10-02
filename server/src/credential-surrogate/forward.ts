@@ -19,7 +19,7 @@ export type SurrogateFailureCode =
   | "helper_id_mismatch" | "body_length_mismatch" | "socket_error";
 export type SurrogateRefusal = SurrogateDenyReason | SurrogateFailureCode | "limit"
   | "invalid_target" | "duplicate_header" | "transfer_encoding" | "host_mismatch"
-  | "upgrade" | "client_denied" | "not_live" | "policy_denied";
+  | "upgrade" | "client_denied" | "not_live" | "policy_denied" | "destinations_unavailable";
 
 // Coordinator clarification, 2026-10-01: request refusals are 403; helper state
 // is 503, superseding design 3.6 step 5 with design 3.4.5. This is the sole table.
@@ -39,6 +39,7 @@ export const SURROGATE_STATUS = {
   host_mismatch: [400, "surrogate-host-mismatch"], upgrade: [501, "surrogate-upgrade"],
   client_denied: [403, "client-denied"], not_live: [503, "surrogate-not-live"],
   policy_denied: [403, "denied-by-policy"],
+  destinations_unavailable: [503, "surrogate-destinations-unavailable"],
 } as const satisfies Record<SurrogateRefusal, readonly [number, string]>;
 
 export interface SurrogateForwardTarget { host: string; authority: string; path: string }

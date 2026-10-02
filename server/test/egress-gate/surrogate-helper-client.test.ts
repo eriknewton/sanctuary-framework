@@ -32,7 +32,7 @@ describe("one-shot helper fault schedule", () => {
   it.each(["silent", "late", "mid_reply", "wrong_id", "second_frame", "split_second_frame", "oversize", "rate_limited"])("%s never resolves or dials an upstream", async mode => {
     const dir = await directory();
     const timers: ReturnType<typeof setTimeout>[] = []; cleanup.push(async () => { timers.forEach(clearTimeout); });
-    await fakeHelper(dir, (s, q) => {
+    const fake = await fakeHelper(dir, (s, q) => {
       const frame = encodeSurrogateQueryResponse({ v: 1, id: mode === "wrong_id" ? newSurrogateCorrelationId() : q.id, kind: "swap", value: randomBytes(20).toString("hex") });
       switch (mode) {
         case "silent": break;
@@ -51,6 +51,7 @@ describe("one-shot helper fault schedule", () => {
     await new Promise(r => setTimeout(r, 75));
     expect(gate.resolver.resolve).not.toHaveBeenCalled(); expect(dial).not.toHaveBeenCalled();
     expect(gate.events.filter(e => e.kind.startsWith("surrogate_")).length).toBe(1);
+    expect(gate.events.filter(e => e.kind.startsWith("surrogate_")).every(e => "correlationId" in e && e.correlationId === fake.queries[0]?.id)).toBe(true);
     if (mode !== "rate_limited") {
       const expected = mode === "silent" || mode === "late" ? "helper_timeout" : mode === "wrong_id" ? "helper_id_mismatch" : "helper_malformed";
       expect(gate.events.some(e => e.kind === "surrogate_helper_unavailable" && e.code === expected)).toBe(true);
@@ -97,4 +98,17 @@ it("helper denials carry only an id recovered from a parsed frame", async () => 
   expect(denials).toHaveLength(2);
   expect(denials[0]?.kind === "query_denied" && denials[0].correlationId === id).toBe(true);
   expect(denials[1]?.kind === "query_denied" && denials[1].correlationId === undefined).toBe(true);
+});
+
+
+it("client disconnect after send retains the unanswered query id", async () => {
+  const dir = await directory();
+  const fake = await fakeHelper(dir, () => {});
+  const dial = vi.fn<SurrogateUpstreamRequest>(); const gate = await daemon(dir, { upstreamRequest: dial });
+  const socket = net.connect(gate.port, "127.0.0.1", () => socket.write(request(gate.header, `Authorization: ${mintSurrogatePlaceholder()}\r\n`)));
+  socket.on("error", () => {}); cleanup.push(async () => { socket.destroy(); });
+  await vi.waitFor(() => expect(fake.queries).toHaveLength(1));
+  socket.destroy();
+  await vi.waitFor(() => expect(gate.events.some(e => e.kind === "surrogate_denied" && e.correlationId === fake.queries[0]!.id)).toBe(true));
+  expect(gate.resolver.resolve).not.toHaveBeenCalled(); expect(dial).not.toHaveBeenCalled();
 });

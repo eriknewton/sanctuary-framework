@@ -11,20 +11,22 @@ import { surrogateQuerySocketPath } from "./surrogate-helper-daemon.js";
 
 export type SurrogateHelperResult =
   | { kind: "response"; correlationId: SurrogateCorrelationId; response: SurrogateQueryResponse }
-  | { kind: "failure"; code: SurrogateFailureCode };
+  | { kind: "failure"; code: SurrogateFailureCode; correlationId?: SurrogateCorrelationId };
 export interface SurrogateHelperClient {
-  query(input: Omit<SurrogateQueryRequest, "v" | "id" | "kind">): Promise<SurrogateHelperResult>;
+  /** onSent records admission before awaiting a reply, so a caller can attribute cancellation. */
+  query(input: Omit<SurrogateQueryRequest, "v" | "id" | "kind">, onSent?: (id: SurrogateCorrelationId) => void): Promise<SurrogateHelperResult>;
 }
 /** Parent-directory injection is for isolated sockets; production uses the uid path. */
 export function createSurrogateHelperClient(agentUid: number, surrogateDir?: string): SurrogateHelperClient {
   const socketPath = surrogateQuerySocketPath(agentUid, surrogateDir);
   return Object.freeze({
-    query(input: Omit<SurrogateQueryRequest, "v" | "id" | "kind">): Promise<SurrogateHelperResult> {
+    query(input: Omit<SurrogateQueryRequest, "v" | "id" | "kind">, onSent?: (id: SurrogateCorrelationId) => void): Promise<SurrogateHelperResult> {
       const id = surrogateCorrelationId(newSurrogateCorrelationId())!;
       return new Promise((resolve) => {
         let state: "CONNECTING" | "READING" | "FRAME" | "SETTLED" = "CONNECTING";
         let bytes = Buffer.alloc(0);
         let answer: SurrogateQueryResponse | null = null;
+        let sent = false;
         const socket = connect(socketPath);
         const state_SETTLED = (result: SurrogateHelperResult): void => {
           if (state === "SETTLED") return;
@@ -34,12 +36,18 @@ export function createSurrogateHelperClient(agentUid: number, surrogateDir?: str
           socket.destroy();
           resolve(result);
         };
-        const fail = (code: SurrogateFailureCode): void => state_SETTLED({ kind: "failure", code });
+        // A3: only a failure before socket.write accepted the query has no join key.
+        const fail = (code: SurrogateFailureCode): void => state_SETTLED({ kind: "failure", code, ...(sent ? { correlationId: id } : {}) });
         const timer = setTimeout(() => fail("helper_timeout"), SURROGATE_QUERY_TIMEOUT_MS);
         socket.on("connect", () => {
           if (state === "SETTLED") return;
           state = "READING";
-          try { socket.write(encodeSurrogateQueryRequest({ ...input, v: SURROGATE_WIRE_VERSION, id, kind: "resolve" })); }
+          try {
+            socket.write(encodeSurrogateQueryRequest({ ...input, v: SURROGATE_WIRE_VERSION, id, kind: "resolve" }));
+            sent = true;
+            // Must match gate-server.ts query admission: notify before a disconnect can terminate the request.
+            onSent?.(id);
+          }
           catch { fail("helper_malformed"); }
         });
         socket.on("data", (chunk: Buffer) => {

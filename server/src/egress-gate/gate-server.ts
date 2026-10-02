@@ -219,6 +219,8 @@ export interface ExclusiveEgressGateOptions {
   /** The single-source gate policy (agent uid + gate port). */
   policy: ExclusiveEgressGatePolicy;
   forwardMode?: SurrogateForwardMode;
+  /** A broken destinations artifact refuses plain requests by name; CONNECT retains its policy. */
+  forwardUnavailable?: "destinations_unavailable";
   upstreamRequest?: SurrogateUpstreamRequest;
   /** Destination rules the gate enforces per CONNECT. */
   rules: AllowlistRule[];
@@ -330,11 +332,12 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   const isRoutable = options.isRoutable;
   const onEvent = options.onEvent;
   const forward = options.forwardMode;
+  const forwardUnavailable = options.forwardUnavailable;
   const destinations = new Set(forward?.destinations ?? []);
   const helperQuery = forward?.helperClient?.query.bind(forward.helperClient);
   const upstreamRequest = options.upstreamRequest ?? https.request;
   // A missing authority must fail at construction, never become advisory forwarding.
-  if (forward && (!clientAuthorize || !helperQuery)) {
+  if ((forward || forwardUnavailable) && (!clientAuthorize || (forward && !helperQuery))) {
     throw new Error("forward mode requires clientAuth and a surrogate helper client");
   }
 
@@ -503,9 +506,27 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   // This bounded observer selects refusal bytes only; llhttp alone accepts HTTP requests.
   const parserProvenance = new WeakMap<object, { forward: boolean }>();
   const bodyRefusals = new WeakMap<object, { request: http.IncomingMessage; refuse: () => void }>();
+  // Budget: one active response and zero queued forward handlers per connection.
+  // A WeakSet implements the cap of one; finish/close evicts it, with constant work per parsed request.
+  const activeForward = new WeakSet<net.Socket>();
+  const admitForward = (request: http.IncomingMessage, response: http.ServerResponse): void => {
+    if (request.socket.destroyed) return;
+    if (activeForward.has(request.socket)) {
+      // Destroy rather than queue a refusal behind a streaming response: queued refusals are also retained state.
+      onEvent?.({ kind: "surrogate_denied", authority: parseSurrogateForwardTarget(request.url ?? "")?.authority ?? "",
+        code: "limit", reason: "limit", status: 403, requestBytes: 0, responseBytes: 0 });
+      request.socket.destroy();
+      return;
+    }
+    activeForward.add(request.socket);
+    const release = (): void => { activeForward.delete(request.socket); };
+    response.once("finish", release);
+    response.once("close", release);
+    void state_FORWARD(request, response);
+  };
   const server = http.createServer((request, response) => {
-    if (forward) {
-      void state_FORWARD(request, response);
+    if (forward || forwardUnavailable) {
+      admitForward(request, response);
       return;
     }
     // The gate speaks CONNECT only; plain requests get a terse 405 that
@@ -515,7 +536,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     response.end("Sanctuary egress gate: use HTTP CONNECT via your configured proxy.");
   });
 
-  if (forward) {
+  if (forward || forwardUnavailable) {
     server.on("connection", socket => {
       const provenance = { forward: false };
       parserProvenance.set(socket, provenance);
@@ -592,7 +613,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       response.assignSocket(socket as net.Socket);
       // Upgrade bypasses Node's normal response-finish owner; drain the refusal and release its socket explicitly.
       response.once("finish", () => { response.detachSocket(socket as net.Socket); socket.end(); });
-      void state_FORWARD(request, response);
+      admitForward(request, response);
     });
   }
 
@@ -603,11 +624,14 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     let responseBytes = 0;
     let upstream: http.ClientRequest | undefined;
     let deadline: ReturnType<typeof setTimeout> | undefined;
+    // The placeholder admission cap bounds retained join keys; the request closure owns their lifetime.
+    const queryIds = new Set<SurrogateCorrelationId>();
+    let committed = false;
     const emit = (kind: SurrogateGateEvent["kind"], code: SurrogateGateEvent["code"], status: number, correlationId?: SurrogateCorrelationId): void => {
       // DEBT(SURROGATE-GATE-EVENTS-CHAIN): per-request events reach the root-readable gate log only, not the fortress chain; assurance stays partial.
       // Binding attribution joins correlationId with the helper event; the gate never asserts which binding answered.
       // correlationId must match the helper event's correlationId in surrogate-helper-daemon.ts.
-      // Before admission an absent correlationId means "no query was issued"; client failures omit it per A1.
+      // An absent correlationId means "no query was issued"; every sent query is retained through terminal events (A3).
       onEvent?.({ kind, authority, requestBytes, responseBytes, status, code,
         ...(correlationId ? { correlationId } : {}), ...(code !== "swap" ? { reason: code } : {}) });
     };
@@ -617,7 +641,11 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       clearTimeout(deadline);
       upstream?.destroy();
       const [status, code] = SURROGATE_STATUS[reason];
-      emit(unavailable ? "surrogate_helper_unavailable" : "surrogate_denied", reason, status, correlationId);
+      if (correlationId) queryIds.add(correlationId);
+      const kind = unavailable ? "surrogate_helper_unavailable" : "surrogate_denied";
+      if (queryIds.size) for (const id of queryIds) emit(kind, reason, status, id);
+      else emit(kind, reason, status);
+      if (response.destroyed || request.socket.destroyed) return;
       if (response.headersSent) { response.destroy(); return; }
       response.writeHead(status, { "Connection": "close", "X-Sanctuary-Gate": code });
       response.end();
@@ -626,7 +654,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     bodyRefusals.set(request.socket, bodyOwner);
     request.once("end", () => { if (bodyRefusals.get(request.socket) === bodyOwner) bodyRefusals.delete(request.socket); });
     request.on("error", bodyOwner.refuse);
-    const onSocketError = (): void => { upstream?.destroy(); };
+    const onSocketError = (): void => { refuse("socket_error"); };
     request.socket.on("error", onSocketError);
     const state_DONE = (): void => {
       state = "DONE";
@@ -637,7 +665,11 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       upstream?.destroy();
     };
     response.once("finish", state_DONE);
-    response.once("close", state_DONE);
+    response.once("close", () => {
+      // A client close before response finish is a terminal failure even after a value was committed.
+      if (!response.writableFinished) refuse("socket_error");
+      state_DONE();
+    });
     const stopped = (): boolean => state === "DONE" || response.destroyed || request.socket.destroyed;
     try {
       // state_AUTH: every request gets fresh liveness and peer/credential decisions.
@@ -647,6 +679,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       if (stopped()) return;
       if (!(await clientAuthorize!({ credentialHeader: request.headers["proxy-authorization"], peer })).allow) return refuse("client_denied");
       if (stopped()) return;
+      if (forwardUnavailable) return refuse(forwardUnavailable);
       state = "PARSE";
       const target = parseSurrogateForwardTarget(request.url ?? "");
       if (!target) return refuse("invalid_target");
@@ -662,9 +695,13 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       for (const occurrence of occurrences) {
         // The shared wire grammar cannot name an overlong header; this is a request refusal, not helper downtime.
         if (!isSurrogateQueryLocation(occurrence.location)) return refuse("wrong_location");
-        const result = await helperQuery!({ placeholder: occurrence.placeholder, host: target.host, port: SURROGATE_BOUND_PORT, location: occurrence.location });
+        const result = await helperQuery!({ placeholder: occurrence.placeholder, host: target.host, port: SURROGATE_BOUND_PORT, location: occurrence.location }, id => {
+          // Must match surrogate-helper-client.ts onSent: capture the sent id before any terminal callback.
+          queryIds.add(id);
+        });
+        if (result.correlationId) queryIds.add(result.correlationId);
         if (stopped()) return;
-        if (result.kind === "failure") return refuse(result.code, undefined, true);
+        if (result.kind === "failure") return refuse(result.code, result.correlationId, true);
         if (result.response.kind === "deny") return refuse(result.response.reason, result.correlationId);
         if (!occurrence.header) return refuse("wrong_location", result.correlationId);
         swaps.push({ header: occurrence.header, start: occurrence.start, length: occurrence.placeholder.length, value: result.response.value, correlationId: result.correlationId });
@@ -701,17 +738,25 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
           headers: buildSurrogateUpstreamHeaders(headers, target.host, length, swaps.length > 0),
         }, (incoming) => {
           if (state === "DONE") { incoming.destroy(); return; }
-          // Slice 1b-i streams swapped responses unscanned; the echo guard belongs to 1b-ii.
-          response.writeHead(incoming.statusCode ?? 502, incoming.headers);
-          incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
-          incoming.on("error", () => refuse("upstream_reset"));
-          incoming.on("end", () => {
-            for (const swap of swaps) emit("surrogate_swap", "swap", incoming.statusCode ?? 502, swap.correlationId);
-            state = "DONE";
-          });
-          incoming.pipe(response);
+          try {
+            // Slice 1b-i streams swapped responses unscanned; the echo guard belongs to 1b-ii.
+            incoming.on("error", () => refuse("upstream_reset"));
+            response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+            incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
+            incoming.pipe(response);
+          } catch {
+            // Response callbacks run outside the dial's try; upstream-controlled metadata must not kill the gate.
+            incoming.destroy();
+            refuse("upstream_reset");
+          }
         });
       } catch { return refuse("header_write_failed"); }
+      const recordCommit = (): void => {
+        if (committed) return;
+        committed = true;
+        // The first successful write/end commits headers to TLS; status 0 means no upstream response exists yet.
+        for (const swap of swaps) emit("surrogate_swap", "swap", 0, swap.correlationId);
+      };
       deadline = setTimeout(() => refuse("upstream_tls_failed"), SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS);
       upstream.on("error", () => refuse(state === "HANDSHAKE" ? "upstream_tls_failed" : "upstream_reset"));
       upstream.on("socket", (socket: TLSSocket) => {
@@ -722,16 +767,17 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
           if (!socket.authorized) return refuse("upstream_tls_failed");
           state = "STREAM";
           request.on("data", (chunk: Buffer) => {
+            if (state !== "STREAM") return;
             requestBytes += chunk.length;
             if (requestBytes > length) return refuse("body_length_mismatch");
-            try { if (!upstream!.write(chunk)) request.pause(); }
+            try { const writable = upstream!.write(chunk); recordCommit(); if (!writable) request.pause(); }
             catch { refuse("header_write_failed"); }
           });
           upstream!.on("drain", () => request.resume());
           request.on("end", () => {
             if (state === "DONE") return;
             if (requestBytes !== length) return refuse("body_length_mismatch");
-            try { upstream!.end(); } catch { refuse("header_write_failed"); }
+            try { upstream!.end(); recordCommit(); } catch { refuse("header_write_failed"); }
           });
           request.on("aborted", () => refuse("body_length_mismatch"));
           request.resume();
