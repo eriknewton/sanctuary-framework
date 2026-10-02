@@ -337,16 +337,14 @@ def systemd_files(installed):
                 relevant = name in (UNIT_NAME, UNIT_NAME + ".d", MOUNT_NAME, MOUNT_NAME + ".d")
                 # Generic drop-ins also affect effective units without sharing
                 # their full names, so the install lifecycle admits none.
-                if name in ("service.d", "mount.d", "sanctuary-.service.d"):
+                if name in ("service.d", "mount.d", "sanctuary-.service.d", "sanctuary-castle-.service.d", "var-.mount.d", "var-lib-.mount.d"):
                     refuse(f"inherited unit drop-in: {path}")
                 # Agent rules: the package's template is the ONLY entry named
                 # `sanctuary-agent@...` allowed anywhere. A template or instance
                 # drop-in directory, an alternate fragment or an instance
                 # enablement symlink would change what the agent unit runs, or
-                # start it at boot. BOUND: the prefix drop-in
-                # `sanctuary-.service.d/` and the top-level `service.d/` also
-                # apply to agent instances and are NOT refused here; host
-                # acceptance checks the unit's DropInPaths instead (README).
+                # start it at boot. Inherited prefix/type drop-ins are refused
+                # above as well, including changes not yet in the manager cache.
                 if name.startswith(AGENT_UNIT_PREFIX) and path != AGENT_UNIT_PATH:
                     if name.endswith(".service.d"):
                         refuse(f"agent unit drop-in directory present: {path}")
@@ -360,7 +358,7 @@ def systemd_files(installed):
                         target = os.readlink(path)
                     except OSError:
                         refuse("unreadable systemd symlink")
-                    if relevant or UNIT_NAME in target or MOUNT_NAME in target or os.path.realpath(path) in (UNIT_PATH, MOUNT_PATH):
+                    if relevant or UNIT_NAME in target or MOUNT_NAME in target or os.path.realpath(path) in (UNIT_PATH, MOUNT_PATH, AGENT_UNIT_PATH):
                         refuse(f"systemd alias or enablement symlink: {path}")
                     if AGENT_UNIT_PREFIX in target:
                         refuse(f"agent unit alias or enablement symlink: {path}")
@@ -424,8 +422,8 @@ def agent_instances_inactive():
         fields = line.split()
         if len(fields) < 4 or not re.fullmatch(r"sanctuary-agent@[^ ]+\.service", fields[0]):
             refuse("unparseable agent instance listing")
-        if fields[2] in AGENT_BUSY_STATES:
-            refuse(f"agent instance not inactive: {fields[0]} {fields[2]}")
+        if fields[2:4] != ["inactive", "dead"]:
+            refuse(f"agent instance not positively inactive: {fields[0]} {fields[2]}")
 
 
 def empty_runtime_root(path):
@@ -455,7 +453,36 @@ def mount_absent():
             refuse("agent workspace mounted")
 
 
+def accounts_absent():
+    # The provisioner creates this fixed group first. A stopped installation
+    # retaining it is provisioned state even if its configuration was moved.
+    try:
+        status, raw, error = bounded_capture(["/usr/bin/getent", "group", "sanctuary"],
+            timeout=15, limit=64 * 1024, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        refuse(f"account observation unavailable: {exc}")
+    # getent's key-not-found status is 2; success means an existing group, and
+    # every other status/output combination is indeterminate rather than absent.
+    if status != 2 or raw or error:
+        refuse("product group exists or NSS absence is unavailable")
+
+
+def legacy_agent_state_absent():
+    for parent in ("/var/lib", "/run"):
+        try:
+            with os.scandir(parent) as entries:
+                for count, entry in enumerate(entries):
+                    if count >= 10_000:  # Fixed upper bound on each host-root inventory.
+                        refuse("legacy state inventory exceeds bound")
+                    if entry.name.startswith("sanctuary-agent-") and entry.path != WORKSPACE_PATH:
+                        refuse("legacy agent state footprint present")
+        except OSError as exc:
+            refuse(f"legacy state inventory unavailable: {exc}")
+
+
 def runtime_absent():
+    accounts_absent()
+    legacy_agent_state_absent()
     for root in (CONFIG_ROOT, STATE_ROOT, RUN_ROOT, WORKSPACE_PATH):
         empty_runtime_root(root)
     # The packaged empty root-owned mountpoint is inert; retained contents or
@@ -547,6 +574,14 @@ def inspect(installed, phase, expected_old=None):
         refuse("dpkg package status changed during observation")
     if package_owners() != owners:
         refuse("dpkg ownership changed during observation")
+    # Recheck the leaves after manager/runtime probes; a stable package database
+    # does not prove that the payload itself stayed unchanged during observation.
+    for path in PAYLOAD:
+        checked_file(path, installed)
+        if not installed and lstat(path) is not None:
+            refuse("fresh payload appeared during observation")
+    if installed and installed_identity(fields, "prerm") != identity:
+        refuse("installed identity changed during observation")
     return identity
 
 

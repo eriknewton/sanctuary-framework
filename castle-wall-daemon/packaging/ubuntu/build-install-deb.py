@@ -65,7 +65,7 @@ def build(revision, output):
                  '--target-dir', str(target), '--message-format=json']
         for binary in LAYOUT['BINARIES']:
             cargo += ['--bin', binary]
-        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUSTFLAGS', 'RUSTC_', 'RUSTDOCFLAGS'))}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUSTFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTUP_TOOLCHAIN'))}
         env['CARGO_TERM_COLOR'] = 'never'
         with (scratch / 'cargo.jsonl').open('w') as log:
             subprocess.run(cargo, cwd=CRATE, env=env, stdout=log, check=True, timeout=45 * 60)

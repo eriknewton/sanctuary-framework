@@ -32,12 +32,12 @@ PAYLOAD_DIRS = {str(parent) for p in PAYLOAD_FILES for parent in Path(p).parents
 WORKSPACE_DIRECTORY = 'var/lib/sanctuary-agent-workspace'
 PAYLOAD_DIRS |= {'var', 'var/lib', WORKSPACE_DIRECTORY}
 CONTROL_FILES = {'control': 0o644, 'preinst': 0o755, 'prerm': 0o755}
-PRE_DEPENDS = 'systemd, nftables, python3'
+PRE_DEPENDS = 'systemd, nftables, python3, libc-bin'
 # Runtime command closure for provisioning, accounts, manager and mount control.
 # Must match runtime_dependencies in build-install-deb.py and the install check.
 RUNTIME_TOOLS = ('/usr/sbin/useradd', '/usr/sbin/groupadd', '/usr/bin/getent',
                  '/usr/bin/mount', '/usr/bin/umount', '/usr/sbin/ip', '/usr/bin/timeout')
-RUNTIME_PACKAGES = {'passwd', 'libc-bin', 'mount', 'iproute2', 'coreutils'}
+RUNTIME_PACKAGES = {'passwd', 'mount', 'iproute2', 'coreutils'}
 
 
 def check_contract(crate):

@@ -8,6 +8,8 @@ import runpy
 import stat
 import sys
 import tempfile
+import time
+import json
 import tarfile
 import unittest
 from types import SimpleNamespace
@@ -70,7 +72,7 @@ class InstallTests(unittest.TestCase):
 
     def test_install_identity_is_exact_and_hook_bound(self):
         fn = GUARD['build_identity']
-        raw = b'install_ready=true\n'
+        raw = json.dumps({'package': 'sanctuary-castle-wall', 'artifact_kind': 'ubuntu-install-deb-v1', 'install_ready': True, 'package_version': '0.1.0-1', 'payload_sha256': HEADER['PAYLOAD_HASHES']}).encode()
         with patch.dict(fn.__globals__, {'checked_file': lambda *_: None, 'stable_read': lambda *_: raw}):
             with self.assertRaises(GUARD['Refusal']):
                 fn()
@@ -84,7 +86,7 @@ class InstallTests(unittest.TestCase):
                 if path == retained:
                     raise GUARD['Refusal']('retained fixture')
             with self.subTest(retained=retained), patch.dict(fn.__globals__, {
-                'empty_runtime_root': empty, 'lstat': lambda _: None, 'mount_absent': lambda: None}):
+                'empty_runtime_root': empty, 'lstat': lambda _: None, 'mount_absent': lambda: None, 'accounts_absent': lambda: None, 'legacy_agent_state_absent': lambda: None}):
                 with self.assertRaises(GUARD['Refusal']):
                     fn()
 
@@ -114,8 +116,10 @@ class InstallTests(unittest.TestCase):
         for script in ('print("x" * 4097)', 'import sys; sys.stderr.write("x" * 4097)'):
             with self.assertRaisesRegex(ValueError, 'output cap'):
                 capture([sys.executable, '-c', script], timeout=2, limit=4096)
+        start = time.monotonic()
         with self.assertRaisesRegex(ValueError, 'deadline'):
             capture([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=0.1, limit=4096)
+        self.assertLess(time.monotonic() - start, 1)
 
     def test_stable_read_refuses_links_and_oversize(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -168,6 +172,53 @@ class InstallTests(unittest.TestCase):
                 with patch.dict(os.environ, {'INSTALL_SOURCE_SHA': 'c' * 40}):
                     with self.assertRaisesRegex(ValueError, 'exact source head'):
                         module['record'](output, True)
+
+
+    def test_existing_or_indeterminate_product_account_refuses(self):
+        fn = GUARD['accounts_absent']
+        for result in ((0, b'sanctuary:x:123:', b''), (1, b'', b''), (2, b'partial', b''), (2, b'', b'NSS failed')):
+            with patch.dict(fn.__globals__, {'bounded_capture': lambda *a, **k: result}):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn()
+        with patch.dict(fn.__globals__, {'bounded_capture': lambda *a, **k: (2, b'', b'')}):
+            fn()
+
+    def test_agent_unknown_or_failed_state_is_not_inactive(self):
+        fn = GUARD['agent_instances_inactive']
+        for state in ('active running', 'failed failed', 'mystery dead', 'inactive exited'):
+            with patch.dict(fn.__globals__, {'command_allow_empty': lambda _: 'sanctuary-agent@60123.service loaded ' + state + ' description'}):
+                with self.assertRaises(GUARD['Refusal']):
+                    fn()
+        with patch.dict(fn.__globals__, {'command_allow_empty': lambda _: 'sanctuary-agent@60123.service loaded inactive dead description'}):
+            fn()
+
+
+    def test_merged_usr_dependency_requires_same_unique_owner(self):
+        deps = runpy.run_path(str(HERE / 'install-dependencies.py'))
+        fn = deps['owner']
+        canonical, alias = '/usr/bin/ip', '/bin/ip'
+        def query(argv, **kw):
+            if argv[-1] == canonical:
+                return SimpleNamespace(returncode=1, stdout='', stderr='dpkg-query: no path found matching pattern /usr/bin/ip\n')
+            return SimpleNamespace(returncode=0, stdout='iproute2: /bin/ip\n', stderr='')
+        with patch.dict(fn.__globals__, {'Path': lambda _: SimpleNamespace(resolve=lambda **kw: canonical)}), patch.object(deps['subprocess'], 'run', side_effect=query):
+            self.assertEqual(fn('/usr/sbin/ip'), 'iproute2')
+        with patch.dict(fn.__globals__, {'Path': lambda _: SimpleNamespace(resolve=lambda **kw: canonical)}), patch.object(deps['subprocess'], 'run', return_value=SimpleNamespace(returncode=0, stdout='diversion by other\n', stderr='')):
+            with self.assertRaises(ValueError):
+                fn('/usr/sbin/ip')
+
+    def test_indirect_agent_alias_is_refused_by_resolved_destination(self):
+        fn = GUARD['systemd_files']
+        root = '/etc/systemd/system'
+        safe_dir = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+        link = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_gid=0)
+        with patch.dict(fn.__globals__, {
+            'SYSTEMD_ROOTS': (root,), 'command': lambda _: root,
+            'check_ancestors': lambda _: True,
+            'lstat': lambda p: link if str(p).endswith('/unrelated.service') else safe_dir,
+        }), patch.object(os, 'walk', return_value=[(root, [], ['unrelated.service'])]), patch.object(os, 'readlink', return_value='/outside/alias'), patch.object(os.path, 'realpath', return_value=GUARD['AGENT_UNIT_PATH']):
+            with self.assertRaises(GUARD['Refusal']):
+                fn(True)
 
 
 

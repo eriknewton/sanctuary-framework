@@ -12,14 +12,29 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
 
 def owner(path):
     canonical = str(Path(path).resolve(strict=True))
-    result = subprocess.run(['dpkg-query', '-S', '--', canonical], capture_output=True, text=True,
-                            timeout=15, env=ENV, check=True)
-    pattern = re.compile(r'([a-z0-9][a-z0-9+.-]*(?::amd64)?): ' + re.escape(canonical))
-    lines = result.stdout.splitlines()
-    # An ambiguous owner or diversion cannot silently reduce the dependency closure.
-    if result.stderr or len(lines) != 1 or not pattern.fullmatch(lines[0]):
+    candidates = [canonical]
+    # Ubuntu's merged /usr may retain dpkg ownership under /bin or /lib.
+    # Only a lexical alias resolving to the very same inode path is eligible.
+    if canonical.startswith(("/usr/bin/", "/usr/sbin/", "/usr/lib/")):
+        alias = canonical.removeprefix("/usr")
+        if str(Path(alias).resolve(strict=True)) == canonical:
+            candidates.append(alias)
+    owners = set()
+    for candidate in candidates:
+        result = subprocess.run(['dpkg-query', '-S', '--', candidate], capture_output=True, text=True,
+                                timeout=15, env=ENV, check=False)
+        absent = 'dpkg-query: no path found matching pattern ' + candidate + '\n'
+        if result.returncode == 1 and not result.stdout and result.stderr == absent:
+            continue
+        pattern = re.compile(r'([a-z0-9][a-z0-9+.-]*(?::amd64)?): ' + re.escape(candidate))
+        lines = result.stdout.splitlines()
+        # A diversion, error or ambiguous owner cannot understate the closure.
+        if result.returncode or result.stderr or len(lines) != 1 or not pattern.fullmatch(lines[0]):
+            raise ValueError('runtime path has ambiguous package ownership: ' + candidate)
+        owners.add(pattern.fullmatch(lines[0])[1])
+    if len(owners) != 1:
         raise ValueError('runtime path has no unique package owner: ' + canonical)
-    return pattern.fullmatch(lines[0])[1]
+    return owners.pop()
 
 
 def runtime_dependencies(binaries):
@@ -46,4 +61,4 @@ def runtime_dependencies(binaries):
         raise ValueError('development package in runtime closure')
     if not LAYOUT['RUNTIME_PACKAGES'] <= {p.removesuffix(':amd64') for p in owners}:
         raise ValueError('fixed command owners differ from Ubuntu runtime closure')
-    return ', '.join(sorted(owners - {'systemd', 'systemd:amd64', 'nftables', 'nftables:amd64', 'python3'}))
+    return ', '.join(sorted(owners - {'systemd', 'systemd:amd64', 'nftables', 'nftables:amd64', 'python3', 'libc-bin', 'libc-bin:amd64'}))
