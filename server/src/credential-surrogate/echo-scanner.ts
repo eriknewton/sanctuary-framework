@@ -8,10 +8,18 @@ export type SurrogateEchoCause = "ceiling" | "encoding" | "scan_error" | "upstre
 export type SurrogateEchoCode = "echo_blocked" | "echo_unscanned";
 export const SURROGATE_ECHO_BLOCKED = [502, "surrogate-echo-blocked"] as const;
 
+type FrameState = "PROBE" | "SIZE" | "EXTENSION" | "SIZE_LF" | "DATA" |
+  "DATA_CR" | "DATA_LF" | "FINAL_CR" | "FINAL_LF" | "DONE" | "PASSTHROUGH";
+const CR = 0x0d;
+const LF = 0x0a;
+const SEMICOLON = 0x3b;
+const HEX_RADIX = 16;
+const HEX_DIGITS = "0123456789abcdef";
+
 type ScanState = "SCANNING" | "PAST_CEILING" | "ABORTED" | "FINISHED";
 /** A blocked chunk releases nothing; ceiling requires terminal refusal with no output. */
 export type SurrogateEchoScanResult =
-  | { blocked: true }
+  | { blocked: true; cause?: "encoding" }
   | { blocked: false; output: Buffer; ceiling: boolean };
 
 /** One instance per swapped identity response; discard it when that response ends. */
@@ -25,8 +33,15 @@ export class SurrogateEchoScanner {
   private start = 0;
   private scanned = 0;
   private comparisons = 0;
+  private readonly strippedMatched: number[];
+  private frameState: FrameState = "PROBE";
+  private frameSize = 0;
+  private frameDigits = false;
+  private frameCommitted = false;
+  private strippedPrefixStart: number | undefined;
+  private framingFailure = false;
 
-  constructor(values: readonly string[]) {
+  constructor(values: readonly string[], private readonly screenChunkFrames: boolean) {
     // The helper owns value validation; this local cap also makes standalone use bounded.
     if (!values.length || values.length > MAX_PLACEHOLDERS_PER_REQUEST ||
         values.some(value => !value.length || Buffer.byteLength(value) > MAX_SURROGATE_VALUE_BYTES)) {
@@ -34,6 +49,7 @@ export class SurrogateEchoScanner {
     }
     this.values = values.map(value => Buffer.from(value));
     this.matched = values.map(() => 0);
+    this.strippedMatched = values.map(() => 0);
     this.prefixes = this.values.map(value => {
       const prefix = new Uint32Array(value.length);
       for (let i = 1, j = 0; i < value.length; i++) {
@@ -72,18 +88,15 @@ export class SurrogateEchoScanner {
     // Prefix matching processes each new byte once per value, even for one-byte chunks.
     for (let i = 0; i < count; i++) {
       this.scanned++;
-      for (let v = 0; v < this.values.length; v++) {
-        const value = this.values[v]!;
-        const prefix = this.prefixes[v]!;
-        let j = this.matched[v]!;
-        while (true) {
-          this.comparisons++;
-          if (chunk[i] === value[j]) { j++; break; }
-          if (j === 0) break;
-          j = prefix[j - 1]!;
+      if (this.matchByte(chunk[i]!, this.matched)) { this.abort(); return { blocked: true }; }
+      if (this.screenChunkFrames) {
+        const view = this.stripByte(chunk[i]!);
+        if (view === "FAIL") return this.failEncoding();
+        if (view === "DATA") {
+          if (this.matchByte(chunk[i]!, this.strippedMatched)) { this.abort(); return { blocked: true }; }
+          if (this.strippedMatched.some(length => length > 0)) this.strippedPrefixStart ??= this.scanned - 1;
+          else this.strippedPrefixStart = undefined;
         }
-        this.matched[v] = j;
-        if (j === value.length) { this.abort(); return { blocked: true }; }
       }
     }
     if (this.scanned === MAX_SURROGATE_ECHO_SCAN_BYTES) {
@@ -93,8 +106,94 @@ export class SurrogateEchoScanner {
       this.state = "PAST_CEILING";
       return { blocked: false, output: Buffer.alloc(0), ceiling: true };
     }
+    // Framing can separate a candidate's bytes by more than the raw carry holds.
+    // Refuse before releasing any candidate prefix rather than allocating another buffer.
+    if (this.strippedPrefixStart !== undefined && this.scanned - this.strippedPrefixStart > this.carry.length) {
+      return this.failEncoding();
+    }
     return { blocked: false, output: this.release(chunk, false), ceiling: false };
   }
+
+  private matchByte(byte: number, matched: number[]): boolean {
+    for (let v = 0; v < this.values.length; v++) {
+      const value = this.values[v]!;
+      const prefix = this.prefixes[v]!;
+      let j = matched[v]!;
+      while (true) {
+        this.comparisons++;
+        if (byte === value[j]) { j++; break; }
+        if (j === 0) break;
+        j = prefix[j - 1]!;
+      }
+      matched[v] = j;
+      if (j === value.length) return true;
+    }
+    return false;
+  }
+
+  /** Screening-only view: delivered bytes are never decoded or rewritten for output. */
+  private stripByte(byte: number): "DATA" | "SKIP" | "FAIL" {
+    switch (this.frameState) {
+      case "PASSTHROUGH": return "SKIP"; // The delivered view already covers this identical view.
+      case "PROBE":
+      case "SIZE": {
+        const digit = HEX_DIGITS.indexOf(String.fromCharCode(byte).toLowerCase());
+        if (digit >= 0) {
+          this.frameDigits = true;
+          // Saturation prevents attacker-selected size digits from overflowing numeric state.
+          this.frameSize = Math.min(MAX_SURROGATE_ECHO_SCAN_BYTES + 1, this.frameSize * HEX_RADIX + digit);
+          return "SKIP";
+        }
+        if (this.frameDigits && (byte === SEMICOLON || byte === CR)) {
+          this.frameCommitted = true;
+          this.frameState = byte === SEMICOLON ? "EXTENSION" : "SIZE_LF";
+          return "SKIP";
+        }
+        // Ordinary decoded bodies have no opening chunk-size line. Both views then
+        // coincide; never use normalized or raw header whitespace to choose a view.
+        if (!this.frameCommitted) { this.frameState = "PASSTHROUGH"; return "SKIP"; }
+        return "FAIL";
+      }
+      case "EXTENSION":
+        if (byte === LF) return "FAIL";
+        if (byte === CR) this.frameState = "SIZE_LF";
+        return "SKIP";
+      case "SIZE_LF":
+        if (byte !== LF || this.frameSize > MAX_SURROGATE_ECHO_SCAN_BYTES) return "FAIL";
+        this.frameState = this.frameSize === 0 ? "FINAL_CR" : "DATA";
+        return "SKIP";
+      case "DATA":
+        if (--this.frameSize === 0) this.frameState = "DATA_CR";
+        return "DATA";
+      case "DATA_CR":
+        if (byte !== CR) return "FAIL";
+        this.frameState = "DATA_LF";
+        return "SKIP";
+      case "DATA_LF":
+        if (byte !== LF) return "FAIL";
+        this.frameDigits = false;
+        this.frameState = "SIZE";
+        return "SKIP";
+      case "FINAL_CR":
+        if (byte !== CR) return "FAIL";
+        this.frameState = "FINAL_LF";
+        return "SKIP";
+      case "FINAL_LF":
+        if (byte !== LF) return "FAIL";
+        this.frameState = "DONE";
+        return "SKIP";
+      case "DONE": return "FAIL";
+    }
+  }
+
+  private failEncoding(): SurrogateEchoScanResult {
+    this.framingFailure = true;
+    this.abort();
+    return { blocked: true, cause: "encoding" };
+  }
+
+  /** Must match the end-of-stream encoding refusal in egress-gate/gate-server.ts. */
+  get encodingFailed(): boolean { return this.framingFailure; }
 
   private release(chunk: Buffer, flush: boolean): Buffer {
     const safeLength = flush ? this.held + chunk.length : Math.max(0, this.held + chunk.length - this.carry.length);
@@ -125,6 +224,12 @@ export class SurrogateEchoScanner {
   /** Flush only a normally completed stream; an aborted stream can never release its carry. */
   finish(): Buffer {
     if (this.state === "ABORTED" || this.state === "FINISHED") return Buffer.alloc(0);
+    // Once a size-line prefix commits the stripped parser, incomplete framing is
+    // an encoding failure; flushing its carry would expose an unscreened response.
+    if (this.screenChunkFrames && this.frameCommitted && this.frameState !== "DONE") {
+      this.failEncoding();
+      return Buffer.alloc(0);
+    }
     const tail = this.release(Buffer.alloc(0), true);
     this.abort();
     this.state = "FINISHED";
@@ -138,5 +243,7 @@ export class SurrogateEchoScanner {
     this.start = 0;
     this.carry.fill(0);
     this.matched.fill(0);
+    this.strippedMatched.fill(0);
+    this.strippedPrefixStart = undefined;
   }
 }

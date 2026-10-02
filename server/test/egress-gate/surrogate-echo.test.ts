@@ -264,6 +264,86 @@ describe("wired surrogate echo consumer", () => {
     fixture.assertSafeEvents();
     await fixture.assertCliEvents();
   });
+  it.each([
+    "identity", "identity, chunked", "chunked, identity", "chunked, chunked",
+    "identity, identity", "identity, chunked, identity", "identity, identity, chunked",
+  ])("refuses non-exact transfer coding %s before forwarding", async transfer => {
+    const fixture = await setup((_request, response) => {
+      response.setHeader("Transfer-Encoding", transfer);
+      response.setHeader("X-Upstream", "present");
+      response.end(randomBytes(secretValue().length));
+    });
+    const scan = vi.spyOn(SurrogateEchoScanner.prototype, "scan");
+    const result = await fixture.run();
+    expect(result.status).toBe(502);
+    expect(result.body.length).toBe(0);
+    expect(result.headers["x-upstream"]).toBeUndefined();
+    expect(scan).not.toHaveBeenCalled();
+    expect(fixture.echoes()).toHaveLength(1);
+    expect(fixture.echoes()[0]).toMatchObject({
+      kind: "surrogate_echo_unscanned", code: "echo_unscanned", cause: "encoding", responseBytes: 0,
+    });
+    fixture.assertSafeEvents();
+  });
+  it.each([undefined, "chunked", "ChUnKeD"])("scans accepted transfer coding %s", async transfer => {
+    // This acceptance fixture is ordinary content, not a candidate framing prefix.
+    const body = Buffer.concat([Buffer.from("!"), randomBytes(secretValue().length)]);
+    const fixture = await setup((request, _response) => {
+      // Explicit framing keeps the upstream serializer from choosing a different coding for whitespace variants.
+      const framing = transfer === undefined ? `Content-Length: ${body.length}` : `Transfer-Encoding: ${transfer}`;
+      const payload = transfer === undefined ? body : Buffer.concat([
+        Buffer.from(`${body.length.toString(16)}\r\n`), body, Buffer.from("\r\n0\r\n\r\n"),
+      ]);
+      request.socket.end(Buffer.concat([Buffer.from(`HTTP/1.1 200 OK\r\n${framing}\r\nConnection: close\r\n\r\n`), payload]));
+    });
+    const scan = vi.spyOn(SurrogateEchoScanner.prototype, "scan");
+    const result = await fixture.run();
+    expect(result.status).toBe(200);
+    expect(result.complete).toBe(true);
+    expect(result.body.equals(body)).toBe(true);
+    expect(scan).toHaveBeenCalled();
+    expect(fixture.echoes()).toHaveLength(0);
+    fixture.assertSafeEvents();
+  });
+  it.each(["chunked\t", " \tchunked\t "])("blocks a framing-split echo with transfer whitespace %s", async transfer => {
+    const fixture = await setup((request, _response) => {
+      const secret = fixture.values[0]!;
+      const split = Math.floor(secret.length / 2);
+      const payload = [secret.slice(0, split), secret.slice(split)]
+        .map(part => `${Buffer.byteLength(part).toString(16)};test=yes\r\n${part}\r\n`).join("");
+      request.socket.end(`HTTP/1.1 200 OK\r\nTransfer-Encoding: ${transfer}\r\nConnection: close\r\n\r\n${payload}0\r\n\r\n`);
+    });
+    const result = await fixture.run();
+    expect(result.complete).toBe(false);
+    expect(result.body.length).toBe(0);
+    expect(fixture.echoes()).toHaveLength(1);
+    expect(fixture.echoes()[0]?.kind).toBe("surrogate_echo_blocked");
+    fixture.assertSafeEvents();
+  });
+  it("passes normal chunked streaming through both screening views", async () => {
+    const body = Buffer.from("ordinary response body with several writes");
+    const fixture = await setup((_request, response) => {
+      response.setHeader("Transfer-Encoding", "chunked");
+      response.write(body.subarray(0, Math.floor(body.length / 2)));
+      setImmediate(() => response.end(body.subarray(Math.floor(body.length / 2))));
+    });
+    const result = await fixture.run();
+    expect(result.complete).toBe(true);
+    expect(result.body.equals(body)).toBe(true);
+    expect(fixture.echoes()).toHaveLength(0);
+  });
+  it.each(["invalid separator", "incomplete frame"])("refuses a stripped-view framing failure: %s", async fault => {
+    const fixture = await setup((request, _response) => {
+      const payload = fault === "invalid separator" ? "1\r\n!XX" : "2\r\n!";
+      request.socket.end(`HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\t\r\nConnection: close\r\n\r\n${payload}`);
+    });
+    const result = await fixture.run();
+    expect(result.complete).toBe(false);
+    expect(result.body.length).toBe(0);
+    expect(fixture.echoes()).toHaveLength(1);
+    expect(fixture.echoes()[0]).toMatchObject({ kind: "surrogate_echo_unscanned", cause: "encoding" });
+    fixture.assertSafeEvents();
+  });
   it("non-echo response is scanned and delivered byte for byte including final carry", async () => {
     const body = randomBytes(MAX_PLACEHOLDERS_PER_REQUEST * secretValue().length + 1); // Cross a multiple of the value length.
     const fixture = await setup((_request, response) => { response.end(body); });

@@ -804,7 +804,9 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
               incoming.pipe(response);
               return;
             }
-            scanner = new SurrogateEchoScanner(swaps.map(swap => swap.value));
+            // Header normalization does not prove whether Node removed chunk framing.
+            // Every transfer-coded response screens delivered and stripped bytes together.
+            scanner = new SurrogateEchoScanner(swaps.map(swap => swap.value), incoming.headers["transfer-encoding"] !== undefined);
             // Screen the raw fields and the exact normalized fields Node will forward.
             const forwardedHeaders = Object.entries(incoming.headers).flatMap(([name, value]) =>
               (Array.isArray(value) ? value : [value ?? ""]).flatMap(entry => [name, entry]));
@@ -816,9 +818,9 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
             const identity = encoding === undefined || (typeof encoding === "string" &&
               (encoding.trim() === "" || encoding.split(",").every(coding => coding.trim().toLowerCase() === "identity")));
             const transfer = incoming.headers["transfer-encoding"];
-            // Node removes chunk framing but does not decode other transfer transformations.
+            // Unsupported transfer transformations cannot be covered by the two plaintext views.
             const decodedTransfer = transfer === undefined || (typeof transfer === "string" &&
-              transfer.split(",").every(coding => ["identity", "chunked"].includes(coding.trim().toLowerCase())));
+              transfer.toLowerCase() === "chunked");
             if (!identity || !decodedTransfer) { terminateEcho("encoding", true); return; }
             response.writeHead(incoming.statusCode ?? 502, incoming.headers);
             // No response deadline or retry is added. Existing client cancellation now owns
@@ -838,14 +840,19 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
               try {
                 responseBytes += chunk.length;
                 const result = scanner!.scan(chunk);
-                if (result.blocked) { terminateEcho(); return; }
+                if (result.blocked) { terminateEcho(result.cause); return; }
                 if (result.ceiling) { terminateEcho("ceiling"); return; }
                 if (result.output.length && !response.write(result.output)) incoming.pause();
               } catch { terminateEcho("scan_error"); }
             });
             incoming.once("end", () => {
               if (stopped()) { scanner!.abort(); return; }
-              try { response.end(scanner!.finish()); }
+              try {
+                const tail = scanner!.finish();
+                // Must match encodingFailed in credential-surrogate/echo-scanner.ts.
+                if (scanner!.encodingFailed) { terminateEcho("encoding"); return; }
+                response.end(tail);
+              }
               catch { terminateEcho("scan_error"); }
             });
           } catch {
