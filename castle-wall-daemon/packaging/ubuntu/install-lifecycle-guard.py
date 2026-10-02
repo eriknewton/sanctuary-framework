@@ -169,11 +169,10 @@ def stable_read(path, limit=OBSERVATION_BYTES):
 
 
 def dpkg_status():
-    # dpkg holds its database lock while invoking us. Refuse pending numbered
-    # journal records rather than treating a stale status snapshot as absence.
-    updates = Path("/var/lib/dpkg/updates")
-    if updates.exists() and any(p.name.isdecimal() for p in updates.iterdir()):
-        refuse("pending dpkg status updates require recovery")
+    # dpkg holds its lock but journals this transaction before invoking us.
+    # The committed snapshot can still name a just-removed conflicting package;
+    # refuse that state and retry in a new dpkg invocation after it checkpoints.
+    # Rejecting every numbered journal record would reject ordinary cold install.
     checked_file(STATUS_PATH, True)
     first = stable_read(STATUS_PATH, STATUS_BYTES)
     if first != stable_read(STATUS_PATH, STATUS_BYTES):

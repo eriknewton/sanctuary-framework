@@ -194,6 +194,12 @@ read-only admission guards: they do not provision, start, stop, reload, disarm o
 clean host state. Source identity and runtime library closure bind the final
 payload; metadata is not an independent CI attestation.
 
+Use separate dpkg invocations to remove a conflicting internal package and to
+install this variant. The guard observes the committed status database; within
+a multi-package transaction, that snapshot can still name the removed package
+until dpkg checkpoints its journal. The symptom is a conservative conflict
+refusal; finish the original transaction and retry the cold install separately.
+
 A refused remove or purge can change dpkg selection while keeping the package installed. The CLI still permits `stop`, `disable`, and evidence capture. Before activation, recover selection with `printf 'sanctuary-castle-wall install\n' | sudo dpkg --set-selections`; otherwise start/enable refuse. Provisioned package removal remains unsupported. The CLI requires an authenticated audit login session (`/proc/self/loginuid` must not be `4294967295`); `SUDO_UID` cannot replace it.
 
 The workstation signer uses `/usr/bin/node` on Linux or `/opt/homebrew/bin/node` on Apple Silicon macOS. Install the trusted interpreter at that fixed path before passing a signing descriptor. It never resolves an interpreter or path helper through PATH.

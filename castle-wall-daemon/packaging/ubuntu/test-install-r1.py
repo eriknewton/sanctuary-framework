@@ -109,12 +109,6 @@ class Repairs(unittest.TestCase):
         with patch.dict(module['preflight'].__globals__, {'Path':FakePath,'run':lambda *a:SimpleNamespace(stdout='systemd 255 fixture')}), patch.dict(os.environ, {'GITHUB_ACTIONS':'true','RUNNER_ENVIRONMENT':'github-hosted','RUNNER_OS':'Linux'}), patch('os.geteuid',return_value=0), patch('os.path.lexists',return_value=False):
             with self.assertRaisesRegex(ValueError,'disposable'): module['preflight']()
 
-    def test_pending_dpkg_updates_refuse_stale_status(self):
-        fn = G['dpkg_status']
-        pending = SimpleNamespace(exists=lambda:True,iterdir=lambda:iter([SimpleNamespace(name='0000')]))
-        with patch.dict(fn.__globals__, {'Path':lambda _:pending,'checked_file':lambda *a:None,'stable_read':lambda *a:b''}):
-            with self.assertRaises(G['Refusal']):fn()
-
     def test_diversions_and_stat_overrides_are_not_fresh(self):
         base=BASE['InstallTests']();fn=G['inspect']
         for database in ['/var/lib/dpkg/diversions','/var/lib/dpkg/statoverride']:
