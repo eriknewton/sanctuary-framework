@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 
 CLI = '/usr/sbin/sanctuary-linux'
@@ -75,19 +76,18 @@ def provision(witness, argv):
     # the original operator's home would instead refuse at input custody.
     operator_argv = list(argv)
     stage_index = operator_argv.index('--stage-file') + 1
-    shared_input = Path('/etc/sanctuary/resume-endpoints-ci.json')
-    require(shared_input.parent.is_dir() and not shared_input.parent.is_symlink()
-            and shared_input.parent.stat().st_uid == 0
-            and shared_input.parent.stat().st_mode & 0o022 == 0,
-            'root-owned resume input parent required')
-    with shared_input.open('xb') as stream:
-        stream.write(Path(operator_argv[stage_index]).read_bytes())
-    shared_input.chmod(0o644)
-    operator_argv[stage_index] = str(shared_input)
-    try:
+    source_bytes = Path(operator_argv[stage_index]).read_bytes()
+    with tempfile.TemporaryDirectory(prefix='sanctuary-resume-ci-', dir='/run') as scratch:
+        shared_input = Path(scratch) / 'endpoints.json'
+        require(shared_input.parent.is_dir() and not shared_input.parent.is_symlink()
+                and shared_input.parent.stat().st_uid == 0
+                and shared_input.parent.stat().st_mode & 0o022 == 0,
+                'root-owned resume input parent required')
+        with shared_input.open('xb') as stream:
+            os.fchmod(stream.fileno(), 0o644)
+            stream.write(source_bytes)
+        operator_argv[stage_index] = str(shared_input)
         refused = witness.run(['/bin/sh', '-c', 'printf 60124 > /proc/self/loginuid; exec "$@"', 'resume-test', *operator_argv], expected=None)
-    finally:
-        shared_input.unlink()
     require(refused.returncode != 0 and 'current operator' in refused.stderr, 'current operator collision admitted')
     invalid = subprocess.run([os.fsencode(CLI), b'\xff'], capture_output=True, timeout=10)
     require(invalid.returncode == 1 and b'non-UTF-8 argument refused' in invalid.stderr, 'argv refusal not bounded')
