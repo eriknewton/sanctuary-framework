@@ -93,6 +93,19 @@ jobs:
           scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
             sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
+      - name: Install the system Hermes YAML parser fixture
+        uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: python3-yaml
+
+      - name: Pin the full-suite Python YAML fixture
+        # Bare python3 gates the real cases; the product also probes /usr/bin/python3.
+        # Provision both interpreters so the Linux passing baseline is reproducible.
+        timeout-minutes: 5
+        run: |
+          scripts/ci/retry-with-timeout.sh "pip install (Hermes parser fixture, hash-pinned)" -- \
+            python3 -m pip install --only-binary=:all: --require-hashes -r scripts/ci/hermes-parity-requirements.txt
+
       # ── Gate 0: build (populates dist/templates for tarball tests) ─
       - name: Gate 0 - build
         working-directory: server
