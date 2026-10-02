@@ -256,12 +256,18 @@ def main(args):
                 and event['details'].get('agent_id') == 'uid-60123' for event in events), 'missing endpoint WAL join')
         observation = WORKSPACE / 'observations.json'
         saved_observation = observation.read_bytes()
+        def replace_testimony(raw):
+            # Open the existing U-owned fixture without O_CREAT: Linux's
+            # protected_regular correctly rejects root's create-open in 1777.
+            fd = os.open(observation, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'wb') as target:
+                target.write(raw)
         try:
-            observation.write_bytes(b'not-json')
+            replace_testimony(b'not-json')
             malformed = json.loads(w.run([CLI, 'evidence', '--output', str(args.evidence / 'malformed-testimony')], expected=1).stdout)
             require(malformed['complete'] is False and 'stand-in observation' in malformed['missing'], 'malformed testimony did not produce incomplete evidence')
         finally:
-            observation.write_bytes(saved_observation)
+            replace_testimony(saved_observation)
         # A refused remove changes dpkg selection; safety retirement must remain available.
         refused = w.run(['dpkg', '--remove', 'sanctuary-castle-wall'], expected=None)
         require(refused.returncode != 0, 'provisioned removal admitted')

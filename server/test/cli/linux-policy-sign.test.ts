@@ -100,16 +100,22 @@ it("the packaged signer ignores PATH helpers while holding the key descriptor", 
     } finally { closeSync(fd); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-it("direct invocation refuses a zero soft but nonzero hard core limit", () => {
+it("direct invocation requires both inherited core limits to be zero", () => {
   const dir = mkdtempSync(join(tmpdir(), "signer-core-"));
   try {
     const key = join(dir, "seed"); writeFileSync(key, seed, { mode: 0o600 });
     const rules = join(dir, "rules"); writeFileSync(rules, "[]");
     const fd = openSync(key, "r");
     try {
+      // A host that already locked the hard limit at zero cannot raise it for a
+      // negative fixture. That host legitimately admits this zero/zero entry.
+      const hard = spawnSync("/bin/sh", ["-c", "ulimit -H -c"], { encoding: "utf8", timeout: 1000 });
+      expect(hard.status).toBe(0);
+      expect(hard.stdout.trim()).toMatch(/^(?:[0-9]+|unlimited)$/);
       const result = spawnSync("/bin/sh", ["-c", 'ulimit -S -c 0; exec "$@"', "core-test", process.execPath, resolve("dist/linux-policy-sign.js"), "--fortress-id", input.fortressId, "--agent-uid", "60123", "--system-uid-ceiling", "1000", "--generation", "10", "--rules", rules, "--key-fd", "3", "--output", join(dir, "out")], { stdio: ["ignore", "pipe", "pipe", fd], timeout: 10_000 });
-      expect(result.status).toBe(1);
-      expect(existsSync(join(dir, "out"))).toBe(false);
+      const dumpsPermanentlyDisabled = hard.stdout.trim() === "0";
+      expect(result.status).toBe(dumpsPermanentlyDisabled ? 0 : 1);
+      expect(existsSync(join(dir, "out"))).toBe(dumpsPermanentlyDisabled);
     } finally { closeSync(fd); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
