@@ -44,3 +44,60 @@ fn options_refuse_duplicates_unknown_and_missing_values() {
         assert!(parse_options(&convert(&bad), &names).is_err());
     }
 }
+
+#[test]
+fn manager_singleton_names_accept_exact_mount_escaping_and_refuse_aliases() {
+    use castle_wall_daemon::linux_install::{
+        command::verify_unit_observation, contract::WORKSPACE_MOUNT_UNIT,
+    };
+    use std::collections::BTreeMap;
+    for unit in [
+        "sanctuary-castle-wall.service",
+        "sanctuary-agent@60123.service",
+        WORKSPACE_MOUNT_UNIT,
+    ] {
+        let fragment = if unit.starts_with("sanctuary-agent@") {
+            "sanctuary-agent@.service"
+        } else {
+            unit
+        };
+        let path = format!("/etc/systemd/system/{fragment}");
+        let names = if unit == WORKSPACE_MOUNT_UNIT {
+            format!("\"{}\"", unit.replace('\\', "\\\\"))
+        } else {
+            unit.into()
+        };
+        let valid: BTreeMap<String, String> = [
+            ("Id", unit),
+            ("Names", names.as_str()),
+            ("FragmentPath", path.as_str()),
+            ("LoadState", "loaded"),
+            ("DropInPaths", ""),
+            ("NeedDaemonReload", "no"),
+            ("UnitFileState", "disabled"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        assert!(verify_unit_observation(&valid, unit, &path).is_ok());
+        for (field, value) in [
+            ("Id", "alias.service"),
+            ("Names", "alias.service"),
+            ("FragmentPath", "/run/systemd/system/foreign.service"),
+            ("LoadState", "not-found"),
+            ("DropInPaths", "/etc/systemd/system/override.conf"),
+            ("NeedDaemonReload", "yes"),
+            ("UnitFileState", "masked"),
+        ] {
+            let mut changed = valid.clone();
+            changed.insert(field.into(), value.into());
+            assert!(verify_unit_observation(&changed, unit, &path).is_err());
+            changed = valid.clone();
+            changed.remove(field);
+            assert!(verify_unit_observation(&changed, unit, &path).is_err());
+        }
+        let mut alias = valid.clone();
+        alias.insert("Names".into(), format!("{names} extra.service"));
+        assert!(verify_unit_observation(&alias, unit, &path).is_err());
+    }
+}

@@ -129,10 +129,7 @@ fn observation(t: &Transaction) -> Result<(Vec<u8>, Value)> {
     let current = std::fs::symlink_metadata(path)?;
     if bytes.len() != before.len() as usize
         || after.len() != before.len()
-        || after.mtime_nsec() != before.mtime_nsec()
-        || after.mtime() != before.mtime()
-        || current.ino() != before.ino()
-        || current.dev() != before.dev()
+        || !unchanged_observation(&before, &after, &current)
     {
         return Err("stand-in observation changed".into());
     }
@@ -141,6 +138,22 @@ fn observation(t: &Transaction) -> Result<(Vec<u8>, Value)> {
         json!({"inode":before.ino(),"device":before.dev(),"owner":before.uid(),"authority":"workload testimony only"}),
     ))
 }
+fn unchanged_observation(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+) -> bool {
+    // U can restore mtime after rewriting testimony; ctime must agree across the opened-file snapshot too.
+    before.mtime_nsec() == after.mtime_nsec()
+        && before.mtime() == after.mtime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.ctime() == after.ctime()
+        && current.ino() == before.ino()
+        && current.dev() == before.dev()
+        && current.ctime_nsec() == after.ctime_nsec()
+        && current.ctime() == after.ctime()
+}
+
 /// Export only enumerated public files and finite observations into a new empty directory.
 pub fn capture(root: &Root, t: &Transaction, output: &Path) -> Result<Value> {
     let absolute = if output.is_absolute() {
@@ -378,4 +391,23 @@ fn workload_identity(
         return Err("configured second exec missing".into());
     }
     Ok((pid, ticks, command.executable))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn workload_metadata_changes_invalidate_the_observed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observation");
+        std::fs::write(&path, b"{}").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        assert!(unchanged_observation(&before, &before, &before));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+        assert!(!unchanged_observation(&before, &after, &after));
+    }
 }

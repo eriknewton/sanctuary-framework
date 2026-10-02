@@ -191,6 +191,27 @@ pub fn verify(root: &Root, t: &Transaction) -> Result<()> {
     }
     Ok(())
 }
+/// The single fixed account-creation invocation shared with the disposable-host helper test.
+pub fn useradd_arguments(uid: u32) -> Vec<String> {
+    // System accounts avoid ordinary-user subordinate-ID allocation and personal-account bookkeeping.
+    vec![
+        "--system".into(),
+        "--uid".into(),
+        uid.to_string(),
+        "--gid".into(),
+        uid.to_string(),
+        "--no-create-home".into(),
+        "--no-user-group".into(),
+        "--no-log-init".into(),
+        "--home-dir".into(),
+        "/nonexistent".into(),
+        "--shell".into(),
+        "/usr/sbin/nologin".into(),
+        "--password".into(),
+        "!".into(),
+        agent_name(uid),
+    ]
+}
 /// Each account helper is preceded by a durable intent; only that exact intent may resume.
 pub fn provision(root: &Root, t: &mut Transaction) -> Result<()> {
     validate_ids(t, overflow_uid()?)?;
@@ -268,22 +289,10 @@ pub fn provision(root: &Root, t: &mut Transaction) -> Result<()> {
                     nss.absent("passwd", &name, t.agent_uid)?;
                     checked(
                         "/usr/sbin/useradd",
-                        &[
-                            "--uid",
-                            &t.agent_uid.to_string(),
-                            "--gid",
-                            &t.agent_uid.to_string(),
-                            "--no-create-home",
-                            "--no-user-group",
-                            "--no-log-init",
-                            "--home-dir",
-                            "/nonexistent",
-                            "--shell",
-                            "/usr/sbin/nologin",
-                            "--password",
-                            "!",
-                            &name,
-                        ],
+                        &useradd_arguments(t.agent_uid)
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
                     )?;
                 }
                 verify(root, t)?;

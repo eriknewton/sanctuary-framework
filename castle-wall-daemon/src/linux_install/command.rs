@@ -194,6 +194,36 @@ fn package(root: &Root) -> Result<()> {
     }
     Ok(())
 }
+/// Admit one complete effective-unit observation against its packaged identity.
+pub fn verify_unit_observation(
+    values: &BTreeMap<String, String>,
+    unit: &str,
+    expected: &str,
+) -> Result<()> {
+    // systemd 255 renders Names as a quoted C-escaped string list for the fixed mount name.
+    // Exact singleton comparison preserves alias refusal; Id and FragmentPath remain literal fields.
+    let names = if unit == WORKSPACE_MOUNT_UNIT {
+        format!("\"{}\"", unit.replace('\\', "\\\\"))
+    } else {
+        unit.to_owned()
+    };
+    if prop(values, "Id")? != unit
+        || prop(values, "Names")? != names
+        || prop(values, "FragmentPath")? != expected
+        || prop(values, "LoadState")? != "loaded"
+        || !prop(values, "DropInPaths")?.is_empty()
+        || prop(values, "NeedDaemonReload")? != "no"
+    {
+        return Err("effective unit identity or overrides refused".into());
+    }
+    if !matches!(
+        prop(values, "UnitFileState")?,
+        "enabled" | "disabled" | "static"
+    ) {
+        return Err("unexpected unit enablement state".into());
+    }
+    Ok(())
+}
 fn units(root: &Root, t: &Transaction) -> Result<()> {
     package(root)?;
     for (unit, fragment) in [
@@ -204,21 +234,7 @@ fn units(root: &Root, t: &Transaction) -> Result<()> {
         let expected = format!("/etc/systemd/system/{fragment}");
         root.read(relative(&expected), RECORD_MAX_BYTES)?;
         let values = properties(&unit)?;
-        if prop(&values, "Id")? != unit
-            || prop(&values, "Names")? != unit
-            || prop(&values, "FragmentPath")? != expected
-            || prop(&values, "LoadState")? != "loaded"
-            || !prop(&values, "DropInPaths")?.is_empty()
-            || prop(&values, "NeedDaemonReload")? != "no"
-        {
-            return Err("effective unit identity or overrides refused".into());
-        }
-        if !matches!(
-            prop(&values, "UnitFileState")?,
-            "enabled" | "disabled" | "static"
-        ) {
-            return Err("unexpected unit enablement state".into());
-        }
+        verify_unit_observation(&values, &unit, &expected)?;
     }
     unit_links(root, t, false)?;
     no_jobs()

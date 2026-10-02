@@ -142,23 +142,23 @@ struct HighWater {
     generation: u64,
     manifest_signature_b64url: String,
 }
-fn high_water(root: &Root, dir: &str, fortress: &str) -> Result<u64> {
+fn high_water(root: &Root, dir: &str, fortress: &str) -> Result<Option<HighWater>> {
     match root.optional(
         &format!("{dir}/.manifest-high-water.json"),
         RECORD_MAX_BYTES,
     )? {
-        None => Ok(0),
+        None => Ok(None),
         Some(bytes) => {
             let high: HighWater = serde_json::from_slice(&bytes)?;
             if high.fortress_id != fortress
                 || URL_SAFE_NO_PAD
-                    .decode(high.manifest_signature_b64url)?
+                    .decode(&high.manifest_signature_b64url)?
                     .len()
                     != ed25519_dalek::SIGNATURE_LENGTH
             {
                 return Err("invalid durable high-water".into());
             }
-            Ok(high.generation)
+            Ok(Some(high))
         }
     }
 }
@@ -181,7 +181,7 @@ pub fn install(root: &Root, t: &mut Transaction, bytes: &[u8], pin: &str) -> Res
         .to_str()
         .ok_or("policy path")?
         .trim_start_matches('/');
-    let high = high_water(root, dir, &t.fortress_id)?;
+    let high = high_water(root, dir, &t.fortress_id)?.map_or(0, |high| high.generation);
     let request = sha256(bytes);
     let next = admitted.loaded.signed.manifest.generation;
     let mut staged = t.policy_generation;
@@ -345,11 +345,17 @@ pub fn read_installed(root: &Root, t: &Transaction, marker: &ConfiguredV1) -> Re
         &marker.public_pin_sha256,
         &identity(t, account::overflow_uid()?),
     )?;
-    // The marker describes this exact signed generation; high-water may equal it only on daemon restart.
+    let committed = high_water(root, dir, &t.fortress_id)?;
+    // The relying side permits equal-generation restart only for the exact signature the daemon committed.
+    let incompatible_commit = committed.is_some_and(|high| {
+        high.generation > marker.policy_generation
+            || (high.generation == marker.policy_generation
+                && high.manifest_signature_b64url != marker.policy_signature_b64url)
+    });
     if sha256(&bytes) != marker.policy_sha256
         || signed.manifest.generation != marker.policy_generation
         || signed.signature.signature_b64url != marker.policy_signature_b64url
-        || high_water(root, dir, &t.fortress_id)? > marker.policy_generation
+        || incompatible_commit
     {
         return Err("installed policy differs from Configured or high-water".into());
     }

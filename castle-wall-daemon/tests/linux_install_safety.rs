@@ -294,3 +294,65 @@ fn explicit_operator_inputs_and_exports_do_not_relax_installed_custody() {
     assert!(root.input("operator/input", 2, operator).is_err());
     assert!(root.output("operator/refused", operator).is_err());
 }
+
+#[test]
+#[ignore = "requires an explicitly assigned disposable root VM"]
+fn real_account_helper_avoids_home_mail_and_subordinate_allocations() {
+    use castle_wall_daemon::linux_install::{
+        account::{agent_name, useradd_arguments},
+        transaction::checked,
+    };
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert_eq!(
+        fs::read_to_string("/root/.sanctuary-host-role")
+            .unwrap()
+            .lines()
+            .next(),
+        Some("disposable")
+    );
+    const UID: u32 = 20123; // Within Ubuntu's ordinary-user allocation range, so this witnesses the system-account distinction.
+    let name = agent_name(UID);
+    for database in ["passwd", "group"] {
+        for key in [&name, &UID.to_string()] {
+            let result = run_bounded(
+                "/usr/bin/getent",
+                &[database, key],
+                Duration::from_secs(5),
+                4096,
+            )
+            .unwrap();
+            assert_eq!(result.code, Some(2));
+            assert!(result.stdout.is_empty());
+        }
+    }
+    checked("/usr/sbin/groupadd", &["--gid", &UID.to_string(), &name]).unwrap();
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = checked("/usr/sbin/userdel", &[&self.0]);
+            let _ = checked("/usr/sbin/groupdel", &[&self.0]);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+    let args = useradd_arguments(UID);
+    checked(
+        "/usr/sbin/useradd",
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for path in ["/etc/subuid", "/etc/subgid"] {
+        assert!(
+            !fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}:"))),
+            "unexpected subordinate-id allocation"
+        );
+    }
+    assert!(!std::path::Path::new(&format!("/var/mail/{name}")).exists());
+    assert!(!std::path::Path::new(&format!("/home/{name}")).exists());
+    let passwd = checked("/usr/bin/getent", &["passwd", &name]).unwrap();
+    assert!(std::str::from_utf8(&passwd)
+        .unwrap()
+        .ends_with(":/nonexistent:/usr/sbin/nologin\n"));
+}

@@ -260,6 +260,11 @@ fn launch_revalidates_installed_rules_pin_marker_and_committed_floor() {
         root.write(&high,&serde_json::to_vec(&serde_json::json!({"fortress_id":t.fortress_id,"generation":generation,"manifest_signature_b64url":marker.policy_signature_b64url})).unwrap(),0o600).unwrap();
         assert_eq!(read_installed(&root, &t, &marker).is_ok(), allowed);
     }
+    root.write(&high,&serde_json::to_vec(&serde_json::json!({"fortress_id":t.fortress_id,"generation":10,"manifest_signature_b64url":URL_SAFE_NO_PAD.encode([0;64])})).unwrap(),0o600).unwrap();
+    assert!(
+        read_installed(&root, &t, &marker).is_err(),
+        "same-generation high-water must bind the exact committed signature"
+    );
     root.remove(&high).unwrap();
     root.write(
         &format!("{dir}/.active-policy-generation"),

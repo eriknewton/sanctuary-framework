@@ -19,13 +19,25 @@ describe("install policy signer", () => {
     expect(verifyManifestSignature(signed, publicKey).ok).toBe(true);
     expect(bundle.rules).toHaveLength(1);
   });
-  it.each([undefined, null, {}, { mode: "nat", system_uid_allow_ceiling: 1000 }, { mode: "uid", agent_uid: 0, system_uid_allow_ceiling: 1000 }])("refuses absent or unusable origin before signing: %j", async (agentOrigin) => {
+  it.each([undefined, null, {}, { mode: "nat", system_uid_allow_ceiling: 1000 }, { mode: "uid", agent_uid: 0, system_uid_allow_ceiling: 1000 }, { mode: "uid", agent_uid: 60123, gate_uid: 60125, system_uid_allow_ceiling: 1000 }])("refuses absent or unusable origin before signing: %j", async (agentOrigin) => {
     let calls = 0;
     await expect(buildInstallBundle({ ...input, agentOrigin, signer: { ...signer, sign: () => { calls++; return new Uint8Array(64); } } }, publicKey)).rejects.toThrow();
     expect(calls).toBe(0);
   });
-  it.each([0, -1, Number.MAX_SAFE_INTEGER + 1, 1.5])("refuses invalid generation %s", async (generation) => {
+  it.each([undefined, 0, -1, Number.MAX_SAFE_INTEGER + 1, 1.5])("refuses invalid generation %s", async (generation) => {
     await expect(buildInstallBundle({ ...input, generation }, publicKey)).rejects.toThrow();
+  });
+  it("refuses an invalid emitted signature", async () => {
+    await expect(buildInstallBundle({ ...input, signer: { ...signer, sign: () => new Uint8Array(64) } }, publicKey)).rejects.toThrow("emitted manifest identity refused");
+  });
+  it("bounds the complete encoded bundle", async () => {
+    const rules = Array.from({ length: 160 }, (_, i) => ({ id: `bounded-${i}`, schema_version: 1 as const, created_at: input.issuedAt, description: "x".repeat(1024), match: { ip: "127.0.0.1", port: 41003, protocol: "tcp" as const }, scope: {}, disposition: "allow" as const }));
+    await expect(buildInstallBundle({ ...input, rules }, publicKey)).rejects.toThrow("policy bundle exceeds quota");
+  });
+  it("requires the existing fortress grammar before invoking the signer", async () => {
+    let calls = 0;
+    await expect(buildInstallBundle({ ...input, fortressId: "NOT_A_FORTRESS", signer: { ...signer, sign: () => { calls++; return new Uint8Array(64); } } }, publicKey)).rejects.toThrow();
+    expect(calls).toBe(0);
   });
   it("refuses Linux-incompatible rules before signing", async () => {
     const rules = [{ id: "test", schema_version: 1 as const, created_at: input.issuedAt, match: { host: "example.com" }, scope: {}, disposition: "allow" as const }];
