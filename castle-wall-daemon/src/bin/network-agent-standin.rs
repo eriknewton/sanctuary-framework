@@ -833,7 +833,10 @@ fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
     match linux::run() {
         Ok(()) => return std::process::ExitCode::SUCCESS,
-        Err(error) => eprintln!("network-agent-standin: {error}"),
+        Err(error) => {
+            // SAFETY: this fixed CLI refusal is the stand-in's operator-visible stderr contract.
+            eprintln!("network-agent-standin: {error}");
+        }
     }
     std::process::ExitCode::FAILURE
 }
