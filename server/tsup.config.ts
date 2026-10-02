@@ -15,6 +15,7 @@ export default defineConfig({
     index: "src/index.ts",
     "intelligence/index": "src/intelligence/index.ts",
     cli: "src/cli.ts",
+    "linux-policy-sign": "src/cli/linux-policy-sign.ts",
     "verify-transparency": "src/transparency/offline-cli.ts",
     "directory-capability-worker": "src/storage/directory-capability-worker.ts",
   },

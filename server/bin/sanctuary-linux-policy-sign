@@ -1,0 +1,16 @@
+#!/bin/sh
+# Disable dumps before the managed runtime can receive the owner's seed descriptor.
+ulimit -c 0 || exit 1
+# npm installs bin symlinks; resolve a bounded chain before locating the bundled entry.
+script=$0
+links=0
+max_links=16 # One npm link is usual; the finite ceiling also refuses link cycles.
+while [ -L "$script" ]; do
+  links=$((links + 1))
+  [ "$links" -le "$max_links" ] || exit 1
+  base=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd) || exit 1
+  link=$(readlink "$script") || exit 1
+  case "$link" in /*) script=$link ;; *) script=$base/$link ;; esac
+done
+base=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd) || exit 1
+exec node "$base/../dist/linux-policy-sign.js" "$@"
