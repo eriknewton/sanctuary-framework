@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build an INTERNAL unprovisioned-guarded Debian artifact for Castle Wall.
+# Build an explicitly selected, unprovisioned-guarded Debian artifact for Castle Wall.
 #
 # This builder never installs or starts the package. The generated maintainer
 # scripts refuse unsafe lifecycle operations; they do not provision or disarm.
@@ -7,7 +7,7 @@ set -euo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 --revision <positive-decimal> --output <empty-artifact-directory> | --check-package-version <Cargo.toml>" >&2
+  echo "usage: $0 [--variant internal|install] --revision <positive-decimal> --output <empty-artifact-directory> | --check-package-version <Cargo.toml>" >&2
   exit 64
 }
 
@@ -40,8 +40,17 @@ fi
 
 output_dir=""
 revision=""
+variant="internal"
+variant_seen=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --variant)
+      [[ $# -ge 2 && "$variant_seen" == false ]] || usage
+      variant="$2"
+      variant_seen=true
+      [[ "$variant" == internal || "$variant" == install ]] || usage
+      shift 2
+      ;;
     --revision)
       [[ $# -ge 2 ]] || usage
       revision="$2"
@@ -59,6 +68,10 @@ done
 [[ "$revision" =~ ^[1-9][0-9]*$ ]] || die "revision must be a positive decimal without leading zeroes"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Variant routing is a trusted caller choice, never an artifact's readiness bit.
+if [[ "$variant" == install ]]; then
+  exec python3 "$script_dir/build-install-deb.py" --revision "$revision" --output "$output_dir"
+fi
 crate_dir="$(cd -- "$script_dir/../.." && pwd -P)"
 repo_root="$(cd -- "$crate_dir/.." && pwd -P)"
 unit_source="$crate_dir/systemd/sanctuary-castle-wall.service"

@@ -1,0 +1,197 @@
+name: Linux Install Package
+
+# No path filters: absence of a required job must not look like a successful run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  # PR evidence is for the contributor head, never GitHub's synthetic merge ref.
+  INSTALL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  install-rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Exact-head Rust and package contracts
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          python3 castle-wall-daemon/packaging/ubuntu/test-lifecycle-guard.py
+          python3 castle-wall-daemon/packaging/ubuntu/test-install-package.py
+          python3 castle-wall-daemon/packaging/ubuntu/assert-source-constants.py
+          cd castle-wall-daemon
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --lib --bins
+
+  install-package-build:
+    needs: install-rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+      - name: Build each closed variant once from the exact clean head
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          source=castle-wall-daemon/packaging/ubuntu
+          bash "$source/build-deb.sh" --variant internal --revision 1 --output "$RUNNER_TEMP/internal"
+          bash "$source/assert-structure.sh" --artifact-dir "$RUNNER_TEMP/internal"
+          # unshare is privileged on some Ubuntu runners. The builder runs as
+          # root in this disposable job so seam tests need no host fallback.
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            python3 "$source/build-install-deb.py" --revision 1 --output "$RUNNER_TEMP/install"
+          deb=("$RUNNER_TEMP"/install/*.deb)
+          [[ ${#deb[@]} == 1 ]]
+          sudo env PYTHONDONTWRITEBYTECODE=1 python3 "$source/test-install-archive.py" "${deb[0]}" "$INSTALL_SOURCE_SHA"
+          python3 "$source/record-install-ci.py" "$RUNNER_TEMP/install/build-context.json"
+      - name: Retain exact package bytes for required downstream jobs
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-install-${{ env.INSTALL_SOURCE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/install
+          if-no-files-found: error
+          retention-days: 7
+
+  install-package-lifecycle:
+    needs: install-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [inert, upgrade, provisioned-refusal]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: nftables libnetfilter-queue1 libnfnetlink0 iproute2
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.install-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/install
+          merge-multiple: true
+      - name: Assert downloaded bytes and run actual inert lifecycle
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          cd "$RUNNER_TEMP/install"
+          sha256sum --check ./*.deb.sha256
+          cd "$GITHUB_WORKSPACE"
+          deb=("$RUNNER_TEMP"/install/*.deb)
+          [[ ${#deb[@]} == 1 ]]
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
+            python3 castle-wall-daemon/packaging/ubuntu/ci-install-lifecycle.py \
+              --scenario '${{ matrix.scenario }}' --deb "${deb[0]}" --evidence "$RUNNER_TEMP/lifecycle"
+      - name: Retain actual-manager lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-install-lifecycle-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lifecycle
+          if-no-files-found: error
+          retention-days: 7
+
+  # P4 supplies the composed witness after the P2/P3 consumers land. Missing
+  # source is deliberately red, never a skipped or fixture-only composition pass.
+  install-cold-composition:
+    needs: install-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: nftables libnetfilter-queue1 libnfnetlink0 iproute2
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.install-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/install
+          merge-multiple: true
+      - name: Require actual-manager composed install witness
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$INSTALL_SOURCE_SHA" ]]
+          [[ "$(cat /proc/1/comm)" == systemd ]]
+          systemctl --version | head -1 | grep '^systemd 255 '
+          cd "$RUNNER_TEMP/install"
+          sha256sum --check ./*.deb.sha256
+          cd "$GITHUB_WORKSPACE"
+          witness=castle-wall-daemon/packaging/ubuntu/ci-install-composition.py
+          [[ -f "$witness" ]] || { echo 'P4 composed install witness is required; package-only evidence is insufficient' >&2; exit 1; }
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
+            python3 "$witness" --artifact-dir "$RUNNER_TEMP/install" --evidence "$RUNNER_TEMP/composition"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-install-composition-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/composition
+          if-no-files-found: error
+          retention-days: 7
+
+  install-package-evidence:
+    if: always()
+    needs: [install-rust, install-package-build, install-package-lifecycle, install-cold-composition]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.INSTALL_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Record service digest and require every package job
+        env:
+          INSTALL_NEEDS: ${{ toJSON(needs) }}
+          INSTALL_ARTIFACT_ID: ${{ needs.install-package-build.outputs.artifact-id }}
+          INSTALL_ARTIFACT_DIGEST: ${{ needs.install-package-build.outputs.artifact-digest }}
+        run: |
+          python3 castle-wall-daemon/packaging/ubuntu/record-install-ci.py "$RUNNER_TEMP/install-ci.json" --require-package-jobs
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-install-ci-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/install-ci.json
+          if-no-files-found: error
+          retention-days: 7

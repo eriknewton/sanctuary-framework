@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Closed install archive inventory; shared by its builder and archive assertion."""
+from pathlib import Path
+import json
+import re
+
+PACKAGE = 'sanctuary-castle-wall'
+KIND = 'ubuntu-install-deb-v1'
+TARGET = 'x86_64-unknown-linux-gnu'
+TOOLCHAIN = '1.95.0'
+DOC = 'usr/share/doc/' + PACKAGE
+# Must match the path constants in src/linux_install/contract.rs. That file is
+# shipped verbatim as the shared command/endpoint schema, not a copied parser.
+BINARIES = {
+    'castle-wall-daemon': 'usr/local/libexec/sanctuary/castle-wall-daemon',
+    'protected-agent-v1': 'usr/local/libexec/sanctuary/protected-agent-v1',
+    'network-agent-standin': 'usr/local/libexec/sanctuary/network-agent-standin',
+    'sanctuary-linux': 'usr/sbin/sanctuary-linux',
+}
+MOUNT_NAME = r'var-lib-sanctuary\x2dagent\x2dworkspace.mount'
+SOURCES = {
+    'etc/systemd/system/sanctuary-castle-wall.service': 'systemd/sanctuary-castle-wall.service',
+    'etc/systemd/system/sanctuary-agent@.service': 'systemd/sanctuary-agent@.service',
+    'etc/systemd/system/' + MOUNT_NAME: 'systemd/' + MOUNT_NAME,
+    DOC + '/schemas/contract.rs': 'src/linux_install/contract.rs',
+    DOC + '/operator-guide.md': 'packaging/ubuntu/README.md',
+}
+IDENTITY = DOC + '/build-identity'
+PAYLOAD_FILES = {**{p: 0o755 for p in BINARIES.values()}, **{p: 0o644 for p in SOURCES}, IDENTITY: 0o644}
+PAYLOAD_DIRS = {str(parent) for p in PAYLOAD_FILES for parent in Path(p).parents if str(parent) != '.'}
+CONTROL_FILES = {'control': 0o644, 'preinst': 0o755, 'prerm': 0o755}
+PRE_DEPENDS = 'systemd, nftables, python3'
+# Runtime command closure for provisioning, accounts, manager and mount control.
+# Must match runtime_dependencies in build-install-deb.py and the install check.
+RUNTIME_TOOLS = ('/usr/sbin/useradd', '/usr/sbin/groupadd', '/usr/bin/getent',
+                 '/usr/bin/mount', '/usr/bin/umount', '/usr/sbin/ip', '/usr/bin/timeout')
+RUNTIME_PACKAGES = {'passwd', 'libc-bin', 'mount', 'iproute2', 'coreutils'}
+
+
+def check_contract(crate):
+    source = (crate / 'src/linux_install/contract.rs').read_text()
+    expected = dict(zip(('DAEMON_PATH', 'LAUNCHER_PATH', 'STANDIN_PATH', 'CLI_PATH'),
+                        ('/' + p for p in BINARIES.values())))
+    expected['WORKSPACE_MOUNT_UNIT'] = MOUNT_NAME
+    for name, value in expected.items():
+        matches = re.findall(r'^pub const ' + name + r': &str = (".*");$', source, re.M)
+        if len(matches) != 1 or json.loads(matches[0]) != value:
+            raise ValueError('install layout differs from shared contract: ' + name)
+    for path in SOURCES.values():
+        if not (crate / path).is_file() or (crate / path).is_symlink():
+            raise ValueError('missing canonical install payload input: ' + path)
+
+
+def guard_bytes(role, version, identity_bytes, hashes, here):
+    import hashlib
+    # Must match the constants consumed by install-lifecycle-guard.py.
+    header = ('#!/usr/bin/python3\n' + f'ROLE = {role!r}\nPACKAGE_VERSION = {version!r}\n'
+              + f'IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n'
+              + f'PAYLOAD_MODES = {PAYLOAD_FILES!r}\nPAYLOAD_HASHES = {hashes!r}\n')
+    return header.encode() + (here / 'install-lifecycle-guard.py').read_bytes()
