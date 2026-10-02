@@ -108,3 +108,14 @@ On **every** reorg PR, the following diffs must be **empty or path-only**. The r
 10. **Import-cycle check** (zero-dependency TS-compiler-API / `rg` scanner, no new package dep) - no new cycle.
 
 **Any unexpected product / API / wire / at-rest / display diff DEFAULT-DENIES the PR until it is explicitly classified** - either reclassified as ALLOWED path-churn with a one-line justification in the PR description, or treated as a behavior change that disqualifies the PR from being a reorg. Base gates (`npm run typecheck`, `npm test` with passing count >= the repo-root `.test-baseline`, no vitest transform/collection errors, codex adversarial review, halt-before-merge) run on top of the manifest-selected gates, never instead of them. Where a row's gate column and this list disagree on coverage, **this manifest is authoritative** and the broader gate still applies if the PR touches that surface.
+
+Credential surrogacy slice 1b-i internal response codes (2026-10-01): the new
+`X-Sanctuary-Gate` strings are `surrogate-unknown`, `surrogate-misroute`,
+`surrogate-wrong-location`, `surrogate-limit`, `surrogate-locked`, `rate_limited`,
+`surrogate-helper-unavailable`, `header_write_failed`, `upstream_tls_failed`,
+`upstream_reset`, `body_length_mismatch`, `socket_error`, `surrogate-invalid-target`,
+`surrogate-duplicate-header`, `surrogate-transfer-encoding`, `surrogate-host-mismatch`,
+`surrogate-upgrade`, `surrogate-not-live`, and `surrogate-destinations-unavailable`. These are internal forward-mode
+artifacts, not frozen display strings. Existing CONNECT codes and bytes stay
+unchanged. `surrogate events` now accepts only `[egress-gate] ` lines with valid
+JSON and a `kind` beginning `surrogate_`; its help strings did not change.

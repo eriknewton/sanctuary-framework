@@ -1763,6 +1763,7 @@ async function cmdSurrogateStatus(
 /** The prefix every surrogate line in the gate log carries. Must match the
  * emission site the gate gains in slice 1b; in slice 1a the gate emits none, so
  * this verb is exercised against fixture log lines only. */
+// Must match surrogate event kinds and the [egress-gate] sink format in egress-gate/gate-daemon.ts.
 export const SURROGATE_GATE_EVENT_PREFIX = "surrogate_";
 
 async function cmdSurrogateEvents(
@@ -1826,7 +1827,13 @@ async function cmdSurrogateEvents(
   }
   let printed = 0;
   for (const line of contents.split("\n")) {
-    if (!line.includes(SURROGATE_GATE_EVENT_PREFIX)) continue;
+    const prefix = "[egress-gate] ";
+    if (!line.startsWith(prefix)) continue;
+    try {
+      const event: unknown = JSON.parse(line.slice(prefix.length));
+      if (typeof event !== "object" || event === null || !("kind" in event) ||
+          typeof event.kind !== "string" || !event.kind.startsWith(SURROGATE_GATE_EVENT_PREFIX)) continue;
+    } catch { continue; }
     // Redacted on the way out as well as at the sink. A placeholder is a live
     // bearer surrogate for its generation, and this verb prints to a terminal
     // that is very often being recorded.
