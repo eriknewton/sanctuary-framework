@@ -1246,6 +1246,11 @@ export async function startMacOSCastleWallDaemon(
     },
     approvalQueue: {
       async enqueue(input) {
+        // Shutdown cannot admit requests after its pending-loss count is taken.
+        if (daemonStopping) {
+          consumer.noteIngressDrop("approval_shutdown");
+          return false;
+        }
         prunePendingRequests();
         if (input.requestId.length > MAX_PENDING_APPROVAL_ID_CHARACTERS ||
             input.agent.id.length > MAX_PENDING_APPROVAL_ID_CHARACTERS) {
@@ -2041,8 +2046,9 @@ export async function startMacOSCastleWallDaemon(
     reloadPolicy,
     async stop() {
       try {
-        pendingRequests.clear();
         daemonStopping = true;
+        if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
+        pendingRequests.clear();
         stopLeaseHeartbeat();
         stopResolverLifecycleTimer();
         await resolverLifecycleRefresh?.catch(() => undefined);
@@ -2058,6 +2064,8 @@ export async function startMacOSCastleWallDaemon(
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
+        // Loss records precede the final stop record, including arrivals during teardown.
+        await consumer.drainIngressDrops();
         // #912 MED-1: carry any still-pending degraded-write count into the
         // shutdown audit write too, not only the next heartbeat -- a reload
         // that drops its audit write shortly before `stop()` must not lose the

@@ -1438,6 +1438,26 @@ const auditIntegrityContext = new AsyncLocalStorage<{
   allowIntegrityFindings: boolean;
 }>();
 
+const auditWriteSettlementContext = new AsyncLocalStorage<Set<Promise<unknown>>>();
+
+/**
+ * Keep a caller's reservation until its audit operations settle, including writes abandoned at a lock deadline.
+ * Must wrap telemetry in castle-wall/runtime/macos-ipc-listener.ts and the single
+ * discard write in castle-wall/runtime/macos-flow-events.ts so both retain their charges.
+ */
+export async function withAuditWriteSettlement<T>(operation: () => Promise<T>): Promise<T> {
+  const pending = new Set<Promise<unknown>>();
+  return auditWriteSettlementContext.run(pending, async () => {
+    try {
+      return await operation();
+    } finally {
+      // The lock deadline releases the lock, not the retained storage payload.
+      // Must match the operationPromise tracking in withAuditWriteLock below.
+      while (pending.size > 0) await Promise.allSettled([...pending]);
+    }
+  });
+}
+
 /**
  * When set, `query` serves from the eagerly-maintained in-memory verified view
  * and throttles the OUT-OF-BAND on-disk re-verification (see {@link
@@ -4704,6 +4724,16 @@ export class AuditLog {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const operationPromise = Promise.resolve().then(() => operation(signal));
       void operationPromise.catch(() => undefined);
+      // Must match withAuditWriteSettlement: caller rejection cannot free an
+      // ingress reservation while the underlying storage still owns its bytes.
+      const pending = auditWriteSettlementContext.getStore();
+      if (pending) {
+        pending.add(operationPromise);
+        void operationPromise.then(
+          () => pending.delete(operationPromise),
+          () => pending.delete(operationPromise),
+        );
+      }
       try {
         const deadlinePromise = new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => {

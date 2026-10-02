@@ -26,6 +26,7 @@
  */
 
 import type { AllowlistRule } from "../allowlist/schema.js";
+import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import {
   CASTLE_WALL_AUDIT_LAYER,
@@ -85,6 +86,7 @@ export type MacOSIngressDropReason =
   | "audit_backpressure"
   | "approval_capacity"
   | "approval_expired"
+  | "approval_shutdown"
   | "approval_id_too_large";
 
 /** The runtime's view of a registered macOS subscriber. */
@@ -214,6 +216,7 @@ export class MacOSFlowEventConsumer {
     audit_backpressure: 0,
     approval_capacity: 0,
     approval_expired: 0,
+    approval_shutdown: 0,
     approval_id_too_large: 0,
   };
   private ingressDropWrite: Promise<void> | null = null;
@@ -596,7 +599,9 @@ export class MacOSFlowEventConsumer {
     }
     let persisted = false;
     // Reserve counts before yielding so drops during a slow write survive it.
-    const write = Promise.resolve().then(async () => {
+    // Must match withAuditWriteSettlement in operational/audit-log.ts: the
+    // single discard-write slot includes storage abandoned at a lock deadline.
+    const write = withAuditWriteSettlement(() => Promise.resolve().then(async () => {
       await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "castle_wall_ingress_discarded",
@@ -605,7 +610,7 @@ export class MacOSFlowEventConsumer {
         "failure",
       );
       persisted = true;
-    }).catch(() => {
+    })).catch(() => {
       for (const reason of Object.keys(reserved) as MacOSIngressDropReason[]) {
         this.ingressDrops[reason] += reserved[reason];
       }
@@ -616,6 +621,14 @@ export class MacOSFlowEventConsumer {
     });
     this.ingressDropWrite = write;
     return write;
+  }
+
+  /** Await coalesced loss records at shutdown; failed persistence stays counted without a retry loop. */
+  async drainIngressDrops(): Promise<void> {
+    await this.flushIngressDrops();
+    // A successful write can start the next batch before its callers resume.
+    // Wait iteratively so continuous drops cannot retain a recursive promise chain.
+    while (this.ingressDropWrite) await this.ingressDropWrite;
   }
 
   handleEnforcementAvailabilityReport(

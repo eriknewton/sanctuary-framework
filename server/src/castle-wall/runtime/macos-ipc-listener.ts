@@ -48,6 +48,7 @@ import { randomBytes } from "node:crypto";
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
+import { withAuditWriteSettlement } from "../../operational/audit-log.js";
 import type {
   AuditEmitNotification,
   CastleWallMessage,
@@ -65,8 +66,8 @@ import type {
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 
-// Eight MiB for retained telemetry work, with one MiB per connection so one
-// producer cannot consume the entire listener budget. Charge 4 KiB per task
+// Eight MiB for retained telemetry work, with one eighth per connection.
+// Reconnecting producers share the global cap, not a per-producer quota. Charge 4 KiB per task
 // (rounded up from a 2.6 KiB retained-task measurement), plus eight bytes per
 // JSON character for decoded strings, object slots and envelope bookkeeping.
 const TELEMETRY_MEMORY_BUDGET_BYTES = 8 * 1024 * 1024;
@@ -826,6 +827,7 @@ export class MacOSFlowIpcListener {
       }
       if (step.kind === "error") {
         this.stats.framesRejected += 1;
+        state.inbound = new Uint8Array(0);
         state.socket.destroy();
         return;
       }
@@ -873,7 +875,12 @@ export class MacOSFlowIpcListener {
     }
     this.telemetryBytes += charge;
     state.telemetryBytes = (state.telemetryBytes ?? 0) + charge;
-    void this.routeMessage(state, message).catch((error) => {
+    // Must match withAuditWriteSettlement in operational/audit-log.ts: await
+    // actual storage settlement even when the audit caller's deadline expires.
+    const routed = charge > 0
+      ? withAuditWriteSettlement(() => this.routeMessage(state, message))
+      : this.routeMessage(state, message);
+    void routed.catch((error) => {
       const type = sanitizeLogValue(String(message.type));
       const reason = sanitizeLogValue(
         error instanceof Error ? error.message : String(error),
@@ -883,8 +890,8 @@ export class MacOSFlowIpcListener {
         `[castle-wall] listener routeMessage failed for type=${type}: ${reason}`,
       );
     }).finally(() => {
-      // Disconnects and caller timeouts do not free reservations: the underlying
-      // persistence still owns its payload until it actually settles (rule 12).
+      // Disconnects and audit deadlines retain the charge until the scoped
+      // storage operations settle; a permanently hung write keeps its charge.
       this.telemetryBytes -= charge;
       state.telemetryBytes = (state.telemetryBytes ?? 0) - charge;
     });
