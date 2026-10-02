@@ -107,7 +107,9 @@ def policy(witness, argv):
         high.unlink()
     # A valid policy cannot mutate state before provision is fully staged.
     transaction = TRANSACTION.read_bytes()
-    incomplete = dict(t, account_step='AgentUserIntent')
+    # Keep the transaction shape valid so this reaches policy's account-stage
+    # guard rather than the earlier completed-transaction consistency check.
+    incomplete = dict(t, state='Absent', account_step='AgentUserIntent', policy_complete=False)
     TRANSACTION.write_text(json.dumps(incomplete))
     digests = {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
     try:
