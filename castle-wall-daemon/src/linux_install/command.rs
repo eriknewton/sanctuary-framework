@@ -638,7 +638,7 @@ pub fn run(args: &[String]) -> Result<Value> {
     ]
     .contains(&verb.as_str())
     {
-        return Err("unknown command".into());
+        return Err(format!("unknown command: {verb}").into());
     }
     let root = Root::open(Path::new("/"))?;
     if verb == "status" {

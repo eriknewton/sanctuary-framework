@@ -666,6 +666,35 @@ fn shipped_operator_control_is_finite_and_needs_no_installed_records() {
     assert_eq!(sentinels.receipts.lock().unwrap().len(), ENDPOINT_COUNT);
     thread::sleep(Duration::from_millis(100));
     assert_eq!(sentinels.receipts.lock().unwrap().len(), ENDPOINT_COUNT);
+
+    // The fault instrument cannot consume a normal or multi-attempt schedule.
+    let invoke = || run("timeout", &["8", bin, "--fault-probe", "--endpoints", path.to_str().unwrap()]);
+    assert!(!invoke().status.success());
+    let mut fault: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (index, endpoint) in fault["endpoints"].as_array_mut().unwrap().iter_mut().enumerate() {
+        endpoint["attempts"] = json!(u8::from(index == 0));
+    }
+    write(&path, serde_json::to_vec(&fault).unwrap(), 0o644);
+    let output = invoke();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.len() <= OBSERVATION_MAX_BYTES);
+    let fault_record: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(fault_record["phase"], "fault-probe-complete");
+    assert_eq!(fault_record["attempt_count"], 1);
+    assert_eq!(fault_record["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(fault_record["attempts"][0]["phase"], "fault-probe");
+    assert_eq!(fault_record["attempts"][0]["index"], 0);
+    assert_eq!(fault_record["attempts"][0]["sent_bytes"], 32);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(sentinels.receipts.lock().unwrap().len(), ENDPOINT_COUNT + 1);
+    for index in 0..ENDPOINT_COUNT {
+        fault["endpoints"][0]["attempts"] = json!(0);
+        fault["endpoints"][index]["attempts"] = json!(if index == 0 {2} else {1});
+        write(&path, serde_json::to_vec(&fault).unwrap(), 0o644);
+        assert!(!invoke().status.success(), "invalid fault schedule index {index}");
+        fault["endpoints"][index]["attempts"] = json!(0);
+    }
+    assert_eq!(sentinels.receipts.lock().unwrap().len(), ENDPOINT_COUNT + 1);
 }
 
 struct Sentinels {

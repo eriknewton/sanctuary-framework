@@ -467,7 +467,7 @@ mod linux {
         Ok(())
     }
 
-    fn control_endpoints(path: &str) -> io::Result<EndpointsV1> {
+    fn instrument_endpoints(path: &str, purpose: EndpointPurpose) -> io::Result<EndpointsV1> {
         // The ordinary-operator control runs before provisioning. Its supplied
         // file is bounded input testimony, never Configured or launch authority.
         let mut file = OpenOptions::new()
@@ -482,7 +482,11 @@ mod linux {
         (&mut file)
             .take(ENDPOINTS_MAX_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        EndpointsV1::parse(&bytes).map_err(io::Error::other)
+        EndpointsV1::parse_for(&bytes, purpose).map_err(io::Error::other)
+    }
+
+    fn control_endpoints(path: &str) -> io::Result<EndpointsV1> {
+        instrument_endpoints(path, EndpointPurpose::Product)
     }
 
     fn control(path: &str) -> io::Result<()> {
@@ -512,6 +516,31 @@ mod linux {
         io::stdout().write_all(b"\n")
     }
 
+    fn fault_probe(path: &str) -> io::Result<()> {
+        let schedule = instrument_endpoints(path, EndpointPurpose::FaultInstrument)?;
+        // The separate instrument consumes exactly one denied IPv4 TCP attempt;
+        // reduced schedules never authorize a product activation or retries.
+        if schedule.endpoints.iter().enumerate().any(|(index, endpoint)|
+            endpoint.attempts != u8::from(index == 0)) {
+            return Err(bad("fault probe requires exactly one IPv4 denied TCP attempt"));
+        }
+        let start = monotonic_ns()?;
+        let mut row = attempt(0, 0, &schedule.endpoints[0])?;
+        row.phase = "fault-probe".into();
+        let record = serde_json::json!({"version":VERSION,"phase":"fault-probe-complete",
+            "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
+            "pid":std::process::id(),"uid":unsafe {libc::geteuid()},
+            "start_ticks":std::fs::read_to_string("/proc/self/stat")?.rsplit_once(')').and_then(|(_, tail)| tail.split_whitespace().nth(19)).ok_or_else(|| bad("start ticks"))?,
+            "start_monotonic_ns":start,"end_monotonic_ns":monotonic_ns()?,
+            "attempt_count":1,"attempts":[row]});
+        let bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        if bytes.len() + 1 > OBSERVATION_MAX_BYTES {
+            return Err(bad("fault observation quota"));
+        }
+        io::stdout().write_all(&bytes)?;
+        io::stdout().write_all(b"\n")
+    }
+
     pub fn run() -> io::Result<()> {
         let args: Vec<_> = std::env::args().skip(1).collect();
         match args
@@ -521,6 +550,7 @@ mod linux {
             .as_slice()
         {
             ["--control", "--endpoints", path] => control(path),
+            ["--fault-probe", "--endpoints", path] => fault_probe(path),
             ["--endpoints", ENDPOINTS_PATH] => worker(0, monotonic_ns()?, std::process::id()),
             ["--worker", role, start, leader] => {
                 let role: usize = role.parse().map_err(|_| bad("worker role"))?;
@@ -532,7 +562,7 @@ mod linux {
                 validate_worker_lineage(role, start, leader)?;
                 worker(role, start, leader)
             }
-            _ => Err(bad("expected --endpoints and the installed endpoint path")),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown or invalid argument: {}", args.first().map(String::as_str).unwrap_or("<missing>")))),
         }
     }
 

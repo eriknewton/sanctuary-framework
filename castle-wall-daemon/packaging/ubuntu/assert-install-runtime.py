@@ -24,11 +24,6 @@ def classify_refusal(name, flag, status, stderr):
     if name == 'castle-wall-daemon':
         if status == 2 and ('unknown argument: ' + flag) in stderr:
             return 'unknown-argument'
-    elif status == 69 and stderr.strip() == 'not built in this commit':
-        # Must match NOT_BUILT_EXIT_CODE/MESSAGE in src/linux_install/mod.rs.
-        # P1 admits frozen refusal stubs for inventory testing only. This is
-        # unavailable functionality, never proof of their future argv parsers.
-        return 'phase-0-unavailable'
     elif status in (1, 2, 64, 78) and flag in stderr and re.search(r'unknown|unexpected|unsupported|unrecognized|invalid', stderr, re.I):
         # A config/startup error alone would also occur after accepting a test
         # flag. Require the parser to identify that exact rejected argument.
@@ -47,19 +42,14 @@ def main(deb, source):
             raise ValueError('ELF/runtime command dependency closure mismatch')
         # A test-enabled daemon must be unable to affect the host while being
         # checked: isolate its network, mounts, users and PID namespace first.
-        scaffolds = set()
         for binary in binaries:
             for flag, value in SEAMS.items():
                 argv = [str(binary), flag] + ([] if value is None else [value])
                 result = subprocess.run(['unshare', '--user', '--map-root-user', '--net', '--mount', '--pid', '--fork', *argv],
                                         capture_output=True, text=True, timeout=10,
                                         env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
-                kind = classify_refusal(binary.name, flag, result.returncode, result.stderr)
-                if kind == 'phase-0-unavailable':
-                    scaffolds.add(binary.name)
-        if scaffolds:
-            print('UNAVAILABLE phase-0 binaries (no composed/parser success claimed): ' + ', '.join(sorted(scaffolds)))
-    print('daemon rejects isolation seams; other binaries reject or are explicitly unavailable; dependency closure matches')
+                classify_refusal(binary.name, flag, result.returncode, result.stderr)
+    print('all four production binaries reject isolation seams; dependency closure matches')
 
 
 if __name__ == '__main__':

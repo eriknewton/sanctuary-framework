@@ -297,7 +297,8 @@ class InstallTests(unittest.TestCase):
         fn = runtime['classify_refusal']
         flag = '--isolated-runtime-root'
         self.assertEqual(fn('castle-wall-daemon', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
-        self.assertEqual(fn('sanctuary-linux', flag, 69, 'not built in this commit\n'), 'phase-0-unavailable')
+        with self.assertRaises(ValueError):
+            fn('sanctuary-linux', flag, 69, 'not built in this commit\n')
         self.assertEqual(fn('sanctuary-linux', flag, 2, 'unknown argument: ' + flag), 'unknown-argument')
         for name, status, stderr in (('castle-wall-daemon', 2, 'configuration missing'),
                                      ('sanctuary-linux', 78, 'configuration missing'),
