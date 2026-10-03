@@ -39,6 +39,43 @@ export function getClientScript(): string {
 const CLIENT_SCRIPT = String.raw`
 "use strict";
 
+// Must match parseIsoInstantWithOffset in server/src/core/time.ts: dashboard
+// freshness is a protection claim, so offset-less or normalised timestamps
+// fail toward stale/unknown instead of borrowing the browser's local zone.
+function parseEvidenceTimestamp(value) {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const writtenMs = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
+  const offsetSign = match[8];
+  const offsetHours = offsetSign ? Number(match[9]) : 0;
+  const offsetMinutes = offsetSign ? Number(match[10]) : 0;
+  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
+  const offsetMs = (offsetSign === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60 * 1000;
+  const wall = new Date(Date.UTC(year, month - 1, day, hour, minute, second, writtenMs));
+  // Date.UTC maps years 0..99 onto 1900..1999; setUTCFullYear restores the
+  // written proleptic Gregorian year before applying the offset.
+  wall.setUTCFullYear(year);
+  const timestamp = wall.getTime() - offsetMs;
+  if (!Number.isFinite(timestamp)) return undefined;
+  const rendered = new Date(timestamp + offsetMs);
+  const calendarFieldsMatch =
+    rendered.getUTCFullYear() === year &&
+    rendered.getUTCMonth() + 1 === month &&
+    rendered.getUTCDate() === day &&
+    rendered.getUTCHours() === hour &&
+    rendered.getUTCMinutes() === minute &&
+    rendered.getUTCSeconds() === second &&
+    rendered.getUTCMilliseconds() === writtenMs;
+  return calendarFieldsMatch ? timestamp : undefined;
+}
+
 // ── Config ─────────────────────────────────────────────────────────────
 const cfgEl = document.getElementById("dashboard-config");
 const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
@@ -3025,7 +3062,8 @@ function renderActivityScreen() {
 // audit chain reads VERIFIED only when chain_verified is true. Named layers
 // only (no L-numbers); no em-dashes in user-visible copy.
 function evidenceCurrent(evidence) {
-  const timestamp = evidence && Date.parse(evidence.last_enforcement_evidence_at);
+  // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
+  const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
   const windowMs = evidence && Number(evidence.freshness_window_ms);
   return Number.isFinite(timestamp) && Number.isFinite(windowMs) && windowMs > 0 && Date.now() >= timestamp && Date.now() - timestamp <= Math.min(windowMs, SEAL_FRESHNESS_MAX_MS);
 }
@@ -3444,7 +3482,7 @@ function scheduleHomeFreshness() {
   if (!home) return;
   // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
   const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
-    return Date.parse(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
+    return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
   }); // One millisecond moves past the inclusive freshness boundary.
   if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
 }

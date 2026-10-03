@@ -93,9 +93,25 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.main.innerHTML).toContain("Unknown");
     expect(h.main.innerHTML).toContain("Retry Agents");
   });
-  it("never renders an Enforcing home pill with stale evidence", async () => {
-    vi.useFakeTimers(); const h = harness({ "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: "2000-01-01T00:00:00Z", freshness_window_ms: 60_000 } }) });
-    await settle(); expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+  it("never renders protective home or agent statuses with stale or invalid evidence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-02T12:00:00Z"));
+    const iso = new Date().toISOString();
+    const msPerMinute = 60 * 1000;
+    // Match the receiver's local clock so permissive parsing would treat this as fresh.
+    const localIso = new Date(Date.now() - new Date().getTimezoneOffset() * msPerMinute).toISOString().slice(0, -1);
+    for (const timestamp of ["2000-01-01T00:00:00Z", localIso, iso.replace("T", " "), "2026-02-30T12:00:00Z", "invalid"]) {
+      const evidence = { last_enforcement_evidence_at: timestamp, freshness_window_ms: msPerMinute };
+      const h = harness({
+        "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }),
+        "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", ...evidence }, agents: [{ agent_id: "fixture", enforcement_active: "active", ...evidence }] }),
+      });
+      await settle();
+      expect.soft(h.main.innerHTML, timestamp).not.toContain(">Enforcing</span>");
+      expect.soft(runInContext("homeFreshnessTimer", h.context), timestamp).toBeNull();
+      runInContext('state.route = "agents"; rerender()', h.context);
+      expect.soft(h.main.innerHTML, timestamp).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    }
   });
   it("shares one panel deadline across dependent intelligence reads", async () => {
     vi.useFakeTimers(); const h = harness({
@@ -412,7 +428,7 @@ describe("D5 closure", () => {
     vi.useFakeTimers();
     const h = harness({
       "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }),
-      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 }] }),
+      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] }),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
     expect(h.main.innerHTML).toContain('state-dot live');
     await vi.advanceTimersByTimeAsync(1001);
