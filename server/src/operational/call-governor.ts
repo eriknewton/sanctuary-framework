@@ -18,6 +18,7 @@
  * - Duplicate cache uses cryptographic hashing (SHA-256)
  */
 
+import { responseCache } from "../proxy/response-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -90,11 +91,6 @@ export interface GovernorStatus {
 
 // ── Internal Types ──────────────────────────────────────────────────────
 
-interface CachedResult {
-  result: unknown;
-  expires_at: number;
-}
-
 // ── Default Config ──────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: GovernorConfig = {
@@ -118,7 +114,7 @@ export class CallGovernor {
   private rateWindows: Map<string, number[]> = new Map();
 
   /** Duplicate cache: SHA-256(server+tool+args) -> cached result + expiry */
-  private duplicateCache: Map<string, CachedResult> = new Map();
+  private readonly cacheOwner = Symbol("governor-response-cache");
 
   /** Total calls this session */
   private lifetimeCount = 0;
@@ -192,12 +188,12 @@ export class CallGovernor {
     const callHash = this.computeCallHash(serverName, toolName, args);
     this.pruneDuplicateCache(now);
 
-    const cached = this.duplicateCache.get(callHash);
-    if (cached && cached.expires_at > now) {
+    const cached = responseCache.get(this.cacheOwner, callHash, now);
+    if (cached !== undefined) {
       return {
         allowed: true,
         reason: "duplicate_cached",
-        cached_result: cached.result,
+        cached_result: cached,
       };
     }
 
@@ -226,10 +222,8 @@ export class CallGovernor {
     const callHash = this.computeCallHash(serverName, toolName, args);
     const effectiveConfig = this.getEffectiveConfig(serverName);
 
-    this.duplicateCache.set(callHash, {
-      result,
-      expires_at: Date.now() + effectiveConfig.duplicate_ttl_ms,
-    });
+    // Must follow response screening and critical audit in proxy/proxy-router.ts.
+    responseCache.set(this.cacheOwner, callHash, result, Date.now() + effectiveConfig.duplicate_ttl_ms);
   }
 
   /**
@@ -256,7 +250,7 @@ export class CallGovernor {
       lifetime_current: this.lifetimeCount,
       lifetime_limit: this.config.lifetime_limit,
       rate_by_tool: rateByTool,
-      duplicate_cache_size: this.duplicateCache.size,
+      duplicate_cache_size: responseCache.size(this.cacheOwner),
       hard_stopped: this.hardStopped,
     };
   }
@@ -269,7 +263,7 @@ export class CallGovernor {
   reset(): void {
     this.volumeWindow = [];
     this.rateWindows.clear();
-    this.duplicateCache.clear();
+    this.clearResponseCache();
     this.lifetimeCount = 0;
     this.hardStopped = false;
   }
@@ -350,16 +344,12 @@ export class CallGovernor {
 
   /**
    * Prune expired entries from the duplicate cache.
-   * Amortized O(1) — only prunes when cache exceeds a size threshold.
+   * Work is bounded by the shared process cache entry cap.
    */
   private pruneDuplicateCache(now: number): void {
-    // Only prune when cache is large enough to justify the scan
-    if (this.duplicateCache.size < 100) return;
-
-    for (const [key, entry] of this.duplicateCache) {
-      if (entry.expires_at <= now) {
-        this.duplicateCache.delete(key);
-      }
-    }
+    responseCache.prune(now);
   }
+
+  /** Drop this instance's cached responses during teardown without changing governance counters. */
+  clearResponseCache(): void { responseCache.clear(this.cacheOwner); }
 }
