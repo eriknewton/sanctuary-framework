@@ -42,7 +42,7 @@
 
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
 import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
-import { MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "./interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "./interface.js";
 import type { Stats } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
@@ -1194,7 +1194,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       // Must match listNamespaces in interface.ts: one shared budget bounds
       // work even for empty/internal directories; opendir bounds allocation.
       if (++scanned > MAX_NAMESPACE_DISCOVERY_ENTRIES) {
-        throw new Error("Namespace discovery scan limit exceeded");
+        throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
       }
     };
     for await (const dir of root) {
@@ -1213,7 +1213,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
       if (!hasEntries) continue;
       if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) {
-        throw new Error("Namespace discovery limit exceeded");
+        throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
       }
       // bijectiveDecode is total (unmatched bytes pass through), so legacy
       // pre-#41 sanitized directory names still surface — as their raw names

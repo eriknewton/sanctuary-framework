@@ -16,7 +16,7 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
-import { MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
 import {
   hasInterruptedExitImport,
   InterruptedExitImportPendingError,
@@ -2860,7 +2860,7 @@ export class StateStore {
     // Recheck the backend contract before retaining or sorting its result;
     // internal namespaces count toward the bound as well.
     if (namespaces.length > MAX_DISCOVERED_NAMESPACES) {
-      throw new Error("Namespace discovery limit exceeded");
+      throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
     }
     return [...new Set(namespaces.filter((namespace) => !isReservedNamespace(namespace)))].sort();
   }

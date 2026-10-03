@@ -5,6 +5,7 @@
  * These tools are the public API that agents interact with.
  */
 
+import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
@@ -1065,6 +1066,9 @@ export function createCognitiveTools(
       }
       const owner = namespaceRegistry.getOwner(namespace);
       if (!owner) {
+        // Ownership is process-local: after restart a fresh registry cannot
+        // authenticate durable opaque handles, so session-bound bulk export
+        // refuses while any orphaned handle remains, even for the same identity.
         throw new Error("namespace_ownership_ambiguous");
       }
       if (owner === active.identity_id) {
@@ -1889,7 +1893,10 @@ export function createCognitiveTools(
         } else if (options?.currentSessionBinding?.()) {
           try {
             namespaces = await sessionOwnedExportNamespaces();
-          } catch {
+          } catch (error) {
+            // Discovery caps are capacity refusals, not ownership decisions;
+            // preserve the fixed remediation that router.ts may safely surface.
+            if (isNamespaceDiscoveryLimitError(error)) throw error;
             await denyNamespaceAccess("state_export", "state_export");
             throw new Error("namespace_ownership_ambiguous");
           }

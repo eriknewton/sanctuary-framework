@@ -26,6 +26,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 import { StateStore as RealStateStore } from "../../src/cognitive/state-store.js";
+import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   CheckpointRestoreAgentNotParkedError,
@@ -206,6 +207,34 @@ function expectPoisonSummary(
 }
 
 describe("restoreCheckpoint", () => {
+  // LEGACY-BUG-001: create and restore preserve the shared capacity remedy.
+  it("surfaces fixed discovery remediation for checkpoint create and restore", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const createDeps = {
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand" as const,
+      retentionValue: "off",
+    };
+    const checkpoint = await createCheckpoint(createDeps);
+    for (let i = 0; i < MAX_DISCOVERED_NAMESPACES; i++) {
+      await fixture.storage.write(`extra-${i}`, "k", stringToBytes("{}"));
+    }
+    await expect(createCheckpoint(createDeps)).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    await expect(restoreCheckpoint({
+      ...createDeps,
+      checkpointStore: fixture.checkpointStore,
+      checkpointId: checkpoint.id,
+      assessParked: parkedClaim,
+      publicKeyResolver: publicKeyResolver(fixture),
+    })).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    expect(await fixture.checkpointStore.list()).toHaveLength(1);
+  });
+
   it("refuses when the harness is alive and does not mutate state or seal a forensic snapshot", async () => {
     const fixture = await makeFixture();
     await writeEntry(fixture, "mem", "Q", "known-good");

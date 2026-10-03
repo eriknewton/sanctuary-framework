@@ -7,7 +7,7 @@ import * as fs from "node:fs/promises";
 import type { Dir, Dirent } from "node:fs";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "../../src/storage/interface.js";
+import { MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof import("node:fs/promises")>();
@@ -36,7 +36,7 @@ describe("namespace discovery bounds", () => {
     }
     expect(await storage.listNamespaces()).toHaveLength(MAX_DISCOVERED_NAMESPACES);
     await storage.write("one-more", "k", new Uint8Array());
-    await expect(storage.listNamespaces()).rejects.toThrow("limit exceeded");
+    await expect(storage.listNamespaces()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
   });
 
   it("bounds filesystem namespace retention and closes the iterator on overflow", async () => {
@@ -46,7 +46,7 @@ describe("namespace discovery bounds", () => {
     vi.mocked(fs.opendir).mockImplementation(async (path) => path === "/discovery-test"
       ? entries(MAX_DISCOVERED_NAMESPACES * 2, (i) => `ns-${i}`, () => seen++, () => { rootClosed = true; })
       : entries(1, () => "k.enc", () => {}, () => {}));
-    await expect(new FilesystemStorage("/discovery-test").listNamespaces()).rejects.toThrow("limit exceeded");
+    await expect(new FilesystemStorage("/discovery-test").listNamespaces()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
     expect(seen).toBe(MAX_DISCOVERED_NAMESPACES + 1);
     expect(rootClosed).toBe(true);
   });
@@ -59,7 +59,7 @@ describe("namespace discovery bounds", () => {
     vi.mocked(fs.opendir).mockImplementation(async (path) => path === "/discovery-test"
       ? entries(1, () => "_internal", () => seen++, () => { rootClosed = true; })
       : entries(MAX_NAMESPACE_DISCOVERY_ENTRIES * 2, (i) => `junk-${i}`, () => seen++, () => { childClosed = true; }));
-    await expect(new FilesystemStorage("/discovery-test").listNamespaces()).rejects.toThrow("scan limit exceeded");
+    await expect(new FilesystemStorage("/discovery-test").listNamespaces()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
     expect(seen).toBe(MAX_NAMESPACE_DISCOVERY_ENTRIES + 1);
     expect(rootClosed && childClosed).toBe(true);
   });

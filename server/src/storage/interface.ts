@@ -23,6 +23,18 @@
 export const MAX_DISCOVERED_NAMESPACES = 1_024;
 export const MAX_NAMESPACE_DISCOVERY_ENTRIES = MAX_DISCOVERED_NAMESPACES * 64;
 
+/** Fixed operator guidance shared by export, checkpoint and rotation callers. */
+export const NAMESPACE_DISCOVERY_LIMIT_REMEDIATION =
+  `Namespace discovery limit exceeded: maximum ${MAX_DISCOVERED_NAMESPACES} namespaces or ${MAX_NAMESPACE_DISCOVERY_ENTRIES} scanned directory entries, including internal state. ` +
+  "Remedy: have the operator back up the fortress and prune unneeded state or stale directories below both bounds, preserving required internal state, then retry.";
+
+/** Recognize only fixed public guidance, including errors relayed by a storage worker. */
+export function isNamespaceDiscoveryLimitError(error: unknown): boolean {
+  // Must match the errors in filesystem.ts, memory.ts and cognitive/state-store.ts;
+  // exact matching permits safe guidance without exposing arbitrary storage errors.
+  return error instanceof Error && error.message === NAMESPACE_DISCOVERY_LIMIT_REMEDIATION;
+}
+
 /** Metadata about a stored entry */
 export interface StorageEntryMeta {
   key: string;

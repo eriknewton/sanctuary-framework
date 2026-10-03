@@ -22,7 +22,7 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { normalizedArgsHash, OpaqueNamespaceRegistry, fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
-import { MAX_DISCOVERED_NAMESPACES } from "../../src/storage/interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../../src/storage/interface.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -30,7 +30,7 @@ afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
 });
 
-async function fixture(sessionScoped = false, ambiguousOwner = false) {
+async function fixture(sessionScoped = false, ambiguousOwner = false, restart = false) {
   const path = await mkdtemp(join(tmpdir(), "cold-export-"));
   cleanup.push(() => rm(path, { recursive: true, force: true }));
   const masterKey = generateRandomKey();
@@ -53,7 +53,7 @@ async function fixture(sessionScoped = false, ambiguousOwner = false) {
   const baseline = new BaselineTracker(reopened, masterKey);
   await baseline.load();
   const { tools } = createCognitiveTools(cold, reopened, masterKey, "recovery-key", audit, {
-    namespaceRegistry: registry,
+    namespaceRegistry: restart ? new OpaqueNamespaceRegistry() : registry,
     currentSessionBinding: () => sessionScoped ? {
       identity_id: identity.identity_id,
       requester_identity_fingerprint: fingerprintIdentityId(identity.identity_id),
@@ -112,16 +112,21 @@ describe("durable namespace export", () => {
     await expect(f.cold.export()).rejects.toThrow("cannot enumerate");
   });
 
-  it("rejects an oversized backend result before reading state or requesting approval", async () => {
-    const f = await fixture();
+  it.each([false, true])("surfaces fixed discovery remediation before approval (session=%s)", async (sessionScoped) => {
+    const f = await fixture(sessionScoped);
     vi.spyOn(f.reopened, "listNamespaces").mockResolvedValue(
       Array.from({ length: MAX_DISCOVERED_NAMESPACES + 1 }, (_, i) => `ns-${i}`),
     );
     const exportState = vi.spyOn(f.cold, "exportNamespaces");
-    await f.client.callTool({ name: "state_export", arguments: {} });
+    const result = await f.client.callTool({ name: "state_export", arguments: {} });
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse((result.content as Array<{ text: string }>)[0]!.text);
+    expect(payload.remediation).toBe(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    expect(payload.remediation).toContain("1024 namespaces or 65536 scanned directory entries");
+    expect(payload.remediation).toContain("Remedy:");
     expect(f.approvedHash()).toBeUndefined();
     expect(exportState).not.toHaveBeenCalled();
-    await expect(f.cold.export()).rejects.toThrow("limit exceeded");
+    await expect(f.cold.export()).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
   });
 
   it("retains explicit namespace and empty-scope semantics without re-enumerating", async () => {
@@ -132,13 +137,23 @@ describe("durable namespace export", () => {
     expect(discovery).not.toHaveBeenCalled();
   });
 
-  it("filters cold opaque namespaces to the active owner before approval", async () => {
+  it("filters opaque namespaces with a warm ownership registry before approval", async () => {
     const f = await fixture(true);
     const result = await f.client.callTool({ name: "state_export", arguments: {} });
     const payload = JSON.parse((result.content as Array<{ text: string }>)[0]!.text);
     expect(payload.namespaces).toEqual(["alpha", "beta", f.owned].sort());
     expect(payload.namespaces).not.toContain(f.foreign);
     expect(f.projection()?.namespaces).toEqual(payload.namespaces);
+  });
+
+  it("refuses session-bound bulk export after restart with a fresh ownership registry", async () => {
+    const f = await fixture(true, false, true);
+    expect(await f.cold.listExportableNamespaces()).toContain(f.owned);
+    const exportState = vi.spyOn(f.cold, "exportNamespaces");
+    const result = await f.client.callTool({ name: "state_export", arguments: {} });
+    expect(result.isError).toBe(true);
+    expect(f.approvedHash()).toBeUndefined();
+    expect(exportState).not.toHaveBeenCalled();
   });
 
   it("refuses cold opaque state with ambiguous ownership before approval", async () => {

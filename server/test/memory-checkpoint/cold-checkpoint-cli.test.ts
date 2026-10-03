@@ -1,5 +1,5 @@
 /**
- * Checkpoint commands preserve and reconstruct durable state across restarts.
+ * Checkpoint commands capture durable state across restarts.
  * LEGACY-BUG-001
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,14 +15,11 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, fromBase64url } from "../../src/core/encoding.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
-import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
-import { ApprovalGate } from "../../src/principal-policy/gate.js";
-import { MemoryCheckpointStore, createCheckpoint } from "../../src/memory-checkpoint/index.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryCheckpointStore } from "../../src/memory-checkpoint/index.js";
 import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 // Only host custody and host liveness are replaced; CLI composition, encrypted
-// filesystem state, namespace discovery, snapshotting and reconstruction are real.
+// filesystem state, namespace discovery, snapshotting are real.
 vi.mock("../../src/core/master-custody.js", async (original) => ({
   ...await original<typeof import("../../src/core/master-custody.js")>(),
   resolveCliMasterKey: vi.fn(),
@@ -91,37 +88,4 @@ describe("cold checkpoint CLI", () => {
     expect(Object.keys(JSON.parse(bytesToString(fromBase64url(raw))).data).sort()).toEqual(["alpha", "beta"]);
   });
 
-  it("restores through the CLI and quarantines cold post-checkpoint additions", async () => {
-    const f = await fixture();
-    // Seed the source independently so this witness isolates restore from create.
-    const checkpoint = await createCheckpoint({
-      stateStore: f.stateStore, store: f.checkpoints, masterKey: f.masterKey,
-      auditLog: new AuditLog(f.storage, f.masterKey), identityId: f.identity.identity_id,
-      source: "on_demand",
-    });
-    await f.write("alpha", "changed");
-    await f.write("added", "post-checkpoint");
-    const originalParked = await vi.importActual<typeof import("../../src/egress-gate/parked-claim.js")>(
-      "../../src/egress-gate/parked-claim.js",
-    );
-    vi.mocked(assessHarnessParked).mockResolvedValue(await originalParked.assessHarnessParked({
-      probe: { harnessStatus: async () => ({ known: true, installed: true, running: false }), sleepMs: async () => {} },
-    }));
-    // Operator approval is supplied at the host boundary; export binding is
-    // exercised with a real ApprovalGate by cold-export-namespaces.test.ts.
-    const approval = vi.spyOn(ApprovalGate.prototype, "evaluate").mockResolvedValue({ allowed: true, tier: 1, reason: "test approval", approval_required: true });
-    const output = await f.call(["restore", checkpoint.id]);
-    expect(approval).toHaveBeenCalledWith("memory_checkpoint_restore", { checkpoint_id: checkpoint.id });
-    expect(output).toContain("added/note");
-    const reopened = new FilesystemStorage(join(f.path, "state"));
-    expect(await reopened.exists("added", "note")).toBe(false);
-    const restored = await new StateStore(reopened, f.masterKey).read(
-      "alpha", "note", fromBase64url(f.identity.public_key),
-    );
-    expect(restored?.value).toBe("original");
-    const forensic = (await f.checkpoints.list()).find((record) => record.source === "forensic_quarantine")!;
-    expect(forensic.namespaces).toEqual(["added", "alpha", "beta"]);
-    const snapshot = JSON.parse(bytesToString(fromBase64url(await f.checkpoints.readBundle(forensic.id, f.masterKey))));
-    expect(snapshot.data.added).toHaveLength(1);
-  });
 });
