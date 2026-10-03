@@ -5,7 +5,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-
+// fail-before-exempt: fixture update; existing approval-binding guard now races durable namespace creation, which already holds on the base.
 import { createServer, type ToolDefinition } from "../../src/router.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
 import { StateStore } from "../../src/cognitive/state-store.js";

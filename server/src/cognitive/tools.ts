@@ -1898,7 +1898,8 @@ export function createCognitiveTools(
             // preserve the fixed remediation that router.ts may safely surface.
             if (isNamespaceDiscoveryLimitError(error)) throw error;
             await denyNamespaceAccess("state_export", "state_export");
-            throw new Error("namespace_ownership_ambiguous");
+            // The cause stays server-side; the agent sees only the fixed message.
+            throw new Error("namespace_ownership_ambiguous", { cause: error });
           }
         } else {
           namespaces = await sessionOwnedExportNamespaces();
