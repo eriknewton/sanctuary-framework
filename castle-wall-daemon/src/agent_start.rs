@@ -350,7 +350,7 @@ pub fn credential_verdict(uid: u32, snapshot: &CredentialSnapshot) -> Credential
 /// file is under 2 KiB, so 16 KiB (1024 * 16) is eight times that; anything
 /// larger is refused as malformed rather than read without bound.
 #[cfg(target_os = "linux")]
-const MAX_PROC_STATUS_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_PROC_STATUS_BYTES: u64 = 16 * 1024;
 
 #[cfg(target_os = "linux")]
 fn read_snapshot() -> CredentialSnapshot {

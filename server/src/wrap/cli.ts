@@ -3851,7 +3851,7 @@ export async function runWrap(
   // agent config. User-supplied `--passphrase` is treated as a one-time
   // setter - we persist it into Keychain/fallback and the launcher
   // re-resolves it at runtime via the same path everyone else uses.
-  // See SEC-061 in Archive/DELTA_REVIEW_V0.9.0_RC1.md.
+  // Regression guard for private finding SEC-061 (v0.9.0-rc1 delta review).
   let passphraseLocation: string;
   let passphraseSource: string;
   // v1.1.2 hotfix (Finding V): capture the passphrase value so the

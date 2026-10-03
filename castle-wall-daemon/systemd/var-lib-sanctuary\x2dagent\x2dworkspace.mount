@@ -1,0 +1,13 @@
+# Must match WORKSPACE_PATH and budgets in src/linux_install/contract.rs and
+# the complete mount listing in tests/agent_unit.rs. Limits are bounded-v1 policy.
+# Failure mode: a missing/failed mount fails the agent dependency; DirectoryMode
+# leaves no U-writable backing directory when tmpfs is absent.
+[Unit]
+Description=Sanctuary bounded agent workspace
+
+[Mount]
+What=tmpfs
+Where=/var/lib/sanctuary-agent-workspace
+Type=tmpfs
+Options=size=64M,nr_inodes=4096,mode=1777,nosuid,nodev,noexec
+DirectoryMode=0755
