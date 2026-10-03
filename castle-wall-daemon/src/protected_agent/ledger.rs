@@ -458,6 +458,35 @@ impl Ledger {
         })
     }
 
+    /// Test-only reopen of a ledger whose previous handle was just dropped.
+    /// Claude R1 for PR #1492 noted flock is released synchronously with the
+    /// final file-description close; the plausible transient holder is a
+    /// current_exe() child spawned by another test thread inheriting this fd
+    /// between fork/clone and exec, before O_CLOEXEC closes it. This retries
+    /// ONLY `WouldBlock`, for at most 50 x 10 ms = 500 ms, and panics on any
+    /// other error or if the lock is still held after that. A real second owner
+    /// still fails the test, just 500 ms later. Production `open` keeps its
+    /// one-shot refusal on purpose: the owner composition root allows exactly
+    /// one ledger handle.
+    #[cfg(test)]
+    pub(crate) fn open_after_release_for_test(path: &Path) -> Ledger {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match Ledger::open(path) {
+                Ok(ledger) => return ledger,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("open test ledger: {err:?}"),
+            }
+        }
+        panic!(
+            "open test ledger after transient flock contention: {:?}",
+            last_err
+        );
+    }
+
     /// Reproduces the state a failed row write or failed fsync leaves behind:
     /// an append was attempted and this handle cannot say whether it landed.
     /// It exists so the durability gate can be shown to refuse in that state,
@@ -571,6 +600,12 @@ mod tests {
     use super::*;
     use crate::protected_agent::receipt::{deterministic_unit_name, ReceiptBody};
     use ed25519_dalek::SigningKey;
+    use std::{io::ErrorKind, thread, time::Duration};
+
+    fn open_ledger_for_test(path: &Path) -> Ledger {
+        Ledger::open_after_release_for_test(path)
+    }
+
     fn fixture() -> (Generation, ManagerIdentity) {
         let mut g = Generation {
             boot_id: "boot".into(),
@@ -609,7 +644,7 @@ mod tests {
         assert!(l.prepared_ack(&g, &m).is_err());
         drop(l);
         // The anchor survives the reopen, and stays open...
-        let mut l = Ledger::open(&path).unwrap();
+        let mut l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].is_open());
         // ...but the CREATE transaction that could have completed it is over,
         // so the record is terminal Prepared rather than resumable.
@@ -618,9 +653,43 @@ mod tests {
             .is_err());
         assert!(l.prepared_ack(&g, &m).is_err());
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].manager.is_none());
         assert!(l.prepared_ack(&g, &m).is_err());
+    }
+
+    #[test]
+    fn test_reopen_waits_through_transient_same_process_flock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let held = Ledger::open(&path).unwrap();
+        // Same-process exclusion must still hold: a one-shot open against a
+        // live handle refuses with WouldBlock, so the helper below can only
+        // succeed because the holder actually released.
+        let refused = Ledger::open(&path)
+            .err()
+            .expect("a second live handle must refuse");
+        assert_eq!(refused.kind(), ErrorKind::WouldBlock);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        let reopened = open_ledger_for_test(&path);
+        drop(reopened);
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "open test ledger after transient flock contention")]
+    fn reopen_helper_still_panics_when_a_real_second_owner_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let _held = Ledger::open(&path).unwrap();
+        // The transient witness releases after 50 ms; the helper waits 500 ms,
+        // a 10x margin, so holding through the whole budget proves the helper
+        // did not turn a real second owner into success.
+        let _never_reopened = open_ledger_for_test(&path);
     }
 
     #[test]
@@ -692,7 +761,7 @@ mod tests {
             .accept_attempt(&g.unit_name, "a", "e".repeat(64).as_str(), Some(&hash))
             .is_err());
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].is_open());
         assert_eq!(l.state.generations[&g.unit_name].attempts.len(), 1);
     }
@@ -755,7 +824,7 @@ mod tests {
                 .unwrap();
         l.record_outcome(completion.clone()).unwrap();
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(!l.state.generations[&g.unit_name].is_open());
         assert_eq!(l.state.generations[&g.unit_name].outcome, Some(completion));
     }
