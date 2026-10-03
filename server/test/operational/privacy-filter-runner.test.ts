@@ -12,7 +12,7 @@ import {
 import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-
+// fail-before-exempt: test-only deadline robustness; the first exec of a freshly written mock can exceed 500 ms under macOS executable scanning.
 describe("privacy filter runtime runner", () => {
   let tempDir: string;
 
@@ -176,6 +176,6 @@ function opfConfig(
     mode: "opf",
     fail_mode: failMode,
     command,
-    timeout_ms: 500,
+    timeout_ms: 10_000, // 10 s >> measured 0.67 to 1.2 s first exec of a new mock script under macOS scanning; no case here exercises the timeout path.
   };
 }
