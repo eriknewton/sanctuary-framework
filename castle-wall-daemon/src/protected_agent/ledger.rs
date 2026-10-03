@@ -458,10 +458,6 @@ impl Ledger {
         })
     }
 
-    /// Reproduces the state a failed row write or failed fsync leaves behind:
-    /// an append was attempted and this handle cannot say whether it landed.
-    /// It exists so the durability gate can be shown to refuse in that state,
-    /// and it can only ever make the ledger more refusing.
     /// Test-only reopen of a ledger whose previous handle was just dropped.
     /// Under CI load the kernel can still report the dropped handle's flock as
     /// held for a moment, so this retries ONLY `WouldBlock`, for at most
@@ -488,6 +484,10 @@ impl Ledger {
         );
     }
 
+    /// Reproduces the state a failed row write or failed fsync leaves behind:
+    /// an append was attempted and this handle cannot say whether it landed.
+    /// It exists so the durability gate can be shown to refuse in that state,
+    /// and it can only ever make the ledger more refusing.
     #[cfg(test)]
     fn mark_durability_uncertain(&mut self) {
         self.uncertain = true;
