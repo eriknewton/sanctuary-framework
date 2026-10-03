@@ -79,7 +79,7 @@ const sourceReads = new Map([
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
   "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
   "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings"
-].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0 }]; }));
+].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0 }]; }));
 const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
 function readKey(url) {
   const parsed = new URL(url, location.origin);
@@ -87,7 +87,8 @@ function readKey(url) {
   return parsed.origin + parsed.pathname + parsed.search;
 }
 function sourceRead(path) { return sourceReads.get(readKey(path)); }
-function sourceLoaded(path) { const read = sourceRead(path); return !!read && read.state === "state_LOADED"; }
+let liveUpdatesStopped = false;
+function sourceLoaded(path) { const read = sourceRead(path); return !liveUpdatesStopped && !!read && read.state === "state_LOADED"; }
 function failSource(path, error) {
   const read = sourceRead(path);
   if (!read) return;
@@ -290,6 +291,7 @@ function readResponse(url, init, deadlineMs) {
   const key = readKey(url);
   if (pendingReads.has(key)) return pendingReads.get(key);
   const source = sourceReads.get(key);
+  const revision = source && source.revision;
   if (source && source.state === "state_FAILED" && Date.now() < source.nextReadAt) {
     const error = new Error(source.error); error.status = source.status; return Promise.reject(error);
   }
@@ -319,6 +321,8 @@ function readResponse(url, init, deadlineMs) {
     return { ok: res.ok, status: res.status, json: async function () { return body; } };
   })();
   const result = Promise.race([read, expired]).then(function (res) {
+    // A response admitted before an event or decision cannot publish over its trailing read.
+    if (source && source.revision !== revision) throw new Error("A newer refresh is pending.");
     if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
     return res;
   }, function (error) {
@@ -356,12 +360,12 @@ function readLabel(path) {
 }
 function renderSourceRead(path) {
   const read = sourceRead(path);
-  if (!read || read.state === "state_LOADED") return "";
+  if (!read || (!liveUpdatesStopped && read.state === "state_LOADED")) return "";
   const label = readLabel(path);
   const loading = read.state === "state_LOADING";
   return '<section class="card" data-source="' + escHtml(path) + '">' +
     '<p role="status" aria-live="polite">' + escHtml(label) + ': Unknown. ' +
-    escHtml(loading ? "Read in progress." : (read.error || "Current data is unavailable.")) + '</p>' +
+    escHtml(liveUpdatesStopped ? "Live updates stopped. Retry to resume." : loading ? "Read in progress." : (read.error || "Current data is unavailable.")) + '</p>' +
     '<button class="btn" data-action="retry-panel" data-read="' + escHtml(path) +
     '" aria-label="Retry ' + escHtml(label) + '" aria-busy="' + loading + '">Retry</button></section>';
 }
@@ -959,14 +963,13 @@ function renderMain() {
   let focus = null;
   if (
     active && (!main.contains || main.contains(active)) &&
-    (active.tagName === "INPUT" || active.tagName === "BUTTON") &&
+    active.tagName === "INPUT" &&
+    ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 &&
     typeof active.getAttribute === "function" &&
     active.getAttribute("data-action")
   ) {
     focus = {
       action: active.getAttribute("data-action"),
-      read: active.getAttribute("data-read"),
-      tag: active.tagName.toLowerCase(),
       agentId: active.getAttribute("data-agent-id"),
       selectionStart: active.selectionStart,
       selectionEnd: active.selectionEnd
@@ -1024,6 +1027,8 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
+  // Stopped live updates invalidate every live view, including previously loaded clears.
+  if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
   // Skip the innerHTML write when the rendered output is byte-identical
   // to the last write on the same route. Preserves the existing DOM
   // tree, focus, and any active text selection during no-op poll
@@ -1059,11 +1064,9 @@ function renderMain() {
     }
   }
   if (focus) {
-    let sel = focus.tag + '[data-action="' + escCssAttr(focus.action) + '"]';
-    if (focus.read) sel += '[data-read="' + escCssAttr(focus.read) + '"]';
+    let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
     if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
     const el = main.querySelector(sel);
-    if (!el && focus.read) restoreRetryFocus(active, main);
     if (el && typeof el.focus === "function") {
       try {
         el.focus();
@@ -1222,6 +1225,7 @@ function renderAgentAttestationBadge(status) {
   if (status === "active") { cls = "verified"; label = "protected"; }
   else if (status === "locked_down") { cls = "unverified"; label = "locked"; }
   else if (status === "error") { cls = "unverified"; label = "unverified"; }
+  else if (status === "unknown") { cls = "neutral"; label = "Unknown"; }
   else { cls = "degraded"; label = "degraded"; }
   return '<span class="att-agent ' + cls + '" title="Agent attestation"><span class="mark"></span>' + escHtml(label) + '</span>';
 }
@@ -1473,10 +1477,10 @@ function renderAgentsList() {
       '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary protect</span></div>' +
     '</div>';
   const count = state.agents.length;
-  const subCopy = count + ' protected. Click one to inspect its activity, policy, and pending approvals.';
+  const subCopy = count + ' agents. Click one to inspect its activity, policy, and pending approvals.';
   const rows = state.agents.map(function (a) {
     const map = agentDisplayStatus(a);
-    const dotCls = agentStateClass(a.status);
+    const dotCls = agentStateClass(agentEvidenceStatus(a));
     const initials = agentInitials(a.agent_id);
     const role = escHtml(a.harness) + (a.model_provider && a.model_provider.model_id ? ' · ' + escHtml(a.model_provider.model_id) : '');
     const isSelected = state.selectedAgentId === a.agent_id;
@@ -1492,7 +1496,7 @@ function renderAgentsList() {
         '<span class="state-dot ' + dotCls + '"></span>' +
         escHtml(map.label) +
       '</span>' +
-      renderAgentAttestationBadge(a.status) +
+      renderAgentAttestationBadge(agentEvidenceStatus(a)) +
       '<span class="agent-last">' + escHtml(relTimeFromIso(a.last_activity_at)) + '</span>' +
       '</div>';
   }).join("\n");
@@ -1577,8 +1581,8 @@ function renderAgentInspectPanel(agent) {
   // shared card chrome; .inspect-pane overrides .card padding so the
   // inspect-head and inspect-body control their own spacing per design.
   if (panel) {
-    const dotCls = agentStateClass(agent.status);
-    const stateMap = STATUS_MAP[agent.status] || STATUS_MAP.unknown;
+    const dotCls = agentStateClass(agentEvidenceStatus(agent));
+    const stateMap = agentDisplayStatus(agent);
     const activity = (panel.recent_activity || []).slice(0, 20);
     const activityHtml = activity.length
       ? '<div class="timeline">' +
@@ -1630,7 +1634,7 @@ function renderAgentInspectPanel(agent) {
         '<div class="row1">' +
           '<div class="agent-glyph">' + escHtml(agentInitials(agent.agent_id)) + '</div>' +
           '<h3>' + escHtml(agent.agent_id) + '</h3>' +
-          '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agent.status) + '</span>' +
+          '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agentEvidenceStatus(agent)) + '</span>' +
         '</div>' +
         '<div class="meta">' +
           '<span class="pill ' + (dotCls === "live" ? "tone-verified" : "tone-degraded") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +
@@ -1657,7 +1661,7 @@ function renderAgentInspectPanel(agent) {
           '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
           '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
           modelLine +
-          '<div class="policy-line"><span class="k">Protected since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Wrapped since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
         '</div>' +
         '<p class="muted" style="margin-top:10px;font-size:12px;">' +
           '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
@@ -3025,10 +3029,16 @@ function evidenceCurrent(evidence) {
   const windowMs = evidence && Number(evidence.freshness_window_ms);
   return Number.isFinite(timestamp) && Number.isFinite(windowMs) && windowMs > 0 && Date.now() >= timestamp && Date.now() - timestamp <= Math.min(windowMs, SEAL_FRESHNESS_MAX_MS);
 }
+function agentEvidenceStatus(agent) {
+  if (!sourceLoaded(HUB + "/agents")) return "unknown";
+  if (agent.status !== "active") return agent.status;
+  // Only this agent's loaded posture evidence can vouch for protection; roster or machine timestamps cannot.
+  const home = sourceLoaded("/api/posture/home") && state.posture.home;
+  const evidence = home && (home.agents || []).find(function (row) { return row.agent_id === agent.agent_id; });
+  return evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence) ? "active" : "unknown";
+}
 function agentDisplayStatus(agent) {
-  // A roster lifecycle flag cannot stand in for this agent's current enforcement evidence.
-  if (!sourceLoaded(HUB + "/agents") || (agent.status === "active" && !evidenceCurrent(agent))) return STATUS_MAP.unknown;
-  return STATUS_MAP[agent.status] || STATUS_MAP.unknown;
+  return STATUS_MAP[agentEvidenceStatus(agent)] || STATUS_MAP.unknown;
 }
 function postureWallLabel(armState) {
   if (!sourceLoaded("/api/posture/home") || (armState === "armed" && !evidenceCurrent(state.posture.home && state.posture.home.castle_wall))) return { cls: "pill", text: "Unknown" };
@@ -3320,17 +3330,44 @@ function loadPanel(job) {
   pendingPanels.set(job, pending);
   return pending;
 }
+const trailingPanels = new Map();
+function queuePanel(job) {
+  // One queued read per fixed panel coalesces bursts; every event invalidates older admitted bytes.
+  job.paths.forEach(function (path) {
+    sourceReads.forEach(function (read, key) {
+      if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) {
+        read.revision++; read.state = "state_LOADING"; read.nextReadAt = 0;
+      }
+    });
+  });
+  if (trailingPanels.has(job)) return trailingPanels.get(job);
+  const queued = Promise.resolve(pendingPanels.get(job)).then(function () {
+    trailingPanels.delete(job); // An event during the new read must queue a subsequent read.
+    job.paths.forEach(function (path) {
+      sourceReads.forEach(function (read, key) { if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) read.nextReadAt = 0; });
+    });
+    return loadPanel(job);
+  });
+  trailingPanels.set(job, queued);
+  return queued;
+}
 async function fetchAll(afterMutation) {
   const jobs = panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; });
-  if (afterMutation) {
-    // A decision must not reuse a snapshot admitted before the decision finished.
-    await Promise.all(Array.from(pendingPanels.values()));
-    sourceReads.forEach(function (read) { read.nextReadAt = 0; });
-  }
   const critical = jobs.filter(function (job) { return job.load === fetchSovereignty || job.load === fetchPostureHome; });
-  await Promise.all(critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; })).map(loadPanel));
+  const pending = critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; })).map(afterMutation ? queuePanel : loadPanel);
+  if (afterMutation) rerender();
+  await Promise.all(pending);
 }
 function retryPanel(path) {
+  if (liveUpdatesStopped) {
+    // A manual restart must reread every source before old snapshots may look current again.
+    sourceReads.forEach(function (read) { read.revision++; read.state = "state_UNREAD"; read.nextReadAt = 0; });
+    liveUpdatesStopped = false;
+    pollingStarted = false;
+    const pending = fetchAll(true);
+    connectStream();
+    return pending;
+  }
   const source = sourceRead(path);
   if (source) source.nextReadAt = 0;
   if (readKey(path) === readKey(POLICY + "/current")) return loadPolicyView();
@@ -3348,7 +3385,7 @@ async function refreshPanel(path) {
   return retryPanel(path);
 }
 function refreshAutoTriggerPanels() {
-  return Promise.all(panelJobs.filter(function (job) { return job.paths[0].indexOf(AUTO_TRIGGER) === 0; }).map(loadPanel));
+  return Promise.all(panelJobs.filter(function (job) { return job.paths[0].indexOf(AUTO_TRIGGER) === 0; }).map(queuePanel));
 }
 
 async function fetchHoneypotState() {
@@ -3401,6 +3438,16 @@ async function fetchSovereignty() {
 // approve/deny or mutation is issued here. A read failure leaves
 // state.posture.home null and the Posture screen shows an honest "could not
 // load" state, never fabricated data.
+function scheduleHomeFreshness() {
+  clearTimeout(homeFreshnessTimer);
+  const home = state.posture.home;
+  if (!home) return;
+  // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
+  const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
+    return Date.parse(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
+  }); // One millisecond moves past the inclusive freshness boundary.
+  if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
+}
 async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
@@ -3416,12 +3463,7 @@ async function fetchPostureHome() {
       body.anomaly_findings = state.posture.anomalies || [];
       body.anomaly_findings_unknown = state.posture.anomaliesUnknown !== false;
       state.posture.home = body;
-      clearTimeout(homeFreshnessTimer);
-      const observed = Date.parse(body.castle_wall.last_enforcement_evidence_at);
-      const windowMs = Math.min(Number(body.castle_wall.freshness_window_ms), SEAL_FRESHNESS_MAX_MS);
-      if (Number.isFinite(observed) && windowMs > 0 && observed <= Date.now() && observed + windowMs >= Date.now()) {
-        homeFreshnessTimer = setTimeout(rerender, observed + windowMs - Date.now() + 1);
-      }
+      scheduleHomeFreshness();
       state.posture.homeError = null;
     }
   } catch (e) {
@@ -4033,14 +4075,10 @@ function connectStream() {
         const e = JSON.parse(ev.data);
         if (state.seenEventIds.has(e.entry_id)) return;
         state.seenEventIds.add(e.entry_id);
-        state.activity = [e].concat(state.activity).slice(0, 200);
-        if (e.category === "privacy") state.privacyEvents = [e].concat(state.privacyEvents).slice(0, 200);
-        if (e.category === "handoff") state.handoffEvents = [e].concat(state.handoffEvents).slice(0, 200);
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
-          return;
         }
-        rerender();
+        void fetchAll(true);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("inbox", function (ev) {
@@ -4048,16 +4086,12 @@ function connectStream() {
         const item = JSON.parse(ev.data);
         if (isPendingApprovalsRedactedMarker(item)) {
           setInboxRedacted(item);
-          rerender();
+          void fetchAll(true);
           return;
         }
         if (state.seenEventIds.has(item.item_id)) return;
         state.seenEventIds.add(item.item_id);
-        // Replace-or-prepend by item_id.
-        const existing = state.inbox.findIndex(function (x) { return x.item_id === item.item_id; });
-        if (existing >= 0) state.inbox[existing] = item;
-        else state.inbox = [item].concat(state.inbox);
-        rerender();
+        void fetchAll(true);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("agent_status", function (ev) {
@@ -4070,24 +4104,29 @@ function connectStream() {
         rerender();
       } catch (err) { /* ignore */ }
     });
-    es.addEventListener("approval", function () { fetchAll().then(rerender); });
+    es.addEventListener("approval", function () { void fetchAll(true); });
     es.onerror = function () {
       try { es && es.close(); } catch (e) { /* ignore */ }
       es = null;
-      // Reconnect with refetch-and-restore: pause, refetch full state,
-      // resume SSE. Race-safe: any inbox/activity events that arrive
-      // during refetch are deduped by event_id via seenEventIds.
-      if (reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) return;
+      // The bounded recovery budget ends visibly; no loaded clear stays current after give-up.
+      if (reconnectTimer) return;
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { stopLiveUpdates(); return; }
       const delay = 1000 * Math.pow(2, reconnectAttempts++);
       reconnectTimer = setTimeout(async function () {
         reconnectTimer = null;
-        await fetchAll();
+        await fetchAll(true);
         rerender();
         void open();
       }, delay);
     };
   }
   void open();
+}
+
+function stopLiveUpdates() {
+  liveUpdatesStopped = true;
+  sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
+  rerender();
 }
 
 // Polling fallback compiled-in but not user-facing. Activated by build-time
@@ -4100,8 +4139,8 @@ function schedulePolling() {
   let attempts = 0;
   const MAX_POLL_ATTEMPTS = 5; // Bound automatic recovery work; panel Retry remains available.
   function poll() {
-    if (attempts >= MAX_POLL_ATTEMPTS) return;
-    setTimeout(async function () { await fetchAll(); rerender(); poll(); }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, attempts++)));
+    if (attempts >= MAX_POLL_ATTEMPTS) { stopLiveUpdates(); return; }
+    setTimeout(async function () { await fetchAll(true); rerender(); poll(); }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, attempts++)));
   }
   poll();
 }
@@ -4386,23 +4425,7 @@ document.addEventListener("click", function (ev) {
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
-    // Wave 1: when the click is on a rail approval-queue tile, animate the
-    // tile out for a click-to-clear feel. The resolve itself is the SAME
-    // token-gated onInboxAction path the inbox rows use; the animation is
-    // cosmetic and never bypasses the request. A subsequent fetchAll +
-    // rerender re-renders the rail authoritatively from server state.
-    if (sub === "approve" || sub === "deny") {
-      const tile = rawTgt.closest(".approval-tile");
-      if (tile) {
-        tile.classList.add("leaving");
-        const countEl = document.getElementById("queue-count");
-        if (countEl) {
-          const remaining = document.querySelectorAll(".approval-tile:not(.leaving)").length;
-          countEl.textContent = String(remaining);
-          if (remaining === 0) countEl.classList.add("zero");
-        }
-      }
-    }
+    // Only a loaded read after the decision may remove a tile or change its queue count.
     return void onInboxAction(itemId, sub);
   }
   if (action.indexOf("agent-") === 0 && agentId) {

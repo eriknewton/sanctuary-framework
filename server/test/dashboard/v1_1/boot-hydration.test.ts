@@ -31,7 +31,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
     },
   });
   runInContext(getClientScript(), context);
-  return { calls, urls, main, fortress, streams, context, retry: () => listeners.click({ target: new Element() }) };
+  return { calls, urls, main, fortress, streams, context, click: (target: unknown) => listeners.click({ target }), retry: () => listeners.click({ target: new Element() }) };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => vi.useRealTimers());
@@ -230,10 +230,10 @@ describe("dashboard bounded independent hydration", () => {
     expect(regions.length).toBeGreaterThan(0);
     for (const region of regions) expect(region[2]).not.toContain("<button");
   });
-  it("restores the same focused Retry after replacing panel content", async () => {
+  it("does not capture Retry buttons during main content replacement", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/posture/home": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     runInContext('let focused = false; document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : key === "data-read" ? "/api/posture/home" : null; } }; document.getElementById("main").querySelector = function (selector) { return selector.includes("retry-panel") && selector.includes("data-read") ? { focus: function () { focused = true; } } : null; }; state.posture.homeError = "new error"; rerender()', h.context);
-    expect(runInContext('focused', h.context)).toBe(true);
+    expect(runInContext('focused', h.context)).toBe(false);
   });
   it("fresh home evidence expires without a refresh and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
@@ -324,6 +324,118 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('state.route = "agents"; rerender()', h.context);
     expect(h.main.innerHTML).not.toMatch(/agent-state[^]*?Protected/);
     expect(h.main.innerHTML).toContain("Unknown");
+  });
+
+});
+
+
+/** D5: decisions, focus, evidence and live refresh keep their read-state contract. */
+describe("D5 closure", () => {
+  it.each(["approve", "deny"])("keeps the queue visible while %s is pending or rejected", async action => {
+    vi.useFakeTimers(); let reject!: (reason: Error) => void;
+    const h = harness({ ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }) }); await settle();
+    runInContext(`
+      let hidden = false;
+      const count = { textContent: "1", classList: { add() {} } };
+      const get = document.getElementById;
+      document.getElementById = id => id === "queue-count" ? count : get(id);
+      const tile = { classList: { add() { hidden = true; } } };
+      const button = new Element();
+      button.getAttribute = key => key === "data-action" ? "inbox-${action}" : key === "data-item-id" ? "fixture" : null;
+      button.closest = selector => selector === ".approval-tile" ? tile : null;
+    `, h.context);
+    h.click(runInContext('button', h.context)); await settle();
+    expect(runInContext('count.textContent', h.context)).toBe("1"); expect(runInContext('hidden', h.context)).toBe(false);
+    reject(new Error("fixture rejection")); await settle();
+    expect(runInContext('count.textContent', h.context)).toBe("1"); expect(runInContext('hidden', h.context)).toBe(false);
+  });
+  it.each(["BUTTON", "INPUT"])("never restores a decision %s onto another inbox row", async tag => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      let focusedItem = null;
+      state.route = "activity";
+      state.inbox = [{ item_id: "first", status: "pending" }, { item_id: "second", status: "pending" }];
+      document.activeElement = { tagName: "${tag}", type: "checkbox", getAttribute: key => key === "data-action" ? "inbox-deny" : key === "data-item-id" ? "second" : null };
+      document.getElementById("main").querySelector = () => ({ focus() { focusedItem = "first"; } });
+      rerender();
+    `, h.context);
+    expect(runInContext('focusedItem', h.context)).toBeNull();
+  });
+  it("requires loaded matching posture evidence for all protective agent chrome", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      state.agents = [{ agent_id: "fixture", status: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60000 }];
+      state.selectedAgentId = "fixture";
+      state.chat.inspect.panelByAgentId.fixture = { recent_activity: [], pending_approvals: [] };
+      state.route = "agents"; rerender();
+    `, h.context);
+    const rendered = () => h.main.innerHTML + runInContext('renderAgentInspectPanel(state.agents[0])', h.context);
+    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    runInContext(`state.posture.home.agents = [{ agent_id: "other", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60000 }]; rerender()`, h.context);
+    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    runInContext('state.posture.home.agents[0].agent_id = "fixture"; rerender()', h.context);
+    expect(rendered()).toContain('state-dot live'); expect(rendered()).toMatch(/protected/i);
+    runInContext('sourceRead("/api/posture/home").state = "state_LOADING"; rerender()', h.context);
+    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    runInContext('sourceRead("/api/posture/home").state = "state_LOADED"; state.posture.home.agents[0].last_enforcement_evidence_at = "2000-01-01T00:00:00Z"; rerender()', h.context);
+    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+  });
+  it.each(["stream", "polling"])("shows stopped %s updates on every route until Retry", async mode => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    if (mode === "stream") {
+      for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); }
+    } else { runInContext('schedulePolling()', h.context); await vi.advanceTimersByTimeAsync(180_000); }
+    for (const route of ["dashboard", "activity", "posture", "agents", "agent-detail", "policy", "auto-trigger", "intelligence", "attestation", "honeypot", "privacy", "coordination", "health", "exit-drill"]) {
+      runInContext('state.route = "' + route + '"; rerender()', h.context);
+      expect(h.main.innerHTML).toContain("Live updates stopped"); expect(h.main.innerHTML).toContain(">Retry</button>");
+      expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
+      expect(runInContext('sourceLoaded(HUB + "/inbox")', h.context)).toBe(false);
+    }
+    const before = h.streams.length; h.retry(); await settle();
+    expect(h.streams.length).toBe(before + 1); expect(h.main.innerHTML).not.toContain("Live updates stopped");
+    expect(h.fortress.innerHTML).toContain("Nothing waiting on you");
+  });
+  it.each(["approval", "inbox", "activity", "reconnect", "polling"])("%s queues a fresh read behind an older read", async trigger => {
+    vi.useFakeTimers(); let reads = 0; let pollingBoot = trigger === "polling"; let old!: (value: unknown) => void; let fresh!: (value: unknown) => void;
+    const h = harness({ "/api/hub/inbox": () => pollingBoot ? response({ data: { items: [] } }) : ++reads === 1 ? new Promise(r => { old = r; }) : new Promise(r => { fresh = r; }) }); await settle();
+    if (trigger === "reconnect") { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(1000); }
+    else if (trigger === "polling") { runInContext('schedulePolling()', h.context); await vi.advanceTimersByTimeAsync(1000); pollingBoot = false; runInContext('void fetchAll()', h.context); await settle(); await vi.advanceTimersByTimeAsync(DEADLINE_MS - 1000); }
+    else h.streams.at(-1)!.listeners[trigger]({ data: JSON.stringify({ item_id: "new", entry_id: "new", status: "pending" }) });
+    await settle(); old(response({ data: { items: [] } })); await settle();
+    expect(reads).toBe(2); expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
+    expect(runInContext('sourceLoaded(HUB + "/inbox")', h.context)).toBe(false);
+    fresh(response({ data: { items: [{ item_id: "new", status: "pending" }] } })); await settle();
+    expect(runInContext('state.inbox.map(item => item.item_id)', h.context)).toEqual(["new"]);
+    expect(runInContext('sourceLoaded(HUB + "/inbox")', h.context)).toBe(true);
+  });
+  it("expires agent badges without borrowing the wall freshness timer", async () => {
+    vi.useFakeTimers();
+    const h = harness({
+      "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }),
+      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 }] }),
+    }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
+    expect(h.main.innerHTML).toContain('state-dot live');
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(h.main.innerHTML).not.toMatch(/protected|state-dot live|att-agent verified/i);
+  });
+  it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
+    vi.useFakeTimers(); const releases: ((value: unknown) => void)[] = [];
+    const h = harness({ "/api/hub/inbox": () => new Promise(r => releases.push(r)) }); await settle();
+    const event = () => h.streams.at(-1)!.listeners.approval({ data: "{}" });
+    for (let i = 0; i < 20; i++) event();
+    await settle(); expect(releases).toHaveLength(1);
+    releases[0](response({ data: { items: [] } })); await settle(); expect(releases).toHaveLength(2);
+    event(); releases[1](response({ data: { items: [] } })); await settle();
+    expect(releases).toHaveLength(3); expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
+    releases[2](response({ data: { items: [{ item_id: "latest", status: "pending" }] } })); await settle();
+    expect(runInContext('state.inbox[0].item_id', h.context)).toBe("latest");
+  });
+  it("does not publish an old clear while the trailing read fails", async () => {
+    vi.useFakeTimers(); let reads = 0; let release!: (value: unknown) => void;
+    const h = harness({ "/api/hub/inbox": () => ++reads === 1 ? new Promise(r => { release = r; }) : response({}, 500) }); await settle();
+    h.streams.at(-1)!.listeners.approval({ data: "{}" }); release(response({ data: { items: [] } })); await settle();
+    expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you"); expect(h.fortress.innerHTML).toContain("Retry Decisions");
+    expect(runInContext('sourceRead(HUB + "/inbox").state', h.context)).toBe("state_FAILED");
   });
 
 });
