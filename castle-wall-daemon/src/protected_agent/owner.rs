@@ -2128,7 +2128,7 @@ mod tests {
         // Both acceptances went through the ledger, so both replay from disk in
         // a fresh handle: the answers reported rows that are actually there, and
         // the record stays OPEN because nothing in this slice closes it.
-        let replayed = Ledger::open(&ledger_path).unwrap();
+        let replayed = Ledger::open_after_release_for_test(&ledger_path);
         let entry = &replayed.state.generations[&g.unit_name];
         assert_eq!(entry.attempts.len(), 2);
         assert!(entry.is_open());

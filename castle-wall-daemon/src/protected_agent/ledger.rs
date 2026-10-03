@@ -462,6 +462,32 @@ impl Ledger {
     /// an append was attempted and this handle cannot say whether it landed.
     /// It exists so the durability gate can be shown to refuse in that state,
     /// and it can only ever make the ledger more refusing.
+    /// Test-only reopen of a ledger whose previous handle was just dropped.
+    /// Under CI load the kernel can still report the dropped handle's flock as
+    /// held for a moment, so this retries ONLY `WouldBlock`, for at most
+    /// 50 x 10 ms = 500 ms, and panics on any other error or if the lock is
+    /// still held after that. A real second owner still fails the test, just
+    /// 500 ms later. Production `open` keeps its one-shot refusal on purpose:
+    /// the owner composition root allows exactly one ledger handle.
+    #[cfg(test)]
+    pub(crate) fn open_after_release_for_test(path: &Path) -> Ledger {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match Ledger::open(path) {
+                Ok(ledger) => return ledger,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("open test ledger: {err:?}"),
+            }
+        }
+        panic!(
+            "open test ledger after transient flock contention: {:?}",
+            last_err
+        );
+    }
+
     #[cfg(test)]
     fn mark_durability_uncertain(&mut self) {
         self.uncertain = true;
@@ -574,21 +600,7 @@ mod tests {
     use std::{io::ErrorKind, thread, time::Duration};
 
     fn open_ledger_for_test(path: &Path) -> Ledger {
-        let mut last_err = None;
-        for _ in 0..50 {
-            match Ledger::open(path) {
-                Ok(ledger) => return ledger,
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    last_err = Some(err);
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => panic!("open test ledger: {err:?}"),
-            }
-        }
-        panic!(
-            "open test ledger after transient flock contention: {:?}",
-            last_err
-        );
+        Ledger::open_after_release_for_test(path)
     }
 
     fn fixture() -> (Generation, ManagerIdentity) {
@@ -648,6 +660,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger");
         let held = Ledger::open(&path).unwrap();
+        // Same-process exclusion must still hold: a one-shot open against a
+        // live handle refuses with WouldBlock, so the helper below can only
+        // succeed because the holder actually released.
+        let refused = Ledger::open(&path).err().expect("a second live handle must refuse");
+        assert_eq!(refused.kind(), ErrorKind::WouldBlock);
         let releaser = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             drop(held);

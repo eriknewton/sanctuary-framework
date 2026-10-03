@@ -64,32 +64,46 @@ export function testRunMarkerPath(root: string): string {
   return join(root, TEST_RUN_MARKER_FILENAME);
 }
 
-// A run token is named `<pid>-...` after the vitest main process that owns it.
-// A run that crashed before teardown leaves its token behind; with a marker
-// directory that token would keep the marker alive forever, so every later
-// run prunes tokens whose owning process is gone. EPERM means the process
-// exists under another uid, so only ESRCH counts as dead.
-function runTokenOwnerIsGone(token: string): boolean {
-  const pid = Number.parseInt(token.split("-", 1)[0] ?? "", 10);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
+// A run that crashed before teardown leaves its token behind, and with a
+// marker directory that token would keep the marker alive forever. Every run
+// therefore prunes tokens older than MAX_TEST_RUN_AGE_MS at setup.
+//
+// WHY AGE AND NOT PID LIVENESS. The marker exists to stop a scrubbed child of a
+// LIVE run from reaching the real credential binary, so pruning a live run's
+// token is the one mistake that reopens the breach. A pid probe can make it:
+// `kill(pid, 0)` is pid-namespace-local (a live owner in another namespace
+// reads as gone) and the token names only the orchestrator, not workers that
+// outlive it. Age cannot prune any run younger than the ceiling. The cost is
+// that a crash leftover keeps this checkout reading as "under test" (fail
+// safe: keychain work refuses) until a run starts after the ceiling, or until
+// someone deletes the directory.
+//
+// 6 h = MAX_TEST_RUN_AGE_MS: the full suite measures 8 to 19 minutes (AGENTS.md)
+// and the slowest observed run under load was about 25 minutes, so a run older
+// than 14x that is hung, not working.
+export const MAX_TEST_RUN_AGE_MS = 6 * 60 * 60 * 1000;
 
-function pruneDeadRunTokens(markerPath: string): void {
+function pruneStaleRunTokens(markerPath: string, nowMs: number): void {
   for (const token of readdirSync(markerPath)) {
-    if (!runTokenOwnerIsGone(token)) continue;
+    const tokenPath = join(markerPath, token);
     try {
-      unlinkSync(join(markerPath, token));
+      if (nowMs - statSync(tokenPath).mtimeMs <= MAX_TEST_RUN_AGE_MS) continue;
+      unlinkSync(tokenPath);
     } catch (err) {
+      // A concurrent teardown removed it first; nothing left to prune.
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
 }
+
+// An overlapping run's teardown can remove the directory between our mkdir and
+// our token write (it saw the directory empty). That surfaces as ENOENT on the
+// write, or as EINVAL from Node's recursive mkdir when the directory is created
+// and removed concurrently (measured on macOS with three or more overlapping
+// runs). Each retry recreates the directory; 5 attempts is a bound, not a
+// tuned value: a failure after it throws, and vitest does not start an
+// unmarked run when globalSetup throws.
+const CREATE_ATTEMPTS = 5;
 
 export function createTestRunMarker(root: string, runId: string): void {
   const markerPath = testRunMarkerPath(root);
@@ -97,12 +111,9 @@ export function createTestRunMarker(root: string, runId: string): void {
     // A single-file marker from before the directory form; replace it.
     unlinkSync(markerPath);
   }
-  // Two attempts: an overlapping run's teardown can remove the directory
-  // between our mkdir and our token write (it saw the directory empty), which
-  // surfaces here as ENOENT on the write. Recreating once closes that window.
-  for (let attempt = 0; ; attempt++) {
-    mkdirSync(markerPath, { mode: 0o700, recursive: true });
+  for (let attempt = 1; ; attempt++) {
     try {
+      mkdirSync(markerPath, { mode: 0o700, recursive: true });
       writeFileSync(
         join(markerPath, runId),
         "A vitest run is in progress in this checkout. src/wrap/keychain-exec.ts\n" +
@@ -115,10 +126,11 @@ export function createTestRunMarker(root: string, runId: string): void {
       );
       break;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT" || attempt >= 1) throw err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== "ENOENT" && code !== "EINVAL") || attempt >= CREATE_ATTEMPTS) throw err;
     }
   }
-  pruneDeadRunTokens(markerPath);
+  pruneStaleRunTokens(markerPath, Date.now());
 }
 
 export function removeTestRunMarker(root: string, runId: string): void {

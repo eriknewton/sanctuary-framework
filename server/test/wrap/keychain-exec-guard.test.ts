@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ import {
 } from "../../src/wrap/keychain-exec.js";
 import {
   createTestRunMarker,
+  MAX_TEST_RUN_AGE_MS,
   removeTestRunMarker,
   testRunMarkerPath,
 } from "../setup/test-run-marker.js";
@@ -629,14 +630,19 @@ describe("no code path in server/test can reach the real credential binary", () 
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("prunes a crashed run's token so a stale marker does not outlive every run", () => {
+  it("prunes only run tokens older than the ceiling, never a fresh one whose pid looks dead", () => {
     const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
     const marker = testRunMarkerPath(root);
-    // 2147483646 = largest pid-shaped integer below INT32_MAX; no live process holds it.
-    createTestRunMarker(root, "2147483646-crashed");
+    // 2147483646 = largest pid-shaped integer below INT32_MAX; no live process
+    // holds it, so a pid-liveness pruner would delete this fresh token.
+    createTestRunMarker(root, "2147483646-fresh");
+    createTestRunMarker(root, "crashed-long-ago");
+    const past = (Date.now() - MAX_TEST_RUN_AGE_MS - 60_000) / 1000;
+    utimesSync(join(marker, "crashed-long-ago"), past, past);
     createTestRunMarker(root, `${process.pid}-live`);
-    expect(readdirSync(marker)).toEqual([`${process.pid}-live`]);
+    expect(readdirSync(marker).sort()).toEqual(["2147483646-fresh", `${process.pid}-live`].sort());
     removeTestRunMarker(root, `${process.pid}-live`);
+    removeTestRunMarker(root, "2147483646-fresh");
     expect(existsSync(marker)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
