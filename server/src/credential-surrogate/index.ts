@@ -137,3 +137,8 @@ export {
   type SurrogateCorrelationId, type SurrogateFailureCode, type SurrogateRefusal,
   type SurrogateForwardTarget, type SurrogateOccurrence,
 } from "./forward.js";
+
+export {
+  SurrogateEchoScanner, SURROGATE_ECHO_BLOCKED,
+  type SurrogateEchoCause, type SurrogateEchoCode, type SurrogateEchoScanResult,
+} from "./echo-scanner.js";
