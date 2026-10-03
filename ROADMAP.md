@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-02. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-02. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -145,6 +145,8 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 - **Local-intelligence config recovery.** `sanctuary intelligence config-reset` recovers a fortress whose durable local-intelligence config is unreadable (corrupt, or written by a newer version): under TTY confirmation and a write-intent unlock it quarantines the unreadable record to a timestamped sidecar so config writes work again, and it refuses readable records and load-integrity refusals, so it never disarms model-load integrity. The config-save lock that serializes concurrent writers is proven by an adversarial two-saver schedule.
 
 ### Recent additions (October 2026)
+
+- **Linux install package candidate.** The opt-in install variant adds observed-state install commands, a workstation policy signer, and an agent launch path that refuses to start unless Castle Wall is ready and the kernel binding for the agent's uid is observed. Required CI covers package lifecycle refusals and cold-install composition. Delivery acceptance and reboot evidence remain pending; this is not a supported-release or completed-install claim.
 
 - **Credential surrogacy:** slice 1b-i built; not yet bound to a real secret.
 

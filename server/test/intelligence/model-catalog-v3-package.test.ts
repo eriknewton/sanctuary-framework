@@ -396,7 +396,7 @@ describe("catalog-v3 built and packed consumers", () => {
       files: string[];
       scripts: Record<string, string>;
     };
-    expect(packageJson.files).toEqual(["dist", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]);
+    expect(packageJson.files).toEqual(["dist", "bin/sanctuary-linux-policy-sign", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]);
     expect(packageJson.scripts.pretest).toBe("npm run build");
     expect(packageJson.scripts.build.indexOf("node scripts/copy-catalog-v3-assets.mjs --verify-only"))
       .toBeLessThan(packageJson.scripts.build.indexOf("tsup"));

@@ -4,7 +4,7 @@
  * These exercise the pure functions only: config rewriting and dashboard
  * boot are covered by integration tests elsewhere.
  */
-
+// fail-before-exempt: comment-only edit repoints a retired public audit reference to private finding ids; no behavior under test changed.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { startedCoarseDisposition, type HarnessDisposition } from "../../src/egress-gate/parked-claim.js";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";

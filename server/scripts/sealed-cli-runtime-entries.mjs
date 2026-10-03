@@ -44,6 +44,7 @@ export const SEALED_CLI_RUNTIME_DIST_ENTRIES = Object.freeze([
   Object.freeze({ path: "directory-capability-worker.js", kind: "file", source: "tsup" }),
   Object.freeze({ path: "index.js", kind: "file", source: "tsup" }),
   Object.freeze({ path: "intelligence/index.js", kind: "file", source: "tsup" }),
+  Object.freeze({ path: "linux-policy-sign.js", kind: "file", source: "tsup" }),
   Object.freeze({ path: "verify-transparency.js", kind: "file", source: "tsup" }),
   // Non-TS assets placed under dist/ by the post-build copy scripts. Each
   // sentinel is a file the runtime actually reads from that directory.

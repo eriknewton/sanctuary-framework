@@ -1,9 +1,13 @@
 # Keeps ROADMAP.md honest against the tree.
 #
-# Two mechanisms:
+# Three mechanisms:
 #   1. PR gate: a PR whose title starts with "feat" must either modify ROADMAP.md
 #      or carry the "roadmap-exempt" label (for features with no public surface).
-#   2. Weekly drift report: every Monday, list feat merges that landed after the
+#   2. Header-date gate (2026-10-02): any PR that changes ROADMAP.md must move its
+#      "Last updated:" date to within a few days of the head commit
+#      (scripts/check-roadmap-date.mjs). Before this gate the header sat at
+#      2026-08-18 for six weeks while the file kept changing.
+#   3. Weekly drift report: every Monday, list feat merges that landed after the
 #      last ROADMAP.md change and file/update a "Public roadmap drift" issue.
 #
 # Companion rule in ROADMAP.md ("Last updated" paragraph). Mirrors the coverage
@@ -55,6 +59,22 @@ jobs:
           echo "the 'roadmap-exempt' label with a one-line justification in the PR"
           echo "description (internal-only change, no public surface)."
           exit 1
+
+  roadmap-header-date:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Must match the usage line in scripts/check-roadmap-date.mjs. Failure mode
+      # seen from outside: a PR that edits ROADMAP.md prose but leaves the header
+      # date alone goes red here with the stale date and its age in days.
+      - name: Require the ROADMAP.md header date to move with the file
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/check-roadmap-date.mjs "$BASE_SHA" "$HEAD_SHA"
 
   weekly-drift-report:
     if: github.event_name != 'pull_request'
