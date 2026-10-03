@@ -24,6 +24,11 @@ import {
   type KeychainExec,
 } from "../../src/wrap/keychain-exec.js";
 import {
+  createTestRunMarker,
+  removeTestRunMarker,
+  testRunMarkerPath,
+} from "../setup/test-run-marker.js";
+import {
   getOrCreateKeychainCustodyKey,
   readKeychainCustodyKey,
   RecoveryKeyKeychainStoreError,
@@ -609,6 +614,31 @@ describe("no code path in server/test can reach the real credential binary", () 
     expect(latchUnderTest(false, true)).toBe(true);
     expect(latchUnderTest(true, true)).toBe(true);
     expect(latchUnderTest(false, false)).toBe(false);
+  });
+
+  it("keeps the package marker alive until every overlapping test run tears down", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+
+    createTestRunMarker(root, "run-a");
+    createTestRunMarker(root, "run-b");
+    removeTestRunMarker(root, "run-a");
+    expect(existsSync(marker)).toBe(true);
+    removeTestRunMarker(root, "run-b");
+    expect(existsSync(marker)).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("prunes a crashed run's token so a stale marker does not outlive every run", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+    // 2147483646 = largest pid-shaped integer below INT32_MAX; no live process holds it.
+    createTestRunMarker(root, "2147483646-crashed");
+    createTestRunMarker(root, `${process.pid}-live`);
+    expect(readdirSync(marker)).toEqual([`${process.pid}-live`]);
+    removeTestRunMarker(root, `${process.pid}-live`);
+    expect(existsSync(marker)).toBe(false);
+    rmSync(root, { recursive: true, force: true });
   });
 
   /**

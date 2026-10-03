@@ -571,6 +571,26 @@ mod tests {
     use super::*;
     use crate::protected_agent::receipt::{deterministic_unit_name, ReceiptBody};
     use ed25519_dalek::SigningKey;
+    use std::{io::ErrorKind, thread, time::Duration};
+
+    fn open_ledger_for_test(path: &Path) -> Ledger {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match Ledger::open(path) {
+                Ok(ledger) => return ledger,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("open test ledger: {err:?}"),
+            }
+        }
+        panic!(
+            "open test ledger after transient flock contention: {:?}",
+            last_err
+        );
+    }
+
     fn fixture() -> (Generation, ManagerIdentity) {
         let mut g = Generation {
             boot_id: "boot".into(),
@@ -609,7 +629,7 @@ mod tests {
         assert!(l.prepared_ack(&g, &m).is_err());
         drop(l);
         // The anchor survives the reopen, and stays open...
-        let mut l = Ledger::open(&path).unwrap();
+        let mut l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].is_open());
         // ...but the CREATE transaction that could have completed it is over,
         // so the record is terminal Prepared rather than resumable.
@@ -618,9 +638,24 @@ mod tests {
             .is_err());
         assert!(l.prepared_ack(&g, &m).is_err());
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].manager.is_none());
         assert!(l.prepared_ack(&g, &m).is_err());
+    }
+
+    #[test]
+    fn test_reopen_waits_through_transient_same_process_flock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let held = Ledger::open(&path).unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        let reopened = open_ledger_for_test(&path);
+        drop(reopened);
+        releaser.join().unwrap();
     }
 
     #[test]
@@ -692,7 +727,7 @@ mod tests {
             .accept_attempt(&g.unit_name, "a", "e".repeat(64).as_str(), Some(&hash))
             .is_err());
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(l.state.generations[&g.unit_name].is_open());
         assert_eq!(l.state.generations[&g.unit_name].attempts.len(), 1);
     }
@@ -755,7 +790,7 @@ mod tests {
                 .unwrap();
         l.record_outcome(completion.clone()).unwrap();
         drop(l);
-        let l = Ledger::open(&path).unwrap();
+        let l = open_ledger_for_test(&path);
         assert!(!l.state.generations[&g.unit_name].is_open());
         assert_eq!(l.state.generations[&g.unit_name].outcome, Some(completion));
     }
