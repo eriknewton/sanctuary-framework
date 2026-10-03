@@ -10,7 +10,7 @@
  * static CLIENT_SCRIPT string into a sandboxed Function so it can be called
  * against synthetic state objects without a real browser.
  */
-
+// fail-before-exempt: adapts the fake location object with the origin field the bounded-load client now reads; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the read-state fix lives in boot-hydration, dashboard-honesty and client-time-parity tests.
 import { describe, expect, it } from "vitest";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
@@ -34,7 +34,7 @@ function liftExitDrillRenderer(): { render: (state: unknown) => string } {
     var document = { getElementById: function() { return null; } };
     var window = { matchMedia: function() { return null; } };
     var sessionStorage = { getItem: function() { return null; }, setItem: function() {} };
-    var location = { hash: "", host: "test" };
+    var location = { hash: "", host: "test", origin: "http://test" };
     ${chunk}
     return function(s) { state = s; return renderExitDrill(); };
   `;

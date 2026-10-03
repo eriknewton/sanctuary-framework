@@ -5,7 +5,7 @@
  * unparseable, or stale enforcement timestamp. Fresh evidence must carry its
  * own visible age.
  */
-
+// fail-before-exempt: marks these fixtures as completed sovereignty reads (sourceLoaded) so the read-state gate renders them; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage lives in boot-hydration, dashboard-honesty and client-time-parity tests.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
@@ -243,6 +243,7 @@ function liftSealHarness(): SealHarness {
   if (!maxLine) throw new Error("SEAL_FRESHNESS_MAX_MS not found");
   const pieces = [
     'const state = { tier1: { lockdown: { state: "idle" } }, posture: { data: null } };',
+    "function sourceLoaded() { return true; }", // These fixtures represent completed sovereignty reads.
     maxLine,
     "let sealFreshnessTimer = null;",
     "let __rerenderCount = 0;",

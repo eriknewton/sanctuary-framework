@@ -19,7 +19,7 @@
  * `intelligence-api-router.test.ts` for the wire layer and
  * `intelligence-real-browser-drill.test.ts` for the real-DOM drill.
  */
-
+// fail-before-exempt: updates a source-anchor string because fetchIntelligenceState now takes an argument; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage lives in boot-hydration and dashboard-honesty tests.
 import { describe, expect, it } from "vitest";
 import {
   renderDashboardV11Html,
@@ -202,7 +202,7 @@ describe("Intelligence panel — CCCC first-load render + substrate-missing word
     // BEFORE the generic loadError assignment, so the raw "unauthorized"
     // string from auth-middleware never reaches state.intelligence.loadError.
     const fetchFn = client.slice(
-      client.indexOf("async function fetchIntelligenceState()"),
+      client.indexOf("async function fetchIntelligenceState("),
       client.indexOf("async function onIntelPickerOpen(")
     );
     // 401 check must appear before the generic loadError fallback

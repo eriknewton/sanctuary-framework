@@ -10,9 +10,9 @@ describe("dashboard wrapped-agent count surfaces", () => {
     );
 
     expect(client).toContain("const count = state.agents.length;");
-    expect(client).toContain("const totalAgents = state.agents.length;");
+    expect(client).toContain('const totalAgents = sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown";');
     expect(client).toContain(
-      "'<section class=\"card\"><h3>Agents (' + state.agents.length + ')"
+      "'<section class=\"card\"><h3>Agents (' + (sourceLoaded(HUB + \"/agents\") ? state.agents.length : \"Unknown\")"
     );
   });
 });

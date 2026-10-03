@@ -39,6 +39,43 @@ export function getClientScript(): string {
 const CLIENT_SCRIPT = String.raw`
 "use strict";
 
+// Must match parseIsoInstantWithOffset in server/src/core/time.ts: dashboard
+// freshness is a protection claim, so offset-less or normalised timestamps
+// fail toward stale/unknown instead of borrowing the browser's local zone.
+function parseEvidenceTimestamp(value) {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (match === null) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const writtenMs = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
+  const offsetSign = match[8];
+  const offsetHours = offsetSign ? Number(match[9]) : 0;
+  const offsetMinutes = offsetSign ? Number(match[10]) : 0;
+  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
+  const offsetMs = (offsetSign === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60 * 1000;
+  const wall = new Date(Date.UTC(year, month - 1, day, hour, minute, second, writtenMs));
+  // Date.UTC maps years 0..99 onto 1900..1999; setUTCFullYear restores the
+  // written proleptic Gregorian year before applying the offset.
+  wall.setUTCFullYear(year);
+  const timestamp = wall.getTime() - offsetMs;
+  if (!Number.isFinite(timestamp)) return undefined;
+  const rendered = new Date(timestamp + offsetMs);
+  const calendarFieldsMatch =
+    rendered.getUTCFullYear() === year &&
+    rendered.getUTCMonth() + 1 === month &&
+    rendered.getUTCDate() === day &&
+    rendered.getUTCHours() === hour &&
+    rendered.getUTCMinutes() === minute &&
+    rendered.getUTCSeconds() === second &&
+    rendered.getUTCMilliseconds() === writtenMs;
+  return calendarFieldsMatch ? timestamp : undefined;
+}
+
 // ── Config ─────────────────────────────────────────────────────────────
 const cfgEl = document.getElementById("dashboard-config");
 const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
@@ -61,6 +98,61 @@ const URL_SESSION = (function () {
 // freshness windows are unknown, never silently widened to this maximum.
 const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
 let sealFreshnessTimer = null;
+let homeFreshnessTimer = null;
+// One five-second interaction budget bounds a read, including its JSON body.
+// Preferences are optional and get the same budget; neither gates startup.
+const DASHBOARD_READ_DEADLINE_MS = 5 * 1000;
+const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
+const pendingReads = new Map();
+// Invariant: every panel tracks one explicit read state per source; only
+// state_LOADED may render a count, checked empty list, clear, configured or
+// protective status. UNREAD/LOADING/FAILED render Unknown with a labeled Retry;
+// protection additionally requires fresh evidence. Fixed sources never evict.
+const sourceReads = new Map([
+  INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
+  HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
+  HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config",
+  HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
+  AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
+  "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
+  "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings"
+].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0 }]; }));
+const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
+function readKey(url) {
+  const parsed = new URL(url, location.origin);
+  parsed.searchParams.delete("_t"); parsed.searchParams.delete("session");
+  return parsed.origin + parsed.pathname + parsed.search;
+}
+function sourceRead(path) { return sourceReads.get(readKey(path)); }
+let liveUpdatesStopped = false;
+function sourceLoaded(path) { const read = sourceRead(path); return !liveUpdatesStopped && !!read && read.state === "state_LOADED"; }
+function failSource(path, error) {
+  const read = sourceRead(path);
+  if (!read) return;
+  read.state = "state_FAILED";
+  read.error = error.message || "The latest result is unavailable.";
+  read.failures = Math.min(read.failures + 1, 5); // Five doublings already reach the one-minute ceiling.
+  read.nextReadAt = Date.now() + Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, read.failures - 1));
+}
+function validateReadBody(key, body) {
+  const data = body && body.data;
+  const arrayFields = [
+    [HUB + "/agents", "agents"], [HUB + "/inbox", "items"],
+    [HUB + "/activity", "entries"], [HUB + "/activity?category=privacy", "entries"],
+    [HUB + "/activity?category=handoff", "entries"], [HUB + "/policies", "policies"],
+    [HUB + "/chat/concierge/history", "messages"], [AUTO_TRIGGER + "/rules", "rules"],
+    [AUTO_TRIGGER + "/recommendations", "recommendations"], ["/api/anomaly/findings", "findings"],
+    ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"]
+  ];
+  const array = arrayFields.find(function (entry) { return readKey(entry[0]) === key; });
+  if (array && !(array[1] === "items" && isPendingApprovalsRedactedMarker(data)) && (!data || !Array.isArray(data[array[1]]))) return false;
+  if ([HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config", POLICY + "/current"].some(function (path) { return readKey(path) === key; }) && (!data || typeof data !== "object" || Array.isArray(data))) return false;
+  if (key === readKey(HUB + "/recognition/did-web") && typeof data.configured !== "boolean") return false;
+  if (key === readKey(HUB + "/intelligence/status") && !Array.isArray(data.surfaces)) return false;
+  if (key === readKey("/api/posture/home") && (!body.castle_wall || !Array.isArray(body.agents) || !body.digest)) return false;
+  if (key === readKey("/api/sovereignty") && (!body.live_enforcement || typeof body.live_enforcement !== "object")) return false;
+  return true;
+}
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
@@ -230,7 +322,102 @@ function credentialedReadUrl(url, method) {
   } catch (_e) { return url; }
 }
 
-async function api(path, opts) {
+// A rejected race cannot publish late bytes, even if a transport ignores abort.
+// Only GETs use this helper; a mutation timeout must not imply it was undone.
+function readResponse(url, init, deadlineMs) {
+  const key = readKey(url);
+  if (pendingReads.has(key)) return pendingReads.get(key);
+  const source = sourceReads.get(key);
+  const revision = source && source.revision;
+  if (source && source.state === "state_FAILED" && Date.now() < source.nextReadAt) {
+    const error = new Error(source.error); error.status = source.status; return Promise.reject(error);
+  }
+  if (source) { source.state = "state_LOADING"; source.error = null; rerender(); }
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise(function (_, reject) {
+    timer = setTimeout(function () {
+      reject(new Error("Read timed out. The latest result is unavailable."));
+      controller.abort();
+    }, deadlineMs === undefined ? DASHBOARD_READ_DEADLINE_MS : deadlineMs);
+  });
+  const read = (async function () {
+    if (deadlineMs !== undefined && deadlineMs <= 0) throw new Error("Read timed out. The latest result is unavailable.");
+    const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    let body = null;
+    try { body = await res.json(); } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
+    if (!res.ok) {
+      const error = new Error(res.status === 401 || res.status === 403
+        ? "Operator access required (HTTP " + res.status + ")."
+        : "Read failed (HTTP " + res.status + ").");
+      error.status = res.status;
+      error.body = body;
+      throw error;
+    }
+    if (!body || typeof body !== "object" || body.error || !validateReadBody(key, body)) throw new Error("The latest result is unavailable.");
+    return { ok: res.ok, status: res.status, json: async function () { return body; } };
+  })();
+  const result = Promise.race([read, expired]).then(function (res) {
+    // A response admitted before an event or decision cannot publish over its trailing read.
+    if (source && source.revision !== revision) throw new Error("A newer refresh is pending.");
+    if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
+    return res;
+  }, function (error) {
+    failSource(url, error);
+    if (source) source.status = error.status;
+    rerender();
+    throw error;
+  }).finally(function () {
+    clearTimeout(timer);
+    pendingReads.delete(key);
+  });
+  pendingReads.set(key, result);
+  return result;
+}
+
+function dashboardResponse(url, init, deadlineAt) {
+  return !init || !init.method || init.method.toUpperCase() === "GET"
+    ? readResponse(url, init, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()))
+    : fetch(url, init);
+}
+
+function readLabel(path) {
+  const labels = [
+    [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
+    ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
+    [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
+    [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
+    [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
+    [HUB + "/intelligence/status", "Intelligence status"], [HUB + "/intelligence/config", "Intelligence configuration"], [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
+    [HUB + "/chat", "Conversation history"], [POLICY, "Operator policy"],
+    [AUTO_TRIGGER + "/recommendations", "Recommendations"], [AUTO_TRIGGER + "/details", "Rule details"], [AUTO_TRIGGER, "Auto-trigger"], ["/api/honeypot/tool-traps", "Tool honeypots"], ["/api/honeypot/credential-traps", "Credential honeypots"], ["/api/honeypot", "Honeypots"]
+  ];
+  const match = labels.find(function (entry) { return path.indexOf(entry[0]) === 0; });
+  return match ? match[1] : "Panel";
+}
+function renderSourceRead(path) {
+  const read = sourceRead(path);
+  if (!read || (!liveUpdatesStopped && read.state === "state_LOADED")) return "";
+  const label = readLabel(path);
+  const loading = read.state === "state_LOADING";
+  return '<section class="card" data-source="' + escHtml(path) + '">' +
+    '<p role="status" aria-live="polite">' + escHtml(label) + ': Unknown. ' +
+    escHtml(liveUpdatesStopped ? "Live updates stopped. Retry to resume." : loading ? "Read in progress." : (read.error || "Current data is unavailable.")) + '</p>' +
+    '<button class="btn" data-action="retry-panel" data-read="' + escHtml(path) +
+    '" aria-label="Retry ' + escHtml(label) + '" aria-busy="' + loading + '">Retry</button></section>';
+}
+function unavailablePanel(title, paths) {
+  return '<h1>' + escHtml(title) + '</h1>' + paths.map(renderSourceRead).join("");
+}
+function restoreRetryFocus(active, container) {
+  if (!active || !active.getAttribute || active.getAttribute("data-action") !== "retry-panel") return;
+  const path = active.getAttribute("data-read");
+  const next = container.querySelector && container.querySelector('[data-action="retry-panel"][data-read="' + escCssAttr(path) + '"]');
+  if (next) next.focus();
+  else if (container.setAttribute && container.focus) { container.setAttribute("tabindex", "-1"); container.focus(); }
+}
+
+async function api(path, opts, deadlineAt) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -261,7 +448,7 @@ async function api(path, opts) {
     url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
-  let res = await fetch(url, init);
+  let res = await dashboardResponse(url, init, deadlineAt);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -282,7 +469,7 @@ async function honeypotApi(path) {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   const sep = path.indexOf("?") >= 0 ? "&" : "?";
-  const res = await fetch(credentialedReadUrl("/api/honeypot" + path + sep + "_t=" + Date.now(), "GET"), {
+  const res = await readResponse(credentialedReadUrl("/api/honeypot" + path + sep + "_t=" + Date.now(), "GET"), {
     headers,
     cache: "no-store"
   });
@@ -292,7 +479,7 @@ async function honeypotApi(path) {
   return body;
 }
 
-async function autoTriggerApi(path, opts) {
+async function autoTriggerApi(path, opts, deadlineAt) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -306,7 +493,7 @@ async function autoTriggerApi(path, opts) {
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   url = credentialedReadUrl(url, method);
-  const res = await fetch(url, init);
+  const res = await dashboardResponse(url, init, deadlineAt);
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
@@ -340,7 +527,7 @@ async function policyApi(path, opts) {
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   url = credentialedReadUrl(url, method);
-  let res = await fetch(url, init);
+  let res = await dashboardResponse(url, init);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -359,7 +546,7 @@ async function policyApi(path, opts) {
 
 async function createStreamSessionQuery() {
   if (!TOKEN) return "";
-  const res = await fetch("/auth/session", {
+  const res = await readResponse("/auth/session", {
     method: "POST",
     headers: { "Authorization": "Bearer " + TOKEN },
     cache: "no-store"
@@ -573,7 +760,11 @@ function setRoute(route) {
 // On failure it records a truthful loadError rather than showing a
 // fabricated policy. Never exposes an agent-readable path: policyApi()
 // sends the operator bearer and the server gates the route.
-async function loadPolicyView() {
+async function loadPolicyView(afterMutation) {
+  if (afterMutation) return refreshPanel(POLICY + "/current");
+  return loadPanel(policyPanelJob);
+}
+async function readPolicyView() {
   state.policyView.loading = true;
   state.policyView.loadError = null;
   try {
@@ -711,6 +902,7 @@ function renderAgentSwitcher() {
   menuEl.hidden = !open;
   if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
   if (!open) return;
+  if (!sourceLoaded(HUB + "/agents")) { menuEl.innerHTML = renderSourceRead(HUB + "/agents"); return; }
   const allSelected = !state.agentScope.selectedAgentId;
   const rows = ['<button type="button" class="agent-switcher-opt' + (allSelected ? ' selected' : '') +
     '" data-action="agent-scope-select" data-agent-id="">' +
@@ -719,7 +911,7 @@ function renderAgentSwitcher() {
     '<span class="opt-state">' + state.agents.length + ' wrapped</span>' +
     '</button>'];
   state.agents.forEach(function (a) {
-    const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
+    const map = agentDisplayStatus(a);
     const isSel = a.agent_id === state.agentScope.selectedAgentId;
     rows.push('<button type="button" class="agent-switcher-opt' + (isSel ? ' selected' : '') +
       '" data-action="agent-scope-select" data-agent-id="' + escHtml(a.agent_id) + '">' +
@@ -766,10 +958,10 @@ function renderPostureSeal() {
     sub = "Lockdown holds wrapped agents. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
-    sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Risky actions still require approval.";
+    sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
   } else {
-    head = "Posture is being checked.";
-    sub = "Live enforcement evidence is not loaded yet. Until it is current, this is not shown as protected.";
+    head = "Protection evidence is unavailable.";
+    sub = "Current enforcement is Unknown. Retry the protection evidence read.";
   }
   const lines = postureLayerLines().map(function (l) {
     const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
@@ -782,7 +974,7 @@ function renderPostureSeal() {
   // anomaly findings, and per-agent drill-down). data-seal keeps the click
   // inside the seal so the outside-click dismiss does not fire first.
   const more = '<a class="pp-more" href="#posture" data-action="posture-detail-open">See full posture detail</a>';
-  popEl.innerHTML = '<h4>' + escHtml(head) + '</h4><p class="pp-sub">' + escHtml(sub) + '</p>' + lines + more;
+  popEl.innerHTML = '<h4>' + escHtml(head) + '</h4><p class="pp-sub">' + escHtml(sub) + '</p>' + lines + renderSourceRead("/api/sovereignty") + more;
 }
 
 // Per-route cache of the last HTML written to #main. Used by renderMain
@@ -807,8 +999,9 @@ function renderMain() {
   const active = document.activeElement;
   let focus = null;
   if (
-    active &&
+    active && (!main.contains || main.contains(active)) &&
     active.tagName === "INPUT" &&
+    ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 &&
     typeof active.getAttribute === "function" &&
     active.getAttribute("data-action")
   ) {
@@ -862,7 +1055,7 @@ function renderMain() {
     case "agent-detail": nextHtml = renderAgentDetail(); break;
     case "policy": nextHtml = renderPolicyCenter(); break;
     case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
-    case "intelligence": nextHtml = renderIntelligenceCenter(); break;
+    case "intelligence": nextHtml = renderIntelligenceCenter() + renderSourceRead(HUB + "/intelligence/status") + renderSourceRead(HUB + "/intelligence/config"); break;
     case "attestation": nextHtml = renderAttestation(); break;
     case "honeypot": nextHtml = renderHoneypotPage(); break;
     case "privacy": nextHtml = renderPrivacyPage(); break;
@@ -871,6 +1064,8 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
+  // Stopped live updates invalidate every live view, including previously loaded clears.
+  if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
   // Skip the innerHTML write when the rendered output is byte-identical
   // to the last write on the same route. Preserves the existing DOM
   // tree, focus, and any active text selection during no-op poll
@@ -906,7 +1101,7 @@ function renderMain() {
     }
   }
   if (focus) {
-    let sel = 'input[data-action="' + focus.action + '"]';
+    let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
     if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
     const el = main.querySelector(sel);
     if (el && typeof el.focus === "function") {
@@ -1013,7 +1208,7 @@ function renderDashboardConcierge() {
         '<h1>Talk to your fortress.</h1>',
         '<p class="sub">A direct line to Sanctuary, routed through the substrate you chose. Nothing leaves without your hand on it.</p>',
       '</div></div>',
-      activeChatsPanel,
+      activeChatsPanel, renderSourceRead(HUB + "/chat/concierge/history"),
       '<div class="card concierge-card">',
         '<div class="concierge-header">',
           '<div class="concierge-persona">',
@@ -1067,6 +1262,7 @@ function renderAgentAttestationBadge(status) {
   if (status === "active") { cls = "verified"; label = "protected"; }
   else if (status === "locked_down") { cls = "unverified"; label = "locked"; }
   else if (status === "error") { cls = "unverified"; label = "unverified"; }
+  else if (status === "unknown") { cls = "neutral"; label = "Unknown"; }
   else { cls = "degraded"; label = "degraded"; }
   return '<span class="att-agent ' + cls + '" title="Agent attestation"><span class="mark"></span>' + escHtml(label) + '</span>';
 }
@@ -1211,6 +1407,7 @@ function renderAgentAttestationBadgeForState(cls, label) {
 }
 
 function renderHoneypotPage() {
+  if (!sourceLoaded("/api/honeypot/tool-traps") || !sourceLoaded("/api/honeypot/credential-traps")) return unavailablePanel("Honeypots", ["/api/honeypot/tool-traps", "/api/honeypot/credential-traps"]);
   const toolTraps = state.honeypot.toolTraps || [];
   const credentialTraps = state.honeypot.credentialTraps || [];
   const toolRows = toolTraps.length ? toolTraps.map(function (trap) {
@@ -1308,6 +1505,7 @@ function durationLabelFromMs(ms) {
 }
 
 function renderAgentsList() {
+  if (!sourceLoaded(HUB + "/agents")) return unavailablePanel("Agents", [HUB + "/agents"]);
   if (!state.agents.length) return '<h1>Agents</h1>' +
     '<div class="agents-empty">' +
       '<div class="icon-frame"><div class="core"></div></div>' +
@@ -1316,10 +1514,10 @@ function renderAgentsList() {
       '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary protect</span></div>' +
     '</div>';
   const count = state.agents.length;
-  const subCopy = count + ' protected. Click one to inspect its activity, policy, and pending approvals.';
+  const subCopy = count + ' agents. Click one to inspect its activity, policy, and pending approvals.';
   const rows = state.agents.map(function (a) {
-    const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
-    const dotCls = agentStateClass(a.status);
+    const map = agentDisplayStatus(a);
+    const dotCls = agentStateClass(agentEvidenceStatus(a));
     const initials = agentInitials(a.agent_id);
     const role = escHtml(a.harness) + (a.model_provider && a.model_provider.model_id ? ' · ' + escHtml(a.model_provider.model_id) : '');
     const isSelected = state.selectedAgentId === a.agent_id;
@@ -1335,7 +1533,7 @@ function renderAgentsList() {
         '<span class="state-dot ' + dotCls + '"></span>' +
         escHtml(map.label) +
       '</span>' +
-      renderAgentAttestationBadge(a.status) +
+      renderAgentAttestationBadge(agentEvidenceStatus(a)) +
       '<span class="agent-last">' + escHtml(relTimeFromIso(a.last_activity_at)) + '</span>' +
       '</div>';
   }).join("\n");
@@ -1359,11 +1557,12 @@ function renderAgentsList() {
 }
 
 function renderAgentDetail() {
+  if (!sourceLoaded(HUB + "/agents")) return unavailablePanel("Agent", [HUB + "/agents"]);
   const a = state.agents.find(function (x) { return x.agent_id === state.selectedAgentId; });
   if (!a) return '<h1>Agent</h1><p class="muted">Agent not found. <a href="#agents">Back to list</a>.</p>';
-  const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
+  const map = agentDisplayStatus(a);
   const events = state.activity.filter(function (e) { return e.agent_id === a.agent_id; }).slice(0, 50);
-  const timeline = events.length
+  const timeline = !sourceLoaded(HUB + "/activity") ? renderSourceRead(HUB + "/activity") : events.length
     ? events.map(function (e) {
         const t = renderTemplate(e.display_template_id, e.display_template_args);
         const badgeHtml = e.attestation
@@ -1419,8 +1618,8 @@ function renderAgentInspectPanel(agent) {
   // shared card chrome; .inspect-pane overrides .card padding so the
   // inspect-head and inspect-body control their own spacing per design.
   if (panel) {
-    const dotCls = agentStateClass(agent.status);
-    const stateMap = STATUS_MAP[agent.status] || STATUS_MAP.unknown;
+    const dotCls = agentStateClass(agentEvidenceStatus(agent));
+    const stateMap = agentDisplayStatus(agent);
     const activity = (panel.recent_activity || []).slice(0, 20);
     const activityHtml = activity.length
       ? '<div class="timeline">' +
@@ -1472,7 +1671,7 @@ function renderAgentInspectPanel(agent) {
         '<div class="row1">' +
           '<div class="agent-glyph">' + escHtml(agentInitials(agent.agent_id)) + '</div>' +
           '<h3>' + escHtml(agent.agent_id) + '</h3>' +
-          '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agent.status) + '</span>' +
+          '<span style="margin-left:auto;">' + renderAgentAttestationBadge(agentEvidenceStatus(agent)) + '</span>' +
         '</div>' +
         '<div class="meta">' +
           '<span class="pill ' + (dotCls === "live" ? "tone-verified" : "tone-degraded") + '"><span class="state-dot ' + dotCls + '" style="margin-right:4px;"></span>' + escHtml(stateMap.label) + '</span>' +
@@ -1499,7 +1698,7 @@ function renderAgentInspectPanel(agent) {
           '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
           '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
           modelLine +
-          '<div class="policy-line"><span class="k">Protected since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Wrapped since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
         '</div>' +
         '<p class="muted" style="margin-top:10px;font-size:12px;">' +
           '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
@@ -1531,6 +1730,7 @@ function renderAgentInspectPanel(agent) {
 
 // ── Render: privacy ────────────────────────────────────────────────────
 function renderPrivacyPage() {
+  if (!sourceLoaded(HUB + "/activity?category=privacy")) return unavailablePanel("Privacy", [HUB + "/activity?category=privacy"]);
   // Safe-metadata-only render (binding addendum 1.6). Content_hash visible
   // only as opaque hex with a tooltip; no raw_path, no raw_value, no
   // source bytes.
@@ -1559,6 +1759,7 @@ function renderPrivacyPage() {
 
 // ── Render: coordination ──────────────────────────────────────────────
 function renderCoordinationPage() {
+  if (!sourceLoaded(HUB + "/activity?category=handoff")) return unavailablePanel("Coordination", [HUB + "/activity?category=handoff"]);
   const events = state.handoffEvents.slice(0, 100);
   if (!events.length) return '<h1>Coordination</h1>' +
     '<section class="card"><h3>No coordination flows recorded yet.</h3>' +
@@ -1580,7 +1781,7 @@ function renderCoordinationPage() {
 
 // ── Render: health ─────────────────────────────────────────────────────
 function renderHealthPage() {
-  const totalAgents = state.agents.length;
+  const totalAgents = sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown";
   const lockedDown = state.agents.filter(function (a) { return a.status === "locked_down"; }).length;
   const errored = state.agents.filter(function (a) { return a.status === "error"; }).length;
   const recentDenials = state.activity.filter(function (e) { return e.category === "denial"; }).length;
@@ -1592,12 +1793,12 @@ function renderHealthPage() {
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
       '<dt>Protected agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
-      '<dt>Locked down</dt><dd>' + escHtml(lockedDown) + '</dd>' +
-      '<dt>Errored</dt><dd>' + escHtml(errored) + '</dd>' +
-      '<dt>Denials in feed</dt><dd>' + escHtml(recentDenials) + '</dd>' +
+      '<dt>Locked down</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? lockedDown : "Unknown") + '</dd>' +
+      '<dt>Errored</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? errored : "Unknown") + '</dd>' +
+      '<dt>Denials in feed</dt><dd>' + escHtml(sourceLoaded(HUB + "/activity") ? recentDenials : "Unknown") + '</dd>' +
       '</dl>' +
     '</div>' +
-    auditVerifyState;
+    renderSourceRead(HUB + "/agents") + renderSourceRead(HUB + "/activity") + auditVerifyState;
 }
 
 // ── Render: intelligence ───────────────────────────────────────────────
@@ -1714,14 +1915,14 @@ function renderIntelligenceCenter() {
       '<h1>Could not load substrate status</h1>' +
       '<p class="intel-subtitle error-text">' + escHtml(state.intelligence.loadError) + '</p>' +
       '<p class="intel-subtitle muted">If this is a new fortress, pick a model in the Intelligence picker on this screen first (local keeps your queries on your machine; Venice.ai is contractual, not cryptographic; a frontier model is highest capability but may log queries, so expect imperfect privacy). The picker reads the substrate environment variables set when the dashboard launched.</p>' +
-      '<button class="btn" data-action="intel-reload">Retry</button>' +
+      '<button class="btn" data-action="intel-reload" aria-label="Retry Intelligence">Retry</button>' +
     '</section>';
   }
-  if (!state.intelligence.status) {
+  if (!sourceLoaded(HUB + "/intelligence/status") || !sourceLoaded(HUB + "/intelligence/config") || !state.intelligence.status) {
     return '<section class="intel-center">' +
       '<p class="eyebrow">INTELLIGENCE</p>' +
       '<h1>Intelligence Substrate</h1>' +
-      '<p class="intel-subtitle muted">Loading substrate status.</p>' +
+      '<p class="intel-subtitle muted">Substrate status unavailable. Current status is Unknown.</p>' +
     '</section>';
   }
   const status = state.intelligence.status;
@@ -1944,10 +2145,11 @@ function renderIntelligencePicker() {
   '</div>';
 }
 
-async function fetchIntelligenceState() {
+async function fetchIntelligenceState(deadlineAt) {
+  if (deadlineAt === undefined) deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
   state.intelligence.loadError = null;
   try {
-    const sr = await api("/intelligence/status");
+    const sr = await api("/intelligence/status", undefined, deadlineAt);
     state.intelligence.status = sr.data || null;
     state.intelligence.notConfigured = false;
   } catch (e) {
@@ -1965,7 +2167,7 @@ async function fetchIntelligenceState() {
     return;
   }
   try {
-    const cr = await api("/intelligence/config");
+    const cr = await api("/intelligence/config", undefined, deadlineAt);
     state.intelligence.config = cr.data || null;
   } catch (e) {
     if (e.status === 503) {
@@ -2058,7 +2260,7 @@ async function onIntelPickerSave() {
         body: choiceBody
       });
     }
-    await fetchIntelligenceState();
+    await refreshPanel(HUB + "/intelligence");
     onIntelPickerClose();
     const target = p.applyToAll
       ? "all surfaces"
@@ -2092,7 +2294,7 @@ async function fetchConciergeHistory() {
     // On 422 (chat not wired) or 404 etc., leave history empty; the
     // concierge surface itself surfaces "substrate not configured" once
     // the operator submits.
-    state.chat.concierge.messages = [];
+    // Keep the last conversation for inspection; the read status marks it unavailable.
   }
 }
 
@@ -2123,7 +2325,7 @@ async function onConciergeSend() {
     // render in chronological order. The service persisted both
     // messages before the response returned; the history endpoint is
     // the single source of truth for the visible thread.
-    await fetchConciergeHistory();
+    await refreshPanel(HUB + "/chat/concierge/history");
     // Update the badge directly from the response so it reflects what
     // served THIS query even before the next render.
     if (data.served_by) {
@@ -2217,7 +2419,7 @@ function renderPolicyPlainEnglishPanel() {
   return '<section class="policy-panel policy-plain-english">' +
     '<h2>Your policy in plain English</h2>' +
     '<p class="muted">This is what your fine-grained policy does right now. It is read-only here; tune it by approving from the queue or editing a rule.</p>' +
-    body +
+    (sourceLoaded(POLICY + "/current") || state.policyView.loadError ? body : "") + renderSourceRead(POLICY + "/current") +
   '</section>';
 }
 
@@ -2264,7 +2466,7 @@ function renderPolicyCenter() {
     '<section class="policy-panel"><h2>Per-agent rules</h2>' +
       '<div class="rules-scroll"><table class="rules-table">' +
       '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
-      '<tbody>' + rows + '</tbody></table></div>' +
+      '<tbody>' + (sourceLoaded(HUB + "/agents") ? rows : '<tr><td colspan="7">' + renderSourceRead(HUB + "/agents") + '</td></tr>') + '</tbody></table></div>' +
     '</section>' +
   '</section>';
 }
@@ -2272,10 +2474,10 @@ function renderPolicyCenter() {
 function renderAutoTriggerPage() {
   const rules = state.autoTrigger.rules || [];
   const recs = state.autoTrigger.recommendations || [];
-  const summary = rules.length
+  const summary = !sourceLoaded(AUTO_TRIGGER + "/rules") ? renderSourceRead(AUTO_TRIGGER + "/rules") : rules.length
     ? '<div class="auto-trigger-rule-list">' + rules.map(renderAutoTriggerRuleRow).join("") + '</div>'
     : '<p class="muted">No auto-trigger ladders configured. Ladders appear here after a sentinel, anomaly detector, or honeypot records its first finding. Use <code>sanctuary auto-trigger promote</code> to create one.</p>';
-  const body = recs.length
+  const body = !sourceLoaded(AUTO_TRIGGER + "/recommendations") ? renderSourceRead(AUTO_TRIGGER + "/recommendations") : recs.length
     ? '<div class="recommendation-list">' + recs.map(function (r) {
         const hs = r.history_summary || {};
         const approval = Math.round(((hs.operator_approval_rate || 0) * 100));
@@ -2319,9 +2521,10 @@ function renderAutoTriggerRuleRow(rule) {
   const o = rule.threshold_overrides || {};
   const history = (rule.history || []).slice(-30);
   const recent = history.slice(-6).reverse();
-  const trend = renderAutoTriggerTrend(history);
+  const detailsUnavailable = !sourceLoaded(AUTO_TRIGGER + "/details") || rule.detailUnavailable;
+  const trend = detailsUnavailable ? '<span class="muted">Trend unavailable.</span>' : renderAutoTriggerTrend(history);
   const saving = state.autoTrigger.savingRuleId === rule.rule_id;
-  const recentHtml = recent.length
+  const recentHtml = detailsUnavailable ? renderSourceRead(AUTO_TRIGGER + "/details") : recent.length
     ? recent.map(function (h) {
         return '<span class="history-chip ' + escHtml(h.outcome) + '" title="' + escHtml(shortTime(h.observed_at)) + '">' + escHtml(h.outcome) + '</span>';
       }).join("")
@@ -2439,14 +2642,18 @@ function normalizeInboxPrefs(raw) {
 }
 
 async function loadInboxPrefs() {
+  const initialFilters = JSON.stringify(state.inboxOps.filters);
   try {
-    const res = await fetch(credentialedReadUrl(INBOX_PREFS, "GET"), {
+    const res = await readResponse(credentialedReadUrl(INBOX_PREFS, "GET"), {
       headers: TOKEN ? { "Authorization": "Bearer " + TOKEN } : {},
       cache: "no-store"
-    });
+    }, INBOX_PREFS_DEADLINE_MS);
     if (!res.ok) return;
     const body = await res.json();
-    state.inboxOps.filters = normalizeInboxPrefs(body && body.data && body.data.filters);
+    // A delayed preference read must not overwrite filters the operator edited.
+    if (JSON.stringify(state.inboxOps.filters) === initialFilters) {
+      state.inboxOps.filters = normalizeInboxPrefs(body && body.data && body.data.filters);
+    }
   } catch (_) {}
 }
 
@@ -2559,9 +2766,10 @@ function pendingApprovalItems() {
 // capability-gating logic are preserved verbatim. The rail keeps only the
 // approvals queue + ambient posture.
 function renderFortressAgentsCard() {
+  if (!sourceLoaded(HUB + "/agents")) return renderSourceRead(HUB + "/agents");
   return state.agents.length
     ? state.agents.slice(0, 8).map(function (a) {
-        const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
+        const map = agentDisplayStatus(a);
         const c = a.capabilities || {};
         const menuItems = [
           { action: "pause", label: "Pause", enabled: !!c.can_pause },
@@ -2602,6 +2810,7 @@ function renderFortressAgentsCard() {
 }
 
 function renderRecognitionHealthCard() {
+  if (!sourceLoaded(HUB + "/recognition/did-web")) return renderSourceRead(HUB + "/recognition/did-web");
   const recognition = state.recognition.health;
   if (state.recognition.error) {
     return '<p class="muted">Recognition Layer health unavailable: ' + escHtml(state.recognition.error) + '</p>';
@@ -2685,9 +2894,9 @@ function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
   const pending = pendingApprovalItems();
-  const queueCount = state.inboxRedacted ? state.inboxRedactedCount : pending.length;
+  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
   const countCls = queueCount ? "count" : "count zero";
-  const queueBody = state.inboxRedacted
+  const queueBody = !sourceLoaded(HUB + "/inbox") ? renderSourceRead(HUB + "/inbox") : state.inboxRedacted
     ? '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>'
     : pending.length
     ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
@@ -2702,20 +2911,21 @@ function renderFortress() {
   const fortressLabel = escHtml(config.tenantName || config.fortressId || "this fortress");
   var protectingLine;
   if (seal.tone === "protected") {
-    protectingLine = "Castle Wall is enforcing on this machine. Sentinels watch every wrapped agent, and the Charter holds anything risky for your approval.";
+    protectingLine = "Castle Wall enforcement has current evidence on this machine.";
   } else if (seal.arm === "locked_down") {
-    protectingLine = "This fortress is locked down. Wrapped agents are held until you lift it. The Charter still gates every risky action.";
+    protectingLine = "This fortress reports lockdown. See the current agent status for its scope.";
   } else if (seal.arm === "armed") {
-    protectingLine = "Castle Wall enforcement evidence is not current enough for a protected claim. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval.";
+    protectingLine = "Castle Wall enforcement evidence is not current enough for a protected claim. Current protection is unavailable. Retry the protection evidence read.";
   } else if (seal.arm === "degraded") {
-    protectingLine = "Castle Wall protection is degraded right now. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval. Check the Health screen.";
+    protectingLine = "Castle Wall protection is degraded right now. Current protection is unavailable. Retry the protection evidence read. Check the Health screen.";
   } else {
-    protectingLine = "Castle Wall enforcement is not confirmed on this machine right now. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval.";
+    protectingLine = "Castle Wall enforcement is not confirmed on this machine right now. Current protection is unavailable. Retry the protection evidence read.";
   }
-  const wrapped = state.agents.length;
-  const federationState = (state.posture.data && state.posture.data.federation && state.posture.data.federation.operator_cloud_nodes)
+  const wrapped = sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown";
+  const federationState = !sourceLoaded("/api/sovereignty") ? "Unknown" : (state.posture.data && state.posture.data.federation && state.posture.data.federation.operator_cloud_nodes)
     ? "On" : "Off";
 
+  const active = !fortress.contains || fortress.contains(document.activeElement) ? document.activeElement : null;
   fortress.innerHTML = [
       '<div class="rail-section">',
       '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + queueCount + '</span></div>',
@@ -2735,8 +2945,10 @@ function renderFortress() {
           '<div class="ambient-stat"><span class="n">' + federationState + '</span><span class="l">Federation</span></div>',
         '</div>',
       '</div>',
+    renderSourceRead(HUB + "/agents"), renderSourceRead("/api/sovereignty"),
     '</div>'
   ].join("");
+  restoreRetryFocus(active, fortress);
 }
 
 // Wave 1 (2026-06-30): the Activity screen. The heavy six-field inbox
@@ -2815,7 +3027,8 @@ function renderActivityScreen() {
     if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
     inboxRows = redactedNotice + sections.join("\n");
   }
-  const total = state.inbox.filter(function (i) { return !i.resolved; }).length;
+  const total = sourceLoaded(HUB + "/inbox") ? state.inbox.filter(function (i) { return !i.resolved; }).length : "Unknown";
+  if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
@@ -2829,8 +3042,8 @@ function renderActivityScreen() {
         '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
         '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
       '</section>',
-      '<section class="card"><h3>Inbox (' + total + ')</h3>' + filterPanel + batchToolbar + inboxRows + snoozeDialog + '</section>',
-      '<section class="card"><h3>Agents (' + state.agents.length + ')</h3>' + renderFortressAgentsCard() + '</section>',
+      '<section class="card"><h3>Inbox (' + total + ')</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
       '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
     '</section>'
   ].join("");
@@ -2848,7 +3061,25 @@ function renderActivityScreen() {
 // arm-state; each agent reads green only on confirmed live enforcement; the
 // audit chain reads VERIFIED only when chain_verified is true. Named layers
 // only (no L-numbers); no em-dashes in user-visible copy.
+function evidenceCurrent(evidence) {
+  // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
+  const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
+  const windowMs = evidence && Number(evidence.freshness_window_ms);
+  return Number.isFinite(timestamp) && Number.isFinite(windowMs) && windowMs > 0 && Date.now() >= timestamp && Date.now() - timestamp <= Math.min(windowMs, SEAL_FRESHNESS_MAX_MS);
+}
+function agentEvidenceStatus(agent) {
+  if (!sourceLoaded(HUB + "/agents")) return "unknown";
+  if (agent.status !== "active") return agent.status;
+  // Only this agent's loaded posture evidence can vouch for protection; roster or machine timestamps cannot.
+  const home = sourceLoaded("/api/posture/home") && state.posture.home;
+  const evidence = home && (home.agents || []).find(function (row) { return row.agent_id === agent.agent_id; });
+  return evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence) ? "active" : "unknown";
+}
+function agentDisplayStatus(agent) {
+  return STATUS_MAP[agentEvidenceStatus(agent)] || STATUS_MAP.unknown;
+}
 function postureWallLabel(armState) {
+  if (!sourceLoaded("/api/posture/home") || (armState === "armed" && !evidenceCurrent(state.posture.home && state.posture.home.castle_wall))) return { cls: "pill", text: "Unknown" };
   if (armState === "armed") return { cls: "pill tone-verified", text: "Enforcing" };
   // S5-P distinct non-green: coarse wall enforcing, fine-grained exclusive-egress
   // stack not live. Never the verified/green tone.
@@ -2940,7 +3171,7 @@ function postureStoryFoot(d) {
 }
 function renderPostureAnomalies(findings, unknown) {
   if (unknown) {
-    return '<p class="muted">Open anomaly findings unavailable (the detector did not respond). This is not a confirmation of zero findings.</p>';
+    return '<p class="muted">Open anomaly findings unavailable (the detector is not available). This is not a confirmation of zero findings.</p>';
   }
   if (!findings || !findings.length) {
     // S3 quiet empty state: earned calm, and explicit about WHY it is empty.
@@ -2981,7 +3212,7 @@ function renderPostureAgentRows(home) {
     // HONEST per-agent pill (#634): green ONLY on confirmed live enforcement;
     // amber on policy-only protection; never machine-arm bleed-through.
     var pill;
-    if (a.enforcement_active === "active") pill = '<span class="pill tone-verified">Enforcing</span>';
+    if (a.enforcement_active === "active" && evidenceCurrent(a)) pill = '<span class="pill tone-verified">Enforcing</span>';
     else if (a.policy_protected) pill = '<span class="pill tone-degraded">Protection requested</span>';
     else pill = '<span class="pill">Not protected</span>';
     const drill = "/posture/agent/" + encodeURIComponent(a.agent_id);
@@ -3000,12 +3231,12 @@ function renderPostureScreen() {
       '<h1>How safe you are right now.</h1>' +
       '<p class="sub">The full posture detail, on this one surface. Castle Wall reads protected only on a fresh enforcement check. Every number traces to your signed audit trail.</p>' +
     '</div></div>';
-  if (!home) {
+  if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
-      ? 'Could not load posture detail (' + escHtml(state.posture.homeError) + '). The data routes stay behind your operator token.'
-      : 'Loading posture detail.';
+      ? 'Protection status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
+      : 'Protection status unavailable. Current data is Unknown.';
     return '<section class="concierge-wrap">' + head +
-      '<section class="card"><p class="muted">' + why + '</p></section>' +
+      '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
@@ -3022,7 +3253,7 @@ function renderPostureScreen() {
       : "";
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
-  const anomalyUnknown = home.anomaly_findings_unknown === true;
+  const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
   // F2 BLOCKER-1: three-state audit-chain pill from the shared verdict.
   const chainPill = home.digest && home.digest.chain_verified
     ? '<span class="pill tone-verified">Verified</span>'
@@ -3058,8 +3289,8 @@ function renderPostureScreen() {
         fresh: wallEvidenceAt,
         freshNone: "no enforcement evidence yet",
       }) +
-      vaultNotice +
-      postureMetricCard(escHtml(pending), "Approvals waiting") +
+      vaultNotice + renderSourceRead(HUB + "/inbox") +
+      postureMetricCard(!sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : escHtml(pending), "Approvals waiting") +
       postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
       postureMetricCard(chainPill, "Audit chain", {
         // The digest window is the period this verdict covers; its end states
@@ -3087,7 +3318,7 @@ function renderPostureScreen() {
       '</section>',
       '<section class="card">',
         '<h3>Anomaly findings</h3>',
-        renderPostureAnomalies(findings, anomalyUnknown),
+        renderPostureAnomalies(findings, anomalyUnknown), renderSourceRead("/api/anomaly/findings"),
       '</section>',
       '<section class="card">',
         '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
@@ -3098,58 +3329,106 @@ function renderPostureScreen() {
 }
 
 // ── Hub API actions ────────────────────────────────────────────────────
-async function fetchAll() {
-  try {
+// Each independent panel publishes as soon as it settles. One slow route must
+// never hold Posture, or another panel, behind it. Retries select one panel.
+const panelJobs = [
+  { paths: [INBOX_PREFS], load: loadInboxPrefs },
+  { paths: [HUB + "/agents"], load: async function () {
     const ar = await api("/agents");
     state.agents = ar.data.agents || [];
     state.chatActiveAgentId = state.chatActiveAgentId || (state.agents[0] ? state.agents[0].agent_id : null);
-  } catch (e) { /* tolerate */ }
-  try {
-    const ir = await api("/inbox");
-    applyInboxPayload(ir.data || {});
-  } catch (e) { /* tolerate */ }
-  try {
-    const acr = await api("/activity");
-    state.activity = acr.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const pr = await api("/policies");
-    state.policies = pr.data.policies || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const pe = await api("/activity?category=privacy");
-    state.privacyEvents = pe.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const he = await api("/activity?category=handoff");
-    state.handoffEvents = he.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    await fetchAutoTriggerState();
-  } catch (e) {
-    state.autoTrigger.loadError = e && e.message && e.message !== "Not Found" ? e.message : null;
+  } },
+  { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
+  { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
+  { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
+  { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
+  { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
+  { paths: [AUTO_TRIGGER], load: fetchAutoTriggerState },
+  { paths: [AUTO_TRIGGER + "/recommendations"], load: async function () { const r = await autoTriggerApi("/recommendations"); state.autoTrigger.recommendations = r.data.recommendations; } },
+  { paths: [HUB + "/recognition/did-web"], load: async function () {
+    try { const r = await api("/recognition/did-web"); state.recognition.health = r.data || null; state.recognition.error = null; }
+    catch (e) { state.recognition.error = e.message; }
+  } },
+  { paths: [HUB + "/intelligence"], load: fetchIntelligenceState },
+  { paths: ["/api/honeypot"], load: fetchHoneypotState },
+  { paths: ["/api/sovereignty"], load: fetchSovereignty },
+  { paths: ["/api/posture/home"], load: fetchPostureHome },
+  { paths: ["/api/anomaly/findings"], load: fetchPostureAnomalies },
+  { paths: [HUB + "/chat/concierge/history"], load: fetchConciergeHistory }
+];
+const policyPanelJob = { paths: [POLICY + "/current"], load: readPolicyView };
+const pendingPanels = new Map();
+function loadPanel(job) {
+  if (pendingPanels.has(job)) return pendingPanels.get(job);
+  // Dependent reads share the panel's budget instead of resetting it per step.
+  const deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
+  const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).catch(function (error) {
+    job.paths.forEach(function (path) { if (sourceRead(path) && sourceRead(path).state !== "state_FAILED") failSource(path, error); });
+  }).finally(function () { pendingPanels.delete(job); rerender(); });
+  pendingPanels.set(job, pending);
+  return pending;
+}
+const trailingPanels = new Map();
+function queuePanel(job) {
+  // One queued read per fixed panel coalesces bursts; every event invalidates older admitted bytes.
+  job.paths.forEach(function (path) {
+    sourceReads.forEach(function (read, key) {
+      if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) {
+        read.revision++; read.state = "state_LOADING"; read.nextReadAt = 0;
+      }
+    });
+  });
+  if (trailingPanels.has(job)) return trailingPanels.get(job);
+  const queued = Promise.resolve(pendingPanels.get(job)).then(function () {
+    trailingPanels.delete(job); // An event during the new read must queue a subsequent read.
+    job.paths.forEach(function (path) {
+      sourceReads.forEach(function (read, key) { if (key === readKey(path) || key.indexOf(readKey(path) + "/") === 0) read.nextReadAt = 0; });
+    });
+    return loadPanel(job);
+  });
+  trailingPanels.set(job, queued);
+  return queued;
+}
+async function fetchAll(afterMutation) {
+  const jobs = panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; });
+  const critical = jobs.filter(function (job) { return job.load === fetchSovereignty || job.load === fetchPostureHome; });
+  const pending = critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; })).map(afterMutation ? queuePanel : loadPanel);
+  if (afterMutation) rerender();
+  await Promise.all(pending);
+}
+function retryPanel(path) {
+  if (liveUpdatesStopped) {
+    // A manual restart must reread every source before old snapshots may look current again.
+    sourceReads.forEach(function (read) { read.revision++; read.state = "state_UNREAD"; read.nextReadAt = 0; });
+    liveUpdatesStopped = false;
+    pollingStarted = false;
+    const pending = fetchAll(true);
+    connectStream();
+    return pending;
   }
-  try {
-    const rh = await api("/recognition/did-web");
-    state.recognition.health = rh.data || null;
-    state.recognition.error = null;
-  } catch (e) {
-    state.recognition.error = e.message || "load failed";
+  const source = sourceRead(path);
+  if (source) source.nextReadAt = 0;
+  if (readKey(path) === readKey(POLICY + "/current")) return loadPolicyView();
+  const job = panelJobs.slice().reverse().find(function (candidate) {
+    return candidate.paths.some(function (prefix) { return readKey(path) === readKey(prefix) || readKey(path).indexOf(readKey(prefix) + "/") === 0; });
+  });
+  if (job) {
+    job.paths.forEach(function (prefix) { sourceReads.forEach(function (read, key) { if (key === readKey(prefix) || key.indexOf(readKey(prefix) + "/") === 0) read.nextReadAt = 0; }); });
+    const result = loadPanel(job); rerender(); return result;
   }
-  await fetchIntelligenceState();
-  await fetchHoneypotState();
-  await fetchSovereignty();
-  await fetchPostureHome();
-  // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
-  // The direct-agent surface was removed; the inspect panel is fetched
-  // lazily on click rather than maintained in state.
-  await fetchConciergeHistory();
+}
+async function refreshPanel(path) {
+  await Promise.all(Array.from(pendingPanels.values()));
+  if (path === AUTO_TRIGGER) return Promise.all([retryPanel(AUTO_TRIGGER + "/rules"), retryPanel(AUTO_TRIGGER + "/recommendations")]);
+  return retryPanel(path);
+}
+function refreshAutoTriggerPanels() {
+  return Promise.all(panelJobs.filter(function (job) { return job.paths[0].indexOf(AUTO_TRIGGER) === 0; }).map(queuePanel));
 }
 
 async function fetchHoneypotState() {
   try {
-    const tool = await honeypotApi("/tool-traps");
-    const credential = await honeypotApi("/credential-traps");
+    const [tool, credential] = await Promise.all([honeypotApi("/tool-traps"), honeypotApi("/credential-traps")]);
     state.honeypot.toolTraps = (tool.data && tool.data.traps) || [];
     state.honeypot.credentialTraps = (credential.data && credential.data.traps) || [];
     state.honeypot.loadError = null;
@@ -3170,7 +3449,7 @@ async function fetchSovereignty() {
   try {
     const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
     if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
-    const res = await fetch(credentialedReadUrl("/api/sovereignty?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+    const res = await readResponse(credentialedReadUrl("/api/sovereignty?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
@@ -3197,43 +3476,32 @@ async function fetchSovereignty() {
 // approve/deny or mutation is issued here. A read failure leaves
 // state.posture.home null and the Posture screen shows an honest "could not
 // load" state, never fabricated data.
+function scheduleHomeFreshness() {
+  clearTimeout(homeFreshnessTimer);
+  const home = state.posture.home;
+  if (!home) return;
+  // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
+  const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
+    return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
+  }); // One millisecond moves past the inclusive freshness boundary.
+  if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
+}
 async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   try {
-    const res = await fetch(credentialedReadUrl("/api/posture/home?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+    const res = await readResponse(credentialedReadUrl("/api/posture/home?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
       state.posture.home = null;
       state.posture.homeError = (body && body.error) || ("HTTP " + res.status);
     } else {
-      // Anomaly findings come from the dedicated endpoint; tolerate its absence
-      // (a fortress with no anomaly detector wired) without failing the screen.
-      // Honesty (never-overclaim): a genuine fetch FAILURE must NOT render as an
-      // affirmative "Open anomalies: 0" / "No open anomaly findings" - that
-      // conflates "the detector errored / auth failed" with "genuinely zero",
-      // which is a soft overclaim on the posture surface. So we distinguish an
-      // UNKNOWN state (anomaly_findings_unknown) from a real zero.
-      // The ONLY non-ok status that is a legitimate "not wired = empty" signal is
-      // 503 (anomaly_not_configured, emitted by dispatch when the anomaly binding
-      // is absent). Every other non-ok status - notably a 401 from an
-      // expired/missing bearer (the route returns 401, never 404, on auth
-      // failure) or any 5xx - is an honest UNKNOWN, never a confirmed clean zero.
-      let findings = [];
-      let anomalyUnknown = false;
-      try {
-        const ar = await fetch(credentialedReadUrl("/api/anomaly/findings?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
-        if (ar.ok) {
-          const ab = await ar.json();
-          findings = (ab && ab.data && ab.data.findings) || [];
-        } else if (ar.status !== 503) {
-          anomalyUnknown = true;
-        }
-      } catch (e) { anomalyUnknown = true; }
-      body.anomaly_findings = findings;
-      body.anomaly_findings_unknown = anomalyUnknown;
+      // Optional detector evidence is independent of the primary home read.
+      body.anomaly_findings = state.posture.anomalies || [];
+      body.anomaly_findings_unknown = state.posture.anomaliesUnknown !== false;
       state.posture.home = body;
+      scheduleHomeFreshness();
       state.posture.homeError = null;
     }
   } catch (e) {
@@ -3242,7 +3510,27 @@ async function fetchPostureHome() {
   }
 }
 
+async function fetchPostureAnomalies() {
+  try {
+    const headers = TOKEN ? { "Authorization": "Bearer " + TOKEN } : {};
+    const res = await readResponse(credentialedReadUrl("/api/anomaly/findings?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+    const body = await res.json();
+    if (!body.data || !Array.isArray(body.data.findings)) throw new Error("Anomaly findings unavailable.");
+    state.posture.anomalies = body.data.findings;
+    state.posture.anomaliesUnknown = false;
+  } catch (_) {
+    // An absent detector is unavailable evidence, never proof of zero findings.
+    state.posture.anomalies = [];
+    state.posture.anomaliesUnknown = true;
+  }
+  if (state.posture.home) {
+    state.posture.home.anomaly_findings = state.posture.anomalies;
+    state.posture.home.anomaly_findings_unknown = state.posture.anomaliesUnknown;
+  }
+}
+
 function liveEnforcementSnapshot() {
+  if (!sourceLoaded("/api/sovereignty")) return null;
   const d = state.posture.data;
   return d && d.live_enforcement ? d.live_enforcement : null;
 }
@@ -3396,7 +3684,7 @@ function deriveSeal() {
     const qualifier = freshness.inline.charAt(0).toUpperCase() + freshness.inline.slice(1);
     return word + ". " + qualifier + ".";
   };
-  if (t1 === "engaged") {
+  if (t1 === "engaged" && sourceLoaded(HUB + "/agents") && sourceLoaded(HUB + "/inbox")) {
     return { tone: "locked", word: "Locked", arm: "locked_down", freshness: freshness, title: title("Locked") };
   }
   if (arm === "armed" && freshness.current) {
@@ -3429,15 +3717,15 @@ function postureLayerLines() {
   else wallV = "unknown";
   const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
-  const wrapped = state.agents.length;
+  const wrapped = sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown";
   return [
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
-    { k: "Sentinels watching agents", v: wrapped + " wrapped", warn: false, off: wrapped === 0 },
-    { k: "Charter approvals", v: pending ? pending + " waiting" : "clear", warn: pending > 0 },
-    { k: "Heralds (reputation)", v: d && d.layers && d.layers.l4 && d.layers.l4.status === "active" ? "signed" : "configured", warn: false }
+    { k: "Sentinels watching agents", v: wrapped === "Unknown" ? "Unknown" : wrapped + " wrapped", warn: wrapped === "Unknown", off: wrapped === 0 },
+    { k: "Charter approvals", v: !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
+    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") }
   ];
 }
 
@@ -3447,7 +3735,7 @@ async function onAutoTriggerRecommendation(ruleId, action) {
       "/rules/" + encodeURIComponent(ruleId) + "/" + action + "-recommendation",
       { method: "POST", body: {} }
     );
-    await fetchAutoTriggerState();
+    await refreshPanel(AUTO_TRIGGER);
     toast(action === "accept" ? "Recommendation accepted." : "Recommendation rejected.", "info");
     rerender();
   } catch (e) {
@@ -3481,7 +3769,7 @@ async function onAutoTriggerThresholdSave(ruleId) {
     const body = { rule_type: rule.rule_type, threshold_overrides: overrides };
     if (cancelWindow !== null) body.cancel_window_seconds = cancelWindow;
     await autoTriggerApi("/rules/" + encodeURIComponent(ruleId), { method: "PATCH", body: body });
-    await fetchAutoTriggerState();
+    await refreshPanel(AUTO_TRIGGER);
     toast("Thresholds saved.", "info");
   } catch (e) {
     toast("Threshold save failed: " + (e && e.message ? e.message : "unknown"), "error");
@@ -3491,21 +3779,30 @@ async function onAutoTriggerThresholdSave(ruleId) {
   }
 }
 
-async function fetchAutoTriggerState() {
-  const rules = await autoTriggerApi("/rules");
-  const list = (rules.data && rules.data.rules) || [];
+async function fetchAutoTriggerState(deadlineAt) {
+  if (deadlineAt === undefined) deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
+  const rules = await autoTriggerApi("/rules", undefined, deadlineAt);
+  const list = rules.data.rules;
+  state.autoTrigger.rules = list;
+  const details = sourceRead(AUTO_TRIGGER + "/details");
+  const detailsBackedOff = details.state === "state_FAILED" && Date.now() < details.nextReadAt;
+  if (!detailsBackedOff) details.state = "state_LOADING";
+  let detailFailed = false;
   const hydrated = [];
   for (let i = 0; i < list.length; i++) {
     try {
-      const detail = await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id));
-      hydrated.push((detail.data && detail.data.rule) || list[i]);
-    } catch (e) {
-      hydrated.push(list[i]);
+      if (detailsBackedOff || Date.now() >= deadlineAt) throw new Error("Rule details unavailable.");
+      const detail = await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id), undefined, deadlineAt);
+      if (!detail.data || !detail.data.rule || !Array.isArray(detail.data.rule.history)) throw new Error("Rule details unavailable.");
+      hydrated.push(detail.data.rule);
+    } catch (_) {
+      detailFailed = true;
+      hydrated.push(Object.assign({}, list[i], { detailUnavailable: true }));
     }
   }
   state.autoTrigger.rules = hydrated;
-  const at = await autoTriggerApi("/recommendations");
-  state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
+  if (detailFailed) { if (!detailsBackedOff) failSource(AUTO_TRIGGER + "/details", new Error("Rule details unavailable.")); }
+  else { details.state = "state_LOADED"; details.failures = 0; details.nextReadAt = 0; }
   state.autoTrigger.loadError = null;
 }
 
@@ -3534,7 +3831,7 @@ async function onAgentControl(agentId, action) {
     } else {
       toast(action + " applied to " + agentId, "info");
     }
-    await fetchAll();
+    await fetchAll(true);
     rerender();
   } catch (e) {
     if (e.status === 422) {
@@ -3599,7 +3896,7 @@ async function onInboxAction(itemId, action) {
         warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
       };
     }
-    await fetchAll();
+    await fetchAll(true);
     // After approve on an agent-bound inbox item, refresh the inspect
     // panel for that agent if the operator is currently viewing it, so
     // the panel reflects the resolved approval.
@@ -3691,8 +3988,8 @@ async function activateStandingRule(draftId, op, force) {
       toast(force
         ? "Standing rule added (you confirmed it relaxes protection)."
         : "Standing rule added: agents may " + op + " without asking.");
-      if (state.route === "policy") await loadPolicyView();
-      await fetchAll();
+      if (state.route === "policy") await loadPolicyView(true);
+      await fetchAll(true);
       rerender();
     } else {
       toast("Rule not activated (" + (status || "refused") + ").", "error");
@@ -3734,7 +4031,7 @@ async function onInboxBatchAction(action, until) {
     }
     state.inboxOps.selected = {};
     state.inboxOps.snoozeDialog = null;
-    await fetchAll();
+    await fetchAll(true);
     rerender();
   } catch (e) {
     toast("Inbox batch action failed.", "error");
@@ -3760,9 +4057,8 @@ async function onDidWebCompromisedRotation() {
   state.recognition.rotating = true;
   rerender();
   try {
-    const r = await api("/recognition/did-web/rotate-compromised", { method: "POST", body: {} });
-    state.recognition.health = r.data.health;
-    state.recognition.error = null;
+    await api("/recognition/did-web/rotate-compromised", { method: "POST", body: {} });
+    await refreshPanel(HUB + "/recognition/did-web");
     toast("did:web key rotated. Publish the updated DID Document.", "info");
   } catch (e) {
     state.recognition.error = e.message || "rotation failed";
@@ -3789,7 +4085,7 @@ async function onTemplateBind(agentId) {
     });
     state.templateBinding.pendingItemId = r.data.inbox_item_id;
     toast("Approval pending. See inbox.", "info");
-    await fetchAll();
+    await fetchAll(true);
     rerender();
   } catch (e) {
     state.templateBinding.pendingItemId = null;
@@ -3803,6 +4099,8 @@ async function onTemplateBind(agentId) {
 function connectStream() {
   let es = null;
   let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 5; // Five repair waves, then operator Retry only.
   async function open() {
     try {
       const sessionQuery = await createStreamSessionQuery();
@@ -3815,14 +4113,10 @@ function connectStream() {
         const e = JSON.parse(ev.data);
         if (state.seenEventIds.has(e.entry_id)) return;
         state.seenEventIds.add(e.entry_id);
-        state.activity = [e].concat(state.activity).slice(0, 200);
-        if (e.category === "privacy") state.privacyEvents = [e].concat(state.privacyEvents).slice(0, 200);
-        if (e.category === "handoff") state.handoffEvents = [e].concat(state.handoffEvents).slice(0, 200);
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
-          void fetchAutoTriggerState().then(rerender);
-          return;
+          void refreshAutoTriggerPanels();
         }
-        rerender();
+        void fetchAll(true);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("inbox", function (ev) {
@@ -3830,16 +4124,12 @@ function connectStream() {
         const item = JSON.parse(ev.data);
         if (isPendingApprovalsRedactedMarker(item)) {
           setInboxRedacted(item);
-          rerender();
+          void fetchAll(true);
           return;
         }
         if (state.seenEventIds.has(item.item_id)) return;
         state.seenEventIds.add(item.item_id);
-        // Replace-or-prepend by item_id.
-        const existing = state.inbox.findIndex(function (x) { return x.item_id === item.item_id; });
-        if (existing >= 0) state.inbox[existing] = item;
-        else state.inbox = [item].concat(state.inbox);
-        rerender();
+        void fetchAll(true);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("agent_status", function (ev) {
@@ -3852,30 +4142,45 @@ function connectStream() {
         rerender();
       } catch (err) { /* ignore */ }
     });
-    es.addEventListener("approval", function () { fetchAll().then(rerender); });
+    es.addEventListener("approval", function () { void fetchAll(true); });
     es.onerror = function () {
       try { es && es.close(); } catch (e) { /* ignore */ }
       es = null;
-      // Reconnect with refetch-and-restore: pause, refetch full state,
-      // resume SSE. Race-safe: any inbox/activity events that arrive
-      // during refetch are deduped by event_id via seenEventIds.
+      // The bounded recovery budget ends visibly; no loaded clear stays current after give-up.
       if (reconnectTimer) return;
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) { stopLiveUpdates(); return; }
+      const delay = 1000 * Math.pow(2, reconnectAttempts++);
       reconnectTimer = setTimeout(async function () {
         reconnectTimer = null;
-        await fetchAll();
+        await fetchAll(true);
         rerender();
         void open();
-      }, 1000);
+      }, delay);
     };
   }
   void open();
 }
 
+function stopLiveUpdates() {
+  liveUpdatesStopped = true;
+  sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
+  rerender();
+}
+
 // Polling fallback compiled-in but not user-facing. Activated by build-time
 // flag (window.__sanctuaryDashboardPolling__ = true) or when EventSource
 // is unavailable.
+let pollingStarted = false;
 function schedulePolling() {
-  setInterval(function () { fetchAll().then(rerender); }, 5000);
+  if (pollingStarted) return;
+  pollingStarted = true;
+  let attempts = 0;
+  const MAX_POLL_ATTEMPTS = 5; // Bound automatic recovery work; panel Retry remains available.
+  function poll() {
+    if (attempts >= MAX_POLL_ATTEMPTS) { stopLiveUpdates(); return; }
+    setTimeout(async function () { await fetchAll(true); rerender(); poll(); }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, attempts++)));
+  }
+  poll();
 }
 
 // WP-V1.2 reshape: the F9 polling loop for direct-agent chat history
@@ -3929,6 +4234,7 @@ document.addEventListener("click", function (ev) {
   }
   if (!tgt) return;
   const action = tgt.getAttribute("data-action");
+  if (action === "retry-panel") return void retryPanel(tgt.getAttribute("data-read"));
   if (!action) return;
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
@@ -4012,7 +4318,7 @@ document.addEventListener("click", function (ev) {
     state.posture.storyPlain = !state.posture.storyPlain;
     return rerender();
   }
-  if (action === "intel-reload") { return void fetchIntelligenceState().then(rerender); }
+  if (action === "intel-reload") { return void refreshPanel(HUB + "/intelligence"); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
   if (action === "intel-picker-close") return onIntelPickerClose();
   if (action === "intel-picker-close-backdrop") return onIntelPickerClose();
@@ -4157,23 +4463,7 @@ document.addEventListener("click", function (ev) {
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
-    // Wave 1: when the click is on a rail approval-queue tile, animate the
-    // tile out for a click-to-clear feel. The resolve itself is the SAME
-    // token-gated onInboxAction path the inbox rows use; the animation is
-    // cosmetic and never bypasses the request. A subsequent fetchAll +
-    // rerender re-renders the rail authoritatively from server state.
-    if (sub === "approve" || sub === "deny") {
-      const tile = rawTgt.closest(".approval-tile");
-      if (tile) {
-        tile.classList.add("leaving");
-        const countEl = document.getElementById("queue-count");
-        if (countEl) {
-          const remaining = document.querySelectorAll(".approval-tile:not(.leaving)").length;
-          countEl.textContent = String(remaining);
-          if (remaining === 0) countEl.classList.add("zero");
-        }
-      }
-    }
+    // Only a loaded read after the decision may remove a tile or change its queue count.
     return void onInboxAction(itemId, sub);
   }
   if (action.indexOf("agent-") === 0 && agentId) {
@@ -4280,9 +4570,8 @@ if (mq) mq.addEventListener("change", function (e) {
 });
 
 // Boot.
-loadInboxPrefs().then(function () {
-  return fetchAll();
-}).then(function () { rerender(); });
+void loadPanel(panelJobs[0]);
+void fetchAll();
 bindHashRoute();
 connectStream();
 `;
