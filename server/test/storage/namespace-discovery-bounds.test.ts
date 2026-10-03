@@ -7,11 +7,7 @@ import * as fs from "node:fs/promises";
 import type { Dir, Dirent } from "node:fs";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-
-// Acceptance ceilings: 1,024 namespaces and 64 scanned entries per namespace.
-// Keep the fixture independent of new exports so it exercises the base behavior too.
-const MAX_DISCOVERED_NAMESPACES = 1_024;
-const MAX_NAMESPACE_DISCOVERY_ENTRIES = MAX_DISCOVERED_NAMESPACES * 64;
+import { MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "../../src/storage/interface.js";
 
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof import("node:fs/promises")>();
