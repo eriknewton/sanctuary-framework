@@ -136,6 +136,15 @@ describe("the credential CLI is UNREACHABLE from the suite", () => {
     expect(surface).toMatch(/export function setKeychainExec\(fn: KeychainExec\): void/);
   });
 
+  it("tells operators to remove the marker directory recursively", () => {
+    const surface = readFileSync(
+      fileURLToPath(new URL("../../src/wrap/keychain-exec.ts", import.meta.url)),
+      "utf8"
+    );
+    expect(surface).toContain("`  rm -r ${markerPathForDiagnostics()}`");
+    expect(surface).not.toContain("`  rm ${markerPathForDiagnostics()}`");
+  });
+
   it("routes through an installed store instead of spawning anything", async () => {
     setKeychainExec(memoryFake);
     const r = await execKeychain("security", ["-i"], 'add-generic-password -U -a "sanctuary" -s "svc-a" -w "sekret"\n');
@@ -654,6 +663,20 @@ describe("no code path in server/test can reach the real credential binary", () 
       expect(readdirSync(marker).sort()).toEqual(
         ["2147483646-fresh", "refreshed-run", `${process.pid}-live`].sort()
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates this run's token when a later run pruned it before refresh", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+    try {
+      createTestRunMarker(root, "paused-run");
+      rmSync(join(marker, "paused-run"));
+
+      expect(() => refreshRunToken(root, "paused-run")).not.toThrow();
+      expect(existsSync(join(marker, "paused-run"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

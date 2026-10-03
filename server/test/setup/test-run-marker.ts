@@ -118,7 +118,14 @@ function pruneStaleRunTokens(markerPath: string, nowMs: number): void {
 
 export function refreshRunToken(root: string, runId: string, nowMs = Date.now()): void {
   const seconds = nowMs / 1000;
-  utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
+  try {
+    utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // A live run must always re-create its token: a missing token is the one
+    // state that can make a scrubbed child reach the real credential store.
+    createTestRunMarker(root, runId);
+  }
 }
 
 export function createTestRunMarkerLifecycle(

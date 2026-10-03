@@ -145,6 +145,9 @@ function packageRoot(): string | null {
 
 function markerOnDiskNow(): boolean {
   const root = packageRoot();
+  // MUST MATCH `createTestRunMarker` in `test/setup/test-run-marker.ts`: this
+  // reads only directory existence as "under test"; token files are teardown
+  // refcounts and are never inspected here.
   return root !== null && existsSync(join(root, TEST_RUN_MARKER_FILENAME));
 }
 
@@ -377,7 +380,7 @@ export async function execKeychain(
           `\n` +
           `NOT running a test? Then a previous run was killed before it could clean up, ` +
           `and its marker file is still on disk. Delete it and this refusal stops:\n` +
-          `  rm ${markerPathForDiagnostics()}`
+          `  rm -r ${markerPathForDiagnostics()}`
       );
     case "spawn-real":
       return spawnReal(cmd, args, input);
