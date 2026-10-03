@@ -161,6 +161,8 @@ export class SurrogateEchoScanner {
         // refuse: passing it through would let that client reassemble a value split by framing.
         // Cost, accepted: a swapped chunked body opening with whitespace or a sign is refused.
         if (!this.frameCommitted && LENIENT_SIZE_PREFIX.has(byte)) return "FAIL";
+        // Stated bound: framing only nonstandard parsers accept is outside detection
+        // (SURROGATE-1B-II-LENIENT-FRAMING-01); the gate re-frames delivery, so this needs an adversarial upstream.
         // Ordinary decoded bodies have no opening chunk-size line. Both views then
         // coincide; never use normalized or raw header whitespace to choose a view.
         if (!this.frameCommitted) { this.frameState = "PASSTHROUGH"; return "SKIP"; }
