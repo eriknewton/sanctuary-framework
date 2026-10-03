@@ -5,7 +5,7 @@
  * unparseable, or stale enforcement timestamp. Fresh evidence must carry its
  * own visible age.
  */
-
+// fail-before-exempt: marks these fixtures as completed sovereignty reads (sourceLoaded) so the read-state gate renders them; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage lives in boot-hydration, dashboard-honesty and client-time-parity tests.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
