@@ -20,8 +20,9 @@ import {
   type StateStore,
 } from "../../src/cognitive/state-store.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
-import { createIdentity } from "../../src/core/identity.js";
-import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { createIdentity, sign } from "../../src/core/identity.js";
+import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
@@ -423,6 +424,52 @@ describe("restoreCheckpoint", () => {
       expect(await fixture.checkpointStore.list()).toHaveLength(1);
     } finally {
       readSpy.mockRestore();
+      writeSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+  });
+
+  it.each(["below", "above"] as const)("refuses a legacy checkpoint %s its anchor before mutation", async (position) => {
+    const fixture = await makeFixture();
+    const namespace = "legacy";
+    const key = "note";
+    const plaintext = stringToBytes("legacy value");
+    const payload = encrypt(plaintext, deriveNamespaceKey(fixture.masterKey, namespace));
+    // Two versions distinguish the legacy ceiling from the ordinary lower floor.
+    const legacyVersion = position === "above" ? 2 : 1;
+    await fixture.storage.write(namespace, key, stringToBytes(JSON.stringify({
+      v: 1, payload, ver: legacyVersion,
+      sig: toBase64url(sign(fromBase64url(payload.ct),
+        fixture.identity.storedIdentity.encrypted_private_key, fixture.identityEncKey)),
+      kid: fixture.identity.storedIdentity.identity_id,
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-10-02T12:00:00.000Z" },
+    })));
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore, store: fixture.checkpointStore,
+      masterKey: fixture.masterKey, auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand", retentionValue: "off",
+    });
+    await fixture.stateStore.delete(namespace, key);
+    await writeEntry(fixture, namespace, key, "recreated");
+    if (position === "below") await writeEntry(fixture, namespace, key, "advanced");
+    await writeEntry(fixture, "added", "preserve", "post-checkpoint");
+    const writeSpy = vi.spyOn(fixture.storage, "write");
+    const deleteSpy = vi.spyOn(fixture.storage, "delete");
+    const auditCount = fixture.audit.criticalCalls.length;
+    try {
+      await expect(restoreCheckpoint({
+        stateStore: fixture.stateStore, checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey, auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id, checkpointId: checkpoint.id,
+        assessParked: parkedClaim, publicKeyResolver: publicKeyResolver(fixture),
+      })).rejects.toThrow(CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL);
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(fixture.audit.criticalCalls).toHaveLength(auditCount);
+      expect(await fixture.checkpointStore.list()).toHaveLength(1);
+    } finally {
       writeSpy.mockRestore();
       deleteSpy.mockRestore();
     }

@@ -1614,6 +1614,49 @@ export class StateStore {
       : 0;
   }
 
+  private async assertLegacyEntryVersionCeiling(
+    namespace: string,
+    key: string,
+    stateEntry: Pick<StateEntry, "v" | "ver">,
+    cache?: VersionAnchorsCache
+  ): Promise<void> {
+    // F1: a legacy (v1) entry must never ADVANCE the version past an established
+    // anchor. Legitimate version bumps are written as signed-envelope schemas
+    // (v2+), so a v1 entry claiming a version above the persisted anchor can
+    // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
+    // ONLY (not version/namespace/key), so the signature check below cannot catch
+    // this; the persisted anchor is the discriminator. The anchor record is now
+    // MAC-authenticated (loadVersionAnchors), so it can no longer be silently
+    // EDITED/LOWERED to defeat this gate (an edit fails the MAC and the read is
+    // rejected).
+    //
+    // RESIDUAL (documented, not closed here): a bare/absent anchor is treated as
+    // "no trusted floor" (anchored 0), so this gate does not fire. A filesystem
+    // adversary can therefore RESET the floor by deleting/stripping the anchors
+    // record and then replay a forged high-version v1 entry. Closing the
+    // deletion variant requires distrusting v1 on the enforced read path entirely
+    // (verified:false unless re-migrated), which breaks reads of legitimate
+    // un-migrated pre-v2 fortresses - a backward-compat migration decision left
+    // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
+    // on a bare-anchor fortress it reads normally because the gate is skipped.)
+    // Narrowed, not closed, by STATE-READ-ANCHOR-01: on the READ path the
+    // anchor RAISE below now requires a VERIFIED read, so a reset floor can no
+    // longer be re-pinned by a read that failed to verify. Two bounds survive
+    // and neither is closed here: a bare/absent anchor is still no floor, so
+    // the reset itself remains open exactly as described; and the WRITE path
+    // still derives the floor from unverified on-disk versions
+    // (STATE-WRITE-ANCHOR-01), so this narrowing covers reads only.
+    if (stateEntry.v === 1) {
+      const anchoredVersion = await this.getAnchoredVersion(namespace, key, cache);
+      if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
+        throw new StateVerificationError(
+          "rollback_detected",
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
+        );
+      }
+    }
+  }
+
   /**
    * HIGH (Codex gate, 2026-08-22): flushes a batch's cached, in-memory
    * anchor raises to durable storage in ONE write, instead of one write
@@ -2429,40 +2472,9 @@ export class StateStore {
       );
     }
 
-    // F1: a legacy (v1) entry must never ADVANCE the version past an established
-    // anchor. Legitimate version bumps are written as signed-envelope schemas
-    // (v2+), so a v1 entry claiming a version above the persisted anchor can
-    // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
-    // ONLY (not version/namespace/key), so the signature check below cannot catch
-    // this; the persisted anchor is the discriminator. The anchor record is now
-    // MAC-authenticated (loadVersionAnchors), so it can no longer be silently
-    // EDITED/LOWERED to defeat this gate (an edit fails the MAC and the read is
-    // rejected).
-    //
-    // RESIDUAL (documented, not closed here): a bare/absent anchor is treated as
-    // "no trusted floor" (anchored 0), so this gate does not fire. A filesystem
-    // adversary can therefore RESET the floor by deleting/stripping the anchors
-    // record and then replay a forged high-version v1 entry. Closing the
-    // deletion variant requires distrusting v1 on the enforced read path entirely
-    // (verified:false unless re-migrated), which breaks reads of legitimate
-    // un-migrated pre-v2 fortresses - a backward-compat migration decision left
-    // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
-    // on a bare-anchor fortress it reads normally because the gate is skipped.)
-    // Narrowed, not closed, by STATE-READ-ANCHOR-01: on the READ path the
-    // anchor RAISE below now requires a VERIFIED read, so a reset floor can no
-    // longer be re-pinned by a read that failed to verify. Two bounds survive
-    // and neither is closed here: a bare/absent anchor is still no floor, so
-    // the reset itself remains open exactly as described; and the WRITE path
-    // still derives the floor from unverified on-disk versions
-    // (STATE-WRITE-ANCHOR-01), so this narrowing covers reads only.
-    if (options.enforceRollback && stateEntry.v === 1) {
-      const anchoredVersion = await this.getAnchoredVersion(namespace, key);
-      if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
-        throw new StateVerificationError(
-          "rollback_detected",
-          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
-        );
-      }
+    if (options.enforceRollback) {
+      // Must match assertImportVersionFloors: legacy envelopes share one ceiling check.
+      await this.assertLegacyEntryVersionCeiling(namespace, key, stateEntry);
     }
 
     let signatureVerified = false;
@@ -2981,6 +2993,8 @@ export class StateStore {
         }
         // An import must not install bytes the enforcing reader will reject;
         // reuse its MAC-authenticated floor check, including read failures.
+        // Must match readInternal: legacy envelopes also cannot exceed an anchor.
+        await this.assertLegacyEntryVersionCeiling(namespace, key, entry, cache);
         await this.assertNotBelowVersionFloor(namespace, key, entry.ver, cache);
       }
     }

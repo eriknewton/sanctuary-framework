@@ -17,9 +17,11 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { bytesToString, fromBase64url } from "../../src/core/encoding.js";
+import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
-import { MemoryCheckpointStore } from "../../src/memory-checkpoint/index.js";
+import { hashToString } from "../../src/core/hashing.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryCheckpointStore, buildMemoryCheckpointId } from "../../src/memory-checkpoint/index.js";
 import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 // Only host custody and host liveness are replaced; CLI composition, encrypted
@@ -125,6 +127,35 @@ describe("cold checkpoint CLI", () => {
     expect(records[0]!.total_keys).toBe(2);
     const raw = await f.checkpoints.readBundle(records[0]!.id, f.masterKey);
     expect(Object.keys(JSON.parse(bytesToString(fromBase64url(raw))).data).sort()).toEqual(["alpha", "beta"]);
+  });
+
+  it("writes a critical failure audit for a tampered checkpoint in the cold CLI", async () => {
+    const f = await fixture();
+    const createdAt = "2026-10-02T12:00:00.000Z";
+    const declaredBundle = toBase64url(stringToBytes(JSON.stringify({ namespaces: [], data: {} })));
+    const declaredHash = hashToString(fromBase64url(declaredBundle));
+    const tamperedBundle = toBase64url(stringToBytes(JSON.stringify({ namespaces: ["alpha"], data: { alpha: [] } })));
+    const id = buildMemoryCheckpointId(createdAt, declaredHash);
+    await f.checkpoints.create({
+      record: {
+        id, created_at: createdAt, source: "on_demand", namespaces: [], total_keys: 0,
+        bundle_hash: declaredHash,
+        completeness_summary: { namespace_count: 0, total_keys: 0, per_namespace: {} },
+        retention_expires_at: null, format_version: 1,
+      },
+      bundle: tamperedBundle,
+      masterKey: f.masterKey,
+    });
+    const result = await coldRestore(f, id);
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain("does not match the recorded bundle_hash");
+    const audit = new AuditLog(f.storage, f.masterKey);
+    const { entries } = await audit.query({ operation_type: "memory_checkpoint_restore" });
+    expect(entries).toEqual(expect.arrayContaining([expect.objectContaining({
+      result: "failure",
+      details: expect.objectContaining({ checkpoint_id: id, error_reason: "bundle_hash_mismatch" }),
+    })]));
+    expect((await f.checkpoints.list()).map((record) => record.id)).toEqual([id]);
   });
 
   it("refuses a cold restore below a durable anchor without changing any durable bytes", async () => {

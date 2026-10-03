@@ -43,6 +43,7 @@ import type {
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   CHECKPOINT_RETENTION_ENV,
+  CheckpointRestoreVersionFloorError,
   MemoryCheckpointStore,
   createCheckpoint,
   nodeMemoryCheckpointFsOps,
@@ -552,8 +553,12 @@ async function cmdRestore(
       checkpointId: id,
     });
   } catch (restoreErr) {
-    write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
-    return 1;
+    // Only version-floor refusals promise unchanged audit bytes; other failures
+    // must reach restoreCheckpoint's critical audit after approval.
+    if (restoreErr instanceof CheckpointRestoreVersionFloorError) {
+      write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
+      return 1;
+    }
   }
 
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
