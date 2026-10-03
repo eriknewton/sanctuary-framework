@@ -22,7 +22,9 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { normalizedArgsHash, OpaqueNamespaceRegistry, fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
-import { MAX_DISCOVERED_NAMESPACES } from "../../src/storage/interface.js";
+
+// Acceptance ceiling, independent of new exports for meaningful base-tree evidence.
+const MAX_DISCOVERED_NAMESPACES = 1_024;
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {

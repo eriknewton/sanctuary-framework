@@ -2970,7 +2970,11 @@ export class StateStore {
     bundleBase64: string,
     conflictResolution: "skip" | "overwrite" | "version" = "skip",
     publicKeyResolver: (kid: string) => Uint8Array | null,
-    options: { allowUnverifiedLegacy?: boolean } = {}
+    options: {
+      allowUnverifiedLegacy?: boolean;
+      /** Checkpoint restore only: preserve content while advancing rollback floors. */
+      restoreAsNewVersions?: boolean;
+    } = {}
   ): Promise<{
     imported_keys: number;
     skipped_keys: number;
@@ -3128,17 +3132,24 @@ export class StateStore {
         // already wrote earlier in the loop in place - import() has never
         // rolled back its own partial progress on any refusal, and this
         // check does not change that.
+        // Must match restoreCheckpoint in memory-checkpoint/restore.ts: an
+        // approved restore advances versions; it never lowers durable floors.
+        const importedEntry = options.restoreAsNewVersions
+          ? await this.prepareCheckpointEntry(ns, key, entry, signerPublicKey)
+          : entry;
         if (await hasInterruptedExitImport(this.storage)) {
           throw new InterruptedExitImportPendingError(`state_import:${ns}/${key}`);
         }
-        // Write the entry
-        const serialized = stringToBytes(JSON.stringify(entry));
+        const serialized = stringToBytes(JSON.stringify(importedEntry));
         await this.storage.write(ns, key, serialized);
+        if (options.restoreAsNewVersions) {
+          await this.observeVersion(ns, key, importedEntry.ver);
+        }
         importedKeys++;
 
         // Update caches
         const vk = this.versionKey(ns, key);
-        this.versionCache.set(vk, entry.ver);
+        this.versionCache.set(vk, importedEntry.ver);
         const nsHashes = await this.getNamespaceHashes(ns);
         nsHashes.set(key, entry.integrity_hash);
       }
@@ -3182,6 +3193,57 @@ export class StateStore {
       namespaces,
       imported_at: new Date().toISOString(),
       completeness_verification: completenessVerification,
+    };
+  }
+
+  private async prepareCheckpointEntry(
+    namespace: string,
+    key: string,
+    entry: StateEntry,
+    verifiedSigner: Uint8Array
+  ): Promise<StateEntry> {
+    // The caller verified both original signatures before reaching this site.
+    // Only the same resident writer may re-sign its content and provenance;
+    // a replacement identity must never inherit the checkpoint's attribution.
+    const writer = await this.resolveStoredIdentity(entry.kid);
+    if (
+      !writer || writer.identity_id !== entry.kid ||
+      !constantTimeEqual(
+        this.publicKeyFromEncryptedPrivateKey(writer.encrypted_private_key, this.identityEncryptionKey),
+        verifiedSigner
+      )
+    ) {
+      throw new StateVerificationError("writer_unverified", "Checkpoint writer signing material unavailable");
+    }
+    await this.getNamespaceHashes(namespace);
+    const version = Math.max(
+      entry.ver,
+      this.versionCache.get(this.versionKey(namespace, key)) ?? 0,
+      await this.getAnchoredVersion(namespace, key)
+    ) + 1;
+    // Integer overflow cannot create an entry outside the monotone version domain.
+    if (!Number.isSafeInteger(entry.ver) || entry.ver < 1 || !Number.isSafeInteger(version)) {
+      throw new StateVerificationError("schema_mismatch", "Checkpoint version cannot advance safely");
+    }
+    // Legacy ciphertext-only entries gain a signed version; original metadata
+    // and provenance remain historical facts, not claims of a new content write.
+    const schemaVersion = entry.v === 1 ? LEGACY_STATE_ENVELOPE_SCHEMA_VERSION : entry.v;
+    const metadata = { ...entry.metadata, schema_version: schemaVersion };
+    const envelope = buildSignedEnvelope({
+      namespace, key, version, kid: entry.kid, schemaVersion, metadata,
+      ...(entry.provenance_stamp !== undefined ? { provenanceStamp: entry.provenance_stamp } : {}),
+      integrityHash: entry.integrity_hash,
+      payload: entry.payload,
+    });
+    return {
+      ...entry,
+      v: schemaVersion,
+      ver: version,
+      metadata,
+      envelope,
+      envelope_sig: toBase64url(sign(
+        stateEnvelopeSigningBytes(envelope), writer.encrypted_private_key, this.identityEncryptionKey
+      )),
     };
   }
 }

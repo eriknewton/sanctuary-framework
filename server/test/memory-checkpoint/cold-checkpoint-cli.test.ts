@@ -100,6 +100,7 @@ describe("cold checkpoint CLI", () => {
       source: "on_demand",
     });
     await f.write("alpha", "changed");
+    const beforeRestore = (await f.storage.read("alpha", "note"))!;
     await f.write("added", "post-checkpoint");
     const originalParked = await vi.importActual<typeof import("../../src/egress-gate/parked-claim.js")>(
       "../../src/egress-gate/parked-claim.js",
@@ -119,6 +120,13 @@ describe("cold checkpoint CLI", () => {
       "alpha", "note", fromBase64url(f.identity.public_key),
     );
     expect(restored?.value).toBe("original");
+    expect(restored?.version).toBeGreaterThan(JSON.parse(bytesToString(beforeRestore)).ver);
+    // A cold reader enforces the new durable floor even before it has read the
+    // restored entry; restoration must not make a later replay acceptable.
+    await reopened.write("alpha", "note", beforeRestore);
+    await expect(new StateStore(new FilesystemStorage(join(f.path, "state")), f.masterKey).read(
+      "alpha", "note", fromBase64url(f.identity.public_key),
+    )).rejects.toMatchObject({ classification: "rollback_detected" });
     const forensic = (await f.checkpoints.list()).find((record) => record.source === "forensic_quarantine")!;
     expect(forensic.namespaces).toEqual(["added", "alpha", "beta"]);
     const snapshot = JSON.parse(bytesToString(fromBase64url(await f.checkpoints.readBundle(forensic.id, f.masterKey))));

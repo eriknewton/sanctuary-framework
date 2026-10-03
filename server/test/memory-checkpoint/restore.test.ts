@@ -316,8 +316,17 @@ describe("restoreCheckpoint", () => {
 
     const restoredEntries = await exportEntries(fixture.stateStore);
     expect(restoredEntries.has("mem/P")).toBe(false);
-    expect(restoredEntries.get("mem/Q")).toEqual(checkpointEntries.get("mem/Q"));
-    expect(restoredEntries.get("mem/R")).toEqual(checkpointEntries.get("mem/R"));
+    for (const key of ["Q", "R"]) {
+      const original = checkpointEntries.get(`mem/${key}`)!;
+      const restoredEntry = restoredEntries.get(`mem/${key}`)!;
+      expect(restoredEntry.integrity_hash).toBe(original.integrity_hash);
+      expect(restoredEntry.payload).toEqual(original.payload);
+      expect(restoredEntry.metadata).toEqual(original.metadata);
+      expect(restoredEntry.ver).toBeGreaterThan(Number(original.ver));
+      expect(restoredEntry.provenance_stamp).toEqual(original.provenance_stamp);
+      await expect(new RealStateStore(fixture.storage, fixture.masterKey).read("mem", key))
+        .resolves.toMatchObject({ value: `known-good-${key.toLowerCase()}` });
+    }
 
     await expect(fixture.stateStore.read("_audit", "audit-key")).resolves.toMatchObject({
       value: "audit-after",

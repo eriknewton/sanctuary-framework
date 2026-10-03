@@ -411,6 +411,9 @@ export async function restoreCheckpoint(
         checkpointBundle,
         "overwrite",
         deps.publicKeyResolver,
+        // Must match StateStore.import in cognitive/state-store.ts: restore
+        // historical content under fresh signed versions, keeping floors intact.
+        { restoreAsNewVersions: true },
       );
     } catch (err) {
       throw new CheckpointRestoreReconstructError(
