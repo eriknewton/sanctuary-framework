@@ -12,7 +12,7 @@ export default defineConfig({
     // env, as it does in a process. See test/setup/homedir-follows-env.ts and
     // register row TEST-ISOLATION-SINGLE-WORKER-01.
     setupFiles: ["./test/setup/keychain-fake.ts", "./test/setup/homedir-follows-env.ts"],
-    // Leaves a marker file at the package root for the whole run. setupFiles
+    // Leaves a marker directory at the package root for the whole run. setupFiles
     // covers this process and children inherit VITEST by default, but a child
     // spawned with `env: {}` has neither; the marker is what a scrubbed
     // environment cannot erase. See test/setup/test-run-marker.ts.

@@ -23,7 +23,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
-  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -110,9 +109,10 @@ describe("sealed Castle Wall CLI runtime layout", () => {
       // dist/cli.js to the nearest package.json, which in this layout is the
       // staged root, so the test-run marker must exist THERE. Always write it:
       // a child that reads "no marker" would classify itself as production.
-      const marker = join(serverRoot, TEST_RUN_MARKER_FILENAME);
-      if (existsSync(marker)) copyFileSync(marker, join(runtime, TEST_RUN_MARKER_FILENAME));
-      else writeFileSync(join(runtime, TEST_RUN_MARKER_FILENAME), "sealed-cli-runtime-layout-smoke\n");
+      // The chokepoint checks only that the marker path exists, so a file is
+      // enough here; never copy the package-root marker, which is a directory
+      // of per-run tokens (test/setup/test-run-marker.ts).
+      writeFileSync(join(runtime, TEST_RUN_MARKER_FILENAME), "sealed-cli-runtime-layout-smoke\n");
       expect(existsSync(join(runtime, TEST_RUN_MARKER_FILENAME))).toBe(true);
 
       const root = join(runtime, "..");
