@@ -459,12 +459,15 @@ impl Ledger {
     }
 
     /// Test-only reopen of a ledger whose previous handle was just dropped.
-    /// Under CI load the kernel can still report the dropped handle's flock as
-    /// held for a moment, so this retries ONLY `WouldBlock`, for at most
-    /// 50 x 10 ms = 500 ms, and panics on any other error or if the lock is
-    /// still held after that. A real second owner still fails the test, just
-    /// 500 ms later. Production `open` keeps its one-shot refusal on purpose:
-    /// the owner composition root allows exactly one ledger handle.
+    /// Claude R1 for PR #1492 noted flock is released synchronously with the
+    /// final file-description close; the plausible transient holder is a
+    /// current_exe() child spawned by another test thread inheriting this fd
+    /// between fork/clone and exec, before O_CLOEXEC closes it. This retries
+    /// ONLY `WouldBlock`, for at most 50 x 10 ms = 500 ms, and panics on any
+    /// other error or if the lock is still held after that. A real second owner
+    /// still fails the test, just 500 ms later. Production `open` keeps its
+    /// one-shot refusal on purpose: the owner composition root allows exactly
+    /// one ledger handle.
     #[cfg(test)]
     pub(crate) fn open_after_release_for_test(path: &Path) -> Ledger {
         let mut last_err = None;
@@ -675,6 +678,18 @@ mod tests {
         let reopened = open_ledger_for_test(&path);
         drop(reopened);
         releaser.join().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "open test ledger after transient flock contention")]
+    fn reopen_helper_still_panics_when_a_real_second_owner_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let _held = Ledger::open(&path).unwrap();
+        // The transient witness releases after 50 ms; the helper waits 500 ms,
+        // a 10x margin, so holding through the whole budget proves the helper
+        // did not turn a real second owner into success.
+        let _never_reopened = open_ledger_for_test(&path);
     }
 
     #[test]
