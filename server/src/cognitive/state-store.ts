@@ -16,6 +16,7 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import { MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
 import {
   hasInterruptedExitImport,
   InterruptedExitImportPendingError,
@@ -2847,6 +2848,23 @@ export class StateStore {
       .sort();
   }
 
+  /** Discover the complete export scope without requiring prior state reads. */
+  async listExportableNamespaces(): Promise<string[]> {
+    // Must match sessionOwnedExportNamespaces in tools.ts: approval and full
+    // export share durable discovery; an absent capability never falls back
+    // to the warm cache, which cannot prove completeness after a restart.
+    if (!this.storage.listNamespaces) {
+      throw new Error("Storage cannot enumerate namespaces");
+    }
+    const namespaces = await this.storage.listNamespaces();
+    // Recheck the backend contract before retaining or sorting its result;
+    // internal namespaces count toward the bound as well.
+    if (namespaces.length > MAX_DISCOVERED_NAMESPACES) {
+      throw new Error("Namespace discovery limit exceeded");
+    }
+    return [...new Set(namespaces.filter((namespace) => !isReservedNamespace(namespace)))].sort();
+  }
+
   async exportNamespaces(
     requestedNamespaces?: string[]
   ): Promise<{
@@ -2871,8 +2889,7 @@ export class StateStore {
         }
       }
     } else {
-      // Discover all namespaces from the content hash cache
-      namespacesToExport.push(...this.listCachedExportableNamespaces());
+      namespacesToExport.push(...await this.listExportableNamespaces());
     }
 
     const exportData: Record<

@@ -41,7 +41,8 @@
  */
 
 import { constants as fsConstants, existsSync, lstatSync } from "node:fs";
-import { link, mkdir, open, unlink, readdir, stat, lstat } from "node:fs/promises";
+import { link, mkdir, open, opendir, unlink, readdir, stat, lstat } from "node:fs/promises";
+import { MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES } from "./interface.js";
 import type { Stats } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
@@ -1178,34 +1179,47 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async listNamespaces(): Promise<string[]> {
     const capability = this.darwinCapability();
     if (capability) return capability.client.call("listNamespaces");
-    let dirNames: string[];
+    let root;
     try {
-      dirNames = await readdir(this.activeBasePath());
-    } catch {
-      return []; // Base path does not exist yet — empty fortress.
+      root = await opendir(this.activeBasePath());
+    } catch (error) {
+      // Only an absent root proves an empty fortress; permission/I/O errors
+      // cannot authorize an apparently complete export of a partial set.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
     }
     const namespaces: string[] = [];
-    for (const dirName of dirNames) {
-      try {
-        const s = await stat(join(this.activeBasePath(), dirName));
-        if (!s.isDirectory()) continue;
-      } catch {
-        continue;
+    let scanned = 0;
+    const chargeEntry = () => {
+      // Must match listNamespaces in interface.ts: one shared budget bounds
+      // work even for empty/internal directories; opendir bounds allocation.
+      if (++scanned > MAX_NAMESPACE_DISCOVERY_ENTRIES) {
+        throw new Error("Namespace discovery scan limit exceeded");
       }
-      // Skip empty namespace directories: a namespace with no entries holds
-      // nothing to rotate, and surfacing it would only trip the rotation
-      // walker's unknown-namespace abort for leftover empty dirs.
-      try {
-        const files = await readdir(join(this.activeBasePath(), dirName));
-        if (!files.some((f) => f.endsWith(".enc"))) continue;
-      } catch {
-        continue;
+    };
+    for await (const dir of root) {
+      chargeEntry();
+      const path = join(this.activeBasePath(), dir.name);
+      if (!(await stat(path)).isDirectory()) continue;
+      let hasEntries = false;
+      // Propagate subdirectory failures too: skipping an unreadable namespace
+      // would turn a storage error into silent data loss in a full export.
+      for await (const entry of await opendir(path)) {
+        chargeEntry();
+        if (entry.name.endsWith(".enc")) {
+          hasEntries = true;
+          break;
+        }
+      }
+      if (!hasEntries) continue;
+      if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) {
+        throw new Error("Namespace discovery limit exceeded");
       }
       // bijectiveDecode is total (unmatched bytes pass through), so legacy
       // pre-#41 sanitized directory names still surface — as their raw names
       // — and the rotation walker's unknown-namespace abort catches them
       // (fail closed) instead of silently skipping a namespace.
-      namespaces.push(bijectiveDecode(dirName));
+      namespaces.push(bijectiveDecode(dir.name));
     }
     return namespaces.sort();
   }

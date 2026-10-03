@@ -1,10 +1,6 @@
 /**
- * `state_export`'s Tier-1 approval gate freezes the exported namespace set
- * at gate time and binds it to the call the human approved: the handler
- * consumes that frozen set instead of re-deriving it from live state, so
- * the executed export's namespace list always matches what the approval
- * prompt was built from. Register: defect.tier1-approval-binding-state-
- * export-namespace-toctou-01.
+ * State export executes exactly the namespace set bound to each Tier-1 approval.
+ * LEGACY-BUG-001
  */
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -91,12 +87,10 @@ describe("state_export approval namespace binding", () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, masterKey);
 
-    // Seed real encrypted records in three namespaces via one StateStore
+    // Seed real encrypted records in two namespaces via one StateStore
     // instance, then hand the SAME underlying storage to a fresh instance
-    // below. `contentHashes` is an in-memory, per-instance cache (never
-    // persisted), so the fresh instance starts knowing about none of them —
-    // this is what lets the test warm A and B before C without special
-    // fixture machinery.
+    // below. C is created only after approval is pending, so durable
+    // discovery must freeze A and B before the new namespace exists.
     const seedingStore = new StateStore(storage, masterKey);
     const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
     const identity = createIdentity(
@@ -107,7 +101,6 @@ describe("state_export approval namespace binding", () => {
     for (const [namespace, key, value] of [
       ["A", "k", "alpha"],
       ["B", "k", "bravo"],
-      ["C", "k", "charlie"],
     ] as const) {
       await seedingStore.write(
         namespace,
@@ -205,8 +198,11 @@ describe("state_export approval namespace binding", () => {
         normalizedArgsHash(capturedGateArgs as Record<string, unknown>)
       );
 
-      // While the approval is still pending, a second routed call widens
-      // the live export cache to a set the approval prompt never saw.
+      // While approval is pending, create durable state outside its scope.
+      await seedingStore.write(
+        "C", "k", "charlie", identity.storedIdentity.identity_id,
+        identity.storedIdentity.encrypted_private_key, identityEncKey,
+      );
       await client.callTool({
         name: "state_list",
         arguments: { namespace: "C" },
@@ -253,7 +249,6 @@ describe("state_export approval namespace binding", () => {
     for (const [namespace, key, value] of [
       ["A", "k", "alpha"],
       ["B", "k", "bravo"],
-      ["C", "k", "charlie"],
     ] as const) {
       await seedingStore.write(
         namespace,
@@ -346,7 +341,11 @@ describe("state_export approval namespace binding", () => {
       });
       await arrivals[0]!.promise;
 
-      // Widen the live cache WHILE export 1's approval is still pending.
+      // Widen durable storage WHILE export 1's approval is still pending.
+      await seedingStore.write(
+        "C", "k", "charlie", identity.storedIdentity.identity_id,
+        identity.storedIdentity.encrypted_private_key, identityEncKey,
+      );
       await client.callTool({
         name: "state_list",
         arguments: { namespace: "C" },
@@ -357,7 +356,7 @@ describe("state_export approval namespace binding", () => {
         "C",
       ]);
 
-      // Export 2's gate-time projection runs with the now-widened cache and
+      // Export 2's gate-time projection runs with the now-widened storage and
       // snapshots {A, B, C} — a DIFFERENT call, a DIFFERENT args object, a
       // DIFFERENT binding than export 1's.
       const exportPromise2 = client.callTool({
@@ -423,7 +422,6 @@ describe("state_export approval namespace binding", () => {
     for (const [namespace, key, value] of [
       ["D", "k", "delta"],
       ["E", "k", "echo"],
-      ["F", "k", "foxtrot"],
     ] as const) {
       await seedingStore.write(
         namespace,
@@ -507,8 +505,11 @@ describe("state_export approval namespace binding", () => {
       });
       await arrivals[0]!.promise;
 
-      // Widen the live cache WHILE export 1's approval is still pending —
-      // the session-bound branch reads this same cache.
+      // Widen durable storage WHILE the session-bound approval is pending.
+      await seedingStore.write(
+        "F", "k", "foxtrot", identity.storedIdentity.identity_id,
+        identity.storedIdentity.encrypted_private_key, identityEncKey,
+      );
       await client.callTool({
         name: "state_list",
         arguments: { namespace: "F" },

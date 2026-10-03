@@ -17,6 +17,12 @@
  * caller mutate through a method nobody refused.
  */
 
+// Policy ceilings: at most 1,024 namespaces per discovery and a shared scan
+// budget of 64 directory entries per allowed namespace (including internal
+// names and empty directories). Exceeding either refuses, never truncates.
+export const MAX_DISCOVERED_NAMESPACES = 1_024;
+export const MAX_NAMESPACE_DISCOVERY_ENTRIES = MAX_DISCOVERED_NAMESPACES * 64;
+
 /** Metadata about a stored entry */
 export interface StorageEntryMeta {
   key: string;
@@ -97,6 +103,9 @@ export interface StorageBackend {
    * walker must be able to prove it visited the WHOLE fortress and fails
    * closed on backends that cannot enumerate). Implemented by the
    * filesystem and in-memory backends.
+   * Must fail on enumeration errors and when MAX_DISCOVERED_NAMESPACES or
+   * MAX_NAMESPACE_DISCOVERY_ENTRIES is exceeded; never return a partial set.
+   * These bounds must match the enforcement in filesystem.ts and memory.ts.
    */
   listNamespaces?(): Promise<string[]>;
 }

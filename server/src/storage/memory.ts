@@ -16,6 +16,7 @@ import type {
 } from "./cross-process-lock.js";
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
+import { MAX_DISCOVERED_NAMESPACES } from "./interface.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
@@ -170,6 +171,11 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   }
 
   async listNamespaces(): Promise<string[]> {
+    // Must match listNamespaces in interface.ts: refuse before allocating an
+    // attacker-sized snapshot; filtering internal names cannot bypass the cap.
+    if (this.namespaceCounts.size > MAX_DISCOVERED_NAMESPACES) {
+      throw new Error("Namespace discovery limit exceeded");
+    }
     return [...this.namespaceCounts.keys()].sort();
   }
 

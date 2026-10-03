@@ -1049,11 +1049,14 @@ export function createCognitiveTools(
     }
   }
 
-  function sessionOwnedExportNamespaces(): string[] {
+  async function sessionOwnedExportNamespaces(): Promise<string[]> {
     const binding = options?.currentSessionBinding?.();
-    if (!binding) return stateStore.listCachedExportableNamespaces();
-    const active = resolveActiveSessionIdentity(binding);
-    const namespaces = stateStore.listCachedExportableNamespaces();
+    const active = binding ? resolveActiveSessionIdentity(binding) : undefined;
+    // Must match listExportableNamespaces in state-store.ts: one durable
+    // enumeration supplies the approval snapshot; execution consumes that
+    // frozen snapshot and must never discover additional namespaces later.
+    const namespaces = await stateStore.listExportableNamespaces();
+    if (!active) return namespaces;
     const exportable: string[] = [];
     for (const namespace of namespaces) {
       if (!namespaceRegistry.isOpaqueMemoryHandle(namespace)) {
@@ -1885,13 +1888,13 @@ export function createCognitiveTools(
           namespaces = [args.namespace];
         } else if (options?.currentSessionBinding?.()) {
           try {
-            namespaces = sessionOwnedExportNamespaces();
+            namespaces = await sessionOwnedExportNamespaces();
           } catch {
             await denyNamespaceAccess("state_export", "state_export");
             throw new Error("namespace_ownership_ambiguous");
           }
         } else {
-          namespaces = sessionOwnedExportNamespaces();
+          namespaces = await sessionOwnedExportNamespaces();
         }
         attachStateExportApprovalBinding(args, {
           toolName: "state_export",
@@ -1911,9 +1914,9 @@ export function createCognitiveTools(
       },
       handler: async (args) => {
         // Consume the gate-time binding instead of recomputing the
-        // namespace set: recomputation here (via the live export cache /
+        // namespace set: recomputation here (via durable discovery /
         // namespace registry) is exactly the TOCTOU this closes — a
-        // namespace warmed or reassigned while the human's approval was
+        // namespace created or reassigned while the human's approval was
         // pending must never reach the bundle. Absent, aged past the
         // fixed freshness ceiling (see `StateExportApprovalBinding`'s
         // trust-bearing-field comment above for why that ceiling exists
