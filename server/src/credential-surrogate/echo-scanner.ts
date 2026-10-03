@@ -147,7 +147,7 @@ export class SurrogateEchoScanner {
           this.frameDigits = true;
           // A begun size line can never become an ordinary body: framing deviations
           // must refuse, since unparsed framing in a non-dechunked body splits a secret across views.
-          // Cost, accepted: a dechunked body that opens with a hex digit is refused too (availability, never a leak).
+          // Cost, accepted: a dechunked body that opens like a size line but does not complete as framing is refused too.
           this.frameCommitted = true;
           // Saturation prevents attacker-selected size digits from overflowing numeric state.
           this.frameSize = Math.min(MAX_SURROGATE_ECHO_SCAN_BYTES + 1, this.frameSize * HEX_RADIX + digit);
@@ -162,7 +162,7 @@ export class SurrogateEchoScanner {
         // Cost, accepted: a swapped chunked body opening with whitespace or a sign is refused.
         if (!this.frameCommitted && LENIENT_SIZE_PREFIX.has(byte)) return "FAIL";
         // Stated bound: framing only nonstandard parsers accept is outside detection
-        // (SURROGATE-1B-II-LENIENT-FRAMING-01); the gate re-frames delivery, so this needs an adversarial upstream.
+        // (SURROGATE-1B-II-LENIENT-FRAMING-01).
         // Ordinary decoded bodies have no opening chunk-size line. Both views then
         // coincide; never use normalized or raw header whitespace to choose a view.
         if (!this.frameCommitted) { this.frameState = "PASSTHROUGH"; return "SKIP"; }
