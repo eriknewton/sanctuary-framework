@@ -1584,7 +1584,7 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
 }
 
 #[derive(Debug, Default)]
-struct WalValidationState {
+pub(crate) struct WalValidationState {
     previous_seq: Option<u64>,
     next_seq: u64,
     last_chain_hash: Option<String>,
@@ -1594,7 +1594,7 @@ struct WalValidationState {
 /// Parse and validate one exact on-disk row before it may be drained or used
 /// by an ACK transaction. Re-running this check for snapshots/truncation is
 /// deliberate: startup validation cannot protect against later disk mutation.
-fn validate_wal_line(
+pub(crate) fn validate_wal_line(
     line: &str,
     line_num: u64,
     state: &mut WalValidationState,

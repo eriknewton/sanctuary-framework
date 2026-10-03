@@ -3230,11 +3230,14 @@ mod tb10_agent_unit_against_real_systemd {
     impl Tb10Units {
         pub(super) fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let dir = TempDir::new().expect("scratch dir");
-            // 0777: the fixture check and agent run as the instance uid and
-            // write their views and marker here.
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
-                .expect("0777 scratch dir");
+            let dir = tempfile::Builder::new()
+                .prefix("sanctuary-tb10-")
+                .tempdir_in("/var/lib")
+                .expect("visible scratch dir");
+            // Scripts remain root-custodied outside hidden temporary paths; only
+            // the separately mounted workspace admits fixture writes.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("0755 scratch dir");
             let tag = format!(
                 "{:x}{:x}",
                 std::process::id(),
@@ -3291,7 +3294,11 @@ mod tb10_agent_unit_against_real_systemd {
         }
 
         pub(super) fn path(&self, name: &str) -> PathBuf {
-            self.dir_path().join(name)
+            if matches!(name, "marker" | "check-view") {
+                self.dir_path().join("workspace").join(name)
+            } else {
+                self.dir_path().join(name)
+            }
         }
 
         pub(super) fn write_unit(&mut self, name: &str, text: &str) {
@@ -3323,6 +3330,40 @@ mod tb10_agent_unit_against_real_systemd {
                 .and_then(|mut f| f.write_all(body.as_bytes()))
                 .expect("write the 0600 env file");
             path
+        }
+
+        /// Preserve the shipped mount dependency and limits under an isolated
+        /// path. Scripts stay outside noexec tmpfs; only observations go inside.
+        fn workspace(&mut self, agent: &str) -> (String, String) {
+            let path = self.dir_path().join("workspace");
+            std::fs::create_dir(&path).expect("workspace backing");
+            let out = Command::new("systemd-escape")
+                .args(["--path", "--suffix=mount", path.to_str().unwrap()])
+                .output()
+                .expect("escape fixture mount");
+            assert!(out.status.success());
+            let name = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            let mount = include_str!("../systemd/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount");
+            let mount = substitute(
+                mount,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                1,
+            );
+            self.write_unit(&name, &mount);
+            let derived = substitute(
+                agent,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                3,
+            );
+            let derived = substitute(
+                &derived,
+                r"var-lib-sanctuary\x2dagent\x2dworkspace.mount",
+                &name,
+                2,
+            );
+            (derived, name)
         }
 
         pub(super) fn reload(&self) {
@@ -3499,7 +3540,7 @@ mod tb10_agent_unit_against_real_systemd {
             units.write_script(
                 "check.sh",
                 &format!(
-                    "#!/bin/sh\ngrep -E '^(Uid|Gid):' /proc/self/status > {d}/check-view\nexit 0\n"
+                    "#!/bin/sh\ngrep -E '^(Uid|Gid):' /proc/self/status > {d}/workspace/check-view\nexit 0\n"
                 ),
             );
             units.write_script(
@@ -3510,7 +3551,7 @@ mod tb10_agent_unit_against_real_systemd {
             );
             units.write_script(
                 "agent.sh",
-                &format!("#!/bin/sh\necho started >> {d}/marker\nexec sleep infinity\n"),
+                &format!("#!/bin/sh\necho started >> {d}/workspace/marker\nexec sleep infinity\n"),
             );
             let env = units
                 .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
@@ -3540,18 +3581,8 @@ mod tb10_agent_unit_against_real_systemd {
                 &format!("EnvironmentFile={}", env.display()),
                 1,
             );
-            // Per-run state and runtime directory names, so no fixture ever
-            // touches an operator's /var/lib/sanctuary-agent-<uid>.
-            let derived = substitute(
-                &derived,
-                "sanctuary-agent-%i",
-                &format!("sanctuary-tb10-{tag}-%i"),
-                4,
-            );
+            let (derived, mount) = units.workspace(&derived);
             units.write_unit(&template, &derived);
-            units.extra_dirs.push(PathBuf::from(format!(
-                "/var/lib/sanctuary-tb10-{tag}-{FIXTURE_INSTANCE}"
-            )));
             // A holder that only ORDERS after both units keeps them loaded once
             // they go inactive; without it systemd garbage-collects an inactive
             // runtime unit and its timestamps read back as 0. It adds no
@@ -3564,7 +3595,7 @@ mod tb10_agent_unit_against_real_systemd {
                      [Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
                 ),
             );
-            units.set_stop_order(vec![agent.clone(), wall.clone(), holder.clone()]);
+            units.set_stop_order(vec![agent.clone(), wall.clone(), holder.clone(), mount]);
             units.reload();
             assert!(
                 systemctl(&["start", &holder]).status.success(),
@@ -4042,7 +4073,7 @@ mod tb10_agent_unit_against_real_systemd {
         units.own(state);
         units.write_script(
             "agent.sh",
-            &format!("#!/bin/sh\necho started >> {d}/marker\nexec sleep infinity\n"),
+            &format!("#!/bin/sh\necho started >> {d}/workspace/marker\nexec sleep infinity\n"),
         );
         let env = units
             .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
@@ -4079,17 +4110,13 @@ mod tb10_agent_unit_against_real_systemd {
             &format!("EnvironmentFile={}", env.display()),
             1,
         );
-        let derived = substitute(
-            &derived,
-            "sanctuary-agent-%i",
-            &format!("sanctuary-tb10-{tag}-%i"),
-            4,
-        );
+        // This legacy verb witness needs the precheck diagnostics. Only its
+        // observation sink differs; the actual packaged-unit tests retain null.
+        let derived = substitute(&derived, "StandardOutput=null", "StandardOutput=journal", 1);
+        let derived = substitute(&derived, "StandardError=null", "StandardError=journal", 1);
+        let (derived, mount) = units.workspace(&derived);
         units.write_unit(&template, &derived);
-        units.extra_dirs.push(PathBuf::from(format!(
-            "/var/lib/sanctuary-tb10-{tag}-{TEST_AGENT_UID}"
-        )));
-        units.set_stop_order(vec![agent.clone(), wall.clone()]);
+        units.set_stop_order(vec![agent.clone(), wall.clone(), mount]);
         units.reload();
 
         let out = systemctl(&["start", &agent]);

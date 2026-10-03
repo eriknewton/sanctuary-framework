@@ -1,109 +1,205 @@
-# Internal Ubuntu package refusal guard
+# Ubuntu cold-install operator guide
 
-This directory builds an **internal, unprovisioned-only** Ubuntu 24.04 amd64
-`.deb` for `castle-wall-daemon`. It remains `install_ready=false` and does not
-establish a Linux enforcement claim.
+The explicit `install` variant packages the daemon, `sanctuary-linux`, the
+`protected-agent-v1` launcher, the finite `network-agent-standin`, and the three
+required systemd units for Ubuntu 24.04 amd64 with systemd 255. Installation is
+inert. Provisioning and activation are separate operator actions.
 
-`build-deb.sh` takes an explicit positive package revision, builds the locked
-default-feature daemon, copies the current source unit byte for byte, and
-writes a `.deb`, checksum, manifest and root-custodied build identity. It puts
-the hook's early `systemd`, `nftables` and `python3` probes in `Pre-Depends`;
-finished-ELF libraries remain in ordinary `Depends`. Source inputs must be
-clean, including untracked files, before the build stamps a commit identity.
-`assert-source-constants.py` pins the exact `src/nftables.rs` bytes from
-repository baseline `17d251f50514a885d0cd9666e363d19dbc963574` by SHA-256
-and checks the relevant literal constants. This byte-identity pin is not a
-general Rust parser or a claim of whole-file review: any nft source edit,
-including a new table-construction helper or an inline command, requires
-source review and an explicit pin update before package assertion can pass.
+Linux remains drill-gated under the [Assurance Matrix](../../../ASSURANCE_MATRIX.md).
+An active unit or `KernelRuntimeReady` is not `Enforcing`. This path witnesses
+the shipped stand-in; a third-party workload needs its own captured evidence.
+No reboot or general Linux enforcement assurance follows from package tests.
 
-The control archive contains only `control`, `preinst` and `prerm`. These
-self-contained scripts read bounded dpkg/filesystem/systemd/nft state and
-refuse a fresh install unless the package and Castle Wall footprint are
-positively absent. Upgrade and removal require an exact old package identity,
-inert disabled unit and absent runtime state. No hook provisions, starts,
-stops, reloads or disarms. A refused old `prerm upgrade` is backed by the new
-`prerm failed-upgrade` veto. After a guarded removal, the operator purges an
-ordinary `config-files` residue if present, then runs `systemctl daemon-reload`
-and rechecks full absence before reinstall. Hooks never do those actions.
+## Artifact and prerequisites
 
-## Agent template unit
+Obtain the exact private artifact and independently authenticated source SHA,
+SHA-256, required-check inventory, workstation signer artifact, `endpoints.json`
+and `rules.json`. Require all checks at that source head to have succeeded;
+a missing, skipped or cancelled required job is not success. The adjacent
+checksum detects corruption but does not authenticate delivery.
 
-The package also ships `/etc/systemd/system/sanctuary-agent@.service`, a
-template whose instance name is the agent's numeric uid. It has no `[Install]`
-section, so nothing enables or starts it. In every systemd unit root the guard
-refuses any entry whose name starts with `sanctuary-agent@` other than the
-packaged template itself (the template drop-in directory
-`sanctuary-agent@.service.d/`, an instance drop-in directory such as
-`sanctuary-agent@<uid>.service.d/`, an alternate fragment, an instance
-enablement symlink) and any symlink whose target names `sanctuary-agent@`. It
-also refuses any package operation while an agent instance is active or
-transitioning. Two drop-in directories that systemd also applies to every agent
-instance are outside the guard's scope: the prefix drop-in
-`sanctuary-.service.d/` and the top-level `service.d/` (distributions ship files
-there, so it cannot be refused wholesale). Host acceptance checks them instead:
-the agent unit's `DropInPaths` must be empty. The
-package does not ship the agent executable
-(`/usr/local/libexec/sanctuary/protected-agent-v1`); an instance whose
-executable is absent fails with 203/EXEC and no agent process runs.
+Use a fresh Ubuntu host with real PID 1 systemd, unified cgroup v2, working
+IPv4/IPv6 routes and nftables/NFQUEUE. The package declares runtime dependencies;
+no compiler, checkout or Node runtime is required on the target. The owner uses
+the separate `sanctuary-linux-policy-sign` workstation executable. Existing
+accounts, configuration, mounts, unit overrides or product state cause refusal.
+There is no upgrade, account adoption or internal-package conversion path.
 
-Provision one agent uid `U` (root, once per host, before publishing a manifest
-that admits `U`). Classify first and stop on anything unexpected:
+The example identity is U=60123, reserved service number B=60124,
+F=0123456789abcdef, signed system uid ceiling 1000. Confirm these identities
+are unused before choosing them. B remains absent from NSS in this no-broker
+profile. Do not create a broker account. Provision creates the `sanctuary`
+group and exact locked, nologin U account/group without a persistent home.
+Failure mode: NSS timeout or incomplete output is uncertainty, not absence.
+
+## Install, provision and start
+
+1. As the ordinary operator, verify the delivered bytes:
+
+   ```bash
+   printf '%s  install.deb\n' "$INSTALL_SHA256" | sha256sum -c -
+   ```
+
+   Verify the workstation artifact and input hashes in the same way. Stop on
+   any mismatch or unavailable required-check evidence.
+
+2. Record OS/kernel/systemd versions, machine and boot IDs, package/account/nft
+   inventory, routes and independent network controls, then install:
+
+   ```bash
+   sudo apt-get install ./install.deb
+   /usr/local/libexec/sanctuary/network-agent-standin --control --endpoints endpoints.json
+   ```
+
+   Verify wall and mount remain inactive, no agent runs and no account or policy
+   was created. The control sends exactly one immediate attempt to each of six
+   endpoints and exits with bounded JSON testimony. Independent receiver records
+   must establish reachability; exit zero alone does not. Failure mode: auto-start
+   or an unreachable family invalidates the installation observation.
+
+3. Stage the literal command and bounded endpoints:
+
+   ```bash
+   sudo sanctuary-linux provision --agent-uid 60123 --service-uid 60124 --fortress-id 0123456789abcdef --stage-file endpoints.json -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+   ```
+
+   For another workload, substitute a root-installed ELF and literal arguments
+   after `--`. Shell scripts, PATH lookup and shell interpolation are unsupported.
+   Configured must still be absent. Failure mode: interrupted provisioning must
+   not authorize a launch; only the identical request can resume its transaction.
+
+4. On the separately authorized owner workstation, with descriptor 3 supplied
+   by existing owner custody, sign the explicit generation `N`:
+
+   ```bash
+   sanctuary-linux-policy-sign --fortress-id 0123456789abcdef --agent-uid 60123 --system-uid-ceiling 1000 --generation "$N" --rules rules.json --key-fd 3 --output policy.bundle.json
+   ```
+
+   Transfer only the public bundle and independently verified public-key SHA-256
+   fingerprint. Failure mode: absent signing authority stops this step; do not
+   generate a replacement owner key or transfer private bytes to the target.
+
+5. Admit the signed policy and inspect status:
+
+   ```bash
+   sudo sanctuary-linux policy-install --bundle policy.bundle.json --expected-key-sha256 "$POLICY_KEY_SHA256"
+   sudo sanctuary-linux status --json
+   ```
+
+   Policy must explicitly bind uid U and fortress F. IP/CIDR rules may narrow
+   ports and TCP/UDP; hostname, template and time-window rules are unsupported.
+   Failure mode: wrong origin, pin, identity, rule or generation refuses before
+   Configured. Completed equality and rollback refuse; daemon restart alone may
+   reclaim the exact previously committed signed generation. No service starts.
+
+6. Start the workload, then enable the next boot:
+
+   ```bash
+   sudo sanctuary-linux start
+   sudo sanctuary-linux enable
+   /usr/local/libexec/sanctuary/network-agent-standin --control --endpoints endpoints.json
+   sudo sanctuary-linux status --json
+   U=60123
+   systemctl show "sanctuary-agent@${U}.service" --property=InvocationID,ActiveState,SubState,Result,MainPID,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ExecMainStatus,NRestarts,ControlGroup,FragmentPath,DropInPaths
+   sudo nft -a list table inet sanctuary-castle
+   sudo sanctuary-linux evidence --output evidence/boot-0
+   ```
+
+   `start` waits for stable PID/start ticks and the configured second executable,
+   after wall READY and both prechecks. The stand-in waits 60 seconds, sends
+   exactly 18 attempts shared by parent/child/grandchild, then idles. Each attempt
+   has a three-second deadline, no application retry and a capped response.
+   Complete controls in the quiet window. Collect evidence after all attempts;
+   an early capture reports incomplete and requires a new output directory.
+   Join nonce receipts, live uid rule/handle/mark, WAL and workload testimony for
+   allow/deny observations. Failure mode: a queued job, trampoline exec, connection
+   errno or zero receipts without a complete receiver window is not proof.
+
+A separately reviewed acceptance run performs five subsequent reboots and a
+same-boot wall-restart observation on each boot. Keep the same signed generation
+through those observations. Do not rerun provision or policy-install. An explicit
+wall restart propagates a new agent activation behind the new READY; count its
+18 attempts and do not issue an extra agent start. Unchanged boot ID, repaired
+initial launch or missed controls cannot count as reboot success. This guide
+and cold-install CI do not themselves establish reboot survival.
+
+## Stop, evidence and recovery
+
+`enable` starts nothing. `disable` removes only agent boot intent and leaves
+running workloads and wall enablement unchanged. `Restart=no` forbids automatic
+agent retries; it does not suppress the bound restart after an operator wall
+restart. Do not reset failed state to disguise a failed observation.
 
 ```bash
-getent passwd U ; getent group U
-groupadd --system --gid U sanctuary-agent-U
-useradd --system --uid U --gid U --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin sanctuary-agent-U
+sudo sanctuary-linux stop
+sudo systemctl stop sanctuary-castle-wall.service
+sudo sanctuary-linux evidence --output evidence/final
+sudo /usr/local/libexec/sanctuary/castle-wall-daemon --disarm
+sudo systemctl disable sanctuary-castle-wall.service
 ```
 
-Run both commands only when both lookups are empty; run only `useradd` when the
-group `sanctuary-agent-U:x:U:` exists and the user does not (an interrupted
-earlier run); do nothing when the user already has uid `U`, gid `U` and shell
-`/usr/sbin/nologin`. Anything else (uid or gid `U` held by another name, a
-different gid, a login shell, the user in a supplementary group) is a stop:
-choose another `U` or repair by hand. Failure mode: `useradd: UID U is not
-unique` looks like a broken tool and is this stop case.
+Stop disables the agent first and proves its whole cgroup empty, including a
+SIGTERM-resistant descendant. Confirm no other uid-U workload survives before
+disarm. Stop retains the kernel floor and wall enablement. Failure mode: stop is
+not disarm, and a process launched outside the product cgroup is not covered by
+its stop proof. Final evidence can report incomplete after the workload exits;
+retain the completed running capture and the explicit missingness. Disarm uses
+authenticated ownership and does not reset policy high-water. If it refuses,
+preserve state and follow the [deployment recovery guide](../../../server/docs/castle-wall-linux-deploy.md).
 
-Identity change from `U` to `V`, in this order: `systemctl stop
-sanctuary-agent@U`, `systemctl stop sanctuary-castle-wall`, stop any process of
-uid `U` started outside the unit and confirm `ps -u U` prints nothing, then
-`castle-wall-daemon --disarm`, provision `V`, publish the manifest admitting
-`V`, start the wall, start `sanctuary-agent@V`. Failure mode: skipping the
-disarm makes the wall's start refuse through the drift path and the agent start
-fail as a dependency; that is the designed refusal, not a broken unit. Failure
-mode that looks like success: `--disarm` refuses only while the daemon runs, so
-a surviving uid-`U` process is not detected by it; the explicit agent stop and
-the `ps -u U` check come first for that reason.
+Provisioned package removal and upgrades are unsupported: `apt-get remove` and
+`dpkg --purge` refuse retained configuration/state, even after stop/disarm. Do not
+delete keys, policy or tables to force successful removal. Successful remove and
+purge apply only to an inert, never-provisioned installation. Disposable proof
+host retirement is a separate authorized lifecycle.
 
-The agent's state directory `/var/lib/sanctuary-agent-U` survives stop,
-disarm, package removal and purge. Nothing bounds its size or content. After
-the agent stop, decide whether to archive or delete that exact path; never use
-a glob.
+## Bounds and fixed outputs
 
-Starting `sanctuary-agent@U` while the wall is stopped or failed starts the
-wall too (`BindsTo=` pulls it). After a wall exit 78 that is an explicit wall
-start, not an automatic restart, so repair the host first. If the wall has hit
-its start limit, the agent start fails with "start request repeated too
-quickly" as a dependency; run `systemctl reset-failed sanctuary-castle-wall`,
-not an edit of the agent unit.
+The mandatory host-visible tmpfs at `/var/lib/sanctuary-agent-workspace` is
+64 MiB and 4096 inodes with noexec/nosuid/nodev. The underlying root directory
+is not U-writable. Agent memory is 512 MiB, tasks 64, core dumps zero, and streams
+are null. Workspace is ephemeral and non-secret. Hidden temporary paths and
+persistent agent homes are not writable alternatives.
 
-A package built before the agent unit shipped cannot be upgraded in place: the
-new preinst refuses with "required package file absent" for the agent unit and
-nothing is unpacked. Use the guarded remove, purge, `systemctl daemon-reload`
-and a fresh install.
+Provision writes root-owned `/etc/sanctuary/castle-wall.env`, command/endpoints
+under `/etc/sanctuary/agent/`, and the fixed policy directory
+`/var/lib/sanctuary/0123456789abcdef/policy/egress/`. Policy-install writes the
+raw public `pinned.key`, manifest and exact signed rules, then publishes
+`configured-v1.json` last. The daemon creates private audit/ownership material;
+none is an installer input or evidence export. The shipped schema is
+`/usr/share/doc/sanctuary-castle-wall/schemas/contract.rs`.
 
-The first slice assumes a quiescent operator-controlled host with no direct
-daemon or concurrent root provisioning actor; hooks cannot prove that process
-or transaction exclusion. Provisioned package upgrades/removal, trusted CLI
-delivery and target-host Linux acceptance remain separate work.
+Audit capacity is finite. The 100 MiB WAL reserves up to 64 KiB for control
+recovery. This no-broker profile promises no unlimited runtime: exhaustion
+fails closed. Evidence copies a verified bounded public WAL prefix and never
+ACKs, truncates or exports seeds. Packet and row budgets must be substantiated
+for each acceptance schedule; the 256-byte application response limit is not
+itself a transport packet bound.
 
-The public repository's CI retains the inert internal `.deb` and lifecycle
-evidence as downloadable Actions artifacts for seven days. This is review
-visibility, not confidential storage, a package publication, or a release.
+## Building the two variants
 
-Example build command (builds only; it does not install):
+Build on Ubuntu from a clean committed tree with Rust 1.95.0 and locked Cargo:
 
 ```bash
-bash castle-wall-daemon/packaging/ubuntu/build-deb.sh --revision 1 --output /tmp/sanctuary-linux-package
-bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh --artifact-dir /tmp/sanctuary-linux-package
+bash castle-wall-daemon/packaging/ubuntu/build-deb.sh --variant install --revision 1 --output /tmp/sanctuary-install
+bash castle-wall-daemon/packaging/ubuntu/build-deb.sh --variant internal --revision 1 --output /tmp/sanctuary-internal
+bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh --artifact-dir /tmp/sanctuary-internal
 ```
+
+`internal` remains the default, `install_ready=false`, structural and
+unprovisioned-only. Its independent archive/lifecycle guard does not accept the
+install variant. The install builder requires all four real binaries and the
+canonical mount; a stub or absent consumer refuses. Both hooks are bounded,
+read-only admission guards: they do not provision, start, stop, reload, disarm or
+clean host state. Source identity and runtime library closure bind the final
+payload; metadata is not an independent CI attestation.
+
+Use separate dpkg invocations to remove a conflicting internal package and to
+install this variant. The guard observes the committed status database; within
+a multi-package transaction, that snapshot can still name the removed package
+until dpkg checkpoints its journal. The symptom is a conservative conflict
+refusal; finish the original transaction and retry the cold install separately.
+
+A refused remove or purge can change dpkg selection while keeping the package installed. The CLI still permits `stop`, `disable`, and evidence capture. Before activation, recover selection with `printf 'sanctuary-castle-wall install\n' | sudo dpkg --set-selections`; otherwise start/enable refuse. Provisioned package removal remains unsupported. The CLI requires an authenticated audit login session (`/proc/self/loginuid` must not be `4294967295`); `SUDO_UID` cannot replace it.
+
+The workstation signer tries fixed interpreter paths in order: `/usr/local/bin/node` then `/opt/homebrew/bin/node` on macOS, and `/usr/bin/node` then `/usr/local/bin/node` on Linux. Every directory and link on the path, and the interpreter itself, must be owned by root and not writable by group, others, or the invoking user (on macOS, no write ACL either). A Homebrew install owned by your user account is refused; the official Node.js installer package gives a root-owned `/usr/local/bin/node`. Install the trusted interpreter at one of these paths before passing a signing descriptor. The symptom of an untrusted interpreter is a silent exit 1 before any key is read. It never resolves an interpreter or path helper through PATH.
