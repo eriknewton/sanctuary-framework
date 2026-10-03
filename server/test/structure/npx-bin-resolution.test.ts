@@ -1,3 +1,4 @@
+// fail-before-exempt: this change pins the added package bin; the guard restores server/src only and leaves package.json at HEAD.
 /**
  * Structural gate: bare-npx executable resolution (v1.6.1 install-path
  * hardening, F1).
@@ -61,10 +62,10 @@ describe("npx bin resolution (install-path hardening F1)", () => {
     }
   });
 
-  it("pins the full frozen bin map (6 names) from reorg-surface-manifest.md", async () => {
+  it("pins the full frozen bin map (7 names) from reorg-surface-manifest.md", async () => {
     const pkg = await readPackageJson();
     // The bin names + their mappings are a FROZEN package surface (see
-    // server/reorg-surface-manifest.md, "Package `bin` (6 names)" row).
+    // server/reorg-surface-manifest.md, "Package `bin` (7 names)" row).
     // Adding, removing, or retargeting a bin is a release-visible
     // contract change and must update the manifest row in the same PR.
     expect(pkg.bin).toEqual({
@@ -74,6 +75,7 @@ describe("npx bin resolution (install-path hardening F1)", () => {
       "verify-transparency": "dist/verify-transparency.js",
       "verify-exit-bundle": "dist/cli.js",
       "import-exit-bundle": "dist/cli.js",
+      "sanctuary-linux-policy-sign": "bin/sanctuary-linux-policy-sign",
     });
   });
 });

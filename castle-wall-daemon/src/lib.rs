@@ -17,6 +17,8 @@
 //! Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 1, 4, 5,
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
 
+#[cfg(target_os = "linux")]
+pub mod agent_launch;
 pub mod agent_start;
 pub mod approval;
 pub mod audit;
@@ -40,6 +42,7 @@ pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;
 pub mod launcher;
+pub mod linux_install;
 pub mod live_status;
 pub mod manifest;
 pub mod nfqueue;

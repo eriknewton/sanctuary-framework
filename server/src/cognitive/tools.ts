@@ -5,6 +5,7 @@
  * These tools are the public API that agents interact with.
  */
 
+import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
@@ -1049,11 +1050,14 @@ export function createCognitiveTools(
     }
   }
 
-  function sessionOwnedExportNamespaces(): string[] {
+  async function sessionOwnedExportNamespaces(): Promise<string[]> {
     const binding = options?.currentSessionBinding?.();
-    if (!binding) return stateStore.listCachedExportableNamespaces();
-    const active = resolveActiveSessionIdentity(binding);
-    const namespaces = stateStore.listCachedExportableNamespaces();
+    const active = binding ? resolveActiveSessionIdentity(binding) : undefined;
+    // Must match listExportableNamespaces in state-store.ts: one durable
+    // enumeration supplies the approval snapshot; execution consumes that
+    // frozen snapshot and must never discover additional namespaces later.
+    const namespaces = await stateStore.listExportableNamespaces();
+    if (!active) return namespaces;
     const exportable: string[] = [];
     for (const namespace of namespaces) {
       if (!namespaceRegistry.isOpaqueMemoryHandle(namespace)) {
@@ -1062,6 +1066,9 @@ export function createCognitiveTools(
       }
       const owner = namespaceRegistry.getOwner(namespace);
       if (!owner) {
+        // Ownership is process-local: after restart a fresh registry cannot
+        // authenticate durable opaque handles, so session-bound bulk export
+        // refuses while any orphaned handle remains, even for the same identity.
         throw new Error("namespace_ownership_ambiguous");
       }
       if (owner === active.identity_id) {
@@ -1885,13 +1892,17 @@ export function createCognitiveTools(
           namespaces = [args.namespace];
         } else if (options?.currentSessionBinding?.()) {
           try {
-            namespaces = sessionOwnedExportNamespaces();
-          } catch {
+            namespaces = await sessionOwnedExportNamespaces();
+          } catch (error) {
+            // Discovery caps are capacity refusals, not ownership decisions;
+            // preserve the fixed remediation that router.ts may safely surface.
+            if (isNamespaceDiscoveryLimitError(error)) throw error;
             await denyNamespaceAccess("state_export", "state_export");
-            throw new Error("namespace_ownership_ambiguous");
+            // The cause stays server-side; the agent sees only the fixed message.
+            throw new Error("namespace_ownership_ambiguous", { cause: error });
           }
         } else {
-          namespaces = sessionOwnedExportNamespaces();
+          namespaces = await sessionOwnedExportNamespaces();
         }
         attachStateExportApprovalBinding(args, {
           toolName: "state_export",
@@ -1911,9 +1922,9 @@ export function createCognitiveTools(
       },
       handler: async (args) => {
         // Consume the gate-time binding instead of recomputing the
-        // namespace set: recomputation here (via the live export cache /
+        // namespace set: recomputation here (via durable discovery /
         // namespace registry) is exactly the TOCTOU this closes — a
-        // namespace warmed or reassigned while the human's approval was
+        // namespace created or reassigned while the human's approval was
         // pending must never reach the bundle. Absent, aged past the
         // fixed freshness ceiling (see `StateExportApprovalBinding`'s
         // trust-bearing-field comment above for why that ceiling exists

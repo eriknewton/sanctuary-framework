@@ -1,3 +1,4 @@
+import { unitResponseScreen } from "../helpers/response-screen.js";
 /**
  * v1.1 Remote-Bound Privacy Enforcement: fail-closed test.
  *
@@ -221,7 +222,7 @@ function setup(): FailClosedContext {
   const router = new ProxyRouter(
     clientManager as unknown as never,
     injectionDetector as unknown as never,
-    auditLog as unknown as never,
+    auditLog as unknown as never, unitResponseScreen(),
     {
       privacyEnforcement: {
         engine,

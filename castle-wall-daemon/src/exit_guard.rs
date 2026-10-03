@@ -557,6 +557,13 @@ mod tests {
     }
 }
 
+/// End an isolated forked test child without unwinding the copied test runner.
+/// Raw exits stay in this module; this helper cannot exist in a production build.
+#[cfg(test)]
+pub(crate) fn exit_forked_test_child(code: i32) -> ! {
+    unsafe { libc::_exit(code) }
+}
+
 /// Structural tests over the crate's own source (LINUX-STOP-PATH-BUDGET-01).
 /// They pin who may exit the process, who may write the stop-request flag, where
 /// the guard is armed, and that nothing can mask `SIGALRM`.

@@ -64,6 +64,7 @@ import {
   parseSurrogateUnlockSocketRequest,
   type SurrogateUnlockDenyReason,
 } from "../credential-surrogate/unlock-codec.js";
+import { surrogateCorrelationId, decodeSurrogateFrameRecord, type SurrogateCorrelationId } from "../credential-surrogate/index.js";
 import { SURROGATE_WIRE_VERSION } from "../credential-surrogate/wire.js";
 
 // ---------------------------------------------------------------------------
@@ -205,8 +206,10 @@ export type SurrogateHelperEvent =
   | { kind: "unlock_accepted"; agentUid: number; binding: number; ttlSeconds: number }
   | { kind: "unlock_denied"; agentUid: number; reason: SurrogateHelperDenyCode }
   | { kind: "lock_accepted"; agentUid: number; bindingsDropped: number }
-  | { kind: "query_answered"; agentUid: number; binding: number }
-  | { kind: "query_denied"; agentUid: number; reason: SurrogateHelperDenyCode }
+  // Join key must match the gate event's correlationId in gate-server.ts; only the helper asserts the binding ordinal.
+  | { kind: "query_answered"; agentUid: number; binding: number; correlationId: SurrogateCorrelationId }
+  // Join key must match the gate event's correlationId in gate-server.ts; absent means parsing yielded no id, never a sentinel.
+  | { kind: "query_denied"; agentUid: number; reason: SurrogateHelperDenyCode; correlationId?: SurrogateCorrelationId }
   | { kind: "daemon_error"; agentUid: number; reason: SurrogateHelperDenyCode };
 
 /**
@@ -705,7 +708,8 @@ function answerQuery(
 ): Buffer {
   const req = parseSurrogateQueryRequest(line);
   if (req === null) {
-    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: "malformed" });
+    const correlationId = surrogateCorrelationId(decodeSurrogateFrameRecord(line)?.id);
+    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: "malformed", ...(correlationId ? { correlationId } : {}) });
     // No `id` to echo: the frame did not parse, so there is nothing trustworthy
     // to correlate with. A synthetic id would be indistinguishable from an
     // answer to a real query.
@@ -717,7 +721,7 @@ function answerQuery(
     });
   }
   const deny = (reason: SurrogateDenyReason, code: SurrogateHelperDenyCode): Buffer => {
-    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: code });
+    ctx.onEvent({ kind: "query_denied", agentUid: ctx.agentUid, reason: code, correlationId: surrogateCorrelationId(req.id)! });
     return encodeSurrogateQueryResponse({
       v: SURROGATE_WIRE_VERSION,
       id: req.id,
@@ -758,7 +762,7 @@ function answerQuery(
       dropRowValue(row);
       return deny("expired", "expired");
     }
-    ctx.onEvent({ kind: "query_answered", agentUid: ctx.agentUid, binding: row.binding.ordinal });
+    ctx.onEvent({ kind: "query_answered", agentUid: ctx.agentUid, binding: row.binding.ordinal, correlationId: surrogateCorrelationId(req.id)! });
     return encodeSurrogateQueryResponse({
       v: SURROGATE_WIRE_VERSION,
       id: req.id,
@@ -1162,23 +1166,29 @@ export async function runSurrogateHelperDaemon(
     querySocketPath,
     deps.gateUid,
     fsOps,
-    (socket) =>
+    (socket) => {
+      // Event-only join state survives a write error; it never changes the query decision.
+      let correlationId: SurrogateCorrelationId | undefined;
       serveOneShotConnection(socket, {
         // ONE codec on this socket, the mirror of the unlock side: an `unlock`
         // frame here reaches only `parseSurrogateQueryRequest` and is
         // `malformed`, so the gate uid can never load a value.
-        onFrame: (line) =>
-          answerQuery(line, {
+        onFrame: (line) => {
+          correlationId = surrogateCorrelationId(decodeSurrogateFrameRecord(line)?.id);
+          return answerQuery(line, {
             agentUid: deps.agentUid,
             table,
             clock,
             onEvent,
             acquireSlot,
             releaseSlot,
-          }),
+          });
+        },
         onExtraBytes: (firstLine) => {
+          correlationId = surrogateCorrelationId(decodeSurrogateFrameRecord(firstLine)?.id);
           onEvent({
             kind: "query_denied",
+            ...(correlationId ? { correlationId } : {}),
             agentUid: deps.agentUid,
             reason: "unexpected_extra_bytes",
           });
@@ -1202,8 +1212,9 @@ export async function runSurrogateHelperDaemon(
           });
         },
         onSocketError: () =>
-          onEvent({ kind: "query_denied", agentUid: deps.agentUid, reason: "socket_error" }),
-      }),
+          onEvent({ kind: "query_denied", agentUid: deps.agentUid, reason: "socket_error", ...(correlationId ? { correlationId } : {}) }),
+      });
+    },
     () => onEvent({ kind: "daemon_error", agentUid: deps.agentUid, reason: "socket_error" }),
   );
 
