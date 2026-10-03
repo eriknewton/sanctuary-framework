@@ -15,6 +15,9 @@ const LF = 0x0a;
 const SEMICOLON = 0x3b;
 const SP = 0x20; // ASCII space.
 const HTAB = 0x09; // ASCII horizontal tab.
+// Bytes a lenient client chunk parser skips or accepts before the first size digit
+// (for example Python's int(line, 16) strips ASCII whitespace and takes a sign).
+const LENIENT_SIZE_PREFIX = new Set([0x20, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x2b, 0x2d]); // SP HT LF VT FF CR + -
 const HEX_RADIX = 16;
 const HEX_DIGITS = "0123456789abcdef";
 
@@ -154,6 +157,10 @@ export class SurrogateEchoScanner {
           this.frameState = byte === SEMICOLON ? "EXTENSION" : "SIZE_LF";
           return "SKIP";
         }
+        // A first line a lenient downstream parser would still read as a chunk size must
+        // refuse: passing it through would let that client reassemble a value split by framing.
+        // Cost, accepted: a swapped chunked body opening with whitespace or a sign is refused.
+        if (!this.frameCommitted && LENIENT_SIZE_PREFIX.has(byte)) return "FAIL";
         // Ordinary decoded bodies have no opening chunk-size line. Both views then
         // coincide; never use normalized or raw header whitespace to choose a view.
         if (!this.frameCommitted) { this.frameState = "PASSTHROUGH"; return "SKIP"; }

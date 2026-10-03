@@ -1,4 +1,4 @@
-/** Capability: exact-byte echo screening bounds work and retained response state. SURROGATE-1B-II-CLAUDE-F1 */
+/** Capability: exact-byte echo screening bounds work and retained response state. SURROGATE-1B-II-CLAUDE-F1 SURROGATE-1B-II-LENIENT-PREFIX */
 import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { SurrogateEchoScanner, MAX_PLACEHOLDERS_PER_REQUEST, MAX_SURROGATE_ECHO_SCAN_BYTES, MAX_SURROGATE_VALUE_BYTES } from "../../src/credential-surrogate/index.js";
@@ -188,6 +188,18 @@ describe("surrogate echo scanner", () => {
       expect(scanner.scan(Buffer.from(secret)).blocked).toBe(true);
       expect(scanner.finish().length).toBe(0);
     }
+  });
+  it.each([" ", "\t", "\r", "\n", "\u000b", "\u000c", "+", "-"])("refuses a first size line opened by %j", prefix => {
+    const secret = value();
+    const hexRadix = 16;
+    const half = Math.floor(secret.length / 2); // Two frames carry one value across a boundary.
+    const parts = [secret.slice(0, half), secret.slice(half)].map(part => Buffer.from(part));
+    const framed = Buffer.concat([Buffer.from(prefix), ...parts.flatMap(part => [Buffer.from(`${part.length.toString(hexRadix)}\r\n`), part, Buffer.from("\r\n")]), Buffer.from("0\r\n\r\n")]);
+    const scanner = new SurrogateEchoScanner([secret], true);
+    const result = scanner.scan(framed);
+    expect(result).toEqual({ blocked: true, cause: "encoding" });
+    expect(scanner.encodingFailed).toBe(true);
+    expect(scanner.finish().length).toBe(0);
   });
   it("refuses an unfinished size line without releasing its carry", () => {
     const scanner = new SurrogateEchoScanner([value()], true);
