@@ -9,6 +9,7 @@
  * root, no pf.
  */
 
+// fail-before-exempt: existing daemon fixtures inject the new surrogate directory so tests never read host artifacts.
 import { connect, createServer } from "node:net";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -182,6 +183,7 @@ describe("egress-gate/gate-daemon runEgressGateDaemon", () => {
         acceptSource: { current: async () => null },
       }),
       runtimeDir: dir,
+      surrogateDir: dir,
       livenessDir: dir,
       credDir: dir,
       onEvent: () => undefined,
@@ -353,6 +355,7 @@ describe("egress-gate/gate-daemon peerRunner wiring (2026-07-24 S5-3 fix)", () =
       loadOraclePublicKey,
       clientAuth: createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource }),
       runtimeDir: dir,
+      surrogateDir: dir,
       livenessDir: dir,
       credDir: dir,
       peerResolverDir: dir, // nothing listens at dir/502.sock in this test
@@ -391,6 +394,7 @@ describe("egress-gate/gate-daemon peerRunner wiring (2026-07-24 S5-3 fix)", () =
       loadOraclePublicKey,
       clientAuth: createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource }),
       runtimeDir: dir,
+      surrogateDir: dir,
       livenessDir: dir,
       credDir: dir,
       peerRunner: trackedRunner,

@@ -262,8 +262,8 @@ test/egress-gate/arming-wiring.test.ts(2089,71): error TS2345: Argument of type 
 test/egress-gate/arming-wiring.test.ts(2145,69): error TS2345: Argument of type '{ agentUid: number; intent: "clear"; fortressPath: string; audit: Mock<Procedure | Constructable>; print: Mock<Procedure | Constructable>; }' is not assignable to parameter of type 'Pick<ExclusiveEgressWiringInput, "audit" | "fortressPath" | "print"> & { agentUid: number | undefined; intent: "observe" | "clear"; }'.
 test/egress-gate/arming-wiring.test.ts(2174,69): error TS2345: Argument of type '{ agentUid: number; intent: "clear"; fortressPath: string; audit: Mock<Procedure | Constructable>; print: Mock<Procedure | Constructable>; }' is not assignable to parameter of type 'Pick<ExclusiveEgressWiringInput, "audit" | "fortressPath" | "print"> & { agentUid: number | undefined; intent: "observe" | "clear"; }'.
 test/egress-gate/claim-basis-structural.test.ts(111,42): error TS2339: Property 'text' does not exist on type 'Node'.
-test/egress-gate/gate-daemon.test.ts(353,7): error TS2322: Type '() => Promise<string | NonSharedBuffer | KeyObject | JsonWebKey>' is not assignable to type '() => Promise<KeyObject>'.
-test/egress-gate/gate-daemon.test.ts(391,7): error TS2322: Type '() => Promise<string | NonSharedBuffer | KeyObject | JsonWebKey>' is not assignable to type '() => Promise<KeyObject>'.
+test/egress-gate/gate-daemon.test.ts(355,7): error TS2322: Type '() => Promise<string | NonSharedBuffer | KeyObject | JsonWebKey>' is not assignable to type '() => Promise<KeyObject>'.
+test/egress-gate/gate-daemon.test.ts(394,7): error TS2322: Type '() => Promise<string | NonSharedBuffer | KeyObject | JsonWebKey>' is not assignable to type '() => Promise<KeyObject>'.
 test/egress-gate/gate-tcb-fixround-refute.test.ts(130,17): error TS2339: Property 'uid' does not exist on type 'AccountProvisionPlan'.
 test/egress-gate/gate-tcb-round3-refute.test.ts(155,17): error TS2339: Property 'uid' does not exist on type 'AccountProvisionPlan'.
 test/egress-gate/gate-tcb-round3-refute.test.ts(156,17): error TS2339: Property 'uid' does not exist on type 'AccountProvisionPlan'.

@@ -211,67 +211,176 @@ Smoke-test the binary before enabling the service:
 /usr/local/libexec/sanctuary/castle-wall-daemon --help
 ```
 
-## Install the systemd unit
+## Install the cold-install variant
 
-Create the service group, runtime directory, state directory, policy
-directory, pinned key, and initial signed manifest. Replace
-`<fortress-id>` with the fortress identifier used by Sanctuary main.
+The packaged uid profile is separate from the broker/desktop profiles above.
+It reserves B without creating a broker and does not provide an audit drain.
+The normal runbook below must match the [packaged operator guide](../../castle-wall-daemon/packaging/ubuntu/README.md).
 
-For the server assurance profile, provision a dedicated non-login broker
-principal and record its numeric UID for the environment file:
+## Artifact and prerequisites
+
+Obtain the exact private artifact and independently authenticated source SHA,
+SHA-256, required-check inventory, workstation signer artifact, `endpoints.json`
+and `rules.json`. Require all checks at that source head to have succeeded;
+a missing, skipped or cancelled required job is not success. The adjacent
+checksum detects corruption but does not authenticate delivery.
+
+Use a fresh Ubuntu host with real PID 1 systemd, unified cgroup v2, working
+IPv4/IPv6 routes and nftables/NFQUEUE. The package declares runtime dependencies;
+no compiler, checkout or Node runtime is required on the target. The owner uses
+the separate `sanctuary-linux-policy-sign` workstation executable. Existing
+accounts, configuration, mounts, unit overrides or product state cause refusal.
+There is no upgrade, account adoption or internal-package conversion path.
+
+The example identity is U=60123, reserved service number B=60124,
+F=0123456789abcdef, signed system uid ceiling 1000. Confirm these identities
+are unused before choosing them. B remains absent from NSS in this no-broker
+profile. Do not create a broker account. Provision creates the `sanctuary`
+group and exact locked, nologin U account/group without a persistent home.
+Failure mode: NSS timeout or incomplete output is uncertainty, not absence.
+
+## Install, provision and start
+
+1. As the ordinary operator, verify the delivered bytes:
+
+   ```bash
+   printf '%s  install.deb\n' "$INSTALL_SHA256" | sha256sum -c -
+   ```
+
+   Verify the workstation artifact and input hashes in the same way. Stop on
+   any mismatch or unavailable required-check evidence.
+
+2. Record OS/kernel/systemd versions, machine and boot IDs, package/account/nft
+   inventory, routes and independent network controls, then install:
+
+   ```bash
+   sudo apt-get install ./install.deb
+   /usr/local/libexec/sanctuary/network-agent-standin --control --endpoints endpoints.json
+   ```
+
+   Verify wall and mount remain inactive, no agent runs and no account or policy
+   was created. The control sends exactly one immediate attempt to each of six
+   endpoints and exits with bounded JSON testimony. Independent receiver records
+   must establish reachability; exit zero alone does not. Failure mode: auto-start
+   or an unreachable family invalidates the installation observation.
+
+3. Stage the literal command and bounded endpoints:
+
+   ```bash
+   sudo sanctuary-linux provision --agent-uid 60123 --service-uid 60124 --fortress-id 0123456789abcdef --stage-file endpoints.json -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+   ```
+
+   For another workload, substitute a root-installed ELF and literal arguments
+   after `--`. Shell scripts, PATH lookup and shell interpolation are unsupported.
+   Configured must still be absent. Failure mode: interrupted provisioning must
+   not authorize a launch; only the identical request can resume its transaction.
+
+4. On the separately authorized owner workstation, with descriptor 3 supplied
+   by existing owner custody, sign the explicit generation `N`:
+
+   ```bash
+   sanctuary-linux-policy-sign --fortress-id 0123456789abcdef --agent-uid 60123 --system-uid-ceiling 1000 --generation "$N" --rules rules.json --key-fd 3 --output policy.bundle.json
+   ```
+
+   Transfer only the public bundle and independently verified public-key SHA-256
+   fingerprint. Failure mode: absent signing authority stops this step; do not
+   generate a replacement owner key or transfer private bytes to the target.
+
+5. Admit the signed policy and inspect status:
+
+   ```bash
+   sudo sanctuary-linux policy-install --bundle policy.bundle.json --expected-key-sha256 "$POLICY_KEY_SHA256"
+   sudo sanctuary-linux status --json
+   ```
+
+   Policy must explicitly bind uid U and fortress F. IP/CIDR rules may narrow
+   ports and TCP/UDP; hostname, template and time-window rules are unsupported.
+   Failure mode: wrong origin, pin, identity, rule or generation refuses before
+   Configured. Completed equality and rollback refuse; daemon restart alone may
+   reclaim the exact previously committed signed generation. No service starts.
+
+6. Start the workload, then enable the next boot:
+
+   ```bash
+   sudo sanctuary-linux start
+   sudo sanctuary-linux enable
+   /usr/local/libexec/sanctuary/network-agent-standin --control --endpoints endpoints.json
+   sudo sanctuary-linux status --json
+   systemctl show sanctuary-agent@60123.service --property=InvocationID,ActiveState,SubState,Result,MainPID,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ExecMainStatus,NRestarts,ControlGroup,FragmentPath,DropInPaths
+   sudo nft -a list table inet sanctuary-castle
+   sudo sanctuary-linux evidence --output evidence/boot-0
+   ```
+
+   `start` waits for stable PID/start ticks and the configured second executable,
+   after wall READY and both prechecks. The stand-in waits 60 seconds, sends
+   exactly 18 attempts shared by parent/child/grandchild, then idles. Each attempt
+   has a three-second deadline, no application retry and a capped response.
+   Complete controls in the quiet window. Collect evidence after all attempts;
+   an early capture reports incomplete and requires a new output directory.
+   Join nonce receipts, live uid rule/handle/mark, WAL and workload testimony for
+   allow/deny observations. Failure mode: a queued job, trampoline exec, connection
+   errno or zero receipts without a complete receiver window is not proof.
+
+A separately reviewed acceptance run performs five subsequent reboots and a
+same-boot wall-restart observation on each boot. Keep the same signed generation
+through those observations. Do not rerun provision or policy-install. An explicit
+wall restart propagates a new agent activation behind the new READY; count its
+18 attempts and do not issue an extra agent start. Unchanged boot ID, repaired
+initial launch or missed controls cannot count as reboot success. This guide
+and cold-install CI do not themselves establish reboot survival.
+
+## Stop, evidence and recovery
+
+`enable` starts nothing. `disable` removes only agent boot intent and leaves
+running workloads and wall enablement unchanged. `Restart=no` forbids automatic
+agent retries; it does not suppress the bound restart after an operator wall
+restart. Do not reset failed state to disguise a failed observation.
 
 ```bash
-sudo groupadd --system sanctuary || true
-sudo useradd --system --gid sanctuary --no-create-home \
-  --home-dir /nonexistent --shell /usr/sbin/nologin sanctuary-broker
-id -u sanctuary-broker
+sudo sanctuary-linux stop
+sudo systemctl stop sanctuary-castle-wall.service
+sudo sanctuary-linux evidence --output evidence/final
+sudo /usr/local/libexec/sanctuary/castle-wall-daemon --disarm
+sudo systemctl disable sanctuary-castle-wall.service
 ```
 
-If the account already exists, verify its group membership and `nologin` shell
-instead of recreating it. Do not run a desktop session or unrelated service as
-this UID. The hardware drill must capture this identity check; placing an
-ordinary interactive user in the group is the weaker desktop profile.
+Stop disables the agent first and proves its whole cgroup empty, including a
+SIGTERM-resistant descendant. Confirm no other uid-U workload survives before
+disarm. Stop retains the kernel floor and wall enablement. Failure mode: stop is
+not disarm, and a process launched outside the product cgroup is not covered by
+its stop proof. Final evidence can report incomplete after the workload exits;
+retain the completed running capture and the explicit missingness. Disarm uses
+authenticated ownership and does not reset policy high-water. If it refuses,
+preserve state and follow the [deployment recovery guide](#last-resort-recovery-when-ownership-proof-cannot-be-verified).
 
-```bash
-sudo install -d -m 0750 -o root -g sanctuary /run/sanctuary/<fortress-id>
-sudo install -d -m 0700 -o root -g root \
-  /var/lib/sanctuary/<fortress-id>/policy/egress
-sudo install -d -m 0700 -o root -g root \
-  /var/lib/sanctuary/<fortress-id>/policy/egress/rules
-sudo install -m 0644 castle-wall-daemon/systemd/sanctuary-castle-wall.service \
-  /etc/systemd/system/sanctuary-castle-wall.service
-```
+Provisioned package removal and upgrades are unsupported: `apt-get remove` and
+`dpkg --purge` refuse retained configuration/state, even after stop/disarm. Do not
+delete keys, policy or tables to force successful removal. Successful remove and
+purge apply only to an inert, never-provisioned installation. Disposable proof
+host retirement is a separate authorized lifecycle.
 
-Install or generate these two files before starting the daemon:
+## Bounds and fixed outputs
 
-```bash
-sudo install -m 0600 -o root -g root pinned.key \
-  /var/lib/sanctuary/<fortress-id>/policy/egress/pinned.key
-sudo install -m 0600 -o root -g root manifest.json \
-  /var/lib/sanctuary/<fortress-id>/policy/egress/manifest.json
-```
+The mandatory host-visible tmpfs at `/var/lib/sanctuary-agent-workspace` is
+64 MiB and 4096 inodes with noexec/nosuid/nodev. The underlying root directory
+is not U-writable. Agent memory is 512 MiB, tasks 64, core dumps zero, and streams
+are null. Workspace is ephemeral and non-secret. Hidden temporary paths and
+persistent agent homes are not writable alternatives.
 
-Create the unit's required root-owned environment file:
+Provision writes root-owned `/etc/sanctuary/castle-wall.env`, command/endpoints
+under `/etc/sanctuary/agent/`, and the fixed policy directory
+`/var/lib/sanctuary/0123456789abcdef/policy/egress/`. Policy-install writes the
+raw public `pinned.key`, manifest and exact signed rules, then publishes
+`configured-v1.json` last. The daemon creates private audit/ownership material;
+none is an installer input or evidence export. The shipped schema is
+`/usr/share/doc/sanctuary-castle-wall/schemas/contract.rs`.
 
-```bash
-sudo install -d -m 0755 -o root -g root /etc/sanctuary
-sudo install -m 0600 -o root -g root /dev/null /etc/sanctuary/castle-wall.env
-sudoedit /etc/sanctuary/castle-wall.env
-```
-
-Add:
-
-```text
-SANCTUARY_FORTRESS_ID=<fortress-id>
-SANCTUARY_TRUSTED_SERVICE_UID=<numeric-uid-of-sanctuary-broker>
-```
-
-Then start the daemon:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now sanctuary-castle-wall.service
-```
+Audit capacity is finite. The 100 MiB WAL reserves up to 64 KiB for control
+recovery. This no-broker profile promises no unlimited runtime: exhaustion
+fails closed. Evidence copies a verified bounded public WAL prefix and never
+ACKs, truncates or exports seeds. Packet and row budgets must be substantiated
+for each acceptance schedule; the 256-byte application response limit is not
+itself a transport packet bound.
 
 ### Last-resort recovery when ownership proof cannot be verified
 
@@ -366,13 +475,11 @@ and not an eBPF program.
 
 - `nftables.rs` installs the dedicated `inet sanctuary-castle` table and
   a base `output` chain with `policy accept`.
-- Each wrapped agent gets a `sanctuary-agent-<agent-id>.service`
-  transient systemd unit. The daemon resolves its cgroup v2 path through
-  `systemctl show --property=ControlGroup`.
-- The base output chain jumps into the agent chain only when the socket
-  belongs to that agent's cgroup v2 path.
-- Static allow and deny rules are emitted as nftables expressions.
-- Prompt and unmatched traffic routes to `queue num 0`.
+- The install profile runs `sanctuary-agent@60123.service` as numeric uid U.
+  Its cgroup controls start/stop and descendants; fresh host-network socket uid
+  is the traffic principal matched by `meta skuid`.
+- The uid chain routes policy decisions to NFQUEUE. One Rust evaluator applies
+  signed IP/CIDR/port/protocol rules; unsupported semantics refuse at admission.
 - The NFQUEUE binding explicitly sets fail-open to `false`.
 - The daemon maps `allow` to `NF_ACCEPT`. `deny`, `prompt_required`, and
   evaluator failure map to `NF_DROP`.
@@ -500,21 +607,21 @@ Expected:
 - Table family is `inet`.
 - Table name is `sanctuary-castle`.
 - Base chain is `output`.
-- Wrapped agents have `agent_<id>` chains.
-- Agent jump rules include `socket cgroupv2 level <N> "<path>"`.
+- The install profile has a uid-scoped chain and `meta skuid` binding for U.
+- Record live handles and marks together with corresponding WAL decisions.
 - Unmatched scoped traffic routes to `queue num 0`.
 
 Verify agent cgroup placement:
 
 ```bash
-systemctl status sanctuary-agent-<agent-id>.service
-systemctl show sanctuary-agent-<agent-id>.service --property=ControlGroup --value
+systemctl status sanctuary-agent@60123.service
+systemctl show sanctuary-agent@60123.service --property=ControlGroup --value
 ```
 
 Expected control group shape:
 
 ```text
-/system.slice/sanctuary-agent-<agent-id>.service
+/system.slice/system-sanctuary\x2dagent.slice/sanctuary-agent@60123.service
 ```
 
 Verify the WAL exists and is restricted:
@@ -607,43 +714,13 @@ recovery window.
 | WAL grows without truncation | Sanctuary main is not draining or ACKing daemon WAL entries | check the IPC socket, Sanctuary main runtime logs, and `audit.drain` handling |
 | SELinux or AppArmor denial appears | host policy blocks daemon file, netlink, or NFQUEUE access | add a scoped local policy for the Castle Wall binary and state paths |
 
-## Rollback
+## Retirement
 
-Stop the service:
-
-```bash
-sudo systemctl disable --now sanctuary-castle-wall.service
-```
-
-Disarm only through the authenticated ownership path:
-
-```bash
-sudo /usr/local/libexec/sanctuary/castle-wall-daemon --disarm
-```
-
-Stop any leftover per-agent transient units:
-
-```bash
-systemctl list-units 'sanctuary-agent-*.service'
-sudo systemctl stop 'sanctuary-agent-<agent-id>.service'
-```
-
-Leave the state directory in place if you need audit continuity:
-
-```text
-/var/lib/sanctuary/<fortress-id>
-```
-
-Remove the state directory only after exporting or preserving the WAL and
-policy artifacts required for your audit record.
-
-To reinstall, restore the daemon binary, service unit, pinned key, and
-signed manifest, then run:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now sanctuary-castle-wall.service
-```
+Use the stop, evidence and authenticated disarm sequence above. Provisioned
+removal and in-place upgrades refuse; do not erase state or replace policy with
+an older generation to work around that refusal. Preserve the public evidence
+and retain private daemon state in its existing custody. Retiring a disposable
+host is a separate authorized action, not an installer command.
 
 ## Castle-walking acknowledgement
 
@@ -657,3 +734,9 @@ bypass resistance, audit drain durability, and disarm on the reference host.
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a
 substitute for the Linux enforcement path. The Linux kernel-routing claim
 becomes publishable only after that drill passes and its evidence is reviewed.
+
+The install CLI requires a kernel audit login uid (normally established by SSH/PAM and retained through sudo). Check `cat /proc/self/loginuid` in the operator session before provisioning or evidence capture. An unset value of `4294967295` refuses; a `SUDO_UID` environment variable does not establish identity. Use an authenticated login session when automation has no audit identity.
+
+If package removal is refused, `sanctuary-linux stop` and `sanctuary-linux disable` remain available. Restore installation selection with `printf 'sanctuary-castle-wall install\n' | sudo dpkg --set-selections` before another start or enable. This changes dpkg selection only; it does not remove retained state or make provisioned removal supported. Without restoring selection, activation refuses even though the payload remains installed.
+
+The finite network stand-in deliberately retains a SIGTERM-ignoring descendant. Its normal stop can take the full 10-second unit deadline and finish with `Result=timeout` and an empty cgroup. Status and evidence preserve those manager facts; this is the expected stop witness, not an enforcement claim. Budget that deadline into wall restart and shutdown timing.

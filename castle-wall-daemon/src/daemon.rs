@@ -4980,10 +4980,7 @@ mod watchdog_structure {
                 .filter(|flag| flag.starts_with("--test-"))
                 .collect()
         };
-        let listed = flag_after(
-            fn_body(&code, "value_options"),
-            "value_options.push(\"",
-        );
+        let listed = flag_after(fn_body(&code, "value_options"), "value_options.push(\"");
         let drained = flag_after(fn_body(&code, "run_daemon_main"), "position(|a| a == \"");
         assert!(!listed.is_empty());
         assert_eq!(listed, drained);

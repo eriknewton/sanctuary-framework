@@ -128,3 +128,17 @@ export {
   redactSurrogatePlaceholders,
   redactSurrogatePlaceholdersInString,
 } from "./redaction.js";
+
+export { SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS } from "./constants.js";
+export {
+  SURROGATE_STATUS, surrogateCorrelationId, parseSurrogateForwardTarget,
+  reconcileSurrogateHost, checkSurrogateRawHeaders, scanSurrogateRequest,
+  surrogateContentLength, buildSurrogateUpstreamHeaders,
+  type SurrogateCorrelationId, type SurrogateFailureCode, type SurrogateRefusal,
+  type SurrogateForwardTarget, type SurrogateOccurrence,
+} from "./forward.js";
+
+export {
+  SurrogateEchoScanner, SURROGATE_ECHO_BLOCKED,
+  type SurrogateEchoCause, type SurrogateEchoCode, type SurrogateEchoScanResult,
+} from "./echo-scanner.js";

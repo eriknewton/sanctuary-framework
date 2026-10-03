@@ -186,7 +186,7 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 ## REVIEW CONTEXT
 
-The structured security review completed 2026-03-28 with all Critical and High findings resolved. Review artifacts (SECURITY_AUDIT.md, BUG_REPORT.md, REMEDIATION_PLAN.md, SPRINT_CONTRACT.md, SPRINT_RESULT.md, SPRINT_EVAL.md) are in `docs/audit/`.
+A structured security review ran in March 2026, followed by delta reviews at later releases. Their findings are tracked privately and are not published; current trust claims and their bounds are in [`ASSURANCE_MATRIX.md`](ASSURANCE_MATRIX.md).
 
 Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`), with environment fingerprinting, OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0-100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
 

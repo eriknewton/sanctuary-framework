@@ -167,6 +167,7 @@ export {
   startExclusiveEgressGate,
   type GateLivenessProbe,
   type EgressGateEvent,
+  type SurrogateEchoEvent,
   type ExclusiveEgressGateOptions,
   type ExclusiveEgressGateHandle,
 } from "./gate-server.js";
@@ -430,3 +431,5 @@ export {
   type SurrogateHelperFsOps,
   type SurrogateHelperStartRefusal,
 } from "./surrogate-helper-daemon.js";
+
+export { createSurrogateHelperClient, type SurrogateHelperClient, type SurrogateHelperResult } from "./surrogate-helper-client.js";

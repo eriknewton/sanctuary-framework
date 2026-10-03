@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { unitResponseScreen } from "../helpers/response-screen.js"; import { describe, it, expect, vi, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { DynamicProxyToolRegistry } from "../../src/proxy/dynamic-proxy.js";
 import {
@@ -251,7 +251,7 @@ describe("proxied call enforcement preservation", () => {
     const router = new ProxyRouter(
       clientManager as any,
       { scan: vi.fn(() => ({ flagged: false, confidence: 0, signals: [], recommendation: "allow" })) } as any,
-      auditLog as any,
+      auditLog as any, unitResponseScreen(),
       { contextGateFilter }
     );
 

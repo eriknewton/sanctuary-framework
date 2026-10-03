@@ -1,4 +1,4 @@
-import type { AuditEntryInput } from "../../../../server/src/operational/audit-log.js";
+import { unitResponseScreen } from "../../../../server/test/helpers/response-screen.js"; import type { AuditEntryInput } from "../../../../server/src/operational/audit-log.js";
 import type { ToolDefinition } from "../../../../server/src/router.js";
 import type { UpstreamServer } from "../../../../server/src/sovereignty-profile.js";
 import type { UpstreamTool } from "../../../../server/src/proxy/client-manager.js";
@@ -151,7 +151,7 @@ registerFixture(CLAIM_ID, CLAIM_LABEL, "proxy-tool-discovery: tier1 context gate
   const router = new ProxyRouter(
     clientManager as never,
     { scan: () => ({ flagged: false, confidence: 0, recommendation: "allow" }) } as never,
-    auditLog as never,
+    auditLog as never, unitResponseScreen(),
     {
       contextGateFilter: async (toolName, args) => {
         gateCalls.push(toolName);

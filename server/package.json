@@ -9,6 +9,7 @@
   "types": "dist/index.d.ts",
   "bin": {
     "mcp-server": "dist/cli.js",
+    "sanctuary-linux-policy-sign": "bin/sanctuary-linux-policy-sign",
     "sanctuary-mcp-server": "dist/cli.js",
     "sanctuary": "dist/cli.js",
     "verify-transparency": "dist/verify-transparency.js",
@@ -37,6 +38,7 @@
   },
   "files": [
     "dist",
+    "bin/sanctuary-linux-policy-sign",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
