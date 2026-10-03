@@ -1,8 +1,8 @@
-import { unitResponseScreen } from "../helpers/response-screen.js"; import { fileURLToPath } from "node:url";
+import { unitResponseScreen } from "../helpers/response-screen.js";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-
 import { createServer, type ToolDefinition } from "../../src/router.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
@@ -227,7 +227,7 @@ describe("proxy upstream transport conformance", () => {
           result: "failure",
           details: expect.objectContaining({
             decision: "blocked",
-            reason: "withhold_scan_failure",
+            reason: "withhold_upstream_failure",
           }),
         }),
         expect.objectContaining({
@@ -235,7 +235,7 @@ describe("proxy upstream transport conformance", () => {
           result: "failure",
           details: expect.objectContaining({
             decision: "error",
-            reason: "label_suspected",
+            error_type: "upstream_error",
           }),
         }),
       ])
@@ -252,27 +252,27 @@ describe("proxy upstream transport conformance", () => {
     }
 
     const explodedDetails = explodedAudit.details;
-    expect(explodedDetails).toEqual(expect.objectContaining({ reason: "label_suspected" }));
-    expect(explodedDetails).not.toHaveProperty("error");
-    expect(JSON.stringify(explodedDetails)).not.toContain("/tmp/private-path");
+    expect(explodedDetails).toEqual(
+      expect.objectContaining({
+        error: expect.any(String),
+      })
+    );
 
+    const explodedError = explodedDetails?.error;
+    expect(typeof explodedError).toBe("string");
+    if (typeof explodedError !== "string") {
+      throw new Error("expected audited explode failure to include details.error");
+    }
+    expect(explodedError).toContain("[path-redacted]");
+    expect(explodedError).not.toContain("/tmp/private-path");
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    const auditedErrorFields = Object.entries(explodedDetails ?? {}).filter(([field]) =>
+      field.toLowerCase().includes("error")
+    );
+    expect(auditedErrorFields.length).toBeGreaterThan(0);
+    for (const [, value] of auditedErrorFields) {
+      expect(String(value)).not.toContain("/tmp/private-path");
+    }
   });
 });
 

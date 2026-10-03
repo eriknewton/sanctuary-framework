@@ -177,8 +177,8 @@ const URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
  * prevents an attacker from turning that bounded corpus into an unbounded
  * collection of base64/hex/url decode attempts.
  */
-// Must match MAX_CANDIDATES in proxy/response-limits.ts; argument scanning retains its historical cap.
-export const INJECTION_MAX_DECODED_RESCANS = RESPONSE_LIMITS.MAX_CANDIDATES;
+// Argument scanning retains its historical cap; response work uses RESPONSE_LIMITS.MAX_CANDIDATES.
+export const INJECTION_MAX_DECODED_RESCANS = 64;
 
 function boundedRegexMatches(
   value: string,

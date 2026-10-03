@@ -181,10 +181,13 @@ export class ProxyRouter {
       const tier = this.getTierForTool(serverName, toolName);
 
       let lease: ResponseReservation | undefined;
+      let withholdReason = "withhold_capacity";
+      let upstreamTimedOut = false;
       const cancel = (): void => lease?.cancel();
       try {
         // Admission precedes governor/cache access and all upstream work.
         lease = this.responseScreen.session.reserve();
+        withholdReason = "withhold_preparation_failure";
         context?.signal?.addEventListener("abort", cancel, { once: true });
         if (context?.signal?.aborted) lease.cancel();
         lease.assertLive();
@@ -290,6 +293,9 @@ export class ProxyRouter {
             });
           }
         }
+
+        // Cancellation during an awaited gate must never authorize a later upstream dispatch.
+        lease.assertLive();
 
         // Step 3.5: v1.1 remote-bound privacy enforcement.
         // When configured, route the outbound payload through the
@@ -403,7 +409,8 @@ export class ProxyRouter {
         }
 
         const reservation = lease;
-        const releaseUpstreamResult = async (value: unknown, cached = false, isError = false) => {
+        const releaseUpstreamResult = async (value: unknown, cached = false, error?: { error: string; error_type: string }) => {
+          withholdReason = "withhold_scan_failure";
           reservation.observe();
           reservation.assertLive();
           validateResponse(value);
@@ -418,26 +425,31 @@ export class ProxyRouter {
               // Must match incremental accounting in operational/privacy-core.ts.
               responseBudget: rehydrationBudget(() => reservation.assertLive(), placeholder => responseBindings.resolve(placeholder)),
             }));
-            validateResponse(rehydrated.response);
-            prepared = rehydrated.response;
+            // A denial grants no authority to expand: only the successful result may replace canonical bytes.
+            if (rehydrated.status === "rehydrated") {
+              validateResponse(rehydrated.response);
+              prepared = rehydrated.response;
+            }
           }
           const delivered = normalizeScreenedResponse(prepared);
           prepared = canonical; // Drop the expanded object before joined/worker copies; normalized strings are shared.
           // Joining without a separator detects instructions split across delivered block boundaries.
           const completion = await reservation.wait(this.responseScreen.screen(delivered.content.map(c => c.text).join(""), reservation));
+          withholdReason = "withhold_audit_failure";
           await reservation.wait(this.auditLog.appendCritical({
             layer: "l2", operation: `proxy_call:${proxyName}`, identity_id: "system",
-            result: isError ? "failure" : "success",
+            result: error ? "failure" : "success",
             details: {
               event_type: "proxy.call", server: serverName, tool: toolName, tier,
-              decision: isError ? "error" : "allowed", reason: completion.label,
+              decision: error ? "error" : "allowed", reason: completion.label,
+              ...error,
               signal_count: completion.signalCount, latency_ms: Date.now() - start,
             },
           }));
           reservation.assertLive();
           // Must precede CallGovernor.recordResult in operational/call-governor.ts: cache has no scan tokens.
-          if (!cached && !isError) this.options.governor?.recordResult(serverName, toolName, filteredArgs, canonical);
-          this.notifyProxyCall(proxyName, serverName, isError ? "error" : "allowed", completion.label, tier);
+          if (!cached && !error) this.options.governor?.recordResult(serverName, toolName, filteredArgs, canonical);
+          this.notifyProxyCall(proxyName, serverName, error ? "error" : "allowed", error?.error ?? completion.label, tier);
           return delivered; // These exact bytes were screened; no raw envelope or later rewriting is allowed.
         };
 
@@ -483,39 +495,46 @@ export class ProxyRouter {
         }
 
         let result: unknown;
-        let isError = false;
+        let upstreamError: { error: string; error_type: string } | undefined;
+        withholdReason = "withhold_upstream_failure";
         try {
-          result = await this.callWithTimeout(serverName, toolName, filteredArgs, UPSTREAM_CALL_TIMEOUT_MS, reservation);
+          result = await this.callWithTimeout(serverName, toolName, filteredArgs, UPSTREAM_CALL_TIMEOUT_MS, reservation, () => { upstreamTimedOut = true; });
         } catch (err) {
           reservation.assertLive(); // Timeout/cancellation is terminal, never a sanitized fallback release.
           // SDK shape failures are incomplete content validation, not releasable upstream error envelopes.
           if (err instanceof Error && (err.name === "ZodError" || err.name === "$ZodError" ||
-            (err instanceof McpError && (err.code === ErrorCode.InvalidParams || err.code === ErrorCode.InvalidRequest)))) throw err;
-          isError = true;
+            (err instanceof McpError && (err.code === ErrorCode.InvalidParams || err.code === ErrorCode.InvalidRequest)))) {
+            // SDK protocol failures can precede content scanning; never copy their diagnostic payload.
+            withholdReason = err instanceof McpError ? "withhold_upstream_failure" : "withhold_scan_failure";
+            throw err;
+          }
           const upstreamUnavailable = err instanceof UpstreamUnavailableError;
           const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
           const MAX_ERROR_UTF16 = 200; // Existing sanitized error truncation contract.
           let safe = rawErrorMessage.substring(0, MAX_ERROR_UTF16);
           safe = safe.replace(/\/[^\s]+/g, '[path-redacted]');
           safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, '[connection-redacted]');
+          upstreamError = { error: safe, error_type: upstreamUnavailable ? "UpstreamUnavailableError" : "upstream_error" };
           result = { content: [{ type: "text", text: JSON.stringify({
             error: safe, code: upstreamUnavailable ? "upstream_unavailable" : "upstream_error",
             proxy: true, server: serverName, tool: toolName,
           }) }] };
         }
-        return await releaseUpstreamResult(result, false, isError);
+        return await releaseUpstreamResult(result, false, upstreamError);
       } catch {
-        // Withholding records fixed operator metadata only, never payloads or exception text.
-        if (lease) {
-          try {
-            await lease.wait(this.auditLog.appendCritical({
-              layer: "l2", operation: `proxy_call:${proxyName}`, identity_id: "system", result: "failure",
-              details: { event_type: "proxy.call", server: serverName, tool: toolName, tier,
-                decision: "blocked", reason: "withhold_scan_failure", latency_ms: Date.now() - start },
-            }));
-          } catch { /* Audit failure cannot release upstream content. */ }
-        }
-        this.notifyProxyCall(proxyName, serverName, "blocked", "withhold_scan_failure", tier);
+        // Fixed causes disclose no response bytes, including SDK validation messages.
+        const reason = upstreamTimedOut ? "withhold_upstream_timeout"
+          : lease?.abort.signal.aborted ? "withhold_cancelled" : withholdReason;
+        try {
+          const audit = this.auditLog.appendCritical({
+            layer: "l2", operation: `proxy_call:${proxyName}`, identity_id: "system", result: "failure",
+            details: { event_type: "proxy.call", server: serverName, tool: toolName, tier,
+              decision: "blocked", reason, latency_ms: Date.now() - start },
+          });
+          if (lease) await lease.wait(audit);
+          else await audit; // Admission refusals still leave the existing operator audit row.
+        } catch { /* Audit failure cannot release upstream content. */ }
+        this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
         return toolResult({ error: "Operation not permitted", proxy: true });
       } finally {
         context?.signal?.removeEventListener("abort", cancel);
@@ -559,11 +578,13 @@ export class ProxyRouter {
     args: Record<string, unknown>,
     timeoutMs: number,
     reservation: ResponseReservation,
+    onTimeout: () => void,
   ): Promise<CanonicalResponse> {
+    reservation.assertLive(); // The last check must precede the effect, never just the awaited result.
     const work = this.clientManager.callTool(serverName, toolName, args);
     // Receipt remains observed even after the caller has timed out; settlement still owns capacity.
     void work.then(() => reservation.observe(), () => reservation.observe());
-    const timer = setTimeout(() => reservation.cancel(), timeoutMs);
+    const timer = setTimeout(() => { onTimeout(); reservation.cancel(); }, timeoutMs);
     try { return await reservation.wait(work); }
     finally { clearTimeout(timer); }
   }

@@ -118,6 +118,9 @@ describe("response worker completion gate", () => {
     const h = harness(); await h.screen.initialize(); h.termination(async () => { throw new Error("termination fault"); });
     const lease = h.session.reserve(); await expect(h.screen.screen("hello", lease)).rejects.toThrow(); lease.finish();
     expect(h.controller.snapshot().active).toBe(1); expect(() => h.session.reserve()).toThrow();
-    // This fake has no OS worker; the retained reservation is the intended fence.
+    let closed = false;
+    void h.screen.close().then(() => { closed = true; });
+    await vi.waitFor(() => expect(closed).toBe(true));
+    expect(h.controller.snapshot().active).toBe(1); // Unproven workers never mint replacement capacity.
   });
 });

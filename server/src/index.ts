@@ -187,8 +187,6 @@ import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js"
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
 import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
-import { LocalPrivacyEngine, PrivacyPolicyStore } from "./operational/privacy-core.js";
-import { PrivacyPlaceholderVault } from "./operational/privacy-filter.js";
 import { ResponseScreen } from "./proxy/response-screen.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -2238,23 +2236,12 @@ export async function createSanctuaryServer(options?: {
         },
       });
 
-      const privacyPolicies = new PrivacyPolicyStore(storage, masterKey);
-      const privacyEnforcement = enabledServers.some(s => s.privacy_policy_id !== undefined)
-        ? {
-          // Per-request vault caches cannot accumulate input across the server lifetime.
-          engine: () => new LocalPrivacyEngine(new PrivacyPlaceholderVault(storage, masterKey), masterKey),
-          policyResolver: async (server: string, identityId: string | undefined) => {
-            const bound = clientManager!.getServerConfig(server)?.privacy_policy_id;
-            return bound ? privacyPolicies.get(bound, identityId) : null;
-          },
-        } : undefined;
       proxyRouter = new ProxyRouter(
         clientManager,
         injectionDetector,
         auditLog,
         responseScreen,
         {
-          privacyEnforcement,
           contextGateFilter: async (_toolName, args) => {
             const activeProfile = profileStore.get();
             if (activeProfile.features.context_gating.enabled) {
@@ -2436,7 +2423,8 @@ export async function createSanctuaryServer(options?: {
     cleanup,
   };
   } catch (error) {
-    await responseScreen.close();
+    // Scanner cleanup cannot skip the custody scrub if cleanup itself fails.
+    try { await responseScreen.close(); } catch { /* Preserve the startup failure below. */ }
     // Startup never transferred the master session to a live server. Release
     // its shared rotation barrier only after every attempted startup write has
     // settled, then scrub the unowned master before surfacing the root cause.

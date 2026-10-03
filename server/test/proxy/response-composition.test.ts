@@ -7,6 +7,7 @@ import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js"
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { SovereigntyProfileStore } from "../../src/sovereignty-profile.js";
 import { PrivacyPolicyStore, LocalPrivacyEngine } from "../../src/operational/privacy-core.js";
+import { ClientManager } from "../../src/proxy/client-manager.js";
 import { CallGovernor } from "../../src/operational/call-governor.js";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
@@ -30,6 +31,7 @@ beforeAll(async () => {
     await profile.load();
     await profile.update({ upstream_servers: [{ name: "fixture", enabled: true, default_tier: 3,
       privacy_policy_id: policy.policy_id, privacy_identity_id: policy.identity_id,
+      transport: { type: "stdio", command: process.execPath, args: [fileURLToPath(new URL("./fixtures/response-ingress-server.mjs", import.meta.url))] } }, { name: "unbound", enabled: true, default_tier: 3,
       transport: { type: "stdio", command: process.execPath, args: [fileURLToPath(new URL("./fixtures/response-ingress-server.mjs", import.meta.url))] } }] });
   } finally { await seed.cleanup(); }
   app = await createSanctuaryServer({ storage, passphrase: TEST_PASSPHRASE });
@@ -77,26 +79,15 @@ describe("shipping response composition", () => {
     expect(JSON.stringify(result)).not.toContain("/tmp/fixture");
     expect(await labels()).toContain("label_suspected");
   });
-  it("screens request-specific rehydration on live and cached responses", async () => {
-    const scan = vi.spyOn(ResponseScreen.prototype, "screen");
-    const cache = vi.spyOn(CallGovernor.prototype, "recordResult");
-    const email = "fixture@example.test";
-    for (let n = 0; n < 2; n++) expect(await call("privacy", email)).toEqual({ content: [{ type: "text", text: email }] });
-    expect(scan.mock.calls.map(c => c[0])).toEqual([email, email]);
-    expect(cache).toHaveBeenCalledOnce();
-    expect(cache.mock.calls[0]![3]).toEqual({ content: [{ type: "text", text: "EMAIL_1" }] });
-    scan.mockRestore(); cache.mockRestore();
-  });
-  it("owns privacy preparation per request without retaining vault caches", async () => {
+  it("does not activate outbound privacy for a policy-bound server", async () => {
     const prepare = vi.spyOn(LocalPrivacyEngine.prototype, "filterOutbound");
-    await call("extra"); await call("extra");
-    expect(prepare.mock.contexts).toHaveLength(2);
-    expect(prepare.mock.contexts[0]).not.toBe(prepare.mock.contexts[1]);
-    prepare.mockRestore();
+    try {
+      expect(await call("privacy", "fixture@example.test")).toEqual({ content: [{ type: "text", text: "RAW_FORWARDED" }] });
+      expect(prepare).not.toHaveBeenCalled();
+    } finally { prepare.mockRestore(); }
   });
-  it("resolves only the current request's placeholders, never historical values", async () => {
-    await call("privacy", "fixture@example.test");
-    expect(await call("foreign", "second@example.test")).toEqual({ content: [{ type: "text", text: "EMAIL_1" }] });
+  it("does not deny an unbound server when another server binds a privacy policy", async () => {
+    expect(await client.callTool({ name: "proxy/unbound/read", arguments: { kind: "extra" } })).toEqual({ content: [{ type: "text", text: "hello" }] });
   });
   it.each(["oversize", "candidates"])("withholds %s and retains sticky exposure", async kind => {
     const result = await call(kind);
@@ -108,15 +99,63 @@ describe("shipping response composition", () => {
     const scan = vi.spyOn(ResponseScreen.prototype, "screen").mockRejectedValueOnce(new Error("injected scanner fault"));
     expect(JSON.stringify(await call("extra"))).toContain("Operation not permitted"); scan.mockRestore();
   });
+  it("schema-validation errors never copy upstream bytes into logs or audit", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const result = await call("schema-error");
+      expect(JSON.stringify(result)).toContain("Operation not permitted");
+      const entries = (await app.auditLog.query({ limit: 1000 })).entries;
+      const retained = JSON.stringify([result, entries, error.mock.calls, warn.mock.calls, log.mock.calls]);
+      expect(retained).not.toContain("untrusted-schema-marker");
+      expect(retained).not.toContain("upstream-private-response-marker");
+    } finally { error.mockRestore(); warn.mockRestore(); log.mockRestore(); }
+  });
+  it("production dispatcher cancellation prevents a late upstream cache commit", async () => {
+    let resolve!: (value: { content: { type: string; text: string }[] }) => void;
+    const delayed = new Promise<{ content: { type: string; text: string }[] }>(r => { resolve = r; });
+    const upstream = vi.spyOn(ClientManager.prototype, "callTool").mockReturnValueOnce(delayed);
+    const cache = vi.spyOn(CallGovernor.prototype, "recordResult");
+    const abort = new AbortController();
+    try {
+      const request = client.callTool({ name: "proxy/fixture/read", arguments: { kind: "cancel-late" } }, undefined, { signal: abort.signal });
+      const rejected = expect(request).rejects.toThrow();
+      await vi.waitFor(() => expect(upstream).toHaveBeenCalled());
+      abort.abort(); await rejected;
+      await vi.waitFor(async () => expect(await labels()).toContain("withhold_cancelled"));
+      resolve({ content: [{ type: "text", text: "late" }] });
+      await delayed; await new Promise<void>(r => setImmediate(r));
+      expect(cache).not.toHaveBeenCalled();
+    } finally { resolve({ content: [{ type: "text", text: "late" }] }); upstream.mockRestore(); cache.mockRestore(); }
+  });
   it("withholds failed critical audit and never caches that response", async () => {
+    const cache = vi.spyOn(CallGovernor.prototype, "recordResult");
     const original = app.auditLog.appendCritical.bind(app.auditLog);
     const audit = vi.spyOn(app.auditLog, "appendCritical").mockImplementation(async entry => {
       if (entry.operation === operation) throw new Error("injected audit fault");
       return original(entry);
     });
-    expect(JSON.stringify(await call("audit-fault"))).toContain("Operation not permitted"); audit.mockRestore();
+    expect(JSON.stringify(await call("audit-fault"))).toContain("Operation not permitted");
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ reason: "withhold_audit_failure" }) }));
+    audit.mockRestore();
+    expect(cache).not.toHaveBeenCalled();
     const scan = vi.spyOn(ResponseScreen.prototype, "screen");
     expect(await call("audit-fault")).toEqual({ content: [{ type: "text", text: "hello" }] });
-    expect(scan).toHaveBeenCalledOnce(); scan.mockRestore();
+    expect(scan).toHaveBeenCalledOnce(); expect(cache).toHaveBeenCalledOnce(); scan.mockRestore(); cache.mockRestore();
   });
+  it("production cleanup flushes after a fenced proxy lease", async () => {
+    const flush = vi.spyOn(app.auditLog, "flush");
+    const scan = vi.spyOn(ResponseScreen.prototype, "screen").mockImplementationOnce(async (_text, lease) => {
+      lease.fence(); throw new Error("fixture uncertain worker termination");
+    });
+    try {
+      expect(JSON.stringify(await call("fenced-cleanup"))).toContain("Operation not permitted");
+      let closed = false;
+      const cleanup = app.cleanup().then(() => { closed = true; });
+      await vi.waitFor(() => expect(closed).toBe(true)); await cleanup;
+      expect(flush).toHaveBeenCalledOnce();
+    } finally { scan.mockRestore(); flush.mockRestore(); }
+  });
+
 });

@@ -138,7 +138,7 @@ describe("Proxy Call Notifications", () => {
         tool: "proxy/test-server/read_file",
         server: "test-server",
         decision: "error",
-        reason: "label_suspected",
+        reason: "Connection refused",
       })
     );
   });

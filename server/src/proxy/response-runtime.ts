@@ -9,6 +9,7 @@ export class ResponseReservation {
   private pending = 0;
   private finished = false;
   private released = false;
+  private fenced = false;
   private resolveDrained!: () => void;
   readonly drained = new Promise<void>(resolve => { this.resolveDrained = resolve; });
   constructor(private readonly release: () => void, private readonly onObserve: () => void) {}
@@ -18,7 +19,7 @@ export class ResponseReservation {
   }
   cancel(): void { this.abort.abort(); }
   /** Uncertain termination retains capacity permanently rather than admitting replacement work. */
-  fence(): void { this.pending++; this.cancel(); }
+  fence(): void { this.fenced = true; this.cancel(); this.maybeRelease(); }
   track<T>(work: Promise<T>): Promise<T> {
     this.pending++;
     // Rejection is observed even when cancellation has already returned the generic denial.
@@ -45,7 +46,8 @@ export class ResponseReservation {
     // A deadline ends caller admission, not the underlying work's ownership of capacity.
     if (!this.released && this.finished && this.pending === 0) {
       this.released = true;
-      this.release();
+      // A fenced worker cannot regain capacity, but must not hold persistence or key cleanup hostage.
+      if (!this.fenced) this.release();
       this.resolveDrained();
     }
   }

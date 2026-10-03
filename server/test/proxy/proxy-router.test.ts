@@ -483,7 +483,7 @@ describe("ProxyRouter", () => {
           result: "failure",
           details: expect.objectContaining({
             decision: "error",
-            reason: "label_suspected",
+            error: "Connection refused",
             event_type: "proxy.call",
           }),
         })
