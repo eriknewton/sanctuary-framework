@@ -42,7 +42,7 @@ export interface RestoreCheckpointResult {
 export interface RestoreCheckpointDeps {
   stateStore: Pick<
     StateStore,
-    "exportNamespaces" | "import" | "delete" | "listCachedExportableNamespaces"
+    "exportNamespaces" | "import" | "delete" | "assertImportVersionFloors"
   >;
   checkpointStore: MemoryCheckpointStore;
   masterKey: Uint8Array;
@@ -76,6 +76,12 @@ export class CheckpointRestoreBundleError extends MemoryCheckpointError {}
 export class CheckpointRestoreBundleHashMismatchError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreReservedNamespaceError extends MemoryCheckpointError {}
+
+// Must match the fixed refusal asserted in test/memory-checkpoint/cold-checkpoint-cli.test.ts.
+export const CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL =
+  "memory checkpoint restore refused: checkpoint versions cannot be safely restored (CHECKPOINT-RESTORE-COLD-VERSION-FLOOR-01). State is unchanged.";
+
+export class CheckpointRestoreVersionFloorError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreExportError extends MemoryCheckpointError {}
 
@@ -189,16 +195,6 @@ function parseExportBundleData(
   return { entriesByPath };
 }
 
-function assertCachedNamespacesExportable(namespaces: string[]): void {
-  const reserved = namespaces.filter((namespace) => namespace.startsWith("_"));
-  if (reserved.length > 0) {
-    throw new CheckpointRestoreReservedNamespaceError(
-      `memory checkpoint restore refused: StateStore listed reserved namespace(s) as exportable: ${reserved.join(", ")}`,
-      "reserved_namespace",
-    );
-  }
-}
-
 function diffBundles(
   checkpoint: ParsedBundleData,
   current: ParsedBundleData,
@@ -291,12 +287,68 @@ function forensicSource(record: MemoryCheckpointRecord): CheckpointRestoreForens
   );
 }
 
+/** Read and validate a restore source without writing state or audit records. */
+export async function preflightCheckpointRestore(
+  deps: Pick<RestoreCheckpointDeps, "checkpointStore" | "checkpointId" | "masterKey" | "stateStore">,
+): Promise<string> {
+  const record = await deps.checkpointStore.get(deps.checkpointId);
+  if (!record) throw checkpointNotFound(deps.checkpointId);
+  if (record.source === "forensic_quarantine") throw forensicSource(record);
+
+  let checkpointBundle: string;
+  try {
+    checkpointBundle = await deps.checkpointStore.readBundle(
+      deps.checkpointId,
+      deps.masterKey,
+    );
+  } catch (err) {
+    throw new CheckpointRestoreBundleError(
+      `memory checkpoint restore failed while reading checkpoint ${deps.checkpointId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      "checkpoint_bundle_read_failed",
+      err,
+    );
+  }
+
+  // Verify the decrypted plaintext hashes to the recorded bundle_hash BEFORE
+  // any live state is overwritten. GCM+AAD already bind the ciphertext to the
+  // checkpoint id (which embeds the first 16 hex of bundle_hash), and
+  // parseMemoryCheckpointRecord already asserts id === buildId(created_at,
+  // bundle_hash). This closes the chain explicitly: plaintext-hash ===
+  // bundle_hash === id. A recorded bundle_hash that does not match the actual
+  // decrypted bytes fails closed here rather than being restored over the
+  // agent's current state.
+  const recomputedBundleHash = hashToString(fromBase64url(checkpointBundle));
+  if (recomputedBundleHash !== record.bundle_hash) {
+    throw new CheckpointRestoreBundleHashMismatchError(
+      `memory checkpoint restore refused: checkpoint ${deps.checkpointId} decrypted bundle hash ${recomputedBundleHash} does not match the recorded bundle_hash ${record.bundle_hash} (id-bound); refusing to overwrite current state`,
+      "bundle_hash_mismatch",
+    );
+  }
+
+  parseExportBundleData(checkpointBundle, "checkpoint");
+  try {
+    // Every entry must clear the durable reader's floor before forensic writes
+    // or deletions; a failed anchor read cannot authorize reconstruction.
+    await deps.stateStore.assertImportVersionFloors(checkpointBundle);
+  } catch (err) {
+    throw new CheckpointRestoreVersionFloorError(
+      CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
+      "checkpoint_version_floor_refused",
+      err,
+    );
+  }
+  return checkpointBundle;
+}
+
 /**
  * Restore exportable StateStore state from a known-good checkpoint.
  *
  * The function never starts, stops, or syncs any agent. The caller supplies the
  * parked claim and the local StateStore/checkpoint dependencies. On every
- * successful or failed attempt it writes a critical audit entry with the
+ * successful or failed attempt, except a read-only version-floor refusal, it
+ * writes a critical audit entry with the
  * checkpoint id, forensic id when available, and poison-map counts.
  */
 export async function restoreCheckpoint(
@@ -314,43 +366,7 @@ export async function restoreCheckpoint(
       );
     }
 
-    const record = await deps.checkpointStore.get(deps.checkpointId);
-    if (!record) throw checkpointNotFound(deps.checkpointId);
-    if (record.source === "forensic_quarantine") throw forensicSource(record);
-
-    let checkpointBundle: string;
-    try {
-      checkpointBundle = await deps.checkpointStore.readBundle(
-        deps.checkpointId,
-        deps.masterKey,
-      );
-    } catch (err) {
-      throw new CheckpointRestoreBundleError(
-        `memory checkpoint restore failed while reading checkpoint ${deps.checkpointId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-        "checkpoint_bundle_read_failed",
-        err,
-      );
-    }
-
-    // Verify the decrypted plaintext hashes to the recorded bundle_hash BEFORE
-    // any live state is overwritten. GCM+AAD already bind the ciphertext to the
-    // checkpoint id (which embeds the first 16 hex of bundle_hash), and
-    // parseMemoryCheckpointRecord already asserts id === buildId(created_at,
-    // bundle_hash). This closes the chain explicitly: plaintext-hash ===
-    // bundle_hash === id. A recorded bundle_hash that does not match the actual
-    // decrypted bytes fails closed here rather than being restored over the
-    // agent's current state.
-    const recomputedBundleHash = hashToString(fromBase64url(checkpointBundle));
-    if (recomputedBundleHash !== record.bundle_hash) {
-      throw new CheckpointRestoreBundleHashMismatchError(
-        `memory checkpoint restore refused: checkpoint ${deps.checkpointId} decrypted bundle hash ${recomputedBundleHash} does not match the recorded bundle_hash ${record.bundle_hash} (id-bound); refusing to overwrite current state`,
-        "bundle_hash_mismatch",
-      );
-    }
-
-    assertCachedNamespacesExportable(deps.stateStore.listCachedExportableNamespaces());
+    const checkpointBundle = await preflightCheckpointRestore(deps);
 
     let currentBundle: string;
     try {
@@ -458,6 +474,8 @@ export async function restoreCheckpoint(
 
     return result;
   } catch (err) {
+    // This refusal promises byte-identical state, including reserved audit data.
+    if (err instanceof CheckpointRestoreVersionFloorError) throw err;
     try {
       await appendRestoreAudit(
         deps,

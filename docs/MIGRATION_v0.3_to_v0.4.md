@@ -225,6 +225,6 @@ This is safe - v0.4.0 does not modify your state store or configuration. Downgra
 
 ## Questions or issues?
 
-- Check `KNOWN_ISSUES.md` for current limitations
+- Check [`ASSURANCE_MATRIX.md`](../ASSURANCE_MATRIX.md) for current limitations
 - File a GitHub issue: https://github.com/eriknewton/sanctuary-framework/issues
 - Read the `README.md` for general setup and troubleshooting

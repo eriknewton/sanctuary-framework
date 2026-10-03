@@ -28,8 +28,8 @@ describe("surrogate forward contracts", () => {
   });
   it("surrogate event types allow no free-form string field except canonical authority", () => {
     const sf = ts.createSourceFile("gate.ts", source("egress-gate/gate-server.ts"), ts.ScriptTarget.Latest, true);
-    const event = sf.statements.find(s => ts.isTypeAliasDeclaration(s) && s.name.text === "SurrogateGateEvent");
-    expect(event).toBeDefined();
+    const events = sf.statements.filter(s => ts.isTypeAliasDeclaration(s) && ["SurrogateGateEvent", "SurrogateEchoEvent"].includes(s.name.text));
+    expect(events).toHaveLength(2);
     const walk = (node: TypeScript.Node): void => {
       if (ts.isPropertySignature(node)) {
         const name = node.name.getText(sf);
@@ -38,7 +38,7 @@ describe("surrogate forward contracts", () => {
       }
       ts.forEachChild(node, walk);
     };
-    walk(event!);
+    events.forEach(walk);
   });
   it("correlation is a validated opaque id on gate and helper event types", () => {
     const helper = source("egress-gate/surrogate-helper-daemon.ts");

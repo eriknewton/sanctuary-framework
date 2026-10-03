@@ -91,6 +91,8 @@ import {
   SURROGATE_STATUS, SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS, SURROGATE_BOUND_PORT,
   parseSurrogateForwardTarget, reconcileSurrogateHost, checkSurrogateRawHeaders,
   scanSurrogateRequest, surrogateContentLength, buildSurrogateUpstreamHeaders, isSurrogateQueryLocation,
+  SurrogateEchoScanner, SURROGATE_ECHO_BLOCKED,
+  type SurrogateEchoCause, type SurrogateEchoCode,
   type SurrogateCorrelationId, type SurrogateRefusal,
 } from "../credential-surrogate/index.js";
 import type { SurrogateHelperClient } from "./surrogate-helper-client.js";
@@ -115,6 +117,16 @@ export type SurrogateGateEvent = {
   code: SurrogateRefusal | "swap";
   reason?: SurrogateRefusal;
 };
+/** Echo outcomes join the same helper query IDs as swap events, never a binding ordinal.
+ * Fixed codes and causes must match credential-surrogate/echo-scanner.ts. */
+export type SurrogateEchoEvent = {
+  authority: string;
+  correlationId: SurrogateCorrelationId;
+  requestBytes: number;
+  responseBytes: number;
+  status: number;
+} & ({ kind: "surrogate_echo_blocked"; code: Extract<SurrogateEchoCode, "echo_blocked"> }
+  | { kind: "surrogate_echo_unscanned"; code: Extract<SurrogateEchoCode, "echo_unscanned">; cause: SurrogateEchoCause });
 import type { Duplex } from "node:stream";
 
 import {
@@ -207,6 +219,7 @@ export interface GateLivenessProbe {
 /** Events the gate emits for audit/posture wiring. */
 export type EgressGateEvent =
   | SurrogateGateEvent
+  | SurrogateEchoEvent
   | { kind: "liveness_refused"; authority: string; reasons: string[] }
   | { kind: "peer_uid_mismatch"; authority: string; peerUid: number; peerPid: number; agentUid: number }
   | { kind: "peer_unresolved"; authority: string }
@@ -745,16 +758,107 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
           headers: buildSurrogateUpstreamHeaders(headers, target.host, length, swaps.length > 0),
         }, (incoming) => {
           if (state === "DONE") { incoming.destroy(); return; }
-          try {
-            // Slice 1b-i streams swapped responses unscanned; the echo guard belongs to 1b-ii.
-            incoming.on("error", () => refuse("upstream_reset"));
-            response.writeHead(incoming.statusCode ?? 502, incoming.headers);
-            incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
-            incoming.pipe(response);
-          } catch {
-            // Response callbacks run outside the dial's try; upstream-controlled metadata must not kill the gate.
+          let scanner: SurrogateEchoScanner | undefined;
+          let echoTerminated = false;
+          const emitEcho = (cause?: SurrogateEchoCause): void => {
+            // Every sent swap gets a join key; the helper, not response content, supplies binding attribution.
+            for (const swap of swaps) onEvent?.({ authority, correlationId: swap.correlationId,
+              requestBytes, responseBytes, status: response.statusCode,
+              ...(cause ? { kind: "surrogate_echo_unscanned", code: "echo_unscanned", cause } as const
+                : { kind: "surrogate_echo_blocked", code: "echo_blocked" } as const) });
+          };
+          const terminateEcho = (cause?: SurrogateEchoCause, beforeHeaders = false): void => {
+            if (echoTerminated) return;
+            echoTerminated = true;
+            scanner?.abort();
+            if (cause === "scan_error" || cause === "upstream_reset") {
+              // Preserve the existing transport refusal and its query attribution while
+              // recording separately why response screening could not complete.
+              try { refuse("upstream_reset"); }
+              finally {
+                incoming.destroy();
+                try { emitEcho(cause); }
+                finally { if (!response.writableEnded) response.destroy(); }
+              }
+              return;
+            }
+            // Terminal state precedes teardown and logging: no failure callback may resume forwarding.
+            state = "DONE";
+            clearTimeout(deadline);
             incoming.destroy();
-            refuse("upstream_reset");
+            upstream?.destroy();
+            const sendRefusal = beforeHeaders && !response.headersSent && !response.destroyed && !request.socket.destroyed;
+            if (sendRefusal) {
+              const [status, code] = SURROGATE_ECHO_BLOCKED;
+              response.writeHead(status, { "Connection": "close", "X-Sanctuary-Gate": code });
+            }
+            // Even a failing event sink cannot leave a response writable after a failed scan.
+            try { emitEcho(cause); }
+            finally { if (sendRefusal) response.end(); else response.destroy(); }
+          };
+          try {
+            if (!swaps.length) {
+              incoming.on("error", () => refuse("upstream_reset"));
+              response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+              incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
+              incoming.pipe(response);
+              return;
+            }
+            // Header normalization does not prove whether Node removed chunk framing.
+            // Every transfer-coded response screens delivered and stripped bytes together.
+            scanner = new SurrogateEchoScanner(swaps.map(swap => swap.value), incoming.headers["transfer-encoding"] !== undefined);
+            // Screen the raw fields and the exact normalized fields Node will forward.
+            const forwardedHeaders = Object.entries(incoming.headers).flatMap(([name, value]) =>
+              (Array.isArray(value) ? value : [value ?? ""]).flatMap(entry => [name, entry]));
+            if (scanner.headersEcho(incoming.rawHeaders) || scanner.headersEcho(forwardedHeaders)) {
+              terminateEcho(undefined, true); return;
+            }
+            const encoding = incoming.headers["content-encoding"];
+            // Repeated identity codings are still plaintext; an empty field applies no transform.
+            const identity = encoding === undefined || (typeof encoding === "string" &&
+              (encoding.trim() === "" || encoding.split(",").every(coding => coding.trim().toLowerCase() === "identity")));
+            const transfer = incoming.headers["transfer-encoding"];
+            // Unsupported transfer transformations cannot be covered by the two plaintext views.
+            const decodedTransfer = transfer === undefined || (typeof transfer === "string" &&
+              transfer.toLowerCase() === "chunked");
+            if (!identity || !decodedTransfer) { terminateEcho("encoding", true); return; }
+            response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+            // No response deadline or retry is added. Existing client cancellation now owns
+            // carry disposal; late end/data/drain callbacks must never write after that abort.
+            const resume = (): void => { if (!stopped()) incoming.resume(); };
+            response.on("drain", resume);
+            response.once("close", () => {
+              response.removeListener("drain", resume);
+              if (scanner!.metrics.state !== "FINISHED") terminateEcho("client_abort");
+              incoming.destroy();
+            });
+            incoming.once("error", () => terminateEcho("upstream_reset"));
+            incoming.once("aborted", () => terminateEcho("upstream_reset"));
+            incoming.on("data", (chunk: Buffer) => {
+              if (stopped()) { scanner!.abort(); return; }
+              // Stream callbacks are separate stacks; setup's catch cannot contain a scanner failure here.
+              try {
+                responseBytes += chunk.length;
+                const result = scanner!.scan(chunk);
+                if (result.blocked) { terminateEcho(result.cause); return; }
+                if (result.ceiling) { terminateEcho("ceiling"); return; }
+                if (result.output.length && !response.write(result.output)) incoming.pause();
+              } catch { terminateEcho("scan_error"); }
+            });
+            incoming.once("end", () => {
+              if (stopped()) { scanner!.abort(); return; }
+              try {
+                const tail = scanner!.finish();
+                // Must match encodingFailed in credential-surrogate/echo-scanner.ts.
+                if (scanner!.encodingFailed) { terminateEcho("encoding"); return; }
+                response.end(tail);
+              }
+              catch { terminateEcho("scan_error"); }
+            });
+          } catch {
+            // Only fixed causes leave the response boundary; upstream text can contain credential material.
+            if (swaps.length) terminateEcho("scan_error", true);
+            else { incoming.destroy(); refuse("upstream_reset"); }
           }
         });
       } catch { return refuse("header_write_failed"); }
