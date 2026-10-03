@@ -379,7 +379,7 @@ export async function execKeychain(
           `scripts/real-backend-check.ts, which runs outside vitest.\n` +
           `\n` +
           `NOT running a test? Then a previous run was killed before it could clean up, ` +
-          `and its marker file is still on disk. Delete it and this refusal stops:\n` +
+          `and its marker directory is still on disk. Delete it and this refusal stops:\n` +
           `  rm -r ${markerPathForDiagnostics()}`
       );
     case "spawn-real":
