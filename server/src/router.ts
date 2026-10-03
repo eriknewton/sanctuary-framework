@@ -53,6 +53,8 @@ export type ToolHandler = (
 ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
 
 export interface ToolExecutionContext {
+  /** SDK-owned cancellation, consumed by proxy/response-runtime.ts. */
+  readonly signal?: AbortSignal;
   /** Gate-minted durable id for the exact approved, normalized arguments. */
   readonly approvalAuditId?: string;
 }
@@ -154,7 +156,7 @@ export function createServer(
   });
 
   // Register tool execution - validation + gate sit between router and handler
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
     const currentAgentId = options?.currentAgentId?.();
@@ -330,7 +332,7 @@ export function createServer(
         // ToolHandler's doc) — this is what lets handshake/federation
         // per-origin quotas bind to a value the calling agent cannot mint
         // more of, instead of a caller-supplied identity_id.
-        return tool.handler(handlerArgs, callerIdentity, { approvalAuditId });
+        return tool.handler(handlerArgs, callerIdentity, { approvalAuditId, signal: extra.signal });
       };
 
       // Read tools bypass the audit-integrity gate unconditionally (an
@@ -403,6 +405,7 @@ export function createServer(
 
 /**
  * Helper to create a successful tool response.
+ * Pretty JSON serialization must match normalizeScreenedResponse in proxy/response-bounds.ts.
  */
 export function toolResult(
   data: object

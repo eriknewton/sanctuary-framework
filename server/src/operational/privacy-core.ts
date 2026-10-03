@@ -91,7 +91,11 @@ export interface PrivacyCoreFinding {
   placeholder_label?: string;
 }
 
+/** Host request-owned capture; labels alone never authorize reading historical vault values. */
+export interface ResponsePrivacyBindings { capture(placeholder: string, rawValue: string): void }
+
 export interface PrivacyFilterRequest {
+  responseBindings?: ResponsePrivacyBindings;
   payload: unknown;
   policy: PrivacyPolicy | null;
   identity_id?: string;
@@ -121,7 +125,16 @@ export type PrivacyFilterDecision =
       audit_payload: PrivacyDeniedPayload;
     };
 
+/** Response-only allocation accounting; proxy/response-bounds.ts supplies the bound. */
+export interface RehydrationBudget {
+  addBytes(bytes: number): void;
+  stringBytes(value: string): number;
+  assertLive(): void;
+  resolvePlaceholder(placeholder: string): string | null;
+}
+
 export interface PrivacyRehydrationRequest {
+  responseBudget?: RehydrationBudget;
   response: unknown;
   policy: PrivacyPolicy | null;
   identity_id?: string;
@@ -259,7 +272,8 @@ export class LocalPrivacyEngine {
         request.destination_category,
         scope,
         findings,
-        new WeakSet<object>()
+        new WeakSet<object>(),
+        request.responseBindings
       );
       const fieldDecisions = await this.fieldDecisionsForFindings(
         findings,
@@ -389,7 +403,8 @@ export class LocalPrivacyEngine {
         0,
         policy,
         counts,
-        new WeakSet<object>()
+        new WeakSet<object>(),
+        request.responseBudget
       );
       const auditPayload: PrivacyAuditPayload = {
         version: "1.1",
@@ -414,6 +429,8 @@ export class LocalPrivacyEngine {
         audit_payload: auditPayload,
       };
     } catch (err) {
+      // A failed response work budget is incomplete screening, never a releasable placeholder fallback.
+      if (request.responseBudget) throw err;
       const reason = err instanceof PrivacyPolicyError
         ? "fail_closed_no_policy"
         : isPrivacyVaultError(err)
@@ -445,7 +462,8 @@ export class LocalPrivacyEngine {
     destination: PrivacyDestinationCategory,
     scope: string,
     findings: PrivacyCoreFinding[],
-    seen: WeakSet<object>
+    seen: WeakSet<object>,
+    bindings?: ResponsePrivacyBindings
   ): Promise<unknown> {
     const maxDepth = policy.max_depth ?? 16;
     if (depth > maxDepth) {
@@ -453,7 +471,7 @@ export class LocalPrivacyEngine {
     }
 
     if (typeof value === "string") {
-      return this.filterString(value, path, policy, destination, scope, findings);
+      return this.filterString(value, path, policy, destination, scope, findings, bindings);
     }
 
     if (Array.isArray(value)) {
@@ -469,7 +487,8 @@ export class LocalPrivacyEngine {
           destination,
           scope,
           findings,
-          seen
+          seen,
+          bindings
         ));
       }
       seen.delete(value);
@@ -487,7 +506,8 @@ export class LocalPrivacyEngine {
           policy,
           destination,
           scope,
-          findings
+          findings,
+          bindings
         );
         const safeKey = typeof filteredKey === "string" ? filteredKey : key;
         const uniqueKey = Object.prototype.hasOwnProperty.call(out, safeKey)
@@ -501,7 +521,8 @@ export class LocalPrivacyEngine {
           destination,
           scope,
           findings,
-          seen
+          seen,
+          bindings
         );
       }
       seen.delete(value);
@@ -517,7 +538,8 @@ export class LocalPrivacyEngine {
     policy: PrivacyPolicy,
     destination: PrivacyDestinationCategory,
     scope: string,
-    findings: PrivacyCoreFinding[]
+    findings: PrivacyCoreFinding[],
+    bindings?: ResponsePrivacyBindings
   ): Promise<string> {
     const maxStringBytes = policy.max_string_bytes ?? 128 * 1024;
     if (stringToBytes(input).length > maxStringBytes) {
@@ -570,6 +592,7 @@ export class LocalPrivacyEngine {
         pieces.push(`[${detector.toUpperCase()}_REDACTED]`);
       } else {
         const placeholder = await this.vault.placeholderFor(span.class, span.text, scope);
+        bindings?.capture(placeholder, span.text);
         findings.push({
           raw_path: path,
           detector_class: detector,
@@ -611,23 +634,27 @@ export class LocalPrivacyEngine {
     depth: number,
     policy: PrivacyPolicy,
     counts: { rehydrated: number; unresolvable: number },
-    seen: WeakSet<object>
+    seen: WeakSet<object>,
+    budget?: RehydrationBudget
   ): Promise<unknown> {
+    budget?.assertLive();
     const maxDepth = policy.max_depth ?? 16;
     if (depth > maxDepth) {
       throw new PrivacyFilterError("payload_depth_limit");
     }
 
     if (typeof value === "string") {
-      return this.rehydrateString(value, scope, counts);
+      budget?.addBytes(2); // Opening and closing JSON quotes.
+      return this.rehydrateString(value, scope, counts, budget);
     }
 
     if (Array.isArray(value)) {
       if (seen.has(value)) throw new PrivacyFilterError("payload_cycle");
       seen.add(value);
+      budget?.addBytes(2 + Math.max(0, value.length - 1)); // Brackets and commas.
       const out: unknown[] = [];
       for (let i = 0; i < value.length; i++) {
-        out.push(await this.rehydrateNode(value[i], scope, depth + 1, policy, counts, seen));
+        out.push(await this.rehydrateNode(value[i], scope, depth + 1, policy, counts, seen, budget));
       }
       seen.delete(value);
       return out;
@@ -636,40 +663,54 @@ export class LocalPrivacyEngine {
     if (value && typeof value === "object") {
       if (seen.has(value)) throw new PrivacyFilterError("payload_cycle");
       seen.add(value);
+      budget?.addBytes(2); // Object braces.
+      let first = true;
       const out: Record<string, unknown> = {};
       for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-        out[key] = await this.rehydrateNode(child, scope, depth + 1, policy, counts, seen);
+        budget?.addBytes(budget.stringBytes(key) + 2 + 1 + (first ? 0 : 1)); // Quotes, colon, comma.
+        first = false;
+        out[key] = await this.rehydrateNode(child, scope, depth + 1, policy, counts, seen, budget);
       }
       seen.delete(value);
       return out;
     }
 
+    budget?.addBytes(String(value).length);
     return value;
   }
 
   private async rehydrateString(
     input: string,
     scope: string,
-    counts: { rehydrated: number; unresolvable: number }
+    counts: { rehydrated: number; unresolvable: number },
+    budget?: RehydrationBudget
   ): Promise<string> {
     const pattern = /\b(?:EMAIL|PHONE|SSN|CARD|PERSON|CLIENT|PROJECT|SECRET|CREDENTIAL|ACCOUNT|FILE_PATH|TERM|ADDRESS|URL|DATE|PRIVATE)_\d+\b/g;
     let cursor = 0;
     const pieces: string[] = [];
+    const append = (piece: string): void => {
+      budget?.assertLive();
+      // Charge each piece before retaining or joining it; a final size check is too late for expansion.
+      budget?.addBytes(budget.stringBytes(piece));
+      pieces.push(piece);
+    };
     for (const match of input.matchAll(pattern)) {
       if (match.index === undefined) continue;
       const placeholder = match[0];
-      pieces.push(input.slice(cursor, match.index));
-      const raw = await this.vault.resolvePlaceholder(placeholder, scope);
+      append(input.slice(cursor, match.index));
+      // Proxy responses resolve only request-captured values; no scan of historical vault state is allowed.
+      // Must match RequestResponseBindings.resolve in proxy/response-bounds.ts.
+      const raw = budget ? budget.resolvePlaceholder(placeholder) : await this.vault.resolvePlaceholder(placeholder, scope);
       if (raw === null) {
         counts.unresolvable++;
-        pieces.push(placeholder);
+        append(placeholder);
       } else {
         counts.rehydrated++;
-        pieces.push(raw);
+        append(raw);
       }
       cursor = match.index + placeholder.length;
     }
-    pieces.push(input.slice(cursor));
+    append(input.slice(cursor));
     return pieces.join("");
   }
 

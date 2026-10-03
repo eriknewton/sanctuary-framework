@@ -1,3 +1,4 @@
+import { unitResponseScreen } from "../helpers/response-screen.js";
 /**
  * Proxy Call Notification Tests
  *
@@ -79,7 +80,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector() as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       { onProxyCall }
     );
 
@@ -101,7 +102,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector(true) as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       { onProxyCall }
     );
 
@@ -125,7 +126,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector() as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       { onProxyCall }
     );
 
@@ -137,7 +138,7 @@ describe("Proxy Call Notifications", () => {
         tool: "proxy/test-server/read_file",
         server: "test-server",
         decision: "error",
-        reason: "Connection refused",
+        reason: "label_suspected",
       })
     );
   });
@@ -152,7 +153,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector() as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       { governor: mockGovernor as any, onProxyCall }
     );
 
@@ -175,7 +176,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector() as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       { onProxyCall }
     );
 
@@ -189,7 +190,7 @@ describe("Proxy Call Notifications", () => {
     const router = new ProxyRouter(
       mockClientManager as any,
       createMockInjectionDetector() as any,
-      mockAuditLog as any,
+      mockAuditLog as any, unitResponseScreen(),
       // No onProxyCall
     );
 
