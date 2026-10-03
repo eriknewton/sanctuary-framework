@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
+import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   establishMaster,
@@ -751,6 +752,20 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
 });
 
 describe("master rotation — fail-closed coverage", () => {
+  // LEGACY-BUG-001: shared enumeration refuses before rotation changes custody.
+  it("surfaces fixed discovery remediation without staging rotation", async () => {
+    const fortress = await buildFortress();
+    for (let i = 0; i < MAX_DISCOVERED_NAMESPACES; i++) {
+      await fortress.storage.write(`extra-${i}`, "k", stringToBytes("{}"));
+    }
+    const before = await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    expect(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION).toContain("1024 namespaces or 65536 scanned directory entries");
+    expect(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION).toContain("Remedy:");
+    expect(await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toEqual(before);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+  });
+
   it("aborts (nothing mutated) when an unsupported namespace holds data", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(

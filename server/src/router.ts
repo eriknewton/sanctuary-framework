@@ -14,6 +14,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { isNamespaceDiscoveryLimitError, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "./storage/interface.js";
 import { randomBytes } from "node:crypto";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
@@ -229,7 +230,7 @@ export function createServer(
       let gateArgs: Record<string, unknown>;
       try {
         gateArgs = (await tool.approvalTargetArgs?.(handlerArgs)) ?? handlerArgs;
-      } catch {
+      } catch (error) {
         const errorPayload = fixedDenial(
           `audit:gate:${name}`,
           GENERIC_GATE_DENIAL_REMEDIATION,
@@ -239,7 +240,12 @@ export function createServer(
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify(errorPayload),
+              // Only state_export's fixed capacity guidance may cross this
+              // boundary; policy and ownership denials keep their coarse schema.
+              // Must match the preserved discovery error in cognitive/tools.ts.
+              text: JSON.stringify(name === "state_export" && isNamespaceDiscoveryLimitError(error)
+                ? { ...errorPayload, remediation: NAMESPACE_DISCOVERY_LIMIT_REMEDIATION }
+                : errorPayload),
             },
           ],
           isError: true,

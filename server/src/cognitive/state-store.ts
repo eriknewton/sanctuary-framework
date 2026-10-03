@@ -16,6 +16,7 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
 import {
   hasInterruptedExitImport,
   InterruptedExitImportPendingError,
@@ -1588,9 +1589,8 @@ export class StateStore {
   /**
    * HIGH (Codex gate, 2026-08-22): the cache-aware load - populates
    * `cache.anchors` on first use within a batch, then reuses it for every
-   * later call in the SAME batch instead of reloading. No cache supplied
-   * (every caller except rekeyState's batch) behaves exactly as
-   * loadVersionAnchors() always has - a fresh load every call.
+   * later call in the SAME batch instead of reloading. Without a cache,
+   * loadVersionAnchors() performs a fresh load every call.
    */
   private async loadVersionAnchorsCached(
     cache?: VersionAnchorsCache
@@ -1612,6 +1612,49 @@ export class StateStore {
     return typeof anchored === "number" && Number.isSafeInteger(anchored)
       ? anchored
       : 0;
+  }
+
+  private async assertLegacyEntryVersionCeiling(
+    namespace: string,
+    key: string,
+    stateEntry: Pick<StateEntry, "v" | "ver">,
+    cache?: VersionAnchorsCache
+  ): Promise<void> {
+    // F1: a legacy (v1) entry must never ADVANCE the version past an established
+    // anchor. Legitimate version bumps are written as signed-envelope schemas
+    // (v2+), so a v1 entry claiming a version above the persisted anchor can
+    // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
+    // ONLY (not version/namespace/key), so the signature check below cannot catch
+    // this; the persisted anchor is the discriminator. The anchor record is now
+    // MAC-authenticated (loadVersionAnchors), so it can no longer be silently
+    // EDITED/LOWERED to defeat this gate (an edit fails the MAC and the read is
+    // rejected).
+    //
+    // RESIDUAL (documented, not closed here): a bare/absent anchor is treated as
+    // "no trusted floor" (anchored 0), so this gate does not fire. A filesystem
+    // adversary can therefore RESET the floor by deleting/stripping the anchors
+    // record and then replay a forged high-version v1 entry. Closing the
+    // deletion variant requires distrusting v1 on the enforced read path entirely
+    // (verified:false unless re-migrated), which breaks reads of legitimate
+    // un-migrated pre-v2 fortresses - a backward-compat migration decision left
+    // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
+    // on a bare-anchor fortress it reads normally because the gate is skipped.)
+    // Narrowed, not closed, by STATE-READ-ANCHOR-01: on the READ path the
+    // anchor RAISE below now requires a VERIFIED read, so a reset floor can no
+    // longer be re-pinned by a read that failed to verify. Two bounds survive
+    // and neither is closed here: a bare/absent anchor is still no floor, so
+    // the reset itself remains open exactly as described; and the WRITE path
+    // still derives the floor from unverified on-disk versions
+    // (STATE-WRITE-ANCHOR-01), so this narrowing covers reads only.
+    if (stateEntry.v === 1) {
+      const anchoredVersion = await this.getAnchoredVersion(namespace, key, cache);
+      if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
+        throw new StateVerificationError(
+          "rollback_detected",
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
+        );
+      }
+    }
   }
 
   /**
@@ -2429,40 +2472,9 @@ export class StateStore {
       );
     }
 
-    // F1: a legacy (v1) entry must never ADVANCE the version past an established
-    // anchor. Legitimate version bumps are written as signed-envelope schemas
-    // (v2+), so a v1 entry claiming a version above the persisted anchor can
-    // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
-    // ONLY (not version/namespace/key), so the signature check below cannot catch
-    // this; the persisted anchor is the discriminator. The anchor record is now
-    // MAC-authenticated (loadVersionAnchors), so it can no longer be silently
-    // EDITED/LOWERED to defeat this gate (an edit fails the MAC and the read is
-    // rejected).
-    //
-    // RESIDUAL (documented, not closed here): a bare/absent anchor is treated as
-    // "no trusted floor" (anchored 0), so this gate does not fire. A filesystem
-    // adversary can therefore RESET the floor by deleting/stripping the anchors
-    // record and then replay a forged high-version v1 entry. Closing the
-    // deletion variant requires distrusting v1 on the enforced read path entirely
-    // (verified:false unless re-migrated), which breaks reads of legitimate
-    // un-migrated pre-v2 fortresses - a backward-compat migration decision left
-    // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
-    // on a bare-anchor fortress it reads normally because the gate is skipped.)
-    // Narrowed, not closed, by STATE-READ-ANCHOR-01: on the READ path the
-    // anchor RAISE below now requires a VERIFIED read, so a reset floor can no
-    // longer be re-pinned by a read that failed to verify. Two bounds survive
-    // and neither is closed here: a bare/absent anchor is still no floor, so
-    // the reset itself remains open exactly as described; and the WRITE path
-    // still derives the floor from unverified on-disk versions
-    // (STATE-WRITE-ANCHOR-01), so this narrowing covers reads only.
-    if (options.enforceRollback && stateEntry.v === 1) {
-      const anchoredVersion = await this.getAnchoredVersion(namespace, key);
-      if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
-        throw new StateVerificationError(
-          "rollback_detected",
-          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
-        );
-      }
+    if (options.enforceRollback) {
+      // Must match assertImportVersionFloors: legacy envelopes share one ceiling check.
+      await this.assertLegacyEntryVersionCeiling(namespace, key, stateEntry);
     }
 
     let signatureVerified = false;
@@ -2847,6 +2859,23 @@ export class StateStore {
       .sort();
   }
 
+  /** Discover the complete export scope without requiring prior state reads. */
+  async listExportableNamespaces(): Promise<string[]> {
+    // Must match sessionOwnedExportNamespaces in tools.ts: approval and full
+    // export share durable discovery; an absent capability never falls back
+    // to the warm cache, which cannot prove completeness after a restart.
+    if (!this.storage.listNamespaces) {
+      throw new Error("Storage cannot enumerate namespaces");
+    }
+    const namespaces = await this.storage.listNamespaces();
+    // Recheck the backend contract before retaining or sorting its result;
+    // internal namespaces count toward the bound as well.
+    if (namespaces.length > MAX_DISCOVERED_NAMESPACES) {
+      throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    }
+    return [...new Set(namespaces.filter((namespace) => !isReservedNamespace(namespace)))].sort();
+  }
+
   async exportNamespaces(
     requestedNamespaces?: string[]
   ): Promise<{
@@ -2871,8 +2900,7 @@ export class StateStore {
         }
       }
     } else {
-      // Discover all namespaces from the content hash cache
-      namespacesToExport.push(...this.listCachedExportableNamespaces());
+      namespacesToExport.push(...await this.listExportableNamespaces());
     }
 
     const exportData: Record<
@@ -2947,6 +2975,32 @@ export class StateStore {
   }
 
   /**
+   * Before checkpoint reconstruction deletes or writes anything, check the entire
+   * import bundle against the same durable floors enforced by state reads.
+   * This is read-only: it neither warms versionCache nor raises an anchor.
+   */
+  async assertImportVersionFloors(bundleBase64: string): Promise<void> {
+    // Must match import below: use its parser, never a checkpoint-only schema.
+    const bundle = parseExportBundleObject(bundleBase64);
+    assertSupportedExportBundleSchema(bundle);
+    const data = readExportData(bundle);
+    assertBundleNamespaceMetadataMatches(bundle, data);
+    const cache: VersionAnchorsCache = { anchors: null, dirty: false };
+    for (const [namespace, entries] of Object.entries(data)) {
+      for (const { key, entry } of entries) {
+        if (!Number.isSafeInteger(entry.ver) || entry.ver < 1) {
+          throw new StateVerificationError("schema_mismatch", "Invalid imported state version");
+        }
+        // An import must not install bytes the enforcing reader will reject;
+        // reuse its MAC-authenticated floor check, including read failures.
+        // Must match readInternal: legacy envelopes also cannot exceed an anchor.
+        await this.assertLegacyEntryVersionCeiling(namespace, key, entry, cache);
+        await this.assertNotBelowVersionFloor(namespace, key, entry.ver, cache);
+      }
+    }
+  }
+
+  /**
    * Import a previously exported state bundle.
    */
   async import(
@@ -2974,6 +3028,7 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError("state_import");
     }
+    // Must match assertImportVersionFloors above: reconstruction preflights this parser.
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
     const data = readExportData(bundle);
