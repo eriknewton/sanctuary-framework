@@ -1,10 +1,10 @@
-// fail-before-exempt: authenticated StateStore fixture wiring only; key-resolution fail-before coverage lives in state-envelope-integrity.test.ts and master-rotation.test.ts
 /**
  * Memory checkpoint restore tests.
+ * CHECKPOINT-RESTORE-COLD-VERSION-FLOOR-01
  *
  * Proves the compromise-recovery path is a true reconstruct over exportable
  * namespaces: it refuses unless the harness is parked, seals a forensic copy
- * first, deletes post-checkpoint additions, restores changed/removed keys from
+ * first, deletes post-checkpoint additions, restores eligible removed keys from
  * the checkpoint bundle, and never touches reserved namespaces.
  */
 
@@ -12,9 +12,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  STATE_ENVELOPE_VERSION_ANCHORS_KEY,
   type StateExportCompletenessManifest,
   type StateStore,
 } from "../../src/cognitive/state-store.js";
@@ -30,6 +31,7 @@ import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   CheckpointRestoreAgentNotParkedError,
+  CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
   CheckpointRestoreBundleHashMismatchError,
   CheckpointRestoreForensicSourceError,
   CheckpointRestoreReconstructError,
@@ -296,7 +298,7 @@ describe("restoreCheckpoint", () => {
     expect(records.map((record) => record.source)).toEqual(["on_demand"]);
   });
 
-  it("deletes added keys, restores changed and removed keys, seals forensic state, and preserves reserved namespaces", async () => {
+  it("warm restore at the durable floors deletes additions, restores removed keys, and preserves reserved namespaces", async () => {
     const fixture = await makeFixture();
     await writeEntry(fixture, "mem", "Q", "known-good-q");
     await writeEntry(fixture, "mem", "R", "known-good-r");
@@ -318,7 +320,6 @@ describe("restoreCheckpoint", () => {
     );
 
     await writeEntry(fixture, "mem", "P", "poison-added");
-    await writeEntry(fixture, "mem", "Q", "poison-changed-q");
     await fixture.stateStore.delete("mem", "R");
     await writeEntry(fixture, "_audit", "audit-key", "audit-after");
     await writeEntry(fixture, "_identities", "identity-key", "identity-after");
@@ -338,7 +339,7 @@ describe("restoreCheckpoint", () => {
     expect(restored.checkpoint_id).toBe(checkpoint.id);
     expect(restored.poison_map).toEqual({
       added: ["mem/P"],
-      changed: ["mem/Q"],
+      changed: [],
       removed: ["mem/R"],
     });
     expect(restored.import_result.imported_keys).toBe(2);
@@ -364,7 +365,7 @@ describe("restoreCheckpoint", () => {
       decodeBundle(await fixture.checkpointStore.readBundle(restored.forensic_id, fixture.masterKey)),
     );
     expect(forensicEntries.has("mem/P")).toBe(true);
-    expect(forensicEntries.get("mem/Q")).not.toEqual(checkpointEntries.get("mem/Q"));
+    expect(forensicEntries.get("mem/Q")).toEqual(checkpointEntries.get("mem/Q"));
 
     const critical = fixture.audit.criticalCalls.at(-1);
     expect(critical).toMatchObject({
@@ -378,6 +379,53 @@ describe("restoreCheckpoint", () => {
       },
     });
     expectPoisonSummary(critical!, restored.poison_map);
+  });
+
+  it.each(["below floor", "anchor I/O failure"])("refuses warm restore on %s before any write or deletion", async (failure) => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "alpha", "Q", "eligible");
+    await writeEntry(fixture, "beta", "Q", "original");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+    });
+    await writeEntry(fixture, "gamma", "added", "preserve");
+    if (failure === "below floor") await writeEntry(fixture, "beta", "Q", "advanced");
+    const read = fixture.storage.read.bind(fixture.storage);
+    const readSpy = vi.spyOn(fixture.storage, "read").mockImplementation(async (ns, key) => {
+      if (failure === "anchor I/O failure" && ns === "_meta" && key === STATE_ENVELOPE_VERSION_ANCHORS_KEY) {
+        throw new Error("injected anchor read failure");
+      }
+      return read(ns, key);
+    });
+    const writeSpy = vi.spyOn(fixture.storage, "write");
+    const deleteSpy = vi.spyOn(fixture.storage, "delete");
+    const auditCount = fixture.audit.criticalCalls.length;
+    try {
+      await expect(restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      })).rejects.toThrow(CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL);
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(fixture.audit.criticalCalls).toHaveLength(auditCount);
+      expect(await fixture.checkpointStore.list()).toHaveLength(1);
+    } finally {
+      readSpy.mockRestore();
+      writeSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
   });
 
   it("refuses to restore from a forensic quarantine checkpoint", async () => {
@@ -426,14 +474,13 @@ describe("restoreCheckpoint", () => {
       now: new Date("2026-08-03T12:05:00.000Z"),
     });
     await writeEntry(fixture, "mem", "P", "poison-added");
-    await writeEntry(fixture, "mem", "Q", "poison-changed");
 
     const failingStateStore: Pick<
       StateStore,
-      "exportNamespaces" | "delete" | "import" | "listCachedExportableNamespaces"
+      "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
-      listCachedExportableNamespaces: () => fixture.stateStore.listCachedExportableNamespaces(),
+      assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
       delete: async () => {
         throw new Error("injected reconstruct failure");
       },
@@ -488,7 +535,7 @@ describe("restoreCheckpoint", () => {
     });
     expectPoisonSummary(failureAudit!, {
       added: ["mem/P"],
-      changed: ["mem/Q"],
+      changed: [],
       removed: [],
     });
   });

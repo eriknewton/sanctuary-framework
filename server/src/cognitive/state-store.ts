@@ -1589,9 +1589,8 @@ export class StateStore {
   /**
    * HIGH (Codex gate, 2026-08-22): the cache-aware load - populates
    * `cache.anchors` on first use within a batch, then reuses it for every
-   * later call in the SAME batch instead of reloading. No cache supplied
-   * (every caller except rekeyState's batch) behaves exactly as
-   * loadVersionAnchors() always has - a fresh load every call.
+   * later call in the SAME batch instead of reloading. Without a cache,
+   * loadVersionAnchors() performs a fresh load every call.
    */
   private async loadVersionAnchorsCached(
     cache?: VersionAnchorsCache
@@ -2964,6 +2963,30 @@ export class StateStore {
   }
 
   /**
+   * Before checkpoint reconstruction deletes or writes anything, check the entire
+   * import bundle against the same durable floors enforced by state reads.
+   * This is read-only: it neither warms versionCache nor raises an anchor.
+   */
+  async assertImportVersionFloors(bundleBase64: string): Promise<void> {
+    // Must match import below: use its parser, never a checkpoint-only schema.
+    const bundle = parseExportBundleObject(bundleBase64);
+    assertSupportedExportBundleSchema(bundle);
+    const data = readExportData(bundle);
+    assertBundleNamespaceMetadataMatches(bundle, data);
+    const cache: VersionAnchorsCache = { anchors: null, dirty: false };
+    for (const [namespace, entries] of Object.entries(data)) {
+      for (const { key, entry } of entries) {
+        if (!Number.isSafeInteger(entry.ver) || entry.ver < 1) {
+          throw new StateVerificationError("schema_mismatch", "Invalid imported state version");
+        }
+        // An import must not install bytes the enforcing reader will reject;
+        // reuse its MAC-authenticated floor check, including read failures.
+        await this.assertNotBelowVersionFloor(namespace, key, entry.ver, cache);
+      }
+    }
+  }
+
+  /**
    * Import a previously exported state bundle.
    */
   async import(
@@ -2991,6 +3014,7 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError("state_import");
     }
+    // Must match assertImportVersionFloors above: reconstruction preflights this parser.
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
     const data = readExportData(bundle);

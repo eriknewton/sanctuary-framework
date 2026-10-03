@@ -48,6 +48,7 @@ import {
   nodeMemoryCheckpointFsOps,
   pruneExpiredCheckpoints,
   restoreCheckpoint,
+  preflightCheckpointRestore,
   type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
@@ -540,6 +541,20 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+
+  // Check before approval auditing writes reserved state; restore repeats this
+  // read-only preflight at its own boundary before any reconstruction writes.
+  try {
+    await preflightCheckpointRestore({
+      stateStore: boot.stateStore,
+      checkpointStore: boot.checkpointStore,
+      masterKey: boot.masterKey,
+      checkpointId: id,
+    });
+  } catch (restoreErr) {
+    write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
+    return 1;
+  }
 
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);
