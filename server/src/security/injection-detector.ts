@@ -9,12 +9,14 @@
  * re-scanning, token budget analysis, and outbound content scanning.
  *
  * Security invariants:
- * - Always returns a result, never throws
+ * - Argument scans return results; response budget failures throw
  * - Typical scan completes in < 5ms
  * - False positives minimized via field-aware scanning
  * - Recursive scanning of nested objects/arrays
  * - Outbound scanning catches secret leaks and injection artifact survival
  */
+
+import { RESPONSE_LIMITS } from "../proxy/response-limits.js";
 
 export interface InjectionDetectorConfig {
   enabled: boolean;
@@ -175,7 +177,8 @@ const URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
  * prevents an attacker from turning that bounded corpus into an unbounded
  * collection of base64/hex/url decode attempts.
  */
-export const INJECTION_MAX_DECODED_RESCANS = 64;
+// Must match MAX_CANDIDATES in proxy/response-limits.ts; argument scanning retains its historical cap.
+export const INJECTION_MAX_DECODED_RESCANS = RESPONSE_LIMITS.MAX_CANDIDATES;
 
 function boundedRegexMatches(
   value: string,
@@ -268,6 +271,46 @@ const OUTPUT_ROLE_MARKER_PATTERNS = [
 
 export class InjectionDetector {
   private config: InjectionDetectorConfig;
+  private responseBudget?: { candidates: number; decodedBytes: number; signals: number };
+
+  /** Response-only completion proof; ordinary argument scanning keeps its semantics. */
+  scanResponseBudgeted(deliveredText: string): {
+    result: DetectionResult;
+    budget: { complete: true; candidates: number; decodedBytes: number; signals: number };
+  } {
+    // Response release cannot interpret disabled detection or custom policy as completed screening.
+    if (!this.config.enabled || (this.config.custom_patterns?.length ?? 0) !== 0 || this.responseBudget) {
+      throw new Error("Response screening unavailable");
+    }
+    if (Buffer.byteLength(deliveredText, "utf8") > RESPONSE_LIMITS.CONTENT_UTF8_BYTES) {
+      throw new Error("Response budget exceeded");
+    }
+    this.responseBudget = { candidates: 0, decodedBytes: 0, signals: 0 };
+    try {
+      // Must match the host-owned scan name/field in proxy/response-worker.ts.
+      const result = this.scan("content_ingress_response", { upstream_content: deliveredText });
+      return { result, budget: { complete: true, ...this.responseBudget } };
+    } finally {
+      this.responseBudget = undefined;
+    }
+  }
+
+  private responseSignals(): InjectionSignal[] {
+    const signals: InjectionSignal[] = [];
+    if (this.responseBudget) {
+      signals.push = (...items: InjectionSignal[]): number => {
+        const budget = this.responseBudget!;
+        // Guard insertion itself: checking a completed array would already retain excess findings.
+        if (budget.signals + items.length > RESPONSE_LIMITS.MAX_SIGNALS) {
+          throw new Error("Response signal budget exceeded");
+        }
+        budget.signals += items.length;
+        return Array.prototype.push.apply(signals, items);
+      };
+    }
+    return signals;
+  }
+
   private stats = {
     total_scans: 0,
     total_flags: 0,
@@ -303,7 +346,7 @@ export class InjectionDetector {
       };
     }
 
-    const signals: InjectionSignal[] = [];
+    const signals = this.responseSignals();
     const visited = new Set<unknown>();
 
     // Recursively scan all string values
@@ -718,6 +761,10 @@ export class InjectionDetector {
     path: string,
     signals: InjectionSignal[]
   ): void {
+    if (this.responseBudget) {
+      this.detectResponseEncodedPayloads(value, path, signals);
+      return;
+    }
     const decodedParts: string[] = [];
     const retainDecoded = (decoded: string | null): void => {
       if (
@@ -788,6 +835,41 @@ export class InjectionDetector {
     }
   }
 
+  private detectResponseEncodedPayloads(value: string, path: string, signals: InjectionSignal[]): void {
+    const budget = this.responseBudget!;
+    let found = false;
+    const inspect = (candidate: string, decode: (input: string) => string | null): void => {
+      // Count attempted work, including nonmatches, before decoding; a truncated list is not proof.
+      if (++budget.candidates > RESPONSE_LIMITS.MAX_CANDIDATES) {
+        throw new Error("Response candidate budget exceeded");
+      }
+      const decoded = decode(candidate);
+      if (decoded === null) return;
+      const bytes = Buffer.byteLength(decoded, "utf8");
+      if (budget.decodedBytes + bytes > RESPONSE_LIMITS.CONTENT_UTF8_BYTES) {
+        throw new Error("Response decoded budget exceeded");
+      }
+      budget.decodedBytes += bytes;
+      found = this.containsInjectionPatterns(decoded) || found;
+    };
+    for (const [pattern, decode] of [
+      [BASE64_BLOCK_PATTERN, (v: string) => this.safeBase64Decode(v)],
+      [HEX_ENCODED_PATTERN, (v: string) => this.safeHexDecode(v)],
+      [URL_ENCODED_PATTERN, (v: string) => this.safeUrlDecode(v)],
+    ] as const) {
+      // Clone regexes so their global lastIndex never carries a previous response's state.
+      const regex = new RegExp(pattern.source, pattern.flags);
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(value)) !== null) inspect(match[0], decode);
+    }
+    if (new RegExp(HTML_ENTITY_PATTERN.source).test(value)) {
+      inspect(value, (v) => this.decodeHtmlEntities(v));
+    }
+    if (found) signals.push({
+      type: "encoding_evasion", pattern: "encoded_injection_payload", location: path, severity: "high",
+    });
+  }
+
   /**
    * Check if a string contains any injection patterns (role override or security bypass).
    */
@@ -820,7 +902,8 @@ export class InjectionDetector {
         return decoded;
       }
       return null;
-    } catch {
+    } catch (err) {
+      if (this.responseBudget) throw err;
       return null;
     }
   }
@@ -837,7 +920,8 @@ export class InjectionDetector {
         return decoded;
       }
       return null;
-    } catch {
+    } catch (err) {
+      if (this.responseBudget) throw err;
       return null;
     }
   }
@@ -849,7 +933,8 @@ export class InjectionDetector {
     return value.replace(/&#x([0-9a-fA-F]{2,4});/g, (_match, hex: string) => {
       try {
         return String.fromCodePoint(parseInt(hex, 16));
-      } catch {
+      } catch (err) {
+        if (this.responseBudget) throw err;
         return _match;
       }
     }).replace(/&#([0-9]{2,5});/g, (_match, dec: string) => {
@@ -857,7 +942,8 @@ export class InjectionDetector {
         const cp = parseInt(dec, 10);
         if (cp > 0x10ffff) return _match;
         return String.fromCodePoint(cp);
-      } catch {
+      } catch (err) {
+        if (this.responseBudget) throw err;
         return _match;
       }
     });
@@ -869,7 +955,8 @@ export class InjectionDetector {
   private safeUrlDecode(value: string): string | null {
     try {
       return decodeURIComponent(value);
-    } catch {
+    } catch (err) {
+      if (this.responseBudget && !(err instanceof URIError)) throw err;
       return null;
     }
   }
