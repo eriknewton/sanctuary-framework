@@ -202,7 +202,7 @@ describe("Intelligence panel — CCCC first-load render + substrate-missing word
     // BEFORE the generic loadError assignment, so the raw "unauthorized"
     // string from auth-middleware never reaches state.intelligence.loadError.
     const fetchFn = client.slice(
-      client.indexOf("async function fetchIntelligenceState()"),
+      client.indexOf("async function fetchIntelligenceState("),
       client.indexOf("async function onIntelPickerOpen(")
     );
     // 401 check must appear before the generic loadError fallback

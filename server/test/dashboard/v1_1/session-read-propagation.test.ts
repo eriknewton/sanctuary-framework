@@ -28,7 +28,7 @@ function loadClient(options: {
     const setTimeout = env.setTimeout;
     const setInterval = env.setInterval;
     ${script}
-    return { api, policyApi, autoTriggerApi, honeypotApi, loadInboxPrefs, fetchSovereignty, fetchPostureHome, connectStream };
+    return { api, policyApi, autoTriggerApi, honeypotApi, loadInboxPrefs, fetchSovereignty, fetchPostureHome, fetchPostureAnomalies, connectStream };
   `) as (env: Record<string, unknown>) => Record<string, (...args: unknown[]) => Promise<unknown> | void>;
 
   const configElement = { textContent: JSON.stringify(config) };
@@ -76,6 +76,7 @@ describe("v1.1 launch-session read propagation", () => {
     await client.loadInboxPrefs();
     await client.fetchSovereignty();
     await client.fetchPostureHome();
+    await client.fetchPostureAnomalies();
     client.connectStream();
     await Promise.resolve();
 

@@ -61,6 +61,14 @@ const URL_SESSION = (function () {
 // freshness windows are unknown, never silently widened to this maximum.
 const SEAL_FRESHNESS_MAX_MS = 10 * 60 * 1000;
 let sealFreshnessTimer = null;
+// One five-second interaction budget bounds a read, including its JSON body.
+// Preferences are optional and get the same budget; neither gates startup.
+const DASHBOARD_READ_DEADLINE_MS = 5 * 1000;
+const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
+const pendingReads = new Map();
+const readFailures = new Map();
+// Retain at most two failed reads per startup group (15 groups + policy).
+const MAX_RETAINED_READ_FAILURES = 2 * 16;
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
@@ -70,6 +78,7 @@ const state = {
   route: "posture",
   agents: [],
   inbox: [],
+  inboxLoaded: false,
   inboxRedacted: false,
   inboxRedactedCount: 0,
   inboxOps: {
@@ -230,7 +239,101 @@ function credentialedReadUrl(url, method) {
   } catch (_e) { return url; }
 }
 
-async function api(path, opts) {
+// A rejected race cannot publish late bytes, even if a transport ignores abort.
+// Only GETs use this helper; a mutation timeout must not imply it was undone.
+function readResponse(url, init, deadlineMs) {
+  const parsed = new URL(url, "http://dashboard.invalid");
+  parsed.searchParams.delete("_t");
+  parsed.searchParams.delete("session");
+  const key = parsed.pathname + parsed.search;
+  if (pendingReads.has(key)) return pendingReads.get(key);
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise(function (_, reject) {
+    timer = setTimeout(function () {
+      reject(new Error("Read timed out. The latest result is unavailable."));
+      controller.abort();
+    }, deadlineMs === undefined ? DASHBOARD_READ_DEADLINE_MS : deadlineMs);
+  });
+  const read = (async function () {
+    if (deadlineMs !== undefined && deadlineMs <= 0) throw new Error("Read timed out. The latest result is unavailable.");
+    const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    const body = await res.json();
+    if (!res.ok) {
+      const error = new Error(res.status === 401 || res.status === 403
+        ? "Operator access required (HTTP " + res.status + ")."
+        : "Read failed (HTTP " + res.status + ").");
+      error.status = res.status;
+      error.body = body;
+      throw error;
+    }
+    if (!body || typeof body !== "object" || body.error) throw new Error("The latest result is unavailable.");
+    return { ok: res.ok, status: res.status, json: async function () { return body; } };
+  })();
+  const result = Promise.race([read, expired]).then(function (res) {
+    readFailures.delete(key);
+    return res;
+  }, function (error) {
+    readFailures.delete(key);
+    readFailures.set(key, error.message || "The latest result is unavailable.");
+    // Dynamic detail URLs must not grow retained error state across retries.
+    if (readFailures.size > MAX_RETAINED_READ_FAILURES) readFailures.delete(readFailures.keys().next().value);
+    rerender();
+    throw error;
+  }).finally(function () {
+    clearTimeout(timer);
+    pendingReads.delete(key);
+  });
+  pendingReads.set(key, result);
+  return result;
+}
+
+function dashboardResponse(url, init, deadlineAt) {
+  return !init || !init.method || init.method.toUpperCase() === "GET"
+    ? readResponse(url, init, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()))
+    : fetch(url, init);
+}
+
+function readLabel(path) {
+  const labels = [
+    [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
+    ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
+    [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
+    [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
+    [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
+    [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
+    [HUB + "/chat", "Conversation history"], [POLICY, "Operator policy"],
+    [AUTO_TRIGGER, "Auto-trigger"], ["/api/honeypot", "Honeypots"]
+  ];
+  const match = labels.find(function (entry) { return path.indexOf(entry[0]) === 0; });
+  return match ? match[1] : "Panel";
+}
+function renderReadFailures() {
+  return Array.from(readFailures).map(function (entry) {
+    return '<section class="card" role="status"><strong>Panel unavailable</strong>' +
+      '<p>' + escHtml(readLabel(entry[0])) + ': ' + escHtml(entry[1]) + '</p>' +
+      '<button class="btn" data-action="retry-panel" data-read="' + escHtml(entry[0]) + '"' +
+      (pendingReads.has(entry[0]) ? ' disabled' : '') + '>Retry</button></section>';
+  }).join("");
+}
+
+function routeReadUnavailable() {
+  const dependencies = {
+    agents: [HUB + "/agents"], "agent-detail": [HUB + "/agents"],
+    activity: [HUB + "/activity", HUB + "/inbox"],
+    policy: [POLICY, HUB + "/policies"], "auto-trigger": [AUTO_TRIGGER],
+    intelligence: [HUB + "/intelligence"], honeypot: ["/api/honeypot"],
+    privacy: [HUB + "/activity?category=privacy"],
+    coordination: [HUB + "/activity?category=handoff"]
+  };
+  return (dependencies[state.route] || []).some(function (prefix) {
+    return Array.from(readFailures.keys()).some(function (path) {
+      return path === prefix || path.indexOf(prefix + "/") === 0;
+    });
+  });
+}
+
+async function api(path, opts, deadlineAt) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -261,7 +364,7 @@ async function api(path, opts) {
     url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
-  let res = await fetch(url, init);
+  let res = await dashboardResponse(url, init, deadlineAt);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -282,7 +385,7 @@ async function honeypotApi(path) {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   const sep = path.indexOf("?") >= 0 ? "&" : "?";
-  const res = await fetch(credentialedReadUrl("/api/honeypot" + path + sep + "_t=" + Date.now(), "GET"), {
+  const res = await readResponse(credentialedReadUrl("/api/honeypot" + path + sep + "_t=" + Date.now(), "GET"), {
     headers,
     cache: "no-store"
   });
@@ -292,7 +395,7 @@ async function honeypotApi(path) {
   return body;
 }
 
-async function autoTriggerApi(path, opts) {
+async function autoTriggerApi(path, opts, deadlineAt) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
   if (init.body && typeof init.body !== "string") {
@@ -306,7 +409,7 @@ async function autoTriggerApi(path, opts) {
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   url = credentialedReadUrl(url, method);
-  const res = await fetch(url, init);
+  const res = await dashboardResponse(url, init, deadlineAt);
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {
@@ -340,7 +443,7 @@ async function policyApi(path, opts) {
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   url = credentialedReadUrl(url, method);
-  let res = await fetch(url, init);
+  let res = await dashboardResponse(url, init);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
     res = await fetch(url, init);
@@ -871,6 +974,10 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
+  // A failed list read is not an empty list; hide its ordinary empty/success copy.
+  nextHtml = renderReadFailures() + (routeReadUnavailable()
+    ? '<section class="card"><p>Current panel data is unavailable. Retry the failed read above.</p></section>'
+    : nextHtml);
   // Skip the innerHTML write when the rendered output is byte-identical
   // to the last write on the same route. Preserves the existing DOM
   // tree, focus, and any active text selection during no-op poll
@@ -1944,10 +2051,11 @@ function renderIntelligencePicker() {
   '</div>';
 }
 
-async function fetchIntelligenceState() {
+async function fetchIntelligenceState(deadlineAt) {
+  if (deadlineAt === undefined) deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
   state.intelligence.loadError = null;
   try {
-    const sr = await api("/intelligence/status");
+    const sr = await api("/intelligence/status", undefined, deadlineAt);
     state.intelligence.status = sr.data || null;
     state.intelligence.notConfigured = false;
   } catch (e) {
@@ -1965,7 +2073,7 @@ async function fetchIntelligenceState() {
     return;
   }
   try {
-    const cr = await api("/intelligence/config");
+    const cr = await api("/intelligence/config", undefined, deadlineAt);
     state.intelligence.config = cr.data || null;
   } catch (e) {
     if (e.status === 503) {
@@ -2439,14 +2547,18 @@ function normalizeInboxPrefs(raw) {
 }
 
 async function loadInboxPrefs() {
+  const initialFilters = JSON.stringify(state.inboxOps.filters);
   try {
-    const res = await fetch(credentialedReadUrl(INBOX_PREFS, "GET"), {
+    const res = await readResponse(credentialedReadUrl(INBOX_PREFS, "GET"), {
       headers: TOKEN ? { "Authorization": "Bearer " + TOKEN } : {},
       cache: "no-store"
-    });
+    }, INBOX_PREFS_DEADLINE_MS);
     if (!res.ok) return;
     const body = await res.json();
-    state.inboxOps.filters = normalizeInboxPrefs(body && body.data && body.data.filters);
+    // A delayed preference read must not overwrite filters the operator edited.
+    if (JSON.stringify(state.inboxOps.filters) === initialFilters) {
+      state.inboxOps.filters = normalizeInboxPrefs(body && body.data && body.data.filters);
+    }
   } catch (_) {}
 }
 
@@ -2478,6 +2590,7 @@ function setInboxRedacted(marker) {
 }
 
 function applyInboxPayload(data) {
+  state.inboxLoaded = true;
   if (isPendingApprovalsRedactedMarker(data)) {
     setInboxRedacted(data);
   } else {
@@ -3002,7 +3115,7 @@ function renderPostureScreen() {
     '</div></div>';
   if (!home) {
     const why = state.posture.homeError
-      ? 'Could not load posture detail (' + escHtml(state.posture.homeError) + '). The data routes stay behind your operator token.'
+      ? 'Protection status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
       : 'Loading posture detail.';
     return '<section class="concierge-wrap">' + head +
       '<section class="card"><p class="muted">' + why + '</p></section>' +
@@ -3059,7 +3172,7 @@ function renderPostureScreen() {
         freshNone: "no enforcement evidence yet",
       }) +
       vaultNotice +
-      postureMetricCard(escHtml(pending), "Approvals waiting") +
+      postureMetricCard(!state.inboxLoaded || state.inboxRedacted || readFailures.has(HUB + "/inbox") ? "Unknown" : escHtml(pending), "Approvals waiting") +
       postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
       postureMetricCard(chainPill, "Audit chain", {
         // The digest window is the period this verdict covers; its end states
@@ -3098,58 +3211,58 @@ function renderPostureScreen() {
 }
 
 // ── Hub API actions ────────────────────────────────────────────────────
-async function fetchAll() {
-  try {
+// Each independent panel publishes as soon as it settles. One slow route must
+// never hold Posture, or another panel, behind it. Retries select one panel.
+const panelJobs = [
+  { paths: [INBOX_PREFS], load: loadInboxPrefs },
+  { paths: [HUB + "/agents"], load: async function () {
     const ar = await api("/agents");
     state.agents = ar.data.agents || [];
     state.chatActiveAgentId = state.chatActiveAgentId || (state.agents[0] ? state.agents[0].agent_id : null);
-  } catch (e) { /* tolerate */ }
-  try {
-    const ir = await api("/inbox");
-    applyInboxPayload(ir.data || {});
-  } catch (e) { /* tolerate */ }
-  try {
-    const acr = await api("/activity");
-    state.activity = acr.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const pr = await api("/policies");
-    state.policies = pr.data.policies || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const pe = await api("/activity?category=privacy");
-    state.privacyEvents = pe.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    const he = await api("/activity?category=handoff");
-    state.handoffEvents = he.data.entries || [];
-  } catch (e) { /* tolerate */ }
-  try {
-    await fetchAutoTriggerState();
-  } catch (e) {
-    state.autoTrigger.loadError = e && e.message && e.message !== "Not Found" ? e.message : null;
-  }
-  try {
-    const rh = await api("/recognition/did-web");
-    state.recognition.health = rh.data || null;
-    state.recognition.error = null;
-  } catch (e) {
-    state.recognition.error = e.message || "load failed";
-  }
-  await fetchIntelligenceState();
-  await fetchHoneypotState();
-  await fetchSovereignty();
-  await fetchPostureHome();
-  // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
-  // The direct-agent surface was removed; the inspect panel is fetched
-  // lazily on click rather than maintained in state.
-  await fetchConciergeHistory();
+  } },
+  { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
+  { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
+  { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
+  { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
+  { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
+  { paths: [AUTO_TRIGGER], load: fetchAutoTriggerState },
+  { paths: [HUB + "/recognition/did-web"], load: async function () {
+    try { const r = await api("/recognition/did-web"); state.recognition.health = r.data || null; state.recognition.error = null; }
+    catch (e) { state.recognition.error = e.message; }
+  } },
+  { paths: [HUB + "/intelligence"], load: fetchIntelligenceState },
+  { paths: ["/api/honeypot"], load: fetchHoneypotState },
+  { paths: ["/api/sovereignty"], load: fetchSovereignty },
+  { paths: ["/api/posture/home"], load: fetchPostureHome },
+  { paths: ["/api/anomaly/findings"], load: fetchPostureAnomalies },
+  { paths: [HUB + "/chat/concierge/history"], load: fetchConciergeHistory }
+];
+const pendingPanels = new Map();
+function loadPanel(job) {
+  if (pendingPanels.has(job)) return pendingPanels.get(job);
+  // Dependent reads share the panel's budget instead of resetting it per step.
+  const deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
+  const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).catch(function () {
+    // The bounded reader retains the specific error and retry affordance.
+  }).finally(function () { pendingPanels.delete(job); rerender(); });
+  pendingPanels.set(job, pending);
+  return pending;
+}
+async function fetchAll() {
+  await Promise.all(panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; }).map(loadPanel));
+}
+function retryPanel(path) {
+  if (path.indexOf(POLICY + "/") === 0) return loadPolicyView();
+  // Prefer the most specific match, so privacy does not retry all activity.
+  const job = panelJobs.slice().reverse().find(function (candidate) {
+    return candidate.paths.some(function (prefix) { return path === prefix || path.indexOf(prefix + "/") === 0 || path.indexOf(prefix + "?") === 0; });
+  });
+  if (job) return loadPanel(job);
 }
 
 async function fetchHoneypotState() {
   try {
-    const tool = await honeypotApi("/tool-traps");
-    const credential = await honeypotApi("/credential-traps");
+    const [tool, credential] = await Promise.all([honeypotApi("/tool-traps"), honeypotApi("/credential-traps")]);
     state.honeypot.toolTraps = (tool.data && tool.data.traps) || [];
     state.honeypot.credentialTraps = (credential.data && credential.data.traps) || [];
     state.honeypot.loadError = null;
@@ -3170,7 +3283,7 @@ async function fetchSovereignty() {
   try {
     const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
     if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
-    const res = await fetch(credentialedReadUrl("/api/sovereignty?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+    const res = await readResponse(credentialedReadUrl("/api/sovereignty?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
@@ -3201,44 +3314,41 @@ async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   try {
-    const res = await fetch(credentialedReadUrl("/api/posture/home?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+    const res = await readResponse(credentialedReadUrl("/api/posture/home?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
       state.posture.home = null;
       state.posture.homeError = (body && body.error) || ("HTTP " + res.status);
     } else {
-      // Anomaly findings come from the dedicated endpoint; tolerate its absence
-      // (a fortress with no anomaly detector wired) without failing the screen.
-      // Honesty (never-overclaim): a genuine fetch FAILURE must NOT render as an
-      // affirmative "Open anomalies: 0" / "No open anomaly findings" - that
-      // conflates "the detector errored / auth failed" with "genuinely zero",
-      // which is a soft overclaim on the posture surface. So we distinguish an
-      // UNKNOWN state (anomaly_findings_unknown) from a real zero.
-      // The ONLY non-ok status that is a legitimate "not wired = empty" signal is
-      // 503 (anomaly_not_configured, emitted by dispatch when the anomaly binding
-      // is absent). Every other non-ok status - notably a 401 from an
-      // expired/missing bearer (the route returns 401, never 404, on auth
-      // failure) or any 5xx - is an honest UNKNOWN, never a confirmed clean zero.
-      let findings = [];
-      let anomalyUnknown = false;
-      try {
-        const ar = await fetch(credentialedReadUrl("/api/anomaly/findings?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
-        if (ar.ok) {
-          const ab = await ar.json();
-          findings = (ab && ab.data && ab.data.findings) || [];
-        } else if (ar.status !== 503) {
-          anomalyUnknown = true;
-        }
-      } catch (e) { anomalyUnknown = true; }
-      body.anomaly_findings = findings;
-      body.anomaly_findings_unknown = anomalyUnknown;
+      // Optional detector evidence is independent of the primary home read.
+      body.anomaly_findings = state.posture.anomalies || [];
+      body.anomaly_findings_unknown = state.posture.anomaliesUnknown !== false;
       state.posture.home = body;
       state.posture.homeError = null;
     }
   } catch (e) {
     state.posture.home = null;
     state.posture.homeError = e && e.message ? e.message : String(e);
+  }
+}
+
+async function fetchPostureAnomalies() {
+  try {
+    const headers = TOKEN ? { "Authorization": "Bearer " + TOKEN } : {};
+    const res = await readResponse(credentialedReadUrl("/api/anomaly/findings", "GET"), { headers: headers, cache: "no-store" });
+    const body = await res.json();
+    if (!body.data || !Array.isArray(body.data.findings)) throw new Error("Anomaly findings unavailable.");
+    state.posture.anomalies = body.data.findings;
+    state.posture.anomaliesUnknown = false;
+  } catch (_) {
+    // An absent detector is unavailable evidence, never proof of zero findings.
+    state.posture.anomalies = [];
+    state.posture.anomaliesUnknown = true;
+  }
+  if (state.posture.home) {
+    state.posture.home.anomaly_findings = state.posture.anomalies;
+    state.posture.home.anomaly_findings_unknown = state.posture.anomaliesUnknown;
   }
 }
 
@@ -3436,7 +3546,7 @@ function postureLayerLines() {
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
     { k: "Sentinels watching agents", v: wrapped + " wrapped", warn: false, off: wrapped === 0 },
-    { k: "Charter approvals", v: pending ? pending + " waiting" : "clear", warn: pending > 0 },
+    { k: "Charter approvals", v: !state.inboxLoaded || state.inboxRedacted || readFailures.has(HUB + "/inbox") ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
     { k: "Heralds (reputation)", v: d && d.layers && d.layers.l4 && d.layers.l4.status === "active" ? "signed" : "configured", warn: false }
   ];
 }
@@ -3491,21 +3601,28 @@ async function onAutoTriggerThresholdSave(ruleId) {
   }
 }
 
-async function fetchAutoTriggerState() {
-  const rules = await autoTriggerApi("/rules");
+async function fetchAutoTriggerState(deadlineAt) {
+  if (deadlineAt === undefined) deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
+  const [rules, recommendations] = await Promise.all([
+    autoTriggerApi("/rules", undefined, deadlineAt),
+    autoTriggerApi("/recommendations", undefined, deadlineAt)
+  ]);
   const list = (rules.data && rules.data.rules) || [];
+  state.autoTrigger.rules = list;
+  state.autoTrigger.recommendations = (recommendations.data && recommendations.data.recommendations) || [];
   const hydrated = [];
   for (let i = 0; i < list.length; i++) {
+    // Stop detail admission when the shared panel budget is spent; never fan
+    // out an unbounded set of requests from a server-provided rule list.
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) break;
     try {
-      const detail = await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id));
+      const detail = await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id), undefined, deadlineAt);
       hydrated.push((detail.data && detail.data.rule) || list[i]);
     } catch (e) {
       hydrated.push(list[i]);
     }
   }
-  state.autoTrigger.rules = hydrated;
-  const at = await autoTriggerApi("/recommendations");
-  state.autoTrigger.recommendations = (at.data && at.data.recommendations) || [];
+  state.autoTrigger.rules = hydrated.concat(list.slice(hydrated.length));
   state.autoTrigger.loadError = null;
 }
 
@@ -3929,6 +4046,7 @@ document.addEventListener("click", function (ev) {
   }
   if (!tgt) return;
   const action = tgt.getAttribute("data-action");
+  if (action === "retry-panel") return void retryPanel(tgt.getAttribute("data-read"));
   if (!action) return;
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
@@ -4280,9 +4398,8 @@ if (mq) mq.addEventListener("change", function (e) {
 });
 
 // Boot.
-loadInboxPrefs().then(function () {
-  return fetchAll();
-}).then(function () { rerender(); });
+void loadPanel(panelJobs[0]);
+void fetchAll();
 bindHashRoute();
 connectStream();
 `;
