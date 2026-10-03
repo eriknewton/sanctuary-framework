@@ -13,7 +13,7 @@ describe("v1.1 dashboard auto-trigger ladder view", () => {
     expect(src).toContain("autoTrigger: { rules: [], recommendations: []");
     expect(src).toContain('autoTriggerApi("/rules", undefined, deadlineAt)');
     expect(src).toContain('await autoTriggerApi("/rules/" + encodeURIComponent(list[i].rule_id), undefined, deadlineAt)');
-    expect(src).toContain('autoTriggerApi("/recommendations", undefined, deadlineAt)');
+    expect(src).toContain('autoTriggerApi("/recommendations")');
   });
 
   it("renders threshold controls and saves through the existing API route", () => {
@@ -32,6 +32,6 @@ describe("v1.1 dashboard auto-trigger ladder view", () => {
     const src = getClientScript();
     expect(src).toContain('indexOf("auto_trigger")');
     expect(src).toContain('indexOf("auto_action")');
-    expect(src).toContain("fetchAutoTriggerState().then(rerender)");
+    expect(src).toContain("refreshAutoTriggerPanels()");
   });
 });

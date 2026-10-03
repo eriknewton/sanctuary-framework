@@ -21,8 +21,9 @@ function liftDashboardRenderers(): {
     var document = { getElementById: () => null };
     var window = { matchMedia: () => null };
     var sessionStorage = { getItem: () => null, setItem: () => null };
-    var location = { hash: "", host: "test" };
+    var location = { hash: "", host: "test", origin: "http://test" };
     ${chunk}
+    sourceReads.forEach(function (read) { read.state = "state_LOADED"; });
     return {
       renderHealth: function (s) { state = s; return renderHealthPage(); },
       renderPolicy: function (s) { state = s; return renderPolicyCenter(); }

@@ -243,6 +243,7 @@ function liftSealHarness(): SealHarness {
   if (!maxLine) throw new Error("SEAL_FRESHNESS_MAX_MS not found");
   const pieces = [
     'const state = { tier1: { lockdown: { state: "idle" } }, posture: { data: null } };',
+    "function sourceLoaded() { return true; }", // These fixtures represent completed sovereignty reads.
     maxLine,
     "let sealFreshnessTimer = null;",
     "let __rerenderCount = 0;",

@@ -71,12 +71,12 @@ describe("v1.2 dashboard concierge surface (WP-V1.2-4)", () => {
     expect(script).toContain('async function onConciergeSend()');
     expect(script).toContain('await api("/chat/concierge", {');
     expect(script).toContain('method: "POST"');
-    expect(script).toContain('await fetchConciergeHistory();');
+    expect(script).toContain('await refreshPanel(HUB + "/chat/concierge/history");');
   });
 
   it("concierge boot path hydrates history on every fetchAll cycle", () => {
     const script = getClientScript();
-    expect(script).toContain('await fetchConciergeHistory();');
+    expect(script).toContain('await refreshPanel(HUB + "/chat/concierge/history");');
     // Direct-agent surface removed in the v1.2 reshape; the inspect
     // panel is fetched lazily on click rather than maintained in state.
     expect(script).not.toContain('await fetchActiveSessions();');

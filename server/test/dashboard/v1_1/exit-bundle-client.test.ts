@@ -34,7 +34,7 @@ function liftExitDrillRenderer(): { render: (state: unknown) => string } {
     var document = { getElementById: function() { return null; } };
     var window = { matchMedia: function() { return null; } };
     var sessionStorage = { getItem: function() { return null; }, setItem: function() {} };
-    var location = { hash: "", host: "test" };
+    var location = { hash: "", host: "test", origin: "http://test" };
     ${chunk}
     return function(s) { state = s; return renderExitDrill(); };
   `;
