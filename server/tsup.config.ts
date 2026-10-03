@@ -18,6 +18,7 @@ export default defineConfig({
     cli: "src/cli.ts",
     "linux-policy-sign": "src/cli/linux-policy-sign.ts",
     "verify-transparency": "src/transparency/offline-cli.ts",
+    "response-worker": "src/proxy/response-worker.ts",
     "directory-capability-worker": "src/storage/directory-capability-worker.ts",
   },
   format: ["esm", "cjs"],

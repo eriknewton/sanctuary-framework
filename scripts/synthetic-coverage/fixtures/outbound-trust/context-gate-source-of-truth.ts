@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { unitResponseScreen } from "../../../../server/test/helpers/response-screen.js"; import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateRandomKey } from "../../../../server/src/core/random.js";
@@ -167,7 +167,7 @@ registerFixture(
     const router = new ProxyRouter(
       clientManager as never,
       createInjectionDetector() as never,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: async (toolName, args) => {
           delegated = true;

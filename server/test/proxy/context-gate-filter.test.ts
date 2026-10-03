@@ -1,3 +1,4 @@
+import { unitResponseScreen } from "../helpers/response-screen.js";
 import { describe, it, expect, vi } from "vitest";
 import { ProxyRouter } from "../../src/proxy/proxy-router.js";
 import { createContextGateTools, initializeContextGateEnforcerFromProfile } from "../../src/operational/context-gate-tools.js";
@@ -73,7 +74,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: (toolName, args) =>
           profile.features.context_gating.enabled
@@ -107,7 +108,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         // A gate filter that always throws (simulates policy-store read
         // failure / malformed policy / runtime exception).
@@ -184,7 +185,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: (toolName, args) =>
           enforcer.filterArgs(toolName, args, { respectBypass: false }),
@@ -262,7 +263,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: (toolName, args) =>
           enforcer.filterArgs(toolName, args, { respectBypass: false }),
@@ -314,7 +315,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: (toolName, args) =>
           enforcer.filterArgs(toolName, args, { respectBypass: false }),
@@ -349,7 +350,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         privacyEnforcement: {
           engine: { filterOutbound, rehydrateResponse: vi.fn() } as any,
@@ -391,7 +392,7 @@ describe("proxy context gate filter", () => {
     const router = new ProxyRouter(
       clientManager as any,
       createInjectionDetector() as any,
-      auditLog,
+      auditLog, unitResponseScreen(),
       {
         contextGateFilter: (toolName, args) =>
           profile.features.context_gating.enabled
