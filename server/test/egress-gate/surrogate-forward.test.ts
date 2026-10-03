@@ -101,8 +101,8 @@ describe("forward refusals", () => {
     const query = vi.fn(); const gate = await direct({ forwardMode: { destinations: [], helperClient: { query } } });
     expect(await raw(gate.port, request(gate.header, "", target))).toContain("400 Bad Request"); expect(query).not.toHaveBeenCalled(); expect(gate.resolver.resolve).not.toHaveBeenCalled();
   });
-  // Linux CI (authoritative) runs the full 10000; on macOS, rapid sequential localhost connects reuse client
-  // ports the gate still holds in TIME_WAIT and the SYN is dropped (connect ETIMEDOUT), so 2000 keeps the claim.
+  // Linux CI (authoritative) runs the full 10000. On macOS each refusal leaves a TIME_WAIT entry on the gate's
+  // listen port for 30 s (net.inet.tcp.msl 15 s), and new handshakes time out near 4,900 entries; 2000 stays under it.
   const REFUSAL_STRESS_COUNT = process.platform === "linux" ? 10_000 : 2_000;
   it("refuses 10000 over-cap requests without one queued query", async () => {
     const query = vi.fn(); const gate = await direct({ forwardMode: { destinations: [], helperClient: { query } } });
