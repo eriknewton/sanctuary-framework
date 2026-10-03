@@ -187,9 +187,13 @@ import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js"
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
 import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
+import { ResponseScreen } from "./proxy/response-screen.js";
+
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 export interface SanctuaryServer {
+  /** Host-only exposure; absence/eviction remains tainted with unknown observation. */
+  readonly responseExposure: import("./proxy/response-runtime.js").ResponseSession["exposure"];
   server: Server;
   config: SanctuaryConfig;
   /**
@@ -415,6 +419,7 @@ export async function createSanctuaryServer(options?: {
     // how the dashboard side left the factor unwiped.
     if (bootKeychainKey) bootKeychainKey.fill(0);
   }
+  const responseScreen = new ResponseScreen(); // Host lifetime begins tainted, independent of proxy configuration.
   try {
   const masterKey = custody.masterKey;
   const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
@@ -1088,6 +1093,8 @@ export async function createSanctuaryServer(options?: {
   // the persisted source of truth for the runtime context gate enforcer.
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   const loadedProfile = await profileStore.load();
+  // Refuse unavailable screening before starting channels, schedulers or upstream connections.
+  if (loadedProfile.upstream_servers?.some(s => s.enabled)) await responseScreen.initialize();
 
   // 14d (moved below profile load). Create Sovereignty Audit tools (read-only
   // diagnostic). Honesty (audit seam #5): the audit reads the LIVE profile so
@@ -2233,6 +2240,7 @@ export async function createSanctuaryServer(options?: {
         clientManager,
         injectionDetector,
         auditLog,
+        responseScreen,
         {
           contextGateFilter: async (_toolName, args) => {
             const activeProfile = profileStore.get();
@@ -2335,6 +2343,7 @@ export async function createSanctuaryServer(options?: {
     // the second call finds cleanupPromise already set and returns it (no reentry).
     cleanupPromise = Promise.resolve().then(async () => {
       const errors: unknown[] = [];
+      responseScreen.stop(); // Fence admission synchronously before any asynchronous teardown.
       // Stop MCP admission first so no new tool calls are accepted.
       // server.close() is async (SDK Protocol.close); awaiting it ensures the
       // transport is fully torn down before we flush persistence below.
@@ -2358,6 +2367,8 @@ export async function createSanctuaryServer(options?: {
       if (clientManager) {
         try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
       }
+      try { await responseScreen.close(); } catch (e) { errors.push(e); }
+      governor.clearResponseCache();
       // Flush persistence last; audit flush must follow inbox and baseline.
       try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
       try { await baseline.save(); } catch (e) { errors.push(e); }
@@ -2402,6 +2413,7 @@ export async function createSanctuaryServer(options?: {
   }
 
   return {
+    get responseExposure() { return responseScreen.session.exposure; },
     server,
     config,
     identityManager,
@@ -2411,6 +2423,8 @@ export async function createSanctuaryServer(options?: {
     cleanup,
   };
   } catch (error) {
+    // Scanner cleanup cannot skip the custody scrub if cleanup itself fails.
+    try { await responseScreen.close(); } catch { /* Preserve the startup failure below. */ }
     // Startup never transferred the master session to a live server. Release
     // its shared rotation barrier only after every attempted startup write has
     // settled, then scrub the unowned master before surfacing the root cause.

@@ -1,3 +1,4 @@
+import { unitResponseScreen } from "../helpers/response-screen.js";
 /**
  * Proxy Router Tests
  *
@@ -111,7 +112,7 @@ describe("ProxyRouter", () => {
       mockClientManager as any,
       mockInjectionDetector as any,
       mockAuditLog as any
-    );
+    , unitResponseScreen());
   });
 
   // ── getProxiedTools ───────────────────────────────────────────────
@@ -204,7 +205,7 @@ describe("ProxyRouter", () => {
         mockClientManager as any,
         mockInjectionDetector as any,
         mockAuditLog as any
-      );
+      , unitResponseScreen());
 
       const tools = router.getProxiedTools();
       const handler = tools[0]!.handler;
@@ -237,7 +238,7 @@ describe("ProxyRouter", () => {
         mockClientManager as any,
         mockInjectionDetector as any,
         mockAuditLog as any
-      );
+      , unitResponseScreen());
 
       const tools = router.getProxiedTools();
       const result = await tools[0]!.handler({});
@@ -261,7 +262,7 @@ describe("ProxyRouter", () => {
         mockClientManager as any,
         mockInjectionDetector as any,
         mockAuditLog as any
-      );
+      , unitResponseScreen());
 
       const tools = router.getProxiedTools();
       const handler = tools[0]!.handler;
@@ -286,7 +287,7 @@ describe("ProxyRouter", () => {
       router = new ProxyRouter(
         mockClientManager as any,
         mockInjectionDetector as any,
-        mockAuditLog as any,
+        mockAuditLog as any, unitResponseScreen(),
         { contextGateFilter }
       );
 
@@ -314,7 +315,7 @@ describe("ProxyRouter", () => {
       router = new ProxyRouter(
         mockClientManager as any,
         mockInjectionDetector as any,
-        mockAuditLog as any,
+        mockAuditLog as any, unitResponseScreen(),
         { contextGateFilter }
       );
 
@@ -356,7 +357,7 @@ describe("ProxyRouter", () => {
       router = new ProxyRouter(
         mockClientManager as any,
         mockInjectionDetector as any,
-        mockAuditLog as any,
+        mockAuditLog as any, unitResponseScreen(),
         { governor: mockGovernor as any }
       );
 
@@ -383,13 +384,13 @@ describe("ProxyRouter", () => {
       mockGovernor.check.mockReturnValue({
         allowed: true,
         reason: "duplicate_cached",
-        cached_result: { data: "from-cache" },
+        cached_result: { content: [{ type: "text", text: "from-cache" }] },
       });
 
       router = new ProxyRouter(
         mockClientManager as any,
         mockInjectionDetector as any,
-        mockAuditLog as any,
+        mockAuditLog as any, unitResponseScreen(),
         { governor: mockGovernor as any }
       );
 
@@ -443,7 +444,7 @@ describe("ProxyRouter", () => {
       router = new ProxyRouter(
         mockClientManager as any,
         mockInjectionDetector as any,
-        mockAuditLog as any,
+        mockAuditLog as any, unitResponseScreen(),
         { governor: mockGovernor as any }
       );
 
@@ -506,7 +507,7 @@ describe("ProxyRouter", () => {
 
       const result = await resultPromise;
       const parsed = JSON.parse(result.content[0]!.text);
-      expect(parsed.error).toContain("timed out");
+      expect(parsed.error).toBe("Operation not permitted");
       expect(parsed.proxy).toBe(true);
 
       vi.useRealTimers();

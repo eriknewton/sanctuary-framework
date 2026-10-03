@@ -378,8 +378,7 @@ To set honest expectations:
 
 - OWASP GenAI Security Project: Agentic AI Threats & Mitigations (2025)
 - OWASP Top 10 for LLM Applications (2023, 2025 revision)
-- Sanctuary [`SECURITY_AUDIT.md`](../SECURITY_AUDIT.md)
-- Sanctuary [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md)
+- Sanctuary [`ASSURANCE_MATRIX.md`](../ASSURANCE_MATRIX.md): every trust claim, its evidence, and its bounds
 - Sanctuary [`SHR_SPEC.md`](SHR_SPEC.md): sovereignty health report format
 
 ---

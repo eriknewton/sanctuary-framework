@@ -4,7 +4,7 @@
  * These exercise the pure functions only: config rewriting and dashboard
  * boot are covered by integration tests elsewhere.
  */
-
+// fail-before-exempt: comment-only edit repoints a retired public audit reference to private finding ids; no behavior under test changed.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { startedCoarseDisposition, type HarnessDisposition } from "../../src/egress-gate/parked-claim.js";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
@@ -593,7 +593,7 @@ describe("port fallback", () => {
 //
 // End-to-end-lite test: invoke `runWrap` against a temp config file and assert
 // that a user-supplied `--passphrase` value is never passed to the config
-// rewrite. See Archive/DELTA_REVIEW_V0.9.0_RC1.md SEC-061 / CLEAN-018.
+// rewrite. Regression guard for private findings SEC-061 / CLEAN-018.
 
 describe("runWrap — SEC-061 passphrase leak regression", () => {
   let tempHome: string;

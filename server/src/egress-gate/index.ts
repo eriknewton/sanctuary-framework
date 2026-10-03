@@ -167,6 +167,7 @@ export {
   startExclusiveEgressGate,
   type GateLivenessProbe,
   type EgressGateEvent,
+  type SurrogateEchoEvent,
   type ExclusiveEgressGateOptions,
   type ExclusiveEgressGateHandle,
 } from "./gate-server.js";

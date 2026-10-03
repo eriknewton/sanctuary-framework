@@ -1,8 +1,8 @@
+import { unitResponseScreen } from "../helpers/response-screen.js";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-
 import { createServer, type ToolDefinition } from "../../src/router.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
@@ -206,8 +206,8 @@ describe("proxy upstream transport conformance", () => {
     });
     const malformedPayload = textJson(malformed);
     expect(malformedPayload.proxy).toBe(true);
-    expect(malformedPayload.code).toBe("upstream_error");
-    expect(String(malformedPayload.error)).toContain("Invalid");
+    expect(malformedPayload.code).toBeUndefined();
+    expect(malformedPayload.error).toBe("Operation not permitted");
 
     const exploded = await harness.client.callTool({
       name: "proxy/real_stdio/explode",
@@ -226,8 +226,8 @@ describe("proxy upstream transport conformance", () => {
           operation: "proxy_call:proxy/real_stdio/malformed",
           result: "failure",
           details: expect.objectContaining({
-            decision: "error",
-            error_type: "upstream_error",
+            decision: "blocked",
+            reason: "withhold_upstream_failure",
           }),
         }),
         expect.objectContaining({
@@ -348,7 +348,7 @@ async function makeHarness(): Promise<ConformanceHarness> {
   const proxyRouter = new ProxyRouter(
     clientManager,
     injectionDetector,
-    auditLog,
+    auditLog, unitResponseScreen(),
     {
       contextGateFilter: (toolName, args) =>
         enforcer.filterArgs(toolName, args, { respectBypass: false }),

@@ -37,15 +37,6 @@
 9	announcements/linkedin-post.md
 8	announcements/x-twitter-thread.md
 7	docs/assets/css/site.css
-46	docs/audit/BUG_REPORT.md
-14	docs/audit/DELTA_REVIEW_REPORT.md
-4	docs/audit/KNOWN_ISSUES.md
-23	docs/audit/MERGE_GATE_REPORT.md
-70	docs/audit/REMEDIATION_PLAN.md
-80	docs/audit/SECURITY_AUDIT.md
-8	docs/audit/SPRINT_CONTRACT.md
-226	docs/audit/SPRINT_EVAL.md
-3	docs/audit/SPRINT_RESULT.md
 26	docs/audit/branch-protection-setup.md
 10	docs/audit/commit-4ac95830-postmortem.md
 16	docs/audit/test-baseline-hardening-plan.md
