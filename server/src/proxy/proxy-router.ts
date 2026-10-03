@@ -432,7 +432,6 @@ export class ProxyRouter {
             }
           }
           const delivered = normalizeScreenedResponse(prepared);
-          prepared = canonical; // Drop the expanded object before joined/worker copies; normalized strings are shared.
           // Joining without a separator detects instructions split across delivered block boundaries.
           const completion = await reservation.wait(this.responseScreen.screen(delivered.content.map(c => c.text).join(""), reservation));
           withholdReason = "withhold_audit_failure";

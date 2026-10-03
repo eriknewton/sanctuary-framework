@@ -86,14 +86,23 @@ export class ResponseScreen {
         resolve({ label: m.signalCount > 0 ? "label_suspected" : "label_untrusted", signalCount: m.signalCount });
       });
     });
-    try { return await result; }
-    finally {
-      state = "state_TERMINAL";
-      clearTimeout(timer!);
-      lease.abort.signal.removeEventListener("abort", onCancel);
-      // No reservation can be recycled while the synchronous scanner is still alive.
-      try { await lease.track(worker.terminate()); }
-      catch { lease.fence(); this.stop(); throw new Error("Response worker termination unproven"); }
+    const outcome = await result.then(completion => ({ completion }), (error: Error) => ({ error }));
+    state = "state_TERMINAL";
+    clearTimeout(timer!);
+    lease.abort.signal.removeEventListener("abort", onCancel);
+    // No reservation can be recycled while the synchronous scanner is still alive.
+    try { await lease.track(worker.terminate()); }
+    catch (cause) {
+      lease.fence(); this.stop();
+      const cleanupError = new Error("Response worker termination unproven", { cause });
+      if ("error" in outcome) {
+        // Preserve the scan's failure identity while surfacing cleanup failure; neither permits release.
+        outcome.error.cause = cleanupError;
+        throw outcome.error;
+      }
+      throw cleanupError;
     }
+    if ("error" in outcome) throw outcome.error;
+    return outcome.completion;
   }
 }

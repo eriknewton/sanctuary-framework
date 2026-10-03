@@ -71,6 +71,21 @@ describe("response runtime bounds", () => {
     work.at(-1)!.resolve(); await lease.drained;
     expect(controller.snapshot().active).toBe(0);
   });
+  it("propagates live rejection and observes late rejection after cancellation", async () => {
+    const controller = new ResponseController(); const session = new ResponseSession(controller);
+    const failure = new Error("upstream failure");
+    const live = session.reserve();
+    await expect(live.wait(Promise.reject(failure))).rejects.toBe(failure);
+    live.finish(); await live.drained;
+    const cancelled = session.reserve();
+    let reject!: (error: Error) => void;
+    const work = new Promise<never>((_, fail) => { reject = fail; });
+    const waiting = expect(cancelled.wait(work)).rejects.toThrow("Response cancelled");
+    cancelled.cancel(); await waiting; cancelled.finish();
+    expect(controller.snapshot().active).toBe(1);
+    reject(failure); await cancelled.drained; await session.close();
+    expect(controller.snapshot().active).toBe(0);
+  });
   it("evicts only inactive idle records and never mints fresh known slots for evicted handles", () => {
     let now = 0;
     const controller = new ResponseController(() => now);

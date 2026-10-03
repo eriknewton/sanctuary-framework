@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ResponseScreen } from "../../src/proxy/response-screen.js";
 import { ResponseController, ResponseSession } from "../../src/proxy/response-runtime.js";
 import { RESPONSE_LIMITS as L } from "../../src/proxy/response-limits.js";
+import { ProxyRouter } from "../../src/proxy/proxy-router.js";
+import { InjectionDetector } from "../../src/security/injection-detector.js";
 
 type Envelope = Record<string, unknown>;
 function harness() {
@@ -114,9 +116,44 @@ describe("response worker completion gate", () => {
     expect(h.controller.snapshot().active).toBe(1);
     end(0); await lease.drained; await h.screen.close();
   });
+  it.each(["throw", "reject"])("preserves scan failure and proxy audit when cleanup reports %s", async mode => {
+    const h = harness(); await h.screen.initialize();
+    const cleanupError = new Error("termination fault");
+    h.termination(() => {
+      if (mode === "throw") throw cleanupError;
+      return Promise.reject(cleanupError);
+    });
+    h.transform(m => ({ ...m, state: "state_FAILED" }));
+    const scan = vi.spyOn(h.screen, "screen");
+    const audit = { append: vi.fn(async () => {}), appendCritical: vi.fn(async () => {}) };
+    const manager = {
+      getAllTools: () => new Map([["fixture", [{ name: "read", description: "fixture", inputSchema: { type: "object" } }]]]),
+      getServerConfig: () => ({ default_tier: 3 }),
+      callTool: async () => ({ content: [{ type: "text", text: "private-response-marker" }] }),
+    };
+    const router = new ProxyRouter(manager as never, new InjectionDetector(), audit as never, h.screen);
+    try {
+      const delivered = await router.getProxiedTools()[0]!.handler({});
+      expect(JSON.stringify(delivered)).toContain("Operation not permitted");
+      expect(audit.appendCritical).toHaveBeenCalledWith(expect.objectContaining({
+        result: "failure", details: expect.objectContaining({ decision: "blocked", reason: "withhold_cancelled" }),
+      }));
+      expect(JSON.stringify([delivered, audit.appendCritical.mock.calls])).not.toContain("private-response-marker");
+      expect(scan).toHaveBeenCalledOnce();
+      await expect(scan.mock.results[0]!.value).rejects.toMatchObject({
+        name: "Error", message: "Response screening failed",
+        cause: { message: "Response worker termination unproven", cause: cleanupError },
+      });
+      expect(() => h.screen.assertReady()).toThrow();
+      expect(() => h.session.reserve()).toThrow();
+      expect(h.session.exposure).toEqual({ state: "state_TAINTED", tainted: true, observed: true });
+    } finally { await h.screen.close(); }
+    expect(h.controller.snapshot().active).toBe(1);
+  });
   it("fences admission if termination cannot be proven", async () => {
     const h = harness(); await h.screen.initialize(); h.termination(async () => { throw new Error("termination fault"); });
-    const lease = h.session.reserve(); await expect(h.screen.screen("hello", lease)).rejects.toThrow(); lease.finish();
+    const lease = h.session.reserve();
+    await expect(h.screen.screen("hello", lease)).rejects.toThrow("Response worker termination unproven"); lease.finish();
     expect(h.controller.snapshot().active).toBe(1); expect(() => h.session.reserve()).toThrow();
     let closed = false;
     void h.screen.close().then(() => { closed = true; });

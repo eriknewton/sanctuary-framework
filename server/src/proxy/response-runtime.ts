@@ -27,7 +27,8 @@ export class ResponseReservation {
     return work;
   }
   async wait<T>(work: Promise<T>): Promise<T> {
-    this.track(work);
+    // track observes late rejection after cancellation; the race below propagates rejection while live.
+    void this.track(work);
     this.assertLive();
     let cancel!: () => void;
     const cancelled = new Promise<never>((_, reject) => {
