@@ -663,7 +663,9 @@ mod tests {
         // Same-process exclusion must still hold: a one-shot open against a
         // live handle refuses with WouldBlock, so the helper below can only
         // succeed because the holder actually released.
-        let refused = Ledger::open(&path).err().expect("a second live handle must refuse");
+        let refused = Ledger::open(&path)
+            .err()
+            .expect("a second live handle must refuse");
         assert_eq!(refused.kind(), ErrorKind::WouldBlock);
         let releaser = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
