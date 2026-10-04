@@ -424,7 +424,7 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(seal.freshness.inline).toBe("last evidenced 2m ago");
   });
 
-  it("rerenders the seal stale after the freshness window elapses without a new event", () => {
+  it("renders the seal stale after the freshness window elapses without a current read", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
     const harness = liftSealHarness();
@@ -437,8 +437,9 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(harness.elements["posture-seal-freshness"].classList.has("fresh")).toBe(true);
 
     vi.advanceTimersByTime(61_001);
+    harness.renderPostureSeal();
 
-    expect(harness.rerenderCount()).toBe(1);
+    expect(harness.rerenderCount()).toBe(0);
     expect(harness.elements["posture-seal"].classList.has("tone-protected")).toBe(false);
     expect(harness.elements["posture-seal"].classList.has("tone-attention")).toBe(true);
     expect(harness.elements["posture-seal-word"].textContent).toBe("Attention");
