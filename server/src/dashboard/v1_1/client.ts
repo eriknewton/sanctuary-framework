@@ -101,6 +101,7 @@ let sealFreshnessTimer = null;
 let homeFreshnessTimer = null;
 // One five-second interaction budget bounds a read, including its JSON body.
 // Preferences are optional and get the same budget; neither gates startup.
+// Must match DASHBOARD_CLIENT_READ_DEADLINE_MS in server/src/dashboard/read-response.ts.
 const DASHBOARD_READ_DEADLINE_MS = 5 * 1000;
 const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
 const pendingReads = new Map();

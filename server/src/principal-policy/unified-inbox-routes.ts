@@ -18,6 +18,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { respondWithBoundedDashboardRead } from "../dashboard/read-response.js";
 import {
   authMiddleware,
   type AuthConfig,
@@ -191,11 +192,19 @@ export async function handleUnifiedInboxRoute(
         return true;
       }
       if (method === "GET") {
-        writeJSON(res, 200, {
-          ok: true,
-          data: { filters: await deps.prefsStore.load() },
+        return respondWithBoundedDashboardRead({
+          route: "unified_inbox_prefs",
+          req,
+          res,
+          operation: "get_unified_inbox_prefs",
+          produce: async () => ({
+            status: 200,
+            body: {
+              ok: true,
+              data: { filters: await deps.prefsStore!.load() },
+            },
+          }),
         });
-        return true;
       }
       if (method === "PUT") {
         const body = await readJsonBody(req);

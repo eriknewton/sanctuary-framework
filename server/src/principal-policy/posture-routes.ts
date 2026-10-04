@@ -48,6 +48,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { respondWithBoundedDashboardRead } from "../dashboard/read-response.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
@@ -670,9 +671,16 @@ export async function handlePostureRoute(
     }
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/home`) {
-      const home = await buildHome(deps);
-      writeJSON(res, 200, home);
-      return true;
+      return respondWithBoundedDashboardRead({
+        route: "posture_home",
+        req: _req,
+        res,
+        operation: "get_posture_home",
+        produce: async () => ({
+          status: 200,
+          body: await buildHome(deps),
+        }),
+      });
     }
 
     // Within the posture namespace but no match - 404 here (do not fall
@@ -1113,7 +1121,7 @@ function buildReach(
 // site (`import type { PostureHome } from "./posture-routes.js"`).
 export type { PostureHome };
 
-async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
+export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // S5-P (codex BLOCKER fix): resolve the exclusive-egress provider EXACTLY
   // ONCE for the whole home payload, then thread the SAME snapshot into both
   // the wall posture and the feature-health panel. Resolving per-builder would
