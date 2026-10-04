@@ -54,7 +54,8 @@ On Linux: kernel-level egress enforcement, shipped in May, with the bypass paths
 > word "shipped" was wrong. Linux Phase 1 was not live enforcement then and was
 > not a production enforcement baseline. The macOS evidence in the next paragraph
 > is unaffected. Later evidence, 2026-10-04: a separate Ubuntu 24.04 x86-64
-> package proved only the narrowed fresh-install per-account signed-policy claim.
+> package proved only the narrowed fresh-install per-account signed-policy claim;
+> DNS, DoH and DoT paths were not drilled.
 > Open defect: **IC-02, IC-03, IC-04**.
 >
 > Audit correction, 2026-08-07: earlier versions described the log as "signed

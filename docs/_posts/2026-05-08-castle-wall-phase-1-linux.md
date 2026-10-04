@@ -61,11 +61,11 @@ This is what kept the Castle Wall from drifting back into the cooperative-only p
 
 ## What the Linux source path implements
 
-Castle Wall Phase 1 on Linux landed source modules in PRs #124 and #125, with the chain-wiring fix in PR #131 and the full TCP-bypass coverage closed in PR #132. 203 Rust integration and unit tests pass against a real kernel binding, including the DoH and DoT bypass coverage that distinguishes a real wall from a hopeful one. Current correction, 2026-08-07: this block describes the pre-October source path, not shipped Linux enforcement. Open defect: **IC-02, IC-03, IC-04**.
+Castle Wall Phase 1 on Linux landed source modules in PRs #124 and #125, with the chain-wiring fix in PR #131 and the full TCP-bypass coverage closed in PR #132. 203 Rust integration and unit tests pass against a real kernel binding, including the DoH and DoT bypass coverage that distinguishes a real wall from a hopeful one. Current correction, 2026-10-04: this block describes the pre-October source path, not shipped Linux enforcement. Open defect: **IC-02, IC-03, IC-04**.
 
-**Kernel binding.** The source modules implement Linux kernel-level enforcement using nftables for packet routing decisions, cgroup v2 for per-process scope, and NFQUEUE for in-line decisions on packets the kernel hands up to user space. Current correction, 2026-08-07: this block describes the pre-October source path, not shipped Linux enforcement. Open defect: **IC-02, IC-04**.
+**Kernel binding.** The source modules implement Linux kernel-level enforcement using nftables for packet routing decisions, cgroup v2 for per-process scope, and NFQUEUE for in-line decisions on packets the kernel hands up to user space. Current correction, 2026-10-04: this block describes the pre-October source path, not shipped Linux enforcement. Open defect: **IC-02, IC-04**.
 
-**Bypass coverage.** A prompt-injected agent does not just send HTTP. It tries DNS exfiltration. It tries DNS-over-HTTPS to a vendor-controlled resolver. It tries DNS-over-TLS to the same. It tries raw sockets. It tries every transport a normal Linux process can reach. The Phase 1 tests cover plain-DNS, DoH, and DoT attempts with real cgroups and real packet flow. Current correction, 2026-08-07: this block describes the pre-October source path, not shipped Linux enforcement. Later evidence, 2026-10-04: DNS, DoH, DoT, and hostname paths were not drilled. Open defect: **IC-02, IC-04**.
+**Bypass coverage.** A prompt-injected agent does not just send HTTP. It tries DNS exfiltration. It tries DNS-over-HTTPS to a vendor-controlled resolver. It tries DNS-over-TLS to the same. It tries raw sockets. It tries every transport a normal Linux process can reach. The Phase 1 tests cover plain-DNS, DoH, and DoT attempts with real cgroups and real packet flow. Current correction, 2026-10-04: this block describes the pre-October source path, not shipped Linux enforcement. Later evidence, 2026-10-04: DNS, DoH, DoT, and hostname paths were not drilled. Open defect: **IC-02, IC-04**.
 
 **Daemon architecture.** The kernel-touching code lives in a privileged daemon written in Rust. The unprivileged Sanctuary process talks to the daemon over a JSON-RPC inter-process channel authenticated with an Ed25519 handshake on every session, so a compromised user-space process cannot speak for an unrelated wrapped agent. The daemon never trusts user-space input on its own merit; every policy update is signed, and the manifest store implements trust-on-first-use against the operator's own key.
 
@@ -85,7 +85,7 @@ Composition holds across the partner surface, too. Sanctuary signs Coinbase x402
 
 ## What's next
 
-Linux Phase 1 now has a narrowed install-grade proof on Ubuntu 24.04 (x86-64); other Linux distributions, architectures, fault-injection witnesses, and a real-agent harness remain unproven. macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
+A later package, not the Phase 1 source this post describes, has a narrowed install-grade proof on Ubuntu 24.04 (x86-64) (2026-10-04, see the Assurance Matrix). DNS, DoH, DoT and hostname paths, other Linux distributions, architectures, fault-injection witnesses, and a real-agent harness remain unproven. macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
 
 Windows Phase 2 sits behind macOS, using Windows Filtering Platform. Container and microVM isolation, Phase 3, is queued for the highest-assurance enterprise deployments where additional isolation between the wrapped agent and the operator's host filesystem matters.
 

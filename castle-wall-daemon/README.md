@@ -22,8 +22,8 @@ The 2026-10-04 drill proves only the narrowed Ubuntu 24.04 (x86-64) claim in
 operator policy per user account, blocked destinations stay blocked and allowed
 ones connect, through five reboots, on three fresh servers, with evidence
 checked by two independent reviewers. Source and automated tests still do not
-establish the open fault-injection, DNS, hostname, other-platform, upgrade,
-removal, or real wrapped-agent claims.
+establish the open fault-injection, queue-pressure fail-closed, DNS, hostname,
+other-platform, upgrade, removal, or real wrapped-agent claims.
 
 ## Status
 

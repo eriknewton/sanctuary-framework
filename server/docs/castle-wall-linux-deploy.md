@@ -728,8 +728,9 @@ host is a separate authorized action, not an installer command.
 Castle Wall Linux L2 is proven only for the narrowed Ubuntu 24.04 (x86-64)
 fresh-install per-account signed-policy claim in `ASSURANCE_MATRIX.md`. It is
 not yet a tagged public-release claim, and it does not cover fault-injection
-witnesses, DNS, DoH, DoT, hostname paths, upgrade or removal, sustained
-operation, overhead, other platforms, or a real wrapped-agent harness.
+witnesses, queue-pressure fail-closed behavior, audit drain durability, DNS,
+DoH, DoT, hostname paths, upgrade or removal, sustained operation, overhead,
+other platforms, or a real wrapped-agent harness.
 
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a
 substitute for the Linux enforcement path. Any broader Linux kernel-routing
