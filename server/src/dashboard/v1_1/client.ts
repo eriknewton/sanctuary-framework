@@ -107,8 +107,11 @@ const DASHBOARD_MILLISECONDS_PER_SECOND = 1000;
 const DASHBOARD_READ_DEADLINE_SECONDS = 5;
 const DASHBOARD_READ_DEADLINE_MS = DASHBOARD_READ_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;
 const SEAL_REREAD_MIN_INTERVAL_DIVISOR = 20;
-// Derived as 10m / 20 = 30s, plus the 5s read deadline: an edge-of-window
-// payload can redraw stale immediately without creating a sub-second read loop.
+// 20 = at most one automatic seal re-read per source per 30 s of the 10-minute
+// SEAL_FRESHNESS_MAX_MS window (10m / 20 = 30 s); the 5 s read deadline is added so a
+// re-read is never issued while the previous one may still be in flight. Bound: one read
+// per 35 s per source even when evidence arrives at its window edge. Trade-off: a payload
+// with under 35 s of window left shows Attention until the floored re-read lands.
 const DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS = (SEAL_FRESHNESS_MAX_MS / SEAL_REREAD_MIN_INTERVAL_DIVISOR) + DASHBOARD_READ_DEADLINE_MS;
 const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = 1; // One millisecond moves past the inclusive freshness boundary.
 const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
@@ -3706,6 +3709,9 @@ function clearSealFreshnessTimer(path) {
 
 function scheduleSealFreshnessRefresh(path, freshness) {
   clearSealFreshnessTimer(path);
+  // Stopped means stopped: a user-action refetch while live updates are stopped must not
+  // re-arm automatic seal re-reads; Retry clears the flag before it rereads and re-arms.
+  if (liveUpdatesStopped) return;
   if (
     !freshness ||
     !freshness.current ||

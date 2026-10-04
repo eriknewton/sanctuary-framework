@@ -375,7 +375,9 @@ describe("dashboard bounded independent hydration", () => {
     expect(homeReads).toBe(1);
 
     runInContext("stopLiveUpdates()", h.context);
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync((runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number) + 5000);
+    runInContext("scheduleSealFreshnessRefresh('/api/sovereignty', { current: true, refreshAt: Date.now() + 1 })", h.context);
+    await vi.advanceTimersByTimeAsync((runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number) + 5000);
     await settle();
 
     expect(sovereigntyReads).toBe(1);
