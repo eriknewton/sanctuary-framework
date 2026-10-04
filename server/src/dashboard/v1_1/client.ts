@@ -3420,6 +3420,14 @@ function jobsForPaths(paths) {
 function queueStreamRefresh(paths) {
   return fetchAll(true, jobsForPaths(paths));
 }
+function refreshExpiredEvidenceSource(path) {
+  const read = sourceRead(path);
+  if (liveUpdatesStopped || !read || read.state !== "state_LOADED") {
+    rerender();
+    return;
+  }
+  void queueStreamRefresh([path]);
+}
 function retryPanel(path) {
   if (liveUpdatesStopped) {
     // A manual restart must reread every source before old snapshots may look current again.
@@ -3482,9 +3490,11 @@ async function fetchSovereignty() {
       return;
     }
     state.posture.data = body;
+    scheduleSealFreshnessRefresh(deriveSealFreshness(body.live_enforcement));
     state.posture.error = null;
   } catch (e) {
     state.posture.data = null;
+    clearSealFreshnessTimer();
     state.posture.error = e && e.message ? e.message : String(e);
   }
 }
@@ -3508,7 +3518,12 @@ function scheduleHomeFreshness() {
   const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
     return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
   }); // One millisecond moves past the inclusive freshness boundary.
-  if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
+  if (expiries.length) {
+    homeFreshnessTimer = setTimeout(function () {
+      homeFreshnessTimer = null;
+      refreshExpiredEvidenceSource("/api/posture/home");
+    }, Math.max(0, Math.min.apply(null, expiries) - Date.now()));
+  }
 }
 async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
@@ -3689,7 +3704,7 @@ function scheduleSealFreshnessRefresh(freshness) {
   const delayMs = Math.max(0, freshness.refreshAt - Date.now());
   sealFreshnessTimer = setTimeout(function () {
     sealFreshnessTimer = null;
-    rerender();
+    refreshExpiredEvidenceSource("/api/sovereignty");
   }, delayMs);
 }
 
@@ -4125,6 +4140,9 @@ function connectStream() {
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 5; // Five repair waves, then operator Retry only.
+  function markStreamFrameReceived() {
+    reconnectAttempts = 0;
+  }
   async function open() {
     try {
       const sessionQuery = await createStreamSessionQuery();
@@ -4132,22 +4150,23 @@ function connectStream() {
       es = new EventSource(url);
     } catch (e) { schedulePolling(); return; }
     es.addEventListener("snapshot", function () { /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
+    es.addEventListener("heartbeat", markStreamFrameReceived);
     es.addEventListener("activity", function (ev) {
       try {
+        markStreamFrameReceived();
         const e = JSON.parse(ev.data);
         if (state.seenEventIds.has(e.entry_id)) return;
         state.seenEventIds.add(e.entry_id);
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
         }
-        const paths = [HUB + "/activity"];
-        if (e.category === "privacy") paths.push(HUB + "/activity?category=privacy");
-        if (e.category === "handoff") paths.push(HUB + "/activity?category=handoff");
+        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot"];
         void queueStreamRefresh(paths);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("inbox", function (ev) {
       try {
+        markStreamFrameReceived();
         const item = JSON.parse(ev.data);
         if (isPendingApprovalsRedactedMarker(item)) {
           setInboxRedacted(item);
@@ -4161,11 +4180,12 @@ function connectStream() {
     });
     es.addEventListener("agent_status", function (ev) {
       try {
+        markStreamFrameReceived();
         JSON.parse(ev.data);
         void queueStreamRefresh([HUB + "/agents", HUB + "/activity"]);
       } catch (err) { /* ignore */ }
     });
-    es.addEventListener("approval", function () { void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
+    es.addEventListener("approval", function () { markStreamFrameReceived(); void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
     es.onerror = function () {
       try { es && es.close(); } catch (e) { /* ignore */ }
       es = null;
@@ -4175,8 +4195,7 @@ function connectStream() {
       const delay = 1000 * Math.pow(2, reconnectAttempts++);
       reconnectTimer = setTimeout(async function () {
         reconnectTimer = null;
-        const refreshed = await fetchAll(true);
-        if (refreshed) reconnectAttempts = 0;
+        await fetchAll(true);
         rerender();
         void open();
       }, delay);
