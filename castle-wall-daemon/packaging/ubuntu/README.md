@@ -12,9 +12,11 @@ No reboot or general Linux enforcement assurance follows from package tests.
 
 ## Artifact and prerequisites
 
-Obtain the exact private artifact and independently authenticated source SHA,
-SHA-256, required-check inventory, workstation signer artifact, `endpoints.json`
-and `rules.json`. Require all checks at that source head to have succeeded;
+Obtain the exact package artifact (the published pre-release is
+[Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1),
+asset `sanctuary-castle-wall_0.1.0-1_amd64.deb`, source commit `bbd6c7d7`) and
+its independently authenticated source SHA, SHA-256, required-check inventory,
+workstation signer artifact, `endpoints.json` and `rules.json`. Require all checks at that source head to have succeeded;
 a missing, skipped or cancelled required job is not success. The adjacent
 checksum detects corruption but does not authenticate delivery.
 

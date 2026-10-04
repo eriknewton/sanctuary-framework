@@ -219,9 +219,11 @@ The normal runbook below must match the [packaged operator guide](../../castle-w
 
 ## Artifact and prerequisites
 
-Obtain the exact private artifact and independently authenticated source SHA,
-SHA-256, required-check inventory, workstation signer artifact, `endpoints.json`
-and `rules.json`. Require all checks at that source head to have succeeded;
+Obtain the exact package artifact (the published pre-release is
+[Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1),
+asset `sanctuary-castle-wall_0.1.0-1_amd64.deb`, source commit `bbd6c7d7`) and
+its independently authenticated source SHA, SHA-256, required-check inventory,
+workstation signer artifact, `endpoints.json` and `rules.json`. Require all checks at that source head to have succeeded;
 a missing, skipped or cancelled required job is not success. The adjacent
 checksum detects corruption but does not authenticate delivery.
 
@@ -726,8 +728,9 @@ host is a separate authorized action, not an installer command.
 ## Castle-walking acknowledgement
 
 Castle Wall Linux L2 is proven only for the narrowed Ubuntu 24.04 (x86-64)
-fresh-install per-account signed-policy claim in `ASSURANCE_MATRIX.md`. It is
-not yet a tagged public-release claim, and it does not cover fault-injection
+fresh-install per-account signed-policy claim in `ASSURANCE_MATRIX.md`, for the
+exact package published as the checksum-verified pre-release Castle Wall Linux
+0.1.0-1 (no signature or apt repository yet). It does not cover fault-injection
 witnesses, queue-pressure fail-closed behavior, audit drain durability, DNS,
 DoH, DoT, hostname paths, upgrade or removal, sustained operation, overhead,
 other platforms, or a real wrapped-agent harness.
