@@ -230,6 +230,7 @@ describe("dashboard bounded independent hydration", () => {
   });
   it("caps stream reconnect attempts with increasing delays", async () => {
     vi.useFakeTimers(); const h = harness(); await settle(); const first = h.streams.length;
+    runInContext('fetch = async function () { throw new Error("offline"); }', h.context);
     h.streams.at(-1)?.onerror?.(); await vi.advanceTimersByTimeAsync(1000); expect(h.streams.length).toBe(first + 1);
     h.streams.at(-1)?.onerror?.(); await vi.advanceTimersByTimeAsync(1000); expect(h.streams.length).toBe(first + 1);
     await vi.advanceTimersByTimeAsync(1000);
@@ -291,6 +292,24 @@ describe("dashboard bounded independent hydration", () => {
     await settle();
     runInContext('state.route = "auto-trigger"; rerender()', h.context);
     expect(h.main.innerHTML).toContain("Retry Auto-trigger");
+  });
+  it("generic activity events reread privacy, handoff, honeypot, and anomaly panels", async () => {
+    vi.useFakeTimers(); let anomalyReads = 0;
+    const h = harness({ "/api/anomaly/findings": () => ++anomalyReads === 1 ? response({ data: { findings: [] } }) : pending() }); await settle();
+    expect(h.main.innerHTML).toContain("No open anomaly findings.");
+    const before = h.calls.length;
+    h.streams.at(-1)!.listeners.activity({ data: JSON.stringify({ entry_id: "generic-audit", category: "other", display_template_id: "audit.other" }) });
+    await settle();
+    expect(h.calls.slice(before)).toEqual(expect.arrayContaining([
+      "/api/hub/activity",
+      "/api/hub/activity?category=privacy",
+      "/api/hub/activity?category=handoff",
+      "/api/honeypot/tool-traps",
+      "/api/honeypot/credential-traps",
+      "/api/anomaly/findings",
+    ]));
+    expect(runInContext('sourceRead("/api/anomaly/findings").state', h.context)).toBe("state_LOADING");
+    expect(h.main.innerHTML).not.toContain("No open anomaly findings.");
   });
   it("keeps later rule details unavailable when the shared deadline runs out", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/auto-trigger/rules": () => response({ data: { rules: [{ rule_id: "first" }, { rule_id: "later" }] } }), "/api/auto-trigger/rules/first": pending });
@@ -398,6 +417,7 @@ describe("D5 closure", () => {
   });
   it.each(["stream", "polling"])("shows stopped %s updates on every route until Retry", async mode => {
     vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext('fetch = async function () { throw new Error("offline"); }', h.context);
     if (mode === "stream") {
       for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); }
     } else { runInContext('schedulePolling()', h.context); await vi.advanceTimersByTimeAsync(180_000); }
@@ -407,11 +427,19 @@ describe("D5 closure", () => {
       expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
       expect(runInContext('sourceLoaded(HUB + "/inbox")', h.context)).toBe(false);
     }
+    runInContext('fetch = async function (url) { const path = String(url).replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, ""); return { ok: true, status: 200, json: async function () { return path === "/api/posture/home" ? { origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest: {}, protection_requested_count: 0, enforcement_confirmed_count: 0 } : { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] }, live_enforcement: { castle_wall_arm_state: "unknown" } }; } }; }', h.context);
     const before = h.streams.length; h.retry(); await settle();
     expect(h.streams.length).toBe(before + 1); expect(h.main.innerHTML).not.toContain("Live updates stopped");
     expect(h.fortress.innerHTML).toContain("Nothing waiting on you");
   });
-  it.each(["approval", "inbox", "activity", "reconnect", "polling"])("%s queues a fresh read behind an older read", async trigger => {
+  it("stops reconnecting when every reopened stream fails before a frame even if reads succeed", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle(); const first = h.streams.length;
+    for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); await settle(); }
+    expect(h.streams.length).toBeLessThanOrEqual(first + 5);
+    expect(h.main.innerHTML).toContain("Live updates stopped");
+    expect(h.main.innerHTML).toContain(">Retry</button>");
+  });
+  it.each(["approval", "inbox", "reconnect", "polling"])("%s queues a fresh read behind an older read", async trigger => {
     vi.useFakeTimers(); let reads = 0; let pollingBoot = trigger === "polling"; let old!: (value: unknown) => void; let fresh!: (value: unknown) => void;
     const h = harness({ "/api/hub/inbox": () => pollingBoot ? response({ data: { items: [] } }) : ++reads === 1 ? new Promise(r => { old = r; }) : new Promise(r => { fresh = r; }) }); await settle();
     if (trigger === "reconnect") { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(1000); }
@@ -452,6 +480,80 @@ describe("D5 closure", () => {
     h.streams.at(-1)!.listeners.approval({ data: "{}" }); release(response({ data: { items: [] } })); await settle();
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you"); expect(h.fortress.innerHTML).toContain("Retry Decisions");
     expect(runInContext('sourceRead(HUB + "/inbox").state', h.context)).toBe("state_FAILED");
+  });
+  it("event bursts do not demote loaded posture or discard a slow posture read", async () => {
+    vi.useFakeTimers(); let releaseHome!: (value: unknown) => void; let inboxReads = 0;
+    const h = harness({
+      "/api/posture/home": () => new Promise(resolve => { releaseHome = resolve; }),
+      "/api/hub/inbox": () => ++inboxReads === 1 ? response({ data: { items: [] } }) : pending(),
+      "/api/sovereignty": () => response({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60_000 } }),
+    }); await settle();
+    expect(runInContext('sourceLoaded("/api/sovereignty")', h.context)).toBe(true);
+    expect(h.fortress.innerHTML).toContain("Nothing waiting on you");
+    for (let i = 0; i < 20; i++) h.streams.at(-1)!.listeners.inbox({ data: JSON.stringify({ item_id: "burst-" + i }) });
+    await settle();
+    expect(runInContext('sourceLoaded("/api/sovereignty")', h.context)).toBe(true);
+    expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
+    releaseHome(response({ ...home, origin_machine: "slow-home-loaded" })); await settle();
+    expect(runInContext('sourceLoaded("/api/posture/home")', h.context)).toBe(true);
+    expect(h.main.innerHTML).toContain("slow-home-loaded");
+  });
+  it("separated stream outages keep reconnecting after loaded recovery refreshes", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    for (let i = 0; i < 6; i++) {
+      const before = h.streams.length;
+      h.streams.at(-1)!.onerror!();
+      await vi.advanceTimersByTimeAsync(1000);
+      await settle();
+      expect(h.streams.length).toBe(before + 1);
+      h.streams.at(-1)!.listeners.snapshot({ data: "{}" });
+      expect(h.main.innerHTML).not.toContain("Live updates stopped");
+    }
+  });
+  it("healthy polling waves do not spend the stopped-live-update budget", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext('schedulePolling()', h.context);
+    for (let i = 0; i < 30; i++) {
+      await vi.advanceTimersByTimeAsync(DEADLINE_MS);
+      await settle();
+      expect(h.main.innerHTML).not.toContain("Live updates stopped");
+    }
+  });
+  it("Retry clears stopped-update text from saved filters and policy views", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    for (let i = 0; i < 6; i++) { h.streams.at(-1)!.onerror!(); await vi.advanceTimersByTimeAsync(60_000); }
+    expect(h.main.innerHTML).toContain("Live updates stopped");
+    h.retry(); await settle();
+    for (const route of ["activity", "policy", "posture", "agents", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill"]) {
+      runInContext('state.route = "' + route + '"; rerender()', h.context);
+      expect(h.main.innerHTML).not.toContain("Live updates stopped");
+    }
+    expect(runInContext('Array.from(sourceReads.values()).filter(read => read.state === "state_UNREAD").map(read => read.state)', h.context)).toEqual([]);
+  });
+  it("uses demo-safe wording for agents and posture rows", async () => {
+    vi.useFakeTimers(); const h = harness({
+      "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active", harness: "codex", model_provider: { vendor: "OpenAI", model_id: "gpt" }, policy_id: "default" }] } }),
+      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", status: "active", harness: "codex", policy_protected: false, enforcement_active: "unknown" }] }),
+    }); await settle();
+    runInContext('state.route = "health"; rerender()', h.context);
+    expect(h.main.innerHTML).toContain("<dt>Wrapped agents</dt>");
+    expect(h.main.innerHTML).not.toContain("<dt>Protected agents</dt>");
+    runInContext('state.route = "agents"; rerender()', h.context);
+    expect(h.main.innerHTML).toContain("1 agent. Click one");
+    expect(h.main.innerHTML).not.toContain("1 agents.");
+    runInContext('state.route = "posture"; rerender()', h.context);
+    expect(h.main.innerHTML).toContain("Not protected");
+    expect(h.main.innerHTML).not.toContain("status active");
+  });
+  it("agent_status events re-read the roster instead of mutating it locally", async () => {
+    vi.useFakeTimers(); let reads = 0; let release!: (value: unknown) => void;
+    const h = harness({ "/api/hub/agents": () => ++reads === 1 ? response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }) : new Promise(resolve => { release = resolve; }) }); await settle();
+    h.streams.at(-1)!.listeners.agent_status({ data: JSON.stringify({ agent_id: "fixture", status: "locked_down", last_activity_at: "now" }) });
+    await settle();
+    expect(reads).toBe(2);
+    expect(runInContext('state.agents[0].status', h.context)).toBe("active");
+    release(response({ data: { agents: [{ agent_id: "fixture", status: "locked_down" }] } })); await settle();
+    expect(runInContext('state.agents[0].status', h.context)).toBe("locked_down");
   });
 
 });
