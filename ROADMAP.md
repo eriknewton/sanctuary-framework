@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-03. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-04. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -12,7 +12,7 @@ Last updated: 2026-10-03. Freshness is enforced: a CI guard requires feature PRs
 
 Sanctuary's enforcement model is the Castle Architecture, codified at [`server/rfcs/RFC-0003-castle-architecture.md`](server/rfcs/RFC-0003-castle-architecture.md). Five named mechanisms, each with a distinct enforcement contract.
 
-- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus attended reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux ships no egress enforcement at all: the source modules are integration-proven, and the shipped daemon does not install the nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator, so the matrix row is `not_implemented` rather than partial. Open defect: **IC-02, IC-03, IC-04**. Windows is on the roadmap.
+- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. macOS is proven: per-uid allow/deny plus attended reboot-survival (N=5) on a Dev-ID-signed and notarized binary, drills 2026-06-11 through 2026-06-22; the per-flow rule-attributed audit trail is the named remaining gap. Linux is proven only for Ubuntu 24.04 (x86-64): a fresh install of the shipped package enforces a signed operator policy per user account, blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with evidence checked by two independent reviewers. Linux fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows is on the roadmap.
 - **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar and notifications. Observation, not enforcement.
 - **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, hash-chained audit with current signed-checkpoint bounds, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks. Open defect: **IC-05**.
 - **Heralds (the voice).** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
@@ -36,9 +36,9 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 ### Castle Wall on Linux: kernel-level enforcement
 
-Target: OS-level egress filtering via netfilter / NFQUEUE with per-process cgroup routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: the Linux modules are proven in integration tests, but the shipped daemon does not assemble that enforcement loop. **Why it matters:** this is the security claim the Linux row must earn before it can be called shipped.
+Target: OS-level egress filtering via netfilter / NFQUEUE with per-account routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. **Why it matters:** this is the first Linux kernel-enforcement claim with install-grade drill evidence.
 
-*Status: not shipped as enforcement. ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `not_implemented`, so marketing and release copy may not trace a Linux enforcement claim to it. Open defect: **IC-02, IC-03, IC-04**. The gate that moves this row is the install-grade proof described under "Current priority" below.*
+*Status: proven only for Ubuntu 24.04 (x86-64). ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `proven` for the narrowed claim above. Fault-injection witnesses, a real-agent harness, DNS/DoH/DoT and hostname paths, sustained-operation and overhead, removal or upgrade, any other distribution, any other architecture, and a tagged-release artifact remain unproven.*
 
 ### Castle Wall on macOS: signed system extension, enforced and attended-reboot-surviving
 
@@ -146,7 +146,7 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 ### Recent additions (October 2026)
 
-- **Linux install package candidate.** The opt-in install variant adds observed-state install commands, a workstation policy signer, and an agent launch path that refuses to start unless Castle Wall is ready and the kernel binding for the agent's uid is observed. Required CI covers package lifecycle refusals and cold-install composition. Delivery acceptance and reboot evidence remain pending; this is not a supported-release or completed-install claim.
+- **Linux install-grade claim, Ubuntu 24.04 (x86-64).** On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Required CI still covers package lifecycle refusals and cold-install composition. Fault-injection witnesses, a real-agent harness, and broader platform coverage remain pending.
 
 - **Credential surrogacy:** slices 1b-i and 1b-ii built and test-proven; the real-secret macOS drill remains owed.
 
@@ -164,7 +164,7 @@ Concordia adds structured negotiation between agents with binding commitments an
 
 ### Current priority
 
-**Linux Castle Wall, install-grade.** The next public claim to move is Linux egress enforcement, and it moves only on an install-grade proof: a cold install of a shipped artifact, per-uid allow and deny observed at the kernel, survival across five reboots, three independent runs, and adjudication by a reviewer who did not build it. Until that drill is captured the Linux row stays `not_implemented` and nothing here, in the README, or in release copy says otherwise. Source slices land on `main` as they pass their gates (the agent unit template, the systemd watchdog, the journal proof token are merged); host legs run on a disposable machine and are recorded under `docs/audit/` when they pass.
+**Linux Castle Wall follow-up.** The first install-grade public claim has moved only for Ubuntu 24.04 (x86-64). The next Linux gates are a fault-injection drill on the shipped artifact, a real-agent harness in place of the test program, DNS/DoH/DoT and hostname paths once hostname attribution exists, broader distribution and architecture coverage, and a tagged-release artifact that is re-drilled or shown unchanged.
 
 **After Linux:** one dashboard across operating-system families (the "One console for many machines" item below), so an operator with a Mac and a Linux box sees one wall, one record, one set of keys.
 
@@ -188,7 +188,7 @@ Today the macOS wall enforces and a per-rule read-out exists, but the unforgeabl
 
 #### Castle Wall on Windows
 
-Windows Filtering Platform backend. Same drill discipline as macOS. **Why it matters:** Windows operators get kernel-level enforcement held to the macOS bar, which is the only platform where the shipped artifact enforces today; Linux is `not_implemented` until **IC-02, IC-03, IC-04** are fixed. Sequenced after the macOS discipline held end to end so the cross-platform bar stays consistent.
+Windows Filtering Platform backend. Same drill discipline as macOS and the narrowed Ubuntu 24.04 (x86-64) Linux row. **Why it matters:** Windows operators get kernel-level enforcement held to the same install-grade bar before any public claim moves. Sequenced after the macOS and Linux discipline held end to end so the cross-platform bar stays consistent.
 
 *Status: planning.*
 
@@ -297,7 +297,7 @@ Sanctuary engages standards bodies to land operator-controlled primitives as ope
 
 ## Non-dependency and composition posture
 
-Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a local security harness with policy gates, local custody, and macOS Castle Wall enforcement when the signed wall is installed and armed. Linux is `not_implemented` and Windows is roadmap.
+Sanctuary never requires Concordia. Concordia never requires Sanctuary. Composition with external frameworks is always optional and default off. The framework alone, with no external dependency of any kind, is a local security harness with policy gates, local custody, macOS Castle Wall enforcement when the signed wall is installed and armed, and the narrowed Ubuntu 24.04 (x86-64) Linux Castle Wall claim in the Assurance Matrix. Windows is roadmap.
 
 Composition partners are named as partners: Coinbase x402, Google AP2, Anthropic MCP, Hermes A2A, Concordia Protocol, Verascore, ERC-8004 ecosystem, and peers in the agent-interop space.
 

@@ -1,7 +1,7 @@
 ---
 title: "The Castle Wall, Linux Phase 1 Source Path"
 date: 2026-05-08
-description: "Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does. Current correction: Linux Phase 1 source modules are tested against a real kernel binding, but the shipped daemon does not assemble live enforcement."
+description: "Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does. Current correction: Ubuntu 24.04 x86-64 has the narrowed install-grade proof; other Linux platforms remain unproven."
 author: "Erik Newton"
 image: /images/blog/castle-wall-phase-1-linux.jpg
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
@@ -15,14 +15,12 @@ claims_era_note: true
 
 # The Castle Wall, Linux Phase 1 Source Path
 
-> **Current correction, 2026-08-07:** Linux Castle Wall ships no enforcement.
-> The Assurance Matrix row is `not_implemented`, so no marketing or release copy
-> may trace a Linux enforcement claim to it. The nftables, cgroup, and NFQUEUE modules are tested
-> against a real kernel, but the shipped daemon does not install the table, bind
-> NFQUEUE, create cgroup scopes, or call the deny-by-default evaluator. The
-> systemd unit is also `Type=notify` while the daemon never sends readiness.
-> Open defect: **IC-02, IC-03, IC-04**
->.
+> **Current correction, 2026-10-04:** On Ubuntu 24.04 (x86-64), a fresh install
+> of the shipped package enforces a signed operator policy per user account:
+> blocked destinations stay blocked and allowed ones connect, through five
+> reboots, on three fresh servers, with the evidence checked by two independent
+> reviewers. No other Linux distribution, CPU architecture, fault-injection
+> witness, or real-agent harness is proven.
 
 An agent under prompt injection executed 75 percent of remote commands across 34 sessions in a recent breach. The result, per OWASP GenAI's Q1 2026 round-up, was 195 million taxpayer records and 220 million civil records exfiltrated from a national-government deployment. The agent cooperated with instructions from somewhere it should not have trusted, and the runtime had no way to refuse the network call.
 
@@ -34,13 +32,13 @@ An L7 proxy can inspect traffic that goes through it. A managed-cloud control pl
 
 The Castle Architecture answers that question at the kernel. The operating system itself blocks unauthorized cross-boundary calls regardless of what transport the agent picks or what prompt-injection state it is in. That is the floor. Everything else, every L7 inspection layer, every cooperative-MCP gate, every managed-cloud governance product, sits above the floor and composes with it. None of them replace it.
 
-The Linux floor described below is the intended source path, not the shipped daemon behavior today. Open defect: **IC-02, IC-03, IC-04**. Kernel-level enforcement remains the decisive differentiator when the agent itself cannot be trusted.
+The Linux floor described below is the intended source path. Current shipped evidence proves only the narrowed Ubuntu 24.04 (x86-64) install-grade claim in the Assurance Matrix. Kernel-level enforcement remains the decisive differentiator when the agent itself cannot be trusted.
 
 ## The Castle Architecture
 
 Sanctuary's enforcement model has four layers, each with a distinct contract. The contracts compose; none of them substitute for another. The model is named after the way a real castle defends a perimeter, observes its interior, governs its inhabitants, and accounts to neighbors.
 
-**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. On macOS this is proven in the current Assurance Matrix. On Linux, the source modules are tested but the shipped daemon does not yet install the enforcement path. Open defect: **IC-02, IC-03, IC-04**. This answers the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
+**The Castle Wall.** Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. Outbound calls (HTTP, DNS, custom protocols) route through a wall the operator's policies define. On macOS this is proven in the current Assurance Matrix. On Linux, the current proof is Ubuntu 24.04 (x86-64) only: a fresh install of the shipped package enforces a signed operator policy per user account, blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with evidence checked by two independent reviewers. This answers the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the shipped surface.
 
 **Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, audit-log analysis, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures inside internal communications. The sentinels surface; the operator decides. Sentinels ship in v1.3.
 
@@ -84,7 +82,7 @@ Composition holds across the partner surface, too. Sanctuary signs Coinbase x402
 
 ## What's next
 
-Linux Phase 1 does not ship as live enforcement today; the source path stays unshipped until **IC-02, IC-03, IC-04** are fixed. macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
+Linux Phase 1 now has a narrowed install-grade proof on Ubuntu 24.04 (x86-64); other Linux distributions, architectures, fault-injection witnesses, and a real-agent harness remain unproven. macOS later shipped a separate Network Extension path and is proven in the current Assurance Matrix.
 
 Windows Phase 2 sits behind macOS, using Windows Filtering Platform. Container and microVM isolation, Phase 3, is queued for the highest-assurance enterprise deployments where additional isolation between the wrapped agent and the operator's host filesystem matters.
 
@@ -92,9 +90,9 @@ Sentinels work begins in v1.3, after Phase 1 macOS clears entitlement review. Th
 
 ## Your kernel
 
-The pitch has been the same since [the Sovereignty Manifesto](https://sanctuaryprotocol.ai/2026/05/07/sovereignty-manifesto.html) landed. Your agent. Your machine. Your keys. The substrate that defends those rights has to be a substrate the operator owns at the layer that matters. For enforcement, that layer is the kernel. As of last week, the kernel-level layer is real for any operator running Sanctuary on Linux. Current correction, 2026-08-07: that sentence is retired. The shipped Linux daemon installs no kernel enforcement, so the kernel-level layer is real on macOS and unshipped on Linux. Open defect: **IC-02, IC-03, IC-04**.
+The pitch has been the same since [the Sovereignty Manifesto](https://sanctuaryprotocol.ai/2026/05/07/sovereignty-manifesto.html) landed. Your agent. Your machine. Your keys. The substrate that defends those rights has to be a substrate the operator owns at the layer that matters. For enforcement, that layer is the kernel. As of last week, the kernel-level layer is real for any operator running Sanctuary on Linux. Current correction, 2026-10-04: that sentence is true only inside the narrowed Ubuntu 24.04 (x86-64) Assurance Matrix claim; no other Linux distribution, CPU architecture, fault-injection witness, or real-agent harness is proven.
 
-If you are an operator running agents on real money or real records, this is the floor your substrate should be built on. If you are an enterprise buyer evaluating sovereign deployment, the pilot demo is concrete and reproducible: a wrapped agent under prompt injection, a curl-call exfiltration attempt, the wall blocking the call, the operator-approval surface firing, you approving or denying in under ten seconds end-to-end, the audit log recording every step. Current correction, 2026-08-07: that demo runs on macOS. It cannot be offered on a Linux host, because the shipped Linux daemon enforces nothing.
+If you are an operator running agents on real money or real records, this is the floor your substrate should be built on. If you are an enterprise buyer evaluating sovereign deployment, the pilot demo is concrete and reproducible: a wrapped agent under prompt injection, a curl-call exfiltration attempt, the wall blocking the call, the operator-approval surface firing, you approving or denying in under ten seconds end-to-end, the audit log recording every step. Current correction, 2026-10-04: the Linux evidence is the narrowed Ubuntu 24.04 (x86-64) install-grade drill, not this broader demo claim.
 
 Your agent. Your machine. Your keys. And now your kernel.
 

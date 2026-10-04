@@ -163,7 +163,7 @@ describe("synthetic coverage gate rollup", () => {
   it("keeps not_implemented rows out of passing assurance totals", () => {
     const linux = report("linux", [
       row({
-        id: "9",
+        id: "99",
         status: "not_implemented",
         fixturesRun: 0,
         fixturesPassed: 0,
@@ -172,7 +172,7 @@ describe("synthetic coverage gate rollup", () => {
     ]);
     const macos = report("macos", [
       row({
-        id: "9",
+        id: "99",
         status: "not_implemented",
         fixturesRun: 0,
         fixturesPassed: 0,
@@ -184,7 +184,7 @@ describe("synthetic coverage gate rollup", () => {
 
     expect(artifact.gate_state).toBe("gate_a_green");
     expect(artifact.claim_to_row[0]).toMatchObject({
-      row_id: "9",
+      row_id: "99",
       linux_fixtures: 0,
       macos_fixtures: 0,
       coverage_state_linux: "not_implemented",
@@ -197,8 +197,8 @@ describe("synthetic coverage gate rollup", () => {
     });
     expect(artifact.gap_inventory).toEqual([
       {
-        row_id: "9",
-        label: "Row 9",
+        row_id: "99",
+        label: "Row 99",
         reason: "not_implemented",
         blocking_for_gate: false,
       },
