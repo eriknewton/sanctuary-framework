@@ -18,7 +18,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 function mockReq(opts: { url?: string; method?: string; headers?: Record<string, string> }): IncomingMessage {
   return {
     url: opts.url ?? "/",
@@ -99,23 +99,23 @@ describe("Dashboard API", () => {
 
   describe("isAuthorized", () => {
     it("returns true when no authToken configured", () => {
-      const deps: APIDeps = { sources: {} as any };
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(), sources: {} as any };
       expect(isAuthorized(deps, mockReq({}), new URL("http://localhost/"))).toBe(true);
     });
 
     it("returns false when token is missing", () => {
-      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(), sources: {} as any, authToken: "secret" };
       expect(isAuthorized(deps, mockReq({}), new URL("http://localhost/"))).toBe(false);
     });
 
     it("returns true when token matches", () => {
-      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(), sources: {} as any, authToken: "secret" };
       const req = mockReq({ headers: { authorization: "Bearer secret" } });
       expect(isAuthorized(deps, req, new URL("http://localhost/"))).toBe(true);
     });
 
     it("returns true when a valid short-lived session is provided", () => {
-      const deps: APIDeps = {
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(),
         sources: {} as any,
         authToken: "secret",
         sessions: { create: vi.fn(), validate: vi.fn((id: string) => id === "sess-ok") },
@@ -126,14 +126,14 @@ describe("Dashboard API", () => {
     });
 
     it("rejects long-lived ?token= query auth", () => {
-      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(), sources: {} as any, authToken: "secret" };
       expect(
         isAuthorized(deps, mockReq({ url: "/?token=secret" }), new URL("http://localhost/?token=secret"))
       ).toBe(false);
     });
 
     it("returns false when token mismatches", () => {
-      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      const deps: APIDeps = { readFlightMap: createDashboardReadFlightMap(), sources: {} as any, authToken: "secret" };
       const req = mockReq({ headers: { authorization: "Bearer wrong" } });
       expect(isAuthorized(deps, req, new URL("http://localhost/"))).toBe(false);
     });
@@ -141,7 +141,7 @@ describe("Dashboard API", () => {
 
   describe("handleRequest", () => {
     function makeDeps(overrides?: Partial<APIDeps>): APIDeps {
-      return {
+      return { readFlightMap: createDashboardReadFlightMap(),
         sources: {
           mode: "co-located" as const,
           stateStore: null,

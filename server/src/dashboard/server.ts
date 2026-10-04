@@ -30,6 +30,7 @@ import {
   DEFAULT_HTTP_SHUTDOWN_GRACE_MS,
 } from "../http/server-lifecycle.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import { createDashboardReadFlightMap } from "./read-response.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export interface DashboardServerOptions {
@@ -188,11 +189,16 @@ export async function startDashboardServer(
   // values on every call because we re-build the deps object per request.
   let v11Bindings: V11Bindings | null = null;
   let v11LoopbackAutoAuth = false;
+  // One bounded-read flight map for this server's lifetime, shared by every
+  // request (the deps object below is rebuilt per request, so the map must
+  // live here to make concurrent reads join one producer).
+  const readFlightMap = createDashboardReadFlightMap();
 
   const server: Server = createServer(async (req, res) => {
     try {
       const deps = {
         sources: options.sources,
+        readFlightMap,
         authToken: options.authToken,
         sessions: sessionStore,
         approvals: options.approvals,

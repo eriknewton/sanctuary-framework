@@ -15,7 +15,7 @@ import {
 } from "../../src/principal-policy/posture-routes.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 const FORTRESS = "fortress:test";
 
 function subjectForUid(uid: number): string {
@@ -115,7 +115,7 @@ function baseDeps(
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
-  return {
+  return { readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => agents,
@@ -449,7 +449,7 @@ describe("posture route layer", () => {
     // Build deps WITHOUT a listReachRules override and WITHOUT enabled curated
     // rule ids - the production default-off shape. The curated catalog must NOT
     // be mapped wholesale into a fabricated kernel-enforced default-deny.
-    const deps: PostureRouteDeps = {
+    const deps: PostureRouteDeps = { readFlightMap: createDashboardReadFlightMap(),
       auditLog: newLog(),
       originMachine: FORTRESS,
       listAgents: () => [wrappedAgent("a1", "claude_code")],
@@ -469,7 +469,7 @@ describe("posture route layer", () => {
     // When the operator has enabled exactly one curated rule, reach reflects
     // that one rule - never the full curated set. Rules on disk are still only
     // CONFIGURATION (enforcement_confirmed stays false).
-    const deps: PostureRouteDeps = {
+    const deps: PostureRouteDeps = { readFlightMap: createDashboardReadFlightMap(),
       auditLog: newLog(),
       originMachine: FORTRESS,
       listAgents: () => [wrappedAgent("a1", "claude_code")],

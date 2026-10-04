@@ -35,7 +35,7 @@ import {
   UNIFIED_INBOX_API_PREFIX,
   handleUnifiedInboxRoute,
 } from "../../src/principal-policy/unified-inbox-routes.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
 const IDENTITY = "identity_test";
@@ -67,7 +67,7 @@ async function makeServer(
   const authToken = opts?.authToken;
   const server: Server = createServer(async (req, res) => {
     const handled = await handleUnifiedInboxRoute(
-      {
+      { readFlightMap: createDashboardReadFlightMap(),
         authConfig: {
           loopbackAutoAuth: true,
           ...(authToken !== undefined ? { authToken } : {}),

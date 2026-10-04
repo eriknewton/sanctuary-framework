@@ -13,7 +13,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { handleRequest } from "../../src/dashboard/api.js";
 import type { AggregatorSources } from "../../src/dashboard/aggregator.js";
 import { runIdentityCommand } from "../../src/cli/identity.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 class StringWritable extends Writable {
   chunks: string[] = [];
 
@@ -124,7 +124,7 @@ describe("dashboard snapshot identity source-of-truth", () => {
     Object.assign(sources, { identityManager, auditLog });
 
     const res = mockRes();
-    const matched = await handleRequest({ sources }, mockReq(), res);
+    const matched = await handleRequest({ sources, readFlightMap: createDashboardReadFlightMap() }, mockReq(), res);
     expect(matched).toBe(true);
     expect(res._status).toBe(200);
     const snapshot = JSON.parse(res._body);
