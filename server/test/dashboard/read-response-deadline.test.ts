@@ -8,13 +8,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createServer,
-  request as httpRequest,
   type IncomingMessage,
-  type Server,
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
-import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -23,6 +21,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { defaultConfig } from "../../src/config.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity, type StoredIdentity } from "../../src/core/identity.js";
+import { getClientScript } from "../../src/dashboard/v1_1/client.js";
 import {
   UnifiedInboxBridge,
 } from "../../src/principal-policy/unified-inbox-bridge.js";
@@ -31,6 +30,10 @@ import type {
   InboxFilterPrefs,
 } from "../../src/principal-policy/unified-inbox-prefs-store.js";
 import {
+  DASHBOARD_CLIENT_READ_DEADLINE_MS,
+  DASHBOARD_CLIENT_READ_DEADLINE_SECONDS,
+  DASHBOARD_MILLISECONDS_PER_SECOND,
+  DASHBOARD_RETRY_AFTER_SECONDS,
   DASHBOARD_READ_RESPONSE_DEADLINE_MS,
   getDashboardReadInFlightCount,
   respondWithBoundedDashboardRead,
@@ -38,6 +41,7 @@ import {
 } from "../../src/dashboard/read-response.js";
 
 const TEST_AUTH_TOKEN = "dashboard-read-deadline-token";
+// Definition: test wall-clock slack is expressed in seconds and converted for Date.now() comparisons.
 const MILLISECONDS_PER_SECOND = 1000;
 const DEADLINE_SLACK_SECONDS = 2;
 const DEADLINE_SLACK_MS = DEADLINE_SLACK_SECONDS * MILLISECONDS_PER_SECOND;
@@ -48,6 +52,63 @@ const TEST_HARNESS_TIMEOUT_MS =
   DEADLINE_SLACK_MS +
   FAST_REFUSAL_HALF_SECOND_MS +
   TEST_HARNESS_SLACK_SECONDS * MILLISECONDS_PER_SECOND;
+
+class MockIncomingMessage extends EventEmitter {
+  headers: Record<string, string> = {};
+}
+
+class MockServerResponse extends EventEmitter {
+  headersSent = false;
+  writableEnded = false;
+  statusCode = 0;
+  headers: Record<string, string> = {};
+  body = "";
+
+  setHeader(name: string, value: number | string | readonly string[]): this {
+    this.headers[name] = Array.isArray(value) ? value.join(", ") : String(value);
+    return this;
+  }
+
+  writeHead(statusCode: number, headers: Record<string, string> = {}): this {
+    this.statusCode = statusCode;
+    this.headersSent = true;
+    for (const [name, value] of Object.entries(headers)) {
+      this.headers[name] = value;
+    }
+    return this;
+  }
+
+  end(chunk?: string): this {
+    if (chunk !== undefined) this.body += chunk;
+    this.writableEnded = true;
+    this.emit("close");
+    return this;
+  }
+
+  json(): Record<string, unknown> {
+    return JSON.parse(this.body) as Record<string, unknown>;
+  }
+}
+
+function directBoundedRead<T>(
+  produce: (signal: AbortSignal) => Promise<{ status: number; body: T }>,
+  operation = "direct_test_read",
+): {
+  req: MockIncomingMessage;
+  res: MockServerResponse;
+  handled: Promise<boolean>;
+} {
+  const req = new MockIncomingMessage();
+  const res = new MockServerResponse();
+  const handled = respondWithBoundedDashboardRead({
+    route: "sovereignty",
+    req: req as IncomingMessage,
+    res: res as unknown as ServerResponse,
+    operation,
+    produce,
+  });
+  return { req, res, handled };
+}
 
 class TestIdentityManager {
   private identities = new Map<string, StoredIdentity>();
@@ -82,6 +143,7 @@ class TestIdentityManager {
 }
 
 async function startDashboardWithStalledReads(options: {
+  auditLocked?: boolean;
   stallExclusiveEgress?: boolean;
 } = {}): Promise<{
   baseUrl: string;
@@ -119,7 +181,7 @@ async function startDashboardWithStalledReads(options: {
       approval_channel: { type: "stderr", timeout_seconds: 30 },
     } as never,
     baseline: { load: async () => undefined, save: async () => undefined } as never,
-    auditLog,
+    auditLog: (options.auditLocked === true ? null : auditLog) as never,
     identityManager: identityManager as never,
     shrOpts: {
       config: defaultConfig(),
@@ -182,16 +244,30 @@ async function readJson(path: string, baseUrl: string): Promise<{
   return { elapsedMs: Date.now() - started, status: res.status, body };
 }
 
-async function closeServer(server: Server): Promise<void> {
-  server.closeAllConnections?.();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-}
-
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   resetDashboardReadInFlightForTests();
 });
 
 describe("dashboard bounded read responses", () => {
+  it("GET /api/posture/home preserves the locked-audit posture_unavailable body", async () => {
+    const rig = await startDashboardWithStalledReads({ auditLocked: true });
+    try {
+      const res = await readJson("/api/posture/home", rig.baseUrl);
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(res.body).toMatchObject({
+        error: "posture_unavailable",
+        reason: "audit log not unlocked; posture cannot be evidenced",
+        origin_machine: expect.any(String),
+      });
+      expect(res.body.origin_machine).not.toBe("");
+      expect(rig.enforcementRead).not.toHaveBeenCalled();
+    } finally {
+      await rig.stop();
+    }
+  });
+
   it("GET /api/inbox/unified/prefs returns unavailable within the server budget and caps retry waves", async () => {
     const rig = await startDashboardWithStalledReads();
     try {
@@ -278,42 +354,148 @@ describe("dashboard bounded read responses", () => {
     }
   }, TEST_HARNESS_TIMEOUT_MS);
 
-  it("aborts cancellable route reads when the caller closes the request", async () => {
-    let enteredProducer: (() => void) | undefined;
-    const producerEntered = new Promise<void>((resolve) => {
-      enteredProducer = resolve;
+  it("shares one healthy producer result across concurrent callers", async () => {
+    let resolveProducer:
+      | ((value: { status: number; body: Record<string, unknown> }) => void)
+      | undefined;
+    const produce = vi.fn(
+      () =>
+        new Promise<{ status: number; body: Record<string, unknown> }>((resolve) => {
+          resolveProducer = resolve;
+        }),
+    );
+
+    const first = directBoundedRead(produce);
+    await Promise.resolve();
+    expect(produce).toHaveBeenCalledTimes(1);
+
+    const second = directBoundedRead(produce);
+    await Promise.resolve();
+    expect(produce).toHaveBeenCalledTimes(1);
+
+    resolveProducer?.({ status: 200, body: { ok: true, shared: "route-wide" } });
+    await Promise.all([first.handled, second.handled]);
+
+    expect(first.res.statusCode).toBe(200);
+    expect(second.res.statusCode).toBe(200);
+    expect(first.res.json()).toEqual({ ok: true, shared: "route-wide" });
+    expect(second.res.json()).toEqual({ ok: true, shared: "route-wide" });
+    expect(getDashboardReadInFlightCount("sovereignty")).toBe(0);
+  });
+
+  it("refuses only overdue flights, suppresses late success, and starts fresh after producer settlement", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T00:00:00.000Z"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const resolvers: Array<
+      (value: { status: number; body: Record<string, unknown> }) => void
+    > = [];
+    const produce = vi.fn(
+      () =>
+        new Promise<{ status: number; body: Record<string, unknown> }>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const first = directBoundedRead(produce, "late_completion_probe");
+    await Promise.resolve();
+    expect(produce).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(DASHBOARD_READ_RESPONSE_DEADLINE_MS);
+    await first.handled;
+    expect(first.res.statusCode).toBe(503);
+    expect(first.res.json()).toMatchObject({
+      error: "dashboard_read_unavailable",
+      reason: "deadline_exceeded",
     });
-    const aborted = new Promise<void>((resolve) => {
-      const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-        void respondWithBoundedDashboardRead({
-          route: "sovereignty",
-          req,
-          res,
-          operation: "abort_probe",
-          produce: async (signal) => {
-            enteredProducer?.();
-            signal.addEventListener("abort", () => {
-              void closeServer(server).then(resolve);
-            }, { once: true });
-            return new Promise<never>(() => undefined);
-          },
-        });
-      });
-      server.listen(0, "127.0.0.1", () => {
-        const port = (server.address() as AddressInfo).port;
-      const req = httpRequest({
-        hostname: "127.0.0.1",
-        port,
-        path: "/abort",
-        method: "GET",
-      });
-        req.on("error", () => undefined);
-        req.end();
-        void producerEntered.then(() => req.destroy());
-      });
+    expect(getDashboardReadInFlightCount("sovereignty")).toBe(1);
+
+    const refused = directBoundedRead(produce, "late_completion_probe");
+    await refused.handled;
+    expect(refused.res.statusCode).toBe(503);
+    expect(refused.res.json()).toMatchObject({
+      error: "dashboard_read_unavailable",
+      reason: "in_flight_limit",
+    });
+    expect(refused.res.headers["Retry-After"]).toBe(String(DASHBOARD_RETRY_AFTER_SECONDS));
+    expect(produce).toHaveBeenCalledTimes(1);
+
+    resolvers[0]?.({ status: 200, body: { ok: true, should_not_write: true } });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(first.res.statusCode).toBe(503);
+    expect(first.res.json()).toMatchObject({ reason: "deadline_exceeded" });
+    expect(getDashboardReadInFlightCount("sovereignty")).toBe(0);
+
+    const fresh = directBoundedRead(produce, "late_completion_probe");
+    await Promise.resolve();
+    expect(produce).toHaveBeenCalledTimes(2);
+    resolvers[1]?.({ status: 200, body: { ok: true, fresh: true } });
+    await fresh.handled;
+    expect(fresh.res.statusCode).toBe(200);
+    expect(fresh.res.json()).toEqual({ ok: true, fresh: true });
+
+    const logged = errors.mock.calls.map((call) => String(call[1] ?? call[0]));
+    expect(logged.some((entry) =>
+      entry.includes("deadline_exceeded") &&
+      entry.includes("sovereignty") &&
+      entry.includes("late_completion_probe"),
+    )).toBe(true);
+  });
+
+  it("logs composition failures with route and operation but no response payload", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const probe = directBoundedRead(
+      async () => {
+        throw new Error("producer failed with token=secret-value");
+      },
+      "composition_probe",
+    );
+
+    await probe.handled;
+    expect(probe.res.statusCode).toBe(503);
+    expect(probe.res.json()).toMatchObject({
+      error: "dashboard_read_unavailable",
+      reason: "composition_failed",
     });
 
-    await aborted;
+    const logged = errors.mock.calls.map((call) => String(call[1] ?? call[0]));
+    expect(logged.some((entry) =>
+      entry.includes("composition_failed") &&
+      entry.includes("sovereignty") &&
+      entry.includes("composition_probe"),
+    )).toBe(true);
+    expect(logged.join("\n")).not.toContain(probe.res.body);
+  });
+
+  it("does not abort or release the shared producer when one caller closes", async () => {
+    let producerSignal: AbortSignal | undefined;
+    const produce = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<{ status: number; body: Record<string, unknown> }>(() => {
+          producerSignal = signal;
+        }),
+    );
+
+    const probe = directBoundedRead(produce, "caller_close_probe");
+    await Promise.resolve();
+    probe.req.emit("aborted");
+    await probe.handled;
+
+    expect(producerSignal?.aborted).toBe(false);
     expect(getDashboardReadInFlightCount("sovereignty")).toBe(1);
+  });
+
+  it("pins the client read deadline to the server derivation", () => {
+    const client = getClientScript();
+    const milliseconds = client.match(/const DASHBOARD_MILLISECONDS_PER_SECOND = (\d+);/);
+    const seconds = client.match(/const DASHBOARD_READ_DEADLINE_SECONDS = (\d+);/);
+    expect(milliseconds?.[1]).toBe(String(DASHBOARD_MILLISECONDS_PER_SECOND));
+    expect(seconds?.[1]).toBe(String(DASHBOARD_CLIENT_READ_DEADLINE_SECONDS));
+    expect(client).toContain(
+      "const DASHBOARD_READ_DEADLINE_MS = DASHBOARD_READ_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;",
+    );
+    expect(
+      Number(seconds?.[1]) * Number(milliseconds?.[1]),
+    ).toBe(DASHBOARD_CLIENT_READ_DEADLINE_MS);
   });
 });

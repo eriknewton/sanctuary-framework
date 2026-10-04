@@ -2338,6 +2338,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       };
     };
     if (method === "GET" && url.pathname === `${POSTURE_API_PREFIX}/home`) {
+      const deps = await buildDeps();
+      if (deps.auditLog === null) {
+        res.writeHead(503, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({
+          error: "posture_unavailable",
+          reason: "audit log not unlocked; posture cannot be evidenced",
+          origin_machine: deps.originMachine,
+        }));
+        return true;
+      }
       return respondWithBoundedDashboardRead({
         route: "posture_home",
         req,
@@ -2345,7 +2358,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         operation: "get_posture_home",
         produce: async () => ({
           status: 200,
-          body: await buildHome(await buildDeps()),
+          body: await buildHome(deps),
         }),
       });
     }
@@ -8699,8 +8712,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Read the LIVE Castle Wall arm-state from the canonical evidence-gated
     // shaper (never the SHR capability), then assemble the honest payload. The
     // shaper is async, so the handler completes on the promise - mirroring
-    // handleSnapshot - and always answers (an honest `unknown` posture on any
-    // failure, never a thrown 500 that paints green by omission).
+    // handleSnapshot - and failed composition now answers explicit unavailable
+    // rather than a thrown 500 or fabricated green.
     void respondWithBoundedDashboardRead({
       route: "sovereignty",
       req,
@@ -8711,10 +8724,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         return {
           status: 200,
           body: buildSovereigntyRoutePayload({
-          shr,
-          wall,
-          federationPosture,
-          configLoaded: this._sanctuaryConfig != null,
+            shr,
+            wall,
+            federationPosture,
+            configLoaded: this._sanctuaryConfig != null,
           }),
         };
       },
