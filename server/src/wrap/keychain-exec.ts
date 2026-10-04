@@ -145,6 +145,9 @@ function packageRoot(): string | null {
 
 function markerOnDiskNow(): boolean {
   const root = packageRoot();
+  // MUST MATCH `createTestRunMarker` in `test/setup/test-run-marker.ts`: this
+  // reads only directory existence as "under test"; token files are teardown
+  // refcounts and are never inspected here.
   return root !== null && existsSync(join(root, TEST_RUN_MARKER_FILENAME));
 }
 
@@ -204,7 +207,7 @@ function testRunMarkerPresent(): boolean {
  * keychain accumulated tens of thousands of `sanctuary-*` artifacts. Absence of
  * evidence was being read as production.
  *
- * The marker file closes it because a scrubbed environment cannot erase a file.
+ * The marker directory closes it because a scrubbed environment cannot erase a filesystem entry.
  * It is a POSITIVE signal for "a test run is in progress" and is scoped to this
  * checkout, so it does not affect an installed package or a drill running the
  * CLI outside `npm test`.
@@ -376,8 +379,8 @@ export async function execKeychain(
           `scripts/real-backend-check.ts, which runs outside vitest.\n` +
           `\n` +
           `NOT running a test? Then a previous run was killed before it could clean up, ` +
-          `and its marker file is still on disk. Delete it and this refusal stops:\n` +
-          `  rm ${markerPathForDiagnostics()}`
+          `and its marker directory is still on disk. Delete it and this refusal stops:\n` +
+          `  rm -r ${markerPathForDiagnostics()}`
       );
     case "spawn-real":
       return spawnReal(cmd, args, input);
