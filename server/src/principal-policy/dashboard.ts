@@ -75,7 +75,11 @@ import {
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import { isRemoteDashboardBinding } from "../dashboard/remote-binding.js";
-import { respondWithBoundedDashboardRead } from "../dashboard/read-response.js";
+import {
+  createDashboardReadFlightMap,
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
 // Dashboard-fold PR-3 (ratified decision 7): the mobile companion PWA moves
 // onto the ONE surviving surface. The shell/manifest/service-worker are
 // tokenless static assets with client-side auth; see dashboard/mobile.ts for
@@ -112,6 +116,7 @@ import { handleV1Request } from "../v1/router.js";
 import { denyForbidden, denyForbiddenWithRequestId } from "../v1/http.js";
 import {
   buildHome,
+  buildLockedAuditPostureUnavailableBody,
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
@@ -979,6 +984,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private postureStreamRegistry: PostureStreamRegistry =
     createPostureStreamRegistry();
+  private readonly readFlightMap: DashboardReadFlightMap =
+    createDashboardReadFlightMap();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
   private dashboardStreamClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
@@ -2048,6 +2055,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(this.unifiedInboxPrefsStore
           ? { prefsStore: this.unifiedInboxPrefsStore }
           : {}),
+        readFlightMap: this.readFlightMap,
         ...(this.auditLog
           ? { auditLog: this.auditLog }
           : {}),
@@ -2245,6 +2253,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.v11Bindings?.fortressId ??
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
+    const auditLog = this.auditLog ?? null;
     const buildDeps = async (): Promise<PostureRouteDeps> => {
       // Slice R + P: load the pinned producer key once (cached) before serving so
       // the readers can re-verify producer signatures. `present` → activate the
@@ -2263,8 +2272,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const compositionEnabled =
         resolveCompositionConfig().composition_enabled;
       return {
-        auditLog: this.auditLog ?? null,
+        auditLog,
         originMachine,
+        readFlightMap: this.readFlightMap,
         platform: process.platform,
         compositionEnabled,
         // Recognition panel (P5) impure sources, resolved lazily per request so
@@ -2338,17 +2348,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       };
     };
     if (method === "GET" && url.pathname === `${POSTURE_API_PREFIX}/home`) {
-      const deps = await buildDeps();
-      if (deps.auditLog === null) {
+      if (auditLog === null) {
         res.writeHead(503, {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify({
-          error: "posture_unavailable",
-          reason: "audit log not unlocked; posture cannot be evidenced",
-          origin_machine: deps.originMachine,
-        }));
+        res.end(JSON.stringify(buildLockedAuditPostureUnavailableBody(originMachine)));
         return true;
       }
       return respondWithBoundedDashboardRead({
@@ -2356,10 +2361,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         req,
         res,
         operation: "get_posture_home",
-        produce: async () => ({
-          status: 200,
-          body: await buildHome(deps),
-        }),
+        readFlights: this.readFlightMap,
+        originMachine,
+        produce: async () => {
+          const deps = await buildDeps();
+          return {
+            status: 200,
+            body: await buildHome(deps),
+          };
+        },
       });
     }
     return handlePostureRoute(await buildDeps(), req, res, url, method);
@@ -8719,6 +8729,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       req,
       res,
       operation: "get_sovereignty",
+      readFlights: this.readFlightMap,
       produce: async () => {
         const wall = await this.buildStatusCastleWall();
         return {

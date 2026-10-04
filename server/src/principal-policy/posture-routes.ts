@@ -48,7 +48,10 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { respondWithBoundedDashboardRead } from "../dashboard/read-response.js";
+import {
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
@@ -140,6 +143,8 @@ export interface PostureRouteDeps {
   auditLog: AuditLog | null;
   /** Origin-machine attribution for `/v1`-compatible shapes. */
   originMachine: string;
+  /** Owning dashboard instance's bounded-read flights; absent only in direct route tests. */
+  readFlightMap?: DashboardReadFlightMap;
   /**
    * Recognition precursor: the resolved `composition_enabled` flag (default-off
    * via `resolveCompositionConfig()`). This is CONFIG, not evidence: it is the
@@ -309,6 +314,18 @@ export interface PostureRouteDeps {
     | Promise<ExclusiveEgressStatus | null>
     | ExclusiveEgressStatus
     | null;
+}
+
+export function buildLockedAuditPostureUnavailableBody(originMachine: string): {
+  error: "posture_unavailable";
+  reason: "audit log not unlocked; posture cannot be evidenced";
+  origin_machine: string;
+} {
+  return {
+    error: "posture_unavailable",
+    reason: "audit log not unlocked; posture cannot be evidenced",
+    origin_machine: originMachine,
+  };
 }
 
 /**
@@ -485,11 +502,7 @@ export async function handlePostureRoute(
   // cannot prove enforcement or count operations - fail closed to a 503 that
   // says so honestly (never an empty-but-green payload).
   if (deps.auditLog === null) {
-    writeJSON(res, 503, {
-      error: "posture_unavailable",
-      reason: "audit log not unlocked; posture cannot be evidenced",
-      origin_machine: om,
-    });
+    writeJSON(res, 503, buildLockedAuditPostureUnavailableBody(om));
     return true;
   }
 
@@ -676,6 +689,8 @@ export async function handlePostureRoute(
         req: _req,
         res,
         operation: "get_posture_home",
+        readFlights: deps.readFlightMap,
+        originMachine: om,
         produce: async () => ({
           status: 200,
           body: await buildHome(deps),

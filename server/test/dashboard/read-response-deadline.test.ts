@@ -38,6 +38,7 @@ import {
   getDashboardReadInFlightCount,
   respondWithBoundedDashboardRead,
   resetDashboardReadInFlightForTests,
+  type DashboardReadFlightMap,
 } from "../../src/dashboard/read-response.js";
 
 const TEST_AUTH_TOKEN = "dashboard-read-deadline-token";
@@ -52,6 +53,8 @@ const TEST_HARNESS_TIMEOUT_MS =
   DEADLINE_SLACK_MS +
   FAST_REFUSAL_HALF_SECOND_MS +
   TEST_HARNESS_SLACK_SECONDS * MILLISECONDS_PER_SECOND;
+const PRODUCER_START_POLL_MS = 10;
+const PRODUCER_START_TIMEOUT_MS = 500;
 
 class MockIncomingMessage extends EventEmitter {
   headers: Record<string, string> = {};
@@ -145,12 +148,16 @@ class TestIdentityManager {
 async function startDashboardWithStalledReads(options: {
   auditLocked?: boolean;
   stallExclusiveEgress?: boolean;
+  stallProducerKeyLoad?: boolean;
+  prefsLoad?: ReturnType<typeof vi.fn>;
 } = {}): Promise<{
   baseUrl: string;
   stop: () => Promise<void>;
   prefsLoad: ReturnType<typeof vi.fn>;
   enforcementRead: ReturnType<typeof vi.fn>;
   exclusiveEgressRead: ReturnType<typeof vi.fn>;
+  producerKeyLoad: ReturnType<typeof vi.fn> | null;
+  readFlightMap: DashboardReadFlightMap;
 }> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
@@ -164,9 +171,18 @@ async function startDashboardWithStalledReads(options: {
     auth_token: TEST_AUTH_TOKEN,
     auto_open: false,
   });
-  const prefsLoad = vi.fn(() => new Promise<InboxFilterPrefs>(() => undefined));
+  const prefsLoad =
+    options.prefsLoad ?? vi.fn(() => new Promise<InboxFilterPrefs>(() => undefined));
   const enforcementRead = vi.fn(() => new Promise<never>(() => undefined));
   const exclusiveEgressRead = vi.fn(() => new Promise<never>(() => undefined));
+  const producerKeyLoad =
+    options.stallProducerKeyLoad === true
+      ? vi.fn(() => new Promise<void>(() => undefined))
+      : null;
+  if (producerKeyLoad) {
+    (dashboard as unknown as { ensureProducerKeyLoaded: () => Promise<void> })
+      .ensureProducerKeyLoaded = producerKeyLoad;
+  }
 
   dashboard.setDependencies({
     policy: {
@@ -220,6 +236,9 @@ async function startDashboardWithStalledReads(options: {
     prefsLoad,
     enforcementRead,
     exclusiveEgressRead,
+    producerKeyLoad,
+    readFlightMap: (dashboard as unknown as { readFlightMap: DashboardReadFlightMap })
+      .readFlightMap,
   };
 }
 
@@ -242,6 +261,15 @@ async function readJson(path: string, baseUrl: string): Promise<{
   });
   const body = await res.json() as Record<string, unknown>;
   return { elapsedMs: Date.now() - started, status: res.status, body };
+}
+
+async function waitForProducerStart(
+  producer: ReturnType<typeof vi.fn>,
+): Promise<void> {
+  const deadline = Date.now() + PRODUCER_START_TIMEOUT_MS;
+  while (producer.mock.calls.length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, PRODUCER_START_POLL_MS));
+  }
 }
 
 afterEach(() => {
@@ -280,7 +308,7 @@ describe("dashboard bounded read responses", () => {
         reason: "deadline_exceeded",
       });
       expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
-      expect(getDashboardReadInFlightCount("unified_inbox_prefs")).toBe(1);
+      expect(getDashboardReadInFlightCount("unified_inbox_prefs", rig.readFlightMap)).toBe(1);
 
       const retryStarted = Date.now();
       const retryA = await readJson("/api/inbox/unified/prefs", rig.baseUrl);
@@ -308,7 +336,7 @@ describe("dashboard bounded read responses", () => {
         reason: "deadline_exceeded",
       });
       expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
-      expect(getDashboardReadInFlightCount("posture_home")).toBe(1);
+      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(1);
 
       const retryStarted = Date.now();
       const retryA = await readJson("/api/posture/home", rig.baseUrl);
@@ -324,6 +352,111 @@ describe("dashboard bounded read responses", () => {
     }
   }, TEST_HARNESS_TIMEOUT_MS);
 
+  it("GET /api/posture/home budgets stalled producer-key loading and caps retry waves", async () => {
+    const rig = await startDashboardWithStalledReads({
+      stallProducerKeyLoad: true,
+    });
+    try {
+      const first = await readJson("/api/posture/home", rig.baseUrl);
+      expect(first.status, JSON.stringify(first.body)).toBe(503);
+      expect(first.body).toMatchObject({
+        ok: false,
+        error: "dashboard_read_unavailable",
+        route: "posture_home",
+        reason: "deadline_exceeded",
+        origin_machine: expect.any(String),
+      });
+      expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
+      expect(getDashboardReadInFlightCount("posture_home", rig.readFlightMap)).toBe(1);
+
+      const retryStarted = Date.now();
+      const retryA = await readJson("/api/posture/home", rig.baseUrl);
+      const retryB = await readJson("/api/posture/home", rig.baseUrl);
+      expect(Date.now() - retryStarted).toBeLessThan(FAST_REFUSAL_HALF_SECOND_MS);
+      expect(retryA.status).toBe(503);
+      expect(retryB.status).toBe(503);
+      expect(retryA.body).toMatchObject({
+        reason: "in_flight_limit",
+        origin_machine: expect.any(String),
+      });
+      expect(retryB.body).toMatchObject({
+        reason: "in_flight_limit",
+        origin_machine: expect.any(String),
+      });
+      expect(rig.producerKeyLoad).toHaveBeenCalledTimes(1);
+      expect(rig.enforcementRead).not.toHaveBeenCalled();
+    } finally {
+      await rig.stop();
+    }
+  }, TEST_HARNESS_TIMEOUT_MS);
+
+  it("keeps read flights scoped to their owning dashboard instance", async () => {
+    let resolveFirst:
+      | ((value: InboxFilterPrefs) => void)
+      | undefined;
+    let resolveSecond:
+      | ((value: InboxFilterPrefs) => void)
+      | undefined;
+    const firstPrefsLoad = vi.fn(
+      () =>
+        new Promise<InboxFilterPrefs>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+    const secondPrefsLoad = vi.fn(
+      () =>
+        new Promise<InboxFilterPrefs>((resolve) => {
+          resolveSecond = resolve;
+        }),
+    );
+    const firstRig = await startDashboardWithStalledReads({
+      prefsLoad: firstPrefsLoad,
+    });
+    const secondRig = await startDashboardWithStalledReads({
+      prefsLoad: secondPrefsLoad,
+    });
+    try {
+      const firstRead = readJson("/api/inbox/unified/prefs", firstRig.baseUrl);
+      await waitForProducerStart(firstPrefsLoad);
+      expect(firstPrefsLoad).toHaveBeenCalledTimes(1);
+      const secondRead = readJson("/api/inbox/unified/prefs", secondRig.baseUrl);
+      await waitForProducerStart(secondPrefsLoad);
+
+      resolveFirst?.({
+        search: "first-instance",
+        source: "",
+        severity: "",
+        agent: "",
+        from: "",
+        to: "",
+      });
+      if (resolveSecond) {
+        resolveSecond({
+          search: "second-instance",
+          source: "",
+          severity: "",
+          agent: "",
+          from: "",
+          to: "",
+        });
+      }
+
+      const first = await firstRead;
+      const second = await secondRead;
+      expect(firstPrefsLoad).toHaveBeenCalledTimes(1);
+      expect(secondPrefsLoad).toHaveBeenCalledTimes(1);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect((first.body.data as { filters: InboxFilterPrefs }).filters.search)
+        .toBe("first-instance");
+      expect((second.body.data as { filters: InboxFilterPrefs }).filters.search)
+        .toBe("second-instance");
+    } finally {
+      await firstRig.stop();
+      await secondRig.stop();
+    }
+  });
+
   it("GET /api/sovereignty returns unavailable within the server budget and caps retry waves", async () => {
     const rig = await startDashboardWithStalledReads({
       stallExclusiveEgress: true,
@@ -338,7 +471,7 @@ describe("dashboard bounded read responses", () => {
         reason: "deadline_exceeded",
       });
       expect(first.elapsedMs).toBeLessThan(DASHBOARD_READ_RESPONSE_DEADLINE_MS + DEADLINE_SLACK_MS);
-      expect(getDashboardReadInFlightCount("sovereignty")).toBe(1);
+      expect(getDashboardReadInFlightCount("sovereignty", rig.readFlightMap)).toBe(1);
 
       const retryStarted = Date.now();
       const retryA = await readJson("/api/sovereignty", rig.baseUrl);

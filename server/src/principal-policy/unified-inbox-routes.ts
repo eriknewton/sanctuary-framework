@@ -18,7 +18,10 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { respondWithBoundedDashboardRead } from "../dashboard/read-response.js";
+import {
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
 import {
   authMiddleware,
   type AuthConfig,
@@ -53,6 +56,7 @@ export interface UnifiedInboxRouterDeps {
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
   prefsStore?: UnifiedInboxPrefsStore;
+  readFlightMap?: DashboardReadFlightMap;
   auditLog?: import("../operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;
@@ -197,6 +201,7 @@ export async function handleUnifiedInboxRoute(
           req,
           res,
           operation: "get_unified_inbox_prefs",
+          readFlights: deps.readFlightMap,
           produce: async () => ({
             status: 200,
             body: {
