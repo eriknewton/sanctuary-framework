@@ -143,7 +143,7 @@ export interface PostureRouteDeps {
   auditLog: AuditLog | null;
   /** Origin-machine attribution for `/v1`-compatible shapes. */
   originMachine: string;
-  /** Owning dashboard instance's bounded-read flights; absent only in direct route tests. */
+  /** Owning dashboard instance's bounded-read flights (one map per running dashboard server). */
   // Required: each dashboard instance owns its flight map (must match the required
   // `readFlights` option in src/dashboard/read-response.ts).
   readFlightMap: DashboardReadFlightMap;

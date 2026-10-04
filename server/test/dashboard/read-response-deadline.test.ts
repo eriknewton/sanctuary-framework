@@ -638,7 +638,7 @@ describe("dashboard bounded read responses", () => {
 });
 
 describe("wrap dashboard servers keep their own bounded-read flights", () => {
-  it("two startDashboardServer instances in one process never join each other's posture flight", async () => {
+  it("a startDashboardServer joins its own concurrent posture reads and never another server's", async () => {
     const { startDashboardServer } = await import("../../src/dashboard/server.js");
     // Instance A's claim resolves after this delay so its flight is still open
     // when instance B is asked; 1500 ms sits well inside the 4 s read deadline.
@@ -677,10 +677,15 @@ describe("wrap dashboard servers keep their own bounded-read flights", () => {
     try {
       const pendingA = readJson("/api/posture/home", a.base);
       await new Promise((resolve) => setTimeout(resolve, B_REQUEST_DELAY_MS));
+      // A second read on the SAME server while A's flight is open must join it.
+      const pendingA2 = readJson("/api/posture/home", a.base);
       const fromB = await readJson("/api/posture/home", b.base);
-      const fromA = await pendingA;
+      const [fromA, fromA2] = await Promise.all([pendingA, pendingA2]);
       expect(fromA.body.origin_machine).toBe(a.origin);
+      expect(fromA2.status).toBe(200);
+      expect(fromA2.body.origin_machine).toBe(a.origin);
       expect(fromB.body.origin_machine).toBe(b.origin);
+      expect(calls.a).toBe(1);
       expect(calls.b).toBe(1);
     } finally {
       await a.handle.stop();

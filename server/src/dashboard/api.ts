@@ -59,24 +59,8 @@ import {
 import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 import { ASCII_LABEL_RE } from "../core/token-grammar.js";
-import {
-  createDashboardReadFlightMap,
-  type DashboardReadFlightMap,
-} from "./read-response.js";
+import type { DashboardReadFlightMap } from "./read-response.js";
 
-// One bounded-read flight map per APIDeps (one per started dashboard server).
-// A process-wide map let two dashboards in one process join each other's
-// posture flights and serve each other's data; keying by the server's own deps
-// object scopes flights to that server and lets the map go with it.
-const readFlightMapByDeps = new WeakMap<APIDeps, DashboardReadFlightMap>();
-function readFlightMapFor(deps: APIDeps): DashboardReadFlightMap {
-  let map = readFlightMapByDeps.get(deps);
-  if (!map) {
-    map = createDashboardReadFlightMap();
-    readFlightMapByDeps.set(deps, map);
-  }
-  return map;
-}
 
 export { constantTimeEquals };
 
@@ -87,6 +71,14 @@ export interface ApprovalHandlers {
 
 export interface APIDeps {
   sources: AggregatorSources;
+  /**
+   * The started server's single bounded-read flight map. Required, and created
+   * once per server by the caller (never per request): deps objects are rebuilt
+   * on every request, so a map made here per call would never join concurrent
+   * reads, and a process-wide one would join reads across servers.
+   * Must match the required `readFlights` option in ./read-response.ts.
+   */
+  readFlightMap: DashboardReadFlightMap;
   authToken?: string;
   sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
@@ -411,7 +403,7 @@ export async function handleRequest(
     }
     const handled = await handlePostureRoute(
       {
-        readFlightMap: readFlightMapFor(deps),
+        readFlightMap: deps.readFlightMap,
         auditLog: deps.sources.auditLog ?? null,
         originMachine:
           deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",
