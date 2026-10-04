@@ -56,7 +56,9 @@ export interface UnifiedInboxRouterDeps {
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
   prefsStore?: UnifiedInboxPrefsStore;
-  readFlightMap?: DashboardReadFlightMap;
+  // Required: each dashboard instance owns its flight map (must match the required
+  // `readFlights` option in src/dashboard/read-response.ts).
+  readFlightMap: DashboardReadFlightMap;
   auditLog?: import("../operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;

@@ -59,6 +59,24 @@ import {
 import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 import { ASCII_LABEL_RE } from "../core/token-grammar.js";
+import {
+  createDashboardReadFlightMap,
+  type DashboardReadFlightMap,
+} from "./read-response.js";
+
+// One bounded-read flight map per APIDeps (one per started dashboard server).
+// A process-wide map let two dashboards in one process join each other's
+// posture flights and serve each other's data; keying by the server's own deps
+// object scopes flights to that server and lets the map go with it.
+const readFlightMapByDeps = new WeakMap<APIDeps, DashboardReadFlightMap>();
+function readFlightMapFor(deps: APIDeps): DashboardReadFlightMap {
+  let map = readFlightMapByDeps.get(deps);
+  if (!map) {
+    map = createDashboardReadFlightMap();
+    readFlightMapByDeps.set(deps, map);
+  }
+  return map;
+}
 
 export { constantTimeEquals };
 
@@ -393,6 +411,7 @@ export async function handleRequest(
     }
     const handled = await handlePostureRoute(
       {
+        readFlightMap: readFlightMapFor(deps),
         auditLog: deps.sources.auditLog ?? null,
         originMachine:
           deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",

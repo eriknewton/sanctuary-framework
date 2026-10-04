@@ -37,7 +37,7 @@ import {
   DASHBOARD_READ_RESPONSE_DEADLINE_MS,
   getDashboardReadInFlightCount,
   respondWithBoundedDashboardRead,
-  resetDashboardReadInFlightForTests,
+  createDashboardReadFlightMap,
   type DashboardReadFlightMap,
 } from "../../src/dashboard/read-response.js";
 
@@ -93,6 +93,9 @@ class MockServerResponse extends EventEmitter {
   }
 }
 
+// The direct-wrapper tests own one flight map, replaced after each test.
+let directReadFlights = createDashboardReadFlightMap();
+
 function directBoundedRead<T>(
   produce: (signal: AbortSignal) => Promise<{ status: number; body: T }>,
   operation = "direct_test_read",
@@ -109,6 +112,7 @@ function directBoundedRead<T>(
     res: res as unknown as ServerResponse,
     operation,
     produce,
+    readFlights: directReadFlights,
   });
   return { req, res, handled };
 }
@@ -275,7 +279,7 @@ async function waitForProducerStart(
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-  resetDashboardReadInFlightForTests();
+  directReadFlights = createDashboardReadFlightMap();
 });
 
 describe("dashboard bounded read responses", () => {
@@ -513,7 +517,7 @@ describe("dashboard bounded read responses", () => {
     expect(second.res.statusCode).toBe(200);
     expect(first.res.json()).toEqual({ ok: true, shared: "route-wide" });
     expect(second.res.json()).toEqual({ ok: true, shared: "route-wide" });
-    expect(getDashboardReadInFlightCount("sovereignty")).toBe(0);
+    expect(getDashboardReadInFlightCount("sovereignty", directReadFlights)).toBe(0);
   });
 
   it("refuses only overdue flights, suppresses late success, and starts fresh after producer settlement", async () => {
@@ -540,7 +544,7 @@ describe("dashboard bounded read responses", () => {
       error: "dashboard_read_unavailable",
       reason: "deadline_exceeded",
     });
-    expect(getDashboardReadInFlightCount("sovereignty")).toBe(1);
+    expect(getDashboardReadInFlightCount("sovereignty", directReadFlights)).toBe(1);
 
     const refused = directBoundedRead(produce, "late_completion_probe");
     await refused.handled;
@@ -557,7 +561,7 @@ describe("dashboard bounded read responses", () => {
     await Promise.resolve();
     expect(first.res.statusCode).toBe(503);
     expect(first.res.json()).toMatchObject({ reason: "deadline_exceeded" });
-    expect(getDashboardReadInFlightCount("sovereignty")).toBe(0);
+    expect(getDashboardReadInFlightCount("sovereignty", directReadFlights)).toBe(0);
 
     const fresh = directBoundedRead(produce, "late_completion_probe");
     await Promise.resolve();
@@ -615,7 +619,7 @@ describe("dashboard bounded read responses", () => {
     await probe.handled;
 
     expect(producerSignal?.aborted).toBe(false);
-    expect(getDashboardReadInFlightCount("sovereignty")).toBe(1);
+    expect(getDashboardReadInFlightCount("sovereignty", directReadFlights)).toBe(1);
   });
 
   it("pins the client read deadline to the server derivation", () => {
@@ -632,3 +636,56 @@ describe("dashboard bounded read responses", () => {
     ).toBe(DASHBOARD_CLIENT_READ_DEADLINE_MS);
   });
 });
+
+describe("wrap dashboard servers keep their own bounded-read flights", () => {
+  it("two startDashboardServer instances in one process never join each other's posture flight", async () => {
+    const { startDashboardServer } = await import("../../src/dashboard/server.js");
+    // Instance A's claim resolves after this delay so its flight is still open
+    // when instance B is asked; 1500 ms sits well inside the 4 s read deadline.
+    const SLOW_CLAIM_MS = 1500;
+    const B_REQUEST_DELAY_MS = 150;
+    const calls = { a: 0, b: 0 };
+    async function startWrap(label: string, claim: () => unknown) {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const identityManager = new TestIdentityManager(masterKey);
+      const port = await getFreePort();
+      const handle = await startDashboardServer({
+        port,
+        host: "127.0.0.1",
+        authToken: TEST_AUTH_TOKEN,
+        mode: "co-located",
+        sources: {
+          mode: "co-located",
+          server_version: label,
+          auditLog,
+          identityManager,
+          resolveProtectionClaimSubject: claim,
+        } as never,
+      });
+      return { handle, base: `http://127.0.0.1:${port}`, origin: identityManager.getPrimaryIdentityId() };
+    }
+    const a = await startWrap("A", () => {
+      calls.a += 1;
+      return new Promise((resolve) => setTimeout(() => resolve(null), SLOW_CLAIM_MS));
+    });
+    const b = await startWrap("B", () => {
+      calls.b += 1;
+      return null;
+    });
+    try {
+      const pendingA = readJson("/api/posture/home", a.base);
+      await new Promise((resolve) => setTimeout(resolve, B_REQUEST_DELAY_MS));
+      const fromB = await readJson("/api/posture/home", b.base);
+      const fromA = await pendingA;
+      expect(fromA.body.origin_machine).toBe(a.origin);
+      expect(fromB.body.origin_machine).toBe(b.origin);
+      expect(calls.b).toBe(1);
+    } finally {
+      await a.handle.stop();
+      await b.handle.stop();
+    }
+  }, TEST_HARNESS_TIMEOUT_MS);
+});
+

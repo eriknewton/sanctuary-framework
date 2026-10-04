@@ -18,7 +18,9 @@ interface DashboardBoundedReadOptions<T> {
   res: ServerResponse;
   operation: string;
   produce: (signal: AbortSignal) => Promise<DashboardReadResponse<T>>;
-  readFlights?: DashboardReadFlightMap;
+  // Required, never defaulted: a shared default map let two dashboard instances in one
+  // process join each other's flights and serve each other's data (round-3 closure read).
+  readFlights: DashboardReadFlightMap;
   originMachine?: string;
 }
 
@@ -51,7 +53,6 @@ export const DASHBOARD_READ_ROUTE_SINGLE_FLIGHT_CAP = 1;
 export const DASHBOARD_RETRY_AFTER_SECONDS = Math.ceil(
   DASHBOARD_RESPONSE_FLUSH_HEADROOM_MS / DASHBOARD_MILLISECONDS_PER_SECOND,
 );
-const inFlightByRoute = createDashboardReadFlightMap();
 
 export function createDashboardReadFlightMap(): DashboardReadFlightMap {
   return new Map<DashboardBoundedReadRoute, DashboardReadFlight<unknown>>();
@@ -92,13 +93,9 @@ function logDashboardReadFailure(
 
 export function getDashboardReadInFlightCount(
   route: DashboardBoundedReadRoute,
-  readFlights: DashboardReadFlightMap = inFlightByRoute,
+  readFlights: DashboardReadFlightMap,
 ): number {
   return readFlights.has(route) ? DASHBOARD_READ_ROUTE_SINGLE_FLIGHT_CAP : 0;
-}
-
-export function resetDashboardReadInFlightForTests(): void {
-  inFlightByRoute.clear();
 }
 
 /**
@@ -118,7 +115,7 @@ export function respondWithBoundedDashboardRead<T>(
   options: DashboardBoundedReadOptions<T>,
 ): Promise<boolean> {
   const { route, req, res, operation, produce, originMachine } = options;
-  const readFlights = options.readFlights ?? inFlightByRoute;
+  const { readFlights } = options;
   const existing = readFlights.get(route) as DashboardReadFlight<T> | undefined;
   const flight = existing ?? startReadFlight(readFlights, route, produce);
 

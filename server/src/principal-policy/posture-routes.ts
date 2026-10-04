@@ -144,7 +144,9 @@ export interface PostureRouteDeps {
   /** Origin-machine attribution for `/v1`-compatible shapes. */
   originMachine: string;
   /** Owning dashboard instance's bounded-read flights; absent only in direct route tests. */
-  readFlightMap?: DashboardReadFlightMap;
+  // Required: each dashboard instance owns its flight map (must match the required
+  // `readFlights` option in src/dashboard/read-response.ts).
+  readFlightMap: DashboardReadFlightMap;
   /**
    * Recognition precursor: the resolved `composition_enabled` flag (default-off
    * via `resolveCompositionConfig()`). This is CONFIG, not evidence: it is the
