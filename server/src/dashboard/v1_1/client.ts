@@ -106,6 +106,11 @@ let homeFreshnessTimer = null;
 const DASHBOARD_MILLISECONDS_PER_SECOND = 1000;
 const DASHBOARD_READ_DEADLINE_SECONDS = 5;
 const DASHBOARD_READ_DEADLINE_MS = DASHBOARD_READ_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;
+const SEAL_REREAD_MIN_INTERVAL_DIVISOR = 20;
+// Derived as 10m / 20 = 30s, plus the 5s read deadline: an edge-of-window
+// payload can redraw stale immediately without creating a sub-second read loop.
+const DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS = (SEAL_FRESHNESS_MAX_MS / SEAL_REREAD_MIN_INTERVAL_DIVISOR) + DASHBOARD_READ_DEADLINE_MS;
+const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = 1; // One millisecond moves past the inclusive freshness boundary.
 const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
 const pendingReads = new Map();
 // Invariant: every panel tracks one explicit read state per source; only
@@ -120,7 +125,7 @@ const sourceReads = new Map([
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
   "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
   "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings"
-].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0 }]; }));
+].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0, lastReadAt: 0 }]; }));
 const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
 function readKey(url) {
   const parsed = new URL(url, location.origin);
@@ -337,7 +342,7 @@ function readResponse(url, init, deadlineMs) {
   if (source && source.state === "state_FAILED" && Date.now() < source.nextReadAt) {
     const error = new Error(source.error); error.status = source.status; return Promise.reject(error);
   }
-  if (source) { clearSealFreshnessTimer(url); source.state = "state_LOADING"; source.error = null; rerender(); }
+  if (source) { clearSealFreshnessTimer(url); source.lastReadAt = Date.now(); source.state = "state_LOADING"; source.error = null; rerender(); }
   const controller = new AbortController();
   let timer;
   const expired = new Promise(function (_, reject) {
@@ -3503,23 +3508,19 @@ async function fetchSovereignty() {
 // approve/deny or mutation is issued here. A read failure leaves
 // state.posture.home null and the Posture screen shows an honest "could not
 // load" state, never fabricated data.
-function scheduleHomeFreshness() {
-  clearTimeout(homeFreshnessTimer);
-  const home = state.posture.home;
-  if (!home) return;
+function postureHomeExpiryAt(home) {
+  if (!home) return null;
   // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
   const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
-    return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
-  }); // One millisecond moves past the inclusive freshness boundary.
-  // Invariant: expired evidence removes protection claims immediately; only the following LOADED read may restore them.
-  if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
-}
-function postureHomeRefreshAt(home) {
-  if (!home) return null;
-  const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
-    return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
-  }); // One millisecond moves past the inclusive freshness boundary.
+    return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + SEAL_FRESHNESS_BOUNDARY_OFFSET_MS;
+  });
   return expiries.length ? Math.min.apply(null, expiries) : null;
+}
+function scheduleHomeFreshness() {
+  clearTimeout(homeFreshnessTimer);
+  const refreshAt = postureHomeExpiryAt(state.posture.home);
+  // Invariant: expired evidence removes protection claims immediately; only the following LOADED read may restore them.
+  if (refreshAt !== null) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, refreshAt - Date.now());
 }
 async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
@@ -3538,7 +3539,7 @@ async function fetchPostureHome() {
       body.anomaly_findings_unknown = state.posture.anomaliesUnknown !== false;
       state.posture.home = body;
       scheduleHomeFreshness();
-      scheduleSealFreshnessRefresh("/api/posture/home", { current: true, refreshAt: postureHomeRefreshAt(body) });
+      scheduleSealFreshnessRefresh("/api/posture/home", { current: true, refreshAt: postureHomeExpiryAt(body) });
       state.posture.homeError = null;
     }
   } catch (e) {
@@ -3682,20 +3683,24 @@ function deriveSealFreshness(live, now) {
     detail: shortTime(iso) + " (" + ageLabel + " ago)",
     windowLabel: windowLabel,
     windowKnown: true,
-    refreshAt: current ? observedAt + windowMs + 1 : null,
+    refreshAt: current ? observedAt + windowMs + SEAL_FRESHNESS_BOUNDARY_OFFSET_MS : null,
     what: what
   };
 }
 
+function clearSealFreshnessTimerValue(value) {
+  if (Array.isArray(value)) value.forEach(function (timer) { clearTimeout(timer); });
+  else clearTimeout(value);
+}
 function clearSealFreshnessTimer(path) {
   if (path === undefined) {
-    sealFreshnessTimers.forEach(function (timer) { clearTimeout(timer); });
+    sealFreshnessTimers.forEach(clearSealFreshnessTimerValue);
     sealFreshnessTimers.clear();
     return;
   }
   const key = readKey(path);
-  const timer = sealFreshnessTimers.get(key);
-  if (timer !== undefined) clearTimeout(timer);
+  const timers = sealFreshnessTimers.get(key);
+  if (timers !== undefined) clearSealFreshnessTimerValue(timers);
   sealFreshnessTimers.delete(key);
 }
 
@@ -3707,13 +3712,22 @@ function scheduleSealFreshnessRefresh(path, freshness) {
     typeof freshness.refreshAt !== "number" ||
     !Number.isFinite(freshness.refreshAt)
   ) return;
-  const delayMs = Math.max(0, freshness.refreshAt - Date.now());
+  const source = sourceRead(path);
+  const lastReadAt = source && Number.isFinite(source.lastReadAt) ? source.lastReadAt : 0;
+  const rereadAt = Math.max(freshness.refreshAt, lastReadAt + DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS);
+  const expiryDelayMs = Math.max(0, freshness.refreshAt - Date.now());
+  const rereadDelayMs = Math.max(0, rereadAt - Date.now());
   const key = readKey(path);
-  sealFreshnessTimers.set(key, setTimeout(function () {
+  const expiryTimer = setTimeout(function () {
+    // Invariant: the visual protection claim expires on the evidence boundary even when the network re-read is rate-limited.
+    rerender();
+  }, expiryDelayMs);
+  const rereadTimer = setTimeout(function () {
     sealFreshnessTimers.delete(key);
     // Invariant: the source is set loading before the network read, so expired evidence cannot keep rendering Protected while the re-read is pending.
     queueStreamRefresh([path]);
-  }, delayMs));
+  }, rereadDelayMs);
+  sealFreshnessTimers.set(key, [expiryTimer, rereadTimer]);
 }
 
 // Wave 1: map the honest Castle Wall arm-state to the operator-facing seal.
@@ -4213,6 +4227,7 @@ function connectStream() {
 
 function stopLiveUpdates() {
   liveUpdatesStopped = true;
+  clearSealFreshnessTimer();
   sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
   rerender();
 }

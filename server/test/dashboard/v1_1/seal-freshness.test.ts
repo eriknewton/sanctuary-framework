@@ -241,10 +241,13 @@ function liftSealHarness(): SealHarness {
   const src = getClientScript();
   const maxLine = src.match(/const SEAL_FRESHNESS_MAX_MS = [^;]+;/)?.[0];
   if (!maxLine) throw new Error("SEAL_FRESHNESS_MAX_MS not found");
+  const boundaryLine = src.match(/const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = [^;]+;/)?.[0];
+  if (!boundaryLine) throw new Error("SEAL_FRESHNESS_BOUNDARY_OFFSET_MS not found");
   const pieces = [
     'const state = { tier1: { lockdown: { state: "idle" } }, posture: { data: null } };',
     "function sourceLoaded() { return true; }", // These fixtures represent completed sovereignty reads.
     maxLine,
+    boundaryLine,
     "let sealFreshnessTimer = null;",
     "let __rerenderCount = 0;",
     "function makeEl() { const classes = new Set(); return { textContent: '', hidden: false, attrs: {}, classList: { add: function () { for (let i = 0; i < arguments.length; i++) classes.add(arguments[i]); }, remove: function () { for (let i = 0; i < arguments.length; i++) classes.delete(arguments[i]); }, has: function (name) { return classes.has(name); } }, setAttribute: function (k, v) { this.attrs[k] = String(v); } }; }",
