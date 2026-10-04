@@ -6,20 +6,44 @@ const DEADLINE_MS = 5 * 1000; // UI responsiveness budget, not evidence freshnes
 const home = { origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest: {}, protection_requested_count: 0, enforcement_confirmed_count: 0 };
 const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
 const pending = () => new Promise<never>(() => {});
-function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub") {
+function testElement() {
+  const classes = new Set<string>();
+  return {
+    innerHTML: "",
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    attrs: {} as Record<string, string>,
+    classList: {
+      add: (...names: string[]) => names.forEach(name => classes.add(name)),
+      remove: (...names: string[]) => names.forEach(name => classes.delete(name)),
+      has: (name: string) => classes.has(name),
+    },
+    setAttribute(key: string, value: string) { this.attrs[key] = String(value); },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+}
+function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub", opts: { topbar?: boolean } = {}) {
   const calls: string[] = [];
   const urls: string[] = [];
   const fortress = { innerHTML: "" };
   const streams: { onerror?: () => void; close: () => void; listeners: Record<string, (event: { data: string }) => void> }[] = [];
   const main = { innerHTML: "", querySelector: () => null, querySelectorAll: () => [] };
   const listeners: Record<string, (event: unknown) => void> = {};
+  const elements: Record<string, ReturnType<typeof testElement>> = {};
+  if (opts.topbar) {
+    ["sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word", "posture-seal-freshness", "posture-seal-pop"].forEach(id => {
+      elements[id] = testElement();
+    });
+  }
   class Element {
     parentElement = null;
     getAttribute(name: string) { return name === "data-action" ? "retry-panel" : name === "data-read" ? "/api/posture/home" : null; }
     closest() { return null; }
   }
   const context = createContext({
-    document: { getElementById: (id: string) => id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null, addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
+    document: { getElementById: (id: string) => elements[id] || (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null), addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
     sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Element, Date,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, EventSource: class { listeners: Record<string, (event: { data: string }) => void> = {}; constructor() { streams.push(this); } close() {} addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; } },
@@ -31,7 +55,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
     },
   });
   runInContext(getClientScript(), context);
-  return { calls, urls, main, fortress, streams, context, click: (target: unknown) => listeners.click({ target }), retry: () => listeners.click({ target: new Element() }) };
+  return { calls, urls, main, fortress, streams, elements, context, click: (target: unknown) => listeners.click({ target }), retry: () => listeners.click({ target: new Element() }) };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => vi.useRealTimers());
@@ -252,7 +276,7 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('let focused = false; document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : key === "data-read" ? "/api/posture/home" : null; } }; document.getElementById("main").querySelector = function (selector) { return selector.includes("retry-panel") && selector.includes("data-read") ? { focus: function () { focused = true; } } : null; }; state.posture.homeError = "new error"; rerender()', h.context);
     expect(runInContext('focused', h.context)).toBe(false);
   });
-  it("fresh home evidence expires without a refresh and unread evidence never becomes Enforcing", async () => {
+  it("fresh home evidence expires before a current read and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
     const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();
     expect(h.main.innerHTML).toContain(">Enforcing</span>");
@@ -266,6 +290,156 @@ describe("dashboard bounded independent hydration", () => {
     expect(runInContext('deriveSeal().word', h.context)).toBe("Protected"); hang = true;
     runInContext('void fetchAll()', h.context); await settle();
     expect(runInContext('deriveSeal().word', h.context)).toBe("Unknown");
+  });
+  it("topbar seal redraws at evidence expiry, then re-reads once per source and recovers Protected after LOADED evidence", async () => {
+    vi.useFakeTimers();
+    const baseTime = new Date("2026-10-04T12:00:00Z");
+    vi.setSystemTime(baseTime);
+    let sovereigntyReads = 0;
+    let homeReads = 0;
+    let releaseSovereignty!: (value: unknown) => void;
+    let releaseHome!: (value: unknown) => void;
+    const sovereigntyBody = () => ({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } });
+    const homeBody = () => ({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 }, agents: [] });
+    const h = harness({
+      "/api/sovereignty": () => ++sovereigntyReads === 1 ? response(sovereigntyBody()) : new Promise(resolve => { releaseSovereignty = resolve; }),
+      "/api/posture/home": () => ++homeReads === 1 ? response(homeBody()) : new Promise(resolve => { releaseHome = resolve; }),
+    }, "/api/hub", { topbar: true });
+    await settle();
+    expect(h.elements["posture-seal-word"].textContent).toBe("Protected");
+    const rereadMinIntervalMs = runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number;
+
+    await vi.advanceTimersByTimeAsync(1001);
+    await settle();
+    expect(h.elements["posture-seal-word"].textContent).toBe("Attention");
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+
+    for (let i = 0; i < 20; i++) runInContext("rerender()", h.context);
+    await settle();
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(rereadMinIntervalMs - 1001);
+    await settle();
+    expect(sovereigntyReads).toBe(2);
+    expect(homeReads).toBe(2);
+
+    vi.setSystemTime(new Date(baseTime.getTime() + rereadMinIntervalMs));
+    releaseSovereignty(response(sovereigntyBody()));
+    releaseHome(response(homeBody()));
+    await settle();
+    expect(h.elements["posture-seal-word"].textContent).toBe("Protected");
+    expect(runInContext('sourceRead("/api/sovereignty").state', h.context)).toBe("state_LOADED");
+    expect(runInContext('sourceRead("/api/posture/home").state', h.context)).toBe("state_LOADED");
+  });
+  it("a failed topbar seal re-read leaves the seal non-green", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T12:00:00Z"));
+    let sovereigntyReads = 0;
+    const h = harness({
+      "/api/sovereignty": () => ++sovereigntyReads === 1
+        ? response({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } })
+        : response({ error: "unavailable" }, 503),
+    }, "/api/hub", { topbar: true });
+    await settle();
+    expect(h.elements["posture-seal-word"].textContent).toBe("Protected");
+    const rereadMinIntervalMs = runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number;
+
+    await vi.advanceTimersByTimeAsync(1001);
+    await settle();
+    expect(sovereigntyReads).toBe(1);
+    expect(h.elements["posture-seal-word"].textContent).toBe("Attention");
+
+    await vi.advanceTimersByTimeAsync(rereadMinIntervalMs - 1001);
+    await settle();
+    expect(sovereigntyReads).toBe(2);
+    expect(h.elements["posture-seal-word"].textContent).toBe("Unknown");
+    expect(h.elements["posture-seal"].classList.has("tone-protected")).toBe(false);
+  });
+  it("stopping live updates clears topbar seal re-read timers", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T12:00:00Z"));
+    let sovereigntyReads = 0;
+    let homeReads = 0;
+    const sovereigntyBody = () => ({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } });
+    const homeBody = () => ({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 }, agents: [] });
+    const h = harness({
+      "/api/sovereignty": () => { sovereigntyReads += 1; return response(sovereigntyBody()); },
+      "/api/posture/home": () => { homeReads += 1; return response(homeBody()); },
+    }, "/api/hub", { topbar: true });
+    await settle();
+
+    expect(h.elements["posture-seal-word"].textContent).toBe("Protected");
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+
+    runInContext("stopLiveUpdates()", h.context);
+    await vi.advanceTimersByTimeAsync((runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number) + 5000);
+    runInContext("scheduleSealFreshnessRefresh('/api/sovereignty', { current: true, refreshAt: Date.now() + 1 })", h.context);
+    await vi.advanceTimersByTimeAsync((runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number) + 5000);
+    await settle();
+
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+    expect(h.elements["posture-seal-word"].textContent).toBe("Unknown");
+  });
+  it("rate-limits topbar seal re-reads when evidence arrives near the window edge", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T12:00:00Z"));
+    const freshnessWindowMs = 30_000;
+    const browserAheadOfServerMs = 29_500;
+    let sovereigntyReads = 0;
+    let homeReads = 0;
+    const sovereigntyBody = () => ({
+      live_enforcement: {
+        castle_wall_arm_state: "armed",
+        last_enforcement_evidence_at: new Date(Date.now() - browserAheadOfServerMs).toISOString(),
+        freshness_window_ms: freshnessWindowMs,
+      },
+    });
+    const homeBody = () => ({
+      ...home,
+      castle_wall: {
+        arm_state: "armed",
+        last_enforcement_evidence_at: new Date(Date.now() - browserAheadOfServerMs).toISOString(),
+        freshness_window_ms: freshnessWindowMs,
+      },
+      agents: [],
+    });
+    const h = harness({
+      "/api/sovereignty": () => { sovereigntyReads += 1; return response(sovereigntyBody()); },
+      "/api/posture/home": () => { homeReads += 1; return response(homeBody()); },
+    }, "/api/hub", { topbar: true });
+    await settle();
+    const rereadMinIntervalMs = runInContext(
+      "typeof DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS === 'number' ? DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS : (SEAL_FRESHNESS_MAX_MS / 20) + DASHBOARD_READ_DEADLINE_MS",
+      h.context,
+    ) as number;
+    const firstExpiryMs = freshnessWindowMs - browserAheadOfServerMs + 1;
+
+    await vi.advanceTimersByTimeAsync(firstExpiryMs);
+    await settle();
+    expect(h.elements["posture-seal-word"].textContent).toBe("Attention");
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(rereadMinIntervalMs - firstExpiryMs - 1);
+    await settle();
+    expect(sovereigntyReads).toBe(1);
+    expect(homeReads).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    expect(sovereigntyReads).toBe(2);
+    expect(homeReads).toBe(2);
+
+    const longRunMs = 10 * 60 * 1000;
+    await vi.advanceTimersByTimeAsync(longRunMs - rereadMinIntervalMs);
+    await settle();
+    const maxReadsPerSource = 1 + Math.floor(longRunMs / rereadMinIntervalMs);
+    expect(sovereigntyReads).toBeLessThanOrEqual(maxReadsPerSource);
+    expect(homeReads).toBeLessThanOrEqual(maxReadsPerSource);
   });
   it("missing per-agent freshness cannot borrow the machine timestamp", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60_000 }, agents: [{ agent_id: "fixture", enforcement_active: "active" }] }) }); await settle();
@@ -454,12 +628,16 @@ describe("D5 closure", () => {
   });
   it("expires agent badges without borrowing the wall freshness timer", async () => {
     vi.useFakeTimers();
+    let homeReads = 0;
     const h = harness({
       "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }),
-      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] }),
+      "/api/posture/home": () => ++homeReads === 1
+        ? response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] })
+        : pending(),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
     expect(h.main.innerHTML).toContain('state-dot live');
     await vi.advanceTimersByTimeAsync(1001);
+    await settle();
     expect(h.main.innerHTML).not.toMatch(/protected|state-dot live|att-agent verified/i);
   });
   it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
