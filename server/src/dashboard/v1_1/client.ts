@@ -56,12 +56,13 @@ function parseEvidenceTimestamp(value) {
   const offsetSign = match[8];
   const offsetHours = offsetSign ? Number(match[9]) : 0;
   const offsetMinutes = offsetSign ? Number(match[10]) : 0;
+  // Mirrors the server predicate's finite Date.parse refusal for in-shape but out-of-range offsets.
   if (offsetHours > 23 || offsetMinutes > 59) return undefined;
   const offsetMs = (offsetSign === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60 * 1000;
-  const wall = new Date(Date.UTC(year, month - 1, day, hour, minute, second, writtenMs));
-  // Date.UTC maps years 0..99 onto 1900..1999; setUTCFullYear restores the
-  // written proleptic Gregorian year before applying the offset.
-  wall.setUTCFullYear(year);
+  const wall = new Date(0);
+  // Set year/month/day together so years 0000..0099 stay proleptic instead of remapping through 1900..1999.
+  wall.setUTCFullYear(year, month - 1, day);
+  wall.setUTCHours(hour, minute, second, writtenMs);
   const timestamp = wall.getTime() - offsetMs;
   if (!Number.isFinite(timestamp)) return undefined;
   const rendered = new Date(timestamp + offsetMs);
@@ -1517,7 +1518,7 @@ function renderAgentsList() {
       '<div class="terminal-block"><span class="cmd"><span class="prompt">$</span>sanctuary protect</span></div>' +
     '</div>';
   const count = state.agents.length;
-  const subCopy = count + ' agents. Click one to inspect its activity, policy, and pending approvals.';
+  const subCopy = count + ' agent' + (count === 1 ? '' : 's') + '. Click one to inspect its activity, policy, and pending approvals.';
   const rows = state.agents.map(function (a) {
     const map = agentDisplayStatus(a);
     const dotCls = agentStateClass(agentEvidenceStatus(a));
@@ -1795,7 +1796,7 @@ function renderHealthPage() {
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
-      '<dt>Protected agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
+      '<dt>Wrapped agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
       '<dt>Locked down</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? lockedDown : "Unknown") + '</dd>' +
       '<dt>Errored</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? errored : "Unknown") + '</dd>' +
       '<dt>Denials in feed</dt><dd>' + escHtml(sourceLoaded(HUB + "/activity") ? recentDenials : "Unknown") + '</dd>' +
@@ -3215,13 +3216,15 @@ function renderPostureAgentRows(home) {
     // HONEST per-agent pill (#634): green ONLY on confirmed live enforcement;
     // amber on policy-only protection; never machine-arm bleed-through.
     var pill;
+    var unprotected = false;
     if (a.enforcement_active === "active" && evidenceCurrent(a)) pill = '<span class="pill tone-verified">Enforcing</span>';
     else if (a.policy_protected) pill = '<span class="pill tone-degraded">Protection requested</span>';
-    else pill = '<span class="pill">Not protected</span>';
+    else { pill = '<span class="pill">Not protected</span>'; unprotected = true; }
     const drill = "/posture/agent/" + encodeURIComponent(a.agent_id);
+    const statusText = unprotected ? "" : ' &middot; status ' + escHtml(a.status);
     return '<div class="row">' +
       '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> ' + pill +
-      '<div class="muted mono">' + escHtml(a.harness) + ' &middot; status ' + escHtml(a.status) + '</div></div>' +
+      '<div class="muted mono">' + escHtml(a.harness) + statusText + '</div></div>' +
       '<a class="btn" href="' + drill + '">View posture</a>' +
       '</div>';
   }).join("");
@@ -3365,8 +3368,11 @@ function loadPanel(job) {
   if (pendingPanels.has(job)) return pendingPanels.get(job);
   // Dependent reads share the panel's budget instead of resetting it per step.
   const deadlineAt = Date.now() + DASHBOARD_READ_DEADLINE_MS;
-  const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).catch(function (error) {
+  const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).then(function () {
+    return job.paths.some(function (path) { const read = sourceRead(path); return read && read.state === "state_LOADED"; });
+  }).catch(function (error) {
     job.paths.forEach(function (path) { if (sourceRead(path) && sourceRead(path).state !== "state_FAILED") failSource(path, error); });
+    return false;
   }).finally(function () { pendingPanels.delete(job); rerender(); });
   pendingPanels.set(job, pending);
   return pending;
@@ -3392,20 +3398,35 @@ function queuePanel(job) {
   trailingPanels.set(job, queued);
   return queued;
 }
-async function fetchAll(afterMutation) {
-  const jobs = panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; });
+function orderedPanelJobs(jobs) {
   const critical = jobs.filter(function (job) { return job.load === fetchSovereignty || job.load === fetchPostureHome; });
-  const pending = critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; })).map(afterMutation ? queuePanel : loadPanel);
+  return critical.concat(jobs.filter(function (job) { return critical.indexOf(job) < 0; }));
+}
+async function fetchAll(afterMutation, selectedJobs) {
+  const jobs = selectedJobs || panelJobs.filter(function (job) { return job.load !== loadInboxPrefs; });
+  const pending = orderedPanelJobs(jobs).map(afterMutation ? queuePanel : loadPanel);
   if (afterMutation) rerender();
-  await Promise.all(pending);
+  const results = await Promise.all(pending);
+  return results.some(Boolean);
+}
+function fetchEverySource(afterMutation) {
+  return fetchAll(afterMutation, panelJobs.concat([policyPanelJob]));
+}
+function jobsForPaths(paths) {
+  return panelJobs.filter(function (job) {
+    return job.paths.some(function (path) { return paths.some(function (target) { return readKey(path) === readKey(target); }); });
+  });
+}
+function queueStreamRefresh(paths) {
+  return fetchAll(true, jobsForPaths(paths));
 }
 function retryPanel(path) {
   if (liveUpdatesStopped) {
     // A manual restart must reread every source before old snapshots may look current again.
-    sourceReads.forEach(function (read) { read.revision++; read.state = "state_UNREAD"; read.nextReadAt = 0; });
+    sourceReads.forEach(function (read) { read.revision++; read.state = "state_UNREAD"; read.error = null; read.failures = 0; read.nextReadAt = 0; });
     liveUpdatesStopped = false;
     pollingStarted = false;
-    const pending = fetchAll(true);
+    const pending = fetchEverySource(true);
     connectStream();
     return pending;
   }
@@ -3611,7 +3632,7 @@ function deriveSealFreshness(live, now) {
     };
   }
   const iso = raw.trim();
-  const observedAt = Date.parse(iso);
+  const observedAt = parseEvidenceTimestamp(iso);
   if (!Number.isFinite(observedAt)) {
     return {
       state: "unparseable",
@@ -4119,7 +4140,10 @@ function connectStream() {
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
         }
-        void fetchAll(true);
+        const paths = [HUB + "/activity"];
+        if (e.category === "privacy") paths.push(HUB + "/activity?category=privacy");
+        if (e.category === "handoff") paths.push(HUB + "/activity?category=handoff");
+        void queueStreamRefresh(paths);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("inbox", function (ev) {
@@ -4127,25 +4151,21 @@ function connectStream() {
         const item = JSON.parse(ev.data);
         if (isPendingApprovalsRedactedMarker(item)) {
           setInboxRedacted(item);
-          void fetchAll(true);
+          void queueStreamRefresh([HUB + "/inbox", HUB + "/activity"]);
           return;
         }
         if (state.seenEventIds.has(item.item_id)) return;
         state.seenEventIds.add(item.item_id);
-        void fetchAll(true);
+        void queueStreamRefresh([HUB + "/inbox", HUB + "/activity"]);
       } catch (err) { /* ignore */ }
     });
     es.addEventListener("agent_status", function (ev) {
       try {
-        const snap = JSON.parse(ev.data);
-        const idx = state.agents.findIndex(function (a) { return a.agent_id === snap.agent_id; });
-        if (idx >= 0) {
-          state.agents[idx] = Object.assign({}, state.agents[idx], { status: snap.status, status_reason_class: snap.status_reason_class, last_activity_at: snap.last_activity_at });
-        }
-        rerender();
+        JSON.parse(ev.data);
+        void queueStreamRefresh([HUB + "/agents", HUB + "/activity"]);
       } catch (err) { /* ignore */ }
     });
-    es.addEventListener("approval", function () { void fetchAll(true); });
+    es.addEventListener("approval", function () { void queueStreamRefresh([HUB + "/inbox", HUB + "/activity", HUB + "/agents"]); });
     es.onerror = function () {
       try { es && es.close(); } catch (e) { /* ignore */ }
       es = null;
@@ -4155,7 +4175,8 @@ function connectStream() {
       const delay = 1000 * Math.pow(2, reconnectAttempts++);
       reconnectTimer = setTimeout(async function () {
         reconnectTimer = null;
-        await fetchAll(true);
+        const refreshed = await fetchAll(true);
+        if (refreshed) reconnectAttempts = 0;
         rerender();
         void open();
       }, delay);
@@ -4177,11 +4198,16 @@ let pollingStarted = false;
 function schedulePolling() {
   if (pollingStarted) return;
   pollingStarted = true;
-  let attempts = 0;
+  let failedWaves = 0;
   const MAX_POLL_ATTEMPTS = 5; // Bound automatic recovery work; panel Retry remains available.
   function poll() {
-    if (attempts >= MAX_POLL_ATTEMPTS) { stopLiveUpdates(); return; }
-    setTimeout(async function () { await fetchAll(true); rerender(); poll(); }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, attempts++)));
+    if (failedWaves >= MAX_POLL_ATTEMPTS) { stopLiveUpdates(); return; }
+    setTimeout(async function () {
+      const refreshed = await fetchAll(true);
+      failedWaves = refreshed ? 0 : failedWaves + 1;
+      rerender();
+      poll();
+    }, Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, failedWaves)));
   }
   poll();
 }

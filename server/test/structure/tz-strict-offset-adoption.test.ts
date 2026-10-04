@@ -91,7 +91,7 @@ const GRANDFATHERED: ReadonlyMap<string, { count: number; why: string }> =
     ["cli/license.ts", { count: 1, why: "expiry parse of a license field (CLI display)" }],
     ["cognitive/state-store.ts", { count: 1, why: "round-trip equality check (exact-form by construction)" }],
     ["coordination/workflow-grouper.ts", { count: 3, why: "ordering of locally-observed events" }],
-    ["dashboard/v1_1/client.ts", { count: 4, why: "display filtering in the dashboard client" }],
+    ["dashboard/v1_1/client.ts", { count: 3, why: "date-filter bounds and display ordering in the dashboard client" }],
     ["disclosure/broker/token-issuer.ts", { count: 2, why: "expiry comparisons on locally-issued bindings" }],
     ["egress-gate/arming-wiring.ts", { count: 1, why: "subprocess lstart parsing, LC_ALL=C pinned (MED-4)" }],
     ["entitlement/fleet-cap.ts", { count: 1, why: "expiry comparison on a locally-verified activation" }],

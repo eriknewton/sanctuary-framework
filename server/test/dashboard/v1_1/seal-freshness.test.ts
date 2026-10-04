@@ -250,6 +250,7 @@ function liftSealHarness(): SealHarness {
     "function makeEl() { const classes = new Set(); return { textContent: '', hidden: false, attrs: {}, classList: { add: function () { for (let i = 0; i < arguments.length; i++) classes.add(arguments[i]); }, remove: function () { for (let i = 0; i < arguments.length; i++) classes.delete(arguments[i]); }, has: function (name) { return classes.has(name); } }, setAttribute: function (k, v) { this.attrs[k] = String(v); } }; }",
     "const elements = { 'posture-seal': makeEl(), 'posture-seal-word': makeEl(), 'posture-seal-freshness': makeEl(), 'posture-seal-pop': makeEl() };",
     "const document = { getElementById: function (id) { return elements[id] || null; } };",
+    functionSource(src, "parseEvidenceTimestamp"),
     functionSource(src, "shortTime"),
     functionSource(src, "durationLabelFromMs"),
     functionSource(src, "liveEnforcementSnapshot"),
@@ -307,6 +308,23 @@ describe("v1.1 dashboard seal freshness", () => {
     vi.spyOn(Date, "now").mockReturnValue(now);
     const harness = liftSealHarness();
     harness.state.posture.data = armedPayload("not-a-date");
+
+    const seal = harness.deriveSeal();
+
+    expect(seal.word).toBe("Attention");
+    expect(seal.tone).toBe("attention");
+    expect(seal.freshness.state).toBe("unparseable");
+    expect(seal.freshness.current).toBe(false);
+    expect(seal.freshness.inline).toBe("invalid evidence time");
+  });
+
+  it("offset-less enforcement timestamp with armed payload does not render Protected", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const harness = liftSealHarness();
+    const msPerMinute = 60 * 1000;
+    // Match the receiver's local clock so permissive parsing would treat this as fresh.
+    const localFresh = new Date(now - 2 * msPerMinute - new Date(now).getTimezoneOffset() * msPerMinute).toISOString().slice(0, -1);
+    harness.state.posture.data = armedPayload(localFresh);
 
     const seal = harness.deriveSeal();
 
