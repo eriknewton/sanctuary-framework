@@ -193,8 +193,12 @@ function startReadFlight<T>(
   produce: (signal: AbortSignal) => Promise<DashboardReadResponse<T>>,
 ): DashboardReadFlight<T> {
   const controller = new AbortController();
-  let flight!: DashboardReadFlight<T>;
-  const promise = Promise.resolve()
+  // The object exists before its promise so the release below can compare
+  // identity with the exact entry this call puts in the map.
+  const flight = {
+    deadlineAtMs: Date.now() + DASHBOARD_READ_RESPONSE_DEADLINE_MS,
+  } as DashboardReadFlight<T>;
+  flight.promise = Promise.resolve()
     .then(() => produce(controller.signal))
     .finally(() => {
       // Invariant: the single-flight slot stays held through caller timeouts and releases only when the producer settles, blocking rule-12 timeout-then-release waves.
@@ -202,10 +206,6 @@ function startReadFlight<T>(
         readFlights.delete(route);
       }
     });
-  flight = {
-    promise,
-    deadlineAtMs: Date.now() + DASHBOARD_READ_RESPONSE_DEADLINE_MS,
-  };
   // Invariant: these route payloads are operator-wide, read-only views with no per-caller redaction or privilege-dependent fields; if that changes, key the flight by caller class, not just route.
   readFlights.set(route, flight as DashboardReadFlight<unknown>);
   return flight;
