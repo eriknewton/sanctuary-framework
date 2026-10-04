@@ -36,9 +36,9 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 ### Castle Wall on Linux: kernel-level enforcement
 
-Target: OS-level egress filtering via netfilter / NFQUEUE with per-account routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. **Why it matters:** this is the first Linux kernel-enforcement claim with install-grade drill evidence.
+Target: OS-level egress filtering via netfilter / NFQUEUE with per-account routing, so outbound calls are blocked at the kernel even when the agent is prompt-injected, jailbroken, or simply not bothering to cooperate. Current bound: On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. **Why it matters:** this gives Linux operators an install-grade evidence point with clear bounds.
 
-*Status: proven only for Ubuntu 24.04 (x86-64). ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `proven` for the narrowed claim above. Fault-injection witnesses, a real-agent harness, DNS/DoH/DoT and hostname paths, sustained-operation and overhead, removal or upgrade, any other distribution, any other architecture, and a tagged-release artifact remain unproven.*
+*Status: proven only for Ubuntu 24.04 (x86-64). ASSURANCE_MATRIX row "Egress enforcement: Linux (Castle Wall Phase 1)" is `proven` for the narrowed claim above. Fault-injection witnesses, a real-agent harness, DNS/DoH/DoT and hostname paths, sustained-operation and overhead, removal or upgrade, any other distribution, any other architecture, and a tagged-release artifact remain unproven. IC-02, IC-03 and IC-04 remain open for the scopes not closed by the narrowed drill.*
 
 ### Castle Wall on macOS: signed system extension, enforced and attended-reboot-surviving
 
@@ -164,7 +164,7 @@ Concordia adds structured negotiation between agents with binding commitments an
 
 ### Current priority
 
-**Linux Castle Wall follow-up.** The first install-grade public claim has moved only for Ubuntu 24.04 (x86-64). The next Linux gates are a fault-injection drill on the shipped artifact, a real-agent harness in place of the test program, DNS/DoH/DoT and hostname paths once hostname attribution exists, broader distribution and architecture coverage, and a tagged-release artifact that is re-drilled or shown unchanged.
+**Linux Castle Wall follow-up.** The install-grade public claim has moved only for Ubuntu 24.04 (x86-64). The next Linux gates are a fault-injection drill on the shipped artifact, a real-agent harness in place of the test program, DNS/DoH/DoT and hostname paths once hostname attribution exists, broader distribution and architecture coverage, and a tagged-release artifact that is re-drilled or shown unchanged.
 
 **After Linux:** one dashboard across operating-system families (the "One console for many machines" item below), so an operator with a Mac and a Linux box sees one wall, one record, one set of keys.
 

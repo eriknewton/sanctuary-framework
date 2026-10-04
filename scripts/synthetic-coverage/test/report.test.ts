@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildReport, renderMarkdownSummary } from "../report.js";
 import { registerFixture } from "../registry.js";
 import { EXPECTED_ASSURANCE_ROW_COUNT } from "../assurance-matrix.js";
@@ -47,5 +47,48 @@ describe.sequential("coverage report", () => {
     expect(row?.fixtures.map((fixture) => fixture.name)).toEqual(["linux-proven-failure-counted"]);
     expect(report.summary.rows_with_fixtures).toBe(1);
     expect(report.summary.rows_failing).toBe(1);
+  });
+
+  it("suppresses fixture outcomes attached to a not_implemented matrix row", async () => {
+    vi.resetModules();
+    vi.doMock("../assurance-matrix.js", () => ({
+      EXPECTED_ASSURANCE_ROW_COUNT: 1,
+      loadAssuranceMatrix: () => [
+        {
+          id: "synthetic-not-implemented",
+          label: "Synthetic not implemented row",
+          status: "not_implemented" as const,
+        },
+      ],
+    }));
+
+    const { registerFixture: registerMockedFixture } = await import("../registry.js");
+    const { buildReport: buildMockedReport } = await import("../report.js");
+
+    registerMockedFixture(
+      "synthetic-not-implemented",
+      "Synthetic not implemented row",
+      "synthetic-not-implemented-failure-suppressed",
+      async () => ({
+        passed: false,
+        message: "should be suppressed while the row is not_implemented",
+        durationMs: 1,
+      }),
+    );
+
+    const report = await buildMockedReport({ platform: "linux", sha: "not-implemented-fixture" });
+    const row = report.rows.find((entry) => entry.assurance_row_id === "synthetic-not-implemented");
+
+    expect(row).toBeDefined();
+    expect(row?.coverage_state).toBe("not_implemented");
+    expect(row?.fixtures).toEqual([]);
+    expect(row?.fixtures_run).toBe(0);
+    expect(row?.fixtures_failed).toBe(0);
+    expect(report.summary.rows_with_fixtures).toBe(0);
+    expect(report.summary.rows_not_implemented).toBe(1);
+    expect(report.summary.rows_failing).toBe(0);
+
+    vi.doUnmock("../assurance-matrix.js");
+    vi.resetModules();
   });
 });

@@ -72,19 +72,18 @@ Underneath each of those experiences is the same architecture. The agent runs as
 
 These are not aspirational. They are buildable. We are building them. The v1.2 substrate is shipping today, and Castle Wall Phase 1 enforcement went live on Linux this week. macOS Phase 1 follows once the platform's developer-program review clears.
 
-> **Current correction, 2026-08-07:** the Linux claim above did not hold up. The
-> nftables, cgroup, and NFQUEUE modules are tested against a real kernel, and the
-> shipped daemon does not install the table, bind NFQUEUE, create cgroup scopes,
-> or call the deny-by-default evaluator, so Linux Castle Wall is not live
-> enforcement. macOS Phase 1 did later ship and is proven in the Assurance
-> Matrix. Open defect: **IC-02, IC-03, IC-04**
->.
+> **Current correction, 2026-08-07:** the Linux claim above did not hold up.
+> Linux Phase 1 was not live enforcement then and was not a production enforcement
+> baseline. macOS Phase 1 did later ship and is proven in the Assurance Matrix.
+> Later evidence, 2026-10-04: a separate Ubuntu 24.04 x86-64 package proved only
+> the narrowed fresh-install per-account signed-policy claim. Open defect:
+> **IC-02, IC-03, IC-04**.
 
 ## The Castle Architecture
 
 Sanctuary's enforcement model has four layers. They work together just like the living community in a real castle. The Castle Wall holds the perimeter. Sentinels in the watchtowers observe and call out. The Charter governs the inhabitants inside who choose to work under its terms. The Heralds carry verified accounts of deeds across castles. Each layer has a distinct contract. The contracts compose; none of them substitute for another.
 
-**The Castle Wall.** The perimeter holds whether or not anyone inside is paying attention. Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. The kernel itself blocks unauthorized egress. Exfiltration attempts, identity assertions, payments, and commitments all route through a wall the operator's policies define. A prompt-injected or jailbroken agent does not get a vote at this layer: the operating system routes the call, within the proven scope and platform bounds in the editor's note above. This is the technical answer to the question every honest enterprise buyer asks: how does the substrate enforce against an agent determined to escape? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the proven surface, and an attacker who can reach an agent through an inbound channel remains a real threat model to design for.
+**The Castle Wall.** The perimeter holds whether or not anyone inside is paying attention. Operating-system-level filtering at the boundary between the operator's machine and the external world, on the outbound path. The kernel itself blocks unauthorized egress. Exfiltration attempts, identity assertions, payments, and commitments all route through a wall the operator's policies define. A prompt-injected or jailbroken agent does not get a vote at this layer: the operating system routes the call, within the proven scope and platform bounds in the editor's note above. This is the technical answer to the question every honest enterprise buyer asks: how does the substrate enforce below the agent? Ingress filtering of inbound webhooks and callbacks is roadmap, not part of the proven surface, and an attacker who can reach an agent through an inbound channel remains a real threat model to design for.
 
 **Sentinels.** The watchtowers do not block; they see, and they call out. Internal observation, not enforcement. Behavioral baselining via process introspection. Anomalies surface to the operator via menubar and operating-system notifications. Sentinels see what the wall cannot: file-access patterns, internal model calls, cross-agent coordination, prompt-injection signatures in internal communications. The sentinels surface. The operator decides.
 
@@ -161,10 +160,10 @@ If you are a technical operator: install Sanctuary. The substrate is shipping no
 If you are an enterprise buyer evaluating sovereign deployment: pilot conversations are open. Castle Wall Phase 1 is live on Linux today. macOS Phase 1 follows once the platform's developer-program review clears. Pilot demos include a prompt-injection scenario showing the wall blocking unauthorized egress at the kernel and the operator approving in under ten seconds.
 
 > **Current correction, 2026-08-07:** read the Linux sentence above as retired.
-> Live kernel enforcement is proven on macOS; the shipped Linux daemon installs
-> no kernel enforcement, so a Linux pilot demo cannot be offered on that basis.
-> Open defect: **IC-02, IC-03, IC-04**
->.
+> Live kernel enforcement was proven on macOS; Linux Phase 1 was not live
+> enforcement then and was not a production enforcement baseline. Later evidence,
+> 2026-10-04: a separate Ubuntu 24.04 x86-64 package proved only the narrowed
+> fresh-install per-account signed-policy claim. Open defect: **IC-02, IC-03, IC-04**.
 
 If you are a partner building a payment rail, mandate framework, identity registry, or reputation engine: compose with us. The substrate is open source and free always. We ship reference integrations against your primitives. We contribute upstream as the operator-side complement to your work. The operator-sovereign reference implementation is the most useful partner you can have if your goal is genuine portability rather than soft lock-in.
 

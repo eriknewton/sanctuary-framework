@@ -17,12 +17,13 @@ Per-agent mutation is one atomic nft transaction and all signed rule semantics
 run in one ordered Rust evaluator behind NFQUEUE; caller-provided nft fragments
 never reach the root daemon.
 
-This is still **drill-gated**. Source and automated tests do not establish that
-the reference Ubuntu host, its nft build, queue pressure behavior, reboot
-recovery, and real wrapped-agent traffic satisfy the release claim. Until the
-captured Gate A hardware drill passes, the published assurance stays
-`not_implemented`, the status this row carries in `ASSURANCE_MATRIX.md`, never
-“Linux enforcement available.”
+The 2026-10-04 drill proves only the narrowed Ubuntu 24.04 (x86-64) claim in
+`ASSURANCE_MATRIX.md`: a fresh install of the shipped package enforces a signed
+operator policy per user account, blocked destinations stay blocked and allowed
+ones connect, through five reboots, on three fresh servers, with evidence
+checked by two independent reviewers. Source and automated tests still do not
+establish the open fault-injection, DNS, hostname, other-platform, upgrade,
+removal, or real wrapped-agent claims.
 
 ## Status
 

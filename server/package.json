@@ -2,7 +2,7 @@
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.8.6-rc.1",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
-  "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS and proven on Ubuntu 24.04 x86-64 within Assurance Matrix bounds; Windows is not live enforcement yet, and your data stays under your own keys. Any agent, local or cloud, one machine or many.",
+  "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS, and the Ubuntu 24.04 x86-64 fresh-install per-account signed-policy claim is proven, with current portability bounds called out in the Assurance Matrix; Windows is roadmap, and your data stays under your own keys. Any agent, local or cloud, one machine or many.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",
