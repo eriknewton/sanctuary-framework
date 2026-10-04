@@ -3420,14 +3420,6 @@ function jobsForPaths(paths) {
 function queueStreamRefresh(paths) {
   return fetchAll(true, jobsForPaths(paths));
 }
-function refreshExpiredEvidenceSource(path) {
-  const read = sourceRead(path);
-  if (liveUpdatesStopped || !read || read.state !== "state_LOADED") {
-    rerender();
-    return;
-  }
-  void queueStreamRefresh([path]);
-}
 function retryPanel(path) {
   if (liveUpdatesStopped) {
     // A manual restart must reread every source before old snapshots may look current again.
@@ -3490,11 +3482,9 @@ async function fetchSovereignty() {
       return;
     }
     state.posture.data = body;
-    scheduleSealFreshnessRefresh(deriveSealFreshness(body.live_enforcement));
     state.posture.error = null;
   } catch (e) {
     state.posture.data = null;
-    clearSealFreshnessTimer();
     state.posture.error = e && e.message ? e.message : String(e);
   }
 }
@@ -3518,12 +3508,8 @@ function scheduleHomeFreshness() {
   const expiries = [home.castle_wall].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
     return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + 1;
   }); // One millisecond moves past the inclusive freshness boundary.
-  if (expiries.length) {
-    homeFreshnessTimer = setTimeout(function () {
-      homeFreshnessTimer = null;
-      refreshExpiredEvidenceSource("/api/posture/home");
-    }, Math.max(0, Math.min.apply(null, expiries) - Date.now()));
-  }
+  // Invariant: expired evidence removes protection claims by rerendering only; re-read scheduling is a registered follow-up and must not make stale bytes look fresh.
+  if (expiries.length) homeFreshnessTimer = setTimeout(function () { rerender(); scheduleHomeFreshness(); }, Math.min.apply(null, expiries) - Date.now());
 }
 async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
@@ -3704,7 +3690,8 @@ function scheduleSealFreshnessRefresh(freshness) {
   const delayMs = Math.max(0, freshness.refreshAt - Date.now());
   sealFreshnessTimer = setTimeout(function () {
     sealFreshnessTimer = null;
-    refreshExpiredEvidenceSource("/api/sovereignty");
+    // Invariant: the seal shows Attention once evidence expires until a fresh LOADED read arrives; automatic reread scheduling is a registered follow-up.
+    rerender();
   }, delayMs);
 }
 
@@ -4149,8 +4136,7 @@ function connectStream() {
       const url = credentialedReadUrl(STREAM + sessionQuery, "GET");
       es = new EventSource(url);
     } catch (e) { schedulePolling(); return; }
-    es.addEventListener("snapshot", function () { /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
-    es.addEventListener("heartbeat", markStreamFrameReceived);
+    es.addEventListener("snapshot", function () { markStreamFrameReceived(); /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
     es.addEventListener("activity", function (ev) {
       try {
         markStreamFrameReceived();
@@ -4160,7 +4146,7 @@ function connectStream() {
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
         }
-        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot"];
+        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot", "/api/anomaly/findings"];
         void queueStreamRefresh(paths);
       } catch (err) { /* ignore */ }
     });

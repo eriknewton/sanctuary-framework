@@ -252,27 +252,20 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('let focused = false; document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : key === "data-read" ? "/api/posture/home" : null; } }; document.getElementById("main").querySelector = function (selector) { return selector.includes("retry-panel") && selector.includes("data-read") ? { focus: function () { focused = true; } } : null; }; state.posture.homeError = "new error"; rerender()', h.context);
     expect(runInContext('focused', h.context)).toBe(false);
   });
-  it("fresh home evidence expires into a pending reread and recovers only from fresh loaded evidence", async () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-03-02T12:00:00Z")); let reads = 0; let release!: (value: unknown) => void;
-    const h = harness({ "/api/posture/home": () => ++reads === 1 ? response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } }) : new Promise(resolve => { release = resolve; }) }); await settle();
+  it("fresh home evidence expires without a refresh and unread evidence never becomes Enforcing", async () => {
+    vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
+    const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();
     expect(h.main.innerHTML).toContain(">Enforcing</span>");
-    await vi.advanceTimersByTimeAsync(2001); await settle();
-    expect(reads).toBe(2);
+    await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+    hang = true; runInContext('void fetchAll()', h.context); await settle();
     expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
-    expect(runInContext('sourceRead("/api/posture/home").state', h.context)).toBe("state_LOADING");
-    release(response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } })); await settle();
-    expect(h.main.innerHTML).toContain(">Enforcing</span>");
   });
-  it("a fresh loaded seal expires into a pending reread and recovers only from fresh loaded evidence", async () => {
-    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-03-02T12:00:00Z")); let reads = 0; let release!: (value: unknown) => void;
-    const h = harness({ "/api/sovereignty": () => ++reads === 1 ? response({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } }) : new Promise(resolve => { release = resolve; }) }); await settle();
-    expect(runInContext('deriveSeal().word', h.context)).toBe("Protected");
-    await vi.advanceTimersByTimeAsync(2001); await settle();
-    expect(reads).toBe(2);
+  it("a fresh loaded seal becomes Unknown while its refresh is pending", async () => {
+    vi.useFakeTimers(); let hang = false;
+    const h = harness({ "/api/sovereignty": () => hang ? pending() : response({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60_000 } }) }); await settle();
+    expect(runInContext('deriveSeal().word', h.context)).toBe("Protected"); hang = true;
+    runInContext('void fetchAll()', h.context); await settle();
     expect(runInContext('deriveSeal().word', h.context)).toBe("Unknown");
-    expect(runInContext('sourceRead("/api/sovereignty").state', h.context)).toBe("state_LOADING");
-    release(response({ live_enforcement: { castle_wall_arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 } })); await settle();
-    expect(runInContext('deriveSeal().word', h.context)).toBe("Protected");
   });
   it("missing per-agent freshness cannot borrow the machine timestamp", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60_000 }, agents: [{ agent_id: "fixture", enforcement_active: "active" }] }) }); await settle();
@@ -300,8 +293,10 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('state.route = "auto-trigger"; rerender()', h.context);
     expect(h.main.innerHTML).toContain("Retry Auto-trigger");
   });
-  it("generic activity events reread privacy, handoff, and honeypot panels", async () => {
-    vi.useFakeTimers(); const h = harness(); await settle();
+  it("generic activity events reread privacy, handoff, honeypot, and anomaly panels", async () => {
+    vi.useFakeTimers(); let anomalyReads = 0;
+    const h = harness({ "/api/anomaly/findings": () => ++anomalyReads === 1 ? response({ data: { findings: [] } }) : pending() }); await settle();
+    expect(h.main.innerHTML).toContain("No open anomaly findings.");
     const before = h.calls.length;
     h.streams.at(-1)!.listeners.activity({ data: JSON.stringify({ entry_id: "generic-audit", category: "other", display_template_id: "audit.other" }) });
     await settle();
@@ -311,7 +306,10 @@ describe("dashboard bounded independent hydration", () => {
       "/api/hub/activity?category=handoff",
       "/api/honeypot/tool-traps",
       "/api/honeypot/credential-traps",
+      "/api/anomaly/findings",
     ]));
+    expect(runInContext('sourceRead("/api/anomaly/findings").state', h.context)).toBe("state_LOADING");
+    expect(h.main.innerHTML).not.toContain("No open anomaly findings.");
   });
   it("keeps later rule details unavailable when the shared deadline runs out", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/auto-trigger/rules": () => response({ data: { rules: [{ rule_id: "first" }, { rule_id: "later" }] } }), "/api/auto-trigger/rules/first": pending });
@@ -455,13 +453,13 @@ describe("D5 closure", () => {
     expect(runInContext('sourceLoaded(HUB + "/inbox")', h.context)).toBe(true);
   });
   it("expires agent badges without borrowing the wall freshness timer", async () => {
-    vi.useFakeTimers(); let reads = 0;
+    vi.useFakeTimers();
     const h = harness({
       "/api/hub/agents": () => response({ data: { agents: [{ agent_id: "fixture", status: "active" }] } }),
-      "/api/posture/home": () => ++reads === 1 ? response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] }) : pending(),
+      "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] }),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
     expect(h.main.innerHTML).toContain('state-dot live');
-    await vi.advanceTimersByTimeAsync(1001); await settle();
+    await vi.advanceTimersByTimeAsync(1001);
     expect(h.main.innerHTML).not.toMatch(/protected|state-dot live|att-agent verified/i);
   });
   it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
@@ -508,7 +506,7 @@ describe("D5 closure", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await settle();
       expect(h.streams.length).toBe(before + 1);
-      h.streams.at(-1)!.listeners.heartbeat({ data: "{}" });
+      h.streams.at(-1)!.listeners.snapshot({ data: "{}" });
       expect(h.main.innerHTML).not.toContain("Live updates stopped");
     }
   });
