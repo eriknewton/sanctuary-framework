@@ -677,6 +677,11 @@ describe("no code path in server/test can reach the real credential binary", () 
 
       expect(() => refreshRunToken(root, "paused-run")).not.toThrow();
       expect(existsSync(join(marker, "paused-run"))).toBe(true);
+
+      // A later run's teardown can also remove the then-empty directory.
+      rmSync(marker, { recursive: true, force: true });
+      expect(() => refreshRunToken(root, "paused-run")).not.toThrow();
+      expect(existsSync(join(marker, "paused-run"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

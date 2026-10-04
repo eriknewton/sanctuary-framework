@@ -13,8 +13,9 @@
  * signals miss.
  *
  * MUST MATCH `TEST_RUN_MARKER_FILENAME` and the package-root derivation in
- * `src/wrap/keychain-exec.ts`, which reads this marker. That file carries a
- * pointer back here. The filename is imported rather than repeated so the two
+ * `src/wrap/keychain-exec.ts`, which reads this marker, and `markerOnDiskNow`
+ * there, which treats the directory's existence alone as "under test" and
+ * never reads the tokens inside it. That file carries a pointer back here. The filename is imported rather than repeated so the two
  * sides cannot drift.
  *
  * FAILURE MODE TO RECOGNIZE: if a run is killed hard enough to skip teardown,
@@ -122,9 +123,13 @@ export function refreshRunToken(root: string, runId: string, nowMs = Date.now())
     utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    // A live run must always re-create its token: a missing token is the one
-    // state that can make a scrubbed child reach the real credential store.
+    // A live run must re-create a pruned token: while it is missing, another
+    // run's teardown can find the directory empty and remove it, and a missing
+    // directory is the state in which a scrubbed child reaches the real
+    // credential store. The exposure lasts at most one refresh period
+    // (RUN_TOKEN_REFRESH_INTERVAL_MS) after a paused run resumes.
     createTestRunMarker(root, runId);
+    utimesSync(join(testRunMarkerPath(root), runId), seconds, seconds);
   }
 }
 

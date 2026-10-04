@@ -207,7 +207,7 @@ function testRunMarkerPresent(): boolean {
  * keychain accumulated tens of thousands of `sanctuary-*` artifacts. Absence of
  * evidence was being read as production.
  *
- * The marker file closes it because a scrubbed environment cannot erase a file.
+ * The marker directory closes it because a scrubbed environment cannot erase a filesystem entry.
  * It is a POSITIVE signal for "a test run is in progress" and is scoped to this
  * checkout, so it does not affect an installed package or a drill running the
  * CLI outside `npm test`.
