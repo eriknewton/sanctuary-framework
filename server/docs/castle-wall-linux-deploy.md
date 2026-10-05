@@ -219,9 +219,11 @@ The normal runbook below must match the [packaged operator guide](../../castle-w
 
 ## Artifact and prerequisites
 
-Obtain the exact private artifact and independently authenticated source SHA,
-SHA-256, required-check inventory, workstation signer artifact, `endpoints.json`
-and `rules.json`. Require all checks at that source head to have succeeded;
+Obtain the exact package artifact (the published pre-release is
+[Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1),
+asset `sanctuary-castle-wall_0.1.0-1_amd64.deb`, source commit `bbd6c7d7`) and
+its independently authenticated source SHA, SHA-256, required-check inventory,
+workstation signer artifact, `endpoints.json` and `rules.json`. Require all checks at that source head to have succeeded;
 a missing, skipped or cancelled required job is not success. The adjacent
 checksum detects corruption but does not authenticate delivery.
 
@@ -594,7 +596,8 @@ runtime directory `/run/sanctuary/<fortress-id>`, which the unit's `ExecStartPre
 installs as `root:sanctuary 0750`. Failure mode: if that directory was created by
 hand without the group, the socket inherits the wrong group here too and `660`
 grants nothing, which looks like a daemon that started cleanly and an IPC client
-that cannot connect for no visible reason. Fix the directory, not the socket.
+that cannot connect for no visible reason. Fix the directory permissions before
+retrying the socket.
 
 Verify the Castle Wall nftables namespace after the daemon reports ready:
 
@@ -724,16 +727,18 @@ host is a separate authorized action, not an installer command.
 
 ## Castle-walking acknowledgement
 
-Castle Wall Linux L2 is not a published production assurance baseline yet. The
-kernel decision path is implemented, but the assurance row stays
-`not_implemented`, the status it carries in `ASSURANCE_MATRIX.md`, until the
-servers-first captured drill proves install,
-reboot/restart recovery, real wrapped-agent allow/deny ordering, queue-pressure fail-closed behavior, DNS
-bypass resistance, audit drain durability, and disarm on the reference host.
+Castle Wall Linux L2 is proven only for the narrowed Ubuntu 24.04 (x86-64)
+fresh-install per-account signed-policy claim in `ASSURANCE_MATRIX.md`, for the
+exact package published as the checksum-verified pre-release Castle Wall Linux
+0.1.0-1 (no signature or apt repository yet). It does not cover fault-injection
+witnesses, queue-pressure fail-closed behavior, audit drain durability, DNS,
+DoH, DoT, hostname paths, upgrade or removal, sustained operation, overhead,
+other platforms, or a real wrapped-agent harness.
 
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a
-substitute for the Linux enforcement path. The Linux kernel-routing claim
-becomes publishable only after that drill passes and its evidence is reviewed.
+substitute for the Linux enforcement path. Any broader Linux kernel-routing
+claim becomes publishable only after the matching drill passes and its evidence
+is reviewed.
 
 The install CLI requires a kernel audit login uid (normally established by SSH/PAM and retained through sudo). Check `cat /proc/self/loginuid` in the operator session before provisioning or evidence capture. An unset value of `4294967295` refuses; a `SUDO_UID` environment variable does not establish identity. Use an authenticated login session when automation has no audit identity.
 

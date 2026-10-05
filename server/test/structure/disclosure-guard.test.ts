@@ -275,14 +275,16 @@ const MUST_PASS: ReadonlyArray<{ shape: string; body: string }> = [
     // never be refused here either.
     shape: "honest capability bound",
     body: [
-      "Linux egress enforcement is not implemented. This capability is unproven",
-      "on Linux and the matrix row stays capped at partial until a drill is",
-      "captured on the platform that matters.",
+      "On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces",
+      "a signed operator policy per user account: blocked destinations stay blocked",
+      "and allowed ones connect, through five reboots, on three fresh servers,",
+      "with the evidence checked by two independent reviewers. This capability is",
+      "unproven on other Linux distributions and CPU architectures.",
     ].join("\n"),
   },
   {
     shape: "honest bound, shorter form",
-    body: "This capability is unproven on Linux.",
+    body: "This capability is unproven outside Ubuntu 24.04 (x86-64).",
   },
   {
     shape: "a body that names the workflow it adds",
@@ -536,8 +538,8 @@ describe("disclosure guard — checker behaviour", () => {
     // must never be refused. If a future widening of MECHANISM_NEG breaks this,
     // the guard has started punishing the honest half of the rule it enforces.
     for (const honest of [
-      "This capability is unproven on Linux.",
-      "Linux egress enforcement is not implemented.",
+      "This capability is unproven outside Ubuntu 24.04 (x86-64).",
+      "Windows egress enforcement is not implemented.",
       "The wrapping path is untested on this platform and the row stays partial.",
     ]) {
       expect(runChecker(honest).status, `refused an honest bound: ${honest}`).toBe(0);

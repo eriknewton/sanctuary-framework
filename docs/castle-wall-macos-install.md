@@ -15,7 +15,7 @@ The npm package installs the cooperative Sanctuary CLI, dashboard, keys, policy 
 - Admin credentials for `sudo`.
 - One operator account that owns the fortress, usually your normal macOS account.
 - One protected agent macOS account. The protected account must have a real UID at or above the default ceiling of `500`.
-- The proven public bound is per-UID allow/deny plus attended reboot survival on one host and one OS version. Unattended reboot survival remains unproven. Linux has no shipped live enforcement path today; Windows is roadmapped.
+- The proven public macOS bound is per-UID allow/deny plus attended reboot survival on one host and one OS version. Unattended reboot survival remains unproven. Linux has a separate narrowed Ubuntu 24.04 (x86-64) Assurance Matrix claim; Windows is roadmapped.
 
 ## 1. Install the Sanctuary CLI and fortress
 

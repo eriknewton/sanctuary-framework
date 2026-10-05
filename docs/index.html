@@ -7,13 +7,13 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live today on macOS; Linux and Windows coming soon.">
+<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live today on macOS; Linux and Windows coming soon. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -77,14 +77,14 @@ layout: null
     </p>
 
     <p class="hero__sub" style="opacity:0.66;margin-top:-0.75rem;">
-      Live today on macOS. Linux and Windows coming soon.
+      Live today on macOS. Ubuntu 24.04 x86-64 has a proven fresh-install per-account claim. Windows is roadmap.
     </p>
 
     <!-- Install block -->
     <div class="install surface-card">
       <div class="install__label">
         <span>Install</span>
-        <span>Node 22+ · macOS live wall · Linux/Windows cooperative</span>
+        <span>Node 22+ · macOS live wall · Ubuntu 24.04 bounded proof</span>
       </div>
       <div class="install__row">
         <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
@@ -158,10 +158,11 @@ layout: null
                 operating system. A prompt-injected agent cannot route around that path within
                 the proven scope because the kernel itself enforces. It enforces a signed
                 operator policy, per account, and re-establishes itself after a restart.
-                On Linux the nftables, cgroup, and NFQUEUE modules are tested against a real
-                kernel, DNS, DoH, DoT and raw sockets included, and the shipped daemon does not
-                install that path yet, so Linux is source coverage today rather than live
-                enforcement.
+                On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces
+                a signed operator policy per user account: blocked destinations stay blocked
+                and allowed ones connect, through five reboots, on three fresh servers, with
+                the evidence checked by two independent reviewers. Other Linux distributions,
+                DNS, DoH, DoT, hostname paths, and a real-agent harness remain unproven.
               </p>
             </div>
           </li>
@@ -199,7 +200,7 @@ layout: null
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
           Four layers, each with a distinct contract: operating-system egress enforcement
-          (live on macOS today, with Linux and Windows coming soon), behavioral observation
+          (live on macOS today, with a narrowed Ubuntu 24.04 x86-64 fresh-install proof), behavioral observation
           inside the box, an encrypted state surface for cooperative agents, and receipts and
           reputation that travel across vendors. Underneath them, an install-time mechanism
           called Mantle binds all four to your machine. The layers compose, and none of them
@@ -213,14 +214,15 @@ layout: null
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
             Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
-            is proven on a signed and notarized build. On Linux the nftables, cgroup v2, and
-            NFQUEUE modules carry plain-DNS, DoH, DoT, and raw-socket bypass coverage against
-            real kernel bindings, and the shipped daemon does not install that path yet.
+            is proven on a signed and notarized build. On Ubuntu 24.04 (x86-64), a fresh
+            install of the shipped package enforces a signed operator policy per user account
+            through five reboots on three fresh servers; DNS, DoH, DoT, hostname paths, and
+            other Linux platforms remain unproven.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">kernel-binding</span>
             <span class="layer__tag">cgroup-v2</span>
-            <span class="layer__tag">doh-dot-covered</span>
+            <span class="layer__tag">per-account-policy</span>
           </div>
         </article>
 
@@ -456,8 +458,8 @@ sanctuary = MCPTool.from_stdio(
           <h3 class="journal__title">The Castle Wall, Linux Phase 1 Source Path</h3>
           <p class="journal__excerpt">
             Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does on macOS within the proven scope.
-            Current correction: Linux Phase 1 source modules are tested against a real kernel
-            binding, and the shipped daemon does not assemble live enforcement.
+            Current correction: the May 2026 source-path claim is retired; a later Ubuntu 24.04
+            x86-64 package has the narrowed fresh-install per-account proof.
           </p>
           <span class="btn btn--terminal">Read the post</span>
         </a>
@@ -475,7 +477,7 @@ sanctuary = MCPTool.from_stdio(
       <div class="cta surface-card">
         <span class="eyebrow">Ship agents you actually control</span>
         <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
-        <p>Open source and local-first. Castle Wall enforcement is proven on macOS; Linux is <code>not_implemented</code> in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
+        <p>Open source and local-first. Castle Wall enforcement is proven on macOS and, on Ubuntu 24.04 (x86-64), for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
         <div class="btn-row" style="justify-content: center;">
           <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
           <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
@@ -496,9 +498,10 @@ sanctuary = MCPTool.from_stdio(
           Sanctuary
         </a>
         <p>
-          A custody substrate for AI agents: operating-system enforcement is live on macOS today;
-          Linux and Windows are not live enforcement yet, with portable reputation and current
-          bounds in the Assurance Matrix.
+          A custody substrate for AI agents: operating-system enforcement is live on macOS today,
+          and the Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim is proven
+          within the Assurance Matrix bounds; Windows remains roadmap for enforcement, with
+          portable reputation and current bounds in the Assurance Matrix.
         </p>
       </div>
 

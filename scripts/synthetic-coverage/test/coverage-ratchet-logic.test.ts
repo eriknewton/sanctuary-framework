@@ -124,13 +124,13 @@ describe("diffAgainstBaseline", () => {
 
   it("does not treat a not_implemented baseline row as passing assurance", () => {
     const live = report([
-      row({ assurance_row_id: "9", fixtures_passed: 0, coverage_state: "not_implemented" }),
+      row({ assurance_row_id: "99", fixtures_passed: 0, coverage_state: "not_implemented" }),
     ]);
     const baseline: CoverageBaseline = {
       rows: [
         {
-          assurance_row_id: "9",
-          label: "row 9",
+          assurance_row_id: "99",
+          label: "not implemented example row",
           assurance_status: "not_implemented",
           fixtures_passed: 0,
           coverage_state: "not_implemented",
