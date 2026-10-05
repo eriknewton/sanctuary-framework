@@ -709,4 +709,44 @@ describe("Standalone Dashboard", () => {
     // retired term, which must never appear on screen).
     expect(await postureRes.text()).toContain("Security Posture");
   });
+
+  it("answers optional v1.1 panel reads with a typed standalone-mode signal, while other misses stay 404", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-optional-panels";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-optional-panels",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const headers = { Authorization: "Bearer test-token-optional-panels" };
+    const optionalPanelPaths = [
+      "/api/inbox/unified/prefs",
+      "/api/auto-trigger/rules",
+      "/api/auto-trigger/recommendations",
+      "/api/honeypot/tool-traps",
+      "/api/honeypot/credential-traps",
+    ];
+
+    for (const path of optionalPanelPaths) {
+      const res = await fetch(`http://127.0.0.1:${result.port}${path}`, {
+        headers,
+      });
+      expect(res.status, path).toBe(503);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: "dashboard_mode_not_served",
+        mode: "standalone",
+        unavailable: true,
+        message: "Not available in this dashboard mode.",
+      });
+    }
+
+    const missing = await fetch(
+      `http://127.0.0.1:${result.port}/api/not-a-real-panel`,
+      { headers },
+    );
+    expect(missing.status).toBe(404);
+  });
 });
