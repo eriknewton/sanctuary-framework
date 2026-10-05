@@ -36,6 +36,17 @@ export function getClientScript(): string {
   return CLIENT_SCRIPT;
 }
 
+// Must match DASHBOARD_MODE_NOT_SERVED_* in
+// server/src/dashboard/standalone-mode-signal.ts. The embedded browser client
+// cannot import server modules at runtime, so tests assert this pinned protocol
+// tuple stays in full parity.
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_STATUS = 503;
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR =
+  "dashboard_mode_not_served";
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE = "standalone";
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE =
+  "Not available in this dashboard mode.";
+
 const CLIENT_SCRIPT = String.raw`
 "use strict";
 
@@ -116,12 +127,15 @@ const DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS = (SEAL_FRESHNESS_MAX_MS / SEAL_RERE
 const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = 1; // One millisecond moves past the inclusive freshness boundary.
 const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
 const pendingReads = new Map();
-// Must match DASHBOARD_MODE_NOT_SERVED_ERROR in
+// Must match DASHBOARD_CLIENT_MODE_NOT_SERVED_* exports in
+// server/src/dashboard/v1_1/client.ts, which tests pin to
 // server/src/dashboard/standalone-mode-signal.ts. This is a positive server
 // signal, distinct from a bare 404, so optional standalone panels render as
 // unavailable without a Retry button.
-const DASHBOARD_MODE_NOT_SERVED_ERROR = "dashboard_mode_not_served";
-const DASHBOARD_MODE_NOT_SERVED_MESSAGE = "Not available in this dashboard mode.";
+const DASHBOARD_MODE_NOT_SERVED_STATUS = ${DASHBOARD_CLIENT_MODE_NOT_SERVED_STATUS};
+const DASHBOARD_MODE_NOT_SERVED_ERROR = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR)};
+const DASHBOARD_MODE_NOT_SERVED_MODE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE)};
+const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE)};
 // Invariant: every panel tracks one explicit read state per source; only
 // state_LOADED may render a count, checked empty list, clear, configured or
 // protective status. UNREAD/LOADING/FAILED render Unknown with a labeled Retry;
@@ -155,18 +169,24 @@ function failSource(path, error) {
   read.nextReadAt = Date.now() + Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, read.failures - 1));
   clearSealFreshnessTimer(path);
 }
-function markSourceNotServed(path, body) {
+function markSourceNotServed(path) {
   const read = sourceRead(path);
   if (!read) return;
   read.state = "state_NOT_SERVED";
-  read.error = body && typeof body.message === "string" ? body.message : DASHBOARD_MODE_NOT_SERVED_MESSAGE;
+  read.error = DASHBOARD_MODE_NOT_SERVED_MESSAGE;
   read.failures = 0;
   read.nextReadAt = 0;
   read.status = null;
   clearSealFreshnessTimer(path);
 }
-function isDashboardModeNotServedBody(body) {
-  return !!body && body.error === DASHBOARD_MODE_NOT_SERVED_ERROR && body.unavailable === true && body.mode === "standalone";
+function isDashboardModeNotServedResponse(status, body) {
+  return status === DASHBOARD_MODE_NOT_SERVED_STATUS &&
+    !!body &&
+    body.ok === false &&
+    body.error === DASHBOARD_MODE_NOT_SERVED_ERROR &&
+    body.mode === DASHBOARD_MODE_NOT_SERVED_MODE &&
+    body.unavailable === true &&
+    body.message === DASHBOARD_MODE_NOT_SERVED_MESSAGE;
 }
 function validateReadBody(key, body) {
   const data = body && body.data;
@@ -381,8 +401,8 @@ function readResponse(url, init, deadlineMs) {
     let body = null;
     try { body = await res.json(); } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
     if (!res.ok) {
-      if (isDashboardModeNotServedBody(body)) {
-        const error = new Error(body.message || DASHBOARD_MODE_NOT_SERVED_MESSAGE);
+      if (isDashboardModeNotServedResponse(res.status, body)) {
+        const error = new Error(DASHBOARD_MODE_NOT_SERVED_MESSAGE);
         error.status = res.status;
         error.body = body;
         error.dashboardModeNotServed = true;
@@ -404,7 +424,7 @@ function readResponse(url, init, deadlineMs) {
     if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
     return res;
   }, function (error) {
-    if (error && error.dashboardModeNotServed) markSourceNotServed(url, error.body);
+    if (error && error.dashboardModeNotServed) markSourceNotServed(url);
     else failSource(url, error);
     if (source && source.state !== "state_NOT_SERVED") source.status = error.status;
     rerender();

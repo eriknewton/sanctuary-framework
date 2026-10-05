@@ -7,7 +7,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import * as clientSignal from "../../../src/dashboard/v1_1/client.js";
+import {
+  DASHBOARD_MODE_NOT_SERVED_ERROR,
+  DASHBOARD_MODE_NOT_SERVED_MESSAGE,
+  DASHBOARD_MODE_NOT_SERVED_STATUS,
+  dashboardModeNotServedBody,
+} from "../../../src/dashboard/standalone-mode-signal.js";
 
 function liftReadRenderer(): {
   readAndRender: (
@@ -15,7 +21,7 @@ function liftReadRenderer(): {
     response: { status: number; body: unknown },
   ) => Promise<string>;
 } {
-  const src = getClientScript();
+  const src = clientSignal.getClientScript();
   const end = src.indexOf('document.addEventListener("click"');
   let chunk = src.slice(0, end);
   chunk = chunk.replace(/const\s+state\s*=/, "var state =");
@@ -64,18 +70,27 @@ function liftReadRenderer(): {
 }
 
 describe("v1.1 dashboard standalone-mode panel signal", () => {
+  it("keeps the client pinned signal tuple in parity with the server writer", () => {
+    expect(clientSignal.DASHBOARD_CLIENT_MODE_NOT_SERVED_STATUS).toBe(
+      DASHBOARD_MODE_NOT_SERVED_STATUS,
+    );
+    expect(clientSignal.DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR).toBe(
+      DASHBOARD_MODE_NOT_SERVED_ERROR,
+    );
+    expect(clientSignal.DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE).toBe(
+      dashboardModeNotServedBody("standalone").mode,
+    );
+    expect(clientSignal.DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE).toBe(
+      DASHBOARD_MODE_NOT_SERVED_MESSAGE,
+    );
+  });
+
   it("renders the typed standalone-mode signal without Retry", async () => {
     const { readAndRender } = liftReadRenderer();
 
     const html = await readAndRender("/api/honeypot/tool-traps", {
-      status: 503,
-      body: {
-        ok: false,
-        error: "dashboard_mode_not_served",
-        mode: "standalone",
-        unavailable: true,
-        message: "Not available in this dashboard mode.",
-      },
+      status: DASHBOARD_MODE_NOT_SERVED_STATUS,
+      body: dashboardModeNotServedBody("standalone"),
     });
 
     expect(html).toContain("Tool honeypots: Not available in this dashboard mode.");
@@ -93,5 +108,49 @@ describe("v1.1 dashboard standalone-mode panel signal", () => {
 
     expect(html).toContain("Tool honeypots: Unknown. Read failed (HTTP 404).");
     expect(html).toContain("Retry");
+  });
+
+  it.each([
+    [
+      "non-503 status",
+      {
+        status: 500,
+        body: dashboardModeNotServedBody("standalone"),
+      },
+      "Read failed (HTTP 500).",
+    ],
+    [
+      "missing typed field",
+      {
+        status: DASHBOARD_MODE_NOT_SERVED_STATUS,
+        body: {
+          error: DASHBOARD_MODE_NOT_SERVED_ERROR,
+          mode: "standalone",
+          unavailable: true,
+          message: DASHBOARD_MODE_NOT_SERVED_MESSAGE,
+        },
+      },
+      "Read failed (HTTP 503).",
+    ],
+    [
+      "spoofed message",
+      {
+        status: DASHBOARD_MODE_NOT_SERVED_STATUS,
+        body: {
+          ...dashboardModeNotServedBody("standalone"),
+          message: "0",
+        },
+      },
+      "Read failed (HTTP 503).",
+    ],
+  ])("keeps %s on the existing read-failure surface", async (_name, response, expected) => {
+    const { readAndRender } = liftReadRenderer();
+
+    const html = await readAndRender("/api/honeypot/tool-traps", response);
+
+    expect(html).toContain(`Tool honeypots: Unknown. ${expected}`);
+    expect(html).toContain("Retry");
+    expect(html).not.toContain("Tool honeypots: Not available in this dashboard mode.");
+    expect(html).not.toContain("Tool honeypots: 0");
   });
 });

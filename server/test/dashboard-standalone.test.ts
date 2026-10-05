@@ -6,7 +6,7 @@
 
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
-import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
+import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -721,26 +721,13 @@ describe("Standalone Dashboard", () => {
     dashboard = result.dashboard;
 
     const headers = { Authorization: "Bearer test-token-optional-panels" };
-    const optionalPanelPaths = [
-      "/api/inbox/unified/prefs",
-      "/api/auto-trigger/rules",
-      "/api/auto-trigger/recommendations",
-      "/api/honeypot/tool-traps",
-      "/api/honeypot/credential-traps",
-    ];
 
-    for (const path of optionalPanelPaths) {
+    for (const path of STANDALONE_OPTIONAL_PANEL_PATHS) {
       const res = await fetch(`http://127.0.0.1:${result.port}${path}`, {
         headers,
       });
       expect(res.status, path).toBe(503);
-      expect(await res.json()).toEqual({
-        ok: false,
-        error: "dashboard_mode_not_served",
-        mode: "standalone",
-        unavailable: true,
-        message: "Not available in this dashboard mode.",
-      });
+      expect(await res.json()).toEqual(dashboardModeNotServedBody("standalone"));
     }
 
     const missing = await fetch(
@@ -749,4 +736,188 @@ describe("Standalone Dashboard", () => {
     );
     expect(missing.status).toBe(404);
   });
+
+  it("keeps standalone optional panel reads behind the same unauthenticated response as other protected API reads", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-optional-panels-auth";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-optional-panels-auth",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+    dashboard.setAutoAuthLocalhost(false);
+
+    const control = await fetch(`http://127.0.0.1:${result.port}/api/status`);
+    const controlText = await control.text();
+    expect(control.status).toBe(401);
+
+    for (const path of STANDALONE_OPTIONAL_PANEL_PATHS) {
+      const res = await fetch(`http://127.0.0.1:${result.port}${path}`);
+      expect(res.status, path).toBe(control.status);
+      expect(await res.text(), path).toBe(controlText);
+      expect(res.status, path).not.toBe(503);
+    }
+  });
+
+  it("does not apply the standalone optional-panel signal to mutations or exact-path subroutes", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-optional-panels-scope";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-optional-panels-scope",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const headers = { Authorization: "Bearer test-token-optional-panels-scope" };
+    const probes: Array<[string, RequestInit]> = [
+      ["/api/honeypot/tool-traps", { method: "POST", headers }],
+      ["/api/auto-trigger/rules/example", { method: "PATCH", headers }],
+      ["/api/auto-trigger/rules/example", { method: "GET", headers }],
+    ];
+
+    for (const [path, init] of probes) {
+      const res = await fetch(`http://127.0.0.1:${result.port}${path}`, init);
+      expect(res.status, `${init.method ?? "GET"} ${path}`).not.toBe(503);
+    }
+  });
+
+  it("serves optional panel routes normally when hosted route runtimes are mounted", async () => {
+    const hosted = await startHostedOptionalPanelDashboard();
+    dashboard = hosted.dashboard;
+
+    const headers = { Authorization: `Bearer ${hosted.authToken}` };
+    for (const path of STANDALONE_OPTIONAL_PANEL_PATHS) {
+      const res = await fetch(`${hosted.baseUrl}${path}`, { headers });
+      expect(res.status, path).not.toBe(503);
+      expect(res.status, path).not.toBe(404);
+      expect(res.status, path).toBe(200);
+    }
+  });
 });
+
+import { AuditLog } from "../src/operational/audit-log.js";
+import { generateRandomKey } from "../src/core/random.js";
+import { MemoryStorage } from "../src/storage/memory.js";
+import {
+  ActionDispatcher,
+  NotifyOperatorAction,
+} from "../src/auto-trigger/action-dispatcher.js";
+import { CalibrationSuggester } from "../src/auto-trigger/calibration-suggester.js";
+import { ThresholdConfigStore } from "../src/auto-trigger/threshold-config-store.js";
+import { TrapRegistry } from "../src/honeypot/trap-registry.js";
+import { ToolCallTrapRuntime } from "../src/honeypot/tool-call-trap-runtime.js";
+import { CredentialTrapRuntime } from "../src/honeypot/credential-trap-runtime.js";
+import { SentinelFindingStore } from "../src/sentinel/sentinel-finding-store.js";
+import { UnifiedInboxBridge } from "../src/principal-policy/unified-inbox-bridge.js";
+import { UnifiedInboxStore } from "../src/principal-policy/unified-inbox-store.js";
+import { UnifiedInboxPrefsStore } from "../src/principal-policy/unified-inbox-prefs-store.js";
+import {
+  STANDALONE_OPTIONAL_PANEL_PATHS,
+  dashboardModeNotServedBody,
+} from "../src/dashboard/standalone-mode-signal.js";
+
+async function startHostedOptionalPanelDashboard(): Promise<{
+  dashboard: DashboardApprovalChannel;
+  authToken: string;
+  baseUrl: string;
+}> {
+  const authToken = "hosted-optional-panel-token";
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const auditLog = new AuditLog(storage, masterKey);
+  const fortressId = "hosted_optional_panel_fortress";
+  const identityId = "hosted_optional_panel_operator";
+  const port = randomTestPort();
+  const dashboard = new DashboardApprovalChannel({
+    port,
+    host: "127.0.0.1",
+    timeout_seconds: 30,
+    auth_token: authToken,
+    auto_open: false,
+  });
+
+  const autoTriggerStore = new ThresholdConfigStore({
+    storage,
+    masterKey,
+    fortressId,
+  });
+  const autoTriggerDispatcher = new ActionDispatcher({
+    store: autoTriggerStore,
+    action: new NotifyOperatorAction(auditLog, identityId, fortressId),
+    auditLog,
+    fortressId,
+    identityId,
+  });
+  const autoTriggerSuggester = new CalibrationSuggester({
+    store: autoTriggerStore,
+    dispatcher: autoTriggerDispatcher,
+    auditLog,
+    fortressId,
+    identityId,
+    tickIntervalMs: 0,
+  });
+  dashboard.setAutoTrigger({
+    store: autoTriggerStore,
+    dispatcher: autoTriggerDispatcher,
+    suggester: autoTriggerSuggester,
+  });
+
+  const inboxStore = new UnifiedInboxStore({
+    storage,
+    masterKey,
+    fortressId,
+  });
+  dashboard.setUnifiedInbox({
+    bridge: new UnifiedInboxBridge({
+      auditLog,
+      identityId,
+      fortressId,
+      store: inboxStore,
+    }),
+    prefsStore: new UnifiedInboxPrefsStore({
+      storage,
+      masterKey,
+      fortressId,
+      operatorId: identityId,
+    }),
+    fortressId,
+    identityId,
+  });
+
+  const findingStore = new SentinelFindingStore({
+    storage,
+    masterKey,
+    fortressId,
+  });
+  const trapRegistry = new TrapRegistry();
+  dashboard.setHoneypotRegistry({
+    registry: trapRegistry,
+    findingStore,
+    auditLog,
+    operatorId: identityId,
+    fortressId,
+    toolCallRuntime: new ToolCallTrapRuntime({
+      registry: trapRegistry,
+      findingStore,
+      auditLog,
+      operatorId: identityId,
+      fortressId,
+    }),
+    credentialRuntime: new CredentialTrapRuntime({
+      registry: trapRegistry,
+      findingStore,
+      auditLog,
+      operatorId: identityId,
+      fortressId,
+    }),
+  });
+
+  await dashboard.start();
+  return {
+    dashboard,
+    authToken,
+    baseUrl: `http://127.0.0.1:${port}`,
+  };
+}
