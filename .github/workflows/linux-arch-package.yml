@@ -1,0 +1,133 @@
+name: Linux Arch Package
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARCH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  arch-package-build:
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+    timeout-minutes: 90
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Build Arch package from exact head
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$ARCH_SOURCE_SHA" ]]
+          pacman -Sy --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
+          useradd -m build
+          chown -R build:build "$GITHUB_WORKSPACE"
+          runuser -u build -- rustup toolchain install 1.95.0 --profile minimal
+          runuser -u build -- bash -lc "cd '$GITHUB_WORKSPACE/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" makepkg --noconfirm --syncdeps --needed"
+          install -d "$RUNNER_TEMP/arch-package"
+          packages=(castle-wall-daemon/packaging/arch/*.pkg.tar.zst)
+          [[ ${#packages[@]} == 1 ]]
+          cp -- "${packages[0]}" "$RUNNER_TEMP/arch-package/"
+          (cd "$RUNNER_TEMP/arch-package" && sha256sum ./*.pkg.tar.zst > SHA256SUMS)
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-package-${{ env.ARCH_SOURCE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-package
+          if-no-files-found: error
+          retention-days: 7
+
+  arch-package-lifecycle:
+    needs: arch-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.arch-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/arch-package
+          merge-multiple: true
+      - name: Run pacman lifecycle under systemd PID 1
+        run: |
+          cd "$RUNNER_TEMP/arch-package"
+          sha256sum --check SHA256SUMS
+          pkg=(*.pkg.tar.zst)
+          [[ ${#pkg[@]} == 1 ]]
+          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:latest /usr/lib/systemd/systemd)"
+          timeout 120 bash -c "until docker exec '$cid' test \"\$(cat /proc/1/comm)\" = systemd; do sleep 2; done"
+          docker exec "$cid" bash -lc "pacman -Sy --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=/tmp/arch-lifecycle /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}"
+          docker cp "$cid:/tmp/arch-lifecycle" "$RUNNER_TEMP/arch-lifecycle"
+          docker stop "$cid"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-lifecycle
+          if-no-files-found: error
+          retention-days: 7
+
+  deb-unchanged-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+      - name: Enforce slice path allowlist
+        run: |
+          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          git fetch --no-tags --depth=1 origin main
+          git diff --name-only "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          allowed_workflow = ".github/workflows/linux-arch-package.yml"
+          bad = []
+          for path in Path(__import__("os").environ["RUNNER_TEMP"], "changed-paths.txt").read_text().splitlines():
+              if path == allowed_workflow or path.startswith("castle-wall-daemon/packaging/arch/"):
+                  continue
+              bad.append(path)
+          if bad:
+              raise SystemExit("outside Arch packaging slice:\n" + "\n".join(bad))
+          PY
+      - name: Rebuild base and head install debs and compare protected fields
+        run: |
+          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          work="$RUNNER_TEMP/deb-unchanged"
+          git worktree add "$work/base" "$base"
+          git worktree add "$work/head" HEAD
+          for side in base head; do
+            (cd "$work/$side" && sudo git config --global --add safe.directory "$PWD")
+            sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+              python3 "$work/$side/castle-wall-daemon/packaging/ubuntu/build-install-deb.py" \
+              --revision 1 --output "$work/$side-out"
+          done
+          base_deb=("$work/base-out"/*.deb)
+          head_deb=("$work/head-out"/*.deb)
+          python3 castle-wall-daemon/packaging/arch/assert-deb-unchanged.py "${base_deb[0]}" "${head_deb[0]}"

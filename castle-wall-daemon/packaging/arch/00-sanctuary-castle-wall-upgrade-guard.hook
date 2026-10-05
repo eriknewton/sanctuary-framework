@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+# Must match pkgname in PKGBUILD.
+Target = sanctuary-castle-wall
+
+[Action]
+Description = Guarding Castle Wall replacement
+When = PreTransaction
+AbortOnFail
+NeedsTargets
+# Must match _guard_path in PKGBUILD and GUARD_PATH in sanctuary-castle-wall-guard.py.
+Exec = /usr/share/libalpm/scripts/sanctuary-castle-wall-guard upgrade

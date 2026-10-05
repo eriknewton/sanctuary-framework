@@ -1,0 +1,53 @@
+# Maintainer: Erik Newton <eriknewton@gmail.com>
+
+pkgname=sanctuary-castle-wall
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Castle Wall cold-install package'
+arch=('x86_64')
+url='https://github.com/eriknewton/sanctuary-framework'
+license=('LicenseRef-Sanctuary')
+# There is deliberately no install= scriptlet: libalpm scriptlets cannot refuse
+# transactions, and this first slice keeps installation inert.
+_glibc_floor="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+depends=("glibc>=${_glibc_floor}" 'systemd' 'nftables' 'python' 'libnetfilter_queue' 'iproute2' 'util-linux' 'shadow')
+makedepends=('rustup')
+options=('!strip')
+backup=()
+source=()
+sha256sums=()
+
+_target='x86_64-unknown-linux-gnu'
+_toolchain='1.95.0'
+_guard_path='usr/share/libalpm/scripts/sanctuary-castle-wall-guard'
+
+_crate_root() {
+  cd "${startdir}/../.." && pwd -P
+}
+
+build() {
+  local crate
+  crate="$(_crate_root)"
+  cd "$crate"
+  rustc --version | grep -F "rustc ${_toolchain} " >/dev/null
+  cargo build --locked --release --target "${_target}" \
+    --bin castle-wall-daemon \
+    --bin protected-agent-v1 \
+    --bin network-agent-standin \
+    --bin sanctuary-linux
+}
+
+package() {
+  local crate source_commit rustc_version
+  crate="$(_crate_root)"
+  source_commit="$(git -C "${crate}/.." rev-parse HEAD)"
+  rustc_version="$(rustc --version)"
+  python3 "${startdir}/build-arch-package.py" \
+    --crate "$crate" \
+    --dest "$pkgdir" \
+    --pkgver "$pkgver" \
+    --pkgrel "$pkgrel" \
+    --source-commit "$source_commit" \
+    --rustc-version "$rustc_version" \
+    --glibc-floor "$_glibc_floor"
+}
