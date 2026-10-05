@@ -26,12 +26,17 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      # The archlinux image ships without git; without it actions/checkout falls back to a
+      # REST download with no .git, and the exact-head check below cannot run.
+      - name: Install git for checkout
+        run: pacman -Sy --noconfirm --needed git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.ARCH_SOURCE_SHA }}
           persist-credentials: false
       - name: Build Arch package from exact head
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$(git rev-parse HEAD)" == "$ARCH_SOURCE_SHA" ]]
           pacman -Sy --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
           useradd -m build

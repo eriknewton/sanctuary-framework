@@ -11,6 +11,8 @@ from pathlib import Path
 
 
 def extract(deb: Path, out: Path) -> None:
+    # dpkg-deb creates only the last path component; the parent must already exist.
+    (out / "fs").mkdir(parents=True, exist_ok=True)
     subprocess.run(["dpkg-deb", "-x", str(deb), str(out / "fs")], check=True)
     subprocess.run(["dpkg-deb", "-e", str(deb), str(out / "control")], check=True)
 
@@ -37,7 +39,11 @@ def main() -> None:
         extract(args.head_deb, head)
         base_identity, head_identity = load_identity(base), load_identity(head)
         for field in ("payload_sha256", "guard_sha256"):
-            if base_identity.get(field) != head_identity.get(field):
+            # A field missing from both sides would compare equal as None; absence is a
+            # refusal, never a pass, so the gate cannot go green on an identity it did not read.
+            if not base_identity.get(field) or not head_identity.get(field):
+                raise SystemExit(f"{field} missing from a build identity")
+            if base_identity[field] != head_identity[field]:
                 raise SystemExit(f"{field} changed")
         if (base / "control/control").read_bytes() != (head / "control/control").read_bytes():
             raise SystemExit("control file changed")
