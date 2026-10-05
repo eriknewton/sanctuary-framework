@@ -36,6 +36,17 @@ export function getClientScript(): string {
   return CLIENT_SCRIPT;
 }
 
+// Must match DASHBOARD_MODE_NOT_SERVED_* in
+// server/src/dashboard/standalone-mode-signal.ts. The embedded browser client
+// cannot import server modules at runtime, so tests assert this pinned protocol
+// tuple stays in full parity.
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_STATUS = 503;
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR =
+  "dashboard_mode_not_served";
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE = "standalone";
+export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE =
+  "Not available in this dashboard mode.";
+
 const CLIENT_SCRIPT = String.raw`
 "use strict";
 
@@ -116,10 +127,20 @@ const DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS = (SEAL_FRESHNESS_MAX_MS / SEAL_RERE
 const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = 1; // One millisecond moves past the inclusive freshness boundary.
 const INBOX_PREFS_DEADLINE_MS = DASHBOARD_READ_DEADLINE_MS;
 const pendingReads = new Map();
+// Must match DASHBOARD_CLIENT_MODE_NOT_SERVED_* exports in
+// server/src/dashboard/v1_1/client.ts, which tests pin to
+// server/src/dashboard/standalone-mode-signal.ts. This is a positive server
+// signal, distinct from a bare 404, so optional standalone panels render as
+// unavailable without a Retry button.
+const DASHBOARD_MODE_NOT_SERVED_STATUS = ${DASHBOARD_CLIENT_MODE_NOT_SERVED_STATUS};
+const DASHBOARD_MODE_NOT_SERVED_ERROR = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR)};
+const DASHBOARD_MODE_NOT_SERVED_MODE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE)};
+const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE)};
 // Invariant: every panel tracks one explicit read state per source; only
 // state_LOADED may render a count, checked empty list, clear, configured or
 // protective status. UNREAD/LOADING/FAILED render Unknown with a labeled Retry;
-// protection additionally requires fresh evidence. Fixed sources never evict.
+// state_NOT_SERVED renders the positive standalone-mode signal with no Retry.
+// Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
   INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
   HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
@@ -138,6 +159,7 @@ function readKey(url) {
 function sourceRead(path) { return sourceReads.get(readKey(path)); }
 let liveUpdatesStopped = false;
 function sourceLoaded(path) { const read = sourceRead(path); return !liveUpdatesStopped && !!read && read.state === "state_LOADED"; }
+function sourceNotServed(path) { const read = sourceRead(path); return !liveUpdatesStopped && !!read && read.state === "state_NOT_SERVED"; }
 function failSource(path, error) {
   const read = sourceRead(path);
   if (!read) return;
@@ -146,6 +168,25 @@ function failSource(path, error) {
   read.failures = Math.min(read.failures + 1, 5); // Five doublings already reach the one-minute ceiling.
   read.nextReadAt = Date.now() + Math.min(READ_BACKOFF_MAX_MS, DASHBOARD_READ_DEADLINE_MS * Math.pow(2, read.failures - 1));
   clearSealFreshnessTimer(path);
+}
+function markSourceNotServed(path) {
+  const read = sourceRead(path);
+  if (!read) return;
+  read.state = "state_NOT_SERVED";
+  read.error = DASHBOARD_MODE_NOT_SERVED_MESSAGE;
+  read.failures = 0;
+  read.nextReadAt = 0;
+  read.status = null;
+  clearSealFreshnessTimer(path);
+}
+function isDashboardModeNotServedResponse(status, body) {
+  return status === DASHBOARD_MODE_NOT_SERVED_STATUS &&
+    !!body &&
+    body.ok === false &&
+    body.error === DASHBOARD_MODE_NOT_SERVED_ERROR &&
+    body.mode === DASHBOARD_MODE_NOT_SERVED_MODE &&
+    body.unavailable === true &&
+    body.message === DASHBOARD_MODE_NOT_SERVED_MESSAGE;
 }
 function validateReadBody(key, body) {
   const data = body && body.data;
@@ -360,6 +401,13 @@ function readResponse(url, init, deadlineMs) {
     let body = null;
     try { body = await res.json(); } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
     if (!res.ok) {
+      if (isDashboardModeNotServedResponse(res.status, body)) {
+        const error = new Error(DASHBOARD_MODE_NOT_SERVED_MESSAGE);
+        error.status = res.status;
+        error.body = body;
+        error.dashboardModeNotServed = true;
+        throw error;
+      }
       const error = new Error(res.status === 401 || res.status === 403
         ? "Operator access required (HTTP " + res.status + ")."
         : "Read failed (HTTP " + res.status + ").");
@@ -376,8 +424,9 @@ function readResponse(url, init, deadlineMs) {
     if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
     return res;
   }, function (error) {
-    failSource(url, error);
-    if (source) source.status = error.status;
+    if (error && error.dashboardModeNotServed) markSourceNotServed(url);
+    else failSource(url, error);
+    if (source && source.state !== "state_NOT_SERVED") source.status = error.status;
     rerender();
     throw error;
   }).finally(function () {
@@ -412,6 +461,11 @@ function renderSourceRead(path) {
   const read = sourceRead(path);
   if (!read || (!liveUpdatesStopped && read.state === "state_LOADED")) return "";
   const label = readLabel(path);
+  if (sourceNotServed(path)) {
+    return '<section class="card" data-source="' + escHtml(path) + '">' +
+      '<p role="status" aria-live="polite">' + escHtml(label) + ': ' +
+      escHtml(read.error || DASHBOARD_MODE_NOT_SERVED_MESSAGE) + '</p></section>';
+  }
   const loading = read.state === "state_LOADING";
   return '<section class="card" data-source="' + escHtml(path) + '">' +
     '<p role="status" aria-live="polite">' + escHtml(label) + ': Unknown. ' +
@@ -3379,7 +3433,7 @@ function loadPanel(job) {
   const pending = Promise.resolve().then(function () { return job.load(deadlineAt); }).then(function () {
     return job.paths.some(function (path) { const read = sourceRead(path); return read && read.state === "state_LOADED"; });
   }).catch(function (error) {
-    job.paths.forEach(function (path) { if (sourceRead(path) && sourceRead(path).state !== "state_FAILED") failSource(path, error); });
+    job.paths.forEach(function (path) { if (sourceRead(path) && sourceRead(path).state !== "state_FAILED" && sourceRead(path).state !== "state_NOT_SERVED") failSource(path, error); });
     return false;
   }).finally(function () { pendingPanels.delete(job); rerender(); });
   pendingPanels.set(job, pending);

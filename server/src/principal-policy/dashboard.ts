@@ -297,6 +297,10 @@ import {
   UNIFIED_INBOX_API_PREFIX,
   UNIFIED_INBOX_RETENTION_API_PREFIX,
 } from "./unified-inbox-routes.js";
+import {
+  isStandaloneOptionalPanelPath,
+  writeDashboardModeNotServed,
+} from "../dashboard/standalone-mode-signal.js";
 import type { UnifiedInboxPrefsStore } from "./unified-inbox-prefs-store.js";
 import {
   UnifiedInboxRetentionPolicy,
@@ -6903,6 +6907,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // session-exchange endpoint keep their own stricter limits below.
     if (!isDashboardViewRoute(method, url.pathname)) {
       if (!this.checkRateLimit(req, res, "general")) return;
+    }
+
+    // Standalone dashboards do not construct the unified-inbox, auto-trigger,
+    // or honeypot management runtimes here. These exact v1.1 panel reads must
+    // get a positive mode signal, not a bare 404, so the client can say the
+    // panel is unavailable in standalone mode without offering a futile Retry.
+    // SECURITY: this mode signal is intentionally AFTER the shared auth
+    // admission and general rate limiter above; otherwise an anonymous caller
+    // could distinguish standalone from hosted mode before proving operator
+    // access. Path set must match STANDALONE_OPTIONAL_PANEL_PATHS in
+    // server/src/dashboard/standalone-mode-signal.ts.
+    if (
+      this._standaloneMode &&
+      method === "GET" &&
+      isStandaloneOptionalPanelPath(url.pathname)
+    ) {
+      writeDashboardModeNotServed(res, "standalone");
+      return;
     }
 
     try {
