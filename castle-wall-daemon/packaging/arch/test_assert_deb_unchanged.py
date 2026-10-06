@@ -16,9 +16,12 @@ from pathlib import Path
 # module and pytest skip it the same way; deb-unchanged-gate installs both packages and runs it.
 try:
     import pytest
-    import yaml
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only by the Arch container
-    raise unittest.SkipTest("pytest and PyYAML are provided only in deb-unchanged-gate") from exc
+    raise unittest.SkipTest("pytest is provided only in deb-unchanged-gate") from exc
+
+# Imported outside the guard on purpose: under pytest a missing PyYAML must be a collection
+# error, never a silent skip of the thirty gate tests (closure read, Claude 1).
+import yaml
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent.parent
@@ -298,6 +301,15 @@ def test_declared_identity_hex_must_equal_declared_file_hash(tmp_path: Path) -> 
         compare(base, head, declared(CLI_PATH))
 
 
+@pytest.mark.parametrize("document", ["[]", "null", '"str"', "1", "true"])
+def test_declaration_must_be_a_json_object(tmp_path: Path, document: str) -> None:
+    declaration = tmp_path / "deb-delta-declaration.json"
+    declaration.write_text(document)
+
+    with pytest.raises(gate.DebCompareError, match="must be a JSON object"):
+        gate.active_declaration([gate.DECLARATION_PATH], declaration)
+
+
 def test_deleted_declaration_file_is_strict_mode(tmp_path: Path) -> None:
     missing = tmp_path / "deb-delta-declaration.json"
 
@@ -461,6 +473,8 @@ def test_disposition_allows_refused_allowlist_only_for_declared_delta(tmp_path: 
         tmp_path / "stale", allowlist="refused", comparator="refused", inheritance="ok", declared=True
     )
     assert stale_summary.returncode == 1
+    # A refused comparator never earns the declared-delta line, whatever the summary file says.
+    assert "DECLARED DELTA" not in stale_summary.stdout
 
 
 def test_arch_predicates_and_workflow_derive_from_python_predicates() -> None:
