@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -14,14 +15,20 @@ import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
-IDENTITY_PATH = "fs/usr/share/doc/sanctuary-castle-wall/build-identity"
+IDENTITY_PATH = "fs/usr/share/doc/sanctuary-castle-wall/build-identity"  # Must match install-layout.py IDENTITY with fs/ prepended.
 DECLARATION_PATH = "castle-wall-daemon/packaging/arch/deb-delta-declaration.json"
 CONTROL_MEMBERS = frozenset({"control", "preinst", "prerm"})
 SCRIPT_NAMES = ("preinst", "prerm")
 
 # 64 hex chars = SHA-256's 32 bytes rendered as two lowercase hex chars each.
 SHA256_HEX = rb"[0-9a-f]{64}"
-SCRIPT_IDENTITY_RE = re.compile(rb"(?m)^IDENTITY_SHA256 = '(" + SHA256_HEX + rb")'$")
+SCRIPT_IDENTITY_RE = re.compile(
+    rb"(?m)^IDENTITY_SHA256 = '(" + SHA256_HEX + rb")'$"
+)  # Must match install-layout.py guard_bytes' IDENTITY_SHA256 header line.
+GUARD_SHA256_RE = re.compile(rb'"guard_sha256"\s*:\s*"[0-9a-f]{64}"')
+PAYLOAD_SHA256_NONEMPTY_RE = re.compile(
+    rb'"payload_sha256"\s*:\s*\{\s*"[^"]+"\s*:\s*"[0-9a-f]{64}"', re.DOTALL
+)
 
 # Must match the derived predicate calls in .github/workflows/linux-arch-package.yml.
 ARCH_TRIGGER_EXACT_PATHS = (
@@ -31,7 +38,6 @@ ARCH_TRIGGER_EXACT_PATHS = (
 ARCH_TRIGGER_PREFIXES = (
     "castle-wall-daemon/packaging/arch/",
     "castle-wall-daemon/src/linux_install/arch/",
-    "castle-wall-daemon/tests/linux_install_arch_",
     "castle-wall-daemon/tests/fixtures/substrate/",
 )
 ARCH_ALLOWED_EXACT_PATHS = ARCH_TRIGGER_EXACT_PATHS + (
@@ -57,11 +63,31 @@ class DeltaDeclaration(NamedTuple):
 
 
 def is_arch_trigger_path(path: str) -> bool:
-    return path in ARCH_TRIGGER_EXACT_PATHS or any(path.startswith(prefix) for prefix in ARCH_TRIGGER_PREFIXES)
+    return (
+        path in ARCH_TRIGGER_EXACT_PATHS
+        or any(path.startswith(prefix) for prefix in ARCH_TRIGGER_PREFIXES)
+        or is_linux_install_arch_test(path)
+    )
 
 
 def is_arch_allowed_path(path: str) -> bool:
-    return path in ARCH_ALLOWED_EXACT_PATHS or any(path.startswith(prefix) for prefix in ARCH_ALLOWED_PREFIXES)
+    return (
+        path in ARCH_ALLOWED_EXACT_PATHS
+        or any(path.startswith(prefix) for prefix in ARCH_ALLOWED_PREFIXES)
+        or is_linux_install_arch_test(path)
+    )
+
+
+def is_linux_install_arch_test(path: str) -> bool:
+    prefix = "castle-wall-daemon/tests/linux_install_arch_"
+    if not path.startswith(prefix) or not path.endswith(".rs"):
+        return False
+    rest = path[len(prefix) :]
+    return "/" not in rest
+
+
+def repr_path_lines(paths: list[str]) -> str:
+    return "".join(f"{path!r}\n" for path in paths)
 
 
 def extract(deb: Path, out: Path) -> None:
@@ -80,7 +106,7 @@ def active_declaration(changed_paths: list[str], declaration_path: Path) -> Delt
     if DECLARATION_PATH not in changed_paths:
         return None
     if not declaration_path.is_file():
-        raise DebCompareError(f"{DECLARATION_PATH} is in the diff but no declaration file exists")
+        return None
     try:
         data = json.loads(declaration_path.read_text())
     except json.JSONDecodeError as exc:
@@ -140,11 +166,32 @@ def identity_entry(path: str, digest: str) -> bytes:
     return json.dumps(key).encode() + b": " + json.dumps(digest).encode()
 
 
+def guard_payload_hash_entry(path: str, digest: str) -> bytes:
+    key = path.removeprefix("fs/")
+    return repr(key).encode() + b": " + repr(digest).encode()
+
+
+def first_differing_line(base: bytes, head: bytes) -> str:
+    base_lines = base.splitlines()
+    head_lines = head.splitlines()
+    matcher = difflib.SequenceMatcher(a=base_lines, b=head_lines, autojunk=False)
+    for tag, base_start, _base_end, head_start, _head_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        base_line = base_lines[base_start] if base_start < len(base_lines) else b"<missing>"
+        head_line = head_lines[head_start] if head_start < len(head_lines) else b"<missing>"
+        return (
+            f"; first differing line base {base_start + 1}, head {head_start + 1}: "
+            f"base={base_line[:160]!r} head={head_line[:160]!r}"
+        )
+    return "; no differing line found"
+
+
 def assert_required_identity_fields(identity: bytes) -> None:
-    for field in ("payload_sha256", "guard_sha256"):
-        needle = rb'"' + re.escape(field.encode()) + rb'"\s*:'
-        if re.search(needle, identity) is None:
-            raise DebCompareError(f"{field} missing from a build identity")
+    if PAYLOAD_SHA256_NONEMPTY_RE.search(identity) is None:
+        raise DebCompareError("payload_sha256 missing or empty in a build identity")
+    if GUARD_SHA256_RE.search(identity) is None:
+        raise DebCompareError("guard_sha256 missing or empty in a build identity")
 
 
 def verify_identity(
@@ -159,6 +206,7 @@ def verify_identity(
     assert_required_identity_fields(base)
     assert_required_identity_fields(head)
     base_hash, head_hash = sha256_bytes(base), sha256_bytes(head)
+    # Must match build-install-deb.py's json.dumps(..., sort_keys=True, indent=2) colon-space rendering.
     rewritten = replace_once(
         base,
         json.dumps("source_commit").encode() + b": " + json.dumps(base_source_commit).encode(),
@@ -186,7 +234,9 @@ def verify_identity(
                 raise DebCompareError(
                     f"declared identity entry {path.removeprefix('fs/')} does not equal that file's SHA-256"
                 )
-        raise DebCompareError(f"{IDENTITY_PATH} changed outside the permitted substitutions")
+        raise DebCompareError(
+            f"{IDENTITY_PATH} changed outside the permitted substitutions{first_differing_line(rewritten, head)}"
+        )
     return base_hash, head_hash
 
 
@@ -200,14 +250,38 @@ def script_identity_line(script: bytes, expected_identity_hash: str, label: str)
     return matches[0].group(0)
 
 
-def verify_script(base_root: Path, head_root: Path, script: str, base_identity_hash: str, head_identity_hash: str) -> None:
+def verify_script(
+    base_root: Path,
+    head_root: Path,
+    script: str,
+    base_identity_hash: str,
+    head_identity_hash: str,
+    declaration: DeltaDeclaration | None,
+) -> None:
     rel = f"control/{script}"
     base = file_bytes(base_root, rel)
     head = file_bytes(head_root, rel)
     base_line = script_identity_line(base, base_identity_hash, f"{rel} base")
     head_line = script_identity_line(head, head_identity_hash, f"{rel} head")
-    if replace_once(base, base_line, head_line, f"{rel} IDENTITY_SHA256 substitution") != head:
-        raise DebCompareError(f"{rel} changed outside the IDENTITY_SHA256 line")
+    rewritten = replace_once(base, base_line, head_line, f"{rel} IDENTITY_SHA256 substitution")
+    if declaration is not None:
+        for path in sorted(declaration.paths):
+            base_digest = sha256_bytes(file_bytes(base_root, path))
+            head_digest = sha256_bytes(file_bytes(head_root, path))
+            head_entry = guard_payload_hash_entry(path, head_digest)
+            if head.count(head_entry) != 1:
+                raise DebCompareError(
+                    f"{rel} declared guard entry {path.removeprefix('fs/')} occurs "
+                    f"{head.count(head_entry)} times in head, expected exactly once"
+                )
+            rewritten = replace_once(
+                rewritten,
+                guard_payload_hash_entry(path, base_digest),
+                head_entry,
+                f"{rel} declared guard entry {path.removeprefix('fs/')}",
+            )
+    if rewritten != head:
+        raise DebCompareError(f"{rel} changed outside the permitted substitutions{first_differing_line(rewritten, head)}")
 
 
 def assert_declaration_paths(entries: dict[str, Entry], declaration: DeltaDeclaration | None) -> None:
@@ -286,7 +360,9 @@ def compare_control(base_root: Path, head_root: Path) -> None:
         )
     compare_entry_metadata(base_entries, head_entries, "control")
     if file_bytes(base_root, "control/control") != file_bytes(head_root, "control/control"):
-        raise DebCompareError("control/control changed")
+        raise DebCompareError(
+            "control/control changed" + first_differing_line(file_bytes(base_root, "control/control"), file_bytes(head_root, "control/control"))
+        )
 
 
 def compare_extracted(
@@ -306,7 +382,7 @@ def compare_extracted(
         base_root, head_root, base_source_commit, head_source_commit, declaration
     )
     for script in SCRIPT_NAMES:
-        verify_script(base_root, head_root, script, base_identity_hash, head_identity_hash)
+        verify_script(base_root, head_root, script, base_identity_hash, head_identity_hash, declaration)
 
 
 def main() -> None:
@@ -317,6 +393,8 @@ def main() -> None:
     parser.add_argument("--head-source-commit", required=True)
     parser.add_argument("--changed-paths-nul", type=Path)
     parser.add_argument("--declaration", type=Path, default=Path(DECLARATION_PATH))
+    parser.add_argument("--declared-paths-json", type=Path)
+    parser.add_argument("--declared-summary", type=Path)
     args = parser.parse_args()
     declaration = None
     if args.changed_paths_nul is not None:
@@ -327,6 +405,11 @@ def main() -> None:
         extract(args.base_deb, base)
         extract(args.head_deb, head)
         compare_extracted(base, head, args.base_source_commit, args.head_source_commit, declaration)
+    if declaration is not None:
+        if args.declared_paths_json is not None:
+            args.declared_paths_json.write_text(json.dumps(sorted(declaration.paths)) + "\n")
+        if args.declared_summary is not None:
+            args.declared_summary.write_text(", ".join(sorted(declaration.paths)) + f", {declaration.document}\n")
     if declaration is None:
         print("deb comparator: PASS strict raw-byte comparison")
     else:
