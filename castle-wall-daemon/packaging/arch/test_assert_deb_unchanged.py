@@ -6,10 +6,19 @@ import hashlib
 import importlib.util
 import json
 import subprocess
+import unittest
 from pathlib import Path
 
-import pytest
-import yaml
+# arch-package-build (linux-arch-package.yml, the Arch container step "python3 -m unittest
+# discover -s castle-wall-daemon/packaging/arch") imports every test_*.py with a bare
+# interpreter that has neither pytest nor PyYAML; a module-level ImportError there is a
+# FAILED (errors=1) run and a red job. Raising SkipTest at import makes unittest skip the
+# module and pytest skip it the same way; deb-unchanged-gate installs both packages and runs it.
+try:
+    import pytest
+    import yaml
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised only by the Arch container
+    raise unittest.SkipTest("pytest and PyYAML are provided only in deb-unchanged-gate") from exc
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent.parent
@@ -233,7 +242,17 @@ def test_declared_mode_refuses_declared_cli_plus_undeclared_daemon_change(tmp_pa
     write_tree(base, BASE_SHA)
     write_tree(head, HEAD_SHA, {CLI_PATH: b"cli changed\n", DAEMON_PATH: b"daemon changed\n"})
 
-    with pytest.raises(gate.DebCompareError, match="castle-wall-daemon"):
+    with pytest.raises(gate.DebCompareError, match="undeclared differences: fs/usr/local/libexec/sanctuary/castle-wall-daemon"):
+        compare(base, head, declared(CLI_PATH))
+
+
+def test_declared_mode_refuses_a_declared_path_that_did_not_change(tmp_path: Path) -> None:
+    # Brief item 8: a declared difference that did not occur fails (the set must be EQUAL).
+    base, head = tmp_path / "base", tmp_path / "head"
+    write_tree(base, BASE_SHA)
+    write_tree(head, HEAD_SHA)
+
+    with pytest.raises(gate.DebCompareError, match="declared paths did not differ: fs/usr/sbin/sanctuary-linux"):
         compare(base, head, declared(CLI_PATH))
 
 
@@ -303,11 +322,15 @@ def test_duplicate_declared_paths_are_refused(tmp_path: Path) -> None:
     ],
 )
 def test_required_identity_fields_are_non_empty_raw_bytes(tmp_path: Path, extra: dict) -> None:
+    # Both sides carry the SAME empty value, so the raw-byte comparison alone would pass and only
+    # the non-empty check can refuse (round-2 Grok 1: a one-sided emptiness was caught by the byte
+    # diff instead and did not witness this check).
     base, head = tmp_path / "base", tmp_path / "head"
-    write_tree(base, BASE_SHA, identity_raw=identity_bytes(BASE_SHA, {CLI_PATH: b"cli\n", DAEMON_PATH: b"daemon\n"}, extra=extra))
-    write_tree(head, HEAD_SHA)
+    files = {CLI_PATH: b"cli\n", DAEMON_PATH: b"daemon\n"}
+    write_tree(base, BASE_SHA, identity_raw=identity_bytes(BASE_SHA, files, extra=extra))
+    write_tree(head, HEAD_SHA, identity_raw=identity_bytes(HEAD_SHA, files, extra=extra))
 
-    with pytest.raises(gate.DebCompareError, match="payload_sha256|guard_sha256"):
+    with pytest.raises(gate.DebCompareError, match="missing or empty in a build identity"):
         compare(base, head)
 
 
@@ -428,6 +451,17 @@ def test_disposition_allows_refused_allowlist_only_for_declared_delta(tmp_path: 
     )
     assert failed_inheritance.returncode == 1
 
+    # The comparator verdict is never optional: a refused comparator fails even with a clean
+    # allowlist, and a declared summary never rescues a refused comparator.
+    failed_comparator = run_disposition(
+        tmp_path / "comparator", allowlist="ok", comparator="refused", inheritance="ok", declared=False
+    )
+    assert failed_comparator.returncode == 1
+    stale_summary = run_disposition(
+        tmp_path / "stale", allowlist="refused", comparator="refused", inheritance="ok", declared=True
+    )
+    assert stale_summary.returncode == 1
+
 
 def test_arch_predicates_and_workflow_derive_from_python_predicates() -> None:
     trigger_paths = [
@@ -459,9 +493,13 @@ def test_arch_predicates_and_workflow_derive_from_python_predicates() -> None:
     deb_job = workflow["jobs"]["deb-unchanged-gate"]
     runs = "\n".join(step.get("run", "") for step in deb_job["steps"])
     assert "spec_from_file_location" in runs
-    assert '"deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"' in runs
-    assert "gate.is_arch_trigger_path(p)" in runs
-    assert "gate.is_arch_allowed_path(p)" in runs
+    # Both probes (trigger and allowlist) load THIS comparator, so the target appears exactly twice;
+    # a probe pointed elsewhere would leave one occurrence.
+    assert runs.count('"deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"') == 2
+    # The exact predicate lines, not only the call forms: an added disjunct on either line breaks
+    # the derive and shows up here.
+    assert 'print("yes" if any(gate.is_arch_trigger_path(p) for p in paths) else "no")' in runs
+    assert "bad = [p for p in paths if not gate.is_arch_allowed_path(p)]" in runs
     assert "def is_slice_path" not in runs
     mirrored_literals = [
         *gate.ARCH_TRIGGER_EXACT_PATHS,

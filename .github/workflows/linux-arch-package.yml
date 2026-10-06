@@ -117,7 +117,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/apt-install-resilient
         with:
-          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml
+          # python3-pytest: the hosted image ships no pytest for /usr/bin/python3; without it the
+          # next step fails before the gate runs and every later step is skipped (round-2 Grok 2).
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml python3-pytest
       - name: Run Arch packaging Python tests
         run: python3 -m pytest castle-wall-daemon/packaging/arch -q
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de

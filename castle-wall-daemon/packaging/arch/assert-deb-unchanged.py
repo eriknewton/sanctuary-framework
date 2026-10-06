@@ -111,6 +111,8 @@ def active_declaration(changed_paths: list[str], declaration_path: Path) -> Delt
         data = json.loads(declaration_path.read_text())
     except json.JSONDecodeError as exc:
         raise DebCompareError(f"{DECLARATION_PATH} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise DebCompareError(f"{DECLARATION_PATH} must be a JSON object")
     raw_paths = data.get("paths", data.get("declared_paths"))
     document = data.get("document", data.get("review_document"))
     if not isinstance(raw_paths, list) or not raw_paths or not all(isinstance(path, str) for path in raw_paths):
