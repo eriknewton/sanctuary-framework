@@ -153,7 +153,10 @@ jobs:
           # own workflow), so the two enforcing steps below run only when a slice path
           # changed and the job records "not applicable" otherwise. Without this scope
           # every unrelated PR and every merge to main would fail here (round-2 R1).
-          git diff --name-only --no-renames "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
+          # core.quotePath=false: git otherwise C-quotes any path with a non-ASCII or control
+          # byte, and a quoted slice path would match neither alternative below, so the gate
+          # would record NOT APPLICABLE on a diff that touched the slice (closure read, both families).
+          git -c core.quotePath=false diff --name-only --no-renames "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
           if grep -Eq '^(castle-wall-daemon/packaging/arch/|\.github/workflows/linux-arch-package\.yml$)' "$RUNNER_TEMP/changed-paths.txt"; then
             echo "ARCH_SLICE_TOUCHED=yes" >>"$GITHUB_ENV"
           else
