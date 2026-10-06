@@ -153,28 +153,39 @@ jobs:
           # own workflow), so the two enforcing steps below run only when a slice path
           # changed and the job records "not applicable" otherwise. Without this scope
           # every unrelated PR and every merge to main would fail here (round-2 R1).
-          # core.quotePath=false: git otherwise C-quotes any path with a non-ASCII or control
-          # byte, and a quoted slice path would match neither alternative below, so the gate
-          # would record NOT APPLICABLE on a diff that touched the slice (closure read, both families).
-          git -c core.quotePath=false diff --name-only --no-renames "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
-          if grep -Eq '^(castle-wall-daemon/packaging/arch/|\.github/workflows/linux-arch-package\.yml$)' "$RUNNER_TEMP/changed-paths.txt"; then
-            echo "ARCH_SLICE_TOUCHED=yes" >>"$GITHUB_ENV"
-          else
-            echo "ARCH_SLICE_TOUCHED=no" >>"$GITHUB_ENV"
-          fi
+          # NUL-separated names: git C-quotes `"`, `\` and control bytes on every
+          # line-oriented listing whatever core.quotePath says, so a slice path made of
+          # those bytes would match neither alternative and the gate would record NOT
+          # APPLICABLE on a diff that touched the slice (binding reads, both families).
+          # With -z nothing is quoted; the reader splits on NUL. The allowlist step reads
+          # this same file with the same predicate (must match the Python there).
+          git diff --name-only --no-renames -z "$base"...HEAD >"$RUNNER_TEMP/changed-paths.nul"
+          touched="$(python3 - <<'PY'
+          import os
+          raw = open(os.path.join(os.environ["RUNNER_TEMP"], "changed-paths.nul"), "rb").read()
+          paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+          # must match is_slice_path in the "Enforce slice path allowlist" step
+          def is_slice_path(p):
+              return p == ".github/workflows/linux-arch-package.yml" or p.startswith("castle-wall-daemon/packaging/arch/")
+          print("yes" if any(is_slice_path(p) for p in paths) else "no")
+          PY
+          )"
+          [[ "$touched" == yes || "$touched" == no ]]
+          echo "ARCH_SLICE_TOUCHED=$touched" >>"$GITHUB_ENV"
       - name: Enforce slice path allowlist
         if: env.ARCH_SLICE_TOUCHED == 'yes'
         run: |
           python3 - <<'PY'
-          from pathlib import Path
-          allowed_workflow = ".github/workflows/linux-arch-package.yml"
-          bad = []
-          for path in Path(__import__("os").environ["RUNNER_TEMP"], "changed-paths.txt").read_text().splitlines():
-              if path == allowed_workflow or path.startswith("castle-wall-daemon/packaging/arch/"):
-                  continue
-              bad.append(path)
+          import os
+          raw = open(os.path.join(os.environ["RUNNER_TEMP"], "changed-paths.nul"), "rb").read()
+          paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+          # must match is_slice_path in the "Resolve comparison base" step
+          def is_slice_path(p):
+              return p == ".github/workflows/linux-arch-package.yml" or p.startswith("castle-wall-daemon/packaging/arch/")
+          bad = [p for p in paths if not is_slice_path(p)]
           if bad:
-              raise SystemExit("outside Arch packaging slice:\n" + "\n".join(bad))
+              raise SystemExit("outside Arch packaging slice:\n" + "\n".join(repr(p) for p in bad))
+          print(f"allowlist: {len(paths)} changed path(s), all inside the Arch slice")
           PY
       - name: Rebuild base and head install debs and compare protected fields
         if: env.ARCH_SLICE_TOUCHED == 'yes'
