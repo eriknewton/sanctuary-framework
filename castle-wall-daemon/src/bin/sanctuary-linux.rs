@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
         .collect::<Result<Vec<_>, _>>()
     else {
         // SAFETY: argument rejection is a fixed CLI diagnostic on stderr.
-        eprintln!("sanctuary-linux: non-UTF-8 argument refused");
+        eprintln!("sanctuary-linux: non-UTF-8 argument refused ");
         return std::process::ExitCode::FAILURE;
     };
     if args == ["--help"] {
