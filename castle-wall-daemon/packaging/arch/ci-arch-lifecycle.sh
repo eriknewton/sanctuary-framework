@@ -76,6 +76,22 @@ assert_inert() {
 }
 
 assert_systemd
+# The official archlinux container image ships NoExtract rules (usr/share/doc/*,
+# locales, help) that stock Arch and Omarchy do not have. The build identity the
+# guard binds to lives under usr/share/doc, so under those rules a fresh install
+# never receives it and `pacman -Qkk` reports an altered file before any hook runs
+# (seen 2026-10-05: "/usr/share/doc (No such file or directory), 1 altered file").
+# The proof target is a default pacman.conf, so strip the image's rules and refuse
+# to continue if any NoExtract remains; a silent skip here would test a host that
+# does not exist. Failure mode: the first-install witness fails on `-Qkk` with no
+# refusal text, which reads like a package defect rather than a container artifact.
+sed -i '/^[[:space:]]*NoExtract/d' /etc/pacman.conf
+if compgen -G '/etc/pacman.d/*.conf' >/dev/null; then sed -i '/^[[:space:]]*NoExtract/d' /etc/pacman.d/*.conf; fi
+if [[ -n "$(pacman-conf NoExtract)" ]]; then
+  echo "container pacman.conf still carries NoExtract rules; the lifecycle witness needs default extraction" >&2
+  exit 1
+fi
+record 'container pacman.conf has no NoExtract rules (default extraction, as on stock Arch and Omarchy)'
 id build >/dev/null 2>&1 || useradd -m build
 pacman -Sy --noconfirm --needed base-devel zstd systemd nftables iproute2 util-linux shadow python libnetfilter_queue >/dev/null
 
