@@ -1,13 +1,67 @@
 #!/usr/bin/env python3
-"""Compare base/head install .debs while allowing source_commit-derived fields."""
+"""Compare base/head install .debs while allowing only declared raw-byte deltas."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
+
+IDENTITY_PATH = "fs/usr/share/doc/sanctuary-castle-wall/build-identity"
+DECLARATION_PATH = "castle-wall-daemon/packaging/arch/deb-delta-declaration.json"
+CONTROL_MEMBERS = frozenset({"control", "preinst", "prerm"})
+SCRIPT_NAMES = ("preinst", "prerm")
+
+# 64 hex chars = SHA-256's 32 bytes rendered as two lowercase hex chars each.
+SHA256_HEX = rb"[0-9a-f]{64}"
+SCRIPT_IDENTITY_RE = re.compile(rb"(?m)^IDENTITY_SHA256 = '(" + SHA256_HEX + rb")'$")
+
+# Must match the derived predicate calls in .github/workflows/linux-arch-package.yml.
+ARCH_TRIGGER_EXACT_PATHS = (
+    ".github/workflows/linux-arch-package.yml",
+    "castle-wall-daemon/src/bin/sanctuary-linux-arch.rs",
+)
+ARCH_TRIGGER_PREFIXES = (
+    "castle-wall-daemon/packaging/arch/",
+    "castle-wall-daemon/src/linux_install/arch/",
+    "castle-wall-daemon/tests/linux_install_arch_",
+    "castle-wall-daemon/tests/fixtures/substrate/",
+)
+ARCH_ALLOWED_EXACT_PATHS = ARCH_TRIGGER_EXACT_PATHS + (
+    ".github/workflows/castle-wall-linux.yml",
+    "castle-wall-daemon/Cargo.toml",
+    "castle-wall-daemon/src/linux_install/mod.rs",
+)
+ARCH_ALLOWED_PREFIXES = ARCH_TRIGGER_PREFIXES
+
+
+class DebCompareError(ValueError):
+    pass
+
+
+class Entry(NamedTuple):
+    kind: str
+    mode: int
+
+
+class DeltaDeclaration(NamedTuple):
+    paths: frozenset[str]
+    document: str
+
+
+def is_arch_trigger_path(path: str) -> bool:
+    return path in ARCH_TRIGGER_EXACT_PATHS or any(path.startswith(prefix) for prefix in ARCH_TRIGGER_PREFIXES)
+
+
+def is_arch_allowed_path(path: str) -> bool:
+    return path in ARCH_ALLOWED_EXACT_PATHS or any(path.startswith(prefix) for prefix in ARCH_ALLOWED_PREFIXES)
 
 
 def extract(deb: Path, out: Path) -> None:
@@ -17,39 +71,274 @@ def extract(deb: Path, out: Path) -> None:
     subprocess.run(["dpkg-deb", "-e", str(deb), str(out / "control")], check=True)
 
 
-def load_identity(root: Path) -> dict:
-    return json.loads((root / "fs/usr/share/doc/sanctuary-castle-wall/build-identity").read_text())
+def read_nul_paths(path: Path) -> list[str]:
+    raw = path.read_bytes()
+    return [item.decode("utf-8", "surrogateescape") for item in raw.split(b"\0") if item]
 
 
-def relevant_identity(identity: dict) -> dict:
-    trimmed = dict(identity)
-    trimmed.pop("source_commit", None)
-    return trimmed
+def active_declaration(changed_paths: list[str], declaration_path: Path) -> DeltaDeclaration | None:
+    if DECLARATION_PATH not in changed_paths:
+        return None
+    if not declaration_path.is_file():
+        raise DebCompareError(f"{DECLARATION_PATH} is in the diff but no declaration file exists")
+    try:
+        data = json.loads(declaration_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise DebCompareError(f"{DECLARATION_PATH} is not valid JSON: {exc}") from exc
+    raw_paths = data.get("paths", data.get("declared_paths"))
+    document = data.get("document", data.get("review_document"))
+    if not isinstance(raw_paths, list) or not raw_paths or not all(isinstance(path, str) for path in raw_paths):
+        raise DebCompareError(f"{DECLARATION_PATH} must contain a non-empty string list named paths")
+    if not isinstance(document, str) or not document:
+        raise DebCompareError(f"{DECLARATION_PATH} must name its review document")
+    paths = frozenset(raw_paths)
+    if len(paths) != len(raw_paths):
+        raise DebCompareError(f"{DECLARATION_PATH} contains duplicate declared paths")
+    return DeltaDeclaration(paths=paths, document=document)
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def entry_kind(path: Path) -> str:
+    st = path.lstat()
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink"
+    return "other"
+
+
+def entry_map(root: Path, prefix: str) -> dict[str, Entry]:
+    base = root / prefix
+    if not base.is_dir():
+        raise DebCompareError(f"{prefix}/ missing from extracted archive")
+    entries: dict[str, Entry] = {}
+    for path in sorted(base.rglob("*")):
+        rel = f"{prefix}/{path.relative_to(base).as_posix()}"
+        st = path.lstat()
+        entries[rel] = Entry(kind=entry_kind(path), mode=stat.S_IMODE(st.st_mode))
+    return entries
+
+
+def file_bytes(root: Path, rel: str) -> bytes:
+    return (root / rel).read_bytes()
+
+
+def replace_once(haystack: bytes, needle: bytes, replacement: bytes, label: str) -> bytes:
+    count = haystack.count(needle)
+    if count != 1:
+        raise DebCompareError(f"{label} occurs {count} times, expected exactly once")
+    return haystack.replace(needle, replacement, 1)
+
+
+def identity_entry(path: str, digest: str) -> bytes:
+    key = path.removeprefix("fs/")
+    return json.dumps(key).encode() + b": " + json.dumps(digest).encode()
+
+
+def assert_required_identity_fields(identity: bytes) -> None:
+    for field in ("payload_sha256", "guard_sha256"):
+        needle = rb'"' + re.escape(field.encode()) + rb'"\s*:'
+        if re.search(needle, identity) is None:
+            raise DebCompareError(f"{field} missing from a build identity")
+
+
+def verify_identity(
+    base_root: Path,
+    head_root: Path,
+    base_source_commit: str,
+    head_source_commit: str,
+    declaration: DeltaDeclaration | None,
+) -> tuple[str, str]:
+    base = file_bytes(base_root, IDENTITY_PATH)
+    head = file_bytes(head_root, IDENTITY_PATH)
+    assert_required_identity_fields(base)
+    assert_required_identity_fields(head)
+    base_hash, head_hash = sha256_bytes(base), sha256_bytes(head)
+    rewritten = replace_once(
+        base,
+        json.dumps("source_commit").encode() + b": " + json.dumps(base_source_commit).encode(),
+        json.dumps("source_commit").encode() + b": " + json.dumps(head_source_commit).encode(),
+        "source_commit substitution",
+    )
+    declared_head_entries: dict[str, bytes] = {}
+    if declaration is not None:
+        for path in sorted(declaration.paths):
+            fs_prefixed = json.dumps(path).encode()
+            if fs_prefixed in base or fs_prefixed in head:
+                raise DebCompareError(f"declared identity entry {path} must use the installed path without fs/")
+            base_digest = sha256_bytes(file_bytes(base_root, path))
+            head_digest = sha256_bytes(file_bytes(head_root, path))
+            declared_head_entries[path] = identity_entry(path, head_digest)
+            rewritten = replace_once(
+                rewritten,
+                identity_entry(path, base_digest),
+                declared_head_entries[path],
+                f"declared identity entry {path.removeprefix('fs/')}",
+            )
+    if rewritten != head:
+        for path, expected in sorted(declared_head_entries.items()):
+            if expected not in head:
+                raise DebCompareError(
+                    f"declared identity entry {path.removeprefix('fs/')} does not equal that file's SHA-256"
+                )
+        raise DebCompareError(f"{IDENTITY_PATH} changed outside the permitted substitutions")
+    return base_hash, head_hash
+
+
+def script_identity_line(script: bytes, expected_identity_hash: str, label: str) -> bytes:
+    matches = list(SCRIPT_IDENTITY_RE.finditer(script))
+    if len(matches) != 1:
+        raise DebCompareError(f"{label} has {len(matches)} IDENTITY_SHA256 lines, expected exactly one")
+    actual = matches[0].group(1).decode()
+    if actual != expected_identity_hash:
+        raise DebCompareError(f"{label} IDENTITY_SHA256 is {actual}, expected {expected_identity_hash}")
+    return matches[0].group(0)
+
+
+def verify_script(base_root: Path, head_root: Path, script: str, base_identity_hash: str, head_identity_hash: str) -> None:
+    rel = f"control/{script}"
+    base = file_bytes(base_root, rel)
+    head = file_bytes(head_root, rel)
+    base_line = script_identity_line(base, base_identity_hash, f"{rel} base")
+    head_line = script_identity_line(head, head_identity_hash, f"{rel} head")
+    if replace_once(base, base_line, head_line, f"{rel} IDENTITY_SHA256 substitution") != head:
+        raise DebCompareError(f"{rel} changed outside the IDENTITY_SHA256 line")
+
+
+def assert_declaration_paths(entries: dict[str, Entry], declaration: DeltaDeclaration | None) -> None:
+    if declaration is None:
+        return
+    for path in sorted(declaration.paths):
+        if not path.startswith("fs/"):
+            raise DebCompareError(f"declared path {path} is not under fs/")
+        if path == IDENTITY_PATH:
+            raise DebCompareError(f"declared path {path} names the build identity")
+        entry = entries.get(path)
+        if entry is None:
+            raise DebCompareError(f"declared path {path} is not present in the extracted payload")
+        if entry.kind != "file":
+            raise DebCompareError(f"declared path {path} is not a regular file")
+
+
+def compare_entry_metadata(base_entries: dict[str, Entry], head_entries: dict[str, Entry], prefix: str) -> None:
+    base_paths = set(base_entries)
+    head_paths = set(head_entries)
+    if base_paths != head_paths:
+        missing = sorted(base_paths - head_paths)
+        added = sorted(head_paths - base_paths)
+        detail = []
+        if missing:
+            detail.append("missing from head: " + ", ".join(missing))
+        if added:
+            detail.append("added in head: " + ", ".join(added))
+        raise DebCompareError(f"{prefix}/ path set changed: {'; '.join(detail)}")
+    for path in sorted(base_paths):
+        if base_entries[path] != head_entries[path]:
+            raise DebCompareError(
+                f"{path} metadata changed: base {base_entries[path].kind} {oct(base_entries[path].mode)}, "
+                f"head {head_entries[path].kind} {oct(head_entries[path].mode)}"
+            )
+
+
+def compare_payload_bytes(
+    base_root: Path,
+    head_root: Path,
+    entries: dict[str, Entry],
+    declaration: DeltaDeclaration | None,
+) -> None:
+    differing_regular_files: set[str] = set()
+    for path, entry in sorted(entries.items()):
+        if entry.kind == "file":
+            if file_bytes(base_root, path) != file_bytes(head_root, path):
+                differing_regular_files.add(path)
+        elif entry.kind == "symlink" and os.readlink(base_root / path) != os.readlink(head_root / path):
+            raise DebCompareError(f"{path} symlink target changed")
+    differing_without_identity = differing_regular_files - {IDENTITY_PATH}
+    if declaration is None:
+        if differing_without_identity:
+            raise DebCompareError(f"{min(differing_without_identity)} changed")
+        return
+    if differing_without_identity != set(declaration.paths):
+        undeclared = sorted(differing_without_identity - declaration.paths)
+        not_observed = sorted(declaration.paths - differing_without_identity)
+        detail = []
+        if undeclared:
+            detail.append("undeclared differences: " + ", ".join(undeclared))
+        if not_observed:
+            detail.append("declared paths did not differ: " + ", ".join(not_observed))
+        raise DebCompareError("declared delta mismatch: " + "; ".join(detail))
+
+
+def compare_control(base_root: Path, head_root: Path) -> None:
+    base_entries = entry_map(base_root, "control")
+    head_entries = entry_map(head_root, "control")
+    base_members = {path.removeprefix("control/") for path in base_entries}
+    head_members = {path.removeprefix("control/") for path in head_entries}
+    if base_members != CONTROL_MEMBERS or head_members != CONTROL_MEMBERS:
+        raise DebCompareError(
+            "control member set changed: "
+            f"base={sorted(base_members)} head={sorted(head_members)} expected={sorted(CONTROL_MEMBERS)}"
+        )
+    compare_entry_metadata(base_entries, head_entries, "control")
+    if file_bytes(base_root, "control/control") != file_bytes(head_root, "control/control"):
+        raise DebCompareError("control/control changed")
+
+
+def compare_extracted(
+    base_root: Path,
+    head_root: Path,
+    base_source_commit: str,
+    head_source_commit: str,
+    declaration: DeltaDeclaration | None = None,
+) -> None:
+    fs_base_entries = entry_map(base_root, "fs")
+    fs_head_entries = entry_map(head_root, "fs")
+    compare_entry_metadata(fs_base_entries, fs_head_entries, "fs")
+    assert_declaration_paths(fs_base_entries, declaration)
+    compare_control(base_root, head_root)
+    compare_payload_bytes(base_root, head_root, fs_base_entries, declaration)
+    base_identity_hash, head_identity_hash = verify_identity(
+        base_root, head_root, base_source_commit, head_source_commit, declaration
+    )
+    for script in SCRIPT_NAMES:
+        verify_script(base_root, head_root, script, base_identity_hash, head_identity_hash)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("base_deb", type=Path)
     parser.add_argument("head_deb", type=Path)
+    parser.add_argument("--base-source-commit", required=True)
+    parser.add_argument("--head-source-commit", required=True)
+    parser.add_argument("--changed-paths-nul", type=Path)
+    parser.add_argument("--declaration", type=Path, default=Path(DECLARATION_PATH))
     args = parser.parse_args()
+    declaration = None
+    if args.changed_paths_nul is not None:
+        declaration = active_declaration(read_nul_paths(args.changed_paths_nul), args.declaration)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         base, head = root / "base", root / "head"
         extract(args.base_deb, base)
         extract(args.head_deb, head)
-        base_identity, head_identity = load_identity(base), load_identity(head)
-        for field in ("payload_sha256", "guard_sha256"):
-            # A field missing from both sides would compare equal as None; absence is a
-            # refusal, never a pass, so the gate cannot go green on an identity it did not read.
-            if not base_identity.get(field) or not head_identity.get(field):
-                raise SystemExit(f"{field} missing from a build identity")
-            if base_identity[field] != head_identity[field]:
-                raise SystemExit(f"{field} changed")
-        if (base / "control/control").read_bytes() != (head / "control/control").read_bytes():
-            raise SystemExit("control file changed")
-        if relevant_identity(base_identity) != relevant_identity(head_identity):
-            raise SystemExit("unexpected build identity field changed")
+        compare_extracted(base, head, args.base_source_commit, args.head_source_commit, declaration)
+    if declaration is None:
+        print("deb comparator: PASS strict raw-byte comparison")
+    else:
+        print(
+            "deb comparator: PASS declared delta: "
+            + ", ".join(sorted(declaration.paths))
+            + f"; document: {declaration.document}"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DebCompareError as exc:
+        raise SystemExit(f"deb comparator: REFUSED: {exc}") from exc
