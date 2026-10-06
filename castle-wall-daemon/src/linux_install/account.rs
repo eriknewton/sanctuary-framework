@@ -193,7 +193,7 @@ pub fn verify(root: &Root, t: &Transaction) -> Result<()> {
         .collect();
     // Never emit shadow bytes; this account is locked and has no credential enrollment path.
     if entries.len() != 1 || !matches!(entries[0][1].as_str(), "!" | "*") {
-        return Err("agent password is not locked".into());
+        return Err("agent password is not locked.".into());
     }
     Ok(())
 }

@@ -11,3 +11,5 @@ Kernel, systemd and nftables updates are outside this package claim. Reboot afte
 The package's build identity is installed under `/usr/share/doc/sanctuary-castle-wall/`, and the remove guard binds to it. A host whose `pacman.conf` excludes `usr/share/doc/*` from extraction (the official Arch container image does; stock Arch and Omarchy do not) never receives that file. Such hosts are outside this package's claim. Failure mode: `pacman -Qkk sanctuary-castle-wall` reports an altered file right after install, and the remove guard refuses every removal there because its identity is absent; removal there is an operator action outside the guard.
 
 `sanctuary-linux` does not yet operate on Arch. This package records the Arch CLI path deviation, but the Rust package checks still expect the Ubuntu install identity until the portability slice lands.
+
+<!-- scratch witness b: touches an allowlisted trigger path so the gate is ENFORCED; never merged -->
