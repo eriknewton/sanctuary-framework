@@ -9,5 +9,5 @@ Description = Guarding Castle Wall removal
 When = PreTransaction
 AbortOnFail
 NeedsTargets
-# Must match _guard_path in PKGBUILD and GUARD_PATH in sanctuary-castle-wall-guard.py.
+# Must match GUARD in build-arch-package.py (which places the file) and GUARD_PATH in sanctuary-castle-wall-guard.py.
 Exec = /usr/share/libalpm/scripts/sanctuary-castle-wall-guard remove

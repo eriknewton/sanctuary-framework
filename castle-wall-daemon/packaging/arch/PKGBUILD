@@ -20,7 +20,6 @@ sha256sums=()
 
 _target='x86_64-unknown-linux-gnu'
 _toolchain='1.95.0'
-_guard_path='usr/share/libalpm/scripts/sanctuary-castle-wall-guard'
 
 _crate_root() {
   cd "${startdir}/../.." && pwd -P

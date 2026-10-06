@@ -5,12 +5,9 @@ on:
     branches: [main]
   push:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      base_sha:
-        description: Base commit to compare against for the .deb unchanged gate
-        required: true
-        type: string
+  # No workflow_dispatch: a free-text input would be the only attacker-controlled
+  # string in this file, and the .deb gate below needs a base commit the event
+  # itself supplies (pull_request.base.sha or push.before). Nothing uses a manual run.
 
 permissions:
   contents: read
@@ -129,9 +126,6 @@ jobs:
             push)
               base="${{ github.event.before }}"
               ;;
-            workflow_dispatch)
-              base="${{ inputs.base_sha }}"
-              ;;
             *)
               echo "unsupported event for Arch .deb unchanged gate: $event" >&2
               exit 1
@@ -148,9 +142,21 @@ jobs:
             exit 1
           }
           echo "ARCH_COMPARE_BASE=$base" >>"$GITHUB_ENV"
+          # The gate binds the Arch slice to the proven .deb: a diff that touches the
+          # Arch packaging tree or this workflow may not touch any .deb input. A diff
+          # that touches neither is not this gate's subject (the .deb inputs have their
+          # own workflow), so the two enforcing steps below run only when a slice path
+          # changed and the job records "not applicable" otherwise. Without this scope
+          # every unrelated PR and every merge to main would fail here (round-2 R1).
+          git diff --name-only --no-renames "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
+          if grep -Eq '^(castle-wall-daemon/packaging/arch/|\.github/workflows/linux-arch-package\.yml$)' "$RUNNER_TEMP/changed-paths.txt"; then
+            echo "ARCH_SLICE_TOUCHED=yes" >>"$GITHUB_ENV"
+          else
+            echo "ARCH_SLICE_TOUCHED=no" >>"$GITHUB_ENV"
+          fi
       - name: Enforce slice path allowlist
+        if: env.ARCH_SLICE_TOUCHED == 'yes'
         run: |
-          git diff --name-only --no-renames "$ARCH_COMPARE_BASE"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
           python3 - <<'PY'
           from pathlib import Path
           allowed_workflow = ".github/workflows/linux-arch-package.yml"
@@ -163,6 +169,7 @@ jobs:
               raise SystemExit("outside Arch packaging slice:\n" + "\n".join(bad))
           PY
       - name: Rebuild base and head install debs and compare protected fields
+        if: env.ARCH_SLICE_TOUCHED == 'yes'
         run: |
           work="$RUNNER_TEMP/deb-unchanged"
           git worktree add "$work/base" "$ARCH_COMPARE_BASE"
@@ -176,3 +183,11 @@ jobs:
           base_deb=("$work/base-out"/*.deb)
           head_deb=("$work/head-out"/*.deb)
           python3 castle-wall-daemon/packaging/arch/assert-deb-unchanged.py "${base_deb[0]}" "${head_deb[0]}"
+      - name: Record gate disposition
+        if: always()
+        run: |
+          case "${ARCH_SLICE_TOUCHED:-unset}" in
+            yes) echo "deb-unchanged gate: ENFORCED (a slice path changed between $ARCH_COMPARE_BASE and $GITHUB_SHA)" ;;
+            no) echo "deb-unchanged gate: NOT APPLICABLE (no Arch slice path changed between $ARCH_COMPARE_BASE and $GITHUB_SHA); the .deb inputs are gated by their own workflow" ;;
+            *) echo "deb-unchanged gate: base resolution failed; see the Resolve comparison base step" >&2; exit 1 ;;
+          esac

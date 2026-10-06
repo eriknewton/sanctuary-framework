@@ -142,6 +142,13 @@ unmask_hooks
 
 expect_refused foreign-alone "$upgrade_refusal" pacman -U --noconfirm "$work/upgrade.pkg.tar.zst"
 expect_refused foreign-batched "$upgrade_refusal" pacman -U --noconfirm "$work/upgrade.pkg.tar.zst" "$work/unrelated.pkg.tar.zst"
+# The claim is "held back with it": the AbortOnFail refusal must have aborted the
+# whole transaction, so the unrelated package in the same batch stays uninstalled.
+if pacman -Q unrelated-hold-witness >/dev/null 2>&1; then
+  echo "foreign-batched refusal did not hold back the unrelated package" >&2
+  exit 1
+fi
+record 'held back: unrelated package in the refused batch stayed uninstalled'
 mask_hook 00-sanctuary-castle-wall-upgrade-guard.hook
 expect_ok foreign-batched-masked pacman -U --noconfirm "$work/upgrade.pkg.tar.zst" "$work/unrelated.pkg.tar.zst"
 expect_ok restore-original-after-foreign pacman -U --noconfirm "$pkg"
