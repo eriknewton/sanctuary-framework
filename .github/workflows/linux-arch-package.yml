@@ -87,10 +87,15 @@ jobs:
           done
           WAIT_SYSTEMD
           docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
-          docker exec "$cid" mkdir -p /tmp/arch-lifecycle
+          # Evidence lives outside /tmp: systemd (PID 1 here) mounts a tmpfs on /tmp, and
+          # docker cp reads the container's root filesystem, not mounts inside it, so a
+          # directory under /tmp is written by the script and then "not found" by the copy
+          # (run 37410410188: the whole lifecycle passed and no evidence was uploaded).
+          evidence=/var/lib/sanctuary-arch-lifecycle-evidence
+          docker exec "$cid" mkdir -p "$evidence"
           rc=0
-          docker exec "$cid" bash -lc "EVIDENCE_DIR=/tmp/arch-lifecycle /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}" || rc=$?
-          docker cp "$cid:/tmp/arch-lifecycle" "$RUNNER_TEMP/arch-lifecycle"
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=$evidence /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}" || rc=$?
+          docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-lifecycle"
           docker stop "$cid"
           exit "$rc"
       - if: always()
