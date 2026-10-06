@@ -18,7 +18,7 @@ fn print_help() {
     // SAFETY: stdout is the CLI --help contract here, not a log channel. CLI
     // convention requires help text on stdout; the contiguous println! block
     // below is structural operator output and is the channel itself.
-    println!("castle-wall-daemon (Sanctuary Castle Wall filter daemon)");
+    println!("castle-wall-daemon (Sanctuary Castle Wall filter daemon) ");
     println!();
     println!("USAGE:");
     println!("    castle-wall-daemon --fortress-id <hex> [options]");
