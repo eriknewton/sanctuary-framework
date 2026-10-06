@@ -70,8 +70,12 @@ expect_ok() {
 
 assert_inert() {
   pacman -Qkk sanctuary-castle-wall
-  systemctl is-enabled sanctuary-castle-wall.service 2>/dev/null | grep -Fx disabled >/dev/null
-  systemctl is-active sanctuary-castle-wall.service 2>/dev/null | grep -Fx inactive >/dev/null
+  # Capture, never pipe: under `set -o pipefail` a disabled unit makes
+  # `systemctl is-enabled` exit 1 and an inactive one makes `is-active` exit 3,
+  # so `systemctl ... | grep` aborted this script on a correct fresh install
+  # with no message (CI run 37404360159). The comparison below is the assertion.
+  [[ "$(systemctl is-enabled sanctuary-castle-wall.service 2>/dev/null || true)" == disabled ]]
+  [[ "$(systemctl is-active sanctuary-castle-wall.service 2>/dev/null || true)" == inactive ]]
   [[ ! -e /etc/sanctuary || -z "$(find /etc/sanctuary -mindepth 1 -maxdepth 1 -print -quit)" ]]
 }
 
