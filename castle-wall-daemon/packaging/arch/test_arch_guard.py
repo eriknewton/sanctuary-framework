@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import importlib.util
+import json
 import os
 import runpy
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +19,9 @@ from unittest.mock import patch
 
 
 HERE = Path(__file__).resolve().parent
+BUILD_SPEC = importlib.util.spec_from_file_location("build_arch_package", HERE / "build-arch-package.py")
+BUILD = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(BUILD)
 IDENTITY = {
     "artifact_kind": "arch-install-pkg-v1",
     "package": "sanctuary-castle-wall",
@@ -48,6 +54,17 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(GUARD["Refusal"], "retire this host"):
                 GUARD["main"](["upgrade"])
 
+    def test_generated_guard_compiles_and_refuses_upgrade(self):
+        identity = json.dumps(IDENTITY, sort_keys=True, indent=2).encode()
+        guard = BUILD.guard_bytes("0.1.0-1", identity, IDENTITY["payload_sha256"], HERE)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "guard.py"
+            path.write_bytes(guard)
+            compile(guard, str(path), "exec")
+            result = subprocess.run([sys.executable, "-I", str(path), "upgrade"], check=False, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Castle Wall package guard refused:", result.stdout + result.stderr)
+
     def test_unknown_phase_and_non_root_refuse(self):
         with patch.dict(GUARD["main"].__globals__, {"os": self.root()}):
             with self.assertRaisesRegex(GUARD["Refusal"], "unsupported"):
@@ -74,6 +91,12 @@ class GuardTests(unittest.TestCase):
                             GUARD[fn]("usr/bin/sanctuary-linux")
                         else:
                             GUARD[fn]()
+
+    def test_package_integrity_requires_exact_clean_summary_line(self):
+        dirty_summary = "sanctuary-castle-wall: 42 total files, 10 altered files\n"
+        with patch.dict(GUARD["package_integrity"].__globals__, {"probe": lambda *_a, **_k: dirty_summary}):
+            with self.assertRaisesRegex(GUARD["Refusal"], "integrity"):
+                GUARD["package_integrity"]()
 
     def test_identity_rejects_hash_mismatch_guard_hash_and_payload_mismatch(self):
         good = dict(IDENTITY)
@@ -116,6 +139,16 @@ class GuardTests(unittest.TestCase):
         )
         for label, fn in cases:
             with self.subTest(label=label):
+                if fn == "no_queued_jobs":
+                    with patch.dict(GUARD[fn].__globals__, {"probe": lambda *_a, **_k: "1 sanctuary-castle-wall.service start waiting\n"}):
+                        with self.assertRaisesRegex(GUARD["Refusal"], "job queued"):
+                            GUARD[fn]()
+                    continue
+                if fn == "agent_instances_inactive":
+                    with patch.dict(GUARD[fn].__globals__, {"probe": lambda *_a, **_k: "sanctuary-agent@x.service loaded active running worker\n"}):
+                        with self.assertRaisesRegex(GUARD["Refusal"], "agent instance"):
+                            GUARD[fn]()
+                    continue
                 with patch.dict(GUARD["runtime_absent"].__globals__, {
                     "accounts_absent": (lambda fn=fn: (_ for _ in ()).throw(GUARD["Refusal"](fn))) if fn == "accounts_absent" else lambda: None,
                     "mount_absent": (lambda fn=fn: (_ for _ in ()).throw(GUARD["Refusal"](fn))) if fn == "mount_absent" else lambda: None,
@@ -123,9 +156,24 @@ class GuardTests(unittest.TestCase):
                     "empty_runtime_root": lambda *_: None,
                     "os": SimpleNamespace(scandir=lambda _p: EmptyScandir()),
                 }):
-                    if fn in {"accounts_absent", "mount_absent", "nft_absent"}:
-                        with self.assertRaisesRegex(GUARD["Refusal"], fn):
-                            GUARD["runtime_absent"]()
+                    with self.assertRaisesRegex(GUARD["Refusal"], fn):
+                        GUARD["runtime_absent"]()
+
+    def test_systemd_inventory_refuses_walk_error(self):
+        dir_info = SimpleNamespace(st_mode=0o040755, st_uid=0)
+
+        def walk_with_error(_root, followlinks=False, onerror=None):
+            if onerror is not None:
+                onerror(OSError("permission denied"))
+            return iter(())
+
+        with patch.dict(GUARD["systemd_files"].__globals__, {
+            "probe": lambda *_a, **_k: "/etc/systemd/system\n",
+            "check_ancestors": lambda _p: True,
+            "lstat": lambda _p: dir_info,
+        }), patch.object(GUARD["os"], "walk", walk_with_error):
+            with self.assertRaisesRegex(GUARD["Refusal"], "cannot inventory systemd directory"):
+                GUARD["systemd_files"]()
 
     def test_systemd_active_or_alias_observations_refuse(self):
         properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")
@@ -157,6 +205,36 @@ class GuardTests(unittest.TestCase):
             }):
                 with self.assertRaises(GUARD["Refusal"]):
                     GUARD["systemd_manager"]()
+
+    def test_remove_allows_only_systemd_load_state_transition(self):
+        first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
+        second = dict(first, LoadState="not-found", FragmentPath="")
+        reads = iter((first, first, second, second))
+        globals_ = GUARD["state_REMOVE"].__globals__
+        with patch.dict(globals_, {
+            "sys": SimpleNamespace(stdin=io.StringIO("sanctuary-castle-wall\n")),
+            "package_query": lambda: None,
+            "package_integrity": lambda: None,
+            "installed_identity": lambda: {"identity": "stable"},
+            "systemd_files": lambda: None,
+            "systemd_manager": lambda *_a, **_k: next(reads),
+            "agent_instances_inactive": lambda: None,
+            "no_queued_jobs": lambda: None,
+            "runtime_absent": lambda: None,
+        }):
+            GUARD["state_REMOVE"]()
+
+    def test_decode_errors_are_refusals(self):
+        with patch.dict(GUARD["probe"].__globals__, {
+            "bounded_capture": lambda *_a, **_k: (0, b"\xff", b""),
+        }):
+            with self.assertRaisesRegex(GUARD["Refusal"], "decode|undecodable"):
+                GUARD["probe"](["/usr/bin/example"])
+        with patch.dict(GUARD["mount_absent"].__globals__, {
+            "stable_read": lambda *_a, **_k: b"\xff",
+        }):
+            with self.assertRaisesRegex(GUARD["Refusal"], "decode|mount"):
+                GUARD["mount_absent"]()
 
     def test_bounded_capture_caps_output_and_deadline(self):
         with self.assertRaises(ValueError):

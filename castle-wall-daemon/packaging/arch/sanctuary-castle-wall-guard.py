@@ -4,11 +4,10 @@ The generated package prepends immutable constants above this file. The guard is
 read-only: hooks may admit or refuse a transaction, never mutate host state.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import os
+import re
 import selectors
 import signal
 import stat
@@ -52,6 +51,10 @@ SYSTEMD_ROOTS = (
     "/usr/lib/systemd/system",
     "/run/systemd/generator.late",
 )
+# Must match upgrade_refusal in ci-arch-lifecycle.sh; the lifecycle harness uses this guard phrase to prove the upgrade-family case.
+UPGRADE_REFUSAL = "in-place Castle Wall upgrade, reinstall and downgrade are unsupported; retire this host and cold-install a new package"
+# Must match provisioned_refusal in ci-arch-lifecycle.sh; the lifecycle harness uses this guard phrase to prove the provisioned-footprint case.
+PROVISIONED_FOOTPRINT_REFUSAL = "runtime/config entry present under"
 
 
 class Refusal(Exception):
@@ -123,7 +126,10 @@ def probe(argv, allow_empty=False):
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         refuse(f"probe unavailable: {argv[0]}: {exc}")
-    output = raw.decode("utf-8", "strict")
+    try:
+        output = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        refuse(f"probe output undecodable: {argv[0]}: {exc}")
     if status != 0 or error or (not allow_empty and not output):
         refuse(f"probe failed or incomplete: {argv[0]}")
     return output
@@ -222,10 +228,10 @@ def package_query():
 
 
 def package_integrity():
-    # pacman -Qkk is the Arch package database witness for leaves this guard
-    # does not hash directly, including the guard file executing now.
+    # pacman -Qkk compares package metadata (size, mtime, mode, ownership and link targets) for leaves this guard does not hash directly.
     output = probe(["/usr/bin/pacman", "-Qkk", PACKAGE])
-    if "0 altered files" not in output:
+    clean_summary = re.compile(rf"^{re.escape(PACKAGE)}: [0-9]+ total files, 0 altered files$", re.MULTILINE)
+    if clean_summary.search(output) is None:
         refuse("pacman package integrity is not clean")
 
 
@@ -290,7 +296,8 @@ def systemd_files():
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             refuse(f"unsafe systemd unit root: {root}")
         count = 0
-        for directory, dirs, files in os.walk(root, followlinks=False):
+        # Walk errors must refuse because a skipped unit directory can hide enablement symlinks or drop-ins.
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=lambda exc: refuse(f"cannot inventory systemd directory: {exc}")):
             directory_info = lstat(directory)
             if directory_info is None or not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or directory_info.st_mode & 0o022:
                 refuse(f"unsafe traversed systemd directory: {directory}")
@@ -417,13 +424,16 @@ def empty_runtime_root(path):
     try:
         with os.scandir(path) as entries:
             if next(entries, None) is not None:
-                refuse(f"runtime/config entry present under {path}")
+                refuse(f"{PROVISIONED_FOOTPRINT_REFUSAL} {path}")
     except OSError as exc:
         refuse(f"unreadable runtime root {path}: {exc}")
 
 
 def mount_absent():
-    raw = stable_read("/proc/self/mountinfo", OBSERVATION_BYTES).decode("utf-8")
+    try:
+        raw = stable_read("/proc/self/mountinfo", OBSERVATION_BYTES).decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        refuse(f"cannot decode mount inventory: {exc}")
     for line in raw.splitlines():
         parts = line.split()
         if len(parts) < 10 or "-" not in parts:
@@ -473,7 +483,7 @@ def runtime_absent():
 def state_UPGRADE():
     # The upgrade state reads no host state: an unconditional hold must not be
     # weakened by a stale or attacker-shaped local observation.
-    refuse("in-place Castle Wall upgrade, reinstall and downgrade are unsupported; retire this host and cold-install a new package")
+    refuse(UPGRADE_REFUSAL)
 
 
 def state_REMOVE():
@@ -495,7 +505,11 @@ def state_REMOVE():
     agent_instances_inactive()
     no_queued_jobs()
     runtime_absent()
-    if manager_first != manager_second or mount_first != mount_second:
+    def comparable_systemd_state(fields):
+        # LoadState and FragmentPath may change when systemd loads an inert unit during observation; the stable fields are the removal invariant.
+        return {key: value for key, value in fields.items() if key not in {"LoadState", "FragmentPath"}}
+
+    if comparable_systemd_state(manager_first) != comparable_systemd_state(manager_second) or comparable_systemd_state(mount_first) != comparable_systemd_state(mount_second):
         refuse("systemd manager state changed during observation")
     if installed_identity() != identity_first:
         refuse("installed identity changed during observation")

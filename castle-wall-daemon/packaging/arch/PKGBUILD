@@ -12,7 +12,8 @@ license=('LicenseRef-Sanctuary')
 _glibc_floor="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
 depends=("glibc>=${_glibc_floor}" 'systemd' 'nftables' 'python' 'libnetfilter_queue' 'iproute2' 'util-linux' 'shadow')
 makedepends=('rustup')
-options=('!strip')
+# docs and emptydirs must stay enabled; deleting them after package() would remove the bound identity and make every guarded removal refuse.
+options=('!strip' 'docs' 'emptydirs')
 backup=()
 source=()
 sha256sums=()

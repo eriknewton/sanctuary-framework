@@ -97,7 +97,7 @@ def stage(args: argparse.Namespace) -> None:
 
     hook_hashes = {name: sha(dest / ("usr/share/libalpm/hooks/" + name)) for name in HOOKS}
     hashed_paths = sorted(set(PAYLOAD_MODES) - {IDENTITY, GUARD})
-    payload_hashes = {path: sha(dest / path) for path in hashed_paths if (dest / path).is_file()}
+    payload_hashes = {path: sha(dest / path) for path in hashed_paths}
     identity = {
         "artifact_kind": KIND,
         "install_ready": False,

@@ -5,7 +5,12 @@ on:
     branches: [main]
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Base commit to compare against for the .deb unchanged gate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,7 +26,7 @@ jobs:
   arch-package-build:
     runs-on: ubuntu-24.04
     container:
-      image: archlinux:latest
+      image: archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     timeout-minutes: 90
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
@@ -29,7 +34,7 @@ jobs:
       # The archlinux image ships without git; without it actions/checkout falls back to a
       # REST download with no .git, and the exact-head check below cannot run.
       - name: Install git for checkout
-        run: pacman -Sy --noconfirm --needed git
+        run: pacman -Syu --noconfirm --needed git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.ARCH_SOURCE_SHA }}
@@ -38,7 +43,8 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$(git rev-parse HEAD)" == "$ARCH_SOURCE_SHA" ]]
-          pacman -Sy --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
+          pacman -Syu --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
+          python3 -m unittest discover -s castle-wall-daemon/packaging/arch -p 'test_*.py'
           useradd -m build
           chown -R build:build "$GITHUB_WORKSPACE"
           runuser -u build -- rustup toolchain install 1.95.0 --profile minimal
@@ -76,12 +82,20 @@ jobs:
           sha256sum --check SHA256SUMS
           pkg=(*.pkg.tar.zst)
           [[ ${#pkg[@]} == 1 ]]
-          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:latest /usr/lib/systemd/systemd)"
-          timeout 120 bash -c "until docker exec '$cid' test \"\$(cat /proc/1/comm)\" = systemd; do sleep 2; done"
-          docker exec "$cid" bash -lc "pacman -Sy --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
-          docker exec "$cid" bash -lc "EVIDENCE_DIR=/tmp/arch-lifecycle /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}"
+          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd /usr/lib/systemd/systemd)"
+          timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          cid="$1"
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd'; do
+            sleep 2
+          done
+          WAIT_SYSTEMD
+          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          docker exec "$cid" mkdir -p /tmp/arch-lifecycle
+          rc=0
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=/tmp/arch-lifecycle /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}" || rc=$?
           docker cp "$cid:/tmp/arch-lifecycle" "$RUNNER_TEMP/arch-lifecycle"
           docker stop "$cid"
+          exit "$rc"
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -105,11 +119,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: 1.95.0
+      - name: Resolve comparison base
+        run: |
+          event="${{ github.event_name }}"
+          case "$event" in
+            pull_request)
+              base="${{ github.event.pull_request.base.sha }}"
+              ;;
+            push)
+              base="${{ github.event.before }}"
+              ;;
+            workflow_dispatch)
+              base="${{ inputs.base_sha }}"
+              ;;
+            *)
+              echo "unsupported event for Arch .deb unchanged gate: $event" >&2
+              exit 1
+              ;;
+          esac
+          zero=0000000000000000000000000000000000000000
+          if [[ -z "$base" || "$base" == "$zero" || "$base" == "$GITHUB_SHA" ]]; then
+            echo "Arch .deb unchanged gate needs a real base commit distinct from head for $event" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$base"
+          git cat-file -e "$base^{commit}" || {
+            echo "Arch .deb unchanged gate cannot resolve base commit: $base" >&2
+            exit 1
+          }
+          echo "ARCH_COMPARE_BASE=$base" >>"$GITHUB_ENV"
       - name: Enforce slice path allowlist
         run: |
-          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
-          git fetch --no-tags --depth=1 origin main
-          git diff --name-only "$base"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
+          git diff --name-only --no-renames "$ARCH_COMPARE_BASE"...HEAD >"$RUNNER_TEMP/changed-paths.txt"
           python3 - <<'PY'
           from pathlib import Path
           allowed_workflow = ".github/workflows/linux-arch-package.yml"
@@ -123,9 +164,8 @@ jobs:
           PY
       - name: Rebuild base and head install debs and compare protected fields
         run: |
-          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
           work="$RUNNER_TEMP/deb-unchanged"
-          git worktree add "$work/base" "$base"
+          git worktree add "$work/base" "$ARCH_COMPARE_BASE"
           git worktree add "$work/head" HEAD
           for side in base head; do
             (cd "$work/$side" && sudo git config --global --add safe.directory "$PWD")
