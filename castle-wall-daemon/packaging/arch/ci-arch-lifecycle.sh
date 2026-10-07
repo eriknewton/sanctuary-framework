@@ -560,7 +560,9 @@ $extra
 }
 PKG
   chown -R build:build "$root"
-  runuser -u build -- bash -lc "cd '$root' && makepkg --noconfirm --nodeps >/dev/null"
+  # -f: the same name and version can be built twice with different contents (the upgrade witness builds a plain
+  # 0.1.1, the version-swap negative a 0.1.1 that carries the CLI); without it makepkg exits 13 on the second build.
+  runuser -u build -- bash -lc "cd '$root' && makepkg -f --noconfirm --nodeps >/dev/null"
   cp "$root"/*.pkg.tar.zst "$out"
 }
 
