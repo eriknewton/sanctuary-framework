@@ -354,7 +354,9 @@ run_unpinned_witness() {
     record 'building unpinned sanctuary-linux-arch for C0 witness'
     pacman -S --noconfirm --needed rustup git >/dev/null
     runuser -u build -- rustup toolchain install 1.95.0 --profile minimal >/dev/null
-    chown -R build:build "$work/unpinned-target"
+    # The target directory does not exist yet on a first build; create it owned by the build user (run 8 failed on
+    # a chown of the missing path).
+    install -d -o build -g build -m 0755 "$work/unpinned-target"
     runuser -u build -- bash -lc "cd /workspace/castle-wall-daemon && PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR='$work/unpinned-target' cargo +1.95.0 build --release --features arch-install --bin sanctuary-linux-arch >/dev/null"
   fi
   local saved="$work/sanctuary-linux.pinned"
