@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-IDENTITY_SHA256 = 'd4d0d7a5bf4991810107caf6f80f10730a2f94b484271fedef5cba8c93d4e443'
+IDENTITY_SHA256 = '08d97284df3529a93aaec07bb3ca8dcbc84e863d5f1c03d3df6f16f4db38adae'
 PACKAGE_VERSION = '0.1.0-1'
 IDENTITY_PATH = '/usr/lib/sanctuary-castle-wall/build-identity'
 PAYLOAD_MODES = {'usr/local/libexec/sanctuary/castle-wall-daemon': 493, 'usr/local/libexec/sanctuary/protected-agent-v1': 493, 'usr/local/libexec/sanctuary/network-agent-standin': 493, 'usr/bin/sanctuary-linux': 493, 'etc/systemd/system/sanctuary-castle-wall.service': 420, 'etc/systemd/system/sanctuary-agent@.service': 420, 'etc/systemd/system/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount': 420, 'usr/share/sanctuary-castle-wall/schemas/contract.rs': 420, 'usr/share/sanctuary-castle-wall/operator-guide.md': 420, 'usr/share/libalpm/hooks/00-sanctuary-castle-wall-upgrade-guard.hook': 420, 'usr/share/libalpm/hooks/00-sanctuary-castle-wall-remove-guard.hook': 420, 'usr/lib/sanctuary-castle-wall/build-identity': 420, 'usr/share/libalpm/scripts/sanctuary-castle-wall-guard': 493}
@@ -259,7 +259,6 @@ def build_identity():
         refuse("wrong Arch install identity")
     payload_hashes = identity.get("payload_sha256")
     # Must match hashed_paths in build-arch-package.py.
-    # Must match pacman::expected_payloads() and build-arch-package.py's staged payload hash set.
     expected_payloads = set(PAYLOAD_MODES) - {IDENTITY_PATH.lstrip("/"), GUARD_PATH.lstrip("/")}
     if (
         identity.get("artifact_kind") != "arch-install-pkg-v1"

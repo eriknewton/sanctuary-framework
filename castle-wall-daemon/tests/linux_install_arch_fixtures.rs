@@ -194,7 +194,7 @@ fn guard_verification_matches_recorded_verdicts() {
         let identity_hash = sha256(&identity);
         let guard = fs::read(path).unwrap();
         let static_hash = if stem == GENERATED {
-            guard_static_sha256(&guard)
+            generated_static_pin(&dir)
         } else {
             sha256(GUARD_BODY)
         };
@@ -210,7 +210,7 @@ fn guard_verification_matches_recorded_verdicts() {
         let identity = fs::read(path).unwrap();
         let guard = fs::read(dir.join(format!("{stem}.guard"))).unwrap();
         let static_hash = if stem == GENERATED {
-            guard_static_sha256(&guard)
+            generated_static_pin(&dir)
         } else {
             sha256(GUARD_BODY)
         };
@@ -226,6 +226,21 @@ fn guard_verification_matches_recorded_verdicts() {
         generated["cli_pins"]["payload_sha256"].as_str().unwrap(),
         "Python-generated identity payload pin must match the Rust canonical form"
     );
+    // The static pin comes from the Python builder (cli_pins); the Rust region split must hash to the same value.
+    assert_eq!(
+        guard_static_sha256(&fs::read(dir.join("generated.guard")).unwrap()),
+        generated_static_pin(&dir),
+        "Rust guard static-region split must match the Python builder's guard_static_sha256 pin"
+    );
+}
+
+fn generated_static_pin(dir: &Path) -> String {
+    let generated: Value =
+        serde_json::from_slice(&fs::read(dir.join("generated.identity")).unwrap()).unwrap();
+    generated["cli_pins"]["guard_static_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn parse_show_fixture(

@@ -15,7 +15,7 @@
     "ubuntu_path": "usr/sbin/sanctuary-linux"
   },
   "cli_pins": {
-    "guard_static_sha256": "315d4718f1278e86f5c4ffbbedef34fc143b112684d7c616a54a113468f9899d",
+    "guard_static_sha256": "6c73c995be2b1783f79f797c76b8933f45acc910fd98b73d0e149e57fd8ded1d",
     "package_version": "0.1.0-1",
     "payload_sha256": "26ff7dc5f189acead66db3e22304b9addf0257d22d5b0e87518ebeb7b7c55c90"
   },

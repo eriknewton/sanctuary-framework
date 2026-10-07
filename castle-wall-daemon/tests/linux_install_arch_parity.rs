@@ -283,6 +283,19 @@ fn parity_negative_controls_fail_on_drift_removed_seam_and_reorder() {
     )
     .unwrap_err();
     assert!(removed_error.contains("command drift near"));
+    // C4 and C5 commute on the real text, so only the pinned table order refuses a swap; witness that it does.
+    let mut swapped = seams.clone();
+    let c4 = swapped.iter().position(|seam| seam.name == "C4").unwrap();
+    let c5 = swapped.iter().position(|seam| seam.name == "C5").unwrap();
+    swapped.swap(c4, c5);
+    let order_error = compare_text(
+        "command",
+        command.clone(),
+        &read("src/linux_install/arch/command.rs"),
+        &swapped,
+    )
+    .unwrap_err();
+    assert!(order_error.contains("seam order changed"));
     let order_sensitive = [
         Seam {
             name: "R1",

@@ -17,7 +17,9 @@ const KIB: usize = 1024;
 const SHA256_BYTES: usize = 32;
 const HEX_CHARS_PER_BYTE: usize = 2;
 const SHA256_HEX_LEN: usize = SHA256_BYTES * HEX_CHARS_PER_BYTE;
-const MAX_VERSION_PIN_BYTES: usize = SHA256_HEX_LEN * HEX_CHARS_PER_BYTE;
+// A chosen bound, not a derivation: Arch pkgver-pkgrel strings are short (0.1.0-1 is 7 bytes); 128 refuses a
+// runaway build-time value without constraining any plausible version.
+const MAX_VERSION_PIN_BYTES: usize = 128;
 const GUARD_CURRENT_UPPER_BOUND_BYTES: usize = 32 * KIB;
 const GUARD_GROWTH_HEADROOM_BYTES: usize = 16 * KIB;
 const GUARD_MAX_BYTES: usize = GUARD_CURRENT_UPPER_BOUND_BYTES + GUARD_GROWTH_HEADROOM_BYTES;

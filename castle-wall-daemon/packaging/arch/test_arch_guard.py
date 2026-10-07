@@ -735,6 +735,23 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(GUARD["Refusal"]):
                 GUARD["stable_read"](str(link), 10)
 
+    def test_committed_generated_guard_fixture_matches_live_builder(self):
+        # The Rust replay (tests/linux_install_arch_fixtures.rs) trusts this pair as builder output; a template or
+        # builder edit must regenerate it, or this test fails before the Rust side can drift silently.
+        fixture = SUBSTRATE / "synthetic-guard"
+        identity_bytes = (fixture / "generated.identity").read_bytes()
+        identity = json.loads(identity_bytes)
+        version = identity["package_version"]
+        self.assertEqual(BUILD.guard_bytes(version, identity_bytes, HERE), (fixture / "generated.guard").read_bytes())
+        self.assertEqual(
+            hashlib.sha256(BUILD.guard_static_bytes(version, HERE)).hexdigest(),
+            identity["cli_pins"]["guard_static_sha256"],
+        )
+        self.assertEqual(
+            BUILD.payload_pin_from_staged_hashes(identity["payload_sha256"]),
+            identity["cli_pins"]["payload_sha256"],
+        )
+
     def test_generated_identity_does_not_record_guard_hash(self):
         identity_block = Path(HERE / "build-arch-package.py").read_text().split("identity = ", 1)[1].split("identity_bytes", 1)[0]
         self.assertNotIn("guard_sha256", identity_block)

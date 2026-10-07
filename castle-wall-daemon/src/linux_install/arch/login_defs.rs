@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 const LOGIN_DEFS: &str = "etc/login.defs";
 const LOGIN_DEFS_MAX_BYTES: usize = 64 * 1024; // Shadow's login.defs is a small key-value file; this caps root-edited input at 64 KiB.
 const SHADOW_FGETS_BUFFER_BYTES: usize = 1024;
-// 1023 = shadow 4.20.0's 1024-byte fgets buffer minus the trailing NUL; a line at that length could be split into a second record by shadow.
+// 1023 = shadow 4.20.0's 1024-byte fgets buffer minus the trailing NUL. The check below counts a line with its LF, so
+// it refuses content of 1022 bytes or more; shadow reads a second record only from content of 1024 bytes or more.
 const MAX_SHADOW_PHYSICAL_LINE_BYTES: usize = SHADOW_FGETS_BUFFER_BYTES - 1;
 const REQUIRED_KEYS: [&str; 8] = [
     "SYS_GID_MIN",
@@ -87,6 +88,12 @@ pub fn parse(bytes: &[u8]) -> Result<Ranges> {
         }
         if !value.iter().all(|byte| byte.is_ascii_digit()) {
             return Err("non-decimal login.defs value".into());
+        }
+        // shadow 4.20.0 parses values with strtoumax base 0, so a multi-digit value with a leading zero is octal there
+        // (01750 is 1000); this reader is decimal, so it refuses that shape rather than disagree. A lone 0 reads the same
+        // in every base and falls through to the order checks, which refuse it.
+        if value.len() > 1 && value[0] == b'0' {
+            return Err("leading-zero login.defs value".into());
         }
         values.insert(key, std::str::from_utf8(value)?.parse::<u32>()?);
     }

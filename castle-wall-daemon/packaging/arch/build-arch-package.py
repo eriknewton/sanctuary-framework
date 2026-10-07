@@ -18,7 +18,7 @@ PRIVATE = "usr/lib/" + PACKAGE
 SHARE = "usr/share/" + PACKAGE
 # Must match pacman::ARCH_BUILD_IDENTITY.
 IDENTITY = PRIVATE + "/build-identity"
-# Must match GUARD_PATH in sanctuary-castle-wall-guard.py.
+# Must match GUARD_PATH in sanctuary-castle-wall-guard.py and GUARD_PATH in src/linux_install/arch/pacman.rs.
 GUARD = "usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
 HOOKS = (
     "00-sanctuary-castle-wall-upgrade-guard.hook",
@@ -44,6 +44,7 @@ SOURCES = {
 }
 HOOK_DESTINATIONS = {"usr/share/libalpm/hooks/" + name: name for name in HOOKS}
 WORKSPACE_DIRECTORY = "var/lib/sanctuary-agent-workspace"
+# Must match pacman::expected_payloads(), plus IDENTITY and GUARD.
 PAYLOAD_MODES = {
     **{path: 0o755 for path in BINARIES.values()},
     **{path: 0o644 for path in SOURCES},
@@ -51,7 +52,6 @@ PAYLOAD_MODES = {
     IDENTITY: 0o644,
     GUARD: 0o755,
 }
-# Must match pacman::expected_payloads(), plus IDENTITY and GUARD.
 PAYLOAD_DIRS = {str(parent) for path in PAYLOAD_MODES for parent in Path(path).parents if str(parent) != "."}
 PAYLOAD_DIRS |= {
     "var",
