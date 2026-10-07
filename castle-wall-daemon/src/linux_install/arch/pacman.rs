@@ -131,9 +131,15 @@ pub fn pins_for_status() -> Value {
 fn db_entry(path: &str) -> Result<DbEntry> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err("pinned package database entry absent".into())
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(DbEntry {
+            dev: 0,
+            ino: 0,
+            len: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+        }),
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_file() {
