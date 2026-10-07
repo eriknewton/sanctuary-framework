@@ -961,9 +961,9 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
    * request itself is threaded on UNCHANGED for its content. Each test
    * below asserts the outward behavior (refusal, no hosted client
    * constructed); the DECISION path's read count is asserted where the
-   * decision refuses (which short-circuits before anything else touches
-   * the request); `invoke()` then serializes the caller's object at entry
-   * for the legacy `request_hash` (`hashOfRequest`, via `JSON.stringify`),
+   * decision refuses. In `invoke()` the legacy `request_hash` serialization
+   * of the caller's object at entry (`hashOfRequest`, via `JSON.stringify`)
+   * runs before the refusal check,
    * which re-reads every own enumerable property including `localOnly` --
    * unrelated to the local-only decision (already made, once, correctly)
    * and not a regression this suite needs to forbid.

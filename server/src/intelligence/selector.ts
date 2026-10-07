@@ -1513,10 +1513,11 @@ export class SubstrateSelector {
     // content below is a separate projection used for screening, sending,
     // and `request_projection_hash`.
     const requestHash = hashOfRequest(req);
-    // P1 fix-round-10, item 3: every NAMED CONTENT FIELD is read from
-    // `req` EXACTLY ONCE too, right here, immediately after the single
-    // `localOnly` read and before this method's first `await` — mirroring
-    // exactly why `localOnly` itself is read once. Without this, a
+    // P1 fix-round-10, item 3: every NAMED CONTENT FIELD that screening,
+    // the projection hash and the send consume is read from `req` exactly
+    // once, right here, before this method's first `await` (the legacy
+    // `request_hash` serialization just above also reads them, but only to
+    // hash the caller's object; it feeds none of those three). Without this, a
     // STATEFUL getter (one that returns different content on successive
     // reads) could present one value to the pre-egress context scanner
     // below, a DIFFERENT value to `request_projection_hash` further down, and a
