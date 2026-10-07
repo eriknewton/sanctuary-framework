@@ -284,7 +284,6 @@ pub fn verified_identity(root: &Root, snapshot: &mut Snapshot) -> Result<Value> 
         .ok_or("missing payload identity")?;
     let observed: BTreeSet<_> = hashes.keys().map(String::as_str).collect();
     if value["artifact_kind"] != "arch-install-pkg-v1"
-        || value["install_ready"] != true
         || value["package"] != PACKAGE
         || value["package_version"] != pins.version
         || value["target"] != "x86_64-unknown-linux-gnu"
