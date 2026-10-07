@@ -388,7 +388,12 @@ PY
   record 'state_PROVISIONED: provision account and command identity'
   expect_cli_ok state-provisioned provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
   getent passwd "$agent_uid" >"$evidence/getent-passwd-agent"
-  getent passwd "$service_uid" >"$evidence/getent-passwd-service"
+  # The service uid is RESERVED, never created: account::verify requires it absent from passwd (reserve_service), so
+  # the witness is getent's "not found" exit 2. A present row, or any other exit, fails the run.
+  service_rc=0
+  getent passwd "$service_uid" >"$evidence/getent-passwd-service" || service_rc=$?
+  printf '%s\n' "$service_rc" >"$evidence/getent-passwd-service.rc"
+  [[ "$service_rc" == 2 && ! -s "$evidence/getent-passwd-service" ]] || { record "service uid $service_uid is not reserved (getent rc $service_rc)"; exit 1; }
   getent group sanctuary >"$evidence/getent-group-sanctuary"
   expect_cli_ok state-provisioned-status status --json
   assert_status_json state-provisioned-status "$evidence/arch-pins.json"
