@@ -1,8 +1,8 @@
-# ruff: noqa: F821, EXE002
+# Byte copy of the guard at fc1bc892, kept as the fail-before fixture; never installed.
+# ruff: noqa: F821, I001
 """Template embedded in the Arch libalpm guard.
 
-The generated package prepends IDENTITY_SHA256 and then STATIC above this file.
-STATIC must match the brief 3.1 definition and the CLI pin in P2a. The guard is
+The generated package prepends immutable constants above this file. The guard is
 read-only: hooks may admit or refuse a transaction, never mutate host state.
 """
 
@@ -18,8 +18,9 @@ import sys
 import time
 from pathlib import Path
 
+
 PACKAGE = "sanctuary-castle-wall"
-# Must match GUARD in build-arch-package.py.
+IDENTITY_PATH = "/usr/share/doc/sanctuary-castle-wall/build-identity"
 GUARD_PATH = "/usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
 UNIT_NAME = "sanctuary-castle-wall.service"
 AGENT_UNIT_PREFIX = "sanctuary-agent@"
@@ -205,6 +206,10 @@ def checked_payload_path(relpath, required):
             refuse(f"required package path absent: {path}")
         return None
     mode = PAYLOAD_MODES.get(relpath)
+    if relpath == "var/lib/sanctuary-agent-workspace":
+        if not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o755):
+            refuse("unsafe underlying workspace directory")
+        return info
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_uid != 0
@@ -224,11 +229,10 @@ def package_query():
         refuse("installed package/version identity mismatch")
 
 
-def package_integrity(expected_count):
-    # pacman 7 -Qkk verifies regular-file size and SHA-256 plus mode for every
-    # package entry; the identity's file_count keeps the summary exact.
+def package_integrity():
+    # pacman -Qkk compares package metadata (size, mtime, mode, ownership and link targets) for leaves this guard does not hash directly.
     output = probe(["/usr/bin/pacman", "-Qkk", PACKAGE])
-    clean_summary = re.compile(rf"^{re.escape(PACKAGE)}: {expected_count} total files, 0 altered files$", re.MULTILINE)
+    clean_summary = re.compile(rf"^{re.escape(PACKAGE)}: [0-9]+ total files, 0 altered files$", re.MULTILINE)
     if clean_summary.search(output) is None:
         refuse("pacman package integrity is not clean")
 
@@ -240,8 +244,6 @@ def package_owner(relpath):
 
 
 def build_identity():
-    if lstat(IDENTITY_PATH) is None:
-        refuse("build identity absent")
     checked_payload_path(IDENTITY_PATH.lstrip("/"), True)
     raw = stable_read(IDENTITY_PATH, 64 * 1024)  # 64 KiB is a bounded package manifest, not host history.
     if hashlib.sha256(raw).hexdigest() != IDENTITY_SHA256:
@@ -250,40 +252,15 @@ def build_identity():
         identity = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         refuse("invalid Arch install identity")
-    if not isinstance(identity, dict):
-        refuse("wrong Arch install identity")
-    payload_hashes = identity.get("payload_sha256")
-    # Must match hashed_paths in build-arch-package.py.
-    expected_payloads = set(PAYLOAD_MODES) - {IDENTITY_PATH.lstrip("/"), GUARD_PATH.lstrip("/")}
     if (
         identity.get("artifact_kind") != "arch-install-pkg-v1"
         or identity.get("package") != PACKAGE
         or identity.get("package_version") != PACKAGE_VERSION
-        or not isinstance(payload_hashes, dict)
-        or set(payload_hashes) != expected_payloads
-        or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in payload_hashes.values())
-        or not isinstance(identity.get("file_count"), int)
+        or identity.get("payload_sha256") != PAYLOAD_HASHES
         or "guard_sha256" in identity
     ):
         refuse("wrong Arch install identity")
     return identity
-
-
-def static_guard_source():
-    raw = stable_read(GUARD_PATH, PAYLOAD_BYTES)
-    lines = raw.splitlines(keepends=True)
-    expected_identity = f"IDENTITY_SHA256 = {IDENTITY_SHA256!r}\n".encode()
-    expected_static = (
-        f"PACKAGE_VERSION = {PACKAGE_VERSION!r}\n".encode(),
-        f"IDENTITY_PATH = {IDENTITY_PATH!r}\n".encode(),
-        f"PAYLOAD_MODES = {PAYLOAD_MODES!r}\n".encode(),
-    )
-    if len(lines) < 2 or lines[0] != b"#!/usr/bin/python3 -I\n" or lines[1] != expected_identity:
-        refuse("installed guard header differs from hook binding")
-    if len(lines) < 5 or tuple(lines[2:5]) != expected_static:
-        refuse("installed guard static header differs from hook binding")
-    # Hash exactly the bytes after line 2; this is the same object P2a pins as STATIC.
-    return hashlib.sha256(raw[len(lines[0]) + len(lines[1]) :]).hexdigest()
 
 
 def hash_file(relpath):
@@ -292,11 +269,10 @@ def hash_file(relpath):
 
 def installed_identity():
     identity = build_identity()
-    static_guard_source()
     for relpath in sorted(PAYLOAD_MODES):
         checked_payload_path(relpath, True)
         package_owner(relpath)
-    for relpath, digest in identity["payload_sha256"].items():
+    for relpath, digest in PAYLOAD_HASHES.items():
         if hash_file(relpath) != digest:
             refuse(f"installed payload differs from bound identity: /{relpath}")
     return identity
@@ -361,18 +337,12 @@ def systemd_files():
                 refuse("unit drop-in directory present")
 
 
-def systemd_pid1_comm():
-    try:
-        raw = stable_read("/proc/1/comm", 64)
-        comm = raw.decode("utf-8", "strict").strip()
-    except UnicodeDecodeError as exc:
-        refuse(f"cannot decode systemd PID 1: {exc}")
-    if comm != "systemd":
-        refuse("systemd is not PID 1")
-
-
 def systemd_manager(unit_name=UNIT_NAME, unit_path=UNIT_PATH):
-    systemd_pid1_comm()
+    try:
+        if Path("/proc/1/comm").read_text().strip() != "systemd":
+            refuse("systemd is not PID 1")
+    except OSError:
+        refuse("cannot verify systemd PID 1")
     properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")
     output = probe(["/usr/bin/systemctl", "show", unit_name, "--no-pager", "--all", "--property=" + ",".join(properties)])
     fields = {}
@@ -391,14 +361,10 @@ def systemd_manager(unit_name=UNIT_NAME, unit_path=UNIT_PATH):
     if fields["ActiveState"] != "inactive" or fields["SubState"] != "dead":
         refuse("unit not positively inactive")
     expected_file_state = "static" if unit_name == MOUNT_NAME else "disabled"
-    if fields["NeedDaemonReload"] != "no":
-        refuse("unit needs daemon reload")
     if fields["LoadState"] not in ("loaded", "not-found") or fields["UnitFileState"] != expected_file_state or fields["FragmentPath"] not in ("", unit_path):
         refuse("installed unit not exact, inert and disabled")
     if fields["LoadState"] == "loaded" and fields["FragmentPath"] != unit_path:
         refuse("loaded unit fragment is not package path")
-    if fields["LoadState"] == "not-found" and fields["FragmentPath"]:
-        refuse("not-found unit reports a fragment path")
     return fields
 
 
@@ -527,8 +493,8 @@ def state_REMOVE():
     if targets != [PACKAGE]:
         refuse("unclear libalpm remove target set")
     package_query()
+    package_integrity()
     identity_first = installed_identity()
-    package_integrity(identity_first["file_count"])
     systemd_files()
     manager_first = systemd_manager()
     mount_first = systemd_manager(MOUNT_NAME, MOUNT_PATH)
@@ -545,7 +511,7 @@ def state_REMOVE():
         # LoadState and FragmentPath may change when systemd loads an inert unit during observation; the stable fields are the removal invariant.
         return {key: value for key, value in fields.items() if key not in {"LoadState", "FragmentPath"}}
 
-    if comparable_systemd_state(manager_first) != comparable_systemd_state(manager_second) or mount_first != mount_second:
+    if comparable_systemd_state(manager_first) != comparable_systemd_state(manager_second) or comparable_systemd_state(mount_first) != comparable_systemd_state(mount_second):
         refuse("systemd manager state changed during observation")
     if installed_identity() != identity_first:
         refuse("installed identity changed during observation")
