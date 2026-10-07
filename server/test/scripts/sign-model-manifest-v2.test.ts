@@ -27,7 +27,7 @@ const SOURCE = join(SERVER_ROOT, "model-catalog", "model-manifest-v2.source.json
 // a catalog update (a new model, a version bump) must not break this test of the signing tool itself.
 const SOURCE_JSON = JSON.parse(readFileSync(SOURCE, "utf8")) as {
   manifest_version: number;
-  models: Record<string, { ollama_identity: { model: string } }>;
+  models: Record<string, { ollama_identity: { model: string; tag: string } }>;
 };
 const SOURCE_VERSION = SOURCE_JSON.manifest_version;
 const SOURCE_MODEL_IDS = Object.keys(SOURCE_JSON.models).sort();
@@ -198,7 +198,7 @@ describe("sign-model-manifest-v2 tool", () => {
     expect(Object.keys(verified.body.models).sort()).toEqual(SOURCE_MODEL_IDS);
     // Every source identity, and nothing else, was fetched from the registry.
     const expectedIdentities = Object.values(SOURCE_JSON.models)
-      .map((m) => `${m.ollama_identity.model}:${(m.ollama_identity as { tag: string }).tag}`)
+      .map((m) => `${m.ollama_identity.model}:${m.ollama_identity.tag}`)
       .sort();
     expect([...served.keys()].filter((k) => !k.endsWith(`:${OVERSIZE_TAG}`)).sort()).toEqual(expectedIdentities);
     const signedDigest = createHash("sha256").update(signedText).digest("hex");
