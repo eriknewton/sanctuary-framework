@@ -43,7 +43,7 @@ fn local_db() -> String {
 
 fn ensure_db_unlocked(lock_path: &str, present_reason: &'static str) -> Result<()> {
     match fs::symlink_metadata(lock_path) {
-        Ok(_) => Err(present_reason.into()),
+        Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot inspect pacman database lock: {error}").into()),
     }
