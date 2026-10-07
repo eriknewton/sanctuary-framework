@@ -55,12 +55,25 @@ build() {
   _scrub_rust_env
   printf '%s' "${RUSTFLAGS-}" >"$srcdir/rustflags.txt"
   cargo build --locked --release --target "${_target}" \
-    --target-dir "$srcdir/cargo-target" \
+    --target-dir "$srcdir/target-shared" \
     --message-format=json \
     --bin castle-wall-daemon \
     --bin protected-agent-v1 \
-    --bin network-agent-standin \
-    --bin sanctuary-linux >"$srcdir/cargo.jsonl"
+    --bin network-agent-standin >"$srcdir/cargo-shared.jsonl"
+  python3 "${startdir}/build-arch-package.py" pin \
+    --crate "$crate" \
+    --pkgver "$pkgver" \
+    --pkgrel "$pkgrel" \
+    --target-dir "$srcdir/target-shared" \
+    --output "$srcdir/arch-pins.json"
+  SANCTUARY_ARCH_PIN_PACKAGE_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_version"])' "$srcdir/arch-pins.json")" \
+  SANCTUARY_ARCH_PIN_PAYLOAD_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["payload_sha256"])' "$srcdir/arch-pins.json")" \
+  SANCTUARY_ARCH_PIN_GUARD_STATIC_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["guard_static_sha256"])' "$srcdir/arch-pins.json")" \
+  cargo build --locked --release --target "${_target}" \
+    --target-dir "$srcdir/target-arch-cli" \
+    --message-format=json \
+    --features arch-install \
+    --bin sanctuary-linux-arch >"$srcdir/cargo-arch-cli.jsonl"
 }
 
 package() {
@@ -70,6 +83,7 @@ package() {
   source_commit="${SOURCE_COMMIT:?SOURCE_COMMIT must be supplied by the build job; package() does not open root-owned linked-worktree gitdirs as the build user}"
   rustc_version="$(rustc --version)"
   python3 "${startdir}/build-arch-package.py" \
+    stage \
     --crate "$crate" \
     --dest "$pkgdir" \
     --pkgver "$pkgver" \
@@ -77,7 +91,10 @@ package() {
     --source-commit "$source_commit" \
     --rustc-version "$rustc_version" \
     --glibc-floor "$_glibc_floor" \
-    --target-dir "$srcdir/cargo-target" \
-    --cargo-json "$srcdir/cargo.jsonl" \
-    --rustflags-file "$srcdir/rustflags.txt"
+    --shared-target-dir "$srcdir/target-shared" \
+    --cli-target-dir "$srcdir/target-arch-cli" \
+    --shared-cargo-json "$srcdir/cargo-shared.jsonl" \
+    --cli-cargo-json "$srcdir/cargo-arch-cli.jsonl" \
+    --rustflags-file "$srcdir/rustflags.txt" \
+    --pins "$srcdir/arch-pins.json"
 }

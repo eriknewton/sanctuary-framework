@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
+SUBSTRATE = HERE.parent.parent / "tests" / "fixtures" / "substrate"
 BUILD_SPEC = importlib.util.spec_from_file_location("build_arch_package", HERE / "build-arch-package.py")
 BUILD = importlib.util.module_from_spec(BUILD_SPEC)
 BUILD_SPEC.loader.exec_module(BUILD)
@@ -169,6 +170,31 @@ def scratch_inert_missing_identity_guard() -> dict[str, object]:
         return runpy.run_path(str(path))
 
 
+def expectation(path: Path) -> tuple[str, str]:
+    text = (path.with_name(path.name + ".expect")).read_text().strip()
+    if text == "accept":
+        return ("accept", "")
+    if text.startswith("refuse "):
+        return ("refuse", text.removeprefix("refuse "))
+    raise AssertionError(f"bad expectation for {path}: {text}")
+
+
+def omarchy_fixture(name: str) -> Path:
+    return SUBSTRATE / "omarchy-4.0.4-systemd-261.2-nft-1.1.7" / name
+
+
+def section_after_marker(path: Path, marker: str) -> str:
+    lines = path.read_text().splitlines()
+    start = lines.index(marker) + 1
+    body = []
+    for line in lines[start:]:
+        if line.startswith("=== "):
+            break
+        if line:
+            body.append(line)
+    return "\n".join(body)
+
+
 GUARD = module_from_bytes(generated_guard_bytes())
 
 
@@ -226,6 +252,37 @@ class GuardTests(unittest.TestCase):
                     with patch.dict(GUARD["static_guard_source"].__globals__, {"GUARD_PATH": str(path)}):
                         with self.assertRaisesRegex(GUARD["Refusal"], "static header"):
                             GUARD["static_guard_source"]()
+
+    def test_stage_refuses_rust_constant_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            source = crate / "src" / "linux_install" / "arch"
+            source.mkdir(parents=True)
+            (source / "pacman.rs").write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "wrong";\n'
+                'pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";\n'
+            )
+            with self.assertRaisesRegex(ValueError, "ARCH_BUILD_IDENTITY"):
+                BUILD.check_optional_rust_constants(crate)
+
+    def test_stage_refuses_when_pin_bytes_are_absent_from_cli(self):
+        pins = {
+            "package_version": "0.1.0-1",
+            "payload_sha256": "a" * 64,
+            "guard_static_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "sanctuary-linux-arch"
+            binary.write_bytes(b"not the pinned cli")
+            with self.assertRaisesRegex(ValueError, "absent"):
+                BUILD.verify_pins_in_binary(binary, pins)
+            binary.write_bytes(
+                b"0.1.0-1\0"
+                + pins["payload_sha256"].encode()
+                + b"\0"
+                + pins["guard_static_sha256"].encode()
+            )
+            BUILD.verify_pins_in_binary(binary, pins)
 
     def test_unknown_phase_and_non_root_refuse(self):
         with patch.dict(GUARD["main"].__globals__, {"os": self.root()}):
@@ -348,6 +405,25 @@ class GuardTests(unittest.TestCase):
         }), patch.object(GUARD["os"], "walk", walk_with_error):
             with self.assertRaisesRegex(GUARD["Refusal"], "cannot inventory systemd directory"):
                 GUARD["systemd_files"]()
+
+    def test_recon_unitpath_capture_replays_through_guard_roots_reader(self):
+        fixture = omarchy_fixture("systemd.txt")
+        self.assertEqual(expectation(fixture)[0], "accept")
+        unit_path_line = section_after_marker(fixture, "=== systemd-unit-paths").splitlines()[0]
+        with patch.dict(GUARD["systemd_files"].__globals__, {
+            "probe": lambda *_a, **_k: unit_path_line,
+            "check_ancestors": lambda _p: False,
+        }):
+            GUARD["systemd_files"]()
+
+    def test_recon_nft_ruleset_capture_documents_reader_boundary(self):
+        fixture = omarchy_fixture("nft-probe.txt")
+        verdict, reason = expectation(fixture)
+        self.assertEqual(verdict, "refuse")
+        ruleset_json = next(line for line in fixture.read_text().splitlines() if line.startswith('{"nftables"'))
+        with patch.dict(GUARD["nft_absent"].__globals__, {"probe": lambda *_a, **_k: ruleset_json}):
+            with self.assertRaisesRegex(GUARD["Refusal"], reason):
+                GUARD["nft_absent"]()
 
     def test_systemd_active_or_alias_observations_refuse(self):
         properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")

@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 
 PACKAGE = "sanctuary-castle-wall"
@@ -32,6 +33,7 @@ BINARIES = {
     "network-agent-standin": "usr/local/libexec/sanctuary/network-agent-standin",
     "sanctuary-linux": "usr/bin/sanctuary-linux",
 }
+CLI_SOURCE_BIN = "sanctuary-linux-arch"
 MOUNT_NAME = r"var-lib-sanctuary\x2dagent\x2dworkspace.mount"
 SOURCES = {
     "etc/systemd/system/sanctuary-castle-wall.service": "systemd/sanctuary-castle-wall.service",
@@ -67,6 +69,10 @@ RUST_CONST = re.compile(r'pub const (ARCH_BUILD_IDENTITY|ARCH_CLI_PATH): &str = 
 
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def sha_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def ensure_directory(path: Path) -> None:
@@ -106,20 +112,27 @@ def guard_bytes(version: str, identity_bytes: bytes, here: Path) -> bytes:
     ).encode() + guard_static_bytes(version, here)
 
 
-def binary_features(cargo_json: Path) -> dict[str, list[str]]:
+def binary_features(paths: list[Path]) -> dict[str, list[str]]:
     seen: dict[str, list[str]] = {}
-    for line in cargo_json.read_text().splitlines():
-        record = json.loads(line)
-        target = record.get("target", {})
-        name = target.get("name")
-        if record.get("reason") == "compiler-artifact" and name in BINARIES and record.get("executable"):
-            features = record.get("features")
-            profile = record.get("profile", {})
-            if features != [] or profile.get("test"):
-                raise ValueError(f"unexpected feature or test artifact for {name}")
-            seen[name] = features
-    if set(seen) != set(BINARIES):
-        missing = sorted(set(BINARIES) - set(seen))
+    expected = {
+        "castle-wall-daemon": [],
+        "protected-agent-v1": [],
+        "network-agent-standin": [],
+        CLI_SOURCE_BIN: ["arch-install"],
+    }
+    for cargo_json in paths:
+        for line in cargo_json.read_text().splitlines():
+            record = json.loads(line)
+            target = record.get("target", {})
+            name = target.get("name")
+            if record.get("reason") == "compiler-artifact" and name in expected and record.get("executable"):
+                features = record.get("features")
+                profile = record.get("profile", {})
+                if features != expected[name] or profile.get("test"):
+                    raise ValueError(f"unexpected feature or test artifact for {name}")
+                seen[name] = features
+    if set(seen) != set(expected):
+        missing = sorted(set(expected) - set(seen))
         raise ValueError(f"Cargo did not witness every binary: {missing}")
     return {name: seen[name] for name in sorted(seen)}
 
@@ -150,19 +163,84 @@ def check_optional_rust_constants(crate: Path) -> None:
             raise ValueError(f"{name} must be {expected[name]!r}, got {value!r}")
 
 
+def payload_hashes_for_pins(crate: Path, target_dir: Path, dest: Path | None = None) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for name, rel in BINARIES.items():
+        if name == "sanctuary-linux":
+            continue
+        hashes[rel] = sha(target_dir / TARGET / "release" / name)
+    for rel, source in SOURCES.items():
+        source_path = dest / rel if dest is not None else crate / source
+        hashes[rel] = sha(source_path)
+    here = Path(__file__).resolve().parent
+    for rel, hook in HOOK_DESTINATIONS.items():
+        source_path = dest / rel if dest is not None else here / hook
+        hashes[rel] = sha(source_path)
+    return {path: hashes[path] for path in sorted(hashes)}
+
+
+def payload_pin_from_hashes(hashes: dict[str, str]) -> str:
+    canonical = b"".join(path.encode() + b"\0" + digest.encode() + b"\n" for path, digest in sorted(hashes.items()))
+    return sha_bytes(canonical)
+
+
+def compute_pins(crate: Path, target_dir: Path, version: str) -> dict[str, str]:
+    here = Path(__file__).resolve().parent
+    return {
+        "package_version": version,
+        "payload_sha256": payload_pin_from_hashes(payload_hashes_for_pins(crate, target_dir)),
+        "guard_static_sha256": sha_bytes(guard_static_bytes(version, here)),
+    }
+
+
+def pin(args: argparse.Namespace) -> None:
+    crate = args.crate.resolve()
+    target_dir = args.target_dir.resolve()
+    version = f"{args.pkgver}-{args.pkgrel}"
+    check_optional_rust_constants(crate)
+    args.output.write_text(json.dumps(compute_pins(crate, target_dir, version), sort_keys=True, indent=2) + "\n")
+
+
+def read_pins(path: Path) -> dict[str, str]:
+    pins = json.loads(path.read_text())
+    required = {"package_version", "payload_sha256", "guard_static_sha256"}
+    if set(pins) != required:
+        raise ValueError("pin file shape mismatch")
+    for key, value in pins.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"pin {key} missing")
+    return pins
+
+
+def verify_pins_in_binary(binary: Path, pins: dict[str, str]) -> None:
+    data = binary.read_bytes()
+    for key in ("payload_sha256", "guard_static_sha256"):
+        needle = pins[key].encode()
+        if data.count(needle) == 0:
+            raise ValueError(f"pin {key} absent from built CLI")
+    if data.count(pins["package_version"].encode()) == 0:
+        raise ValueError("package version pin absent from built CLI")
+
+
 def stage(args: argparse.Namespace) -> None:
     crate = args.crate.resolve()
     here = Path(__file__).resolve().parent
     dest = args.dest.resolve()
-    target_dir = args.target_dir.resolve()
+    shared_target_dir = args.shared_target_dir.resolve()
+    cli_target_dir = args.cli_target_dir.resolve()
     version = f"{args.pkgver}-{args.pkgrel}"
     check_optional_rust_constants(crate)
+    pins = read_pins(args.pins.resolve())
+    if pins != compute_pins(crate, shared_target_dir, version):
+        raise ValueError("compiled Arch pins differ from staged payload inputs")
 
     for directory in PAYLOAD_DIRS:
         ensure_directory(dest / directory)
 
     for name, rel in BINARIES.items():
-        copy_file(target_dir / TARGET / "release" / name, dest / rel, PAYLOAD_MODES[rel])
+        source_name = CLI_SOURCE_BIN if name == "sanctuary-linux" else name
+        target_dir = cli_target_dir if name == "sanctuary-linux" else shared_target_dir
+        copy_file(target_dir / TARGET / "release" / source_name, dest / rel, PAYLOAD_MODES[rel])
     for rel, source in SOURCES.items():
         copy_file(crate / source, dest / rel, PAYLOAD_MODES[rel])
     for rel, hook in HOOK_DESTINATIONS.items():
@@ -172,7 +250,10 @@ def stage(args: argparse.Namespace) -> None:
     # Must match expected_payloads in sanctuary-castle-wall-guard.py.
     hashed_paths = sorted(set(PAYLOAD_MODES) - {IDENTITY, GUARD})
     payload_hashes = {path: sha(dest / path) for path in hashed_paths}
-    features = binary_features(args.cargo_json)
+    verify_pins_in_binary(cli_target_dir / TARGET / "release" / CLI_SOURCE_BIN, pins)
+    if pins != compute_pins(crate, shared_target_dir, version):
+        raise ValueError("pin recomputation drifted before staging")
+    features = binary_features([args.shared_cargo_json, args.cli_cargo_json])
     rustflags_file = args.rustflags_file.resolve()
     if not rustflags_file.is_file():
         raise ValueError("scrubbed RUSTFLAGS witness is absent")
@@ -181,7 +262,7 @@ def stage(args: argparse.Namespace) -> None:
         raise ValueError("RUSTFLAGS must be scrubbed before staging the Arch package")
     identity = {
         "artifact_kind": KIND,
-        "install_ready": False,
+        "install_ready": True,
         "binary_features": features,
         "package": PACKAGE,
         "package_version": version,
@@ -196,6 +277,8 @@ def stage(args: argparse.Namespace) -> None:
         "glibc_floor": args.glibc_floor,
         "payload_sha256": payload_hashes,
         "hook_sha256": hook_hashes,
+        "cli_source_bin": CLI_SOURCE_BIN,
+        "cli_pins": pins,
         "cli_path_deviation": {
             "ubuntu_path": "usr/sbin/sanctuary-linux",
             "arch_path": BINARIES["sanctuary-linux"],
@@ -209,17 +292,34 @@ def stage(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--crate", type=Path, required=True)
-    parser.add_argument("--dest", type=Path, required=True)
-    parser.add_argument("--pkgver", required=True)
-    parser.add_argument("--pkgrel", required=True)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--rustc-version", required=True)
-    parser.add_argument("--glibc-floor", required=True)
-    parser.add_argument("--target-dir", type=Path, required=True)
-    parser.add_argument("--cargo-json", type=Path, required=True)
-    parser.add_argument("--rustflags-file", type=Path, required=True)
-    stage(parser.parse_args())
+    sub = parser.add_subparsers(dest="command", required=True)
+    pin_parser = sub.add_parser("pin")
+    pin_parser.add_argument("--crate", type=Path, required=True)
+    pin_parser.add_argument("--pkgver", required=True)
+    pin_parser.add_argument("--pkgrel", required=True)
+    pin_parser.add_argument("--target-dir", type=Path, required=True)
+    pin_parser.add_argument("--output", type=Path, required=True)
+    stage_parser = sub.add_parser("stage")
+    stage_parser.add_argument("--crate", type=Path, required=True)
+    stage_parser.add_argument("--dest", type=Path, required=True)
+    stage_parser.add_argument("--pkgver", required=True)
+    stage_parser.add_argument("--pkgrel", required=True)
+    stage_parser.add_argument("--source-commit", required=True)
+    stage_parser.add_argument("--rustc-version", required=True)
+    stage_parser.add_argument("--glibc-floor", required=True)
+    stage_parser.add_argument("--shared-target-dir", type=Path, required=True)
+    stage_parser.add_argument("--cli-target-dir", type=Path, required=True)
+    stage_parser.add_argument("--shared-cargo-json", type=Path, required=True)
+    stage_parser.add_argument("--cli-cargo-json", type=Path, required=True)
+    stage_parser.add_argument("--rustflags-file", type=Path, required=True)
+    stage_parser.add_argument("--pins", type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == "pin":
+        pin(args)
+    elif args.command == "stage":
+        stage(args)
+    else:
+        sys.exit(f"unknown command {args.command}")
 
 
 if __name__ == "__main__":

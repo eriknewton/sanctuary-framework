@@ -19,3 +19,6 @@ pub mod policy;
 
 #[cfg(target_os = "linux")]
 pub mod evidence;
+
+#[cfg(all(target_os = "linux", feature = "arch-install"))]
+pub mod arch;

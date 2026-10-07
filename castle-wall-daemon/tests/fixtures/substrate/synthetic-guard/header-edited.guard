@@ -1,0 +1,3 @@
+#!/usr/bin/python3 -I
+IDENTITY_SHA256 = '41c959252ffbefaa32c1dfdd657b7cfd2a0f5381dda6e29d4616eb3ff4b2fab8'
+PACKAGE_VERSION = '0.1.0-1'

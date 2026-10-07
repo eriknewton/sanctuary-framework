@@ -10,4 +10,4 @@ Kernel, systemd and nftables updates are outside this package claim. Reboot afte
 
 The package's build identity is installed under `/usr/lib/sanctuary-castle-wall/`, outside the documentation tree, so hosts whose `pacman.conf` excludes `usr/share/doc/*` from extraction receive it.
 
-`sanctuary-linux` does not yet operate on Arch. This package records the Arch CLI path deviation, but the Rust package checks still expect the Ubuntu install identity until the portability slice lands.
+`sanctuary-linux` on this package is built against the Arch install identity and installs inert; its verbs are not yet exercised in CI.
