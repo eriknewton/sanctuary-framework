@@ -115,8 +115,9 @@ import sys
 
 result = json.loads(open(sys.argv[1]).read())
 required = set(sys.argv[2:])
-missing = set(result.get("missing", []))
-status_missing = set(result.get("status", {}).get("missing_evidence", []))
+# The evidence verb carries status gaps in `missing` as "status: <entry>" (brief 7.1 step 5); compare without the prefix.
+missing = {item[len("status: "):] if item.startswith("status: ") else item for item in result.get("missing", [])}
+status_missing = set((result.get("status") or {}).get("missing_evidence", []))
 if result.get("complete") is not False:
     raise SystemExit("evidence did not report complete:false")
 if not required.issubset(missing | status_missing):
