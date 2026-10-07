@@ -1,3 +1,4 @@
+// fail-before-exempt: this change rewrites an existing structural assertion (the gated handle comes from getOrIssueHandle) as a parser-based match; the pinned property already holds on the base, so the test passing there is expected
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";

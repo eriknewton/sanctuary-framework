@@ -150,6 +150,8 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 - **Credential surrogacy:** slices 1b-i and 1b-ii built and test-proven; the real-secret macOS drill remains owed.
 
+- **Local-only requests for Sanctuary's own intelligence.** A caller of Sanctuary's model selector can mark a request local-only; the selector then refuses every hosted model on every path and returns a typed refusal instead of falling back. Test-proven, not yet drilled; it governs Sanctuary's own assistant, while other agents on the machine are bounded by the per-account wall.
+
 - **Credential surrogacy (slices 1a, 1b-i and 1b-ii).** The agent's environment carries a placeholder for an operator-bound secret, the Secret Broker refuses to issue a read or rotate token for that name, and a root-owned helper per agent releases the value only while explicitly unlocked. Forward-mode HTTP substitutes the value only for its bound destination and header and refuses misroutes. A bounded response guard checks header names and values and identity bodies for credential echoes, aborting on a match; unsupported encodings, reaching the scan ceiling, and scan failures stop further delivery. **Bounds:** CONNECT tunnels do not swap placeholders; transformed values inside identity bodies and values returned in a later response remain outside detection. Misuse through authenticated calls to the bound destination remains possible. The [credential-surrogacy assurance-matrix row](ASSURANCE_MATRIX.md) remains `partial`: tests establish these paths, and the real-secret macOS drill is still owed. **Why it matters:** this limits the agent's exposure to operator-bound credentials.
 
 ### Concordia and Verascore composition (optional, default off)
