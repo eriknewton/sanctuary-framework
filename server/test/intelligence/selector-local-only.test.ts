@@ -962,11 +962,11 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
    * below asserts the outward behavior (refusal, no hosted client
    * constructed); the DECISION path's read count is asserted where the
    * decision refuses (which short-circuits before anything else touches
-   * the request); an ACCEPTED request's content is separately hashed for
-   * the audit record afterward (`hashOfRequest`, via `JSON.stringify`),
-   * which incidentally re-reads every own enumerable property including
-   * `localOnly` -- unrelated to the local-only decision (already made,
-   * once, correctly) and not a regression this suite needs to forbid.
+   * the request); `invoke()` then serializes the caller's object at entry
+   * for the legacy `request_hash` (`hashOfRequest`, via `JSON.stringify`),
+   * which re-reads every own enumerable property including `localOnly` --
+   * unrelated to the local-only decision (already made, once, correctly)
+   * and not a regression this suite needs to forbid.
    */
   function accessorSummarizeRequest(): { req: SummarizeRequest; reads: () => number } {
     let count = 0;

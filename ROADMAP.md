@@ -150,7 +150,6 @@ Cross-machine federation has hardware drill evidence recorded on the roadmap wit
 
 - **Credential surrogacy:** slices 1b-i and 1b-ii built and test-proven; the real-secret macOS drill remains owed.
 
-- **Local-only requests for Sanctuary's own intelligence.** A caller of Sanctuary's model selector can mark a request local-only; the selector then refuses every hosted model on every path and returns a typed refusal instead of falling back. Test-proven, not yet drilled; it governs Sanctuary's own assistant, while other agents on the machine are bounded by the per-account wall.
 
 - **Credential surrogacy (slices 1a, 1b-i and 1b-ii).** The agent's environment carries a placeholder for an operator-bound secret, the Secret Broker refuses to issue a read or rotate token for that name, and a root-owned helper per agent releases the value only while explicitly unlocked. Forward-mode HTTP substitutes the value only for its bound destination and header and refuses misroutes. A bounded response guard checks header names and values and identity bodies for credential echoes, aborting on a match; unsupported encodings, reaching the scan ceiling, and scan failures stop further delivery. **Bounds:** CONNECT tunnels do not swap placeholders; transformed values inside identity bodies and values returned in a later response remain outside detection. Misuse through authenticated calls to the bound destination remains possible. The [credential-surrogacy assurance-matrix row](ASSURANCE_MATRIX.md) remains `partial`: tests establish these paths, and the real-secret macOS drill is still owed. **Why it matters:** this limits the agent's exposure to operator-bound credentials.
 
@@ -254,6 +253,10 @@ Slice 1a (October 2026, above) binds a secret to one wrapped agent and keeps the
 #### Content arriving through tools, screened at the boundary
 
 Tool results that pass through Sanctuary's MCP proxy will be screened by the built-in heuristic injection detector before the agent sees them, and the operator sees a plain label on anything flagged. Once a session has taken in untrusted content, its sensitive actions (credential use, a new outbound destination, tier-gated tools) are planned to require a stricter approval. **Why it matters:** an injection does its worst harm when it makes the agent act, and Sanctuary mediates several of the actions that matter most (credential use, outbound destinations, approval-gated tools) on the platforms where its protections are installed. Limit: content an agent harness fetches or reads on its own does not pass through the MCP proxy, so this feature does not screen it.
+
+#### Local-only requests for Sanctuary's own assistant
+
+Sanctuary's model selector can now refuse every hosted model for a request marked local-only and return a typed refusal instead of falling back; this is test-proven at the selector, not yet drilled. No assistant surface sets the flag yet: wiring the concierge, chat and dashboard surfaces is the next slice. Agents running in their own protected accounts are governed by the per-account wall, not by this flag. **Why it matters:** an operator can keep a sensitive question to Sanctuary's own assistant on the machine, with a refusal rather than a silent fallback when no local model can answer.
 
 #### Concordia local receipts on by default
 

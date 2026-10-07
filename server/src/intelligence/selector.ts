@@ -206,8 +206,8 @@ function refusesLocalOnly(
  * (`boolean | undefined`), NOT pre-coerced to a boolean. Every call site
  * except `invoke()` immediately coerces it (`readLocalOnlyOnce(x) ===
  * true`) and never looks at the raw value again, so this is not a
- * behavior change for them. `invoke()` keeps the raw value for decision
- * provenance only; the legacy `request_hash` is deliberately a separate
+ * behavior change for them. Since round 7 `invoke()` coerces it the same
+ * way and the raw value is unused; the legacy `request_hash` is a separate
  * `JSON.stringify(req)` serialization of the caller's object at entry
  * (see `hashOfRequest`), not another meaning layered onto this snapshot.
  */
@@ -1501,10 +1501,10 @@ export class SubstrateSelector {
   ): Promise<SubstrateResponse> {
     // P0 fix-round-8 (subtracting fix-round-7's own regression):
     // `req.localOnly` is read HERE, as the literal first statement, via
-    // `readLocalOnlyOnce` — exactly once, whether `req` is a plain object
-    // or a class instance with a prototype getter. See `readLocalOnlyOnce`'s
-    // doc comment for the full account, including fix-round-10's addition
-    // (below) of why the RAW read value is kept alongside the coerced one.
+    // `readLocalOnlyOnce`, exactly once FOR THE DECISION, whether `req` is a
+    // plain object or a class instance with a prototype getter. The legacy
+    // `request_hash` serialization just below re-reads `localOnly` as part of
+    // the caller's object; that second read never feeds the decision.
     const requestLocalOnlyRaw = readLocalOnlyOnce(req);
     const requestLocalOnly = requestLocalOnlyRaw === true;
     // P1 round 7: `request_hash` keeps its legacy meaning: the caller's
@@ -1519,7 +1519,7 @@ export class SubstrateSelector {
     // exactly why `localOnly` itself is read once. Without this, a
     // STATEFUL getter (one that returns different content on successive
     // reads) could present one value to the pre-egress context scanner
-    // below, a DIFFERENT value to the audit hash further down, and a
+    // below, a DIFFERENT value to `request_projection_hash` further down, and a
     // THIRD value to the substrate actually invoked — the thing screened,
     // the thing recorded, and the thing sent would then be three
     // different values, which defeats the entire purpose of screening
@@ -2792,12 +2792,13 @@ function makeEventId(): string {
  * identically on a plain data property or a prototype getter, enumerable
  * or not), and returns a plain object holding those single-read values.
  * `invoke()` calls this ONCE, immediately after its own local-only read
- * and legacy request serialization, and uses the RESULT for screening,
+ * and the legacy `request_hash` serialization of the caller's object (which
+ * this result does not feed), and uses the RESULT for screening,
  * the v2 projection hash, and the actual substrate invocation from that
  * point on -- `req` itself is never read for selector-known content
  * again. Without this, a STATEFUL getter
  * (one that returns different content on each read) could present
- * DIFFERENT content to the pre-egress context scanner, the audit hash,
+ * DIFFERENT content to the pre-egress context scanner, `request_projection_hash`,
  * and the substrate actually invoked: the thing screened, the thing
  * recorded, and the thing sent would then be three different values,
  * which is not auditable at all.
@@ -2826,6 +2827,9 @@ function materializeRequestContent(
       // The caller owns these arrays and screening awaits before send; clone
       // at materialization so the bytes screened are exactly the bytes later
       // sent even if the caller mutates the original arrays during the await.
+      // Bound: the clone is shallow and leaf values are trusted to be the
+      // declared strings; this is defense in depth for well-behaved in-process
+      // callers, not a boundary against an in-process type violation.
       items: [...req.items],
       categories: [...req.categories],
       maxTokens: req.maxTokens,
