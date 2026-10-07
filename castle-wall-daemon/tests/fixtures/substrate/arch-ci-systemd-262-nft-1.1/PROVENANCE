@@ -1,8 +1,81 @@
-pending: no captures committed yet; see brief 16.6
-
-The first CI run writes this directory's raw captures from
-/var/lib/sanctuary-arch-lifecycle-evidence before the coordinator commits them.
-Every committed reader input must have a sibling .expect file: login.defs,
-systemctl-show-*, pacman-Q-* and pacman-Qo-* use "accept" or "refuse <needle>".
-Raw full systemctl dumps are archival only. A directory with only this provenance
-file is intentionally not a fixture failure before the captures arrive.
+captured arch-ci 2026-10-07 command: save_raw_captures <phase> in castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh
+reader maps command: systemctl show <unit> --no-pager --property=Id,Names,LoadState,ActiveState,SubState,FragmentPath,DropInPaths,NeedDaemonReload,UnitFileState,MainPID,ControlGroup,InvocationID,Result,ExecMainStatus,NRestarts,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ActiveExitTimestampMonotonic,InactiveEnterTimestampMonotonic,StateChangeTimestampMonotonic,MemoryMax,TasksMax,LimitCORE
+reader maps source: castle-wall-daemon/src/linux_install/arch/command.rs properties_until argument list; each committed map is the reader input form
+full dumps command: systemctl show <unit> --no-pager; kept under raw/ as raw-systemctl-show-<role>-<phase>.full, archive only, never replayed
+pacman command: pacman -Q sanctuary-castle-wall
+pacman owner command: pacman -Qo /usr/bin/sanctuary-linux
+pacman integrity command: pacman -Qkk sanctuary-castle-wall
+login command: cp /etc/login.defs
+nss command: cp /etc/nsswitch.conf
+nft table command: nft -j -a list table inet sanctuary-castle
+nft ruleset command: nft -j -a list ruleset
+jobs command: systemctl list-jobs --no-pager
+units: sanctuary-castle-wall.service; sanctuary-agent@60123.service; var-lib-sanctuary\x2dagent\x2dworkspace.mount
+phases: running after start/status/evidence and before stop; retired after wall and mount stops, masked-hook pacman -Rdd, and copied-CLI refusals
+run 37673697370; run_attempt 1; job_id 112973455579; workflow linux-arch-package.yml job arch-package-lifecycle
+head_sha af3dbeceb607aae9b42198504738e06babbd147e; artifact_name linux-arch-lifecycle-37673697370-1; artifact_id 11507416049; artifact_zip_sha256 3a079bf2a38b0ac7b14835c5f8972f68156cd1bcb3d6c86da8350af085293cb1
+image archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+image source packet text because META omitted image key
+cgroupns private
+systemd 262; systemctl-version first line: systemd 262 (262-1-arch)
+nftables v1.1.7; nft-version first line: nftables v1.1.7 (Commodore Bullmoose #8); nft-ruleset-running metainfo.version: 1.1.7
+login.defs ranges SYS_GID_MIN 500, SYS_GID_MAX 999, GID_MIN 1000, GID_MAX 60000
+state-provisioned-status.out system_id_ranges sys_gid_min 500, sys_gid_max 999, gid_min 1000, gid_max 60000
+bounds: systemd 262 is a stepping stone; the Omarchy claim pins 261.2
+bounds: this is a CI container capture, not a host drill
+bounds: retired pacman captures record real not-installed stdout shape; the CLI database snapshot refuses earlier with pinned package database entry absent
+bounds: retired unit maps follow a container retire with wall and mount stopped and the remove hook masked; real-host retire remains an Omarchy drill leg
+key-set notes: no systemctl-show capture contains a key outside the 23-name reader list
+key-set systemctl-show-agent-retired: absent listed names none
+key-set systemctl-show-agent-running: absent listed names none
+key-set systemctl-show-mount-retired: absent listed names MainPID, ExecMainStatus, NRestarts, ExecMainStartTimestampMonotonic
+key-set systemctl-show-mount-running: absent listed names MainPID, ExecMainStatus, NRestarts, ExecMainStartTimestampMonotonic
+key-set systemctl-show-wall-retired: absent listed names none
+key-set systemctl-show-wall-running: absent listed names none
+file hashes and verdicts, excluding PROVENANCE itself:
+login.defs sha256 65b7e950a3de5320773586157054a4d86e98d3593fb49e4ec47f08221a0d9789 verdict accept basis CLI status system_id_ranges equal captured SYS_GID and GID ranges; parser contract accepts complete Arch login.defs
+login.defs.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+pacman-Q-retired sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verdict refuse installed package version mismatch basis empty retired pacman -Q stdout with not-found stderr; parse_q accepts only exact package/version line
+pacman-Q-retired.expect sha256 7be440afa251502bdaa5889ac55bc5ce5ced20f614241271bad562a7dc0e0360
+pacman-Q-running sha256 3e37c85ea0ba082c464ffa8c28a829640215eb330e7859bbd368d1bc3f9adfff verdict accept basis arch-pins.json package_version 0.1.0-1 and running package query is exact accepted stdout
+pacman-Q-running.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+pacman-Qo-cli-retired sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verdict refuse installed path owner mismatch basis empty retired pacman -Qo stdout with unowned-path stderr; parse_qo accepts only exact owner line
+pacman-Qo-cli-retired.expect sha256 1a17811d19557f8752a7fc2c6d1cd4fc8133c70c3d7d2b257751f6e0556bd3cc
+pacman-Qo-cli-running sha256 c52c2179c86fb5cc7ef017ee9ecdb126d28a62490fcd6db25a463054a0fb06b4 verdict accept basis CLI accepted same installed package; path owner stdout is exact accepted form
+pacman-Qo-cli-running.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+systemctl-show-agent-retired sha256 4fe5bac62b0059a1ccc066560349e154d23e1129e7730ad6fa4702590edaa9c9 verdict refuse effective unit identity or overrides refused basis hand verifier stops at NeedDaemonReload: 'yes'
+systemctl-show-agent-retired.expect sha256 88a6ad264d5c7368f192d9f2332b813812ebfee5e606c72ca019707ed2b596d7
+systemctl-show-agent-running sha256 d1faede6b33f5890dddf154a53cafeade065a0a8c34590957c5a48b9aa659e80 verdict accept basis state-started-status effective_units_valid true; same --property list and unit identity accepted by verifier
+systemctl-show-agent-running.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+systemctl-show-mount-retired sha256 ca0035e2ecab502d11e171814c8dfeb8af7dd9aa51db03f55233ff27760c53e8 verdict refuse effective unit identity or overrides refused basis hand verifier stops at NeedDaemonReload: 'yes'
+systemctl-show-mount-retired.expect sha256 88a6ad264d5c7368f192d9f2332b813812ebfee5e606c72ca019707ed2b596d7
+systemctl-show-mount-running sha256 4f119913af82b92af1e2ddfaa777ce4af70256317d388b1eab7dd35f317b430b verdict accept basis state-started-status effective_units_valid true; same --property list and unit identity accepted by verifier
+systemctl-show-mount-running.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+systemctl-show-wall-retired sha256 e0b2cfb300c5f51476f1b7aca787003265f93a8b83393e695338896928c4a2b5 verdict refuse effective unit identity or overrides refused basis hand verifier stops at NeedDaemonReload: 'yes'
+systemctl-show-wall-retired.expect sha256 88a6ad264d5c7368f192d9f2332b813812ebfee5e606c72ca019707ed2b596d7
+systemctl-show-wall-running sha256 e272b2ef17cecd168a5dc937844a839f8c482e9d62e61048d66632477bbabf73 verdict accept basis state-started-status effective_units_valid true; same --property list and unit identity accepted by verifier
+systemctl-show-wall-running.expect sha256 a7569daef68e7aa91f0cc9856e2461c5cb2bd5494eaf28818c3e059972d987e5
+raw/raw-systemctl-show-wall-running.full sha256 b6a91bcf0cf1bd74ba011cefbc8fb77700b27d854ef4c0ecdaaedb210e5e9d1a
+raw/raw-systemctl-show-agent-running.full sha256 0dff67dfe3f3b7e65e905cbb8a14c7552b657caae80b3ffd948372e5dd9bfaa5
+raw/raw-systemctl-show-mount-running.full sha256 baaac7f5ef146bc791f329ea2d196f887f3265c118595b1ee5897350dd5ae0c8
+raw/raw-systemctl-show-wall-retired.full sha256 efe0ba83bb6822ed31c7e3c0f79c057c75efb895bce90b07e14561ab2a9ecc8d
+raw/raw-systemctl-show-agent-retired.full sha256 5f0e24d00d853a4da6794247e992d25794b9e992c8d96244c4bb2bae53407167
+raw/raw-systemctl-show-mount-retired.full sha256 147e6828ef6e8161ccb960c4dd50ae96bdb823d62705bc97d3c54a29dadf88ce
+raw/pacman-Q-running.err sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+raw/pacman-Q-retired.err sha256 c5102bee7468d7c54d651127c4bbf038f2f6c2be5d427ba2500a31a58a815c23
+raw/pacman-Qo-cli-running.err sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+raw/pacman-Qo-cli-retired.err sha256 bdacc76e36353c443c74785399708f21692e193250fd06aa2d70be279fbb1db4
+raw/pacman-Qkk-running sha256 5eca30115cf3bf9c2236067fa1f962e1d4dfbfe57e15bccbb61ba1e15f31976a
+raw/pacman-Qkk-running.err sha256 54ba17d5645f9a66ec9408d4408e59662587ec121ee60fa7998a399e8530a47d
+raw/pacman-Qkk-retired sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+raw/pacman-Qkk-retired.err sha256 c5102bee7468d7c54d651127c4bbf038f2f6c2be5d427ba2500a31a58a815c23
+raw/systemctl-list-jobs-running sha256 eb47af433bb9a5bbf3a4a976eb5a0b595e609d7d094e78559a8150457bc4c134
+raw/systemctl-list-jobs-retired sha256 eb47af433bb9a5bbf3a4a976eb5a0b595e609d7d094e78559a8150457bc4c134
+raw/nsswitch.conf sha256 c8ee7a9faf798caab178ec51afae4146f1efd8a716b7acedf28345b6c75f9697
+raw/nft-table-running.json sha256 6ae70f0c66cc7b6959aeba7246ab8859fe47acd34fad4ba7687ed9074d5992c8
+raw/nft-table-retired.json sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+raw/nft-ruleset-running.json sha256 6ae70f0c66cc7b6959aeba7246ab8859fe47acd34fad4ba7687ed9074d5992c8
+raw/nft-ruleset-retired.json sha256 eb485a3dd0535b5ded8989f4b43b4cb8878937acbcc5aa0fe7a3db47547d3f70
+raw/systemctl-version.out sha256 b450e78d15de4b2dde4ddebeae16ae63fe98fd7e01ed163f6679cc440aaa1973
+raw/nft-version.out sha256 f92caa05629b8dd35398f48eb2ca41a99caade6bec65fe435223e155bbd5b04c
+raw/nft-table-retired.err sha256 6956eb3debfb41b83f54fe1630ba599b706de3b6c115355a59031d9d93205e07
