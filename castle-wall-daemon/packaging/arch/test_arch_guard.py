@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
+# ruff: noqa: SIM117, EXE001, B023
 """Arch guard unit tests: refusal and bounded-observation witnesses. ARCH-HOLD-01."""
 
 from __future__ import annotations
 
 import hashlib
-import io
 import importlib.util
+import io
 import json
-import os
 import runpy
-import sys
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
 
 HERE = Path(__file__).resolve().parent
 BUILD_SPEC = importlib.util.spec_from_file_location("build_arch_package", HERE / "build-arch-package.py")
@@ -26,17 +25,21 @@ IDENTITY = {
     "artifact_kind": "arch-install-pkg-v1",
     "package": "sanctuary-castle-wall",
     "package_version": "0.1.0-1",
+    "file_count": 3,
     "payload_sha256": {"usr/bin/sanctuary-linux": "b" * 64},
 }
-IDENTITY_BYTES = (str(IDENTITY).replace("'", '"') + "\n").encode()
+IDENTITY_BYTES = (json.dumps(IDENTITY, sort_keys=True, indent=2) + "\n").encode()
+TEMPLATE_BYTES = (HERE / "sanctuary-castle-wall-guard.py").read_bytes()
 GUARD = runpy.run_path(
     str(HERE / "sanctuary-castle-wall-guard.py"),
     init_globals={
         "PACKAGE_VERSION": "0.1.0-1",
         "IDENTITY_SHA256": hashlib.sha256(IDENTITY_BYTES).hexdigest(),
+        "STATIC_SHA256": hashlib.sha256(TEMPLATE_BYTES).hexdigest(),
+        "IDENTITY_PATH": "/usr/lib/sanctuary-castle-wall/build-identity",
         "PAYLOAD_MODES": {
             "usr/bin/sanctuary-linux": 0o755,
-            "usr/share/doc/sanctuary-castle-wall/build-identity": 0o644,
+            "usr/lib/sanctuary-castle-wall/build-identity": 0o644,
             "usr/share/libalpm/scripts/sanctuary-castle-wall-guard": 0o755,
         },
         "PAYLOAD_HASHES": IDENTITY["payload_sha256"],
@@ -57,6 +60,8 @@ class GuardTests(unittest.TestCase):
     def test_generated_guard_compiles_and_refuses_upgrade(self):
         identity = json.dumps(IDENTITY, sort_keys=True, indent=2).encode()
         guard = BUILD.guard_bytes("0.1.0-1", identity, IDENTITY["payload_sha256"], HERE)
+        self.assertEqual(guard.splitlines()[1].decode().split(" = ", 1)[0], "IDENTITY_SHA256")
+        self.assertEqual(guard.splitlines()[2].decode().split(" = ", 1)[0], "STATIC_SHA256")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "guard.py"
             path.write_bytes(guard)
@@ -89,6 +94,8 @@ class GuardTests(unittest.TestCase):
                     with self.assertRaises(GUARD["Refusal"]):
                         if fn == "package_owner":
                             GUARD[fn]("usr/bin/sanctuary-linux")
+                        elif fn == "package_integrity":
+                            GUARD[fn](IDENTITY["file_count"])
                         else:
                             GUARD[fn]()
 
@@ -96,25 +103,30 @@ class GuardTests(unittest.TestCase):
         dirty_summary = "sanctuary-castle-wall: 42 total files, 10 altered files\n"
         with patch.dict(GUARD["package_integrity"].__globals__, {"probe": lambda *_a, **_k: dirty_summary}):
             with self.assertRaisesRegex(GUARD["Refusal"], "integrity"):
-                GUARD["package_integrity"]()
+                GUARD["package_integrity"](42)
+        clean_wrong_count = "sanctuary-castle-wall: 42 total files, 0 altered files\n"
+        with patch.dict(GUARD["package_integrity"].__globals__, {"probe": lambda *_a, **_k: clean_wrong_count}):
+            with self.assertRaisesRegex(GUARD["Refusal"], "integrity"):
+                GUARD["package_integrity"](41)
 
     def test_identity_rejects_hash_mismatch_guard_hash_and_payload_mismatch(self):
         good = dict(IDENTITY)
         bad_guard = dict(good, guard_sha256="c" * 64)
 
         def read_identity(model):
-            raw = (str(model).replace("'", '"') + "\n").encode()
+            raw = (json.dumps(model, sort_keys=True, indent=2) + "\n").encode()
             return raw
 
         globals_ = GUARD["build_identity"].__globals__
-        with patch.dict(globals_, {"checked_payload_path": lambda *_: None, "stable_read": lambda *_: read_identity(good), "IDENTITY_SHA256": "0" * 64}):
+        with patch.dict(globals_, {"lstat": lambda _p: object(), "checked_payload_path": lambda *_: None, "stable_read": lambda *_: read_identity(good), "IDENTITY_SHA256": "0" * 64}):
             with self.assertRaisesRegex(GUARD["Refusal"], "identity differs"):
                 GUARD["build_identity"]()
-        with patch.dict(globals_, {"checked_payload_path": lambda *_: None, "stable_read": lambda *_: read_identity(bad_guard), "IDENTITY_SHA256": hashlib.sha256(read_identity(bad_guard)).hexdigest()}):
+        with patch.dict(globals_, {"lstat": lambda _p: object(), "checked_payload_path": lambda *_: None, "stable_read": lambda *_: read_identity(bad_guard), "IDENTITY_SHA256": hashlib.sha256(read_identity(bad_guard)).hexdigest()}):
             with self.assertRaisesRegex(GUARD["Refusal"], "wrong Arch"):
                 GUARD["build_identity"]()
         with patch.dict(GUARD["installed_identity"].__globals__, {
             "build_identity": lambda: good,
+            "static_guard_source": lambda: None,
             "checked_payload_path": lambda *_: None,
             "package_owner": lambda *_: None,
             "hash_file": lambda _p: "0" * 64,
@@ -194,13 +206,16 @@ class GuardTests(unittest.TestCase):
         def render(fields):
             return "\n".join(f"{key}={fields[key]}" for key in properties) + "\n"
 
-        class Proc:
-            def read_text(self):
-                return "systemd\n"
-
         for mutation in ({"ActiveState": "active"}, {"DropInPaths": "/etc/systemd/system/x.d"}, {"FragmentPath": "/tmp/other"}):
             with self.subTest(mutation=mutation), patch.dict(GUARD["systemd_manager"].__globals__, {
-                "Path": lambda *_: Proc(),
+                "systemd_pid1_comm": lambda: None,
+                "probe": lambda *_a, **_k: render(dict(clean, **mutation)),
+            }):
+                with self.assertRaises(GUARD["Refusal"]):
+                    GUARD["systemd_manager"]()
+        for mutation in ({"NeedDaemonReload": "yes"}, {"NeedDaemonReload": "maybe"}, {"LoadState": "not-found", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service"}):
+            with self.subTest(mutation=mutation), patch.dict(GUARD["systemd_manager"].__globals__, {
+                "systemd_pid1_comm": lambda: None,
                 "probe": lambda *_a, **_k: render(dict(clean, **mutation)),
             }):
                 with self.assertRaises(GUARD["Refusal"]):
@@ -209,13 +224,14 @@ class GuardTests(unittest.TestCase):
     def test_remove_allows_only_systemd_load_state_transition(self):
         first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
         second = dict(first, LoadState="not-found", FragmentPath="")
-        reads = iter((first, first, second, second))
+        mount = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/" + GUARD["MOUNT_NAME"], "ActiveState": "inactive"}
+        reads = iter((first, mount, second, mount))
         globals_ = GUARD["state_REMOVE"].__globals__
         with patch.dict(globals_, {
             "sys": SimpleNamespace(stdin=io.StringIO("sanctuary-castle-wall\n")),
             "package_query": lambda: None,
-            "package_integrity": lambda: None,
-            "installed_identity": lambda: {"identity": "stable"},
+            "package_integrity": lambda _count: None,
+            "installed_identity": lambda: {"identity": "stable", "file_count": 3},
             "systemd_files": lambda: None,
             "systemd_manager": lambda *_a, **_k: next(reads),
             "agent_instances_inactive": lambda: None,
@@ -223,6 +239,26 @@ class GuardTests(unittest.TestCase):
             "runtime_absent": lambda: None,
         }):
             GUARD["state_REMOVE"]()
+
+    def test_remove_compares_mount_unit_whole(self):
+        first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
+        mount_first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/" + GUARD["MOUNT_NAME"], "ActiveState": "inactive"}
+        mount_second = dict(mount_first, LoadState="not-found", FragmentPath="")
+        reads = iter((first, mount_first, first, mount_second))
+        globals_ = GUARD["state_REMOVE"].__globals__
+        with patch.dict(globals_, {
+            "sys": SimpleNamespace(stdin=io.StringIO("sanctuary-castle-wall\n")),
+            "package_query": lambda: None,
+            "package_integrity": lambda _count: None,
+            "installed_identity": lambda: {"file_count": 3},
+            "systemd_files": lambda: None,
+            "systemd_manager": lambda *_a, **_k: next(reads),
+            "agent_instances_inactive": lambda: None,
+            "no_queued_jobs": lambda: None,
+            "runtime_absent": lambda: None,
+        }):
+            with self.assertRaisesRegex(GUARD["Refusal"], "systemd manager state changed"):
+                GUARD["state_REMOVE"]()
 
     def test_decode_errors_are_refusals(self):
         with patch.dict(GUARD["probe"].__globals__, {
@@ -235,6 +271,22 @@ class GuardTests(unittest.TestCase):
         }):
             with self.assertRaisesRegex(GUARD["Refusal"], "decode|mount"):
                 GUARD["mount_absent"]()
+        with patch.dict(GUARD["systemd_pid1_comm"].__globals__, {
+            "stable_read": lambda *_a, **_k: b"\xff",
+        }):
+            with self.assertRaisesRegex(GUARD["Refusal"], "decode|PID 1"):
+                GUARD["systemd_pid1_comm"]()
+
+    def test_missing_identity_refuses_before_runtime_footprint(self):
+        globals_ = GUARD["state_REMOVE"].__globals__
+        with patch.dict(globals_, {
+            "sys": SimpleNamespace(stdin=io.StringIO("sanctuary-castle-wall\n")),
+            "package_query": lambda: None,
+            "installed_identity": lambda: (_ for _ in ()).throw(GUARD["Refusal"]("build identity absent")),
+            "runtime_absent": lambda: self.fail("missing identity must not be treated as inert"),
+        }):
+            with self.assertRaisesRegex(GUARD["Refusal"], "identity absent"):
+                GUARD["state_REMOVE"]()
 
     def test_bounded_capture_caps_output_and_deadline(self):
         with self.assertRaises(ValueError):
@@ -258,6 +310,9 @@ class GuardTests(unittest.TestCase):
         identity_block = Path(HERE / "build-arch-package.py").read_text().split("identity = ", 1)[1].split("identity_bytes", 1)[0]
         self.assertNotIn("guard_sha256", identity_block)
         self.assertIn('"hook_sha256"', identity_block)
+        self.assertIn('"binary_features"', identity_block)
+        self.assertIn('"rustflags"', identity_block)
+        self.assertIn('"file_count"', identity_block)
 
 
 if __name__ == "__main__":

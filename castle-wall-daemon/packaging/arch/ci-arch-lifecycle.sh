@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-pkg="${1:?usage: ci-arch-lifecycle.sh <pkg.tar.zst>}"
+pkg="${1:?usage: ci-arch-lifecycle.sh <pkg.tar.zst> [--noextract-witness]}"
+mode="${2:-default}"
 pkg="$(realpath "$pkg")"
 work="$(mktemp -d)"
 evidence="${EVIDENCE_DIR:-$work/evidence}"
@@ -85,11 +86,65 @@ assert_inert() {
 }
 
 assert_systemd
+id build >/dev/null 2>&1 || useradd -m build
+chown build:build "$work"
+pacman -Syu --noconfirm --needed base-devel zstd systemd nftables iproute2 util-linux shadow python libnetfilter_queue >/dev/null
+
+identity_path=/usr/lib/sanctuary-castle-wall/build-identity
+identity_rel=${identity_path#/}
+guard_path=/usr/share/libalpm/scripts/sanctuary-castle-wall-guard
+
+if [[ "$mode" == --noextract-witness ]]; then
+  record 'NoExtract witness keeps the image pacman.conf rules; base failure was captured in run 37365438647 attempt 2'
+  expect_ok noextract-head-install pacman -U --noconfirm "$pkg"
+  pacman -Qkk sanctuary-castle-wall >"$evidence/noextract-head-qkk.out"
+  if pacman -Ql sanctuary-castle-wall | grep -F '/usr/share/doc' >"$evidence/noextract-head-doc-paths.out"; then
+    echo "NoExtract head package listed usr/share/doc payload paths" >&2
+    exit 1
+  fi
+  installed_sha="$(sha256sum "$identity_path" | cut -d' ' -f1)"
+  guard_sha="$(awk -F"'" 'NR == 2 && $1 == "IDENTITY_SHA256 = " {print $2}' "$guard_path")"
+  [[ "$installed_sha" == "$guard_sha" ]]
+  expect_ok noextract-inert-remove pacman -R --noconfirm sanctuary-castle-wall
+  expect_ok noextract-reinstall pacman -U --noconfirm "$pkg"
+  install -d -m 0755 /etc/sanctuary
+  printf provisioned >/etc/sanctuary/provisioned
+  provisioned_refusal='runtime/config entry present under /etc/sanctuary'
+  expect_refused noextract-remove-provisioned "$provisioned_refusal" pacman -R --noconfirm sanctuary-castle-wall
+  expect_refused noextract-remove-dd-provisioned "$provisioned_refusal" pacman -Rdd --noconfirm sanctuary-castle-wall
+  mask_hook 00-sanctuary-castle-wall-remove-guard.hook
+  expect_ok noextract-remove-provisioned-masked pacman -R --noconfirm sanctuary-castle-wall
+  unmask_hooks
+  rm -f /etc/sanctuary/provisioned
+
+  printf '\nNoExtract = %s\n' "$identity_rel" >>/etc/pacman.conf
+  expect_ok noextract-missing-identity-install pacman -U --noconfirm "$pkg"
+  [[ ! -e "$identity_path" ]]
+  if pacman -Qkk sanctuary-castle-wall >"$evidence/noextract-missing-qkk.out" 2>"$evidence/noextract-missing-qkk.err"; then
+    echo "missing identity install unexpectedly passed pacman -Qkk" >&2
+    exit 1
+  fi
+  identity_absent='build identity absent'
+  expect_refused noextract-missing-inert-remove "$identity_absent" pacman -R --noconfirm sanctuary-castle-wall
+  install -d -m 0755 /etc/sanctuary
+  printf provisioned >/etc/sanctuary/provisioned
+  expect_refused noextract-missing-provisioned-remove "$identity_absent" pacman -R --noconfirm sanctuary-castle-wall
+  expect_refused noextract-missing-provisioned-remove-dd "$identity_absent" pacman -Rdd --noconfirm sanctuary-castle-wall
+  record 'NoExtract identity-present and missing-identity witnesses passed'
+  exit 0
+fi
+
+if [[ "$mode" != default ]]; then
+  echo "unsupported lifecycle mode: $mode" >&2
+  exit 1
+fi
+
 # The official archlinux container image ships NoExtract rules (usr/share/doc/*,
 # locales, help) that stock Arch and Omarchy do not have. The build identity the
-# guard binds to lives under usr/share/doc, so under those rules a fresh install
-# never receives it and `pacman -Qkk` reports an altered file before any hook runs
-# (seen 2026-10-05: "/usr/share/doc (No such file or directory), 1 altered file").
+# P1 guard bound to lived under usr/share/doc, so under those rules a fresh
+# install never received it and `pacman -Qkk` reported an altered file before
+# any hook ran (seen 2026-10-05: "/usr/share/doc (No such file or directory),
+# 1 altered file"). P2b has a separate NoExtract witness that keeps the rule.
 # The proof target is a default pacman.conf, so strip the image's rules and refuse
 # to continue if any NoExtract remains; a silent skip here would test a host that
 # does not exist. Failure mode: the first-install witness fails on `-Qkk` with no
@@ -101,10 +156,6 @@ if [[ -n "$(pacman-conf NoExtract)" ]]; then
   exit 1
 fi
 record 'container pacman.conf has no NoExtract rules (default extraction, as on stock Arch and Omarchy)'
-id build >/dev/null 2>&1 || useradd -m build
-# mktemp creates a root-owned 0700 parent; makepkg as build otherwise cannot traverse scratch package roots.
-chown build:build "$work"
-pacman -Syu --noconfirm --needed base-devel zstd systemd nftables iproute2 util-linux shadow python libnetfilter_queue >/dev/null
 
 record 'first install is not refused'
 expect_ok first-install pacman -U --noconfirm "$pkg"

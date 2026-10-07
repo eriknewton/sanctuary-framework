@@ -13,7 +13,7 @@ _glibc_floor="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
 depends=("glibc>=${_glibc_floor}" 'systemd' 'nftables' 'python' 'libnetfilter_queue' 'iproute2' 'util-linux' 'shadow')
 makedepends=('rustup')
 # docs and emptydirs must stay enabled; deleting them after package() would remove the bound identity and make every guarded removal refuse.
-options=('!strip' 'docs' 'emptydirs')
+options=('!strip' '!debug' 'docs' 'emptydirs')
 backup=()
 source=()
 sha256sums=()
@@ -25,16 +25,31 @@ _crate_root() {
   cd "${startdir}/../.." && pwd -P
 }
 
+_scrub_rust_env() {
+  local name
+  while IFS='=' read -r name _; do
+    case "$name" in
+      CARGO_*|RUSTFLAGS|RUSTC|RUSTDOC|RUSTUP_TOOLCHAIN)
+        unset "$name"
+        ;;
+    esac
+  done < <(env)
+  export CARGO_TERM_COLOR=never
+}
+
 build() {
   local crate
   crate="$(_crate_root)"
   cd "$crate"
   rustc --version | grep -F "rustc ${_toolchain} " >/dev/null
+  _scrub_rust_env
   cargo build --locked --release --target "${_target}" \
+    --target-dir "$srcdir/cargo-target" \
+    --message-format=json \
     --bin castle-wall-daemon \
     --bin protected-agent-v1 \
     --bin network-agent-standin \
-    --bin sanctuary-linux
+    --bin sanctuary-linux >"$srcdir/cargo.jsonl"
 }
 
 package() {
@@ -49,5 +64,7 @@ package() {
     --pkgrel "$pkgrel" \
     --source-commit "$source_commit" \
     --rustc-version "$rustc_version" \
-    --glibc-floor "$_glibc_floor"
+    --glibc-floor "$_glibc_floor" \
+    --target-dir "$srcdir/cargo-target" \
+    --cargo-json "$srcdir/cargo.jsonl"
 }

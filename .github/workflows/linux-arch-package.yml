@@ -43,13 +43,81 @@ jobs:
           pacman -Syu --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
           python3 -m unittest discover -s castle-wall-daemon/packaging/arch -p 'test_*.py'
           useradd -m build
-          chown -R build:build "$GITHUB_WORKSPACE"
           runuser -u build -- rustup toolchain install 1.95.0 --profile minimal
-          runuser -u build -- bash -lc "cd '$GITHUB_WORKSPACE/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" makepkg --noconfirm --syncdeps --needed"
+          build_one() {
+            local checkout="$1" out="$2" extra_env="${3:-}"
+            install -d -o build -g build "$out"
+            git -C "$checkout" config --global --add safe.directory "$checkout"
+            chown -R build:build "$checkout"
+            runuser -u build -- bash -lc "cd '$checkout/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" PKGDEST='$out' $extra_env makepkg --noconfirm --syncdeps --needed"
+          }
+          compare_packages() {
+            local left="$1" right="$2" root="$3"
+            install -d "$root/left" "$root/right"
+            bsdtar -xf "$left" -C "$root/left"
+            bsdtar -xf "$right" -C "$root/right"
+            python3 - "$root/left" "$root/right" <<'PY'
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          left, right = [Path(arg) for arg in sys.argv[1:]]
+          excluded = {".PKGINFO", ".BUILDINFO", ".MTREE"}
+
+          def digest_tree(root):
+              entries = {}
+              for path in root.rglob("*"):
+                  rel = path.relative_to(root).as_posix()
+                  if rel in excluded:
+                      continue
+                  if path.is_dir():
+                      entries[rel] = ("dir", "")
+                  elif path.is_symlink():
+                      entries[rel] = ("symlink", path.readlink().as_posix())
+                  elif path.is_file():
+                      entries[rel] = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+                  else:
+                      raise SystemExit(f"unsupported package entry: {rel}")
+              return entries
+
+          if digest_tree(left) != digest_tree(right):
+              raise SystemExit("extracted package payloads differ outside .PKGINFO/.BUILDINFO/.MTREE")
+          PY
+          }
+          work="$RUNNER_TEMP/arch-repro"
+          git worktree add "$work/a" HEAD
+          git worktree add "$work/b" HEAD
+          git worktree add "$work/rustflags-negative" HEAD
+          build_one "$work/a" "$RUNNER_TEMP/arch-package-a"
+          build_one "$work/b" "$RUNNER_TEMP/arch-package-b"
+          pkg_a=("$RUNNER_TEMP/arch-package-a"/*.pkg.tar.zst)
+          pkg_b=("$RUNNER_TEMP/arch-package-b"/*.pkg.tar.zst)
+          [[ ${#pkg_a[@]} == 1 && ${#pkg_b[@]} == 1 ]]
+          compare_packages "${pkg_a[0]}" "${pkg_b[0]}" "$RUNNER_TEMP/arch-repro-compare"
+          python3 - "$work/rustflags-negative" <<'PY'
+          from pathlib import Path
+          root = Path(__import__("sys").argv[1])
+          pkgbuild = root / "castle-wall-daemon/packaging/arch/PKGBUILD"
+          text = pkgbuild.read_text()
+          pkgbuild.write_text(text.replace("  _scrub_rust_env\n  cargo build", "  : # negative witness leaves caller RUSTFLAGS live\n  cargo build"))
+          builder = root / "castle-wall-daemon/packaging/arch/build-arch-package.py"
+          text = builder.read_text()
+          old = '    if rustflags:\n        raise ValueError("RUSTFLAGS must be scrubbed before staging the Arch package")\n'
+          builder.write_text(text.replace(old, ""))
+          PY
+          build_one "$work/rustflags-negative" "$RUNNER_TEMP/arch-package-rustflags-negative" "RUSTFLAGS='-C metadata=sanctuary_negative_rustflags'"
+          pkg_rustflags=("$RUNNER_TEMP/arch-package-rustflags-negative"/*.pkg.tar.zst)
+          [[ ${#pkg_rustflags[@]} == 1 ]]
+          set +e
+          compare_packages "${pkg_a[0]}" "${pkg_rustflags[0]}" "$RUNNER_TEMP/arch-rustflags-negative-compare"
+          rustflags_compare_rc=$?
+          set -e
+          if [[ "$rustflags_compare_rc" == 0 ]]; then
+            echo "RUSTFLAGS negative witness unexpectedly matched the scrubbed build" >&2
+            exit 1
+          fi
           install -d "$RUNNER_TEMP/arch-package"
-          packages=(castle-wall-daemon/packaging/arch/*.pkg.tar.zst)
-          [[ ${#packages[@]} == 1 ]]
-          cp -- "${packages[0]}" "$RUNNER_TEMP/arch-package/"
+          cp -- "${pkg_a[0]}" "$RUNNER_TEMP/arch-package/"
           (cd "$RUNNER_TEMP/arch-package" && sha256sum ./*.pkg.tar.zst > SHA256SUMS)
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -103,6 +171,50 @@ jobs:
         with:
           name: linux-arch-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/arch-lifecycle
+          if-no-files-found: error
+          retention-days: 7
+
+  arch-package-lifecycle-noextract:
+    needs: arch-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.arch-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/arch-package
+          merge-multiple: true
+      - name: Run NoExtract lifecycle witness under systemd PID 1
+        run: |
+          cd "$RUNNER_TEMP/arch-package"
+          sha256sum --check SHA256SUMS
+          pkg=(*.pkg.tar.zst)
+          [[ ${#pkg[@]} == 1 ]]
+          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd /usr/lib/systemd/systemd)"
+          timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          cid="$1"
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd'; do
+            sleep 2
+          done
+          WAIT_SYSTEMD
+          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          evidence=/var/lib/sanctuary-arch-noextract-evidence
+          docker exec "$cid" mkdir -p "$evidence"
+          rc=0
+          # Base failure is not rebuilt here; it was captured on main in run 37365438647 attempt 2.
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=$evidence /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]} --noextract-witness" || rc=$?
+          docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-noextract"
+          docker stop "$cid"
+          exit "$rc"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-noextract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-noextract
           if-no-files-found: error
           retention-days: 7
 
