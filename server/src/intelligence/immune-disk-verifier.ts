@@ -1,12 +1,14 @@
 /**
- * Q5C: inert on-disk Ollama manifest and descriptor verifier.
+ * Q5C: on-disk Ollama manifest and descriptor verifier.
  *
- * No production composition root imports or invokes this module. A caller must
- * explicitly supply a Q5A-validated immune binding, an absolute persisted root,
- * and an injected filesystem adapter before any filesystem read can occur.
- * Residual: the parser admits the observed Ollama descriptor `from` provenance
- * key as inert metadata only; descriptor authority remains digest, size, and
- * media type, and every other extension key stays refused.
+ * Production callers are `intelligence/selector.ts` and
+ * `wrap/local-intelligence.ts`. A caller must still supply a Q5A-validated
+ * immune binding, an absolute persisted root, and an injected filesystem
+ * adapter before any filesystem read can occur.
+ * Residual: the parser admits the observed Ollama layer-descriptor `from`
+ * provenance key as inert metadata only. Config descriptors and every other
+ * unknown descriptor key still refuse; a future Ollama format change can
+ * create false refusals until this fail-closed parser is updated.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -47,6 +49,16 @@ const OCI_MANIFEST_SCHEMA_VERSION = 2;
 const OCI_DESCRIPTOR_REQUIRED_KEYS = ["mediaType", "digest", "size"] as const;
 /** Observed Ollama descriptor provenance key, ignored by verification. */
 const OCI_DESCRIPTOR_PROVENANCE_FROM_KEY = "from";
+/** Top-level Ollama metadata keys are inert and never enter the parsed result. */
+const INERT_OCI_MANIFEST_TOP_LEVEL_KEYS = [
+  "schemaVersion",
+  "mediaType",
+  "config",
+  "layers",
+  "runner",
+  "format",
+] as const;
+const INERT_OCI_MANIFEST_STRING_KEYS = ["runner", "format"] as const;
 /** Design section 6.3 permits the first changed read plus one retry. */
 const STABLE_FILE_MAX_ATTEMPTS = 2;
 
@@ -62,8 +74,8 @@ export const IMMUNE_OCI_MAX_DESCRIPTOR_BYTES = 128 * GIBIBYTE_BYTES;
 export const IMMUNE_OCI_MAX_TOTAL_DESCRIPTOR_BYTES = 512 * GIBIBYTE_BYTES;
 /** Design section 6.4 bounds every descriptor media type to 256 ASCII chars. */
 export const IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS = 256;
-/** Reuse the reviewed 256-character ASCII envelope for inert descriptor provenance. */
-const OCI_DESCRIPTOR_PROVENANCE_FROM_MAX_CHARS = IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS;
+/** 256 = the existing media-type envelope reused for inert Ollama string metadata. */
+const IMMUNE_OCI_MAX_INERT_STRING_CHARS = IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS;
 /** Design section 6.5 permits at most four MiB per streaming hash buffer. */
 export const IMMUNE_HASH_MAX_BUFFER_BYTES = 4 * MEBIBYTE_BYTES;
 /** A smaller fixed buffer remains below the reviewed four-MiB ceiling. */
@@ -82,8 +94,8 @@ const OLLAMA_IDENTITY_COMPONENT = new RegExp(
 const SHA256_HEX = new RegExp(`^[0-9a-f]{${SHA256_HEX_CHARS}}$`);
 const SHA256_DESCRIPTOR = new RegExp(`^sha256:([0-9a-f]{${SHA256_HEX_CHARS}})$`);
 const ALL_ZERO_SHA256 = "0".repeat(SHA256_HEX_CHARS);
-// Printable US-ASCII excludes control bytes and Unicode-confusable media types.
-const ASCII_MEDIA_TYPE = /^[\x20-\x7e]+$/;
+// Printable US-ASCII excludes control bytes and Unicode-confusable metadata.
+const PRINTABLE_ASCII = /^[\x20-\x7e]+$/;
 
 export type ImmuneVerificationRefusalReason =
   | "binding_mismatch"
@@ -264,7 +276,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function validDescriptorKeys(value: Record<string, unknown>): boolean {
+function isPrintableAsciiInertString(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= IMMUNE_OCI_MAX_INERT_STRING_CHARS &&
+    PRINTABLE_ASCII.test(value);
+}
+
+function validDescriptorKeys(
+  value: Record<string, unknown>,
+  options: { readonly allowLayerProvenanceFrom: boolean },
+): boolean {
   const keys = Object.keys(value);
   for (const required of OCI_DESCRIPTOR_REQUIRED_KEYS) {
     if (!keys.includes(required)) return false;
@@ -272,15 +294,14 @@ function validDescriptorKeys(value: Record<string, unknown>): boolean {
   for (const key of keys) {
     if ((OCI_DESCRIPTOR_REQUIRED_KEYS as readonly string[]).includes(key)) continue;
     const provenanceValue = value[key];
-    // Ollama's `from` names the source artifact only; digest-derived blob paths
-    // and byte verification never consume it, while every unknown key remains
-    // refused so new descriptor authority cannot arrive silently.
+    // Ollama layer `from` names the source artifact only; digest-derived blob
+    // paths and byte verification never consume it, while config descriptors
+    // and every unknown descriptor key fail closed so authority cannot arrive
+    // silently.
     if (
+      !options.allowLayerProvenanceFrom ||
       key !== OCI_DESCRIPTOR_PROVENANCE_FROM_KEY ||
-      typeof provenanceValue !== "string" ||
-      provenanceValue.length === 0 ||
-      provenanceValue.length > OCI_DESCRIPTOR_PROVENANCE_FROM_MAX_CHARS ||
-      !ASCII_MEDIA_TYPE.test(provenanceValue)
+      !isPrintableAsciiInertString(provenanceValue)
     ) {
       return false;
     }
@@ -288,14 +309,17 @@ function validDescriptorKeys(value: Record<string, unknown>): boolean {
   return true;
 }
 
-function parseDescriptor(value: unknown): OciDescriptor {
-  if (!isRecord(value) || !validDescriptorKeys(value)) {
+function parseDescriptor(
+  value: unknown,
+  options: { readonly allowLayerProvenanceFrom: boolean },
+): OciDescriptor {
+  if (!isRecord(value) || !validDescriptorKeys(value, options)) {
     refuse("disk_manifest_invalid");
   }
   if (
     typeof value.mediaType !== "string" || value.mediaType.length === 0 ||
     value.mediaType.length > IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS ||
-    !ASCII_MEDIA_TYPE.test(value.mediaType)
+    !PRINTABLE_ASCII.test(value.mediaType)
   ) {
     refuse("disk_manifest_invalid");
   }
@@ -320,6 +344,21 @@ function parseDescriptor(value: unknown): OciDescriptor {
   };
 }
 
+function validManifestTopLevelKeys(value: Record<string, unknown>): boolean {
+  const allowedKeys = INERT_OCI_MANIFEST_TOP_LEVEL_KEYS as readonly string[];
+  const inertStringKeys = INERT_OCI_MANIFEST_STRING_KEYS as readonly string[];
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.includes(key)) return false;
+    if (
+      inertStringKeys.includes(key) &&
+      !isPrintableAsciiInertString(value[key])
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Parse only authenticated config/layers after the design's byte cap is enforced. */
 export function parseBoundedOciManifest(bytes: Uint8Array): ParsedOciManifest {
   if (bytes.byteLength > IMMUNE_OCI_MANIFEST_MAX_BYTES) {
@@ -334,15 +373,21 @@ export function parseBoundedOciManifest(bytes: Uint8Array): ParsedOciManifest {
   }
   if (
     !isRecord(value) || value.schemaVersion !== OCI_MANIFEST_SCHEMA_VERSION ||
-    !("config" in value) || !Array.isArray(value.layers)
+    !validManifestTopLevelKeys(value) || !("config" in value) ||
+    !Array.isArray(value.layers)
   ) {
     refuse("disk_manifest_invalid");
   }
   if (value.layers.length < 1 || value.layers.length > IMMUNE_OCI_MAX_LAYERS) {
     refuse("descriptor_bounds_exceeded");
   }
-  const config = parseDescriptor(value.config);
-  const layers = value.layers.map((descriptor) => parseDescriptor(descriptor));
+  // These inert top-level keys are not consumed for paths, bytes, sizes, or the
+  // verdict, and this closed list matches the descriptor policy so an
+  // unreviewed Ollama format change trades availability for fail-closed parsing.
+  const config = parseDescriptor(value.config, { allowLayerProvenanceFrom: false });
+  const layers = value.layers.map((descriptor) =>
+    parseDescriptor(descriptor, { allowLayerProvenanceFrom: true })
+  );
   const allDescriptors = [config, ...layers];
   let totalDescriptorBytes = 0;
   const distinct = new Map<string, OciDescriptor>();

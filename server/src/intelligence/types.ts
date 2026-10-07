@@ -372,7 +372,31 @@ export function isFirstPartyContextClaim(
   );
 }
 
-export interface SummarizeRequest {
+/**
+ * Request-scoped local-only constraint, shared by all three invocation
+ * kinds (2026-09-15 slice). Set by the CALLER on a per-request basis, never
+ * read from persisted operator config: an operator-configured binding is a
+ * standing preference, while `localOnly` is this one request's requirement
+ * and must win over that preference rather than merge with it.
+ *
+ * When true, `SubstrateSelector.invoke()` (the sole chokepoint every
+ * summarize/classify/redact call passes through) refuses the request unless
+ * the surface's EFFECTIVE, hybrid-resolved substrate is `local`; on refusal
+ * or on a subsequent local-generation failure, the standing
+ * `degrade-silent` fallback chain to Venice/frontier is never attempted, so
+ * a local-only request can only ever be served locally or refused. See the
+ * enforcement invariant comment at the top of `SubstrateSelector.invoke()`.
+ */
+export interface LocalOnlyRequest {
+  localOnly?: boolean;
+}
+
+/** True iff `req` carries an explicit, active local-only constraint. */
+export function isLocalOnlyRequest(req: LocalOnlyRequest): boolean {
+  return req.localOnly === true;
+}
+
+export interface SummarizeRequest extends LocalOnlyRequest {
   kind: "summarize";
   context: string;
   query: string;
@@ -395,14 +419,14 @@ export interface SummarizeRequest {
   contextProvenance?: FirstPartyContextClaim;
 }
 
-export interface ClassifyRequest {
+export interface ClassifyRequest extends LocalOnlyRequest {
   kind: "classify";
   items: string[];
   categories: string[];
   maxTokens?: number;
 }
 
-export interface RedactRequest {
+export interface RedactRequest extends LocalOnlyRequest {
   kind: "redact";
   text: string;
 }
@@ -428,6 +452,39 @@ export interface SubstrateResponse {
   completedAt: string;
   /** Total wall-clock latency in ms. */
   latencyMs: number;
+  /**
+   * Fix-round-4 (Grok P1): set only when `failureClass ===
+   * "local_only_violation"`, distinguishing the two different ways a
+   * local-only request can fail to be served locally. `"binding_conflict"`
+   * is the pre-emptive refusal: the surface (or handle) is bound to a
+   * non-local substrate, refused before any handle/client is constructed.
+   * `"local_unavailable"` is the local substrate itself failing (down,
+   * integrity refusal, timeout, missing model) after a local invocation
+   * was actually attempted. Callers that need to choose an HTTP status
+   * (409 vs 503) or a retry strategy need this distinction; `failureClass`
+   * alone collapses both into one value on purpose (P2-4: "one truth" for
+   * a caller that only asks "was this served locally"), so this field is
+   * additive, not a replacement.
+   */
+  localOnlyReason?: "binding_conflict" | "local_unavailable";
+  /**
+   * Fix-round-6 (P1, item 3): set only alongside `localOnlyReason`, i.e.
+   * only on a local-only refusal response. `true` means the refusal's
+   * audit event was written; `false` means the write itself failed. The
+   * refusal is unconditional either way (fail-closed always wins), and an
+   * earlier version of this file's docs claimed "every local-only
+   * decision writes exactly one audit row" — that claim was false
+   * whenever the write failed, since the row then simply never existed.
+   * The claim is narrowed instead of building the durability it would
+   * take to make it true: every local-only refusal ATTEMPTS an audit
+   * event; a failed attempt is reported HERE (plus one stderr line at the
+   * write site) rather than silently dropped. Omitted (not `false`) on
+   * every non-refusal response and on refusals where the write succeeded,
+   * so its mere presence at `false` is itself the signal to look closer.
+   */
+  auditRecorded?: boolean;
+  /** The failed audit write's error class/name, set only when `auditRecorded === false`. */
+  auditError?: string;
 }
 
 /**
@@ -453,6 +510,15 @@ export type SubstrateFailureClass =
    * who cannot tell them apart goes looking for an outage that is not there.
    */
   | "substrate_context_refused"
+  /**
+   * A request carried `localOnly: true` and the surface's effective,
+   * hybrid-resolved substrate was not `local` (or local generation itself
+   * failed). Distinct from `substrate_disabled`/`substrate_unavailable`:
+   * this class means the request was refused ON PURPOSE to honor its own
+   * constraint, not that the surface is misconfigured or unreachable, and
+   * it always means no Venice/frontier fallback was attempted.
+   */
+  | "local_only_violation"
   | "internal_error";
 
 /**
@@ -487,6 +553,23 @@ export interface SubstrateHandle {
   summarize?: (req: SummarizeRequest) => Promise<SubstrateResponse>;
   classify?: (req: ClassifyRequest) => Promise<SubstrateResponse>;
   redact?: (req: RedactRequest) => Promise<SubstrateResponse>;
+  /**
+   * Fix-round-9 (P1): mirrors `SubstrateResponse.auditRecorded` for the
+   * ONE handle-issuance path that is itself a local-only decision:
+   * `getSubstrate()`'s capability pre-check against a hosted binding,
+   * which refuses to construct the hosted client and returns a
+   * capability-zeroed disabled handle instead of ever reaching `invoke()`.
+   * Before this field existed, that refusal's own audit ATTEMPT (via
+   * `auditLocalOnlyRefusal`) was made and then discarded — a caller
+   * holding only the returned handle had no way to learn that the audit
+   * write itself had failed, unlike every other local-only refusal shape
+   * in this file, which surfaces exactly this pair on the typed response.
+   * Present (`true` or `false`) only on a handle returned from THAT
+   * refusal path; absent on every ordinarily-issued handle.
+   */
+  auditRecorded?: boolean;
+  /** The failed audit write's error class/name, set only when `auditRecorded === false`. */
+  auditError?: string;
 }
 
 /**
