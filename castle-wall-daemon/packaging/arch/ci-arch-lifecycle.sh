@@ -159,6 +159,7 @@ data = {
     "systemd": "container corpus, not the Omarchy 261.2 corpus",
     "reimage": "not performed; intended retirement remains reimage",
     "loginuid": "harness wrote /proc/self/loginuid before CLI execution",
+    "network_online": "container adaptation: systemd-networkd-wait-online masked so network-online.target is reached; the drill host's real wait-online is the witness",
     "cgroupns": sys.argv[3],
     "descendants_check": "read cgroup.events" if cgroup_file else "vacuous: cgroup.events was not read",
 }
@@ -407,6 +408,11 @@ identity = json.load(open(sys.argv[1]))
 open(sys.argv[2], "w").write(json.dumps(identity["cli_pins"], sort_keys=True, indent=2) + "\n")
 PY
 
+  # Container adaptation, recorded in vacuous-witnesses.json: the agent unit orders after network-online.target, and
+  # in this container systemd-networkd manages no link, so systemd-networkd-wait-online never completes and the agent's
+  # start job queues past the CLI's helper deadline (CI run 37638516101: wall READY, agent job waiting on wait-online).
+  systemctl mask --now systemd-networkd-wait-online.service >"$evidence/mask-wait-online.out" 2>&1
+  record 'container adaptation: systemd-networkd-wait-online masked (network-online.target reached without a managed link)'
   record 'state_PROVISIONED: provision account and command identity'
   expect_cli_ok state-provisioned provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
   getent passwd "$agent_uid" >"$evidence/getent-passwd-agent"
