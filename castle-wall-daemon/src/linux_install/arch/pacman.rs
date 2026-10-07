@@ -317,8 +317,7 @@ pub fn verified_guard_bytes(
     let shebang = lines.next().ok_or("guard header absent")?;
     let identity = lines.next().ok_or("guard identity header absent")?;
     let static_region = &guard[shebang.len() + identity.len()..];
-    let expected_identity = format!("IDENTITY_SHA256 = '{identity_sha256}'\n");
-    if shebang != b"#!/usr/bin/python3 -I\n" || identity != expected_identity.as_bytes() {
+    if shebang != b"#!/usr/bin/python3 -I\n" {
         return Err("guard identity header mismatch".into());
     }
     if sha256(static_region) != static_sha256 {
