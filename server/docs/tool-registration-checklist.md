@@ -6,7 +6,7 @@ This checklist is part of the v1.1 Local Sovereignty Harness scope lock. v1.1 sh
 
 ## Why this exists
 
-The v1.0 surface grew to 75 tools without a single source of truth on policy tier, network behavior, audit shape, or privacy impact. v1.1 adds query privacy, internal coordination, and exit bundling as first-class capabilities. Without a registration discipline, every new tool is a quiet hole in the privacy filter, audit chain, or operator approval gate.
+The server surface now has 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`) and still needs one source of truth on policy tier, network behavior, audit shape, and privacy impact. v1.1 adds query privacy, internal coordination, and exit bundling as first-class capabilities. Without a registration discipline, every new tool is a quiet hole in the privacy filter, audit chain, or operator approval gate.
 
 ## When this applies
 

@@ -83,7 +83,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Before Sanctuary | After Sanctuary |
 |-----------------|-----------------|
 | No agent identity | Ed25519 keypair + W3C DID |
-| Default logging | Encrypted, tamper-evident hash-chained audit trail; production audit checkpoints are currently unsigned until **IC-05** closes |
+| Default logging | Encrypted, tamper-evident hash-chained audit trail; production call sites sign checkpoints when the fortress holds an identity; the audit-chain row stays partial pending the external-verifier drill (**IC-05**) |
 | No reputation | Verifiable Verascore profile |
 | Platform-locked trust | Portable across any runtime |
 | No sovereignty proof | Castle Wall, Sentinels, Charter, Heralds Sovereignty Health Report |
