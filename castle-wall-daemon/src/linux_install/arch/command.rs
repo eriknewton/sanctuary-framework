@@ -612,7 +612,6 @@ pub fn status(root: &Root, t: &Transaction) -> Result<Value> {
 }
 
 pub fn run(args: &[String]) -> Result<Value> {
-    super::pacman::require_pins()?;
     if unsafe { libc::geteuid() } != 0
         || unsafe { libc::getuid() } != 0
         || unsafe { libc::getegid() } != 0
