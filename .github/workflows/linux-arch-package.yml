@@ -141,7 +141,7 @@ jobs:
   arch-package-lifecycle:
     needs: arch-package-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 90 # Lifecycle plus C0 rebuild stays below this CI budget; a timeout loses the capture artifact.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -177,16 +177,20 @@ jobs:
           sudo modprobe nfnetlink_queue
           run_container() {
             local cgroupns="$1"
+            local cgroup_mount=()
+            if [[ "$cgroupns" == host ]]; then
+              cgroup_mount=(-v /sys/fs/cgroup:/sys/fs/cgroup:rw)
+            fi
             docker run --privileged --cgroupns="$cgroupns" \
-              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              "${cgroup_mount[@]}" \
               -v "$GITHUB_WORKSPACE:/workspace:ro" \
               -v "$RUNNER_TEMP/arch-package:/pkg:ro" \
               -v "$RUNNER_TEMP/arch-lifecycle-inputs:/inputs:ro" \
               -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd \
               /usr/lib/systemd/systemd
           }
-          cid="$(run_container private)"
           cgroupns=private
+          cid="$(run_container private)"
           if ! timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
           cid="$1"
           # A privileged container usually finishes boot "degraded" (some units cannot start there); the harness accepts
@@ -198,14 +202,16 @@ jobs:
           done
           WAIT_SYSTEMD
           then
+            docker inspect "$cid" >"$RUNNER_TEMP/arch-private-cgroup-inspect.json" 2>&1 || true
+            docker exec "$cid" systemctl is-system-running >"$RUNNER_TEMP/arch-private-cgroup-is-system-running.out" 2>&1 || true
+            docker exec "$cid" journalctl -b --no-pager -o short-precise >"$RUNNER_TEMP/arch-private-cgroup-journal.txt" 2>&1 || true
             docker logs "$cid" >"$RUNNER_TEMP/arch-private-cgroup-systemd.log" 2>&1 || true
             docker stop "$cid" >/dev/null 2>&1 || true
             cid="$(run_container host)"
             cgroupns=host
             timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
           cid="$1"
-          # A privileged container usually finishes boot "degraded" (some units cannot start there); the harness accepts
-          # running or degraded, so this wait must too, or a good private-cgroup boot reads as a failure and falls back.
+          # Host cgroup namespace is the fallback after private evidence is saved; running/degraded both reach the same harness.
           until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd && s="$(systemctl is-system-running --wait 2>/dev/null)"; test "$s" = running || test "$s" = degraded'; do
             state="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
             [[ "$state" == true ]] || exit 1
@@ -220,13 +226,20 @@ jobs:
           # (run 37410410188: the whole lifecycle passed and no evidence was uploaded).
           evidence=/var/lib/sanctuary-arch-lifecycle-evidence
           docker exec "$cid" mkdir -p "$evidence"
+          docker exec "$cid" bash -lc "printf '%s\n' '$cgroupns' >'$evidence/cgroupns'"
           rc=0
           docker exec "$cid" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin EVIDENCE_DIR="$evidence" SANCTUARY_ARCH_INPUTS=/inputs SANCTUARY_ARCH_CGROUPNS="$cgroupns" \
             /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh "/pkg/${pkg[0]}" || rc=$?
-          docker exec "$cid" bash -lc "printf '%s\n' '$cgroupns' >'$evidence/cgroupns'"
+          docker exec "$cid" systemctl list-jobs --no-pager >"$RUNNER_TEMP/arch-lifecycle-list-jobs-before-copy.txt" 2>&1 || true
           docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-lifecycle"
           if [[ -f "$RUNNER_TEMP/arch-private-cgroup-systemd.log" ]]; then
             cp "$RUNNER_TEMP/arch-private-cgroup-systemd.log" "$RUNNER_TEMP/arch-lifecycle/private-cgroup-systemd.log"
+          fi
+          if [[ -f "$RUNNER_TEMP/arch-private-cgroup-inspect.json" ]]; then
+            cp "$RUNNER_TEMP"/arch-private-cgroup-* "$RUNNER_TEMP/arch-lifecycle/"
+          fi
+          if [[ -f "$RUNNER_TEMP/arch-lifecycle-list-jobs-before-copy.txt" ]]; then
+            cp "$RUNNER_TEMP/arch-lifecycle-list-jobs-before-copy.txt" "$RUNNER_TEMP/arch-lifecycle/"
           fi
           docker stop "$cid"
           exit "$rc"

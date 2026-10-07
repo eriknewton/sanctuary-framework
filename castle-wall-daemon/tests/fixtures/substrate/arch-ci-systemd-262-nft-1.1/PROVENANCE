@@ -1,8 +1,8 @@
-captured arch-ci pending P3 lifecycle artifact
+pending: no captures committed yet; see brief 16.6
 
 The first CI run writes this directory's raw captures from
 /var/lib/sanctuary-arch-lifecycle-evidence before the coordinator commits them.
-Every captured reader input committed here must have a sibling .expect file:
-login.defs, systemctl-show-*, pacman-Q-* and pacman-Qo-* use "accept" or
-"refuse <needle>". A directory with only this provenance file is intentionally
-not a fixture failure before the captures arrive.
+Every committed reader input must have a sibling .expect file: login.defs,
+systemctl-show-*, pacman-Q-* and pacman-Qo-* use "accept" or "refuse <needle>".
+Raw full systemctl dumps are archival only. A directory with only this provenance
+file is intentionally not a fixture failure before the captures arrive.

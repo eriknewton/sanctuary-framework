@@ -10,7 +10,7 @@ use castle_wall_daemon::linux_install::{
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -22,6 +22,19 @@ const GUARD_BODY: &[u8] = b"PACKAGE_VERSION = '0.1.0-1'\n";
 const CLEAN_IDENTITY: &str = "clean";
 const IDENTITY_EDITED: &str = "identity-edited";
 const GENERATED: &str = "generated";
+const ARCH_CI_REQUIRED_READERS: &[&str] = &[
+    "login.defs",
+    "pacman-Q-retired",
+    "pacman-Q-running",
+    "pacman-Qo-cli-retired",
+    "pacman-Qo-cli-running",
+    "systemctl-show-agent-retired",
+    "systemctl-show-agent-running",
+    "systemctl-show-mount-retired",
+    "systemctl-show-mount-running",
+    "systemctl-show-wall-retired",
+    "systemctl-show-wall-running",
+];
 
 #[derive(Debug, Clone)]
 enum Expected {
@@ -78,7 +91,13 @@ fn assert_every_fixture_has_expectation(dir: &Path) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name == "PROVENANCE" || name.ends_with(".expect") {
+        if name == "PROVENANCE"
+            || name.ends_with(".expect")
+            || matches!(
+                arch_ci_capture_kind(name),
+                Some(ArchCiCaptureKind::RawSystemctlShow)
+            )
+        {
             continue;
         }
         let _ = expectation(&path);
@@ -275,10 +294,14 @@ fn parse_show_fixture(
 }
 
 fn unit_for(path: &Path) -> (&'static str, &'static str) {
-    let name = path
+    let mut name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
+    // Must match save_raw_captures in packaging/arch/ci-arch-lifecycle.sh: harness captures include the reader prefix.
+    if let Some(rest) = name.strip_prefix("systemctl-show-") {
+        name = rest;
+    }
     if name.starts_with("mount-") {
         (
             WORKSPACE_MOUNT_UNIT,
@@ -294,6 +317,58 @@ fn unit_for(path: &Path) -> (&'static str, &'static str) {
             "sanctuary-castle-wall.service",
             "/etc/systemd/system/sanctuary-castle-wall.service",
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchCiCaptureKind {
+    LoginDefs,
+    PacmanQ,
+    PacmanQo,
+    SystemctlShow,
+    RawSystemctlShow,
+}
+
+fn arch_ci_capture_kind(name: &str) -> Option<ArchCiCaptureKind> {
+    if name.ends_with(".err") || name.ends_with(".rc") || name.ends_with(".combined") {
+        return None;
+    }
+    if name == "login.defs" {
+        Some(ArchCiCaptureKind::LoginDefs)
+    } else if name.starts_with("pacman-Qo-cli-") {
+        Some(ArchCiCaptureKind::PacmanQo)
+    } else if name.starts_with("pacman-Q-") && !name.starts_with("pacman-Qkk-") {
+        Some(ArchCiCaptureKind::PacmanQ)
+    } else if name.starts_with("systemctl-show-") {
+        Some(ArchCiCaptureKind::SystemctlShow)
+    } else if name.starts_with("raw-systemctl-show-") && name.ends_with(".full") {
+        Some(ArchCiCaptureKind::RawSystemctlShow)
+    } else {
+        None
+    }
+}
+
+fn assert_arch_ci_shape(dir: &Path, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+    let names = files
+        .iter()
+        .map(|path| path.file_name().and_then(|name| name.to_str()).unwrap())
+        .collect::<BTreeSet<_>>();
+    for name in &names {
+        assert!(
+            arch_ci_capture_kind(name).is_some(),
+            "unrecognised arch-ci capture kind in {}: {name}",
+            dir.display()
+        );
+    }
+    for required in ARCH_CI_REQUIRED_READERS {
+        assert!(
+            names.contains(required),
+            "arch-ci fixture {} is missing required reader-shaped capture {required}",
+            dir.display()
+        );
     }
 }
 
@@ -343,45 +418,66 @@ fn synthetic_show_maps_are_differential_witnesses_for_shared_unit_reader() {
 fn arch_ci_capture_directories_replay_recorded_readers_when_present() {
     for dir in fixture_dirs_with_prefix("arch-ci-") {
         assert_every_fixture_has_expectation(&dir);
-        for path in fixture_files(&dir) {
+        let files = fixture_files(&dir);
+        assert_arch_ci_shape(&dir, &files);
+        for path in files {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if name == "login.defs" {
-                assert_expected(
-                    login_defs::parse(&fs::read(&path).unwrap()).map(|_| ()),
-                    expectation(&path),
-                );
-            } else if name.starts_with("pacman-Qo-") {
-                assert_expected(
-                    pacman::parse_qo(&fs::read(&path).unwrap(), QO_PATH, PACKAGE_VERSION),
-                    expectation(&path),
-                );
-            } else if name.starts_with("pacman-Q-") && !name.starts_with("pacman-Qkk-") {
-                assert_expected(
-                    pacman::parse_q(&fs::read(&path).unwrap(), PACKAGE_VERSION),
-                    expectation(&path),
-                );
-            } else if name.starts_with("systemctl-show-") {
-                let expected = expectation(&path);
-                let values = parse_show_fixture(&path)
-                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let (unit, expected_path) = unit_for(&path);
-                let ubuntu_result =
-                    ubuntu_command::verify_unit_observation(&values, unit, expected_path)
-                        .map_err(|error| error.to_string());
-                let arch_result =
-                    arch_command::verify_unit_observation(&values, unit, expected_path)
-                        .map_err(|error| error.to_string());
-                assert_eq!(
-                    ubuntu_result.as_ref().map(|_| ()).map_err(String::clone),
-                    arch_result.as_ref().map(|_| ()).map_err(String::clone),
-                    "Ubuntu/Arch verdict drift for {}",
-                    path.display()
-                );
-                assert_expected(arch_result.map_err(Into::into), expected);
+            match arch_ci_capture_kind(name).expect("shape checked above") {
+                ArchCiCaptureKind::LoginDefs => {
+                    assert_expected(
+                        login_defs::parse(&fs::read(&path).unwrap()).map(|_| ()),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::PacmanQo => {
+                    assert_expected(
+                        pacman::parse_qo(&fs::read(&path).unwrap(), QO_PATH, PACKAGE_VERSION),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::PacmanQ => {
+                    assert_expected(
+                        pacman::parse_q(&fs::read(&path).unwrap(), PACKAGE_VERSION),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::SystemctlShow => {
+                    let expected = expectation(&path);
+                    let values = parse_show_fixture(&path)
+                        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                    let (unit, expected_path) = unit_for(&path);
+                    let ubuntu_result =
+                        ubuntu_command::verify_unit_observation(&values, unit, expected_path)
+                            .map_err(|error| error.to_string());
+                    let arch_result =
+                        arch_command::verify_unit_observation(&values, unit, expected_path)
+                            .map_err(|error| error.to_string());
+                    assert_eq!(
+                        ubuntu_result.as_ref().map(|_| ()).map_err(String::clone),
+                        arch_result.as_ref().map(|_| ()).map_err(String::clone),
+                        "Ubuntu/Arch verdict drift for {}",
+                        path.display()
+                    );
+                    assert_expected(arch_result.map_err(Into::into), expected);
+                }
+                ArchCiCaptureKind::RawSystemctlShow => {}
             }
         }
     }
+}
+
+#[test]
+fn arch_ci_harness_names_route_to_their_units_and_unknowns_fail_shape() {
+    let agent = Path::new("systemctl-show-agent-running");
+    let mount = Path::new("systemctl-show-mount-running");
+    let unknown = PathBuf::from("nft-table-running.json");
+    assert_eq!(unit_for(agent).0, "sanctuary-agent@60123.service");
+    assert_eq!(unit_for(mount).0, WORKSPACE_MOUNT_UNIT);
+    assert!(
+        arch_ci_capture_kind(unknown.to_str().unwrap()).is_none(),
+        "unknown top-level arch-ci captures must fail once any capture is committed"
+    );
 }
