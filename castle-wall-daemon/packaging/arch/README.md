@@ -10,4 +10,4 @@ Kernel, systemd and nftables updates are outside this package claim. Reboot afte
 
 The package's build identity is installed under `/usr/lib/sanctuary-castle-wall/`, outside the documentation tree, so hosts whose `pacman.conf` excludes `usr/share/doc/*` from extraction receive it.
 
-`sanctuary-linux` on this package is built against the Arch install identity and installs inert; its verbs are not yet exercised in CI.
+`sanctuary-linux` verbs run on this package in CI on a container with systemd as PID 1; no host has been drilled and no enforcement claim is made for Arch or Omarchy.
