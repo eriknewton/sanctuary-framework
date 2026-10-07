@@ -29,8 +29,9 @@ IDENTITY = {
     "payload_sha256": {"usr/bin/sanctuary-linux": "b" * 64},
 }
 IDENTITY_BYTES = (json.dumps(IDENTITY, sort_keys=True, indent=2) + "\n").encode()
-PRE_P2B_GUARD_TEXT = """
-# Reconstructed from fc1bc892:castle-wall-daemon/packaging/arch/sanctuary-castle-wall-guard.py.
+FC1BC892_FIXTURE = HERE / "fixtures" / "pre_p2b_guard_fc1bc892.py"
+SCRATCH_INERT_MISSING_IDENTITY_GUARD_TEXT = """
+# Scratch model for the dangerous missing-identity fallback; not fc1bc892.
 class Refusal(Exception):
     pass
 
@@ -76,6 +77,65 @@ def state_REMOVE():
 """
 
 
+def fc1bc892_header_constants() -> tuple[dict[str, int], dict[str, str], bytes]:
+    # Recreates the fc1bc892 builder's generated header constants so the fixture
+    # below is run the way that commit's build-arch-package.py rendered it.
+    package = "sanctuary-castle-wall"
+    doc = "usr/share/doc/" + package
+    identity = doc + "/build-identity"
+    guard = "usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
+    mount_name = r"var-lib-sanctuary\x2dagent\x2dworkspace.mount"
+    binaries = {
+        "castle-wall-daemon": "usr/local/libexec/sanctuary/castle-wall-daemon",
+        "protected-agent-v1": "usr/local/libexec/sanctuary/protected-agent-v1",
+        "network-agent-standin": "usr/local/libexec/sanctuary/network-agent-standin",
+        "sanctuary-linux": "usr/bin/sanctuary-linux",
+    }
+    sources = {
+        "etc/systemd/system/sanctuary-castle-wall.service": "systemd/sanctuary-castle-wall.service",
+        "etc/systemd/system/sanctuary-agent@.service": "systemd/sanctuary-agent@.service",
+        "etc/systemd/system/" + mount_name: "systemd/" + mount_name,
+        doc + "/schemas/contract.rs": "src/linux_install/contract.rs",
+        doc + "/operator-guide.md": "packaging/ubuntu/README.md",
+    }
+    hook_destinations = {
+        "usr/share/libalpm/hooks/00-sanctuary-castle-wall-upgrade-guard.hook": "00-sanctuary-castle-wall-upgrade-guard.hook",
+        "usr/share/libalpm/hooks/00-sanctuary-castle-wall-remove-guard.hook": "00-sanctuary-castle-wall-remove-guard.hook",
+    }
+    payload_modes = {
+        **{path: 0o755 for path in binaries.values()},
+        **{path: 0o644 for path in sources},
+        **{path: 0o644 for path in hook_destinations},
+        identity: 0o644,
+        guard: 0o755,
+    }
+    payload_hashes = {path: "a" * 64 for path in sorted(set(payload_modes) - {identity, guard})}
+    identity_model = {
+        "artifact_kind": "arch-install-pkg-v1",
+        "install_ready": False,
+        "package": package,
+        "package_version": "0.1.0-1",
+        "source_commit": "fc1bc892",
+        "cargo_lock_sha256": "b" * 64,
+        "rustc_version": "rustc 1.95.0",
+        "target": "x86_64-unknown-linux-gnu",
+        "features": [],
+        "glibc_floor": "2.41",
+        "payload_sha256": payload_hashes,
+        "hook_sha256": {
+            "00-sanctuary-castle-wall-upgrade-guard.hook": "c" * 64,
+            "00-sanctuary-castle-wall-remove-guard.hook": "d" * 64,
+        },
+        "cli_path_deviation": {
+            "ubuntu_path": "usr/sbin/sanctuary-linux",
+            "arch_path": "usr/bin/sanctuary-linux",
+            "reason": "Arch /usr/sbin is owned as a filesystem symlink; D4 Q9 chooses usr/bin.",
+        },
+    }
+    identity_bytes = (json.dumps(identity_model, sort_keys=True, indent=2) + "\n").encode()
+    return payload_modes, payload_hashes, identity_bytes
+
+
 def generated_guard_bytes(identity: dict[str, object] | None = None) -> bytes:
     model = IDENTITY if identity is None else identity
     identity_bytes = (json.dumps(model, sort_keys=True, indent=2) + "\n").encode()
@@ -91,9 +151,21 @@ def module_from_bytes(source: bytes) -> dict[str, object]:
 
 
 def pre_p2b_guard() -> dict[str, object]:
+    payload_modes, payload_hashes, identity_bytes = fc1bc892_header_constants()
+    header = (
+        "#!/usr/bin/python3 -I\n"
+        + "PACKAGE_VERSION = '0.1.0-1'\n"
+        + f"IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n"
+        + f"PAYLOAD_MODES = {payload_modes!r}\n"
+        + f"PAYLOAD_HASHES = {payload_hashes!r}\n"
+    ).encode()
+    return module_from_bytes(header + FC1BC892_FIXTURE.read_bytes())
+
+
+def scratch_inert_missing_identity_guard() -> dict[str, object]:
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "pre-p2b-guard.py"
-        path.write_text(PRE_P2B_GUARD_TEXT)
+        path = Path(tmp) / "scratch-inert-missing-identity-guard.py"
+        path.write_text(SCRATCH_INERT_MISSING_IDENTITY_GUARD_TEXT)
         return runpy.run_path(str(path))
 
 
@@ -195,7 +267,8 @@ class GuardTests(unittest.TestCase):
                 GUARD["package_integrity"](41)
 
     def test_identity_rejects_hash_mismatch_guard_hash_and_payload_mismatch(self):
-        good = dict(IDENTITY)
+        expected_payloads = set(GUARD["PAYLOAD_MODES"]) - {GUARD["IDENTITY_PATH"].lstrip("/"), GUARD["GUARD_PATH"].lstrip("/")}
+        good = dict(IDENTITY, payload_sha256={path: "b" * 64 for path in expected_payloads})
         bad_guard = dict(good, guard_sha256="c" * 64)
 
         def read_identity(model):
@@ -207,6 +280,10 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(GUARD["Refusal"], "identity differs"):
                 GUARD["build_identity"]()
         with patch.dict(globals_, {"lstat": lambda _p: object(), "checked_payload_path": lambda *_: None, "stable_read": lambda *_: read_identity(bad_guard), "IDENTITY_SHA256": hashlib.sha256(read_identity(bad_guard)).hexdigest()}):
+            with self.assertRaisesRegex(GUARD["Refusal"], "wrong Arch"):
+                GUARD["build_identity"]()
+        list_identity = b'["not", "an", "object"]\n'
+        with patch.dict(globals_, {"lstat": lambda _p: object(), "checked_payload_path": lambda *_: None, "stable_read": lambda *_: list_identity, "IDENTITY_SHA256": hashlib.sha256(list_identity).hexdigest()}):
             with self.assertRaisesRegex(GUARD["Refusal"], "wrong Arch"):
                 GUARD["build_identity"]()
         with patch.dict(GUARD["installed_identity"].__globals__, {
@@ -331,11 +408,21 @@ class GuardTests(unittest.TestCase):
         def render(fields):
             return "\n".join(f"{key}={fields[key]}" for key in properties) + "\n"
 
+        class SystemdPath:
+            def __init__(self, _path):
+                pass
+
+            def read_text(self):
+                return "systemd\n"
+
         for mutation in (
             {"NeedDaemonReload": "yes"},
             {"LoadState": "not-found", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service"},
         ):
-            with self.subTest(mutation=mutation), patch.dict(base["systemd_manager"].__globals__, {"probe": lambda *_a, mutation=mutation, **_k: render(dict(clean, **mutation))}):
+            with self.subTest(mutation=mutation), patch.dict(base["systemd_manager"].__globals__, {
+                "Path": SystemdPath,
+                "probe": lambda *_a, mutation=mutation, **_k: render(dict(clean, **mutation)),
+            }):
                 base["systemd_manager"]()
 
     def test_pre_p2b_guard_admits_mount_second_read_drift(self):
@@ -345,28 +432,40 @@ class GuardTests(unittest.TestCase):
         mount_second = dict(mount_first, LoadState="not-found", FragmentPath="")
         reads = iter((first, mount_first, first, mount_second))
         with patch.dict(base["state_REMOVE"].__globals__, {
+            "sys": SimpleNamespace(stdin=io.StringIO("sanctuary-castle-wall\n")),
+            "package_query": lambda: None,
+            "package_integrity": lambda: None,
             "installed_identity": lambda: {"file_count": 3},
+            "systemd_files": lambda: None,
             "systemd_manager": lambda *_a, **_k: next(reads),
+            "agent_instances_inactive": lambda: None,
+            "no_queued_jobs": lambda: None,
             "runtime_absent": lambda: None,
         }):
             base["state_REMOVE"]()
 
-    def test_pre_p2b_guard_admits_pid1_decode_error_witness(self):
+    def test_pre_p2b_guard_pid1_decode_error_crashes_uncontracted(self):
         base = pre_p2b_guard()
-        clean = """Id=sanctuary-castle-wall.service
-Names=sanctuary-castle-wall.service
-Following=
-LoadState=loaded
-ActiveState=inactive
-SubState=dead
-UnitFileState=disabled
-FragmentPath=/etc/systemd/system/sanctuary-castle-wall.service
-DropInPaths=
-Job=
-NeedDaemonReload=no
-"""
-        with patch.dict(base["systemd_manager"].__globals__, {"probe": lambda *_a, **_k: clean, "stable_read": lambda *_a, **_k: b"\xff"}):
-            base["systemd_manager"]()
+
+        class UndecodablePath:
+            def __init__(self, _path):
+                pass
+
+            def read_text(self):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        with patch.dict(base["systemd_manager"].__globals__, {"Path": UndecodablePath}):
+            with self.assertRaises(UnicodeDecodeError):
+                base["systemd_manager"]()
+
+    def test_pre_p2b_missing_identity_refuses_with_base_message(self):
+        base = pre_p2b_guard()
+        with patch.dict(base["build_identity"].__globals__, {
+            "check_ancestors": lambda _p: True,
+            "lstat": lambda _p: None,
+        }):
+            with self.assertRaisesRegex(base["Refusal"], "required package path absent"):
+                base["build_identity"]()
 
     def test_remove_allows_only_systemd_load_state_transition(self):
         first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
@@ -441,7 +540,7 @@ NeedDaemonReload=no
                 GUARD["build_identity"]()
 
     def test_pre_p2b_missing_identity_scratch_guard_treats_host_as_inert(self):
-        base = pre_p2b_guard()
+        base = scratch_inert_missing_identity_guard()
         reached = {"runtime": False}
 
         def runtime_absent():

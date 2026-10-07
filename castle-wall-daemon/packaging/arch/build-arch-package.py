@@ -169,6 +169,7 @@ def stage(args: argparse.Namespace) -> None:
         copy_file(here / hook, dest / rel, PAYLOAD_MODES[rel])
 
     hook_hashes = {name: sha(dest / ("usr/share/libalpm/hooks/" + name)) for name in HOOKS}
+    # Must match expected_payloads in sanctuary-castle-wall-guard.py.
     hashed_paths = sorted(set(PAYLOAD_MODES) - {IDENTITY, GUARD})
     payload_hashes = {path: sha(dest / path) for path in hashed_paths}
     features = binary_features(args.cargo_json)

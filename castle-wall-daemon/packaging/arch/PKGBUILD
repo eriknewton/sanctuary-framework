@@ -66,6 +66,7 @@ build() {
 package() {
   local crate source_commit rustc_version
   crate="$(_crate_root)"
+  # Recorded in the identity for traceability; the guard and P2a pins do not verify this field.
   source_commit="${SOURCE_COMMIT:?SOURCE_COMMIT must be supplied by the build job; package() does not open root-owned linked-worktree gitdirs as the build user}"
   rustc_version="$(rustc --version)"
   python3 "${startdir}/build-arch-package.py" \

@@ -47,10 +47,11 @@ jobs:
           build_one() {
             local checkout="$1" out="$2" extra_env="${3:-}"
             install -d -o build -g build "$out"
+            local source_commit
+            # Capture before chown: git rejects a linked worktree root after it is owned by the build user.
+            source_commit="$(git -C "$checkout" rev-parse HEAD)"
             chown -R build:build "$checkout"
             # SOURCE_COMMIT avoids opening root-owned linked-worktree gitdirs from makepkg's build user.
-            local source_commit
-            source_commit="$(git -C "$checkout" rev-parse HEAD)"
             runuser -u build -- bash -lc "cd '$checkout/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" PKGDEST='$out' SOURCE_COMMIT='$source_commit' $extra_env makepkg --noconfirm --syncdeps --needed"
           }
           compare_packages() {

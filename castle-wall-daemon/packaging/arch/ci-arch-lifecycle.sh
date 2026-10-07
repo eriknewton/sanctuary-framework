@@ -93,6 +93,7 @@ pacman -Syu --noconfirm --needed base-devel zstd systemd nftables iproute2 util-
 
 identity_path=/usr/lib/sanctuary-castle-wall/build-identity
 identity_rel=${identity_path#/}
+identity_dir_rel=${identity_rel%/*}
 guard_path=/usr/share/libalpm/scripts/sanctuary-castle-wall-guard
 
 if [[ "$mode" == --noextract-witness ]]; then
@@ -119,14 +120,19 @@ if [[ "$mode" == --noextract-witness ]]; then
   unmask_hooks
   rm -f /etc/sanctuary/provisioned
 
-  sed -i "/^\[options\]/a NoExtract = $identity_rel" /etc/pacman.conf
-  pacman-conf NoExtract | grep -Fx "$identity_rel" >/dev/null
+  # pacman check_file_exists skips a NoExtract-matched missing file, so a rule
+  # naming only the identity leaves -Qkk clean; withholding the directory leaves
+  # pacman's mtree directory entry reported.
+  sed -i "/^\[options\]/a NoExtract = $identity_dir_rel/*" /etc/pacman.conf
+  pacman-conf NoExtract | grep -Fx "$identity_dir_rel/*" >/dev/null
   expect_ok noextract-missing-identity-install pacman -U --noconfirm "$pkg"
   [[ ! -e "$identity_path" ]]
   if pacman -Qkk sanctuary-castle-wall >"$evidence/noextract-missing-qkk.out" 2>"$evidence/noextract-missing-qkk.err"; then
     echo "missing identity install unexpectedly passed pacman -Qkk" >&2
     exit 1
   fi
+  cat "$evidence/noextract-missing-qkk.out" "$evidence/noextract-missing-qkk.err" >"$evidence/noextract-missing-qkk.combined"
+  grep -F "$identity_dir_rel" "$evidence/noextract-missing-qkk.combined" >/dev/null
   identity_absent='build identity absent'
   expect_refused noextract-missing-inert-remove "$identity_absent" pacman -R --noconfirm sanctuary-castle-wall
   install -d -m 0755 /etc/sanctuary
