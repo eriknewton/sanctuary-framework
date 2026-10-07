@@ -551,6 +551,8 @@ pkgrel=1
 pkgdesc='scratch package for Castle Wall lifecycle CI'
 arch=('any')
 license=('LicenseRef-Scratch')
+# A scratch package that carries the CLI ELF would otherwise get a split -debug package and a stripped binary.
+options=('!debug' '!strip')
 source=()
 sha256sums=()
 package() {
@@ -563,7 +565,10 @@ PKG
   # -f: the same name and version can be built twice with different contents (the upgrade witness builds a plain
   # 0.1.1, the version-swap negative a 0.1.1 that carries the CLI); without it makepkg exits 13 on the second build.
   runuser -u build -- bash -lc "cd '$root' && makepkg -f --noconfirm --nodeps >/dev/null"
-  cp "$root"/*.pkg.tar.zst "$out"
+  # Exactly one artifact, named for this package and version; a second match (a -debug split) is a harness failure.
+  local built=("$root/$name-$version"-*.pkg.tar.zst)
+  [[ ${#built[@]} == 1 && -f "${built[0]}" ]] || { echo "scratch build for $name $version produced ${#built[@]} packages" >&2; return 1; }
+  cp "${built[0]}" "$out"
 }
 
 mask_hook() {
