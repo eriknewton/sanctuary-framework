@@ -19,6 +19,7 @@ inputs_dir="${inputs_dir%/}"
 # Must match the literal --property= list in src/linux_install/arch/command.rs::properties_until.
 systemctl_show_properties=Id,Names,LoadState,ActiveState,SubState,FragmentPath,DropInPaths,NeedDaemonReload,UnitFileState,MainPID,ControlGroup,InvocationID,Result,ExecMainStatus,NRestarts,ExecMainStartTimestampMonotonic,ActiveEnterTimestampMonotonic,ActiveExitTimestampMonotonic,InactiveEnterTimestampMonotonic,StateChangeTimestampMonotonic,MemoryMax,TasksMax,LimitCORE
 expected_systemd_major=262
+expected_nft_major=1  # with expected_nft_minor: must match the fixture directory name arch-ci-systemd-262-nft-1.1
 expected_nft_minor=1
 operator_uid=
 
@@ -372,7 +373,12 @@ marks = [
 if len(marks) != 1 or not isinstance(marks[0], int) or marks[0] <= 0:
     raise SystemExit("nft agent chain did not stamp one positive mark")
 receipt_nonces = {row.get("nonce_hex") for row in receipts.get("receipts", [])}
-for attempt in observation.get("attempts", []):
+attempts = observation.get("attempts", [])
+# The per-nonce checks below are vacuous without attempts of both roles, so their presence is required first.
+roles = [attempt.get("endpoint", {}).get("role") for attempt in attempts]
+if "allow" not in roles or "deny" not in roles:
+    raise SystemExit("stand-in observation lacks allow or deny attempts; queue binding unwitnessed")
+for attempt in attempts:
     endpoint = attempt.get("endpoint", {})
     nonce = attempt.get("nonce_hex")
     if endpoint.get("role") == "allow":
@@ -389,7 +395,7 @@ assert_substrate_versions() {
   nft --version >"$evidence/nft-version.out"
   uname -r >"$evidence/uname-r.out"
   pacman -Q >"$evidence/pacman-Q-full.out"
-  python3 - "$evidence/systemctl-version.out" "$evidence/nft-version.out" "$expected_systemd_major" "$expected_nft_minor" <<'PY'
+  python3 - "$evidence/systemctl-version.out" "$evidence/nft-version.out" "$expected_systemd_major" "$expected_nft_minor" "$expected_nft_major" <<'PY'
 import re
 import sys
 
@@ -397,14 +403,16 @@ systemd = open(sys.argv[1]).read()
 nft = open(sys.argv[2]).read()
 expected_systemd = int(sys.argv[3])
 expected_nft_minor = int(sys.argv[4])
+expected_nft_major = int(sys.argv[5])
 systemd_match = re.search(r"systemd\s+(\d+)", systemd)
 nft_match = re.search(r"v(\d+)\.(\d+)\.", nft)
 if not systemd_match or int(systemd_match.group(1)) != expected_systemd:
     raise SystemExit("systemd major disagrees with arch-ci-systemd-262-nft-1.1")
-if not nft_match or int(nft_match.group(2)) != expected_nft_minor:
-    raise SystemExit("nft minor disagrees with arch-ci-systemd-262-nft-1.1")
+# Both major and minor are compared: a minor-only check admitted v2.1.x and v0.1.x under the nft-1.1 directory name.
+if not nft_match or (int(nft_match.group(1)), int(nft_match.group(2))) != (expected_nft_major, expected_nft_minor):
+    raise SystemExit("nft major.minor disagrees with arch-ci-systemd-262-nft-1.1")
 PY
-  record "substrate versions asserted: systemd-$expected_systemd_major nft-1.$expected_nft_minor"
+  record "substrate versions asserted: systemd-$expected_systemd_major nft-$expected_nft_major.$expected_nft_minor"
 }
 
 assert_guard_and_package_cross_checks() {
@@ -660,7 +668,9 @@ PY
   # in this container systemd-networkd manages no link, so systemd-networkd-wait-online never completes and the agent's
   # start job queues past the CLI's helper deadline (CI run 37638516101: wall READY, agent job waiting on wait-online).
   systemctl mask --now systemd-networkd-wait-online.service >"$evidence/mask-wait-online.out" 2>&1
-  systemctl is-enabled systemd-networkd-wait-online.service >"$evidence/wait-online-enabled.out" 2>&1
+  # is-enabled exits non-zero for a masked unit, so under set -e it would abort here (CI run 37671106516); the grep
+  # below is the assertion that the unit really is masked.
+  systemctl is-enabled systemd-networkd-wait-online.service >"$evidence/wait-online-enabled.out" 2>&1 || true
   grep -Fx masked "$evidence/wait-online-enabled.out" >/dev/null
   record 'container adaptation: systemd-networkd-wait-online masked (network-online.target reached without a managed link)'
   assert_substrate_versions
