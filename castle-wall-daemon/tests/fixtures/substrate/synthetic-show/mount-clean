@@ -1,0 +1,7 @@
+Id=var-lib-sanctuary\x2dagent\x2dworkspace.mount
+Names="var-lib-sanctuary\\x2dagent\\x2dworkspace.mount"
+FragmentPath=/etc/systemd/system/var-lib-sanctuary\x2dagent\x2dworkspace.mount
+LoadState=loaded
+DropInPaths=
+NeedDaemonReload=no
+UnitFileState=static

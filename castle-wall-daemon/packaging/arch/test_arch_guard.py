@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
+SUBSTRATE = HERE.parent.parent / "tests" / "fixtures" / "substrate"
 BUILD_SPEC = importlib.util.spec_from_file_location("build_arch_package", HERE / "build-arch-package.py")
 BUILD = importlib.util.module_from_spec(BUILD_SPEC)
 BUILD_SPEC.loader.exec_module(BUILD)
@@ -169,6 +170,31 @@ def scratch_inert_missing_identity_guard() -> dict[str, object]:
         return runpy.run_path(str(path))
 
 
+def expectation(path: Path) -> tuple[str, str]:
+    text = (path.with_name(path.name + ".expect")).read_text().strip()
+    if text == "accept":
+        return ("accept", "")
+    if text.startswith("refuse "):
+        return ("refuse", text.removeprefix("refuse "))
+    raise AssertionError(f"bad expectation for {path}: {text}")
+
+
+def omarchy_fixture(name: str) -> Path:
+    return SUBSTRATE / "omarchy-4.0.4-systemd-261.2-nft-1.1.7" / name
+
+
+def section_after_marker(path: Path, marker: str) -> str:
+    lines = path.read_text().splitlines()
+    start = lines.index(marker) + 1
+    body = []
+    for line in lines[start:]:
+        if line.startswith("=== "):
+            break
+        if line:
+            body.append(line)
+    return "\n".join(body)
+
+
 GUARD = module_from_bytes(generated_guard_bytes())
 
 
@@ -226,6 +252,124 @@ class GuardTests(unittest.TestCase):
                     with patch.dict(GUARD["static_guard_source"].__globals__, {"GUARD_PATH": str(path)}):
                         with self.assertRaisesRegex(GUARD["Refusal"], "static header"):
                             GUARD["static_guard_source"]()
+
+    def test_stage_refuses_rust_constant_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            source = crate / "src" / "linux_install" / "arch"
+            source.mkdir(parents=True)
+            (source / "pacman.rs").write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "wrong";\n'
+                'pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";\n'
+            )
+            with self.assertRaisesRegex(ValueError, "ARCH_BUILD_IDENTITY"):
+                BUILD.check_required_rust_constants(crate)
+
+    def test_stage_refuses_when_pin_bytes_are_absent_from_cli(self):
+        pins = {
+            "package_version": "0.1.0-1",
+            "payload_sha256": "a" * 64,
+            "guard_static_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "sanctuary-linux-arch"
+            binary.write_bytes(b"not the pinned cli")
+            with self.assertRaisesRegex(ValueError, "absent"):
+                BUILD.verify_pins_in_binary(binary, pins)
+            binary.write_bytes(
+                b"0.1.0-1\0"
+                + pins["payload_sha256"].encode()
+                + b"\0"
+                + pins["guard_static_sha256"].encode()
+            )
+            BUILD.verify_pins_in_binary(binary, pins)
+
+    def test_stage_refuses_when_staged_payload_byte_differs_from_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crate = root / "crate"
+            shared = root / "shared"
+            cli = root / "cli"
+            dest = root / "pkg"
+            src = crate / "src" / "linux_install" / "arch"
+            src.mkdir(parents=True)
+            (src / "pacman.rs").write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
+                'pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";\n'
+            )
+            (crate / "Cargo.lock").write_text("# lock\n")
+            for rel, text in BUILD.SOURCES.items():
+                path = crate / text
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{rel}\n")
+            release = shared / BUILD.TARGET / "release"
+            release.mkdir(parents=True)
+            for name in ("castle-wall-daemon", "protected-agent-v1", "network-agent-standin"):
+                (release / name).write_bytes(name.encode())
+            version = "0.1.0-1"
+            pins = BUILD.compute_pins(crate, shared, version)
+            cli_release = cli / BUILD.TARGET / "release"
+            cli_release.mkdir(parents=True)
+            (cli_release / BUILD.CLI_SOURCE_BIN).write_bytes(
+                b"0.1.0-1\0"
+                + pins["payload_sha256"].encode()
+                + b"\0"
+                + pins["guard_static_sha256"].encode()
+            )
+            pins_path = root / "arch-pins.json"
+            pins_path.write_text(json.dumps(pins))
+            cargo_shared = root / "cargo-shared.jsonl"
+            cargo_cli = root / "cargo-cli.jsonl"
+
+            def cargo_record(name: str, features: list[str]) -> str:
+                return json.dumps(
+                    {
+                        "reason": "compiler-artifact",
+                        "target": {"name": name},
+                        "executable": f"/tmp/{name}",
+                        "features": features,
+                        "profile": {"test": False},
+                    }
+                )
+
+            cargo_shared.write_text(
+                "\n".join(
+                    [
+                        cargo_record("castle-wall-daemon", []),
+                        cargo_record("protected-agent-v1", []),
+                        cargo_record("network-agent-standin", []),
+                    ]
+                )
+                + "\n"
+            )
+            cargo_cli.write_text(cargo_record(BUILD.CLI_SOURCE_BIN, ["arch-install"]) + "\n")
+            rustflags = root / "rustflags.txt"
+            rustflags.write_text("")
+            args = SimpleNamespace(
+                crate=crate,
+                dest=dest,
+                pkgver="0.1.0",
+                pkgrel="1",
+                source_commit="459a8c91",
+                rustc_version="rustc 1.95.0",
+                glibc_floor="2.41",
+                shared_target_dir=shared,
+                cli_target_dir=cli,
+                shared_cargo_json=cargo_shared,
+                cli_cargo_json=cargo_cli,
+                rustflags_file=rustflags,
+                pins=pins_path,
+            )
+            real_copy_file = BUILD.copy_file
+
+            def drifting_copy_file(source: Path, destination: Path, mode: int) -> None:
+                real_copy_file(source, destination, mode)
+                if destination.as_posix().endswith("operator-guide.md"):
+                    destination.write_bytes(destination.read_bytes() + b"drift\n")
+
+            with patch.object(BUILD, "copy_file", drifting_copy_file):
+                with self.assertRaisesRegex(ValueError, "staged payload bytes"):
+                    BUILD.stage(args)
 
     def test_unknown_phase_and_non_root_refuse(self):
         with patch.dict(GUARD["main"].__globals__, {"os": self.root()}):
@@ -348,6 +492,25 @@ class GuardTests(unittest.TestCase):
         }), patch.object(GUARD["os"], "walk", walk_with_error):
             with self.assertRaisesRegex(GUARD["Refusal"], "cannot inventory systemd directory"):
                 GUARD["systemd_files"]()
+
+    def test_recon_unitpath_capture_replays_through_guard_roots_reader(self):
+        fixture = omarchy_fixture("systemd.txt")
+        self.assertEqual(expectation(fixture)[0], "accept")
+        unit_path_line = section_after_marker(fixture, "=== systemd-unit-paths").splitlines()[0]
+        with patch.dict(GUARD["systemd_files"].__globals__, {
+            "probe": lambda *_a, **_k: unit_path_line,
+            "check_ancestors": lambda _p: False,
+        }):
+            GUARD["systemd_files"]()
+
+    def test_recon_nft_ruleset_capture_records_ruleset_shape_mismatch(self):
+        fixture = omarchy_fixture("nft-probe.txt")
+        verdict, reason = expectation(fixture)
+        self.assertEqual(verdict, "refuse")
+        ruleset_json = next(line for line in fixture.read_text().splitlines() if line.startswith('{"nftables"'))
+        with patch.dict(GUARD["nft_absent"].__globals__, {"probe": lambda *_a, **_k: ruleset_json}):
+            with self.assertRaisesRegex(GUARD["Refusal"], reason):
+                GUARD["nft_absent"]()
 
     def test_systemd_active_or_alias_observations_refuse(self):
         properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")
@@ -572,6 +735,23 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(GUARD["Refusal"]):
                 GUARD["stable_read"](str(link), 10)
 
+    def test_committed_generated_guard_fixture_matches_live_builder(self):
+        # The Rust replay (tests/linux_install_arch_fixtures.rs) trusts this pair as builder output; a template or
+        # builder edit must regenerate it, or this test fails before the Rust side can drift silently.
+        fixture = SUBSTRATE / "synthetic-guard"
+        identity_bytes = (fixture / "generated.identity").read_bytes()
+        identity = json.loads(identity_bytes)
+        version = identity["package_version"]
+        self.assertEqual(BUILD.guard_bytes(version, identity_bytes, HERE), (fixture / "generated.guard").read_bytes())
+        self.assertEqual(
+            hashlib.sha256(BUILD.guard_static_bytes(version, HERE)).hexdigest(),
+            identity["cli_pins"]["guard_static_sha256"],
+        )
+        self.assertEqual(
+            BUILD.payload_pin_from_staged_hashes(identity["payload_sha256"]),
+            identity["cli_pins"]["payload_sha256"],
+        )
+
     def test_generated_identity_does_not_record_guard_hash(self):
         identity_block = Path(HERE / "build-arch-package.py").read_text().split("identity = ", 1)[1].split("identity_bytes", 1)[0]
         self.assertNotIn("guard_sha256", identity_block)
@@ -580,7 +760,7 @@ class GuardTests(unittest.TestCase):
         self.assertIn('"rustflags"', identity_block)
         self.assertIn('"file_count"', identity_block)
 
-    def test_optional_rust_constants_compare_absolute_cli_and_relative_identity(self):
+    def test_required_rust_constants_compare_absolute_cli_and_relative_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             crate = Path(tmp)
             src = crate / "src"
@@ -590,13 +770,24 @@ class GuardTests(unittest.TestCase):
                 'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
                 'pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";\n'
             )
-            BUILD.check_optional_rust_constants(crate)
+            BUILD.check_required_rust_constants(crate)
             source.write_text(
                 'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
                 'pub const ARCH_CLI_PATH: &str = "usr/bin/sanctuary-linux";\n'
             )
             with self.assertRaisesRegex(ValueError, "ARCH_CLI_PATH"):
-                BUILD.check_optional_rust_constants(crate)
+                BUILD.check_required_rust_constants(crate)
+
+    def test_required_rust_constants_refuse_absent_constant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            src = crate / "src"
+            src.mkdir()
+            (src / "lib.rs").write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
+            )
+            with self.assertRaisesRegex(ValueError, "ARCH_CLI_PATH"):
+                BUILD.check_required_rust_constants(crate)
 
     def test_pkgbuild_scrubs_rust_environment_by_prefix(self):
         text = (HERE / "PKGBUILD").read_text()

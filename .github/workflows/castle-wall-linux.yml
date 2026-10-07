@@ -149,6 +149,13 @@ jobs:
         # rather than silently skipped.
         run: cargo check --locked --all-targets --all-features
 
+      - name: cargo test Arch install CLI and fixtures
+        working-directory: castle-wall-daemon
+        # Runs unprivileged on purpose: C0 must refuse on missing Arch package pins
+        # before the root check, while the fixture/parity suites execute real
+        # assertions. A red here means an Arch assertion failed, not that sudo was absent.
+        run: cargo test --locked --features arch-install --test linux_install_arch_parity --test linux_install_arch_fixtures --test linux_install_arch_cli
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
