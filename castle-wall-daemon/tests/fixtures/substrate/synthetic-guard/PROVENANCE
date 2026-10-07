@@ -1,1 +1,2 @@
 synthetic generated guard verification fixtures in the brief 3.1 layout
+generated.guard and generated.identity were rendered by packaging/arch/build-arch-package.py guard_bytes/payload_pin_from_staged_hashes from commit 459a8c91.

@@ -1,1 +1,2 @@
 synthetic systemctl show key=value maps for the shared unit-observation verifier
+wall-duplicate-key is a test-parser case for the fixture-side key=value copy described in brief 16.2; its refusal wording is not a product differential verdict.

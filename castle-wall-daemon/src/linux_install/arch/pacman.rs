@@ -4,22 +4,47 @@ use super::{
     Result,
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, fs, os::unix::fs::MetadataExt};
+use std::{collections::BTreeSet, fs, io::ErrorKind, os::unix::fs::MetadataExt};
 
 const PACMAN: &str = "/usr/bin/pacman";
 const PACKAGE: &str = "sanctuary-castle-wall";
 const DB_PATH: &str = "/var/lib/pacman";
-const DB_LOCK: &str = "/var/lib/pacman/db.lck";
-const LOCAL_DB: &str = "/var/lib/pacman/local";
+const DB_LOCK_BASENAME: &str = "db.lck";
+const LOCAL_DB_BASENAME: &str = "local";
+// Must match GUARD in packaging/arch/build-arch-package.py.
 const GUARD_PATH: &str = "usr/share/libalpm/scripts/sanctuary-castle-wall-guard";
+const KIB: usize = 1024;
+const SHA256_BYTES: usize = 32;
+const HEX_CHARS_PER_BYTE: usize = 2;
+const SHA256_HEX_LEN: usize = SHA256_BYTES * HEX_CHARS_PER_BYTE;
+const MAX_VERSION_PIN_BYTES: usize = SHA256_HEX_LEN * HEX_CHARS_PER_BYTE;
+const GUARD_CURRENT_UPPER_BOUND_BYTES: usize = 32 * KIB;
+const GUARD_GROWTH_HEADROOM_BYTES: usize = 16 * KIB;
+const GUARD_MAX_BYTES: usize = GUARD_CURRENT_UPPER_BOUND_BYTES + GUARD_GROWTH_HEADROOM_BYTES;
 
-// Must match BINARIES["sanctuary-linux"] in packaging/arch/build-arch-package.py.
+// Must match "/" + BINARIES["sanctuary-linux"] in packaging/arch/build-arch-package.py.
 pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";
 // Must match IDENTITY in packaging/arch/build-arch-package.py.
 pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";
 
 fn relative(path: &str) -> &str {
     path.trim_start_matches('/')
+}
+
+fn db_lock() -> String {
+    format!("{DB_PATH}/{DB_LOCK_BASENAME}")
+}
+
+fn local_db() -> String {
+    format!("{DB_PATH}/{LOCAL_DB_BASENAME}")
+}
+
+fn ensure_db_unlocked(lock_path: &str, present_reason: &'static str) -> Result<()> {
+    match fs::symlink_metadata(lock_path) {
+        Ok(_) => Err(present_reason.into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect pacman database lock: {error}").into()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +76,10 @@ struct Pins {
 fn env_pin(name: &str, value: Option<&'static str>, hex: bool) -> Result<&'static str> {
     let value = value.ok_or("Arch CLI built without package pins")?;
     let valid = if hex {
-        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        value.len() == SHA256_HEX_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     } else {
         !value.is_empty()
-            && value.len() <= 128
+            && value.len() <= MAX_VERSION_PIN_BYTES
             && value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-' | b':')
             })
@@ -67,6 +92,7 @@ fn env_pin(name: &str, value: Option<&'static str>, hex: bool) -> Result<&'stati
 
 fn pins() -> Result<Pins> {
     Ok(Pins {
+        // Must match the SANCTUARY_ARCH_PIN_* exports in packaging/arch/PKGBUILD.
         version: env_pin(
             "SANCTUARY_ARCH_PIN_PACKAGE_VERSION",
             option_env!("SANCTUARY_ARCH_PIN_PACKAGE_VERSION"),
@@ -101,9 +127,15 @@ pub fn pins_for_status() -> Value {
 }
 
 fn db_entry(path: &str) -> Result<DbEntry> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err("pinned package database entry absent".into())
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !metadata.is_file() {
-        return Err("package database entry absent".into());
+        return Err("pinned package database entry absent".into());
     }
     Ok(DbEntry {
         dev: metadata.dev(),
@@ -117,7 +149,7 @@ fn db_entry(path: &str) -> Result<DbEntry> {
 }
 
 fn snapshot_for(version: &str) -> Result<(DbEntry, DbEntry)> {
-    let base = format!("{LOCAL_DB}/{PACKAGE}-{version}");
+    let base = format!("{}/{PACKAGE}-{version}", local_db());
     Ok((
         db_entry(&format!("{base}/desc"))?,
         db_entry(&format!("{base}/files"))?,
@@ -147,9 +179,10 @@ pub fn installed(_root: &Root, package: &str) -> Result<Snapshot> {
     if package != PACKAGE {
         return Err("unexpected Arch package name".into());
     }
-    if fs::symlink_metadata(DB_LOCK).is_ok() {
-        return Err("a pacman transaction holds the database lock; wait for it, or if no package manager is running remove the stale lock as pacman's own message says".into());
-    }
+    ensure_db_unlocked(
+        &db_lock(),
+        "a pacman transaction holds the database lock; wait for it, or if no package manager is running remove the stale lock as pacman's own message says",
+    )?;
     let (desc, files) = snapshot_for(pins.version)?;
     let package_line = checked(PACMAN, &["--root", "/", "--dbpath", DB_PATH, "-Q", PACKAGE])?;
     parse_q(&package_line, pins.version)?;
@@ -177,6 +210,7 @@ pub fn installed(_root: &Root, package: &str) -> Result<Snapshot> {
 }
 
 fn expected_payloads() -> BTreeSet<&'static str> {
+    // Must match PAYLOAD_MODES in packaging/arch/build-arch-package.py, excluding the identity and guard records.
     BTreeSet::from([
         "usr/local/libexec/sanctuary/castle-wall-daemon",
         "usr/local/libexec/sanctuary/protected-agent-v1",
@@ -209,9 +243,10 @@ fn payload_pin(hashes: &serde_json::Map<String, Value>) -> Result<String> {
             .get(path)
             .and_then(Value::as_str)
             .ok_or("missing payload identity")?;
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if digest.len() != SHA256_HEX_LEN || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("payload digest shape".into());
         }
+        // Must match payload_pin_from_hashes in packaging/arch/build-arch-package.py: path, NUL, lowercase SHA-256 hex, newline.
         canonical.extend_from_slice(path.as_bytes());
         canonical.push(0);
         canonical.extend_from_slice(digest.as_bytes());
@@ -220,7 +255,15 @@ fn payload_pin(hashes: &serde_json::Map<String, Value>) -> Result<String> {
     Ok(sha256(&canonical))
 }
 
+pub fn payload_pin_from_identity(value: &Value) -> Result<String> {
+    let hashes = value["payload_sha256"]
+        .as_object()
+        .ok_or("missing payload identity")?;
+    payload_pin(hashes)
+}
+
 fn required_binary_features() -> Value {
+    // Must match binary_features' expected map in packaging/arch/build-arch-package.py.
     json!({
         "castle-wall-daemon": [],
         "network-agent-standin": [],
@@ -259,7 +302,7 @@ pub fn verified_identity(root: &Root, snapshot: &mut Snapshot) -> Result<Value> 
 }
 
 pub fn verified_guard(root: &Root, identity_sha256: &str, static_sha256: &str) -> Result<()> {
-    let guard = root.read(GUARD_PATH, RECORD_MAX_BYTES)?;
+    let guard = root.read(GUARD_PATH, GUARD_MAX_BYTES)?;
     verified_guard_bytes(&guard, identity_sha256, static_sha256)
 }
 
@@ -282,21 +325,55 @@ pub fn verified_guard_bytes(
     Ok(())
 }
 
-pub fn recheck(_root: &Root, snapshot: &Snapshot) -> Result<()> {
+pub fn recheck(root: &Root, snapshot: &Snapshot) -> Result<()> {
     let pins = pins()?;
-    if fs::symlink_metadata(DB_LOCK).is_ok() {
-        return Err("package database or identity changed during verification".into());
-    }
+    ensure_db_unlocked(
+        &db_lock(),
+        "package database or identity changed during verification",
+    )?;
     let package_line = checked(PACMAN, &["--root", "/", "--dbpath", DB_PATH, "-Q", PACKAGE])?;
     let (desc, files) = snapshot_for(pins.version)?;
     if package_line != snapshot.package_line || desc != snapshot.desc || files != snapshot.files {
         return Err("package database or identity changed during verification".into());
     }
-    if let Some(identity) = &snapshot.identity {
-        let now = fs::read(format!("/{ARCH_BUILD_IDENTITY}"))?;
-        if &now != identity {
-            return Err("package database or identity changed during verification".into());
-        }
+    let identity = snapshot
+        .identity
+        .as_ref()
+        .ok_or("package database or identity changed during verification")?;
+    let now = root.read(ARCH_BUILD_IDENTITY, RECORD_MAX_BYTES)?;
+    if &now != identity {
+        return Err("package database or identity changed during verification".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn db_entry_names_absent_pinned_database_entry() {
+        let error = db_entry("/definitely-absent-sanctuary-pacman-entry")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pinned package database entry absent"));
+    }
+
+    #[test]
+    fn lock_probe_admits_only_absence() {
+        ensure_db_unlocked("/definitely-absent-sanctuary-pacman-lock", "lock present").unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file = std::env::temp_dir().join(format!("sanctuary-lock-parent-{unique}"));
+        fs::write(&file, b"not a directory").unwrap();
+        let child = file.join("db.lck");
+        let error = ensure_db_unlocked(child.to_str().unwrap(), "lock present")
+            .unwrap_err()
+            .to_string();
+        fs::remove_file(file).unwrap();
+        assert!(error.contains("cannot inspect pacman database lock"));
+    }
 }

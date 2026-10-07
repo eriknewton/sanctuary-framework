@@ -16,7 +16,7 @@ KIND = "arch-install-pkg-v1"
 TARGET = "x86_64-unknown-linux-gnu"
 PRIVATE = "usr/lib/" + PACKAGE
 SHARE = "usr/share/" + PACKAGE
-# Must match pacman::ARCH_BUILD_IDENTITY when that P2a Rust constant exists.
+# Must match pacman::ARCH_BUILD_IDENTITY.
 IDENTITY = PRIVATE + "/build-identity"
 # Must match GUARD_PATH in sanctuary-castle-wall-guard.py.
 GUARD = "usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
@@ -51,6 +51,7 @@ PAYLOAD_MODES = {
     IDENTITY: 0o644,
     GUARD: 0o755,
 }
+# Must match pacman::expected_payloads(), plus IDENTITY and GUARD.
 PAYLOAD_DIRS = {str(parent) for path in PAYLOAD_MODES for parent in Path(path).parents if str(parent) != "."}
 PAYLOAD_DIRS |= {
     "var",
@@ -114,6 +115,7 @@ def guard_bytes(version: str, identity_bytes: bytes, here: Path) -> bytes:
 
 def binary_features(paths: list[Path]) -> dict[str, list[str]]:
     seen: dict[str, list[str]] = {}
+    # Must match pacman::required_binary_features().
     expected = {
         "castle-wall-daemon": [],
         "protected-agent-v1": [],
@@ -145,20 +147,23 @@ def package_file_count(root: Path) -> int:
     return count
 
 
-def check_optional_rust_constants(crate: Path) -> None:
+def check_required_rust_constants(crate: Path) -> None:
     expected = {
         "ARCH_BUILD_IDENTITY": IDENTITY,
         # Rust verifies opened absolute paths; payload keys remain relative.
         "ARCH_CLI_PATH": "/" + BINARIES["sanctuary-linux"],
     }
-    found: dict[str, str] = {}
+    found: dict[str, list[tuple[Path, str]]] = {name: [] for name in expected}
     src = crate / "src"
     if not src.exists():
-        return
+        raise ValueError("Rust source directory absent for Arch path constant check")
     for path in src.rglob("*.rs"):
         for match in RUST_CONST.finditer(path.read_text()):
-            found[match.group(1)] = match.group(2)
-    for name, value in found.items():
+            found[match.group(1)].append((path, match.group(2)))
+    for name, matches in found.items():
+        if len(matches) != 1:
+            raise ValueError(f"{name} must appear exactly once in Rust source")
+        value = matches[0][1]
         if value != expected[name]:
             raise ValueError(f"{name} must be {expected[name]!r}, got {value!r}")
 
@@ -180,8 +185,15 @@ def payload_hashes_for_pins(crate: Path, target_dir: Path, dest: Path | None = N
 
 
 def payload_pin_from_hashes(hashes: dict[str, str]) -> str:
+    # Must match pacman::payload_pin: path, NUL, lowercase SHA-256 hex, newline.
     canonical = b"".join(path.encode() + b"\0" + digest.encode() + b"\n" for path, digest in sorted(hashes.items()))
     return sha_bytes(canonical)
+
+
+def payload_pin_from_staged_hashes(payload_hashes: dict[str, str]) -> str:
+    return payload_pin_from_hashes(
+        {path: digest for path, digest in payload_hashes.items() if path != BINARIES["sanctuary-linux"]}
+    )
 
 
 def compute_pins(crate: Path, target_dir: Path, version: str) -> dict[str, str]:
@@ -197,7 +209,7 @@ def pin(args: argparse.Namespace) -> None:
     crate = args.crate.resolve()
     target_dir = args.target_dir.resolve()
     version = f"{args.pkgver}-{args.pkgrel}"
-    check_optional_rust_constants(crate)
+    check_required_rust_constants(crate)
     args.output.write_text(json.dumps(compute_pins(crate, target_dir, version), sort_keys=True, indent=2) + "\n")
 
 
@@ -229,7 +241,7 @@ def stage(args: argparse.Namespace) -> None:
     shared_target_dir = args.shared_target_dir.resolve()
     cli_target_dir = args.cli_target_dir.resolve()
     version = f"{args.pkgver}-{args.pkgrel}"
-    check_optional_rust_constants(crate)
+    check_required_rust_constants(crate)
     pins = read_pins(args.pins.resolve())
     if pins != compute_pins(crate, shared_target_dir, version):
         raise ValueError("compiled Arch pins differ from staged payload inputs")
@@ -251,8 +263,8 @@ def stage(args: argparse.Namespace) -> None:
     hashed_paths = sorted(set(PAYLOAD_MODES) - {IDENTITY, GUARD})
     payload_hashes = {path: sha(dest / path) for path in hashed_paths}
     verify_pins_in_binary(cli_target_dir / TARGET / "release" / CLI_SOURCE_BIN, pins)
-    if pins != compute_pins(crate, shared_target_dir, version):
-        raise ValueError("pin recomputation drifted before staging")
+    if payload_pin_from_staged_hashes(payload_hashes) != pins["payload_sha256"]:
+        raise ValueError("staged payload bytes differ from compiled Arch payload pin")
     features = binary_features([args.shared_cargo_json, args.cli_cargo_json])
     rustflags_file = args.rustflags_file.resolve()
     if not rustflags_file.is_file():

@@ -1,0 +1,49 @@
+{
+  "artifact_kind": "arch-install-pkg-v1",
+  "binary_features": {
+    "castle-wall-daemon": [],
+    "network-agent-standin": [],
+    "protected-agent-v1": [],
+    "sanctuary-linux-arch": [
+      "arch-install"
+    ]
+  },
+  "cargo_lock_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "cli_path_deviation": {
+    "arch_path": "usr/bin/sanctuary-linux",
+    "reason": "Arch /usr/sbin is owned as a filesystem symlink; D4 Q9 chooses usr/bin.",
+    "ubuntu_path": "usr/sbin/sanctuary-linux"
+  },
+  "cli_pins": {
+    "guard_static_sha256": "315d4718f1278e86f5c4ffbbedef34fc143b112684d7c616a54a113468f9899d",
+    "package_version": "0.1.0-1",
+    "payload_sha256": "26ff7dc5f189acead66db3e22304b9addf0257d22d5b0e87518ebeb7b7c55c90"
+  },
+  "cli_source_bin": "sanctuary-linux-arch",
+  "file_count": 13,
+  "glibc_floor": "2.41",
+  "hook_sha256": {
+    "00-sanctuary-castle-wall-remove-guard.hook": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "00-sanctuary-castle-wall-upgrade-guard.hook": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "install_ready": true,
+  "package": "sanctuary-castle-wall",
+  "package_version": "0.1.0-1",
+  "payload_sha256": {
+    "etc/systemd/system/sanctuary-agent@.service": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "etc/systemd/system/sanctuary-castle-wall.service": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "etc/systemd/system/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/bin/sanctuary-linux": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "usr/local/libexec/sanctuary/castle-wall-daemon": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/local/libexec/sanctuary/network-agent-standin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/local/libexec/sanctuary/protected-agent-v1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/share/libalpm/hooks/00-sanctuary-castle-wall-remove-guard.hook": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/share/libalpm/hooks/00-sanctuary-castle-wall-upgrade-guard.hook": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/share/sanctuary-castle-wall/operator-guide.md": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "usr/share/sanctuary-castle-wall/schemas/contract.rs": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "rustc_version": "rustc 1.95.0",
+  "rustflags": "",
+  "source_commit": "459a8c91",
+  "target": "x86_64-unknown-linux-gnu"
+}

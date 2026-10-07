@@ -1,4 +1,5 @@
-//! Arch parser fixtures replay file-backed verdicts for pure readers and unit observations. ARCH-CLI-FIXTURES-01.
+//! Arch parser fixtures replay pure readers and the one reachable shared unit reader. ARCH-CLI-FIXTURES-01.
+//! The synthetic-show key=value parse is a test-side copy of properties_until's inline parse because brief 16.2 forbids a seam into the Ubuntu file; its duplicate-key wording is intentionally a test-parser case, not a differential reader verdict.
 #![cfg(all(target_os = "linux", feature = "arch-install"))]
 
 use castle_wall_daemon::linux_install::{
@@ -7,6 +8,7 @@ use castle_wall_daemon::linux_install::{
     contract::WORKSPACE_MOUNT_UNIT,
     transaction::sha256,
 };
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
@@ -19,6 +21,7 @@ const QO_PATH: &str = "usr/bin/sanctuary-linux";
 const GUARD_BODY: &[u8] = b"PACKAGE_VERSION = '0.1.0-1'\n";
 const CLEAN_IDENTITY: &str = "clean";
 const IDENTITY_EDITED: &str = "identity-edited";
+const GENERATED: &str = "generated";
 
 #[derive(Debug, Clone)]
 enum Expected {
@@ -80,6 +83,13 @@ fn assert_every_fixture_has_expectation(dir: &Path) {
         }
         let _ = expectation(&path);
     }
+}
+
+fn guard_static_sha256(guard: &[u8]) -> String {
+    let mut lines = guard.split_inclusive(|byte| *byte == b'\n');
+    let shebang = lines.next().unwrap_or_default();
+    let identity = lines.next().unwrap_or_default();
+    sha256(&guard[shebang.len() + identity.len()..])
 }
 
 fn fixture_files(dir: &Path) -> Vec<PathBuf> {
@@ -164,7 +174,6 @@ fn pacman_query_parsers_match_recorded_verdicts() {
 fn guard_verification_matches_recorded_verdicts() {
     let dir = fixture_dir("synthetic-guard");
     assert_every_fixture_has_expectation(&dir);
-    let static_hash = sha256(GUARD_BODY);
     let files = fixture_files(&dir);
     for path in files
         .iter()
@@ -173,7 +182,9 @@ fn guard_verification_matches_recorded_verdicts() {
         let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
         let identity = fs::read(dir.join(format!(
             "{}.identity",
-            if stem == IDENTITY_EDITED {
+            if stem == GENERATED {
+                GENERATED
+            } else if stem == IDENTITY_EDITED {
                 IDENTITY_EDITED
             } else {
                 CLEAN_IDENTITY
@@ -181,8 +192,14 @@ fn guard_verification_matches_recorded_verdicts() {
         )))
         .unwrap();
         let identity_hash = sha256(&identity);
+        let guard = fs::read(path).unwrap();
+        let static_hash = if stem == GENERATED {
+            guard_static_sha256(&guard)
+        } else {
+            sha256(GUARD_BODY)
+        };
         assert_expected(
-            pacman::verified_guard_bytes(&fs::read(path).unwrap(), &identity_hash, &static_hash),
+            pacman::verified_guard_bytes(&guard, &identity_hash, &static_hash),
             expectation(path),
         );
     }
@@ -192,11 +209,23 @@ fn guard_verification_matches_recorded_verdicts() {
         let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
         let identity = fs::read(path).unwrap();
         let guard = fs::read(dir.join(format!("{stem}.guard"))).unwrap();
+        let static_hash = if stem == GENERATED {
+            guard_static_sha256(&guard)
+        } else {
+            sha256(GUARD_BODY)
+        };
         assert_expected(
             pacman::verified_guard_bytes(&guard, &sha256(&identity), &static_hash),
             expectation(path),
         );
     }
+    let generated: Value =
+        serde_json::from_slice(&fs::read(dir.join("generated.identity")).unwrap()).unwrap();
+    assert_eq!(
+        pacman::payload_pin_from_identity(&generated).unwrap(),
+        generated["cli_pins"]["payload_sha256"].as_str().unwrap(),
+        "Python-generated identity payload pin must match the Rust canonical form"
+    );
 }
 
 fn parse_show_fixture(

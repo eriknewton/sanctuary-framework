@@ -66,6 +66,7 @@ build() {
     --pkgrel "$pkgrel" \
     --target-dir "$srcdir/target-shared" \
     --output "$srcdir/arch-pins.json"
+  # Must match option_env! names in src/linux_install/arch/pacman.rs.
   SANCTUARY_ARCH_PIN_PACKAGE_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_version"])' "$srcdir/arch-pins.json")" \
   SANCTUARY_ARCH_PIN_PAYLOAD_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["payload_sha256"])' "$srcdir/arch-pins.json")" \
   SANCTUARY_ARCH_PIN_GUARD_STATIC_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["guard_static_sha256"])' "$srcdir/arch-pins.json")" \

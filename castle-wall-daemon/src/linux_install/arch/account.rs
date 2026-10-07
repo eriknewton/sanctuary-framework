@@ -5,6 +5,7 @@ use super::{
     },
     Result,
 };
+
 const MAX_NSS_ROWS: usize = 4096; // Must match accounts_absent in packaging/ubuntu/install-lifecycle-guard.py; fixed enumeration ceiling.
 pub use crate::linux_install::account::AccountStep;
 pub fn agent_name(uid: u32) -> String {

@@ -1,4 +1,4 @@
-synthetic login.defs parser verdict fixtures
+synthetic login.defs parser verdict fixtures, including brief 16.4 control-byte, physical-line, ambiguous-prefix, and range-order refusals
 unrelated-keys-any-shape: a valueless key and a multi-word value on keys this reader does not consume (shadow reads both); accepted
 required-key-without-value: a range key with no value; refused, never defaulted
 nbsp-separated-required-key: SYS_GID_MIN joined to its value by U+00A0, which shadow's ASCII isspace does not split, so shadow sees no SYS_GID_MIN; refused as absent

@@ -72,30 +72,49 @@ fn first_item(text: &str, byte: usize) -> &str {
     current
 }
 
-fn assert_parity(name: &str, ubuntu_path: &str, arch_path: &str, seams: &[Seam]) {
+fn check_order(name: &str, seams: &[Seam]) -> Result<(), String> {
     match name {
         "command" => assert_order(
             seams,
             &[
                 "C0", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12",
             ],
-        )
-        .unwrap(),
-        "account" => assert_order(seams, &["A0a", "A0b", "A1", "A2", "A3", "A4"]).unwrap(),
-        "evidence" => assert_order(seams, &["E1"]).unwrap(),
+        ),
+        "account" => assert_order(seams, &["A0a", "A0b", "A1", "A2", "A3", "A4"]),
+        "evidence" => assert_order(seams, &["E1"]),
         _ => unreachable!(),
     }
-    let rendered =
-        apply(read(ubuntu_path), seams).unwrap_or_else(|error| panic!("{name}: {error}"));
-    let arch = read(arch_path);
+}
+
+fn compare_text(name: &str, ubuntu: String, arch: &str, seams: &[Seam]) -> Result<(), String> {
+    check_order(name, seams)?;
+    let rendered = apply(ubuntu, seams)?;
+    compare_rendered(name, &rendered, arch)
+}
+
+fn compare_rendered(name: &str, rendered: &str, arch: &str) -> Result<(), String> {
     if rendered != arch {
         let index = rendered
             .bytes()
             .zip(arch.bytes())
             .position(|(left, right)| left != right)
             .unwrap_or_else(|| rendered.len().min(arch.len()));
-        panic!("{name} drift near {}", first_item(&arch, index));
+        return Err(format!("{name} drift near {}", first_item(arch, index)));
     }
+    Ok(())
+}
+
+fn compare_files(
+    name: &str,
+    ubuntu_path: &str,
+    arch_path: &str,
+    seams: &[Seam],
+) -> Result<(), String> {
+    compare_text(name, read(ubuntu_path), &read(arch_path), seams)
+}
+
+fn assert_parity(name: &str, ubuntu_path: &str, arch_path: &str, seams: &[Seam]) {
+    compare_files(name, ubuntu_path, arch_path, seams).unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn command_seams() -> Vec<Seam> {
@@ -179,7 +198,7 @@ fn account_seams() -> Vec<Seam> {
     vec![
         Seam {
             name: "A0a",
-            ubuntu: "use serde::{Deserialize, Serialize};\n\n",
+            ubuntu: "use serde::{Deserialize, Serialize};\n",
             arch: "",
             count: 1,
         },
@@ -253,16 +272,46 @@ fn parity_negative_controls_fail_on_drift_removed_seam_and_reorder() {
     let seams = command_seams();
     let rendered = apply(command.clone(), &seams).unwrap();
     let drift = rendered.replacen("pub fn run", "pub fn run_drift", 1);
-    assert!(drift != rendered);
+    let drift_error = compare_text("command", command.clone(), &drift, &seams).unwrap_err();
+    assert!(drift_error.contains("command drift near pub fn run_drift"));
     let without = &seams[..seams.len() - 1];
-    assert!(apply(command.clone(), without).is_ok());
-    assert_ne!(apply(command.clone(), without).unwrap(), rendered);
-    let mut reordered = seams.clone();
-    reordered.swap(3, 4);
-    assert!(assert_order(
-        &reordered,
-        &["C0", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12",],
+    let removed = apply(command.clone(), without).unwrap();
+    let removed_error = compare_rendered(
+        "command",
+        &removed,
+        &read("src/linux_install/arch/command.rs"),
     )
-    .is_err());
+    .unwrap_err();
+    assert!(removed_error.contains("command drift near"));
+    let order_sensitive = [
+        Seam {
+            name: "R1",
+            ubuntu: "aa",
+            arch: "a",
+            count: 1,
+        },
+        Seam {
+            name: "R2",
+            ubuntu: "a",
+            arch: "b",
+            count: 1,
+        },
+    ];
+    assert_eq!(apply("aa".to_owned(), &order_sensitive).unwrap(), "b");
+    let reordered = [order_sensitive[1], order_sensitive[0]];
+    assert!(apply("aa".to_owned(), &reordered)
+        .unwrap_err()
+        .contains("R2 fired 2 time(s), expected 1"));
+    assert!(apply(
+        "once".to_owned(),
+        &[Seam {
+            name: "COUNT",
+            ubuntu: "once",
+            arch: "twice",
+            count: 2,
+        }]
+    )
+    .unwrap_err()
+    .contains("COUNT fired 1 time(s), expected 2"));
     assert_eq!(apply(command, &seams).unwrap(), rendered);
 }

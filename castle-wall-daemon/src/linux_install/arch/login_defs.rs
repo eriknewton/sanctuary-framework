@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 
 const LOGIN_DEFS: &str = "etc/login.defs";
 const LOGIN_DEFS_MAX_BYTES: usize = 64 * 1024; // Shadow's login.defs is a small key-value file; this caps root-edited input at 64 KiB.
+const SHADOW_FGETS_BUFFER_BYTES: usize = 1024;
+// 1023 = shadow 4.20.0's 1024-byte fgets buffer minus the trailing NUL; a line at that length could be split into a second record by shadow.
+const MAX_SHADOW_PHYSICAL_LINE_BYTES: usize = SHADOW_FGETS_BUFFER_BYTES - 1;
 const REQUIRED_KEYS: [&str; 8] = [
     "SYS_GID_MIN",
     "SYS_GID_MAX",
@@ -33,40 +36,59 @@ pub fn read(root: &Root) -> Result<Ranges> {
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Ranges> {
-    let text = std::str::from_utf8(bytes)?;
     let mut values = BTreeMap::new();
-    for raw in text.lines() {
-        // shadow's getdef splits on ASCII isspace; Unicode whitespace would let this reader see a key shadow never reads.
-        let line = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-        if line.is_empty() || line.starts_with('#') {
+    // The shadow separator evidence is not stable across reviewers; bytes outside space, tab and newline are refused rather than guessed.
+    if bytes
+        .iter()
+        .any(|byte| matches!(*byte, 0x00..=0x08 | 0x0b..=0x1f | 0x7f))
+    {
+        return Err("ambiguous login.defs control byte".into());
+    }
+    for raw in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if raw.len() >= MAX_SHADOW_PHYSICAL_LINE_BYTES {
+            return Err("login.defs physical line too long".into());
+        }
+        let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
+        line = trim_space_tab(line);
+        if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
-        let mut fields = line.split_ascii_whitespace();
+        let mut fields = line
+            .split(|byte| *byte == b' ' || *byte == b'\t')
+            .filter(|field| !field.is_empty());
         let key = fields.next().ok_or("malformed login.defs line")?;
-        let required = REQUIRED_KEYS.contains(&key);
-        let case_only_required = REQUIRED_KEYS
+        // A token that begins with a range key but is not exactly it may be a range record under a separator model we do not trust.
+        if REQUIRED_KEYS
             .iter()
-            .any(|required| key != *required && key.eq_ignore_ascii_case(required));
+            .any(|required| key.starts_with(required.as_bytes()) && key != required.as_bytes())
+        {
+            return Err("ambiguous login.defs range key".into());
+        }
+        let required = REQUIRED_KEYS
+            .iter()
+            .any(|required| key == required.as_bytes());
+        let case_only_required = REQUIRED_KEYS.iter().any(|required| {
+            key != required.as_bytes() && key.eq_ignore_ascii_case(required.as_bytes())
+        });
         if !required {
             if case_only_required {
                 return Err("login.defs key case mismatch".into());
             }
-            // shadow owns every other key, including valueless ones (the stock Arch file's bare MOTD_FILE line) and
-            // multi-word values. Skipping them cannot hide a range key: any line shadow reads as one of REQUIRED_KEYS
-            // has that exact key as its first ASCII-whitespace token here too, and is parsed strictly below.
+            // Shadow owns unrelated keys; this reader refuses ambiguous range-key prefixes instead of claiming to model every separator shadow might accept.
             continue;
         }
         let value = fields.next().ok_or("malformed login.defs line")?;
         if fields.next().is_some() {
             return Err("malformed login.defs line".into());
         }
+        let key = std::str::from_utf8(key)?;
         if values.contains_key(key) {
             return Err("duplicate login.defs key".into());
         }
-        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if !value.iter().all(|byte| byte.is_ascii_digit()) {
             return Err("non-decimal login.defs value".into());
         }
-        values.insert(key, value.parse::<u32>()?);
+        values.insert(key, std::str::from_utf8(value)?.parse::<u32>()?);
     }
     for key in REQUIRED_KEYS {
         if !values.contains_key(key) {
@@ -95,4 +117,20 @@ pub fn parse(bytes: &[u8]) -> Result<Ranges> {
         return Err("login.defs system id range order".into());
     }
     Ok(ranges)
+}
+
+fn trim_space_tab(mut bytes: &[u8]) -> &[u8] {
+    while bytes
+        .first()
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
+        bytes = &bytes[1..];
+    }
+    while bytes
+        .last()
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\t'))
+    {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
