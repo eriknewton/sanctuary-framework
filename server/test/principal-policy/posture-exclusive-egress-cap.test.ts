@@ -46,7 +46,7 @@ import {
   type ProtectionSubjectResolutionStatus,
 } from "../../src/castle-wall/subject-binding.js";
 import type { ResolvedEnforcementAvailability } from "../../src/castle-wall/runtime/enforcement-availability.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 const FORTRESS = "fortress:test";
 
 function newAuditLog(): AuditLog {
@@ -620,7 +620,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute(deps, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -661,7 +661,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute(deps, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -721,7 +721,7 @@ describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", ()
     };
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-      const handled = await handlePostureRoute(deps, req, res, url, req.method ?? "GET");
+      const handled = await handlePostureRoute({ readFlightMap: createDashboardReadFlightMap(), ...deps }, req, res, url, req.method ?? "GET");
       if (!handled) res.writeHead(404).end();
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

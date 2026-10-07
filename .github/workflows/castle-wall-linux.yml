@@ -44,7 +44,7 @@ jobs:
           packages: libnetfilter-queue-dev libnfnetlink-dev
 
       - name: Install declared minimum Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: 1.75.0
 
@@ -80,7 +80,7 @@ jobs:
           lsmod | grep nfnetlink || echo "nfnetlink modules may be built-in"
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned 2026-06-16
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, pinned 2026-06-16
         with:
           toolchain: 1.95.0
           components: clippy
@@ -149,6 +149,13 @@ jobs:
         # rather than silently skipped.
         run: cargo check --locked --all-targets --all-features
 
+      - name: cargo test Arch install CLI and fixtures
+        working-directory: castle-wall-daemon
+        # Runs unprivileged on purpose: C0 must refuse on missing Arch package pins
+        # before the root check, while the fixture/parity suites execute real
+        # assertions. A red here means an Arch assertion failed, not that sudo was absent.
+        run: cargo test --locked --features arch-install --test linux_install_arch_parity --test linux_install_arch_fixtures --test linux_install_arch_cli
+
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -162,6 +169,11 @@ jobs:
 
       - name: cargo test (lib + integration, as root for kernel access)
         working-directory: castle-wall-daemon
+        # 20 = about 6x the longest observed run of this step (165 to 188 s over
+        # the last seven runs, 2026-09-27), leaving room for a cold-cache rebuild.
+        # Without a bound a hung or OOM-thrashing suite holds the job to the
+        # 360-minute default and the leftover-state refusal below never runs.
+        timeout-minutes: 20
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
@@ -230,6 +242,182 @@ jobs:
           # precondition disappears rather than producing a false green.
           SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
+      - name: Prove real systemd start-limit case ran without a fixture skip
+        working-directory: castle-wall-daemon
+        timeout-minutes: 5
+        run: |
+          # The all-targets run captures this test's eprintln! output, so an
+          # early `SKIP` return looks like a passing test. Rerun the exact case
+          # with uncaptured output and refuse that false-positive shape.
+          set -o pipefail
+          case_name='start_limit_against_real_systemd::repeated_failures_reach_a_terminal_failed_state_and_release_the_ordered_dependent'
+          sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+            --test systemd_unit --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee systemd-start-limit-focused.log
+          grep -Fxq "test $case_name ... ok" systemd-start-limit-focused.log || {
+            echo "FAIL: exact real-systemd case did not report ok"
+            exit 1
+          }
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' systemd-start-limit-focused.log || {
+            echo "FAIL: focused real-systemd result was absent, skipped, or malformed"
+            exit 1
+          }
+          if grep -Fq 'SKIP' systemd-start-limit-focused.log; then
+            echo "FAIL: real-systemd fixture returned early with SKIP"
+            exit 1
+          fi
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Prove the agent-unit premise witnesses (TB0a, TB0b) ran without a fixture skip
+        working-directory: castle-wall-daemon
+        timeout-minutes: 5
+        run: |
+          # TB0a (a `+` ExecStartPre= receives an EnvironmentFile= value as one
+          # argv token) and TB0b (a `+` ExecStartPre= keeps CAP_NET_ADMIN under an
+          # empty CapabilityBoundingSet=) are the premises the agent template
+          # unit's kernel gate stands on. Like the start-limit case above, an
+          # early `SKIP` return reads as a pass in the captured all-targets run,
+          # so each case is rerun uncaptured and a SKIP is refused. Failure mode
+          # this guards: a runner without root or without a system bus turns both
+          # witnesses into silent passes and the agent unit's digest then rests
+          # on an unwitnessed manager behaviour.
+          set -o pipefail
+          : > agent-unit-premises-focused.log
+          for case_name in \
+            start_limit_against_real_systemd::tb0a_a_plus_exec_start_pre_receives_the_environment_file_value_as_one_token \
+            start_limit_against_real_systemd::tb0b_a_plus_exec_start_pre_keeps_cap_net_admin_under_an_empty_bounding_set; do
+            sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+              --test systemd_unit --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee case.log
+            cat case.log >> agent-unit-premises-focused.log
+            # With --nocapture the witness's own evidence lines sit between
+            # "test <name> ... " and its "ok", so the name and a bare "ok" line
+            # are checked separately; the result line below pins the count.
+            grep -Fq "test $case_name ... " case.log && grep -Eq "(^| )ok$" case.log || {
+              echo "FAIL: exact premise case $case_name did not report ok"
+              exit 1
+            }
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' case.log || {
+              echo "FAIL: focused premise result for $case_name was absent, skipped, or malformed"
+              exit 1
+            }
+            if grep -Fq 'SKIP' case.log; then
+              echo "FAIL: premise case $case_name returned early with SKIP"
+              exit 1
+            fi
+          done
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Prove the agent template unit schedules (TB10) ran against real systemd without a skip
+        working-directory: castle-wall-daemon
+        # Three schedules each hold a 124 s no-restart window (W, derived from
+        # the shipped wall unit), so the loop's worst case is several minutes.
+        timeout-minutes: 20
+        run: |
+          # TB10 derives runtime units from the SHIPPED agent unit and drives
+          # them under the runner's systemd PID 1: (i) to (viii) with fixture
+          # verbs as the overflow account, (ix) with the REAL verbs against an
+          # isolated-table daemon as a provisioned agent account. Each case is
+          # rerun uncaptured, one at a time, and a SKIP is refused, because an
+          # early return reads as a pass in the captured all-targets run.
+          # Failure mode this guards: a runner without root or without systemd
+          # as PID 1 turns every schedule into a silent pass.
+          set -o pipefail
+          : > agent-unit-tb10-focused.log
+          prefix=tb10_agent_unit_against_real_systemd
+          for case_name in \
+            $prefix::tb10_i_the_agent_starts_only_after_the_walls_ready \
+            $prefix::tb10_ii_a_wall_that_fails_to_start_fails_the_agent_start \
+            $prefix::tb10_iii_a_wall_stop_stops_the_agent_first \
+            $prefix::tb10_iv_a_killed_wall_restarts_alone \
+            $prefix::tb10_v_a_wall_exit_78_stops_the_agent_and_nothing_restarts_it \
+            $prefix::tb10_v_a_wall_exit_75_stops_the_agent_and_only_the_wall_returns \
+            $prefix::tb10_vi_a_wall_stop_during_the_agents_start_cancels_it \
+            $prefix::tb10_vii_the_agent_and_its_check_run_as_the_instance \
+            $prefix::tb10_viii_a_wall_restart_restarts_the_agent_behind_the_new_ready \
+            $prefix::tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives; do
+            sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+              --test integration_linux_runtime_activation --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee case.log
+            cat case.log >> agent-unit-tb10-focused.log
+            grep -Fq "test $case_name ... " case.log && grep -Eq "(^| )ok$" case.log || {
+              echo "FAIL: exact TB10 case $case_name did not report ok"
+              exit 1
+            }
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' case.log || {
+              echo "FAIL: focused TB10 result for $case_name was absent, skipped, or malformed"
+              exit 1
+            }
+            if grep -Fq 'SKIP' case.log; then
+              echo "FAIL: TB10 case $case_name returned early with SKIP"
+              exit 1
+            fi
+          done
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Refuse leftover kernel state before the upload
+        if: always()
+        run: |
+          # Failure mode this catches: a test that leaves a Castle Wall table
+          # behind, above all the deny-all safety net (`policy drop` on the inet
+          # output hook), cuts this runner's network for every later step. The
+          # next network step (the evidence upload below) then fails with
+          # `getaddrinfo EAI_AGAIN results-receiver.actions.githubusercontent.com`,
+          # which reads as GitHub weather rather than as a test that did not clean
+          # up. Every suite's teardown (castle-wall-daemon/tests/isolation/mod.rs,
+          # `SuiteGuard`) already refuses its own leftovers; this step is the
+          # cross-binary check that nothing survived the whole run.
+          # Patterns must match `CASTLE_TABLE`, `ISOLATED_TABLE_PREFIX` and the
+          # `NET_RULE_COMMENT_*` constants in castle-wall-daemon/src/nftables.rs,
+          # and `names_this_run` in castle-wall-daemon/tests/isolation/mod.rs.
+          ruleset=$(sudo nft list ruleset)
+          if printf '%s\n' "$ruleset" | grep -Eq '^table [a-z0-9]+ sanctuary-castle|sanctuary-castle-net:'; then
+            echo "FAIL: Castle Wall kernel state survived the test run; the ruleset was:"
+            printf '%s\n' "$ruleset"
+            # Remove it now so the evidence upload below can still reach the
+            # network and the failure is diagnosable; the step fails either way.
+            # Each delete is checked and retried once after 1 s (a delete of a
+            # table another netlink transaction is still touching fails
+            # transiently; those finish in milliseconds, so one second is far
+            # past one). A delete that fails twice is reported STILL PRESENT and
+            # the step never claims a cleanup it did not do.
+            still_present=0
+            for t in $(sudo nft list tables | awk '$3 ~ /^sanctuary-castle/ {print $2 ":" $3}'); do
+              fam="${t%%:*}"; name="${t#*:}"
+              if ! sudo nft delete table "$fam" "$name"; then
+                sleep 1
+                if ! sudo nft delete table "$fam" "$name"; then
+                  echo "FAIL: table $fam $name is STILL PRESENT after two deletes"
+                  still_present=1
+                fi
+              fi
+            done
+            if [ "$still_present" -ne 0 ]; then
+              echo "FAIL: Castle Wall kernel state could NOT be removed; the upload below will likely fail with EAI_AGAIN. The ruleset now:"
+              sudo nft list ruleset
+            else
+              echo "the leftover tables were removed; the job still fails because a test left them"
+            fi
+            exit 1
+          fi
+          echo "no Castle Wall kernel state left after the tests"
+
+      - name: Retain Linux integration and real-systemd evidence logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: castle-wall-linux-integration-logs
+          path: |
+            castle-wall-daemon/cargo-test.log
+            castle-wall-daemon/cargo-test.plain.log
+            castle-wall-daemon/systemd-start-limit-focused.log
+            castle-wall-daemon/agent-unit-premises-focused.log
+            castle-wall-daemon/agent-unit-tb10-focused.log
+          if-no-files-found: warn
+
       - name: Cleanup nftables state
         if: always()
         run: |
@@ -269,7 +457,7 @@ jobs:
           packages: musl-tools gcc-aarch64-linux-gnu file
 
       - name: Install pinned Rust toolchain with musl targets
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned 2026-06-16
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, pinned 2026-06-16
         with:
           toolchain: 1.95.0
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl

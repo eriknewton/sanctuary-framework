@@ -99,15 +99,122 @@ export function resolveHooksDir(root) {
   throw new Error(`Unexpected .git entry type at ${dotGit}`);
 }
 
+// Both hook names installed by this script, in INSTALL ORDER.
+//
+// ORDER IS LOAD-BEARING (2026-09-26, fixed - previously "pre-commit" was
+// installed first): `pre-commit` is the fast tier (typecheck + changed-path
+// tests, every commit); `pre-push` is the full test-baseline guard (the
+// full suite + the floor comparison, every push) - see .githooks/pre-commit's
+// header for why the guard was split this way. If the SECOND copy in the
+// loop below throws (a permissions error, a full disk, a hooks directory
+// that vanished mid-run), installing pre-commit first left a repo with the
+// fast tier in place and NO full-suite gate at all - a partial install that
+// looked complete for every commit made afterward, silently missing the one
+// check with the audited SKIP_TEST_BASELINE override and the baseline
+// floor. Installing pre-push first means a failure on the second copy
+// (pre-commit) leaves the expensive, harder-to-bypass gate already in
+// place; the fast tier is convenience on top of it, not a substitute for it.
+//
+// Keep this list in sync with the two files that actually exist under
+// .githooks/ - a name added here with no matching source file fails loudly
+// below rather than silently installing nothing for it.
+const HOOK_NAMES = ["pre-push", "pre-commit"];
+
+// A line present verbatim in both shipped hooks' headers (see the top of
+// .githooks/pre-commit and .githooks/pre-push). Used to tell "a Sanctuary
+// hook we can safely overwrite/redeploy" apart from "someone else's hook
+// that happens to occupy this path" - a foreign pre-commit/pre-push hook
+// (from another tool, or hand-written by a developer) must never be
+// silently destroyed by this installer.
+// MUST stay a string that only the two Sanctuary-shipped hooks carry
+// verbatim in their header (see the top of .githooks/pre-commit and
+// .githooks/pre-push). The previous marker was the generic
+// "# Copyright 2026 Erik Newton" line, which any file in this repository
+// (or any hook a developer wrote and happened to copyright-stamp the same
+// way) could carry - so a foreign hook whose author reused that boilerplate
+// line would read as "ours" and be silently overwritten in place with no
+// backup, defeating the whole point of this check. A distinctive,
+// hook-specific token cannot collide with an unrelated file's copyright
+// header.
+export const MARKER_LINE = "# sanctuary-managed-hook: install-hooks.js owns this file";
+
+// If `dst` already exists and does NOT carry MARKER_LINE, it is a foreign
+// hook (not one this installer put there) - back it up before it gets
+// overwritten below, rather than destroying whatever was in it. Returns the
+// backup path, or null when there was nothing foreign to back up (no file
+// at dst, or the file at dst already carries the marker and is safe to
+// replace in place).
+//
+// NEVER CLOBBERS AN EXISTING BACKUP (2026-09-26): the previous version
+// always wrote to the same fixed `<name>.pre-sanctuary.bak` path, so a
+// SECOND foreign hook backed up at some later run would silently overwrite
+// the FIRST foreign hook's backup - the exact "destroy what was already
+// there" failure this function exists to prevent, one layer down. When a
+// backup already exists at that path, this suffixes a UTC timestamp instead
+// of overwriting it.
+export function backupExistingForeignHook(dst) {
+  if (!fs.existsSync(dst)) {
+    return null;
+  }
+  let existing;
+  try {
+    existing = fs.readFileSync(dst, "utf8");
+  } catch {
+    // Unreadable (e.g. a directory at that path, or a permissions error) -
+    // treat as foreign rather than silently overwriting; the backup attempt
+    // below will surface the real error if the path truly can't be read.
+    existing = "";
+  }
+  if (existing.includes(MARKER_LINE)) {
+    return null;
+  }
+  let backupPath = `${dst}.pre-sanctuary.bak`;
+  if (fs.existsSync(backupPath)) {
+    // Colons are not valid in Windows path segments and are needlessly
+    // shell-unfriendly on POSIX; strip them from the ISO timestamp so the
+    // suffix is safe to embed in a filename on every platform this repo
+    // targets.
+    const timestamp = new Date().toISOString().replace(/[:]/g, "");
+    backupPath = `${dst}.pre-sanctuary.${timestamp}.bak`;
+  }
+  fs.copyFileSync(dst, backupPath);
+  return backupPath;
+}
+
+// The install loop itself, separated from main()'s argv/exit handling so it
+// can be exercised directly (a temp root + a temp hooksDir, no real .git
+// involved) - in particular so a test can simulate the second copy in
+// HOOK_NAMES failing (e.g. a missing source file) and assert what state
+// the FIRST hook is left in, proving the install order in HOOK_NAMES above
+// is what protects the full-suite gate. Throws on the first failure
+// (missing source file, or whatever fs.copyFileSync/fs.chmodSync throws);
+// does not itself catch or exit - main() owns that.
+export function installHooksInto(root, hooksDir) {
+  fs.mkdirSync(hooksDir, { recursive: true });
+  const installed = [];
+  for (const hookName of HOOK_NAMES) {
+    const src = path.join(root, ".githooks", hookName);
+    if (!fs.existsSync(src)) {
+      throw new Error(`.githooks/${hookName} not found at ${src}`);
+    }
+    const dst = path.join(hooksDir, hookName);
+    const backupPath = backupExistingForeignHook(dst);
+    if (backupPath) {
+      console.log(`Backed up existing non-Sanctuary ${hookName} hook: ${backupPath}`);
+    }
+    fs.copyFileSync(src, dst);
+    fs.chmodSync(dst, 0o755);
+    console.log(`Installed ${hookName} hook: ${dst}`);
+    installed.push(dst);
+  }
+  return installed;
+}
+
 function main() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
   const root = path.resolve(__dirname, "..", "..");
-  const src = path.join(root, ".githooks", "pre-commit");
-  if (!fs.existsSync(src)) {
-    console.error(`Error: .githooks/pre-commit not found at ${src}`);
-    process.exit(1);
-  }
+
   let hooksDir;
   try {
     hooksDir = resolveHooksDir(root);
@@ -115,11 +222,13 @@ function main() {
     console.error(`Error: ${err.message}`);
     process.exit(1);
   }
-  fs.mkdirSync(hooksDir, { recursive: true });
-  const dst = path.join(hooksDir, "pre-commit");
-  fs.copyFileSync(src, dst);
-  fs.chmodSync(dst, 0o755);
-  console.log(`Installed pre-commit hook: ${dst}`);
+
+  try {
+    installHooksInto(root, hooksDir);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
 }
 
 if (

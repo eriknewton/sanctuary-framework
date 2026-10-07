@@ -43,11 +43,13 @@ import type {
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   CHECKPOINT_RETENTION_ENV,
+  CheckpointRestoreVersionFloorError,
   MemoryCheckpointStore,
   createCheckpoint,
   nodeMemoryCheckpointFsOps,
   pruneExpiredCheckpoints,
   restoreCheckpoint,
+  preflightCheckpointRestore,
   type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
@@ -540,6 +542,24 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+
+  // Check before approval auditing writes reserved state; restore repeats this
+  // read-only preflight at its own boundary before any reconstruction writes.
+  try {
+    await preflightCheckpointRestore({
+      stateStore: boot.stateStore,
+      checkpointStore: boot.checkpointStore,
+      masterKey: boot.masterKey,
+      checkpointId: id,
+    });
+  } catch (restoreErr) {
+    // Only version-floor refusals promise unchanged audit bytes; other failures
+    // must reach restoreCheckpoint's critical audit after approval.
+    if (restoreErr instanceof CheckpointRestoreVersionFloorError) {
+      write(err, `Error: checkpoint restore failed. ${errorMessage(restoreErr)}\n`);
+      return 1;
+    }
+  }
 
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);

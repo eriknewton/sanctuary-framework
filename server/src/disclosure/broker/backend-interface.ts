@@ -14,6 +14,18 @@
  * - A failed `readSecret` throws — callers MUST NOT fall back to plaintext.
  */
 
+/**
+ * The broker's token scopes.
+ *
+ * PIN: `surrogate` is NOT a token scope; it must not be added here. Surrogate
+ * bindings live in `surrogate-policy.json`, parsed by
+ * `parseSurrogatePolicyDocument` in `policy.ts`, and the value lives under a
+ * separate keychain label the broker never reads. Widening this union would put
+ * surrogacy back on the broker's token path, which is exactly what the separate
+ * label and the separate policy file exist to prevent, and it would move the
+ * frozen `scope` enum at `broker-mcp/broker-server.ts:97-101`. Must stay in step
+ * with `SCOPE_RANK` in `token-issuer.ts`.
+ */
 export type SecretScope = "read" | "rotate";
 
 export interface SecretMetadata {

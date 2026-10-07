@@ -1361,6 +1361,22 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runDeployPreflight(args.slice(1));
   }
 
+  if (command === "upgrade-linux") {
+    // Static CLI imports have already run. The trusted installed CLI/package
+    // and absolute Node invocation are pre-execution operator prerequisites;
+    // this refusal prevents loading the privileged handler from a checkout.
+    if (process.platform !== "linux" || process.geteuid?.() !== 0 ||
+        process.argv[1] !== "/usr/local/libexec/sanctuary/server/dist/cli.js" ||
+        !process.execPath.startsWith("/") || process.env.NODE_OPTIONS !== undefined ||
+        process.env.NODE_PATH !== undefined) {
+      // SAFETY: stderr tells the operator why the privileged offline CLI refused to load.
+      console.error("upgrade-linux requires Linux root and the trusted installed CLI under a sanitized absolute Node invocation");
+      return 1;
+    }
+    const { runCastleWallLinuxUpgrade } = await import("./cli/castle-wall-linux-upgrade.js");
+    return runCastleWallLinuxUpgrade(args.slice(1));
+  }
+
   if (command === "reload") {
     const { runReload } = await import("./cli/castle-wall.js");
     return runReload(args.slice(1));
@@ -1553,6 +1569,58 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     }
   }
 
+  if (command === "surrogate-helper-daemon") {
+    // The ROOT per-agent credential-surrogate helper (design 3.4). It holds
+    // bound credential values in memory only after an operator unlock, answers
+    // the gate's value queries on one socket and the operator's unlock, lock and
+    // status requests on another, and starts LOCKED every time. Spawned by
+    // launchd as root, one per agent that has surrogate bindings, alongside that
+    // agent's gate daemon and peer resolver.
+    //
+    // Every uid and the generation come from THIS argv, which root baked into
+    // the plist at arming time (`renderSurrogateHelperDaemonPlist`), never from
+    // anything a caller says over either socket. The parse and the refusals live
+    // in `parseSurrogateHelperDaemonArgs`, so this verb adds no second grammar;
+    // a refusal here exits non-zero and the gate then denies every surrogate
+    // request rather than passing a placeholder through.
+    const { runSurrogateHelperDaemonFromArgv } = await import(
+      "./egress-gate/surrogate-helper-daemon.js"
+    );
+    try {
+      const handle = await runSurrogateHelperDaemonFromArgv(args.slice(1));
+      const stop = async (): Promise<void> => {
+        try {
+          // `close()` overwrites and drops every held value before either
+          // socket goes away; see the handle's own comment.
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      // Socket paths and a binding COUNT only: never a secret name, an env name,
+      // a placeholder or a value.
+      console.error(
+        `[surrogate-helper] serving ${handle.bindingCount} binding(s), locked, on ${handle.querySocketPath}`,
+      );
+      // Holds the event loop open; shutdown exits via the signal handlers above.
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      // The refusal classes this prints are fixed strings from
+      // `SurrogateHelperStartError` and `SurrogateHelperArgvError`; neither
+      // carries policy content or a value.
+      console.error(`surrogate helper daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -1599,6 +1667,9 @@ function printCastleWallHelp(): void {
                      Exits 2 when the versions positively skew;
                      --allow-extension-skew accepts the skew and says what it
                      overrode.
+    upgrade-linux    Offline replacement for an already provisioned fixed Linux
+                     root service. Requires trusted installed CLI and root.
+                     --route disarm|reboot --candidate ABSOLUTE_PATH
     reload           Reload policy in the running fortress daemon.
                      Exits 0 even when no daemon was reachable to reload (a
                      fresh fortress has nothing to reload; this is intentional).

@@ -74,6 +74,10 @@ import { createGateClientAuthenticator, type GateClientAuthenticator } from "./g
 import { createFsGateAcceptSource, GATE_CRED_DIR } from "./gate-credential.js";
 import type { PeerCommandRunner } from "./peer-identity.js";
 import { createPrivilegedPeerRunner } from "./peer-resolver-client.js";
+import { parseSurrogateDestinationsFile, redactSurrogatePlaceholders } from "../credential-surrogate/index.js";
+import { createSurrogateHelperClient } from "./surrogate-helper-client.js";
+import { surrogateDestinationsPath } from "./surrogate-helper-daemon.js";
+import type { SurrogateUpstreamRequest, ExclusiveEgressGateOptions } from "./gate-server.js";
 import { PEER_RESOLVER_DIR, peerResolverSocketPath } from "./peer-resolver-daemon.js";
 
 /**
@@ -261,6 +265,14 @@ export function egressGateDaemonLogPaths(input: {
 }
 
 /**
+ * CORE DUMPS ARE OFF, hard and soft (design v2.1 section 3.4.6). In forward mode
+ * this process holds a bound credential value in memory for the length of one
+ * request, so a core file would be a plaintext copy of it on a disk nothing else
+ * guards. The HARD limit is set as well as the soft one because a soft limit
+ * alone can be raised by the process or by anything that inherits from it. For
+ * an existing install the key lands at the next boot, because the boot path
+ * rewrites this plist unconditionally, and at the next repair.
+ *
  * Render the gate daemon plist. `RunAtLoad=false` + `KeepAlive={Crashed:true}`
  * deliberately: the ROOT SUPERVISOR sequences gate start inside the exclusive
  * bring-up (owner-checked, generation-bound); an auto-started gate at boot
@@ -322,6 +334,16 @@ ${logXml}\t<key>RunAtLoad</key>
 \t<dict>
 \t\t<key>Crashed</key>
 \t\t<true/>
+\t</dict>
+\t<key>HardResourceLimits</key>
+\t<dict>
+\t\t<key>Core</key>
+\t\t<integer>0</integer>
+\t</dict>
+\t<key>SoftResourceLimits</key>
+\t<dict>
+\t\t<key>Core</key>
+\t\t<integer>0</integer>
 \t</dict>
 </dict>
 </plist>
@@ -410,6 +432,12 @@ export function buildGateDaemonPlistContent(input: {
 export interface EgressGateDaemonDeps {
   /** The confined agent uid this daemon serves. */
   agentUid: number;
+  /** Isolated artifact/socket directory for tests; production uses the uid path. */
+  surrogateDir?: string;
+  /** Trusted transport and address seams for host-free TLS tests only. */
+  upstreamRequest?: SurrogateUpstreamRequest;
+  resolver?: ExclusiveEgressGateOptions["resolver"];
+  isRoutable?: ExclusiveEgressGateOptions["isRoutable"];
   /** Load the committed gate policy JSON text (default: the gate-readable runtime copy). */
   loadGatePolicy?: () => Promise<string>;
   /** Load the destination allow rules the gate enforces (default: the gate-readable runtime copy). */
@@ -523,11 +551,35 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     binding: { agentUid: policy.agent_uid, gatePort: policy.gate_port, generationId },
   });
 
-  const onEvent =
+  const sink =
     deps.onEvent ??
     ((event: EgressGateEvent): void => {
+      // Prefix must match cmdSurrogateEvents in cli/secrets.ts: [egress-gate] plus one space.
+      // Surrogate kinds must match SURROGATE_GATE_EVENT_PREFIX in cli/secrets.ts.
       process.stderr.write(`[egress-gate] ${JSON.stringify(event)}\n`);
     });
+
+  const onEvent = (event: EgressGateEvent): void => sink(redactSurrogatePlaceholders(event));
+  let forwardMode: ExclusiveEgressGateOptions["forwardMode"];
+  let forwardUnavailable: ExclusiveEgressGateOptions["forwardUnavailable"];
+  try {
+    const text = await readFile(surrogateDestinationsPath(deps.agentUid, deps.surrogateDir), "utf8");
+    const artifact = parseSurrogateDestinationsFile(text);
+    // A stale or unreadable artifact cannot enable forward mode for another generation.
+    if (artifact.generationId === generationId) {
+      forwardMode = {
+        destinations: artifact.destinations.map(({ host, port }) => `${host}:${port}`),
+        helperClient: createSurrogateHelperClient(deps.agentUid, deps.surrogateDir),
+      };
+    }
+  } catch (error) {
+    // Only ENOENT means unconfigured; a present but broken artifact must be visible and deny forwarding.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      forwardUnavailable = "destinations_unavailable";
+      onEvent({ kind: "surrogate_denied", authority: "", status: 503, code: forwardUnavailable,
+        reason: forwardUnavailable, requestBytes: 0, responseBytes: 0 });
+    }
+  }
 
   // 2026-07-24 fix (Option 1): the default peer runner dials the PRIVILEGED
   // root resolver instead of shelling `lsof` as this (unprivileged) daemon's
@@ -553,6 +605,11 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     peerRunner,
     clientAuth,
     onEvent,
+    ...(forwardMode ? { forwardMode } : {}),
+    ...(forwardUnavailable ? { forwardUnavailable } : {}),
+    ...(deps.upstreamRequest ? { upstreamRequest: deps.upstreamRequest } : {}),
+    ...(deps.resolver ? { resolver: deps.resolver } : {}),
+    ...(deps.isRoutable ? { isRoutable: deps.isRoutable } : {}),
   });
 
   const runtimeDir = deps.runtimeDir ?? EGRESS_GATE_RUNTIME_DIR;

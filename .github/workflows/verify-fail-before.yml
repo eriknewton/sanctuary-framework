@@ -69,7 +69,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Verify changed tests fail before source fix
         env:

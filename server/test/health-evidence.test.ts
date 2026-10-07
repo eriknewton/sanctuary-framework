@@ -279,6 +279,49 @@ describe("health/evidence : the four-state runtime model", () => {
     expect(result.detector_evidence).toContain("probe_unavailable");
   });
 
+  it("keeps terminal indeterminate unproven and carries safety-net state in the report", () => {
+    const statusResponse = status({
+      manifest_state: "ready",
+      lifecycle_state: "running",
+      runtime_state: "kernel_runtime_ready",
+      kernel_runtime_ready: false,
+      enforcing: false,
+      runtime_health: "indeterminate",
+      safety_net: {
+        state: "install_failed",
+        attempted_scope: "v2-confined-identity",
+        error: "install did not complete",
+      },
+    }) as never;
+    const report = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "FilesystemStorage",
+      castleWall: { ...base, statusResponse },
+    });
+    expect(report.castle_wall.status).not.toBe("active");
+    expect(report.castle_wall.safety_net?.state).toBe("install_failed");
+
+    const retry = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "FilesystemStorage",
+      castleWall: {
+        ...base,
+        statusResponse: status({
+          manifest_state: "ready",
+          lifecycle_state: "running",
+          runtime_state: "kernel_runtime_ready",
+          kernel_runtime_ready: false,
+          enforcing: false,
+          runtime_health: "indeterminate",
+          safety_net: { state: "not_attempted" },
+        }) as never,
+      },
+    });
+    expect(retry.castle_wall.safety_net?.state).toBe("not_attempted");
+  });
+
   it("reads a PROVEN-lost runtime as degraded", () => {
     const result = evaluateCastleWall({
       ...base,

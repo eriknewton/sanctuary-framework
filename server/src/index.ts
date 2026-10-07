@@ -32,7 +32,10 @@ import type {
   PrincipalPolicy,
 } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
-import type { ApprovalChannel } from "./principal-policy/approval-channel.js";
+import {
+  StderrApprovalChannel,
+  type ApprovalChannel,
+} from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
@@ -184,9 +187,13 @@ import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js"
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
 import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
+import { ResponseScreen } from "./proxy/response-screen.js";
+
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 export interface SanctuaryServer {
+  /** Host-only exposure; absence/eviction remains tainted with unknown observation. */
+  readonly responseExposure: import("./proxy/response-runtime.js").ResponseSession["exposure"];
   server: Server;
   config: SanctuaryConfig;
   /**
@@ -412,6 +419,7 @@ export async function createSanctuaryServer(options?: {
     // how the dashboard side left the factor unwiped.
     if (bootKeychainKey) bootKeychainKey.fill(0);
   }
+  const responseScreen = new ResponseScreen(); // Host lifetime begins tainted, independent of proxy configuration.
   try {
   const masterKey = custody.masterKey;
   const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
@@ -1085,6 +1093,8 @@ export async function createSanctuaryServer(options?: {
   // the persisted source of truth for the runtime context gate enforcer.
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   const loadedProfile = await profileStore.load();
+  // Refuse unavailable screening before starting channels, schedulers or upstream connections.
+  if (loadedProfile.upstream_servers?.some(s => s.enabled)) await responseScreen.initialize();
 
   // 14d (moved below profile load). Create Sovereignty Audit tools (read-only
   // diagnostic). Honesty (audit seam #5): the audit reads the LIVE profile so
@@ -1331,7 +1341,69 @@ export async function createSanctuaryServer(options?: {
       dashboard.setAutoAuthLocalhost(true);
     }
     await selectedApprovalChannel.start();
-    approvalChannel = dashboard;
+    if (dashboard.addrInUse()) {
+      // F5 (dashboard-bind-degrade, 2026-09-24 dogfood finding): the
+      // embedded dashboard's bind failed with EADDRINUSE. That
+      // classification is errno-only (dashboard.ts's onStartupError):
+      // nothing here identifies WHO holds the port. It could be another
+      // Sanctuary session, or any other local process bound to it first.
+      // Exiting on this would leave THIS session with no Sanctuary tools
+      // at all; instead the server finishes booting, but its approval
+      // channel becomes deny-all.
+      //
+      // Why swap instead of leaving the unbound `dashboard` object as the
+      // channel: that object still fails CLOSED on a timeout (SEC-002,
+      // dashboard.ts's requestApproval), never open, so the swap is not
+      // about correctness. It is about latency and load: every Tier-1/
+      // Tier-2 request would sit in `dashboard.pending` for the full
+      // `approval_channel.timeout_seconds` before denying, and the queue
+      // of pending entries grows with call volume until each one times
+      // out. `StderrApprovalChannel` already IS Sanctuary's
+      // deny-everything channel (SEC-002/SEC-016: no config can turn it
+      // into an approval, no timer, no TTY read) and MUST-NEVER #7
+      // already governs what its denial reveals, so this reuses it
+      // (AGENTS rule 5: one source) rather than adding a second deny-all
+      // implementation, and denies immediately instead of per-call.
+      //
+      // BOUND: if `policy.approval_redirect.enabled` is true and its mode
+      // resolves to "replace" (default: disabled, loader.ts), the
+      // `AggregatorBackedChannel` wrapper built below never calls the
+      // underlying channel at all (aggregator-backed-channel.ts), so this
+      // swap is inert for that policy and every gated call reverts to the
+      // per-call timeout-then-deny wait this swap exists to avoid. The
+      // deny outcome still holds either way; only the immediacy does not.
+      //
+      // `dashboard` itself stays assigned below: the `if (dashboard)`
+      // wiring blocks (SSE broadcast, sentinel dispatcher, honeypot
+      // registry, unified inbox) still run and attach to it. They do not
+      // no-op; they attach to an object with no bound listener, so it has
+      // no route through which to receive or deliver an approval
+      // decision. `cleanup()` still calls this channel's `stop()`
+      // unconditionally for the dashboard case, which stops its session
+      // timer and any other handles the constructor started.
+      approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+      // SAFETY: no structured logger module is wired in server/src/ yet;
+      // until one lands, raw stderr is the runtime warning channel for
+      // this site. Port number only: no token, path, or policy detail.
+      // No "who owns it" claim: see the comment above on why that cannot
+      // be attributed from an EADDRINUSE errno alone.
+      process.stderr.write(
+        `\n  Sanctuary: dashboard port ${config.dashboard.port} is already ` +
+          `in use; this session's approval-gated operations ` +
+          `are refused, not approved.\n\n`,
+      );
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "dashboard_bind_unavailable",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          port: config.dashboard.port,
+        },
+      });
+    } else {
+      approvalChannel = dashboard;
+    }
     break;
   }
   case "webhook":
@@ -1805,6 +1877,10 @@ export async function createSanctuaryServer(options?: {
     storage,
     masterKey,
     fortressId: sdwFortressId,
+    // Must match DEFAULT_OWNER_REF in server/src/cli/memory-file.ts, which
+    // refuses any `--owner-ref` other than this scope (STEP1-F1/F2): a CLI
+    // ingest pinned under a different owner_ref would be invisible to this
+    // guard and to `sdw-owner`, which also hard-codes "fleet-self".
     ownerRef: "fleet-self",
     ownerIdentity: sdwMemoryIdentity,
   });
@@ -2164,6 +2240,7 @@ export async function createSanctuaryServer(options?: {
         clientManager,
         injectionDetector,
         auditLog,
+        responseScreen,
         {
           contextGateFilter: async (_toolName, args) => {
             const activeProfile = profileStore.get();
@@ -2266,6 +2343,7 @@ export async function createSanctuaryServer(options?: {
     // the second call finds cleanupPromise already set and returns it (no reentry).
     cleanupPromise = Promise.resolve().then(async () => {
       const errors: unknown[] = [];
+      responseScreen.stop(); // Fence admission synchronously before any asynchronous teardown.
       // Stop MCP admission first so no new tool calls are accepted.
       // server.close() is async (SDK Protocol.close); awaiting it ensures the
       // transport is fully torn down before we flush persistence below.
@@ -2289,6 +2367,8 @@ export async function createSanctuaryServer(options?: {
       if (clientManager) {
         try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
       }
+      try { await responseScreen.close(); } catch (e) { errors.push(e); }
+      governor.clearResponseCache();
       // Flush persistence last; audit flush must follow inbox and baseline.
       try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
       try { await baseline.save(); } catch (e) { errors.push(e); }
@@ -2333,6 +2413,7 @@ export async function createSanctuaryServer(options?: {
   }
 
   return {
+    get responseExposure() { return responseScreen.session.exposure; },
     server,
     config,
     identityManager,
@@ -2342,6 +2423,8 @@ export async function createSanctuaryServer(options?: {
     cleanup,
   };
   } catch (error) {
+    // Scanner cleanup cannot skip the custody scrub if cleanup itself fails.
+    try { await responseScreen.close(); } catch { /* Preserve the startup failure below. */ }
     // Startup never transferred the master session to a live server. Release
     // its shared rotation barrier only after every attempted startup write has
     // settled, then scrub the unowned master before surfacing the root cause.

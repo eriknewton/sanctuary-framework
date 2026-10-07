@@ -1,0 +1,13 @@
+UID_MIN			 1000
+UID_MAX			60000
+SYS_UID_MIN		  500
+SYS_UID_MAX		  999
+GID_MIN			 1000
+GID_MAX			60000
+SYS_GID_MIN		  500
+SYS_GID_MAX		  999
+ENCRYPT_METHOD YESCRYPT
+USERGROUPS_ENAB yes
+ls: cannot access '/mnt/live/airootfs/mnt/etc/login.defs.d': No such file or directory
+/mnt/live/airootfs/mnt/usr/lib/sysusers.d:
+alpm.conf

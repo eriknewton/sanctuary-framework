@@ -1,3 +1,4 @@
+// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker and TokenIssuer constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
 /**
  * Hardening wave 6 finding #86, token expiry pruning hooked into the
  * fortress-unlock initialization path.
@@ -76,6 +77,8 @@ describe("token expiry pruning fires on fortress-unlock (finding #86)", () => {
     const backend = makeFakeBackend({ "api-key": "value" });
     // We construct the issuer directly so we can advance the clock.
     const issuer = new TokenIssuer({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       grants: [grant],
@@ -85,6 +88,8 @@ describe("token expiry pruning fires on fortress-unlock (finding #86)", () => {
     // backend and grants, Broker's TokenIssuer is internal, but
     // pruneExpiredTokens() is the public verb.
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend,
       auditLog,
       grants: [grant],

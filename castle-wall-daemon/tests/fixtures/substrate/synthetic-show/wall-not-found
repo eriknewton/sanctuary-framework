@@ -1,0 +1,7 @@
+Id=sanctuary-castle-wall.service
+Names=sanctuary-castle-wall.service
+FragmentPath=/etc/systemd/system/sanctuary-castle-wall.service
+LoadState=not-found
+DropInPaths=
+NeedDaemonReload=no
+UnitFileState=enabled

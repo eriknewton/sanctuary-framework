@@ -2,7 +2,7 @@
 
 Canonical, at-a-glance statement of where the repository stands on release provenance, supply chain, branch protection, and code scanning, plus the open security-debt board. This is the page an external reviewer should read first. Update it whenever any row below changes.
 
-Last updated: 2026-06-17.
+Last updated: 2026-10-06.
 
 This posture reflects the remediation of the independent 2026-06-16 hygiene and security audit (which graded the repository B / 8.1 after the first remediation wave) and the 2026-06-17 follow-up wave that closed the remaining clean-win findings and documented the residue. The remaining open items below are either upstream-blocked, dev-and-build-only (never shipped), drill-gated, or deliberate maintainer-posture choices. Each is disclosed here rather than silently dismissed.
 
@@ -10,13 +10,14 @@ This posture reflects the remediation of the independent 2026-06-16 hygiene and 
 
 | Field | Value |
 |---|---|
-| npm `latest` | `@sanctuary-framework/mcp-server@1.4.0` (published 2026-06-16) |
-| Git tag | `v1.4.0` (annotated, at the published commit `1554fda1`) |
-| GitHub release | `v1.4.0`, marked Latest, with the npm tarball digest in the notes |
-| Supported versions | `1.4.x` (full), `1.3.x` (critical fixes, best effort). See [`SECURITY.md`](../../SECURITY.md). |
+| npm `latest` | `@sanctuary-framework/mcp-server@1.8.4` |
+| npm `next` | `@sanctuary-framework/mcp-server@1.8.6-rc.5` |
+| Git tag | `v1.8.4` for stable; `v1.8.6-rc.5` for the current prerelease |
+| GitHub release | `v1.8.4` for stable; `v1.8.6-rc.5` for the current prerelease; `castle-wall-linux-0.1.0-1` for the bounded Ubuntu 24.04 x86-64 Linux Castle Wall pre-release |
+| Supported versions | Current stable and current prerelease, with older supported lines governed by [`SECURITY.md`](../../SECURITY.md). |
 | Publish flow | npm Trusted Publishing (OIDC), manual `workflow_dispatch`. No static npm token. |
 
-The npm artifact, the git tag, and the GitHub release all bind to the same source commit, so the published package is traceable to source.
+The npm artifact, the git tag, and the GitHub release bind through the manual publish workflow and release manifest, so the published package is traceable to source.
 
 ## Supply chain
 
@@ -57,7 +58,7 @@ The npm artifact, the git tag, and the GitHub release all bind to the same sourc
 | Issue #567 safe-mode root-owned socket-dir TOCTOU | Partially done (drill-gated) | The boot-guard plist parse is hardened and the severe symlink-redirect escalation is closed; the residual by-name race is non-exploitable in any supported config (0700 operator-owned fortress dir + separate-uid enforcement). The clean relocation to a root-owned socket dir needs a boot drill on the signing host and rides the next Castle Wall macOS drill. |
 | Required approving reviews = 0 | Accept (documented decision) | Deliberate solo-maintainer posture (2026-06-16); see Branch protection above. Structural gates (required CI, strict, conversation-resolution) plus advisory CODEOWNERS stand in. Revisited if a second maintainer joins. |
 | Markdown-image-exfil detector caps the URL path at 8192 chars | Resolved (widened) | Bound exists only to keep matching linear (ReDoS-safe; pathological 50k input matches in 0.156ms). Widened from 2048 to 8192 in PR #607; the independent secret-pattern scan remains the backstop beyond the cap. |
-| `dashboard/multi-server.ts` keeps a private `constantTimeEquals` duplicate | Tracked | Pre-existing duplication; the shared helper now lives in `http/auth.ts`. Consolidation is a cleanup, not a defect. |
+| `dashboard/multi-server.ts` keeps a private `constantTimeEquals` duplicate | Tracked | Pre-existing duplication; the shared helper now lives in `http/auth.ts`. Consolidation is tracked cleanup rather than a defect. |
 | Fail-PR-on-new-CodeQL-alert | Pending (owner) | To be enabled as a repository code-scanning check-failure threshold plus a required-check entry on the `main` ruleset. Owner-only repository settings. |
 | gitleaks job as a required status check | Pending (owner) | The gitleaks CI job exists and fails on findings (PR #610); promoting it to a required check on the `main` ruleset is an owner ruleset edit. |
 

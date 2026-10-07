@@ -15,6 +15,13 @@ updates:
     groups:
       server-minor-patch:
         update-types: ["minor", "patch"]
+    # A freshly-published release has had no time for the ecosystem to catch
+    # a compromised or backdoored version; a few days' cooldown before
+    # Dependabot proposes a new version lets that window close. default-days
+    # applies to any update not covered by a more specific semver-*-days key
+    # (docs: dependabot-options-reference.md#cooldown).
+    cooldown:
+      default-days: 3
 
   # Repo root tooling.
   - package-ecosystem: "npm"
@@ -26,6 +33,8 @@ updates:
     groups:
       root-minor-patch:
         update-types: ["minor", "patch"]
+    cooldown:
+      default-days: 3
 
   # Peripheral npm packages — monthly, grouped (lower churn).
   - package-ecosystem: "npm"
@@ -37,6 +46,8 @@ updates:
     groups:
       menubar-minor-patch:
         update-types: ["minor", "patch"]
+    cooldown:
+      default-days: 3
 
   - package-ecosystem: "npm"
     directory: "/quickstart"
@@ -47,6 +58,8 @@ updates:
     groups:
       quickstart-minor-patch:
         update-types: ["minor", "patch"]
+    cooldown:
+      default-days: 3
 
   # The Concordia Python sidecar.
   - package-ecosystem: "pip"

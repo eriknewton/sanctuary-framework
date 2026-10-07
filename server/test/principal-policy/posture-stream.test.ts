@@ -40,7 +40,7 @@ import {
 } from "../../src/principal-policy/posture-stream.js";
 import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 const FORTRESS = "fortress:test";
 
 function subjectForUid(uid: number): string {
@@ -140,7 +140,7 @@ function baseDeps(
   const detected: DetectedHarness[] = [
     { platform: "cursor", harness: "cursor", config_path: "/home/u/.cursor/mcp.json" },
   ];
-  return {
+  return { readFlightMap: createDashboardReadFlightMap(),
     auditLog: log,
     originMachine: FORTRESS,
     listAgents: () => agents,

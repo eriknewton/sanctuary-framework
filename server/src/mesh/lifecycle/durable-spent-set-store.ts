@@ -4,8 +4,8 @@
  * Both the local-join nonce store ({@link BootstrapNonceStore}) and the
  * operator-cloud provision-claim store ({@link OperatorCloudProvisionClaimStore})
  * are single-use gates: a nonce / claim may be consumed exactly once. In memory
- * the gate is the event loop's synchronous check-and-set. The DEBT this backend
- * closes is durability: an in-memory-only gate FORGETS the spent set on a daemon
+ * the gate is the event loop's synchronous check-and-set. DEBT(MESH-SPENT-SET-DURABILITY): this backend
+ * closes durability: an in-memory-only gate FORGETS the spent set on a daemon
  * restart, re-allowing one already-authorized token until its (<=15 min) expiry.
  *
  * This module persists the spent set so single-use survives a restart. It mirrors

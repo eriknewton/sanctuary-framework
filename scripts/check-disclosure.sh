@@ -452,8 +452,9 @@ check_paragraph() { # check_paragraph <text> <first-line-number>
 
   # D4-PRESENT — a claim that a defect is live, current, unfixed or reachable.
   # Unconditional. Note what is deliberately NOT here: absence-of-capability
-  # phrasing ("Linux egress enforcement is not implemented", "unproven on
-  # Linux") is an HONESTY OBLIGATION under the same rule and must keep passing.
+  # phrasing ("Windows egress enforcement is not implemented", "unproven on
+  # this platform") is an HONESTY OBLIGATION under the same rule and must keep
+  # passing.
   # The separator is presence-of-a-defect versus absence-of-a-capability; if a
   # future edit blurs it, the guard starts punishing the honest half of #9.
   if matches "$text" "$PRESENT_RE"; then

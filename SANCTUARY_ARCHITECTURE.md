@@ -11,7 +11,7 @@ module map at [`server/src/README.md`](server/src/README.md).
 
 ## WHAT THESE TOOLS ARE
 
-**Sanctuary** is a TypeScript MCP server (~202,000 lines, 80+ MCP tools) that gives AI agents four layers of cryptographic sovereignty without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Current release status is tracked in `CHANGELOG.md`.
+**Sanctuary** is a TypeScript MCP server with 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`). It gives AI agents four layers of cryptographic sovereignty without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Current release status is tracked in `CHANGELOG.md`.
 
 What it concretely does:
 
@@ -133,7 +133,7 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 6. "Private keys never appear in any MCP tool response." *(Tested: `test/security/key-never-in-response.test.ts`)*
 7. "Identity key rotation produces a signed chain proving authorization: the new key is signed by the old key."
-8. "A user can export current identity and reputation artifacts through shipped paths." Full exit remains partial: dashboard export omits the state re-key key, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09**.
+8. "A user can export current identity and reputation artifacts through shipped paths." Full exit remains partial: dashboard export deliberately omits the state re-key key because that path persists its result, import hides skipped-entry counters, and rotated-key imports can lose pre-rotation state. Open defect: **IC-07, IC-08, IC-09**.
 
 **Operational sovereignty:**
 
@@ -186,11 +186,11 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 ## REVIEW CONTEXT
 
-The structured security review completed 2026-03-28 with all Critical and High findings resolved. Review artifacts (SECURITY_AUDIT.md, BUG_REPORT.md, REMEDIATION_PLAN.md, SPRINT_CONTRACT.md, SPRINT_RESULT.md, SPRINT_EVAL.md) are in `docs/audit/`.
+A structured security review ran in March 2026, followed by delta reviews at later releases. Their findings are tracked privately and are not published; current trust claims and their bounds are in [`ASSURANCE_MATRIX.md`](ASSURANCE_MATRIX.md).
 
 Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`), with environment fingerprinting, OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0-100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
 
-**Current release status:** see `CHANGELOG.md`. The server currently exposes 80+ MCP tools. Major additions since v0.4.2: Sovereignty Dashboard, `sanctuary wrap` one-command install, EU AI Act compliance generator, context gating, SIEM export, sovereignty profile, governor, and federation tools.
+**Current release status:** see `CHANGELOG.md`. The server currently exposes 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`). Major additions since v0.4.2: Sovereignty Dashboard, `sanctuary wrap` one-command install, EU AI Act compliance generator, context gating, SIEM export, sovereignty profile, governor, and federation tools.
 
 ---
 

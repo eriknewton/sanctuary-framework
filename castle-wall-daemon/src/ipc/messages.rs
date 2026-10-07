@@ -214,6 +214,10 @@ pub enum IpcMessage {
         /// `None` when nothing has been observed yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_health_age_ms: Option<u64>,
+        /// Tagged predicate last published by the runtime supervisor. Must match
+        /// `StatusResponse.safety_net` in the TypeScript IPC consumer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        safety_net: Option<serde_json::Value>,
     },
     #[serde(rename = "policy_reload_request")]
     PolicyReloadRequest {

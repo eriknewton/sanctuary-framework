@@ -2,26 +2,23 @@
 
 Trust claims for macOS egress enforcement are tracked in [../ASSURANCE_MATRIX.md](../ASSURANCE_MATRIX.md).
 
-Phase 1 foundation of WP-V1.x-CASTLE-WALL on macOS. Castle Architecture's
-Castle Wall layer lives at the OS-level egress filter; on macOS the
-`com.apple.developer.networking.networkextension` `content-filter-provider-systemextension`
-entitlement gates the kernel-attached chokepoint.
+Castle Architecture's Castle Wall layer lives at the OS-level egress filter; on
+macOS the `com.apple.developer.networking.networkextension`
+`content-filter-provider-systemextension` entitlement gates the
+kernel-attached chokepoint.
 
 ## Status
 
-**Packet filter logic + manifest sync engaged (Alpha-2).** The package
-ships a working `handleNewFlow` verdict path that consults a manifest
-snapshot received via IPC, an LRU flow cache for hot destinations, and
-new IPC notifications for flow decisions + pending approvals.
-Loaded-extension integration tests + audit-emit pipeline + install flow
-land in subsequent Alpha builds.
+Castle Wall macOS enforces a signed operator policy with a clean per-uid
+allow/deny demo + reboot-survival. The proof is a Dev-ID-signed and notarized
+binary on the drilled host and OS version, cited in the Assurance Matrix. The
+per-flow rule-attributed audit trail remains owed.
 
 | Build | Scope | Status |
 |-------|-------|--------|
-| Alpha-1 | Project structure, NEFilterProvider subclass, UDS IPC client, Ed25519 handshake verification, macOS CI, unit tests | Shipped (PR #150) |
-| Alpha-2 (this) | NEFilterProvider verdict logic, manifest store + flow cache, IPC bridge for manifest sync + flow decision telemetry, server-side handler module | This PR |
-| Alpha-3 | Audit emit pipeline, Tier B coverage (DoH, DoT, content-filter equivalents), loaded-extension integration tests, p99 perf measurement | Pending |
-| Alpha-4 | Install + uninstall flow, signed dmg, notarization, host-app launcher with operator notification UX | Pending |
+| Signed app and system extension | Host app, content-filter provider, signer helper, launcher, signed app bundle, notarization | Shipped |
+| Proven enforcement claim | Signed operator policy with clean per-uid allow/deny demo + reboot-survival | Proven in the Assurance Matrix |
+| Remaining macOS proof gaps | Per-flow rule-attributed audit trail, wider host and OS coverage, p99 overhead, unattended reboot path, a sustained-operation drill, the TTL-expiry leg through the real CLI enable path, hardware boot verification of the GUI host-app launch (the Assurance Matrix macOS row is the full list) | Owed |
 
 ## Relationship to `castle-wall-daemon/` (Linux)
 
@@ -35,7 +32,7 @@ Different platform, same IPC protocol, same Sanctuary-main-side runtime.
 | Wire envelope | JSON-RPC 2.0 over the framing | Same |
 | Authentication | Ed25519 challenge-response + SO_PEERCRED | Ed25519 challenge-response (no SO_PEERCRED equivalent on macOS Network framework) |
 | Privilege | Root daemon, dropped to `sanctuary` group | User-space system extension; user approval per Apple sysextd |
-| Distribution | Native package + systemd unit | Notarized signed dmg (Alpha-4) |
+| Distribution | Native package + systemd unit | Dev-ID-signed and notarized app archive |
 
 The Sanctuary main side speaks the SAME wire protocol regardless of which
 platform the kernel-binding side runs on. `server/src/castle-wall/ipc/`
@@ -72,8 +69,8 @@ Support/Sanctuary/active.json`.
 - **Language: Swift.** NEFilterProvider is the Apple-native API; Swift
   gives clean access without the Objective-C bridge tax.
 - **Build system: Swift Package Manager.** `xcodebuild` drives the
-  package directly via `-scheme` + `-package-path`. The `.systemextension`
-  bundle wrapping happens in Alpha-4 install flow.
+  package directly via `-scheme` + `-package-path`. The release wrapper
+  assembles the `.systemextension` bundle inside the app archive.
 - **IPC: UDS, not XPC.** XPC requires the system extension to embed
   inside a host-app bundle and run as a privileged helper. UDS keeps the
   protocol identical to the Linux daemon, eliminates a layer, and reuses
@@ -83,7 +80,7 @@ Support/Sanctuary/active.json`.
 - **Signing: Developer-ID + Network Extensions entitlement.**
   Apple Team ID `YFQSWQ9BJN`, App ID `ai.sanctuaryprotocol.macos`, sub-App-ID
   for the system extension `ai.sanctuaryprotocol.macos.castle-wall`.
-  Notarization lands in Alpha-4.
+  Released app archives are Dev-ID-signed and notarized.
 - **CI: `macos-latest` GitHub runner.** Builds the package without code
   signing (CI cannot sign; foundation does not require a signed binary
   to run unit tests). Loaded-extension scenarios CANNOT be exercised in
@@ -157,42 +154,16 @@ extension verifies against a TOFU-pinned public key. SO_PEERCRED-style
 UID binding is unavailable on macOS BSD sockets, so the fortress
 identity binding is the primary trust anchor.
 
-## What ships in subsequent builds
+## Remaining proof work
 
-- Alpha-3: audit-emit pipeline, Tier B test surface (DoH, DoT, content
-  filter parity with the Linux daemon's coverage matrix), loaded-extension
-  integration tests against real NEFilterFlow shapes, p99 performance
-  measurement on allowed traffic.
-- Alpha-4: install / uninstall flow, signed dmg, notarization, host-app
-  launcher with operator-facing notification UX, operator approval flow
-  wiring (the verdict path here surfaces `flow_pending_approval`; the
-  operator-decision IPC return path lands in Alpha-4 alongside the
-  notification UX).
+- Per-flow rule-attributed audit trail.
+- Wider host and OS coverage.
+- p99 performance measurement on allowed traffic.
+- Unattended reboot path.
+- A sustained-operation drill, the TTL-expiry leg through the real CLI enable path, and hardware boot verification of the GUI host-app launch (see the Assurance Matrix macOS row).
 
 Phase 2 (Windows) and Phase 3 (container/microVM) are out of scope for
 the macOS work package.
-
-## Known issue: do not run `sanctuary init` followed by `sanctuary wrap`
-
-`sanctuary init` and `sanctuary wrap` currently derive the fortress master
-key from different sources:
-
-- `init` derives from a random recovery key.
-- `wrap` derives from a passphrase and does not consume `SANCTUARY_RECOVERY_KEY`.
-
-Running `init` and then `wrap` against the same fortress can produce
-`aes/gcm: invalid ghash tag` when the daemon decrypts the pinned IPC keypair.
-
-Current workaround:
-
-- Skip `init`.
-- Use `sanctuary wrap` only. It creates the fortress, generates the passphrase,
-  and derives the master key in one consistent pass.
-
-Tracking reference: Newton Wiki session `sanctuary-castle-wall-mac-phase-2-5-track-4a-ipc-drill-mini1-2026-05-26.md` (operator-local; not part of this repo).
-
-A future PR will either deprecate `init` for filesystem-only Castle Wall
-fortresses or wire recovery-key consumption through `wrap`.
 
 ## Headless arm / disarm (SSH-safe operation)
 

@@ -1,0 +1,497 @@
+name: Linux Arch Package
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # No workflow_dispatch: a free-text input would be the only attacker-controlled
+  # string in this file, and the .deb gate below needs a base commit the event
+  # itself supplies (pull_request.base.sha or push.before). Nothing uses a manual run.
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARCH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  arch-package-build:
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    timeout-minutes: 90
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      # The archlinux image ships without git; without it actions/checkout falls back to a
+      # REST download with no .git, and the exact-head check below cannot run.
+      - name: Install git for checkout
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Build Arch package from exact head
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [[ "$(git rev-parse HEAD)" == "$ARCH_SOURCE_SHA" ]]
+          pacman -Syu --noconfirm --needed base-devel git rustup zstd libnetfilter_queue nftables systemd iproute2 util-linux shadow python
+          python3 -m unittest discover -s castle-wall-daemon/packaging/arch -p 'test_*.py'
+          useradd -m build
+          runuser -u build -- rustup toolchain install 1.95.0 --profile minimal
+          build_one() {
+            local checkout="$1" out="$2" extra_env="${3:-}"
+            install -d -o build -g build "$out"
+            local source_commit
+            # Capture before chown: git rejects a linked worktree root after it is owned by the build user.
+            source_commit="$(git -C "$checkout" rev-parse HEAD)"
+            chown -R build:build "$checkout"
+            # SOURCE_COMMIT avoids opening root-owned linked-worktree gitdirs from makepkg's build user.
+            runuser -u build -- bash -lc "cd '$checkout/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" PKGDEST='$out' SOURCE_COMMIT='$source_commit' $extra_env makepkg --noconfirm --syncdeps --needed"
+          }
+          compare_packages() {
+            local left="$1" right="$2" root="$3"
+            install -d "$root/left" "$root/right"
+            bsdtar -xf "$left" -C "$root/left"
+            bsdtar -xf "$right" -C "$root/right"
+            python3 - "$root/left" "$root/right" <<'PY'
+          import hashlib
+          import stat
+          import sys
+          from pathlib import Path
+
+          left, right = [Path(arg) for arg in sys.argv[1:]]
+          excluded = {".PKGINFO", ".BUILDINFO", ".MTREE"}
+
+          def digest_tree(root):
+              entries = {}
+              for path in root.rglob("*"):
+                  rel = path.relative_to(root).as_posix()
+                  if rel in excluded:
+                      continue
+                  mode = stat.S_IMODE(path.lstat().st_mode)
+                  if path.is_dir():
+                      entries[rel] = ("dir", mode, "")
+                  elif path.is_symlink():
+                      entries[rel] = ("symlink", mode, path.readlink().as_posix())
+                  elif path.is_file():
+                      entries[rel] = ("file", mode, hashlib.sha256(path.read_bytes()).hexdigest())
+                  else:
+                      raise SystemExit(f"unsupported package entry: {rel}")
+              return entries
+
+          if digest_tree(left) != digest_tree(right):
+              raise SystemExit("extracted package payloads differ outside .PKGINFO/.BUILDINFO/.MTREE")
+          PY
+          }
+          work="$RUNNER_TEMP/arch-repro"
+          git worktree add "$work/a" HEAD
+          git worktree add "$work/b" HEAD
+          git worktree add "$work/rustflags-negative" HEAD
+          build_one "$work/a" "$RUNNER_TEMP/arch-package-a"
+          build_one "$work/b" "$RUNNER_TEMP/arch-package-b"
+          pkg_a=("$RUNNER_TEMP/arch-package-a"/*.pkg.tar.zst)
+          pkg_b=("$RUNNER_TEMP/arch-package-b"/*.pkg.tar.zst)
+          [[ ${#pkg_a[@]} == 1 && ${#pkg_b[@]} == 1 ]]
+          compare_packages "${pkg_a[0]}" "${pkg_b[0]}" "$RUNNER_TEMP/arch-repro-compare"
+          python3 - "$work/rustflags-negative" <<'PY'
+          from pathlib import Path
+          root = Path(__import__("sys").argv[1])
+          pkgbuild = root / "castle-wall-daemon/packaging/arch/PKGBUILD"
+          text = pkgbuild.read_text()
+          mutated = text.replace("  _scrub_rust_env\n  printf '%s' \"${RUSTFLAGS-}\" >\"$srcdir/rustflags.txt\"\n  cargo build", "  printf '%s' \"${RUSTFLAGS-}\" >\"$srcdir/rustflags.txt\"\n  cargo build")
+          if mutated == text:
+              raise SystemExit("RUSTFLAGS negative failed to remove the scrub call")
+          pkgbuild.write_text(mutated)
+          builder = root / "castle-wall-daemon/packaging/arch/build-arch-package.py"
+          text = builder.read_text()
+          old = '    if rustflags:\n        raise ValueError("RUSTFLAGS must be scrubbed before staging the Arch package")\n'
+          mutated = text.replace(old, "")
+          if mutated == text:
+              raise SystemExit("RUSTFLAGS negative failed to remove the stage refusal")
+          builder.write_text(mutated)
+          PY
+          build_one "$work/rustflags-negative" "$RUNNER_TEMP/arch-package-rustflags-negative" "RUSTFLAGS='-C metadata=sanctuary_negative_rustflags'"
+          pkg_rustflags=("$RUNNER_TEMP/arch-package-rustflags-negative"/*.pkg.tar.zst)
+          [[ ${#pkg_rustflags[@]} == 1 ]]
+          set +e
+          compare_packages "${pkg_a[0]}" "${pkg_rustflags[0]}" "$RUNNER_TEMP/arch-rustflags-negative-compare"
+          rustflags_compare_rc=$?
+          set -e
+          if [[ "$rustflags_compare_rc" == 0 ]]; then
+            echo "RUSTFLAGS negative witness unexpectedly matched the scrubbed build" >&2
+            exit 1
+          fi
+          install -d "$RUNNER_TEMP/arch-package"
+          cp -- "${pkg_a[0]}" "$RUNNER_TEMP/arch-package/"
+          (cd "$RUNNER_TEMP/arch-package" && sha256sum ./*.pkg.tar.zst > SHA256SUMS)
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-package-${{ env.ARCH_SOURCE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-package
+          if-no-files-found: error
+          retention-days: 7
+
+  arch-package-lifecycle:
+    needs: arch-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.arch-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/arch-package
+          merge-multiple: true
+      - name: Run pacman lifecycle under systemd PID 1
+        run: |
+          cd "$RUNNER_TEMP/arch-package"
+          sha256sum --check SHA256SUMS
+          pkg=(*.pkg.tar.zst)
+          [[ ${#pkg[@]} == 1 ]]
+          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd /usr/lib/systemd/systemd)"
+          timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          cid="$1"
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd'; do
+            sleep 2
+          done
+          WAIT_SYSTEMD
+          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          # Evidence lives outside /tmp: systemd (PID 1 here) mounts a tmpfs on /tmp, and
+          # docker cp reads the container's root filesystem, not mounts inside it, so a
+          # directory under /tmp is written by the script and then "not found" by the copy
+          # (run 37410410188: the whole lifecycle passed and no evidence was uploaded).
+          evidence=/var/lib/sanctuary-arch-lifecycle-evidence
+          docker exec "$cid" mkdir -p "$evidence"
+          rc=0
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=$evidence /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}" || rc=$?
+          docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-lifecycle"
+          docker stop "$cid"
+          exit "$rc"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-lifecycle
+          if-no-files-found: error
+          retention-days: 7
+
+  arch-package-lifecycle-noextract:
+    needs: arch-package-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.arch-package-build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/arch-package
+          merge-multiple: true
+      - name: Run NoExtract lifecycle witness under systemd PID 1
+        run: |
+          cd "$RUNNER_TEMP/arch-package"
+          sha256sum --check SHA256SUMS
+          pkg=(*.pkg.tar.zst)
+          [[ ${#pkg[@]} == 1 ]]
+          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd /usr/lib/systemd/systemd)"
+          timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          cid="$1"
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd'; do
+            sleep 2
+          done
+          WAIT_SYSTEMD
+          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          evidence=/var/lib/sanctuary-arch-noextract-evidence
+          docker exec "$cid" mkdir -p "$evidence"
+          rc=0
+          # Base failure is not rebuilt here; it was captured on main in run 37365438647 attempt 2.
+          docker exec "$cid" bash -lc "EVIDENCE_DIR=$evidence /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]} --noextract-witness" || rc=$?
+          docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-noextract"
+          docker stop "$cid"
+          exit "$rc"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arch-noextract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arch-noextract
+          if-no-files-found: error
+          retention-days: 7
+
+  deb-unchanged-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ARCH_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          # python3-pytest: the hosted image ships no pytest for /usr/bin/python3; without it the
+          # next step fails before the gate runs and every later step is skipped (round-2 Grok 2).
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml python3-pytest
+      - name: Run Arch packaging Python tests
+        run: python3 -m pytest castle-wall-daemon/packaging/arch -q
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.95.0
+      - id: resolve
+        name: Resolve comparison base
+        run: |
+          event="${{ github.event_name }}"
+          case "$event" in
+            pull_request)
+              base="${{ github.event.pull_request.base.sha }}"
+              ;;
+            push)
+              base="${{ github.event.before }}"
+              ;;
+            *)
+              echo "unsupported event for Arch .deb unchanged gate: $event" >&2
+              exit 1
+              ;;
+          esac
+          zero=0000000000000000000000000000000000000000
+          if [[ -z "$base" || "$base" == "$zero" || "$base" == "$GITHUB_SHA" ]]; then
+            echo "Arch .deb unchanged gate needs a real base commit distinct from head for $event" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$base"
+          git cat-file -e "$base^{commit}" || {
+            echo "Arch .deb unchanged gate cannot resolve base commit: $base" >&2
+            exit 1
+          }
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          # The workflow derives the trigger predicate from is_arch_trigger_path in
+          # castle-wall-daemon/packaging/arch/assert-deb-unchanged.py; keep the
+          # cross-file contract comment there in sync when this call path changes.
+          # A diff that touches an allowed .deb input but no trigger path is not this
+          # gate's subject, so the job records "not applicable" rather than failing
+          # every unrelated Ubuntu package PR.
+          # NUL-separated names: git C-quotes `"`, `\` and control bytes on every
+          # line-oriented listing whatever core.quotePath says, so a slice path made of
+          # those bytes would match neither alternative and the gate would record NOT
+          # APPLICABLE on a diff that touched the slice (binding reads, both families).
+          # With -z nothing is quoted; the reader splits on NUL.
+          git diff --name-only --no-renames -z "$base"...HEAD >"$RUNNER_TEMP/changed-paths.nul"
+          touched="$(python3 - "$RUNNER_TEMP/changed-paths.nul" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          changed = Path(sys.argv[1]).read_bytes().split(b"\0")
+          paths = [p.decode("utf-8", "surrogateescape") for p in changed if p]
+          spec = importlib.util.spec_from_file_location(
+              "deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"
+          )
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          print("yes" if any(gate.is_arch_trigger_path(p) for p in paths) else "no")
+          PY
+          )"
+          [[ "$touched" == yes || "$touched" == no ]]
+          echo "touched=$touched" >>"$GITHUB_OUTPUT"
+      - name: Enforce slice path allowlist
+        if: steps.resolve.outputs.touched == 'yes'
+        run: |
+          # The workflow derives the allowlist predicate from is_arch_allowed_path in
+          # castle-wall-daemon/packaging/arch/assert-deb-unchanged.py; keep the
+          # cross-file contract comment there in sync when this call path changes.
+          python3 - "$RUNNER_TEMP/changed-paths.nul" "$GITHUB_ENV" "$RUNNER_TEMP/allowlist-refused.txt" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          changed_path = Path(sys.argv[1])
+          github_env = Path(sys.argv[2])
+          refused_path = Path(sys.argv[3])
+          raw = changed_path.read_bytes()
+          paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+          spec = importlib.util.spec_from_file_location(
+              "deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"
+          )
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          bad = [p for p in paths if not gate.is_arch_allowed_path(p)]
+          verdict = "refused" if bad else "ok"
+          with github_env.open("a") as env:
+              env.write(f"ARCH_ALLOWLIST={verdict}\n")
+          refused_path.write_text(gate.repr_path_lines(bad), encoding="utf-8")
+          print(f"allowlist: {verdict}")
+          if bad:
+              for path in bad:
+                  print(f"allowlist refused path: {path!r}")
+          else:
+              print(f"allowlist: {len(paths)} changed path(s), all allowed for the Arch slice")
+          PY
+      - name: Rebuild base and head install debs and compare protected fields
+        if: steps.resolve.outputs.touched == 'yes'
+        run: |
+          log="$RUNNER_TEMP/deb-comparator.log"
+          set +e
+          (
+            set -e
+            work="$RUNNER_TEMP/deb-unchanged"
+            : >"$RUNNER_TEMP/deb-declared-paths.json"
+            : >"$RUNNER_TEMP/deb-declared-summary.txt"
+            git worktree add "$work/base" "${{ steps.resolve.outputs.base }}"
+            git worktree add "$work/head" HEAD
+            for side in base head; do
+              (cd "$work/$side" && sudo git config --global --add safe.directory "$PWD")
+              sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+                python3 "$work/$side/castle-wall-daemon/packaging/ubuntu/build-install-deb.py" \
+                --revision 1 --output "$work/$side-out"
+            done
+            base_deb=("$work/base-out"/*.deb)
+            head_deb=("$work/head-out"/*.deb)
+            printf '%s\n' "${base_deb[0]}" >"$RUNNER_TEMP/arch-base-deb.path"
+            printf '%s\n' "${head_deb[0]}" >"$RUNNER_TEMP/arch-head-deb.path"
+            python3 castle-wall-daemon/packaging/arch/assert-deb-unchanged.py \
+              --base-source-commit "${{ steps.resolve.outputs.base }}" \
+              --head-source-commit "$(git rev-parse HEAD)" \
+              --changed-paths-nul "$RUNNER_TEMP/changed-paths.nul" \
+              --declared-paths-json "$RUNNER_TEMP/deb-declared-paths.json" \
+              --declared-summary "$RUNNER_TEMP/deb-declared-summary.txt" \
+              "${base_deb[0]}" "${head_deb[0]}"
+          ) 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$rc" == 0 ]]; then verdict=ok; else verdict=refused; fi
+          echo "ARCH_COMPARATOR=$verdict" >>"$GITHUB_ENV"
+          exit 0
+      - name: Compare inherited published install deb
+        if: steps.resolve.outputs.touched == 'yes'
+        run: |
+          log="$RUNNER_TEMP/deb-inheritance.log"
+          set +e
+          (
+            set -e
+            if [[ ! -s "$RUNNER_TEMP/arch-base-deb.path" || ! -s "$RUNNER_TEMP/arch-head-deb.path" ]]; then
+              echo "base/head deb paths missing from comparator step" >&2
+              exit 1
+            fi
+            ARCH_BASE_DEB="$(<"$RUNNER_TEMP/arch-base-deb.path")"
+            ARCH_HEAD_DEB="$(<"$RUNNER_TEMP/arch-head-deb.path")"
+            # Update procedure: when a later Ubuntu release is drilled and published,
+            # change this tag and SHA-256 in the same PR that updates DECISION.md's
+            # inheritance anchor. Never rebuild or replace the 0.1.0-1 asset.
+            asset_url="https://github.com/eriknewton/sanctuary-framework/releases/download/castle-wall-linux-0.1.0-1/sanctuary-castle-wall_0.1.0-1_amd64.deb"
+            expected="0be0eedb7a3ba3f217a3e580b8d893b884d16291a10e79eb28ece3ac86ef8f5b"
+            asset="$RUNNER_TEMP/castle-wall-linux-0.1.0-1.deb"
+            curl -fsSL "$asset_url" -o "$asset"
+            actual="$(sha256sum "$asset" | cut -d' ' -f1)"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "published asset SHA-256 mismatch: expected $expected got $actual" >&2
+              exit 1
+            fi
+            root="$RUNNER_TEMP/deb-inheritance"
+            mkdir -p "$root/asset/fs" "$root/base/fs" "$root/head/fs"
+            dpkg-deb -x "$asset" "$root/asset/fs"
+            dpkg-deb -x "$ARCH_BASE_DEB" "$root/base/fs"
+            dpkg-deb -x "$ARCH_HEAD_DEB" "$root/head/fs"
+          python3 - "$root/asset/fs" "$root/base/fs" "$root/head/fs" "$RUNNER_TEMP/deb-declared-paths.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          asset, base, head, declared_path = [Path(arg) for arg in sys.argv[1:]]
+          declared = set()
+          if declared_path.is_file() and declared_path.read_text().strip():
+              declared = set(json.loads(declared_path.read_text()))
+          # Must match install-layout.py BINARIES, SOURCES and MOUNT_NAME for proof inheritance.
+          compared = [
+              "usr/local/libexec/sanctuary/castle-wall-daemon",
+              "usr/local/libexec/sanctuary/protected-agent-v1",
+              "usr/local/libexec/sanctuary/network-agent-standin",
+              "usr/sbin/sanctuary-linux",
+              "etc/systemd/system/sanctuary-castle-wall.service",
+              "etc/systemd/system/sanctuary-agent@.service",
+              r"etc/systemd/system/var-lib-sanctuary\x2dagent\x2dworkspace.mount",
+              "usr/share/doc/sanctuary-castle-wall/schemas/contract.rs",
+          ]
+          printed_only = [
+              "usr/share/doc/sanctuary-castle-wall/operator-guide.md",
+              "usr/share/doc/sanctuary-castle-wall/build-identity",
+          ]
+
+          def digest(root: Path, rel: str) -> str | None:
+              path = root / rel
+              if not path.is_file():
+                  return None
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          print("inheritance table against castle-wall-linux-0.1.0-1")
+          print("path\tbase\thead\tasset")
+          failed = False
+          for rel in compared:
+              asset_hash = digest(asset, rel)
+              base_hash = digest(base, rel)
+              head_hash = digest(head, rel)
+              if asset_hash is None:
+                  raise SystemExit(f"published asset missing expected row: {rel}")
+              base_state = "MATCH" if base_hash == asset_hash else "DIFFERS"
+              head_state = "MATCH" if head_hash == asset_hash else "DIFFERS"
+              print(f"{rel}\t{base_state}\t{head_state}\t{asset_hash}")
+              if base_state == "MATCH" and head_state != "MATCH" and f"fs/{rel}" not in declared:
+                  failed = True
+          print("printed without comparison")
+          for rel in printed_only:
+              print(f"{rel}\tbase={digest(base, rel)}\thead={digest(head, rel)}\tasset={digest(asset, rel)}")
+          if failed:
+              raise SystemExit("head differs from the published asset on a row base still matched")
+          PY
+          ) 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$rc" == 0 ]]; then verdict=ok; else verdict=refused; fi
+          echo "ARCH_INHERITANCE=$verdict" >>"$GITHUB_ENV"
+          exit 0
+      - name: Record gate disposition
+        if: always()
+        run: |
+          case "${{ steps.resolve.outputs.touched }}" in
+            yes)
+              echo "deb-unchanged gate: ENFORCED (a trigger path changed between ${{ steps.resolve.outputs.base }} and $GITHUB_SHA)"
+              echo "allowlist verdict: ${ARCH_ALLOWLIST:-missing}"
+              if [[ -s "$RUNNER_TEMP/allowlist-refused.txt" ]]; then
+                echo "allowlist refused paths:"
+                cat "$RUNNER_TEMP/allowlist-refused.txt"
+              fi
+              echo "comparator verdict: ${ARCH_COMPARATOR:-missing}"
+              if [[ -s "$RUNNER_TEMP/deb-comparator.log" ]]; then
+                cat "$RUNNER_TEMP/deb-comparator.log"
+              fi
+              echo "inheritance verdict: ${ARCH_INHERITANCE:-missing}"
+              if [[ -s "$RUNNER_TEMP/deb-inheritance.log" ]]; then
+                cat "$RUNNER_TEMP/deb-inheritance.log"
+              fi
+              declared_delta=no
+              if [[ "${ARCH_COMPARATOR:-missing}" == ok && -s "$RUNNER_TEMP/deb-declared-summary.txt" ]]; then
+                declared_delta=yes
+                echo "ENFORCED, DECLARED DELTA: $(<"$RUNNER_TEMP/deb-declared-summary.txt")"
+              fi
+              allowlist_ok=no
+              if [[ "${ARCH_ALLOWLIST:-missing}" == ok || ( "${ARCH_ALLOWLIST:-missing}" == refused && "$declared_delta" == yes ) ]]; then
+                allowlist_ok=yes
+              fi
+              if [[ "$allowlist_ok" != yes || "${ARCH_COMPARATOR:-missing}" != ok || "${ARCH_INHERITANCE:-missing}" != ok ]]; then
+                exit 1
+              fi
+              ;;
+            no) echo "deb-unchanged gate: NOT APPLICABLE (no Arch slice path changed between ${{ steps.resolve.outputs.base }} and $GITHUB_SHA); the .deb inputs are gated by their own workflow" ;;
+            *) echo "deb-unchanged gate: base resolution failed; see the Resolve comparison base step" >&2; exit 1 ;;
+          esac

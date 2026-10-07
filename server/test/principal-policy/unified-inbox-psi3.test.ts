@@ -20,7 +20,7 @@ import {
 import { UnifiedInboxPrefsStore } from "../../src/principal-policy/unified-inbox-prefs-store.js";
 import { UnifiedInboxScheduler } from "../../src/principal-policy/unified-inbox-scheduler.js";
 import { handleUnifiedInboxRoute } from "../../src/principal-policy/unified-inbox-routes.js";
-
+import { createDashboardReadFlightMap } from "../../src/dashboard/read-response.js";
 const FORTRESS = "fortress_psi3";
 const IDENTITY = "identity_psi3";
 
@@ -94,7 +94,7 @@ async function makeInboxServer(opts: {
 }): Promise<{ base: string; close: () => Promise<void> }> {
   const server: Server = createServer(async (req, res) => {
     const handled = await handleUnifiedInboxRoute(
-      {
+      { readFlightMap: createDashboardReadFlightMap(),
         authConfig: { loopbackAutoAuth: true, authToken: INBOX_HTTP_TOKEN },
         bridge: opts.bridge,
         retentionPolicy: opts.policy,

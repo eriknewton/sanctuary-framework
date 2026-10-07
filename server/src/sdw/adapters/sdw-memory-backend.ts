@@ -1694,7 +1694,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     maxScan: number,
     afterPassageId?: string,
   ): Promise<{ readonly documents: readonly SdwDocumentRecord[]; readonly truncated: boolean }> {
-    // DEBT: storage.list() itself still enumerates the full owner-scope
+    // DEBT(SDW-MEMORY-BACKEND-LIST-SCAN): storage.list() itself still enumerates the full owner-scope
     // corpus (O(corpus) key listing, no decryption) before the maxScan cap
     // below limits the decrypt work. Accepted as a residual, not fixed
     // here; see the LD4 SDW-SEARCH-DOS-01 rule-8 bound above for what IS

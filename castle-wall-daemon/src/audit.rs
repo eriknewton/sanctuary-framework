@@ -613,20 +613,14 @@ fn write_progress_entry(progress: &mut TruncateProgress, entry: &WalEntry) -> Re
         path: progress.tmp_path.clone(),
         source_message: err.to_string(),
     })?;
-    progress
-        .tmp
-        .write_all(serialized.as_bytes())
-        .map_err(|err| WalError::Io {
-            path: progress.tmp_path.clone(),
-            source_message: err.to_string(),
-        })?;
-    progress.tmp.write_all(b"\n").map_err(|err| WalError::Io {
+    // One row, one buffer (shared with `append` through `wal_row_bytes`), so
+    // this writer cannot leave a row body without its newline either.
+    let row = wal_row_bytes(&serialized);
+    progress.tmp.write_all(&row).map_err(|err| WalError::Io {
         path: progress.tmp_path.clone(),
         source_message: err.to_string(),
     })?;
-    progress.new_bytes = progress
-        .new_bytes
-        .saturating_add(serialized.len() as u64 + 1);
+    progress.new_bytes = progress.new_bytes.saturating_add(row.len() as u64);
     progress.new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
     Ok(())
 }
@@ -638,6 +632,22 @@ fn write_progress_anchor(progress: &mut TruncateProgress) -> Result<(), WalError
     }
     progress.anchor_written = true;
     Ok(())
+}
+
+/// Build the exact on-disk bytes for one WAL row: the serialized entry
+/// followed by exactly one trailing newline, as a single buffer. Pulled out
+/// as a pure helper (no file I/O) so the "one row, one newline, one buffer"
+/// shape is unit-testable on its own, independent of whether the eventual
+/// `write_all` call against it is itself atomic.
+///
+/// The single `b'\n'` pushed here is the one-newline-per-row assumption every
+/// row-writing site in this file shares, and that `append`'s
+/// `attempted_bytes` and `validate_wal_line`'s replay count both assume.
+fn wal_row_bytes(serialized_entry: &str) -> Vec<u8> {
+    let mut row = Vec::with_capacity(serialized_entry.len() + 1);
+    row.extend_from_slice(serialized_entry.as_bytes());
+    row.push(b'\n');
+    row
 }
 
 impl WalWriter {
@@ -902,6 +912,8 @@ impl WalWriter {
             path: self.path.clone(),
             source_message: err.to_string(),
         })?;
+        // `+ 1` must match the single trailing newline `wal_row_bytes` pushes
+        // onto the row it builds below; `bytes_written` is advanced by this value.
         let attempted_bytes = serialized.len() as u64 + 1;
         let reserved = WAL_CONTROL_HEADROOM_MAX_BYTES.min(self.size_cap_bytes / 8);
         let effective_cap = if use_control_headroom {
@@ -927,11 +939,16 @@ impl WalWriter {
             }
             return Err(self.poison("test-injected failure after partial body write".to_string()));
         }
-        if let Err(err) = self.file.write_all(serialized.as_bytes()) {
-            return Err(self.poison(format!("append body write became indeterminate: {err}")));
-        }
-        if let Err(err) = self.file.write_all(b"\n") {
-            return Err(self.poison(format!("append newline write became indeterminate: {err}")));
+        // Body and newline are one buffer passed to one `write_all` call, so
+        // no two-call split can happen at this site. `write_all` can still
+        // make partial progress across several underlying `write` calls
+        // before it finishes or fails, so a torn tail is narrowed, not
+        // eliminated. A complete-but-unterminated last row is not rejected as
+        // malformed: `validate_wal_line` still credits `line.len() + 1` for
+        // it, one byte MORE than the file actually has, and `open_with_cap`'s
+        // length reconciliation refuses on that mismatch.
+        if let Err(err) = self.file.write_all(&wal_row_bytes(&serialized)) {
+            return Err(self.poison(format!("append row write became indeterminate: {err}")));
         }
         if fsync {
             #[cfg(test)]
@@ -1414,16 +1431,15 @@ impl WalWriter {
                 path: tmp_path.clone(),
                 source_message: err.to_string(),
             })?;
-            tmp.write_all(serialized.as_bytes())
-                .map_err(|err| WalError::Io {
-                    path: tmp_path.clone(),
-                    source_message: err.to_string(),
-                })?;
-            tmp.write_all(b"\n").map_err(|err| WalError::Io {
+            // One row, one buffer (shared with `append` through
+            // `wal_row_bytes`), so the replay rewrite cannot leave a row body
+            // without its newline either.
+            let row = wal_row_bytes(&serialized);
+            tmp.write_all(&row).map_err(|err| WalError::Io {
                 path: tmp_path.clone(),
                 source_message: err.to_string(),
             })?;
-            new_bytes += serialized.len() as u64 + 1;
+            new_bytes += row.len() as u64;
             new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
             Ok(())
         };
@@ -1568,7 +1584,7 @@ fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalErro
 }
 
 #[derive(Debug, Default)]
-struct WalValidationState {
+pub(crate) struct WalValidationState {
     previous_seq: Option<u64>,
     next_seq: u64,
     last_chain_hash: Option<String>,
@@ -1578,7 +1594,7 @@ struct WalValidationState {
 /// Parse and validate one exact on-disk row before it may be drained or used
 /// by an ACK transaction. Re-running this check for snapshots/truncation is
 /// deliberate: startup validation cannot protect against later disk mutation.
-fn validate_wal_line(
+pub(crate) fn validate_wal_line(
     line: &str,
     line_num: u64,
     state: &mut WalValidationState,
@@ -1857,6 +1873,70 @@ mod wal_tests {
         details.insert("seq".to_string(), serde_json::json!(seq));
         details.insert("prior_sha256_hex".to_string(), serde_json::json!(prior));
         entry.event_canonical_json = crate::manifest::canonical_json::canonicalize(&event).unwrap();
+    }
+
+    /// Structural tripwire (LINUX-WAL-OTHER-ROW-WRITERS-01): fails if any of
+    /// the common spellings of a bare newline write reappears anywhere in this
+    /// file. It is a regression tripwire for the row writers that now build
+    /// their rows with `wal_row_bytes`, not a proof that every possible
+    /// spelling is caught (a newline written through an unlisted form would
+    /// pass). The needles are escaped string literals on purpose: written as
+    /// raw strings they would match this test's own source and fail forever.
+    #[test]
+    fn no_wal_writer_writes_the_row_newline_separately() {
+        let source = include_str!("audit.rs");
+        let separate_newline_writes = [
+            "write_all(b\"\\n\")",
+            "write(b\"\\n\")",
+            "write_all(&[b'\\n'])",
+            "\"\\n\".as_bytes()",
+            // Split so this test's own source does not contain the macro name.
+            concat!("writel", "n!("),
+        ];
+        for needle in separate_newline_writes {
+            assert_eq!(
+                source.matches(needle).count(),
+                0,
+                "`{needle}` found in audit.rs: build WAL rows with wal_row_bytes (or, for a deliberate \
+                 test fixture, write the bytes another way and say why)"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_row_bytes_is_one_buffer_ending_in_exactly_one_newline() {
+        // The row a WAL append writes must be the serialized entry plus
+        // exactly one trailing newline, produced as a single buffer rather
+        // than a body write followed by a separate newline write: a death
+        // between two writes leaves a complete row with no trailing newline.
+        // `validate_wal_line` still parses that row fine (`str::lines()`
+        // yields it as an ordinary line), but it always credits
+        // `line.len() + 1` bytes for it — one byte MORE than the file
+        // actually has — so `open_with_cap`'s `opened_len != bytes` check
+        // refuses to open on the next boot.
+        let serialized = r#"{"seq":1,"event_canonical_json":"{}"}"#;
+        let row = wal_row_bytes(serialized);
+
+        assert_eq!(
+            row.len(),
+            serialized.len() + 1,
+            "the row is exactly the serialized bytes plus one newline byte, nothing more"
+        );
+        assert_eq!(
+            row.last().copied(),
+            Some(b'\n'),
+            "the row must end in a newline"
+        );
+        assert_eq!(
+            row.iter().filter(|&&b| b == b'\n').count(),
+            1,
+            "the row must contain exactly one newline for an input with none"
+        );
+        assert_eq!(
+            &row[..row.len() - 1],
+            serialized.as_bytes(),
+            "everything before the trailing newline must be exactly the serialized entry"
+        );
     }
 
     #[test]

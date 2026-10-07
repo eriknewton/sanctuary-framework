@@ -264,6 +264,10 @@ impl AcquiredComponent for ThreadBackedComponent {
         // whole process; detaching here would let a successor acquire the host
         // lock while the old NFQUEUE/watcher still owns resources.
         self.stop.store(true, Ordering::SeqCst);
+        // The join is unconditional, never a detach. The exit gate relies on it:
+        // a verdict fail-stop that loses the gate parks forever, which is safe
+        // only while `main` cannot return past a live worker. Must match
+        // `terminate_with_decided_code` in `src/exit_guard.rs`.
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }

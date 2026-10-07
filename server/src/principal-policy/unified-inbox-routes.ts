@@ -19,6 +19,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
+import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
@@ -52,6 +56,9 @@ export interface UnifiedInboxRouterDeps {
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
   prefsStore?: UnifiedInboxPrefsStore;
+  // Required: each dashboard instance owns its flight map (must match the required
+  // `readFlights` option in src/dashboard/read-response.ts).
+  readFlightMap: DashboardReadFlightMap;
   auditLog?: import("../operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;
@@ -191,11 +198,20 @@ export async function handleUnifiedInboxRoute(
         return true;
       }
       if (method === "GET") {
-        writeJSON(res, 200, {
-          ok: true,
-          data: { filters: await deps.prefsStore.load() },
+        return respondWithBoundedDashboardRead({
+          route: "unified_inbox_prefs",
+          req,
+          res,
+          operation: "get_unified_inbox_prefs",
+          readFlights: deps.readFlightMap,
+          produce: async () => ({
+            status: 200,
+            body: {
+              ok: true,
+              data: { filters: await deps.prefsStore!.load() },
+            },
+          }),
         });
-        return true;
       }
       if (method === "PUT") {
         const body = await readJsonBody(req);

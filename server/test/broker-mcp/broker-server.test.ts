@@ -1,3 +1,4 @@
+// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
 /**
  * Broker MCP Server Tests
  *
@@ -59,6 +60,8 @@ async function makeServer() {
   const auditLog = new AuditLog(storage, masterKey);
   const backend = makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" });
   const broker = new Broker({
+    // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+    surrogateBoundSecrets: new Set<string>(),
     backend,
     auditLog,
     grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -148,6 +151,8 @@ describe("Broker MCP Server", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ" }),
         auditLog,
         grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -232,6 +237,8 @@ describe("Broker MCP Server", () => {
         );
       };
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend,
         auditLog,
         grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
@@ -292,6 +299,8 @@ describe("Broker MCP Server", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const broker = new Broker({
+        // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+        surrogateBoundSecrets: new Set<string>(),
         backend: makeFakeBackend({ gmail_oauth: "SECRET-VALUE-XYZ", slack_token: "SLACK-SECRET-XYZ" }),
         auditLog,
         grants: [

@@ -75,6 +75,11 @@ import {
 } from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import { isRemoteDashboardBinding } from "../dashboard/remote-binding.js";
+import {
+  createDashboardReadFlightMap,
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
 // Dashboard-fold PR-3 (ratified decision 7): the mobile companion PWA moves
 // onto the ONE surviving surface. The shell/manifest/service-worker are
 // tokenless static assets with client-side auth; see dashboard/mobile.ts for
@@ -110,6 +115,8 @@ import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import { denyForbidden, denyForbiddenWithRequestId } from "../v1/http.js";
 import {
+  buildHome,
+  buildLockedAuditPostureUnavailableBody,
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
@@ -290,6 +297,10 @@ import {
   UNIFIED_INBOX_API_PREFIX,
   UNIFIED_INBOX_RETENTION_API_PREFIX,
 } from "./unified-inbox-routes.js";
+import {
+  isStandaloneOptionalPanelPath,
+  writeDashboardModeNotServed,
+} from "../dashboard/standalone-mode-signal.js";
 import type { UnifiedInboxPrefsStore } from "./unified-inbox-prefs-store.js";
 import {
   UnifiedInboxRetentionPolicy,
@@ -977,6 +988,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private postureStreamRegistry: PostureStreamRegistry =
     createPostureStreamRegistry();
+  private readonly readFlightMap: DashboardReadFlightMap =
+    createDashboardReadFlightMap();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
   private dashboardStreamClients: Map<SSEClient, DashboardAuthAdmission> = new Map();
@@ -2046,6 +2059,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(this.unifiedInboxPrefsStore
           ? { prefsStore: this.unifiedInboxPrefsStore }
           : {}),
+        readFlightMap: this.readFlightMap,
         ...(this.auditLog
           ? { auditLog: this.auditLog }
           : {}),
@@ -2243,97 +2257,126 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.v11Bindings?.fortressId ??
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
-    // Slice R + P: load the pinned producer key once (cached) before serving so
-    // the readers can re-verify producer signatures. `present` → activate the
-    // signed close; `absent` → channel basis (honest macOS / pre-provision);
-    // `unreadable` → fail honestly (the readers force non-green via
-    // `producerKeyExpectedButUnavailable`), never the channel basis.
-    await this.ensureProducerKeyLoaded();
-    await this.ensureBrokerProducerKeyLoaded();
-    const load = this._producerKeyLoad;
-    const brokerLoad = this._brokerProducerKeyLoad;
-    // Recognition precursor: resolve the composition render-gate flag via the
-    // canonical resolver (default-off). The fortress config carries no composition
-    // input today, so this resolves to the honest `false` default; when an input
-    // is added later the same resolver picks it up without a shape change. This is
-    // CONFIG, not evidence - the composition endpoint exposes only this boolean.
-    const compositionEnabled =
-      resolveCompositionConfig().composition_enabled;
-    const deps: PostureRouteDeps = {
-      auditLog: this.auditLog ?? null,
-      originMachine,
-      platform: process.platform,
-      compositionEnabled,
-      // Recognition panel (P5) impure sources, resolved lazily per request so
-      // post-unlock wiring is observed. Both are LOCAL reads only: a count of
-      // persisted bridge commitments, and the local attestation-store evidence
-      // (COUNTS, never a score). They are only consulted when the route builds
-      // the panel (composition-enabled); the panel is absent otherwise.
-      countBridgeCommitments: () => this.countBridgeCommitments(),
-      gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
-      listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
-      // Fleet Console Slice 1: present the federation-backed fleet roster over
-      // the SAME live `V1FederationDeps` (and the SAME `isNodeRevoked`
-      // projection) the `/v1` federation endpoints use, so the panel's trust
-      // verdict is the federation layer's, never re-derived from a response
-      // shape. The eviction serial is fleet context only. Read-only: this builds
-      // a presentation object and drives no mutation, exposes no key material.
-      //
-      // Fleet control plane PR-B: apply the paid NODE-COUNT cap here, on the
-      // DURABLE daemon roster (`_federationState.nodes`, persisted by #888). The
-      // cap is resolved fail-closed from the signed, master-MAC'd activation
-      // record re-verified against the pinned operator issuer key at the CURRENT
-      // clock (so expiry/grace are honored live). When over the entitled count,
-      // `applyFleetCap` drops the excess nodes from THIS CENTRAL roster only -
-      // every dropped node keeps its free local wall, its local dashboard, kill
-      // safety, and free policy-push (this path has no wall/enforcement code and
-      // preserves the `policy_distribution` rail verbatim). A resolve failure can
-      // only ever REMOVE paid management capacity (community floor), never grant
-      // it and never touch a node's security. The count that drives the cap is
-      // `summary.admitted` (active, non-revoked), already computed by
-      // `buildFleetRoster` via the shared `isNodeRevoked` projection.
-      // Dashboard-fold PR-1: an injected provider (setDependencies, wrap-reuse
-      // path — a boot with no live federation daemon reads the at-rest fortress
-      // records) overrides the live daemon roster; absent, byte-identical to
-      // the pre-fold behavior below.
-      fleetRoster:
-        this.injectedFleetRoster ??
-        (async () => {
-          const roster = buildFleetRoster(this.buildV1FederationDeps(), {
-            evictionSerial: this._federationState.evictionMaxSerial,
-            operatorPolicy: this._federationState.operatorPolicy,
-          });
-          const cap = await this.resolveFleetCap();
-          return applyFleetCap(roster, cap).roster;
-        }),
-      resolvePinnedProducerKey:
-        this.injectedResolvePinnedProducerKey ??
-        (() => (load?.status === "present" ? load.keyB64url : null)),
-      producerKeyExpectedButUnavailable: this.injectedResolvePinnedProducerKey
-        ? this.injectedProducerKeyExpectedButUnavailable
-        : load?.status === "unreadable",
-      resolveBrokerPinnedProducerKey: () =>
-        brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
-      brokerProducerKeyExpectedButUnavailable:
-        brokerLoad?.status === "unreadable",
-      resolveProtectionClaimSubject: () =>
-        this.resolveProtectionClaimSubject(),
-      resolveEnforcementAvailability:
-        this.injectedResolveEnforcementAvailability ??
-        (() => this.resolveEnforcementAvailability()),
-      resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
-      // Wire the shared registry so the SSE live-refresh stream is available and
-      // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
-      // (no new data, no new green paths) on a cadence plus a heartbeat.
-      streamRegistry: this.postureStreamRegistry,
-      // S5-P: the exclusive-egress posture provider (fail-closed resolve lives
-      // in the route layer; this passes the raw provider through so post-wiring
-      // is observed lazily per request). Null until S5-6 attaches a producer.
-      ...(this._exclusiveEgressPostureProvider
-        ? { exclusiveEgressPosture: this._exclusiveEgressPostureProvider }
-        : {}),
+    const auditLog = this.auditLog ?? null;
+    const buildDeps = async (): Promise<PostureRouteDeps> => {
+      // Slice R + P: load the pinned producer key once (cached) before serving so
+      // the readers can re-verify producer signatures. `present` → activate the
+      // signed close; `absent` → channel basis (honest macOS / pre-provision);
+      // `unreadable` → fail honestly (the readers force non-green via
+      // `producerKeyExpectedButUnavailable`), never the channel basis.
+      await this.ensureProducerKeyLoaded();
+      await this.ensureBrokerProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      const brokerLoad = this._brokerProducerKeyLoad;
+      // Recognition precursor: resolve the composition render-gate flag via the
+      // canonical resolver (default-off). The fortress config carries no composition
+      // input today, so this resolves to the honest `false` default; when an input
+      // is added later the same resolver picks it up without a shape change. This is
+      // CONFIG, not evidence - the composition endpoint exposes only this boolean.
+      const compositionEnabled =
+        resolveCompositionConfig().composition_enabled;
+      return {
+        auditLog,
+        originMachine,
+        readFlightMap: this.readFlightMap,
+        platform: process.platform,
+        compositionEnabled,
+        // Recognition panel (P5) impure sources, resolved lazily per request so
+        // post-unlock wiring is observed. Both are LOCAL reads only: a count of
+        // persisted bridge commitments, and the local attestation-store evidence
+        // (COUNTS, never a score). They are only consulted when the route builds
+        // the panel (composition-enabled); the panel is absent otherwise.
+        countBridgeCommitments: () => this.countBridgeCommitments(),
+        gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
+        listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+        // Fleet Console Slice 1: present the federation-backed fleet roster over
+        // the SAME live `V1FederationDeps` (and the SAME `isNodeRevoked`
+        // projection) the `/v1` federation endpoints use, so the panel's trust
+        // verdict is the federation layer's, never re-derived from a response
+        // shape. The eviction serial is fleet context only. Read-only: this builds
+        // a presentation object and drives no mutation, exposes no key material.
+        //
+        // Fleet control plane PR-B: apply the paid NODE-COUNT cap here, on the
+        // DURABLE daemon roster (`_federationState.nodes`, persisted by #888). The
+        // cap is resolved fail-closed from the signed, master-MAC'd activation
+        // record re-verified against the pinned operator issuer key at the CURRENT
+        // clock (so expiry/grace are honored live). When over the entitled count,
+        // `applyFleetCap` drops the excess nodes from THIS CENTRAL roster only -
+        // every dropped node keeps its free local wall, its local dashboard, kill
+        // safety, and free policy-push (this path has no wall/enforcement code and
+        // preserves the `policy_distribution` rail verbatim). A resolve failure can
+        // only ever REMOVE paid management capacity (community floor), never grant
+        // it and never touch a node's security. The count that drives the cap is
+        // `summary.admitted` (active, non-revoked), already computed by
+        // `buildFleetRoster` via the shared `isNodeRevoked` projection.
+        // Dashboard-fold PR-1: an injected provider (setDependencies, wrap-reuse
+        // path — a boot with no live federation daemon reads the at-rest fortress
+        // records) overrides the live daemon roster; absent, byte-identical to
+        // the pre-fold behavior below.
+        fleetRoster:
+          this.injectedFleetRoster ??
+          (async () => {
+            const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+              evictionSerial: this._federationState.evictionMaxSerial,
+              operatorPolicy: this._federationState.operatorPolicy,
+            });
+            const cap = await this.resolveFleetCap();
+            return applyFleetCap(roster, cap).roster;
+          }),
+        resolvePinnedProducerKey:
+          this.injectedResolvePinnedProducerKey ??
+          (() => (load?.status === "present" ? load.keyB64url : null)),
+        producerKeyExpectedButUnavailable: this.injectedResolvePinnedProducerKey
+          ? this.injectedProducerKeyExpectedButUnavailable
+          : load?.status === "unreadable",
+        resolveBrokerPinnedProducerKey: () =>
+          brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+        brokerProducerKeyExpectedButUnavailable:
+          brokerLoad?.status === "unreadable",
+        resolveProtectionClaimSubject: () =>
+          this.resolveProtectionClaimSubject(),
+        resolveEnforcementAvailability:
+          this.injectedResolveEnforcementAvailability ??
+          (() => this.resolveEnforcementAvailability()),
+        resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
+        // Wire the shared registry so the SSE live-refresh stream is available and
+        // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
+        // (no new data, no new green paths) on a cadence plus a heartbeat.
+        streamRegistry: this.postureStreamRegistry,
+        // S5-P: the exclusive-egress posture provider (fail-closed resolve lives
+        // in the route layer; this passes the raw provider through so post-wiring
+        // is observed lazily per request). Null until S5-6 attaches a producer.
+        ...(this._exclusiveEgressPostureProvider
+          ? { exclusiveEgressPosture: this._exclusiveEgressPostureProvider }
+          : {}),
+      };
     };
-    return handlePostureRoute(deps, req, res, url, method);
+    if (method === "GET" && url.pathname === `${POSTURE_API_PREFIX}/home`) {
+      if (auditLog === null) {
+        res.writeHead(503, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify(buildLockedAuditPostureUnavailableBody(originMachine)));
+        return true;
+      }
+      return respondWithBoundedDashboardRead({
+        route: "posture_home",
+        req,
+        res,
+        operation: "get_posture_home",
+        readFlights: this.readFlightMap,
+        originMachine,
+        produce: async () => {
+          const deps = await buildDeps();
+          return {
+            status: 200,
+            body: await buildHome(deps),
+          };
+        },
+      });
+    }
+    return handlePostureRoute(await buildDeps(), req, res, url, method);
   }
 
   /**
@@ -5572,8 +5615,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   can exit 0 and KeepAlive treats it as a successful run (no churn). When
    *   false/omitted (interactive `sanctuary dashboard`), EADDRINUSE still
    *   prints the loud operator banner and rejects.
+   * @param opts.silentAddrInUse F5 (2026-09-24): when true, suppresses the
+   *   "standing down (single-owner)" stderr line this same EADDRINUSE branch
+   *   would otherwise print alongside `exitCleanOnAddrInUse`. Only a caller
+   *   that does NOT actually stand down (it keeps running with a different
+   *   approval channel, rather than exiting) should pass this, so it prints
+   *   its own accurate message instead. Ignored when `exitCleanOnAddrInUse`
+   *   is false/omitted. Never passed by the supervised LaunchAgent path
+   *   (dashboard-standalone.ts): that path's message is unchanged.
    */
-  async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
+  async start(opts?: {
+    exitCleanOnAddrInUse?: boolean;
+    silentAddrInUse?: boolean;
+  }): Promise<void> {
     if (this.startPromise) return this.startPromise;
     if (this.httpServer) return;
     this._addrInUse = false;
@@ -5587,6 +5641,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private async startHttpServer(opts?: {
     exitCleanOnAddrInUse?: boolean;
+    silentAddrInUse?: boolean;
   }): Promise<void> {
     // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
     // over the wire is a credential-theft vector. The operator can opt
@@ -5648,10 +5703,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             // loses, quietly.
             if (opts?.exitCleanOnAddrInUse) {
               this._addrInUse = true;
-              process.stderr.write(
-                `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
-                  `instance; standing down (single-owner).\n\n`,
-              );
+              if (!opts?.silentAddrInUse) {
+                process.stderr.write(
+                  `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
+                    `instance; standing down (single-owner).\n\n`,
+                );
+              }
               resolve();
               return;
             }
@@ -6307,7 +6364,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // distinguishable error → no membership/enabled-state oracle). The counter
       // is released in a finally after the handler resolves.
       //
-      // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
+      // DEBT(PRINCIPAL-POLICY-FEDERATION-RATE-LIMIT) (Federation P1): the per-/64 rate limit + this concurrent-verify
       // ceiling bound CPU spent on crypto verification, but do NOT bound a
       // slow-loris socket-exhaustion attack: there is no listener read/idle
       // timeout and no max-connection bound. `v1/http.ts` readJsonBody has no
@@ -6852,6 +6909,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       if (!this.checkRateLimit(req, res, "general")) return;
     }
 
+    // Standalone dashboards do not construct the unified-inbox, auto-trigger,
+    // or honeypot management runtimes here. These exact v1.1 panel reads must
+    // get a positive mode signal, not a bare 404, so the client can say the
+    // panel is unavailable in standalone mode without offering a futile Retry.
+    // SECURITY: this mode signal is intentionally AFTER the shared auth
+    // admission and general rate limiter above; otherwise an anonymous caller
+    // could distinguish standalone from hosted mode before proving operator
+    // access. Path set must match STANDALONE_OPTIONAL_PANEL_PATHS in
+    // server/src/dashboard/standalone-mode-signal.ts.
+    if (
+      this._standaloneMode &&
+      method === "GET" &&
+      isStandaloneOptionalPanelPath(url.pathname)
+    ) {
+      writeDashboardModeNotServed(res, "standalone");
+      return;
+    }
+
     try {
       if (method === "GET" && url.pathname === "/fleet") {
         this.serveFleetSwitcher(res);
@@ -6951,7 +7026,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
         this.handleAuditLog(url, res);
       } else if (method === "GET" && url.pathname === "/api/sovereignty") {
-        this.handleSovereignty(res);
+        this.handleSovereignty(req, res);
       } else if (method === "GET" && url.pathname === "/api/identity") {
         this.handleIdentity(res);
       } else if (method === "GET" && url.pathname === "/api/handshakes") {
@@ -8650,7 +8725,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Never throws into the request path: any failure resolves to an honest error
    * body or an `unknown` wall posture, never a fabricated green.
    */
-  private handleSovereignty(res: ServerResponse): void {
+  private handleSovereignty(req: IncomingMessage, res: ServerResponse): void {
     if (!this.shrOpts) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "SHR generator not available" }));
@@ -8669,29 +8744,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Read the LIVE Castle Wall arm-state from the canonical evidence-gated
     // shaper (never the SHR capability), then assemble the honest payload. The
     // shaper is async, so the handler completes on the promise - mirroring
-    // handleSnapshot - and always answers (an honest `unknown` posture on any
-    // failure, never a thrown 500 that paints green by omission).
-    this.buildStatusCastleWall()
-      .then((wall) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(buildSovereigntyRoutePayload({
-          shr,
-          wall,
-          federationPosture,
-          configLoaded: this._sanctuaryConfig != null,
-        })));
-      })
-      .catch((err) => {
-        logCaughtError(
-          err,
-          { route: "/api/sovereignty", operation: "get_sovereignty" },
-          { status: 500 },
-        );
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "sovereignty_failed" }));
-        }
-      });
+    // handleSnapshot - and failed composition now answers explicit unavailable
+    // rather than a thrown 500 or fabricated green.
+    void respondWithBoundedDashboardRead({
+      route: "sovereignty",
+      req,
+      res,
+      operation: "get_sovereignty",
+      readFlights: this.readFlightMap,
+      produce: async () => {
+        const wall = await this.buildStatusCastleWall();
+        return {
+          status: 200,
+          body: buildSovereigntyRoutePayload({
+            shr,
+            wall,
+            federationPosture,
+            configLoaded: this._sanctuaryConfig != null,
+          }),
+        };
+      },
+    });
   }
 
   private handleIdentity(res: ServerResponse): void {

@@ -2657,7 +2657,7 @@ export function decideDsclAttributeRead(
   return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
 }
 
-function realAccountProvisionOps() {
+export function realAccountProvisionOps() {
   const dsclReadResult = async (args: readonly string[]): Promise<DsclReadResult> => {
     try {
       const { stdout, stderr } = await execFileAsync("/usr/bin/dscl", [...args]);

@@ -11,10 +11,14 @@
  * Security invariants:
  * - Every proxied call passes through injection scan + gate + audit (no bypass path)
  * - Denied calls return a generic denial message (same as native Sanctuary denials)
- * - Upstream errors are passed through to the agent unmodified
+ * - Upstream-bearing responses release only after completed screening and critical audit
  * - Native sanctuary/* tools are never affected by the proxy layer
  */
 
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { ResponseScreen } from "./response-screen.js";
+import type { ResponseReservation } from "./response-runtime.js";
+import { validateResponse, normalizeScreenedResponse, rehydrationBudget, RequestResponseBindings, type CanonicalResponse } from "./response-bounds.js";
 import type { ToolDefinition, ToolHandler } from "../router.js";
 import { toolResult } from "../router.js";
 import type { ClientManager } from "./client-manager.js";
@@ -60,7 +64,8 @@ export interface ProxyRouterOptions {
    *   are honored by the engine itself.
    */
   privacyEnforcement?: {
-    engine: LocalPrivacyEngine;
+    /** A factory scopes vault lookup caches to the admitted request. */
+    engine: LocalPrivacyEngine | (() => LocalPrivacyEngine);
     policyResolver: (
       server: string,
       identityId: string | undefined
@@ -94,8 +99,11 @@ export class ProxyRouter {
     clientManager: ClientManager,
     injectionDetector: InjectionDetector,
     auditLog: AuditLog,
+    private readonly responseScreen: ResponseScreen,
     options?: ProxyRouterOptions
   ) {
+    // Proxy registration without a live response scanner would silently remove the release gate.
+    responseScreen.assertReady();
     this.clientManager = clientManager;
     this.injectionDetector = injectionDetector;
     this.auditLog = auditLog;
@@ -167,12 +175,22 @@ export class ProxyRouter {
    * The handler runs the full enforcement chain before forwarding.
    */
   private createHandler(serverName: string, toolName: string): ToolHandler {
-    return async (args: Record<string, unknown>) => {
+    return async (args: Record<string, unknown>, _caller, context) => {
       const proxyName = `proxy/${serverName}/${toolName}`;
       const start = Date.now();
       const tier = this.getTierForTool(serverName, toolName);
 
+      let lease: ResponseReservation | undefined;
+      let withholdReason = "withhold_capacity";
+      let upstreamTimedOut = false;
+      const cancel = (): void => lease?.cancel();
       try {
+        // Admission precedes governor/cache access and all upstream work.
+        lease = this.responseScreen.session.reserve();
+        withholdReason = "withhold_preparation_failure";
+        context?.signal?.addEventListener("abort", cancel, { once: true });
+        if (context?.signal?.aborted) lease.cancel();
+        lease.assertLive();
         // Step 1: Injection detection
         const injectionResult = this.injectionDetector.scan(proxyName, args);
         if (injectionResult.flagged && injectionResult.recommendation === "block") {
@@ -276,46 +294,8 @@ export class ProxyRouter {
           }
         }
 
-        // Step 3: Governor check (rate, volume, duplicate, lifetime)
-        if (this.options.governor) {
-          const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
-
-          if (!govResult.allowed) {
-            await this.auditLog.appendCritical({
-              layer: "l2",
-              operation: `proxy_governor_blocked:${proxyName}`,
-              identity_id: "system",
-              result: "failure",
-              details: {
-                server: serverName,
-                tool: toolName,
-                tier,
-                reason: govResult.reason,
-                latency_ms: Date.now() - start,
-              },
-            });
-
-            this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
-            return toolResult({
-              error: "Operation not permitted",
-              proxy: true,
-              governor_reason: govResult.reason,
-            });
-          }
-
-          // Duplicate cached — return cached result without forwarding
-          if (govResult.reason === "duplicate_cached" && govResult.cached_result !== undefined) {
-            void this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
-              server: serverName,
-              tool: toolName,
-              tier,
-              cached: true,
-              latency_ms: Date.now() - start,
-            });
-
-            return toolResult(govResult.cached_result ?? {});
-          }
-        }
+        // Cancellation during an awaited gate must never authorize a later upstream dispatch.
+        lease.assertLive();
 
         // Step 3.5: v1.1 remote-bound privacy enforcement.
         // When configured, route the outbound payload through the
@@ -326,6 +306,9 @@ export class ProxyRouter {
         let privacyPolicy: PrivacyPolicy | null = null;
         let privacyDestination: PrivacyDestinationCategory = "tool-api";
         let outboundFiltered = false;
+        const responseBindings = new RequestResponseBindings(() => lease!.assertLive());
+        const configuredEngine = this.options.privacyEnforcement?.engine;
+        const privacyEngine = typeof configuredEngine === "function" ? configuredEngine() : configuredEngine;
         if (this.options.privacyEnforcement) {
           const serverConfig = this.clientManager.getServerConfig(serverName);
           privacyDestination =
@@ -334,10 +317,10 @@ export class ProxyRouter {
           const identityId = serverConfig?.privacy_identity_id;
           let resolverFailed = false;
           try {
-            privacyPolicy = await this.options.privacyEnforcement.policyResolver(
+            privacyPolicy = await lease.wait(this.options.privacyEnforcement.policyResolver(
               serverName,
               identityId
-            );
+            ));
           } catch {
             // Resolver rejection means the vault was unreachable or a decrypt
             // failed (an INFRA outage, not a missing/unbound policy). Passing
@@ -380,15 +363,17 @@ export class ProxyRouter {
             });
           }
 
-          const decision = await this.options.privacyEnforcement.engine.filterOutbound({
+          const decision = await lease.wait(privacyEngine!.filterOutbound({
             payload: filteredArgs,
+            responseBindings,
             policy: privacyPolicy,
             identity_id: identityId,
             agent_id: `proxy:${serverName}`,
             destination_category: privacyDestination,
             audit_log: this.auditLog,
-          });
+          }));
 
+          responseBindings.assertComplete();
           if (decision.status === "denied") {
             await this.auditLog.appendCritical({
               layer: "l2",
@@ -423,121 +408,136 @@ export class ProxyRouter {
           }
         }
 
-        // Step 4: Forward to upstream server
-        const result = await this.callWithTimeout(
-          serverName,
-          toolName,
-          filteredArgs,
-          UPSTREAM_CALL_TIMEOUT_MS
-        );
-
-        const latencyMs = Date.now() - start;
-
-        // Step 5: Record result for duplicate caching
-        if (this.options.governor) {
-          this.options.governor.recordResult(serverName, toolName, filteredArgs, result);
-        }
-
-        // Step 6: Audit log the successful call
-        await this.auditLog.appendCritical({
-          layer: "l2",
-          operation: `proxy_call:${proxyName}`,
-          identity_id: "system",
-          result: "success",
-          details: {
-            event_type: "proxy.call",
-            server: serverName,
-            tool: toolName,
-            tier,
-            decision: "allowed",
-            latency_ms: latencyMs,
-          },
-        });
-
-        this.notifyProxyCall(proxyName, serverName, "allowed", undefined, tier);
-
-        // Step 7: v1.1 rehydration of upstream response.
-        // Only attempts rehydration if the outbound was filtered AND a policy
-        // is bound. Engine fails closed on denied rehydration (placeholders
-        // remain in the response unchanged); audit captures the decision.
-        if (outboundFiltered && this.options.privacyEnforcement && privacyPolicy) {
-          const serverConfig = this.clientManager.getServerConfig(serverName);
-          const identityId = serverConfig?.privacy_identity_id;
-          const rehydrated = await this.options.privacyEnforcement.engine.rehydrateResponse({
-            response: result,
-            policy: privacyPolicy,
-            identity_id: identityId,
-            agent_id: `proxy:${serverName}`,
-            destination_category: privacyDestination,
-            audit_log: this.auditLog,
-          });
-          if (rehydrated.status === "rehydrated") {
-            return this.normalizeResponse(
-              rehydrated.response as { content: Array<{ type: string; text?: string; [key: string]: unknown }> }
-            );
+        const reservation = lease;
+        const releaseUpstreamResult = async (value: unknown, cached = false, error?: { error: string; error_type: string }) => {
+          withholdReason = "withhold_scan_failure";
+          reservation.observe();
+          reservation.assertLive();
+          validateResponse(value);
+          const canonical = value;
+          let prepared: CanonicalResponse = canonical;
+          if (outboundFiltered && privacyEngine && privacyPolicy) {
+            const rehydrated = await reservation.wait(privacyEngine.rehydrateResponse({
+              response: canonical, policy: privacyPolicy,
+              identity_id: this.clientManager.getServerConfig(serverName)?.privacy_identity_id,
+              agent_id: `proxy:${serverName}`, destination_category: privacyDestination,
+              audit_log: this.auditLog,
+              // Must match incremental accounting in operational/privacy-core.ts.
+              responseBudget: rehydrationBudget(() => reservation.assertLive(), placeholder => responseBindings.resolve(placeholder)),
+            }));
+            // A denial grants no authority to expand: only the successful result may replace canonical bytes.
+            if (rehydrated.status === "rehydrated") {
+              validateResponse(rehydrated.response);
+              prepared = rehydrated.response;
+            }
           }
-          // Denied rehydration: caller sees placeholders unchanged.
-          return this.normalizeResponse(
-            (rehydrated.response as { content: Array<{ type: string; text?: string; [key: string]: unknown }> })
-          );
-        }
-
-        // Return the upstream response, coerced to standard text format
-        return this.normalizeResponse(result);
-      } catch (err) {
-        const latencyMs = Date.now() - start;
-        const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
-        const upstreamUnavailable = err instanceof UpstreamUnavailableError;
-
-        // SEC-050: Sanitize upstream error messages to prevent info disclosure
-        const sanitizeError = (msg: string): string => {
-          // Truncate to 200 chars
-          let safe = msg.substring(0, 200);
-          // Remove file paths
-          safe = safe.replace(/\/[^\s]+/g, '[path-redacted]');
-          // Remove connection strings
-          safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, '[connection-redacted]');
-          return safe;
+          const delivered = normalizeScreenedResponse(prepared);
+          // Joining without a separator detects instructions split across delivered block boundaries.
+          const completion = await reservation.wait(this.responseScreen.screen(delivered.content.map(c => c.text).join(""), reservation));
+          withholdReason = "withhold_audit_failure";
+          await reservation.wait(this.auditLog.appendCritical({
+            layer: "l2", operation: `proxy_call:${proxyName}`, identity_id: "system",
+            result: error ? "failure" : "success",
+            details: {
+              event_type: "proxy.call", server: serverName, tool: toolName, tier,
+              decision: error ? "error" : "allowed", reason: completion.label,
+              ...error,
+              signal_count: completion.signalCount, latency_ms: Date.now() - start,
+            },
+          }));
+          reservation.assertLive();
+          // Must precede CallGovernor.recordResult in operational/call-governor.ts: cache has no scan tokens.
+          if (!cached && !error) this.options.governor?.recordResult(serverName, toolName, filteredArgs, canonical);
+          this.notifyProxyCall(proxyName, serverName, error ? "error" : "allowed", error?.error ?? completion.label, tier);
+          return delivered; // These exact bytes were screened; no raw envelope or later rewriting is allowed.
         };
 
-        const errorMessage = sanitizeError(rawErrorMessage);
+        // Step 3: Governor check (rate, volume, duplicate, lifetime)
+        if (this.options.governor) {
+          const govResult = this.options.governor.check(serverName, toolName, filteredArgs);
 
-        try {
-          await this.auditLog.appendCritical({
-            layer: "l2",
-            operation: `proxy_call:${proxyName}`,
-            identity_id: "system",
-            result: "failure",
-            details: {
-              event_type: "proxy.call",
+          if (!govResult.allowed) {
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: `proxy_governor_blocked:${proxyName}`,
+              identity_id: "system",
+              result: "failure",
+              details: {
+                server: serverName,
+                tool: toolName,
+                tier,
+                reason: govResult.reason,
+                latency_ms: Date.now() - start,
+              },
+            });
+
+            this.notifyProxyCall(proxyName, serverName, "blocked", govResult.reason, tier);
+            return toolResult({
+              error: "Operation not permitted",
+              proxy: true,
+              governor_reason: govResult.reason,
+            });
+          }
+
+          // Duplicate cached — return cached result without forwarding
+          if (govResult.reason === "duplicate_cached" && govResult.cached_result !== undefined) {
+            void this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
               server: serverName,
               tool: toolName,
               tier,
-              decision: "error",
-              error: errorMessage,
-              error_type: upstreamUnavailable ? "UpstreamUnavailableError" : "upstream_error",
-              latency_ms: latencyMs,
-            },
-          });
-        } catch {
-          // Fail closed: never forward or retry after critical audit failure.
+              cached: true,
+              latency_ms: Date.now() - start,
+            });
+
+            return await releaseUpstreamResult(govResult.cached_result, true);
+          }
         }
 
-        this.notifyProxyCall(proxyName, serverName, "error", errorMessage, tier);
-
-        // Pass upstream errors through to the agent (sanitized)
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              error: errorMessage,
-              code: upstreamUnavailable ? "upstream_unavailable" : "upstream_error",
-              proxy: true,
-              server: serverName,
-              tool: toolName,
-            }),
-          }],
-        };
+        let result: unknown;
+        let upstreamError: { error: string; error_type: string } | undefined;
+        withholdReason = "withhold_upstream_failure";
+        try {
+          result = await this.callWithTimeout(serverName, toolName, filteredArgs, UPSTREAM_CALL_TIMEOUT_MS, reservation, () => { upstreamTimedOut = true; });
+        } catch (err) {
+          reservation.assertLive(); // Timeout/cancellation is terminal, never a sanitized fallback release.
+          // SDK shape failures are incomplete content validation, not releasable upstream error envelopes.
+          if (err instanceof Error && (err.name === "ZodError" || err.name === "$ZodError" ||
+            (err instanceof McpError && (err.code === ErrorCode.InvalidParams || err.code === ErrorCode.InvalidRequest)))) {
+            // SDK protocol failures can precede content scanning; never copy their diagnostic payload.
+            withholdReason = err instanceof McpError ? "withhold_upstream_failure" : "withhold_scan_failure";
+            throw err;
+          }
+          const upstreamUnavailable = err instanceof UpstreamUnavailableError;
+          const rawErrorMessage = err instanceof Error ? err.message : "Unknown upstream error";
+          const MAX_ERROR_UTF16 = 200; // Existing sanitized error truncation contract.
+          let safe = rawErrorMessage.substring(0, MAX_ERROR_UTF16);
+          safe = safe.replace(/\/[^\s]+/g, '[path-redacted]');
+          safe = safe.replace(/(?:mongodb|postgres|mysql|redis):\/\/[^\s]+/g, '[connection-redacted]');
+          upstreamError = { error: safe, error_type: upstreamUnavailable ? "UpstreamUnavailableError" : "upstream_error" };
+          result = { content: [{ type: "text", text: JSON.stringify({
+            error: safe, code: upstreamUnavailable ? "upstream_unavailable" : "upstream_error",
+            proxy: true, server: serverName, tool: toolName,
+          }) }] };
+        }
+        return await releaseUpstreamResult(result, false, upstreamError);
+      } catch {
+        // Fixed causes disclose no response bytes, including SDK validation messages.
+        const reason = upstreamTimedOut ? "withhold_upstream_timeout"
+          : lease?.abort.signal.aborted ? "withhold_cancelled" : withholdReason;
+        try {
+          const audit = this.auditLog.appendCritical({
+            layer: "l2", operation: `proxy_call:${proxyName}`, identity_id: "system", result: "failure",
+            details: { event_type: "proxy.call", server: serverName, tool: toolName, tier,
+              decision: "blocked", reason, latency_ms: Date.now() - start },
+          });
+          if (lease) await lease.wait(audit);
+          else await audit; // Admission refusals still leave the existing operator audit row.
+        } catch { /* Audit failure cannot release upstream content. */ }
+        this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
+        return toolResult({ error: "Operation not permitted", proxy: true });
+      } finally {
+        context?.signal?.removeEventListener("abort", cancel);
+        lease?.finish();
       }
     };
   }
@@ -575,68 +575,16 @@ export class ProxyRouter {
     serverName: string,
     toolName: string,
     args: Record<string, unknown>,
-    timeoutMs: number
-  ): Promise<{ content: Array<{ type: string; text?: string; [key: string]: unknown }> }> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`Upstream tool call timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-
-      this.clientManager
-        .callTool(serverName, toolName, args)
-        .then(result => {
-          clearTimeout(timer);
-          resolve(result);
-        })
-        .catch(err => {
-          clearTimeout(timer);
-          reject(err);
-        });
-    });
-  }
-
-  /**
-   * Normalize an upstream response to the standard Sanctuary response format.
-   */
-  private normalizeResponse(
-    result: { content: Array<{ type: string; text?: string; [key: string]: unknown }> }
-  ): { content: Array<{ type: "text"; text: string }> } {
-    // SEC-046: Validate response size before processing
-    const MAX_RESPONSE_SIZE = 1_000_000; // 1MB
-    const MAX_TEXT_BLOCK_SIZE = 100_000; // 100KB per text block
-
-    const responseStr = JSON.stringify(result);
-    if (responseStr.length > MAX_RESPONSE_SIZE) {
-      return toolResult({
-        error: "upstream_response_too_large",
-        max_bytes: MAX_RESPONSE_SIZE,
-      });
-    }
-
-    if (!result.content || !Array.isArray(result.content)) {
-      return toolResult({ upstream_response: result });
-    }
-
-    // Pass through text content directly, with truncation if needed
-    const textContent = result.content
-      .filter(c => c.type === "text" && typeof c.text === "string")
-      .map(c => {
-        // SEC-046: Truncate text blocks to 100KB
-        const text = c.text!;
-        if (text.length > MAX_TEXT_BLOCK_SIZE) {
-          return {
-            type: "text" as const,
-            text: text.substring(0, MAX_TEXT_BLOCK_SIZE) + "\n[response truncated]",
-          };
-        }
-        return { type: "text" as const, text };
-      });
-
-    if (textContent.length > 0) {
-      return { content: textContent };
-    }
-
-    // For non-text content, serialize it as JSON
-    return toolResult({ upstream_response: result.content });
+    timeoutMs: number,
+    reservation: ResponseReservation,
+    onTimeout: () => void,
+  ): Promise<CanonicalResponse> {
+    reservation.assertLive(); // The last check must precede the effect, never just the awaited result.
+    const work = this.clientManager.callTool(serverName, toolName, args);
+    // Receipt remains observed even after the caller has timed out; settlement still owns capacity.
+    void work.then(() => reservation.observe(), () => reservation.observe());
+    const timer = setTimeout(() => { onTimeout(); reservation.cancel(); }, timeoutMs);
+    try { return await reservation.wait(work); }
+    finally { clearTimeout(timer); }
   }
 }

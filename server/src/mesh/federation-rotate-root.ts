@@ -1475,7 +1475,7 @@ export async function resumeFederationRootCompromised(
       },
     });
     await clearRotationJournal(storage, failpoint);
-    // DEBT: the signed revocation event from the original run is not
+    // DEBT(MESH-REVOCATION-ECHO-UNSIGNED): the signed revocation event from the original run is not
     // reconstructable here (the K2 principal key is at rest, not in the journal);
     // the durable projection is the enforcement source of truth and is now
     // re-persisted. We therefore emit an empty `operator_signature` with an

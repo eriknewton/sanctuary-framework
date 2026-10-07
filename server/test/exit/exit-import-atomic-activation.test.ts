@@ -1,3 +1,4 @@
+// fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 /**
  * F1: `importExitBundle` activation is atomic under a hard process kill,
  * not just under a caught JS exception. A durable per-import rollback
@@ -55,6 +56,7 @@ import {
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
 } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
+import { fixedDenial } from "../../src/agent-native/safety-base.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { createReputationTools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
@@ -134,6 +136,9 @@ const STAGED_ARTIFACT_NAMESPACES = [
 
 interface ToolDef {
   name: string;
+  approvalTargetArgs?: (
+    args: Record<string, unknown>
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>;
   handler: (args: Record<string, unknown>) => Promise<{
     content: Array<{ type: string; text: string }>;
   }>;
@@ -146,6 +151,18 @@ async function callTool(
 ): Promise<Record<string, unknown>> {
   const tool = tools.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`Tool not found: ${name}`);
+  // Mirror router.ts:229 (the gate-time projection runs on the SAME args
+  // object the handler receives, before the handler runs) and router.ts's
+  // catch around it (a throwing approvalTargetArgs denies rather than
+  // propagating). For state_export this is also what attaches the
+  // approval binding the handler now requires (SDW-pattern exact-consent
+  // binding, cognitive/tools.ts); tools without approvalTargetArgs are
+  // unaffected.
+  try {
+    await tool.approvalTargetArgs?.(args);
+  } catch {
+    return fixedDenial(`audit:gate:${name}`) as unknown as Record<string, unknown>;
+  }
   const result = await tool.handler(args);
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }

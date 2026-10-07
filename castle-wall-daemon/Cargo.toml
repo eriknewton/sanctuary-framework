@@ -23,6 +23,46 @@ path = "src/bin/sanctuary-jail.rs"
 name = "sanctuary-plugin-launcher"
 path = "src/bin/sanctuary-plugin-launcher.rs"
 
+[[bin]]
+name = "sanctuary-stop-owner"
+path = "src/bin/sanctuary-stop-owner.rs"
+
+[[bin]]
+name = "sanctuary-protected-wait"
+path = "src/bin/sanctuary-protected-wait.rs"
+
+[[bin]]
+name = "castle-wall-prestart-v1"
+path = "src/bin/castle-wall-prestart-v1.rs"
+
+[[bin]]
+name = "castle-wall-stop-notify-v1"
+path = "src/bin/castle-wall-stop-notify-v1.rs"
+
+# Isolation-only fixed pathname connect-and-close probe. Packaging must not
+# install this binary or enable test-isolation in the shipped service build.
+[[bin]]
+name = "castle-wall-prestart-socket-probe"
+path = "src/bin/castle-wall-prestart-socket-probe.rs"
+required-features = ["test-isolation"]
+
+[[bin]]
+name = "sanctuary-linux"
+path = "src/bin/sanctuary-linux.rs"
+
+[[bin]]
+name = "sanctuary-linux-arch"
+path = "src/bin/sanctuary-linux-arch.rs"
+required-features = ["arch-install"]
+
+[[bin]]
+name = "protected-agent-v1"
+path = "src/bin/protected-agent-v1.rs"
+
+[[bin]]
+name = "network-agent-standin"
+path = "src/bin/network-agent-standin.rs"
+
 [features]
 # Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
 # and `nftables::use_isolated_castle_table`. Integration tests that drive the real
@@ -32,6 +72,7 @@ path = "src/bin/sanctuary-plugin-launcher.rs"
 # AGENTS.md: "the operator's machine is not a fixture". The seam is structural,
 # not a convention the next test author has to remember.
 test-isolation = []
+arch-install = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -127,6 +168,16 @@ required-features = ["test-isolation"]
 name = "integration_gf1_recovery"
 path = "tests/integration_gf1_recovery.rs"
 required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_install_arch_cli"
+path = "tests/linux_install_arch_cli.rs"
+required-features = ["arch-install"]
+
+[[test]]
+name = "linux_install_arch_fixtures"
+path = "tests/linux_install_arch_fixtures.rs"
+required-features = ["arch-install"]
 
 [profile.release]
 opt-level = 3

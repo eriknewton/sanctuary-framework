@@ -129,6 +129,60 @@ pub struct DaemonConfig {
     /// it, and doing so is what keeps the suite off the operator's live lock,
     /// journal, and journal MAC key.
     pub linux_runtime_paths: LinuxRuntimePaths,
+    /// TEST-ISOLATION ONLY (LINUX-BOOT-STOP-HOSTWIDE-NET-01): when set,
+    /// `boot()` pre-sets the daemon's shutdown-request flag before kernel
+    /// activation runs, simulating a stop already requested during the boot
+    /// phase (signal handlers installed, kernel activation not yet reached) --
+    /// the boot-phase counterpart of `--test-shutdown-at pre-recovery`. Set via
+    /// `--test-shutdown-at boot-acquire` in `main.rs`, applied to `config`
+    /// AFTER `from_argv` returns but BEFORE `daemon::boot` runs, never parsed
+    /// by `from_argv` itself. This is UNLIKE `test_health_interval_ms`, which
+    /// stays a `main` local applied to `supervise_until_shutdown` only AFTER a
+    /// successful boot returns a handle: `boot-acquire`'s sites run INSIDE
+    /// `boot()`'s acquisition, before any handle exists, so it has to land on
+    /// `DaemonConfig` itself rather than being threaded in after the fact.
+    /// Compiled out of the shipped binary, so a production boot has no argv
+    /// path that can pre-arm this.
+    #[cfg(feature = "test-isolation")]
+    pub test_boot_time_shutdown_requested: bool,
+    /// TEST-ISOLATION ONLY (LINUX-SUPERVISOR-WEDGE-R1-01, harness leg HW3): when
+    /// set, `boot()` sleeps this many milliseconds immediately before sending
+    /// `READY=1`, to show systemd's watchdog is inactive while the unit is still
+    /// activating. Routed exactly like `test_boot_time_shutdown_requested`: set
+    /// via `--test-delay-before-ready-ms` in `main.rs` after `from_argv` and
+    /// before `daemon::boot`, because the sleep must run inside `boot()`, before
+    /// any handle exists. Compiled out of the shipped binary.
+    #[cfg(feature = "test-isolation")]
+    pub test_delay_before_ready_ms: Option<u64>,
+}
+
+/// Shortest fortress id the server profile accepts.
+#[cfg(any(target_os = "linux", test))]
+const FORTRESS_ID_MIN_LEN: usize = 8;
+/// Longest fortress id the server profile accepts: 64 = the hex length of a
+/// 32-byte identifier.
+#[cfg(any(target_os = "linux", test))]
+const FORTRESS_ID_MAX_LEN: usize = 64;
+
+/// THE fortress-id grammar, the one implementation: 8 to 64 lowercase
+/// hexadecimal characters. Called by [`DaemonConfig::validate_server_profile`]
+/// and by the agent start gate (`src/agent_start.rs`), so the wall and the gate
+/// can never disagree on which ids are well formed (TB7s pins the single
+/// grammar). Linux-or-test only, like both callers: a macOS release build has
+/// no caller and carries no dead code.
+#[cfg(any(target_os = "linux", test))]
+pub fn validate_fortress_id(fortress_id: &str) -> Result<(), String> {
+    if fortress_id.len() < FORTRESS_ID_MIN_LEN
+        || fortress_id.len() > FORTRESS_ID_MAX_LEN
+        || !fortress_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "server fortress id must be 8..64 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    Ok(())
 }
 
 impl DaemonConfig {
@@ -152,6 +206,10 @@ impl DaemonConfig {
             wal_size_cap_bytes: DEFAULT_WAL_SIZE_CAP_BYTES,
             trusted_service_uid: None,
             linux_runtime_paths: LinuxRuntimePaths::production(),
+            #[cfg(feature = "test-isolation")]
+            test_boot_time_shutdown_requested: false,
+            #[cfg(feature = "test-isolation")]
+            test_delay_before_ready_ms: None,
         }
     }
 
@@ -165,17 +223,7 @@ impl DaemonConfig {
         if self.linux_runtime_paths != LinuxRuntimePaths::production() {
             return Ok(());
         }
-        if self.fortress_id.len() < 8
-            || self.fortress_id.len() > 64
-            || !self
-                .fortress_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(
-                "server fortress id must be 8..64 lowercase hexadecimal characters".to_string(),
-            );
-        }
+        validate_fortress_id(&self.fortress_id)?;
         if unsafe { libc::geteuid() } != 0 {
             return Err(
                 "server enforcement daemon must run as root under the provisioned systemd unit"
@@ -451,5 +499,23 @@ mod tests {
     fn argv_rejects_unknown_flag() {
         let err = DaemonConfig::from_argv(["--fortress-id", "x", "--rogue", "y"]).unwrap_err();
         assert!(matches!(err, ConfigError::Unknown(s) if s == "--rogue"));
+    }
+
+    // A partially-isolated path set is the shape that still reads or mutates
+    // operator state, so the predicate has to fail on EACH path individually.
+    #[test]
+    fn a_production_journal_beside_isolated_paths_is_not_isolated() {
+        let root = std::path::Path::new("/tmp/castle-wall-isolation-fixture");
+        let isolated = LinuxRuntimePaths::isolated_under(root);
+        assert!(isolated.is_isolated_from_production());
+        let mut leaky = isolated.clone();
+        leaky.journal_auth_key_path =
+            PathBuf::from(crate::ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH);
+        assert!(
+            !leaky.is_isolated_from_production(),
+            "a boot with two temporary paths and the operator's own journal key would \
+             authenticate against operator state"
+        );
+        assert!(!LinuxRuntimePaths::production().is_isolated_from_production());
     }
 }

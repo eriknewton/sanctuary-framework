@@ -51,11 +51,12 @@ Sanctuary is operator custody at the agent runtime. Not a promise. A mechanism, 
 On Linux: kernel-level egress enforcement, shipped in May, with the bypass paths you'd actually try (plain DNS, DoH, DoT) covered by integration tests against a real kernel binding.
 
 > **Current correction, 2026-08-07:** the integration-test coverage is real; the
-> word "shipped" was wrong. The shipped Linux daemon does not install the
-> nftables table, bind NFQUEUE, create cgroup scopes, or call the deny-by-default
-> evaluator, so Linux is source coverage rather than enforcement an operator can
-> run. The macOS evidence in the next paragraph is unaffected. Open defect:
-> **IC-02, IC-03, IC-04**.
+> word "shipped" was wrong. Linux Phase 1 was not live enforcement then and was
+> not a production enforcement baseline. The macOS evidence in the next paragraph
+> is unaffected. Later evidence, 2026-10-04: a separate Ubuntu 24.04 x86-64
+> package proved only the narrowed fresh-install per-account signed-policy claim;
+> DNS, DoH and DoT paths were not drilled.
+> Open defect: **IC-02, IC-03, IC-04**.
 >
 > Audit correction, 2026-08-07: earlier versions described the log as "signed
 > and chained," which was too broad. Sanctuary's production audit log is hash-chained, but production boot

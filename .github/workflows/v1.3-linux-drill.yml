@@ -48,7 +48,7 @@ jobs:
         run: |
           VERSION="${{ inputs.sanctuary_version || 'next' }}"
           if [ "$VERSION" = "local" ]; then
-            cd server && npm ci && npm run build && npm install -g .
+            cd server && npm ci --ignore-scripts && npm run build && npm install -g .
           else
             npm install -g "@sanctuary-framework/mcp-server@$VERSION"
           fi

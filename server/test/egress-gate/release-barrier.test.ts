@@ -16,6 +16,7 @@ import { describe, it, expect } from "vitest";
 import { execFile } from "node:child_process";
 import {
   mkdtempSync,
+  mkdirSync,
   writeFileSync,
   chmodSync,
   rmSync,
@@ -69,7 +70,17 @@ import {
 import {
   GATE_PROXY_BASIC_USERNAME,
   gateCredentialTokenPath,
+  gateSurrogatePlaceholderPath,
 } from "../../src/egress-gate/gate-credential.js";
+import {
+  MAX_SURROGATE_BINDINGS_PER_AGENT,
+  SURROGATE_ARTIFACT_VERSION,
+  SURROGATE_PLACEHOLDER_FILE_KIND,
+  SURROGATE_PLACEHOLDER_LINE_RE,
+  mintSurrogatePlaceholder,
+  renderSurrogatePlaceholderFile,
+  type MintedSurrogateBinding,
+} from "../../src/credential-surrogate/index.js";
 
 /**
  * FIX F-HARNESSENV: a `HarnessLaunchSpec` is the ONLY thing the parked planner
@@ -424,6 +435,111 @@ describe("wrapper script (static content invariants)", () => {
     expect(tokenGenerationMatch).toBeGreaterThan(tokenAbsent);
     expect(tokenSecretHex).toBeGreaterThan(tokenGenerationMatch);
     expect(proxyBuild).toBeGreaterThan(tokenSecretHex);
+  });
+});
+
+/**
+ * Credential surrogacy slice 1a: the wrapper's placeholder export. Capability
+ * prose only. The wrapper hands the agent the NAMES bound to placeholders for
+ * exactly the generation being released, and refuses (78, no exec) rather than
+ * export a stale or malformed set.
+ */
+describe("wrapper script surrogate placeholder export (static invariants)", () => {
+  it("derives the placeholder path from TOKEN_FILE, so the launchd argv contract and its digest do not change", () => {
+    // The wrapper takes no tenth argument: the argv digest in the hold file
+    // pins ProgramArguments, so a tenth argument would force a re-commit on
+    // every fortress that turned surrogacy on or off.
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$#" -ge 9 ] ||');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("shift 8");
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '*) fail "gate credential token path does not end in .token; cannot derive the surrogate placeholder path" ;;',
+    );
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      `SURROGATE_FILE=$(printf '%s' "$TOKEN_FILE" | sed 's/\\.token$/.surrogates/')`,
+    );
+    // Pin the derivation against the single source for both path shapes: the
+    // substitution above must turn one into the other for any uid and dir.
+    const dir = "/var/db/sanctuary/gate-cred";
+    expect(gateCredentialTokenPath(503, dir).replace(/\.token$/, ".surrogates")).toBe(
+      gateSurrogatePlaceholderPath(503, dir),
+    );
+  });
+
+  it("validates the whole body against the SAME anchored grammar credential-surrogate/artifacts.ts declares", () => {
+    // Cross-file contract: the wrapper cannot import the regex, so the two
+    // literals are compared here. A drift on either side fails this test.
+    const wrapperPattern = "^[A-Z_][A-Z0-9_]{0,63}=sanctuary_surrogate_[0-9a-f]{32}$";
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(`grep -qvE '${wrapperPattern}'`);
+    expect(SURROGATE_PLACEHOLDER_LINE_RE.source).toBe(
+      "^([A-Z_][A-Z0-9_]{0,63})=(sanctuary_surrogate_[0-9a-f]{32})$",
+    );
+    // Same grammar, minus the two capture groups the TypeScript side needs.
+    expect(SURROGATE_PLACEHOLDER_LINE_RE.source.replace(/[()]/g, "")).toBe(wrapperPattern);
+  });
+
+  it("pins the header literal to the artifact renderer's header", () => {
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      `"${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation="*) ;;`,
+    );
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      `sed 's/^${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation=//'`,
+    );
+  });
+
+  it("bounds the body before iterating it, strictly above the per-agent binding cap", () => {
+    // rule 8: the wrapper cannot import MAX_SURROGATE_BINDINGS_PER_AGENT, so the
+    // literal is pinned here instead. Strictly above, not equal: the cap counts
+    // bindings and the wrapper counts lines including the header.
+    const cap = /\[ "\$SURROGATE_LINE_COUNT" -le ([0-9]+) \]/.exec(RELEASE_EXEC_WRAPPER_SCRIPT);
+    expect(cap).not.toBeNull();
+    expect(Number(cap![1])).toBeGreaterThan(MAX_SURROGATE_BINDINGS_PER_AGENT);
+    const capCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$SURROGATE_LINE_COUNT" -le');
+    const grammarCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("grep -qvE '^[A-Z_]");
+    const exportLine = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('export "$SURROGATE_LINE"');
+    expect(capCheck).toBeGreaterThan(0);
+    expect(grammarCheck).toBeGreaterThan(capCheck);
+    // The whole body is validated BEFORE the first export, so a malformed last
+    // line cannot leave earlier lines in the environment.
+    expect(exportLine).toBeGreaterThan(grammarCheck);
+  });
+
+  it("exports placeholders LAST: after every release check, after the proxy export, immediately before exec", () => {
+    const digestCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("argv digest mismatch");
+    const tokenSecret = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("gate credential token secret missing or malformed");
+    const proxyExport = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('export http_proxy="$PROXY_URL"');
+    const surrogateBlock = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('case "$TOKEN_FILE" in');
+    const exportLine = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('export "$SURROGATE_LINE"');
+    const execLine = RELEASE_EXEC_WRAPPER_SCRIPT.lastIndexOf('exec "$@"');
+    expect(digestCheck).toBeGreaterThan(0);
+    expect(tokenSecret).toBeGreaterThan(digestCheck);
+    expect(proxyExport).toBeGreaterThan(tokenSecret);
+    expect(surrogateBlock).toBeGreaterThan(proxyExport);
+    expect(exportLine).toBeGreaterThan(surrogateBlock);
+    expect(execLine).toBeGreaterThan(exportLine);
+  });
+
+  it("reads the file directly rather than through a pipe, so the exports survive the loop", () => {
+    // A `tail | while read` loop runs its body in a subshell and every export in
+    // it is discarded: the agent would start with no placeholders at all and no
+    // refusal. The redirect form is the fix, and this is its pin.
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('done < "$SURROGATE_FILE"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).not.toMatch(/\|\s*while IFS= read -r SURROGATE_LINE/);
+  });
+
+  it("never records a placeholder in the diagnostic refusal record: fixed codes only", () => {
+    const record = RELEASE_EXEC_WRAPPER_SCRIPT.slice(
+      RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("record_refusal() {"),
+      RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("fail() {"),
+    );
+    expect(record).toContain("printf 'surrogate_file=%s");
+    expect(record).toContain("printf 'surrogate_generation=%s");
+    expect(record).toContain("printf 'surrogate_lines=%s");
+    // The record prints only the three OBS_ variables, never the file, a line,
+    // an env name, or a placeholder.
+    expect(record).not.toContain("$SURROGATE_LINE");
+    expect(record).not.toContain("$SURROGATE_FILE");
+    expect(record).not.toContain("$SURROGATE_HEADER");
+    expect(record).not.toContain("$SURROGATE_GEN");
   });
 });
 
@@ -2130,4 +2246,225 @@ describe("wrapper script live behavior (Linux-visible test copy)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+/**
+ * Credential surrogacy slice 1a: the wrapper's placeholder export, run for real.
+ *
+ * This is the pin the artifacts module's header names: the wrapper is executed
+ * over a file the PRODUCTION renderer produced, so the renderer and the shell
+ * grammar cannot drift apart without this failing. Placeholders are minted in
+ * the test and never appear in any assertion message.
+ */
+describe("wrapper script surrogate placeholder export (live behavior, Linux-visible test copy)", () => {
+  const ENV_A = "SANCTUARY_TEST_SURROGATE_A";
+  const ENV_B = "SANCTUARY_TEST_SURROGATE_B";
+
+  function minted(env: string, ordinal: number): MintedSurrogateBinding {
+    return {
+      secret: `test-secret-${ordinal}`,
+      agent: "sanctuary-hermes",
+      env,
+      destinations: [{ host: "api.example.test", port: 443 }],
+      header: "Authorization",
+      placeholder: mintSurrogatePlaceholder(),
+      ordinal,
+    };
+  }
+
+  interface Harness {
+    dir: string;
+    surrogatePath: string;
+    run: (generation: string) => Promise<{ code: number; stdout: string; stderr: string }>;
+    refusal: () => ReturnType<typeof parseReleaseWrapperRefusalRecord>;
+  }
+
+  function withHarness(body: (h: Harness) => Promise<void>): () => Promise<void> {
+    return async () => {
+      const dir = mkdtempSync(join(tmpdir(), "surrogate-wrapper-"));
+      try {
+        const shasum = writeSha256SumShim(dir);
+        const wrapper = join(dir, "release-exec-wrapper.sh");
+        writeFileSync(wrapper, renderLinuxVisibleWrapperScript(shasum));
+        chmodSync(wrapper, 0o755);
+
+        const uid = process.getuid ? process.getuid() : 0;
+        const hold = join(dir, `${uid}.release`);
+        // The token path is what the wrapper derives the surrogate path FROM, so
+        // both come from the production path helpers rather than from literals.
+        const token = gateCredentialTokenPath(uid, dir);
+        const surrogatePath = gateSurrogatePlaceholderPath(uid, dir);
+        const refusalPath = join(dir, "agent-harness.release-refusal.log");
+
+        // The released argv prints the two env names the placeholder file binds.
+        // `unset` distinguishes "not exported" from "exported empty".
+        const show = join(dir, "show-surrogate-env.sh");
+        writeFileSync(
+          show,
+          `#!/bin/sh\nprintf 'A=%s\\n' "\${${ENV_A}-unset}"\nprintf 'B=%s\\n' "\${${ENV_B}-unset}"\n`,
+        );
+        chmodSync(show, 0o755);
+
+        const argv = [show];
+        writeFileSync(
+          hold,
+          renderHarnessReleaseHoldFile({
+            generation_id: 7,
+            agent_uid: uid,
+            harness_label: AGENT_HARNESS_DAEMON_LABEL,
+            argv_digest: computeHarnessArgvDigest(argv),
+            boot_session_uuid: TEST_BOOT_SESSION_UUID,
+          }),
+        );
+        writeFileSync(
+          token,
+          JSON.stringify({ version: 1, generation_id: 7, secret: "ab".repeat(32) }),
+        );
+
+        await body({
+          dir,
+          surrogatePath,
+          run: (generation) =>
+            runSh([
+              wrapper,
+              hold,
+              generation,
+              "49152",
+              token,
+              refusalPath,
+              GATE_PROXY_BASIC_USERNAME,
+              AGENT_HARNESS_DAEMON_LABEL,
+              "--",
+              ...argv,
+            ]),
+          refusal: () => parseReleaseWrapperRefusalRecord(readFileSync(refusalPath, "utf8")),
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+  }
+
+  it(
+    "exports every placeholder in a file the PRODUCTION renderer produced, for the generation being released",
+    withHarness(async (h) => {
+      const bindings = [minted(ENV_A, 1), minted(ENV_B, 2)];
+      writeFileSync(h.surrogatePath, renderSurrogatePlaceholderFile(7, bindings));
+
+      const r = await h.run("7");
+      expect(r.code).toBe(0);
+      // Compared against the minted values, never printed into a message.
+      expect(r.stdout.trim().split("\n")).toEqual([
+        `A=${bindings[0]!.placeholder}`,
+        `B=${bindings[1]!.placeholder}`,
+      ]);
+    }),
+  );
+
+  it(
+    "exports NOTHING and still releases when no placeholder file exists (surrogacy is opt-in per fortress)",
+    withHarness(async (h) => {
+      const r = await h.run("7");
+      expect(r.code).toBe(0);
+      expect(r.stdout.trim().split("\n")).toEqual(["A=unset", "B=unset"]);
+    }),
+  );
+
+  it(
+    "refuses 78 on a placeholder file left behind by an earlier generation, and never execs",
+    withHarness(async (h) => {
+      // Rendered by the same production renderer, one generation stale: the
+      // exact shape a bring-up that failed between artifacts would leave.
+      writeFileSync(h.surrogatePath, renderSurrogatePlaceholderFile(6, [minted(ENV_A, 1)]));
+
+      const r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toContain("surrogate placeholder generation does not match expected generation");
+      const record = h.refusal();
+      expect(record.observations.surrogate_file).toBe("present");
+      expect(record.observations.surrogate_generation).toBe("mismatch");
+      expect(record.observations.surrogate_lines).toBe("not_checked");
+    }),
+  );
+
+  it(
+    "refuses 78 on a malformed body line and exports none of the well-formed lines beside it",
+    withHarness(async (h) => {
+      const good = minted(ENV_A, 1);
+      const header = `${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation=7`;
+      // A well-formed line FIRST, then a value that is not a placeholder: the
+      // all-or-nothing ordering is what this proves.
+      writeFileSync(
+        h.surrogatePath,
+        `${header}\n${good.env}=${good.placeholder}\n${ENV_B}=not-a-placeholder\n`,
+      );
+
+      const r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toContain("surrogate placeholder file has a malformed line");
+      expect(h.refusal().observations.surrogate_lines).toBe("malformed");
+    }),
+  );
+
+  it(
+    "refuses 78 on a wrong header, a non-numeric generation, and a lowercase env name",
+    withHarness(async (h) => {
+      const good = minted(ENV_A, 1);
+      const header = `${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation=7`;
+
+      writeFileSync(h.surrogatePath, `not-a-surrogate-file v1 generation=7\n`);
+      let r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("surrogate placeholder file header mismatch");
+      expect(h.refusal().observations.surrogate_generation).toBe("malformed");
+
+      writeFileSync(h.surrogatePath, `${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation=07x\n`);
+      r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("surrogate placeholder generation missing or malformed");
+
+      // Lower-case env name: the grammar is upper-case only, so a shell that
+      // exported it would put a name in the environment root never authorized.
+      writeFileSync(h.surrogatePath, `${header}\nlower_case=${good.placeholder}\n`);
+      r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("surrogate placeholder file has a malformed line");
+    }),
+  );
+
+  it(
+    "refuses 78 rather than iterate a body over the line cap (rule 8: the loop is bounded before it runs)",
+    withHarness(async (h) => {
+      const cap = Number(
+        /\[ "\$SURROGATE_LINE_COUNT" -le ([0-9]+) \]/.exec(RELEASE_EXEC_WRAPPER_SCRIPT)![1],
+      );
+      const header = `${SURROGATE_PLACEHOLDER_FILE_KIND} v${SURROGATE_ARTIFACT_VERSION} generation=7`;
+      // cap + 1 body lines, every one of them WELL FORMED: the refusal is the
+      // bound alone, not a grammar failure.
+      const body = Array.from(
+        { length: cap + 1 },
+        (_unused, i) => `${ENV_A}_${i}=${mintSurrogatePlaceholder()}`,
+      );
+      writeFileSync(h.surrogatePath, `${header}\n${body.map((l) => `${l}\n`).join("")}`);
+
+      const r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toContain("surrogate placeholder file exceeds the placeholder line cap");
+      expect(h.refusal().observations.surrogate_lines).toBe("over_cap");
+    }),
+  );
+
+  it(
+    "refuses 78 when the placeholder path is a directory rather than a regular file",
+    withHarness(async (h) => {
+      mkdirSync(h.surrogatePath);
+      const r = await h.run("7");
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("surrogate placeholder path is not a regular file");
+      expect(h.refusal().observations.surrogate_file).toBe("not_regular");
+    }),
+  );
 });

@@ -1,3 +1,4 @@
+// fail-before-exempt: credential surrogacy slice 1a made surrogateBoundSecrets a required Broker constructor option (AGENTS.md rule 3); this file only passes an empty set to the existing constructions, asserts no new behavior, and so passes against pre-fix source by construction. The refusal behavior is pinned by the new surrogate-refusal, broker-server-surrogate-refusal and surrogate-policy tests, which fail on pre-fix source.
 /**
  * broker-server startup — v0.10.1 regression guard for v0.10.0-rc.2 finding #1.
  *
@@ -64,6 +65,8 @@ describe("broker-server startup — rc.2 require-path regression", () => {
 
   it("createBrokerMcpServer reports SANCTUARY_VERSION as its server version", () => {
     const broker = new Broker({
+      // Required option (AGENTS.md rule 3); these suites bind no surrogate.
+      surrogateBoundSecrets: new Set<string>(),
       backend: fakeBackend(),
       auditLog: new AuditLog(new MemoryStorage(), generateRandomKey()),
       grants: [],

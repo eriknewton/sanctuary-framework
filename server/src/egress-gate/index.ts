@@ -167,6 +167,7 @@ export {
   startExclusiveEgressGate,
   type GateLivenessProbe,
   type EgressGateEvent,
+  type SurrogateEchoEvent,
   type ExclusiveEgressGateOptions,
   type ExclusiveEgressGateHandle,
 } from "./gate-server.js";
@@ -396,3 +397,39 @@ export {
   type QuarantinedBootRegistryEntry,
   type UnprotectWiringDeps,
 } from "./arming-wiring.js";
+
+export {
+  GATE_SURROGATE_DIR,
+  SURROGATE_HELPER_BOUNDS,
+  SURROGATE_HELPER_DAEMON_LABEL_PREFIX,
+  SURROGATE_HELPER_SOCKET_UMASK,
+  SURROGATE_HELPER_EXPIRY_SWEEP_MS,
+  SURROGATE_HELPER_IDLE_TIMEOUT_MS,
+  SurrogateHelperArgvError,
+  SurrogateHelperStartError,
+  clampSurrogateUnlockSeconds,
+  loadSurrogateHelperTable,
+  parseSurrogateHelperDaemonArgs,
+  renderSurrogateHelperDaemonPlist,
+  runSurrogateHelperDaemon,
+  runSurrogateHelperDaemonFromArgv,
+  surrogateBindingsPath,
+  surrogateDestinationsPath,
+  surrogateHelperDaemonLabel,
+  surrogateHelperDaemonLogPaths,
+  surrogateHelperDaemonPlistPath,
+  surrogateQuerySocketPath,
+  surrogateUnlockSocketPath,
+  type SurrogateHelperArgvRefusal,
+  type SurrogateHelperClock,
+  type SurrogateHelperDaemonArgs,
+  type SurrogateHelperDaemonDeps,
+  type SurrogateHelperDaemonHandle,
+  type SurrogateHelperDaemonPlistOptions,
+  type SurrogateHelperDenyCode,
+  type SurrogateHelperEvent,
+  type SurrogateHelperFsOps,
+  type SurrogateHelperStartRefusal,
+} from "./surrogate-helper-daemon.js";
+
+export { createSurrogateHelperClient, type SurrogateHelperClient, type SurrogateHelperResult } from "./surrogate-helper-client.js";

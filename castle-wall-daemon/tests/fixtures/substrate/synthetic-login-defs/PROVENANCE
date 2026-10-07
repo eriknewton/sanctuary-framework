@@ -1,0 +1,9 @@
+synthetic login.defs parser verdict fixtures, including brief 16.4 control-byte, physical-line, ambiguous-prefix, and range-order refusals
+unrelated-keys-any-shape: a valueless key and a multi-word value on keys this reader does not consume (shadow reads both); accepted
+required-key-without-value: a range key with no value; refused, never defaulted
+nbsp-separated-required-key: SYS_GID_MIN joined to its value by U+00A0; refused as an ambiguous range key (its first token starts with SYS_GID_MIN), brief 16.4
+long-split-range-key: the stock Arch file plus 'MAIL_DIR ' and 1014 bytes, so the first fgets(buf, 1024) chunk is exactly 1023 bytes and shadow reads 'SYS_GID_MAX 60000' as a second record; refused (without the rule the reader would ignore the line and accept 999)
+long-unrelated-1023: the stock Arch file plus an unrelated line of 1022 content bytes and its LF; shadow reads it in one call; refused as the bound's margin
+vertical-tab-leading-range-key: the stock Arch file plus '\x0bSYS_GID_MAX 60000'; under an isspace separator model shadow skips the VT and reads 60000, while a space-and-tab reader would ignore the line; refused at the control-byte rule
+crlf-control: the whole stock Arch file with CRLF endings; shadow keeps the CR in each value and falls back to defaults; refused
+leading-zero-octal: the stock Arch file with SYS_GID_MAX 01750 and GID_MIN 2000; shadow parses base 0 (01750 is octal 1000) while a decimal reader would take 1750; refused

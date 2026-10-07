@@ -1315,6 +1315,27 @@ export const BROKER_OPS = {
   TOKEN_ISSUED: "broker_token_issued",
   TOKEN_DENIED: "broker_token_denied",
   BACKEND_UNLOCKED: "broker_backend_unlocked",
+  // Credential surrogacy (design v2.1 section 3.10), additive. These are the
+  // OPERATOR-side records; per-request gate decisions are `EgressGateEvent`
+  // kinds in the gate's own log, because the gate uid holds no master key and so
+  // cannot write this chain. Details carry an agent uid, a generation, secret
+  // names and fixed failure classes, never a value, a placeholder or parser text.
+  /** An operator unlock accepted by the helper THROUGH THE CLI. `appendCritical`. */
+  SURROGATE_UNLOCKED: "broker_surrogate_unlocked",
+  /** A token issue or read refused because the secret is surrogate-bound. `appendCritical`. */
+  SURROGATE_TOKEN_REFUSED: "broker_surrogate_token_refused",
+  /** A surrogate binding added by the operator. `appendCritical`. */
+  SURROGATE_BOUND: "broker_surrogate_bound",
+  /** A surrogate binding removed by the operator. `appendCritical`. */
+  SURROGATE_REMOVED: "broker_surrogate_removed",
+  /**
+   * A policy file that was PRESENT and failed to read or parse. `append`.
+   *
+   * Never fired for ENOENT (round-2 finding B2-S6): an absent policy file is the
+   * normal no-policy case, and auditing it would write a line on every load for
+   * every fortress that has no bindings.
+   */
+  POLICY_LOAD_FAILED: "broker_policy_load_failed",
 } as const;
 
 export type BrokerOp = (typeof BROKER_OPS)[keyof typeof BROKER_OPS];
@@ -1416,6 +1437,26 @@ class ConsumerRejectedEntryError extends Error {
 const auditIntegrityContext = new AsyncLocalStorage<{
   allowIntegrityFindings: boolean;
 }>();
+
+const auditWriteSettlementContext = new AsyncLocalStorage<Set<Promise<unknown>>>();
+
+/**
+ * Keep a caller's reservation until its audit operations settle, including writes abandoned at a lock deadline.
+ * Must wrap telemetry in castle-wall/runtime/macos-ipc-listener.ts and the single
+ * discard write in castle-wall/runtime/macos-flow-events.ts so both retain their charges.
+ */
+export async function withAuditWriteSettlement<T>(operation: () => Promise<T>): Promise<T> {
+  const pending = new Set<Promise<unknown>>();
+  return auditWriteSettlementContext.run(pending, async () => {
+    try {
+      return await operation();
+    } finally {
+      // The lock deadline releases the lock, not the retained storage payload.
+      // Must match the operationPromise tracking in withAuditWriteLock below.
+      while (pending.size > 0) await Promise.allSettled([...pending]);
+    }
+  });
+}
 
 /**
  * When set, `query` serves from the eagerly-maintained in-memory verified view
@@ -2201,8 +2242,8 @@ export class AuditLog {
    * acquire-temp sweep; resolved once from config/env. See
    * {@link resolveIdlessStaleLockMs}. */
   private readonly idlessStaleLockMs: number;
-  /** Deadline-bounds a single acquired lock hold; see {@link withAuditWriteLock}. */
-  private readonly writeLockHoldDeadlineMs: number;
+  /** Bound shutdown waits by the same resolved deadline as each acquired audit write lock. */
+  readonly writeLockHoldDeadlineMs: number;
   /** Same-pid stale-lock breaker bound; must exceed {@link writeLockHoldDeadlineMs}. */
   private readonly selfHeldStaleLockMs: number;
   /** Process-local count of forced audit-write-lock recovery events. */
@@ -4683,6 +4724,16 @@ export class AuditLog {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const operationPromise = Promise.resolve().then(() => operation(signal));
       void operationPromise.catch(() => undefined);
+      // Must match withAuditWriteSettlement: caller rejection cannot free an
+      // ingress reservation while the underlying storage still owns its bytes.
+      const pending = auditWriteSettlementContext.getStore();
+      if (pending) {
+        pending.add(operationPromise);
+        void operationPromise.then(
+          () => pending.delete(operationPromise),
+          () => pending.delete(operationPromise),
+        );
+      }
       try {
         const deadlinePromise = new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => {

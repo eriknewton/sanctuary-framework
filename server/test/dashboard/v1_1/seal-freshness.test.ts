@@ -5,7 +5,7 @@
  * unparseable, or stale enforcement timestamp. Fresh evidence must carry its
  * own visible age.
  */
-
+// fail-before-exempt: marks these fixtures as completed sovereignty reads (sourceLoaded) so the read-state gate renders them; asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage lives in boot-hydration, dashboard-honesty and client-time-parity tests.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
@@ -241,14 +241,19 @@ function liftSealHarness(): SealHarness {
   const src = getClientScript();
   const maxLine = src.match(/const SEAL_FRESHNESS_MAX_MS = [^;]+;/)?.[0];
   if (!maxLine) throw new Error("SEAL_FRESHNESS_MAX_MS not found");
+  const boundaryLine = src.match(/const SEAL_FRESHNESS_BOUNDARY_OFFSET_MS = [^;]+;/)?.[0];
+  if (!boundaryLine) throw new Error("SEAL_FRESHNESS_BOUNDARY_OFFSET_MS not found");
   const pieces = [
     'const state = { tier1: { lockdown: { state: "idle" } }, posture: { data: null } };',
+    "function sourceLoaded() { return true; }", // These fixtures represent completed sovereignty reads.
     maxLine,
+    boundaryLine,
     "let sealFreshnessTimer = null;",
     "let __rerenderCount = 0;",
     "function makeEl() { const classes = new Set(); return { textContent: '', hidden: false, attrs: {}, classList: { add: function () { for (let i = 0; i < arguments.length; i++) classes.add(arguments[i]); }, remove: function () { for (let i = 0; i < arguments.length; i++) classes.delete(arguments[i]); }, has: function (name) { return classes.has(name); } }, setAttribute: function (k, v) { this.attrs[k] = String(v); } }; }",
     "const elements = { 'posture-seal': makeEl(), 'posture-seal-word': makeEl(), 'posture-seal-freshness': makeEl(), 'posture-seal-pop': makeEl() };",
     "const document = { getElementById: function (id) { return elements[id] || null; } };",
+    functionSource(src, "parseEvidenceTimestamp"),
     functionSource(src, "shortTime"),
     functionSource(src, "durationLabelFromMs"),
     functionSource(src, "liveEnforcementSnapshot"),
@@ -306,6 +311,23 @@ describe("v1.1 dashboard seal freshness", () => {
     vi.spyOn(Date, "now").mockReturnValue(now);
     const harness = liftSealHarness();
     harness.state.posture.data = armedPayload("not-a-date");
+
+    const seal = harness.deriveSeal();
+
+    expect(seal.word).toBe("Attention");
+    expect(seal.tone).toBe("attention");
+    expect(seal.freshness.state).toBe("unparseable");
+    expect(seal.freshness.current).toBe(false);
+    expect(seal.freshness.inline).toBe("invalid evidence time");
+  });
+
+  it("offset-less enforcement timestamp with armed payload does not render Protected", () => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const harness = liftSealHarness();
+    const msPerMinute = 60 * 1000;
+    // Match the receiver's local clock so permissive parsing would treat this as fresh.
+    const localFresh = new Date(now - 2 * msPerMinute - new Date(now).getTimezoneOffset() * msPerMinute).toISOString().slice(0, -1);
+    harness.state.posture.data = armedPayload(localFresh);
 
     const seal = harness.deriveSeal();
 
@@ -405,7 +427,7 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(seal.freshness.inline).toBe("last evidenced 2m ago");
   });
 
-  it("rerenders the seal stale after the freshness window elapses without a new event", () => {
+  it("renders the seal stale after the freshness window elapses without a current read", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
     const harness = liftSealHarness();
@@ -418,8 +440,9 @@ describe("v1.1 dashboard seal freshness", () => {
     expect(harness.elements["posture-seal-freshness"].classList.has("fresh")).toBe(true);
 
     vi.advanceTimersByTime(61_001);
+    harness.renderPostureSeal();
 
-    expect(harness.rerenderCount()).toBe(1);
+    expect(harness.rerenderCount()).toBe(0);
     expect(harness.elements["posture-seal"].classList.has("tone-protected")).toBe(false);
     expect(harness.elements["posture-seal"].classList.has("tone-attention")).toBe(true);
     expect(harness.elements["posture-seal-word"].textContent).toBe("Attention");

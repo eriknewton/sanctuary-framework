@@ -1269,7 +1269,7 @@ async function fileExists(path: string): Promise<boolean> {
  * holder created, so a displaced holder aborts before it can clobber a
  * pointer a successor may have just written.
  *
- * DEBT (round-13 reviewer ruling, pre-existing class): this lock covers
+ * DEBT(WRAP-CONFIG-READER-LOCK-SCOPE) (round-13 reviewer ruling, pre-existing class): this lock covers
  * the wrap-META mutation only, not the caller's config-file mutation
  * window (rewriteConfigForWrap / restoreConfig run in the CLI flows before
  * saveWrapMeta / removeWrapMeta acquire), so a concurrent wrap and unwrap

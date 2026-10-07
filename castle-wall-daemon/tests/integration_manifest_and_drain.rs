@@ -44,7 +44,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -64,7 +64,7 @@ struct BootedDaemon {
     /// is what serializes this binary's tests against the ONE isolated table,
     /// host lock, and ownership journal they share. Declared last so it is
     /// released only after `handle` (whose `Drop` tears enforcement down) has run.
-    _suite: MutexGuard<'static, ()>,
+    _suite: isolation::SuiteGuard,
 }
 
 /// Build a minimally-valid `AllowlistRule` JSON body whose `id` field
@@ -142,6 +142,8 @@ fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
         // the isolated paths is what keeps them from drifting per suite
         // (AGENTS rule 5).
         linux_runtime_paths: isolation::runtime_paths(),
+        test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     };
     let handle = boot(cfg).expect("boot daemon");
     BootedDaemon {
@@ -1308,4 +1310,674 @@ fn audit_drain_more_pending_when_capped() {
     }
     let _ = stream;
     let _ = booted.handle.stop();
+}
+
+// ---- T3w: the stop guard in the real daemon binary --------------------------
+//
+// Capability (LINUX-STOP-PATH-BUDGET-01): once the daemon binary has enabled
+// its stop guard, a stop whose teardown never finishes still ends the process
+// with a nonzero exit CODE (never a signal) about one guard deadline after the
+// guard was armed. The teardown wedge and the one-second deadline are
+// `test-isolation` seams (`--test-hang-teardown`,
+// `--test-stop-guard-deadline-secs`); a release build has neither.
+//
+// This lives in a suite that runs on every host (macOS and Linux) because the
+// guard is a process-level mechanism: on macOS the subprocess boots
+// control-plane-only, on privileged Linux it holds the isolated kernel runtime.
+
+/// The fixed line the guard's arming path writes to stderr in a
+/// `test-isolation` build. Must match `SystemAlarm::schedule` in
+/// `src/exit_guard.rs`.
+const STOP_GUARD_ARMED_LINE: &str = "castle-wall-daemon: stop guard armed";
+/// The injected guard deadline, in seconds.
+const T3W_DEADLINE_SECS: u64 = 1;
+/// Scheduler and CI allowance on top of the injected deadline.
+const T3W_CI_ALLOWANCE: Duration = Duration::from_secs(2);
+/// The harness's own give-up bound: long enough that a working guard always
+/// exits first, short enough that a missing guard fails the test instead of
+/// hanging the suite. 30 s = boot (bounded well under this on CI) plus deadline
+/// plus allowance, with room to spare.
+const T3W_HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long, after the daemon exits, the harness waits for its pipes to reach
+/// EOF. Bounded like the give-up branch: a descendant still holding a pipe must
+/// not hang the suite. 5 s is generous for two already-closed pipes.
+const T3W_PIPE_DRAIN: Duration = Duration::from_secs(5);
+
+enum T3wTrigger {
+    FatalControlPath,
+    Sigterm,
+}
+
+struct T3wRun {
+    code: Option<i32>,
+    signal: Option<i32>,
+    armed_at: Option<std::time::Instant>,
+    sigterm_at: Option<std::time::Instant>,
+    exited_at: std::time::Instant,
+    stderr: String,
+    stdout: String,
+}
+
+fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let _suite = isolation::guard();
+    reset_isolated_host_state();
+    let dir = TempDir::new().expect("tempdir");
+    let policy_dir = dir.path().join("policy/egress");
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned_path = policy_dir.join("pinned.key");
+    fs::write(&pinned_path, signing.verifying_key().to_bytes()).unwrap();
+    write_signed_manifest(&policy_dir, &signing, 1, 1);
+    let socket_path = dir.path().join("guard.sock");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"));
+    command
+        .args(["--fortress-id", "deadbeef"])
+        .arg("--socket-path")
+        .arg(&socket_path)
+        .arg("--policy-dir")
+        .arg(&policy_dir)
+        .arg("--wal-path")
+        .arg(dir.path().join("guard.wal"))
+        .arg("--pinned-public-key")
+        .arg(&pinned_path)
+        .arg("--producer-key")
+        .arg(policy_dir.join("audit-producer.key"))
+        .arg("--producer-pub-key")
+        .arg(policy_dir.join("audit-producer.pub"))
+        .args(isolation::subprocess_args())
+        .arg("--test-hang-teardown")
+        .args([
+            "--test-stop-guard-deadline-secs",
+            &T3W_DEADLINE_SECS.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if matches!(trigger, T3wTrigger::FatalControlPath) {
+        command.arg("--test-trigger-fatal-control-path");
+    }
+    let mut child = command.spawn().expect("spawn the daemon binary");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<String>();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stdout), &mut text);
+        let _ = stdout_tx.send(text);
+    });
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel::<(Instant, String)>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send((Instant::now(), line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut sigterm_at = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the daemon") {
+            break status;
+        }
+        if matches!(trigger, T3wTrigger::Sigterm) && sigterm_at.is_none() && socket_path.exists() {
+            // The IPC socket exists only after boot installed the SIGTERM handler,
+            // so this signal is caught by the daemon, not by the default action.
+            // SAFETY: kill(2) on our own direct child's pid, which is unreaped
+            // (try_wait just returned None), so it cannot name a reused pid.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            sigterm_at = Some(Instant::now());
+        }
+        if started.elapsed() > T3W_HARNESS_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers are NOT joined here: a descendant still holding a pipe
+            // would block the join and hang the suite, which is exactly what this
+            // give-up bound exists to prevent. Their handles are dropped (detached)
+            // and the lines already received are reported.
+            drop(reader);
+            drop(stdout_reader);
+            let lines: Vec<String> = rx.try_iter().map(|(_, l)| l).collect();
+            panic!(
+                "the daemon did not exit within {T3W_HARNESS_TIMEOUT:?} with a wedged teardown: \
+                 the stop guard is not ending the process. stderr: {lines:#?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let exited_at = Instant::now();
+    // Bounded drain, never an unbounded join (same reason as the give-up branch):
+    // wait for both pipes to reach EOF up to T3W_PIPE_DRAIN, then detach whatever
+    // reader is still blocked and use what has already arrived.
+    let drain_until = exited_at + T3W_PIPE_DRAIN;
+    while !(reader.is_finished() && stdout_reader.is_finished()) && Instant::now() < drain_until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(reader);
+    drop(stdout_reader);
+    let stdout = stdout_rx.try_recv().unwrap_or_default();
+    let lines: Vec<(Instant, String)> = rx.try_iter().collect();
+    let armed_at = lines
+        .iter()
+        .find(|(_, l)| l == STOP_GUARD_ARMED_LINE)
+        .map(|(at, _)| *at);
+    let stderr = lines
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    reset_isolated_host_state();
+    if stderr.contains("kernel runtime activation failed") {
+        // An unprivileged Linux host cannot boot the subprocess at all; the
+        // privileged CI job sets SANCTUARY_EXPECT_PRIVILEGED_LINUX and must not skip.
+        if std::env::var_os("SANCTUARY_EXPECT_PRIVILEGED_LINUX").is_some() {
+            panic!("privileged Linux runtime was required but unavailable: {stderr}");
+        }
+        eprintln!("SKIP (privileged Linux runtime unavailable): {stderr}");
+        return None;
+    }
+    Some(T3wRun {
+        code: status.code(),
+        signal: status.signal(),
+        armed_at,
+        sigterm_at,
+        exited_at,
+        stderr,
+        stdout,
+    })
+}
+
+fn t3w_assert_guard_exit(run: &T3wRun, clock_start: std::time::Instant, case: &str) {
+    assert_eq!(
+        run.signal, None,
+        "{case}: the process must end by an exit code, not a signal. stderr:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.code,
+        Some(75),
+        "{case}: a wedged stop exits with the decided code 75. stderr:\n{}",
+        run.stderr
+    );
+    // The clean-exit line is printed to STDOUT (`main`'s `println!`), so that is
+    // where its absence is asserted. Model: `integration_failure_modes.rs`.
+    assert!(
+        !run.stdout.contains("clean exit"),
+        "{case}: a guard exit must never claim a clean exit. stdout:\n{}",
+        run.stdout
+    );
+    let bound = Duration::from_secs(T3W_DEADLINE_SECS) + T3W_CI_ALLOWANCE;
+    let took = run.exited_at.saturating_duration_since(clock_start);
+    assert!(
+        took <= bound,
+        "{case}: exit took {took:?} from the arm, over the {bound:?} bound"
+    );
+}
+
+/// T3w (a): a fatal control-path self-exit whose teardown wedges, with no
+/// signal sent, exits 75 within the guard deadline measured from the arm.
+#[test]
+fn t3w_a_fatal_self_exit_with_a_wedged_teardown_exits_75_by_the_guard() {
+    let Some(run) = t3w_run(T3wTrigger::FatalControlPath) else {
+        return;
+    };
+    let armed_at = run.armed_at.unwrap_or_else(|| {
+        panic!(
+            "the guard never armed (no `{STOP_GUARD_ARMED_LINE}` line). stderr:\n{}",
+            run.stderr
+        )
+    });
+    t3w_assert_guard_exit(&run, armed_at, "fatal self-exit");
+}
+
+/// T3w (b): a manager-style SIGTERM whose teardown wedges exits 75 within the
+/// guard deadline measured from the SIGTERM, which is when the guard arms.
+#[test]
+fn t3w_b_sigterm_with_a_wedged_teardown_exits_75_by_the_guard() {
+    let Some(run) = t3w_run(T3wTrigger::Sigterm) else {
+        return;
+    };
+    let sigterm_at = run.sigterm_at.unwrap_or_else(|| {
+        panic!(
+            "the daemon never became signalable. stderr:\n{}",
+            run.stderr
+        )
+    });
+    assert!(
+        run.armed_at.is_some(),
+        "the SIGTERM must arm the guard. stderr:\n{}",
+        run.stderr
+    );
+    t3w_assert_guard_exit(&run, sigterm_at, "SIGTERM");
+}
+
+// ---- TW-wired: the liveness pet in the real daemon binary -------------------
+//
+// Capability (LINUX-SUPERVISOR-WEDGE-R1-01, LINUX-WD-POSTSTOP-PET-01): the
+// shipped binary sends systemd's watchdog datagram once per COMPLETED
+// supervisor health pass and only when the manager asked for pets
+// (`WATCHDOG_USEC`), from the supervisor thread alone: a wedged supervisor stops
+// petting, a slow health interval pets once, and no pet follows a stop request.
+// The supervisor wedge is a `test-isolation` seam
+// (`--test-wedge-health-pass-after`); a release build has none.
+//
+// Runs on every host, like T3w: control-plane-only on macOS (READY=1 withheld,
+// pets still sent, harmless with no armed watchdog), the isolated kernel runtime
+// on privileged Linux, where READY=1 precedes the pets.
+
+/// The watchdog interval the test hands the daemon, in microseconds: the shipped
+/// unit's `WatchdogSec`, so no mismatch line is expected.
+fn tw_watchdog_usec() -> String {
+    (u64::from(castle_wall_daemon::daemon::WATCHDOG_SEC) * 1_000_000).to_string()
+}
+/// A fast health interval, in milliseconds, so a few passes fit in a short run.
+const TW_FAST_INTERVAL_MS: &str = "100";
+/// An interval no second pass can reach inside the run: only the initial pass pets.
+const TW_NO_SECOND_PASS_MS: &str = "600000";
+/// How long the harness watches for pets after its trigger (20 fast intervals).
+const TW_QUIET_WINDOW: Duration = Duration::from_secs(2);
+/// Policy allowance for "no gap" on the control run (10 fast intervals).
+const TW_MAX_CONTROL_GAP: Duration = Duration::from_secs(1);
+/// Allowance between a SIGTERM and the last datagram a pre-signal pet can
+/// deliver (one fast interval).
+const TW_POST_STOP_ALLOWANCE: Duration = Duration::from_millis(100);
+/// The harness's give-up bound for boot plus the first pets.
+const TW_HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Injected stop-guard deadline, so a stop of a wedged supervisor ends in ~1 s.
+const TW_GUARD_DEADLINE_SECS: &str = "1";
+/// The watchdog datagram. Must match `WATCHDOG_DATAGRAM` in src/systemd_notify.rs.
+const TW_PET: &[u8] = castle_wall_daemon::systemd_notify::WATCHDOG_DATAGRAM;
+/// The readiness datagram. Must match `READY_DATAGRAM` in src/systemd_notify.rs.
+const TW_READY: &[u8] = b"READY=1\n";
+
+enum TwStop {
+    /// Stop once `n` pets arrived, then watch the quiet window while alive.
+    AfterPetsThenWatch(usize),
+    /// Watch the quiet window from the first pet (or from boot when none come).
+    Watch,
+    /// SIGTERM once `n` pets arrived, then wait for the exit.
+    SigtermAfterPets(usize),
+}
+
+struct TwRun {
+    datagrams: Vec<(std::time::Instant, Vec<u8>)>,
+    alive_after_window: bool,
+    sigterm_at: Option<std::time::Instant>,
+    stderr: String,
+}
+
+impl TwRun {
+    fn pets(&self) -> Vec<std::time::Instant> {
+        self.datagrams
+            .iter()
+            .filter(|(_, d)| d == TW_PET)
+            .map(|(at, _)| *at)
+            .collect()
+    }
+}
+
+/// End the daemon (SIGTERM, bounded wait, then SIGKILL) and reap it. Idempotent:
+/// an already-reaped child is waited again harmlessly.
+fn tw_end_child(child: &mut std::process::Child) {
+    use std::time::Instant;
+    if child.try_wait().ok().flatten().is_none() {
+        // SAFETY: kill(2) on our own unreaped direct child's pid.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let until = Instant::now() + TW_HARNESS_TIMEOUT;
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// Owns the spawned daemon and ends and reaps it on drop, so an unwind anywhere
+/// between `spawn` and the explicit end still leaves no live daemon behind. It
+/// also stops the datagram receiver thread. Must be declared after the suite
+/// guard it protects (locals drop in reverse order).
+struct TwChildReaper {
+    child: std::process::Child,
+    receiving: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::ops::Deref for TwChildReaper {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for TwChildReaper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for TwChildReaper {
+    fn drop(&mut self) {
+        tw_end_child(&mut self.child);
+        self.receiving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn tw_run(extra: &[&str], watchdog_usec: Option<String>, stop: TwStop) -> Option<TwRun> {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixDatagram;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    let _suite = isolation::guard();
+    reset_isolated_host_state();
+    let dir = TempDir::new().expect("tempdir");
+    let policy_dir = dir.path().join("policy/egress");
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned_path = policy_dir.join("pinned.key");
+    fs::write(&pinned_path, signing.verifying_key().to_bytes()).unwrap();
+    write_signed_manifest(&policy_dir, &signing, 1, 1);
+    let socket_path = dir.path().join("wd.sock");
+    let notify_path = dir.path().join("notify.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind the notify socket");
+    listener
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let receiving = Arc::new(AtomicBool::new(true));
+    let (dg_tx, dg_rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+    let receiver = {
+        let receiving = Arc::clone(&receiving);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while receiving.load(Ordering::SeqCst) {
+                if let Ok(n) = listener.recv(&mut buf) {
+                    let _ = dg_tx.send((Instant::now(), buf[..n].to_vec()));
+                }
+            }
+        })
+    };
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"));
+    command
+        .args(["--fortress-id", "deadbeef"])
+        .arg("--socket-path")
+        .arg(&socket_path)
+        .arg("--policy-dir")
+        .arg(&policy_dir)
+        .arg("--wal-path")
+        .arg(dir.path().join("wd.wal"))
+        .arg("--pinned-public-key")
+        .arg(&pinned_path)
+        .arg("--producer-key")
+        .arg(policy_dir.join("audit-producer.key"))
+        .arg("--producer-pub-key")
+        .arg(policy_dir.join("audit-producer.pub"))
+        .args(isolation::subprocess_args())
+        .args(["--test-stop-guard-deadline-secs", TW_GUARD_DEADLINE_SECS])
+        .args(extra)
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env_remove("WATCHDOG_PID")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    match &watchdog_usec {
+        Some(usec) => command.env("WATCHDOG_USEC", usec),
+        None => command.env_remove("WATCHDOG_USEC"),
+    };
+    // Declared AFTER `_suite`, so on every exit path, a panic unwind included,
+    // this reaper drops (ends and reaps the daemon) BEFORE the suite guard's
+    // teardown deletes this run's table: the teardown never runs under a live
+    // daemon.
+    let mut child = TwChildReaper {
+        child: command.spawn().expect("spawn the daemon binary"),
+        receiving: Arc::clone(&receiving),
+    };
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut datagrams: Vec<(Instant, Vec<u8>)> = Vec::new();
+    let collect = |datagrams: &mut Vec<(Instant, Vec<u8>)>| datagrams.extend(dg_rx.try_iter());
+    let pet_count =
+        |datagrams: &[(Instant, Vec<u8>)]| datagrams.iter().filter(|(_, d)| d == TW_PET).count();
+    let end_child = tw_end_child;
+
+    let wanted = match stop {
+        TwStop::AfterPetsThenWatch(n) | TwStop::SigtermAfterPets(n) => n,
+        TwStop::Watch => 1,
+    };
+    let started = Instant::now();
+    let mut exited_early = false;
+    // Phase 1: boot and the first pets (or, with no watchdog, a settle window).
+    loop {
+        collect(&mut datagrams);
+        if child.try_wait().ok().flatten().is_some() {
+            exited_early = true;
+            break;
+        }
+        if pet_count(&datagrams) >= wanted {
+            break;
+        }
+        if watchdog_usec.is_none() && socket_path.exists() {
+            break;
+        }
+        if started.elapsed() > TW_HARNESS_TIMEOUT {
+            end_child(&mut child);
+            receiving.store(false, Ordering::SeqCst);
+            let lines: Vec<String> = rx.try_iter().collect();
+            panic!("no {wanted} pets within {TW_HARNESS_TIMEOUT:?}: {datagrams:?} {lines:#?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut sigterm_at = None;
+    let mut alive_after_window = false;
+    if !exited_early {
+        match stop {
+            TwStop::AfterPetsThenWatch(_) | TwStop::Watch => {
+                std::thread::sleep(TW_QUIET_WINDOW);
+                collect(&mut datagrams);
+                alive_after_window = child.try_wait().ok().flatten().is_none();
+            }
+            TwStop::SigtermAfterPets(_) => {
+                // SAFETY: kill(2) on our own unreaped direct child's pid.
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                sigterm_at = Some(Instant::now());
+            }
+        }
+    }
+    end_child(&mut child);
+    // Let a datagram already in flight land, then stop the receiver.
+    std::thread::sleep(TW_POST_STOP_ALLOWANCE);
+    receiving.store(false, Ordering::SeqCst);
+    let _ = receiver.join();
+    collect(&mut datagrams);
+    let _ = reader.join();
+    let stderr = rx.try_iter().collect::<Vec<_>>().join("\n");
+    reset_isolated_host_state();
+    if stderr.contains("kernel runtime activation failed") {
+        if std::env::var_os("SANCTUARY_EXPECT_PRIVILEGED_LINUX").is_some() {
+            panic!("privileged Linux runtime was required but unavailable: {stderr}");
+        }
+        eprintln!("SKIP (privileged Linux runtime unavailable): {stderr}");
+        return None;
+    }
+    assert!(
+        !exited_early,
+        "the daemon exited before the harness trigger: {stderr}"
+    );
+    for (_, datagram) in &datagrams {
+        assert!(
+            datagram == TW_PET || datagram == TW_READY,
+            "only READY=1 and the watchdog pet may reach the manager: {datagram:?}"
+        );
+    }
+    Some(TwRun {
+        datagrams,
+        alive_after_window,
+        sigterm_at,
+        stderr,
+    })
+}
+
+/// TW-wired (a): a supervisor that wedges after three completed passes sends
+/// exactly three pets and then none, while the process stays alive.
+#[test]
+fn tw_a_a_wedged_supervisor_stops_petting_while_the_process_lives() {
+    let Some(run) = tw_run(
+        &[
+            "--test-health-interval-ms",
+            TW_FAST_INTERVAL_MS,
+            "--test-wedge-health-pass-after",
+            "3",
+        ],
+        Some(tw_watchdog_usec()),
+        TwStop::AfterPetsThenWatch(3),
+    ) else {
+        return;
+    };
+    assert_eq!(run.pets().len(), 3, "{:?}\n{}", run.datagrams, run.stderr);
+    assert!(
+        run.alive_after_window,
+        "the wedged daemon must still be alive: {}",
+        run.stderr
+    );
+}
+
+/// TW-wired (b), the control: a healthy supervisor pets every pass, with no gap
+/// near the watchdog interval.
+#[test]
+fn tw_b_a_healthy_supervisor_pets_every_pass() {
+    let Some(run) = tw_run(
+        &["--test-health-interval-ms", TW_FAST_INTERVAL_MS],
+        Some(tw_watchdog_usec()),
+        TwStop::Watch,
+    ) else {
+        return;
+    };
+    let pets = run.pets();
+    assert!(
+        pets.len() >= 10,
+        "{} pets in the window: {}",
+        pets.len(),
+        run.stderr
+    );
+    let widest = pets
+        .windows(2)
+        .map(|w| w[1].saturating_duration_since(w[0]))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        widest <= TW_MAX_CONTROL_GAP,
+        "a {widest:?} gap between pets"
+    );
+    assert!(
+        !run.stderr.contains("watchdog mismatch") && !run.stderr.contains("enabled no watchdog"),
+        "the shipped interval needs no diagnostic: {}",
+        run.stderr
+    );
+}
+
+/// TW-wired (c): a health interval longer than the run pets exactly once (the
+/// initial pass), so no timer or per-tick pinger exists.
+#[test]
+fn tw_c_a_slow_interval_pets_only_for_the_initial_pass() {
+    let Some(run) = tw_run(
+        &["--test-health-interval-ms", TW_NO_SECOND_PASS_MS],
+        Some(tw_watchdog_usec()),
+        TwStop::Watch,
+    ) else {
+        return;
+    };
+    assert_eq!(run.pets().len(), 1, "{:?}\n{}", run.datagrams, run.stderr);
+}
+
+/// TW-wired (d): no pet follows a stop request (beyond one in-flight datagram's
+/// allowance, LINUX-WD-POSTSTOP-PET-01).
+#[test]
+fn tw_d_no_pet_follows_a_stop_request() {
+    let Some(run) = tw_run(
+        &["--test-health-interval-ms", TW_FAST_INTERVAL_MS],
+        Some(tw_watchdog_usec()),
+        TwStop::SigtermAfterPets(3),
+    ) else {
+        return;
+    };
+    let sigterm_at = run.sigterm_at.expect("the SIGTERM was sent");
+    let late: Vec<Duration> = run
+        .pets()
+        .into_iter()
+        .filter_map(|at| at.checked_duration_since(sigterm_at))
+        .filter(|after| *after > TW_POST_STOP_ALLOWANCE)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "pets after the stop request: {late:?}\n{}",
+        run.stderr
+    );
+}
+
+/// TW-wired (e): with no `WATCHDOG_USEC` the daemon sends no pet at all and says
+/// on stderr that a wedged supervisor is unbounded.
+#[test]
+fn tw_e_no_watchdog_interval_means_no_pets_and_one_loud_line() {
+    let Some(run) = tw_run(
+        &["--test-health-interval-ms", TW_FAST_INTERVAL_MS],
+        None,
+        TwStop::Watch,
+    ) else {
+        return;
+    };
+    assert!(run.pets().is_empty(), "{:?}", run.datagrams);
+    assert!(
+        run.stderr.contains("supervisor enabled no watchdog"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// Witness for the TW harness's reaper (code gate round 1): a panic between
+/// spawn and the explicit end still ends and reaps the child before the
+/// function's other locals (the suite guard among them) drop.
+#[test]
+fn tw_reaper_ends_and_reaps_the_child_on_an_unwind() {
+    use std::process::{Command, Stdio};
+    let mut pid: i32 = 0;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let receiving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child = TwChildReaper {
+            child: Command::new("sleep")
+                .arg("30")
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn sleep"),
+            receiving,
+        };
+        pid = child.id() as i32;
+        panic!("an assertion failing between spawn and the explicit end");
+    }));
+    assert!(unwound.is_err());
+    // kill(pid, 0) succeeds for a live or unreaped (zombie) child; a reaped one
+    // is gone. Read before any cleanup so the result is the reaper's.
+    // SAFETY: signal 0 only probes existence; `pid` was our direct child.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        // Never leak the process, even when the witness fails.
+        // SAFETY: as above; SIGKILL to our own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "the child outlived the unwind (pid {pid})");
 }

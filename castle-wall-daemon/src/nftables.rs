@@ -2,17 +2,37 @@
 //!
 //! Per scope-lock section 1 Option A: the daemon shells out to the `nft` binary
 //! with atomic ruleset replacement, installs rules in a dedicated
-//! `sanctuary-castle` table (E7.2 namespace separation), binds rules to
-//! cgroup IDs via `socket cgroupv2 level N "<scope-path>"` matches.
+//! `sanctuary-castle` table (E7.2 namespace separation), and binds an agent's
+//! rules to that agent's uid via `meta skuid <uid>` matches.
+//!
+//! ## What `meta skuid` matches, precisely
+//!
+//! On Linux 6.8 `nft_meta` reads `sock->file->f_cred->fsuid`, translated through
+//! the user namespace of the socket's network namespace. The expression is
+//! UNAVAILABLE, so the packet does not match, in exactly three cases: no socket,
+//! no backing file, or a socket-versus-packet network-namespace mismatch. A uid
+//! with NO mapping in that user namespace is NOT one of them: the kernel renders
+//! it through `from_kuid_munged` as the overflow uid (65534), which then matches
+//! nothing the manifest names. Either way the packet falls through to the base
+//! chain's `policy accept`, but the two are different mechanisms and must not be
+//! collapsed. The guarantee is bounded to SOCKET credentials, and only while the
+//! rule exists: an inherited or passed socket, another network namespace, a
+//! `setfsuid` divergence, or a uid hop on a NEW socket all leave the match. Each
+//! of those is a row in the private defect register; none is closed here.
 //!
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated;
 //! on macOS (the dev sandbox) the stubs return structured errors so
 //! `cargo check` passes cross-platform.
 
-use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
+
+// The net's uid values come through the shared validator ONLY. `ConfinedUidSet`
+// has a private field there, so this module can carry it and render it but can
+// never mint one from a raw `u32`.
+// Must match `crate::safety_net_uid::ConfinedUidSet`'s constructor contract.
+use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet, HostOverflowUid};
 
 /// Errors emitted by the nftables module.
 #[derive(Debug, thiserror::Error)]
@@ -32,13 +52,441 @@ pub enum NftablesError {
     /// unknown ruleset nor deletes another owner's table.
     #[error("foreign or incompatible sanctuary-castle table: {0}")]
     ForeignState(String),
+    /// LINUX-NFT-PID-REUSE-KILL-01: an `nft` child could not be proven finished
+    /// (its waiter could not be spawned, it did not exit after SIGKILL, or it was
+    /// not reaped in the grace window). The child stays held in its slot until it
+    /// is joined. This proves NOTHING about the table: every consumer must read it
+    /// as an indeterminate outcome, never as a loss and never as health.
+    #[error("nft child could not be proven finished at stage {stage:?}; its slot stays held")]
+    ChildStuck { stage: ChildStuckStage },
+    /// LINUX-NFT-PID-REUSE-KILL-01: no child slot was free for this origin, so no
+    /// `nft` was spawned. Fail-closed and indeterminate, like `ChildStuck`.
+    #[error("nft child slots exhausted for {origin:?} calls; nothing was spawned")]
+    ChildSlotsExhausted { origin: NftOrigin },
 }
 
-/// Identifier for a wrapped agent's cgroup-bound ruleset.
+/// Which slot pool an `nft` invocation may draw from (LINUX-NFT-PID-REUSE-KILL-01).
+///
+/// Passed as the FIRST argument of every `run_nft` / `run_nft_stdin` call, so the
+/// origin of each call site is visible at the site and parsed from it by the
+/// inventory test. `SafetyNet` is reserved for the deny-all net install and its
+/// read-back; everything else is `General`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftOrigin {
+    General,
+    SafetyNet,
+}
+
+/// Where a child that could not be proven finished got stuck (named states of
+/// the bounded wait, `S_WAITING` / `S_EXITED?` / `S_REAPED?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStuckStage {
+    /// The output waiter thread could not be spawned.
+    WaiterSpawnFailed,
+    /// SIGKILL was sent (or no pidfd existed to send it through) and the process
+    /// was not observed to exit within the kill grace.
+    NotExited,
+    /// The process exited but the waiter did not reap it within the reap grace
+    /// (for example a descendant still holds an output pipe open).
+    NotReaped,
+}
+
+/// General-pool child slots. Policy: four concurrent general `nft` calls, the cap
+/// both design reviews accepted as fixed.
+pub const NFT_CHILD_SLOTS_GENERAL: usize = 4;
+/// Slots only a `SafetyNet` call may take: one net install in flight at a time.
+pub const NFT_CHILD_SLOTS_SAFETY_NET_RESERVED: usize = 1;
+/// Every slot, computed: `GENERAL + SAFETY_NET_RESERVED`.
+pub const NFT_CHILD_SLOTS_TOTAL: usize =
+    NFT_CHILD_SLOTS_GENERAL + NFT_CHILD_SLOTS_SAFETY_NET_RESERVED;
+
+/// How an `nft` invocation passes its command: argv or a `-f -` stdin script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NftSiteKind {
+    Argv,
+    Stdin,
+}
+
+/// Every `run_nft` / `run_nft_stdin` call site in this file's production code,
+/// as (enclosing fn, kind, mutating, origin); a function with two calls appears
+/// twice. Line numbers are deliberately absent (they drift); function names are
+/// not. The T12 inventory test parses every field back out of the call site
+/// itself and requires multiset equality, so a new call site, a retagged origin
+/// (a General site taking the reserved `SafetyNet` slot) or a new mutating argv
+/// verb cannot land without an edit here. Must match the call sites below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NFT_INVOCATION_SITES: &[(&str, NftSiteKind, bool, NftOrigin)] = &[
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_deny_all_safety_net_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "live_table_is_deny_all_safety_net_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "live_net_covers_attempt_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "list_castle_table_json_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "atomic_reset_deny_all_net_to_fresh_owned_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "force_delete_castle_table_by_name_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "create_castle_table_exclusive_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "list_owned_castle_table_json_for_binding_set",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl_from_live_inventory",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_agent_jump_rule_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "list_agent_rulesets_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "table_exists_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_castle_table_shape_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+];
+
+/// A child held in a slot after its call returned without proving it finished.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) trait ParkedChild {
+    /// Whether the child is now finished (joinable without blocking).
+    fn poll_finished(&mut self) -> bool;
+    /// Join the finished child, releasing everything it holds.
+    fn reap(self);
+}
+
+/// Per-origin child slots with reserved headroom (mirrors the audit ring's
+/// reserved-capacity rule). A slot is held from admission until the child is
+/// joined, so in-flight and parked children count alike.
+///
+/// INVARIANT (per-origin slot rule): a `General` call is admitted only while
+/// `held < NFT_CHILD_SLOTS_GENERAL` and a `SafetyNet` call only while
+/// `held < NFT_CHILD_SLOTS_TOTAL`, so General pressure can never consume the
+/// reserved slot. The reservation happens at ADMISSION, before any timeout can
+/// race it (AGENTS rule 12); a timeout never releases a slot, only a join does.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ChildSlotTable<P: ParkedChild> {
+    next_id: u64,
+    in_flight: Vec<(u64, NftOrigin)>,
+    parked: Vec<(NftOrigin, P)>,
+    /// `poll_finished` calls made by the most recent admission's sweep; bounded
+    /// by `NFT_CHILD_SLOTS_TOTAL` (the per-request work bound).
+    last_sweep_polls: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<P: ParkedChild> ChildSlotTable<P> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_id: 0,
+            in_flight: Vec::new(),
+            parked: Vec::new(),
+            last_sweep_polls: 0,
+        }
+    }
+
+    /// Slots currently held, in flight or parked.
+    pub(crate) fn held(&self) -> usize {
+        self.in_flight.len() + self.parked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_sweep_polls(&self) -> usize {
+        self.last_sweep_polls
+    }
+
+    /// Join every parked child that has finished, freeing its slot. Touches at
+    /// most `NFT_CHILD_SLOTS_TOTAL` entries, because no more can ever be held.
+    pub(crate) fn sweep(&mut self) {
+        let mut polls = 0;
+        let mut index = 0;
+        while index < self.parked.len() {
+            polls += 1;
+            if self.parked[index].1.poll_finished() {
+                let (_, child) = self.parked.swap_remove(index);
+                // Freeing a slot drops (reaps) its child, closing its pidfd.
+                child.reap();
+            } else {
+                index += 1;
+            }
+        }
+        self.last_sweep_polls = polls;
+    }
+
+    /// `S_ADMIT`: sweep, then reserve a slot for `origin` or refuse.
+    pub(crate) fn admit(&mut self, origin: NftOrigin) -> Result<u64, NftablesError> {
+        self.sweep();
+        let cap = match origin {
+            NftOrigin::General => NFT_CHILD_SLOTS_GENERAL,
+            NftOrigin::SafetyNet => NFT_CHILD_SLOTS_TOTAL,
+        };
+        if self.held() >= cap {
+            return Err(NftablesError::ChildSlotsExhausted { origin });
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.in_flight.push((id, origin));
+        Ok(id)
+    }
+
+    /// The call finished and its child was joined: free the slot.
+    pub(crate) fn release(&mut self, id: u64) {
+        self.in_flight.retain(|(held, _)| *held != id);
+    }
+
+    /// `S_PARKED`: the call returns, the slot stays held by the parked child.
+    ///
+    /// INVARIANT (per-origin slot rule): parking MOVES an in-flight slot to the
+    /// parked list, it never adds one. An `id` that is not in flight is refused
+    /// and the child handed back, so `held()` can never grow past the cap and the
+    /// origin is never guessed.
+    pub(crate) fn park(&mut self, id: u64, child: P) -> Result<(), P> {
+        let Some(at) = self.in_flight.iter().position(|(held, _)| *held == id) else {
+            debug_assert!(false, "park of nft slot {id}, which is not in flight");
+            return Err(child);
+        };
+        let origin = self.in_flight.swap_remove(at).1;
+        self.parked.push((origin, child));
+        Ok(())
+    }
+}
+
+/// Identifier for a wrapped agent's uid-bound ruleset.
+///
+/// `fortress_id` is not decoration: it is a seal input, so the same agent id and
+/// uid under a DIFFERENT fortress produce a different `agent_uid_seal` and the
+/// live rule fails to verify. Must match `AllowlistManifest.fortress_id` in
+/// `src/manifest/verify.rs` and `PolicySnapshot::fortress_id` in `src/policy.rs`;
+/// the verification side reads it from the CURRENT policy snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRulesetId {
     pub agent_id: String,
-    pub cgroup_path: PathBuf,
+    pub fortress_id: String,
+}
+
+/// The manifest-derived kernel binding one agent's rules are emitted from.
+///
+/// BOTH fields come from the SIGNED manifest's `agent_origin` (must match
+/// `AgentOrigin.agent_uid` / `AgentOrigin.system_uid_allow_ceiling` in
+/// `src/manifest/verify.rs`, admitted by `confined_agent_uid_from_loaded_manifest`
+/// in `src/policy.rs`); neither is ever read from local configuration. The
+/// ceiling travels WITH the uid so the emission site can prove, at the moment it
+/// seals a uid into a kernel rule, that the uid still clears the floor admission
+/// accepted it under — a snapshot swap between admission and emission cannot
+/// silently lower it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentUidBinding {
+    pub agent_uid: u32,
+    pub system_uid_allow_ceiling: u32,
+}
+
+/// What a verification site knows about the agent binding the live kernel rules
+/// are ALLOWED to carry. Named states, because the three are not interchangeable
+/// and the difference is the whole security content of the check: an
+/// internally-consistent inventory whose uid and seal were BOTH rewritten is
+/// refused only by [`Self::Confined`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedAgentBinding {
+    /// `agent_uid` is confined under `fortress_id`. Every live per-agent binding
+    /// must carry exactly this uid AND a seal that recomputes under this fortress
+    /// id. It is the trusted expectation the design names, and it has exactly
+    /// TWO admitted provenances, neither of which is ever read from the listing
+    /// it is compared against:
+    ///
+    /// (a) the daemon's frozen armed identity, for acquisition, readback and
+    ///     health: read from the write-once armed identity cell
+    ///     (`AdmittedIdentity` in `src/decision.rs`, by way of
+    ///     `current_expected_agent_binding` in `src/runtime_providers.rs`), never
+    ///     re-derived from the live store; a reload that would change the uid is
+    ///     REFUSED while armed, so there is no later value to drift against.
+    /// (b) the agent unit's instance uid, for the agent start gate ONLY
+    ///     ([`agent_start_gate_verdict`]): trusted because it is the value
+    ///     systemd applies as `User=` to the process the gate admits. That
+    ///     argv-fed construction has exactly one site, pinned by TB5s in
+    ///     `src/agent_start.rs`.
+    Confined { fortress_id: String, agent_uid: u32 },
+    /// The identity this process FROZE at boot confines NO agent uid (the frozen
+    /// cell is `Unconfined`: absent `agent_origin`, or a non-`uid` mode), or the
+    /// cell is not set yet because the boot freeze has not run (the freeze runs
+    /// BEFORE table creation, so an unset cell here is never explained by the
+    /// table having just been created). Read from the same
+    /// write-once cell as [`Self::Confined`] (`AdmittedIdentity` in
+    /// `src/decision.rs`, by way of `current_expected_agent_binding` in
+    /// `src/runtime_providers.rs`), never from a fresh store read, so the two
+    /// variants cannot disagree about which snapshot they describe. Any live
+    /// per-agent binding is unverifiable against a trusted expectation under this
+    /// variant, so it reads foreign: absent evidence is not passing evidence.
+    NoneConfined,
+    /// Shape, seal, agreement and cardinality only, under `fortress_id`, with the
+    /// uid NOT compared against a manifest expectation.
+    ///
+    /// Used ONLY where the caller genuinely holds no trusted expectation and the
+    /// operation's direction is already fail-closed: the pre-mutation ownership
+    /// precondition (which is followed by a real health poll that DOES compare),
+    /// and the disarm path (which deletes the table outright, so refusing on a
+    /// uid mismatch would wedge recovery rather than protect anything). It is
+    /// never correct on the reclaim, adoption or health paths.
+    SealOnly { fortress_id: String },
+    /// Shape, body/jump agreement and cardinality only, with NEITHER the seal
+    /// recomputed nor the uid compared, because the caller holds neither a
+    /// fortress id nor a manifest expectation.
+    ///
+    /// Used ONLY by the disarm path, whose verification exists to answer one
+    /// question — has this table drifted off the identity we captured, so that
+    /// deleting it would clobber someone else's state? — and which then DELETES
+    /// the table. Refusing there on a seal or uid mismatch would wedge the one
+    /// recovery path an operator has, while protecting nothing: the table is
+    /// about to cease to exist either way. It is never correct on a path that
+    /// keeps the table standing.
+    StructureOnly,
+}
+
+impl ExpectedAgentBinding {
+    /// The fortress id the seal is recomputed under, when the site has one.
+    /// [`Self::NoneConfined`] has none and needs none: it refuses every
+    /// per-agent binding before any seal is recomputed.
+    fn seal_fortress_id(&self) -> Option<&str> {
+        match self {
+            Self::Confined { fortress_id, .. } | Self::SealOnly { fortress_id } => {
+                Some(fortress_id.as_str())
+            }
+            Self::NoneConfined | Self::StructureOnly => None,
+        }
+    }
+
+    /// Whether a live per-agent binding may stand without a recomputable seal.
+    /// True only for [`Self::StructureOnly`]; every other state either supplies
+    /// a fortress id to recompute against or refuses the binding outright.
+    fn tolerates_unverifiable_seal(&self) -> bool {
+        matches!(self, Self::StructureOnly)
+    }
 }
 
 /// The dedicated nftables table name PRODUCTION installs into. Per scope-lock
@@ -140,6 +588,445 @@ const AGENT_CHAIN_PREFIX: &str = "agent_";
 /// the journal records for the same acquisition (see `ownership_journal`).
 pub const OWNER_MARKER_PREFIX: &str = "sanctuary-castle-owner:v1:";
 
+/// Rule `comment` on the safety net's DROP rule, which names the confined
+/// identity. This and the two comments below are the net's v2 wire shape: they
+/// are what `is_deny_all_safety_net_json` reads back to prove a live table is
+/// this daemon's own net, and the disarm verb's recovery arm keys on that same
+/// recognition. Emitter and recogniser are both in this file; the values are a
+/// PERMANENT product shape and must match the three rules in `D1` of
+/// `Review/Sanctuary/Linux_Safety_Net_Carveout_Design_2026-09-17.md`. They carry
+/// no `OWNER_MARKER_PREFIX`: the net is deliberately NOT a captured owned table
+/// (it is `policy drop`, while the owned parser requires `policy accept`).
+pub const NET_RULE_COMMENT_IDENTITY: &str = "sanctuary-castle-net:v2:confined-identity";
+
+/// Rule `comment` on the kernel neighbour-discovery accept rule.
+/// Must match the rule-2 comment in `is_deny_all_safety_net_json`.
+pub const NET_RULE_COMMENT_KERNEL_ND: &str = "sanctuary-castle-net:v2:kernel-nd";
+
+/// Rule `comment` on the "every other principal" accept rule.
+/// Must match the rule-3 comment in `is_deny_all_safety_net_json`.
+pub const NET_RULE_COMMENT_OTHERS: &str = "sanctuary-castle-net:v2:other-principals";
+
+/// The ONLY ICMPv6 types the net accepts while armed: the kernel's own
+/// neighbour-discovery messages, which carry no socket (`skb->sk` is null) and
+/// would otherwise fall to the drop policy and take IPv6 connectivity, an IPv6
+/// ssh session included, down with the agent.
+///
+/// MLD is deliberately ABSENT. An ordinary IPv6 datagram socket can join and
+/// leave multicast groups with no capability, and each membership change makes
+/// the kernel emit an MLD report with no socket, so an MLD accept would be a
+/// link-local channel the confined agent can drive. The cost is recorded as a
+/// residual in the design memo (IPv6 multicast memberships age out on
+/// MLD-snooping links while the net is armed; the IPv4 operator path is the
+/// documented repair path).
+///
+/// Must match the rule-2 type set the recogniser requires in
+/// `is_deny_all_safety_net_json`.
+pub const KERNEL_ND_ICMPV6_TYPES: [&str; 3] = [
+    "nd-neighbor-solicit",
+    "nd-neighbor-advert",
+    "nd-router-solicit",
+];
+
+/// Largest confined-uid set the net will name in one rule.
+///
+/// DERIVATION, not a preference: one agent uid and one gate uid per signed
+/// manifest, so 256 entries is 128 distinct admitted identities within a single
+/// boot with no disarm. An operating host rotates its confined identity a handful
+/// of times at most; a set larger than this comes from an attacker-crafted
+/// inventory, not from operation. Over the bound the net falls back to the
+/// host-wide shape with the `deny-set-over-capacity` reason rather than
+/// truncating, because a truncated set silently unconfines whichever identity
+/// fell off the end.
+pub const DENY_SET_MAX: usize = 256;
+
+/// Which principals the deny-all safety net denies.
+///
+/// `Identity` is the v2 shape and the only shape that preserves operator access:
+/// it denies exactly the uids in its [`ConfinedUidSet`] and accepts every other
+/// attestable principal. `HostWide` is the v1 shape (a bare `policy drop` base
+/// chain, no rules), installed ONLY when no confined identity can be named:
+/// an empty deny set, unknown history for this boot, or a deny set over
+/// [`DENY_SET_MAX`]. On that shape operator access is NOT preserved, and every
+/// refusal and audit row that carries it says so with its reason.
+///
+/// The variant is CLOSED: `ConfinedUidSet` has a private field and no constructor
+/// outside `crate::safety_net_uid`, so no caller anywhere in the crate can place
+/// uid 0, this host's `kernel.overflowuid` or `u32::MAX` into rule 1. This is the
+/// type-level half of D1c; the ceiling half stays at admission and at the
+/// emission floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetyNetScope {
+    /// Deny exactly these uids; accept every other attestable principal.
+    Identity(ConfinedUidSet),
+    /// Deny every uid on this host. Operator access is not preserved.
+    HostWide,
+}
+
+impl SafetyNetScope {
+    /// The uids rule 1 denies, ascending; empty for the host-wide shape (which
+    /// denies by policy rather than by naming anyone).
+    pub fn denied_uids(&self) -> Vec<u32> {
+        match self {
+            SafetyNetScope::Identity(set) => set.uids(),
+            SafetyNetScope::HostWide => Vec::new(),
+        }
+    }
+
+    /// The shape tag the audit row and the signed health report carry.
+    /// Must match the `shape` values in `D4` of the design memo and in the
+    /// `safety_net` state this daemon emits.
+    pub fn shape_tag(&self) -> &'static str {
+        match self {
+            SafetyNetScope::Identity(_) => "v2-confined-identity",
+            SafetyNetScope::HostWide => "v1-host-wide",
+        }
+    }
+}
+
+/// Why the net was installed with the scope it was.
+///
+/// Every host-wide reason is DISTINCT and carries its own refusal sentence,
+/// because they are not the same operational situation and an operator acts
+/// differently on each. Folding them into one "unrecoverable" message is what made
+/// an over-capacity set read as unknown history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyNetReason {
+    /// A confined identity was recoverable and the net denies exactly it. This is
+    /// the only reason under which operator access is preserved.
+    Identity,
+    /// No confined identity was recoverable from any of the three sources.
+    EmptyDenySet,
+    /// The journal's `confined` key is ABSENT on a same-boot record, so neither
+    /// the manifest nor the live table can prove this boot's history.
+    UnknownHistory,
+    /// The deny set is known exactly but is larger than `DENY_SET_MAX`.
+    DenySetOverCapacity { count: usize, cap: usize },
+}
+
+impl SafetyNetReason {
+    /// The tag the audit row and the signed health report carry.
+    /// Must match the `reason` values in `D4` of the design memo.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SafetyNetReason::Identity => "identity",
+            SafetyNetReason::EmptyDenySet => "empty-deny-set",
+            SafetyNetReason::UnknownHistory => "unknown-history",
+            SafetyNetReason::DenySetOverCapacity { .. } => "deny-set-over-capacity",
+        }
+    }
+}
+
+/// The repair order an operator must follow, in the order that WORKS.
+///
+/// FAILURE MODE this sentence exists to prevent: repairing the wall first and
+/// running disarm second does not work while the unit is running, because systemd
+/// restarts the daemon into the same refusal and it re-takes the host lock that
+/// disarm needs. Stopping the unit first is what makes the other two steps
+/// possible.
+pub const SAFETY_NET_REPAIR_ORDER: &str =
+    "stop the castle-wall unit, repair the wall, then run the disarm verb";
+
+/// The scope sentence a refusal on a net-install path carries, in plain words an
+/// operator can act on.
+///
+/// The identity form names the uids and states explicitly that every other
+/// principal is unaffected, because the first question an operator asks on seeing
+/// a deny-all net is whether their own session is about to die. Each host-wide
+/// form names its OWN reason and then says, in the same sentence, that operator
+/// access is NOT preserved on that path.
+pub fn safety_net_scope_sentence(scope: &SafetyNetScope, reason: &SafetyNetReason) -> String {
+    match scope {
+        SafetyNetScope::Identity(set) => format!(
+            "the net denies uids {:?}; every other principal, including root and ssh, \
+             is unaffected. {SAFETY_NET_REPAIR_ORDER}",
+            set.uids()
+        ),
+        SafetyNetScope::HostWide => {
+            let why = match reason {
+                SafetyNetReason::EmptyDenySet => "no confined identity was recoverable".to_string(),
+                SafetyNetReason::UnknownHistory => "history unknown for this boot".to_string(),
+                SafetyNetReason::DenySetOverCapacity { count, cap } => {
+                    format!("deny set over capacity ({count} of {cap})")
+                }
+                // `Identity` cannot pair with the host-wide shape; if it ever
+                // does, say so rather than printing a reason that is not true.
+                SafetyNetReason::Identity => {
+                    "a confined identity was named but the host-wide shape was installed \
+                     (this pairing is a defect)"
+                        .to_string()
+                }
+            };
+            format!(
+                "{why}; the net denies every uid on this host; operator access is not \
+                 preserved on this path. {SAFETY_NET_REPAIR_ORDER}"
+            )
+        }
+    }
+}
+
+/// The TAGGED `safety_net` state the `kernel_runtime_lost` WAL row and the signed
+/// health report carry (design memo D4).
+///
+/// INVARIANT, and the reason this is a tagged enum rather than a struct with an
+/// `installed: bool`: a status request or an audit row emitted WHILE a net install
+/// has failed must not attest to a protection that is not in place. A struct with
+/// optional fields reads as "installed, details missing"; these variants
+/// cannot be confused for one another by a consumer.
+///
+/// Producer and consumer schemas change together. Must match the `safety_net`
+/// object the TypeScript reader parses on the `kernel_runtime_lost` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetyNetAuditState {
+    /// The net is in the kernel with this exact predicate.
+    Installed {
+        shape: &'static str,
+        reason: &'static str,
+        deny_set_size: usize,
+        deny_set_max: usize,
+        rules: Vec<String>,
+        denied_uids: Vec<u32>,
+        sources: SafetyNetSources,
+        kernel_nd_accepted: Vec<&'static str>,
+        unattestable_packets: &'static str,
+        coverage: &'static str,
+    },
+    /// An install was attempted for this scope and FAILED. No protection is
+    /// claimed.
+    InstallFailed {
+        attempted_scope: String,
+        error: String,
+    },
+    /// A prior install succeeded, but this poll did not re-prove kernel presence.
+    /// Carries no predicate or coverage assertion.
+    Unverified,
+    /// No install was attempted on this path (both nft-indeterminate rows).
+    NotAttempted,
+}
+
+/// Which of the three sources contributed to the deny set, so a reader can tell a
+/// set recovered from the journal from one recovered only from the live table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNetSources {
+    pub journal: bool,
+    pub manifest: bool,
+    pub live_table: bool,
+}
+
+/// What the net does with a packet whose sending credential the kernel cannot
+/// attest. Named so the audit row and the doc comment cannot drift apart.
+pub const SAFETY_NET_UNATTESTABLE_DISPOSITION: &str = "drop-except-kernel-nd";
+
+/// The net's coverage limit, stated on every audit row that claims the net is
+/// installed. The net sits on the same hook as the wall, so a packet socket
+/// transmits below it; that bound is the launcher's to close, not this net's.
+pub const SAFETY_NET_COVERAGE_BOUND: &str = "inet output hook; packet sockets are outside it";
+
+impl SafetyNetAuditState {
+    /// Build the `Installed` state for a scope that is now in the kernel.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn installed(
+        scope: &SafetyNetScope,
+        reason: &SafetyNetReason,
+        sources: SafetyNetSources,
+    ) -> Self {
+        let denied_uids = scope.denied_uids();
+        // The rule texts come from the SAME builder that produced the
+        // transaction, so the audit row cannot describe a predicate other than
+        // the one installed.
+        let rules: Vec<String> = build_deny_all_safety_net_script(scope)
+            .lines()
+            .filter(|line| line.starts_with("add rule "))
+            .map(|line| line.to_string())
+            .collect();
+        SafetyNetAuditState::Installed {
+            shape: scope.shape_tag(),
+            reason: reason.tag(),
+            deny_set_size: denied_uids.len(),
+            deny_set_max: DENY_SET_MAX,
+            rules,
+            denied_uids,
+            sources,
+            kernel_nd_accepted: match scope {
+                SafetyNetScope::Identity(_) => KERNEL_ND_ICMPV6_TYPES.to_vec(),
+                // The host-wide shape carries no rules at all, so it accepts no
+                // neighbour discovery either. Saying so is the honest row.
+                SafetyNetScope::HostWide => Vec::new(),
+            },
+            unattestable_packets: SAFETY_NET_UNATTESTABLE_DISPOSITION,
+            coverage: SAFETY_NET_COVERAGE_BOUND,
+        }
+    }
+
+    /// The tag a consumer switches on.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SafetyNetAuditState::Installed { .. } => "installed",
+            SafetyNetAuditState::InstallFailed { .. } => "install_failed",
+            SafetyNetAuditState::Unverified => "unverified",
+            SafetyNetAuditState::NotAttempted => "not_attempted",
+        }
+    }
+
+    /// Render as the JSON object the WAL row and the signed report embed.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            SafetyNetAuditState::Installed {
+                shape,
+                reason,
+                deny_set_size,
+                deny_set_max,
+                rules,
+                denied_uids,
+                sources,
+                kernel_nd_accepted,
+                unattestable_packets,
+                coverage,
+            } => serde_json::json!({
+                "state": "installed",
+                "shape": shape,
+                "reason": reason,
+                "deny_set_size": deny_set_size,
+                "deny_set_max": deny_set_max,
+                "rules": rules,
+                "denied_uids": denied_uids,
+                "sources": {
+                    "journal": sources.journal,
+                    "manifest": sources.manifest,
+                    "live_table": sources.live_table,
+                },
+                "kernel_nd_accepted": kernel_nd_accepted,
+                "unattestable_packets": unattestable_packets,
+                "coverage": coverage,
+            }),
+            SafetyNetAuditState::InstallFailed {
+                attempted_scope,
+                error,
+            } => serde_json::json!({
+                "state": "install_failed",
+                "attempted_scope": attempted_scope,
+                "error": error,
+            }),
+            SafetyNetAuditState::Unverified => serde_json::json!({ "state": "unverified" }),
+            SafetyNetAuditState::NotAttempted => serde_json::json!({ "state": "not_attempted" }),
+        }
+    }
+}
+
+/// Render an nft set literal (`{ a, b }`) from ascending uids.
+///
+/// Gated the same way as its only caller, `build_deny_all_safety_net_script`:
+/// production-used on Linux and exercised by the cross-platform unit tests, so an
+/// ungated definition is a dead-code diagnostic under `clippy -D warnings` on the
+/// macOS dev lib build.
+#[cfg(any(target_os = "linux", test))]
+fn render_uid_set(uids: &[u32]) -> String {
+    let members: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+    format!("{{ {} }}", members.join(", "))
+}
+
+/// Build the ONE atomic transaction that arms the safety net for `scope`.
+///
+/// Pure and cross-platform so the exact transaction text, and above all the RULE
+/// ORDER, are unit-testable without a kernel.
+///
+/// INVARIANT, the rule order is the whole carve-out: rule 1 DROPS every
+/// attestable packet of the confined identity FIRST, so no later accept is
+/// reachable by an agent packet the kernel can attribute (including one sent on
+/// an `AF_INET`/`AF_INET6` raw or ping socket). Rule 2 then accepts the kernel's
+/// own neighbour-discovery messages, which carry no socket at all and therefore
+/// cannot be the agent's. Rule 3 accepts every other attestable principal, which
+/// is what keeps root, sshd and an ordinary human user's sockets alive. Reorder
+/// these and the net either denies the operator or lets the agent out; a
+/// reordered table is refused by the recogniser for exactly that reason.
+///
+/// Everything the three rules do not match falls to the chain's `policy drop`:
+/// an unattestable packet that is not kernel neighbour discovery (a closed
+/// socket's queued bytes with no file attached, a TIME_WAIT or orphaned socket,
+/// an ICMP error, an outbound packet-too-big) is DROPPED. That is deliberate,
+/// and it is why rule 2 exists at all.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn build_deny_all_safety_net_script(scope: &SafetyNetScope) -> String {
+    let castle_table = castle_table();
+    // add (ensure exists) -> delete (drop any drifted/leftover contents of OUR
+    // named table) -> add (fresh empty) -> base output chain, policy DROP. One
+    // transaction, so the kernel never observes the intermediate empty state:
+    // there is NO fail-open window between the teardown and the drop policy.
+    let mut script = format!(
+        "add table {CASTLE_FAMILY} {castle_table}\n\
+         delete table {CASTLE_FAMILY} {castle_table}\n\
+         add table {CASTLE_FAMILY} {castle_table}\n\
+         add chain {CASTLE_FAMILY} {castle_table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n"
+    );
+    if let SafetyNetScope::Identity(set) = scope {
+        let uid_set = render_uid_set(&set.uids());
+        let nd_types = KERNEL_ND_ICMPV6_TYPES.join(", ");
+        script.push_str(&format!(
+            "add rule {CASTLE_FAMILY} {castle_table} output meta skuid {uid_set} drop \
+             comment \"{NET_RULE_COMMENT_IDENTITY}\"\n\
+             add rule {CASTLE_FAMILY} {castle_table} output icmpv6 type {{ {nd_types} }} accept \
+             comment \"{NET_RULE_COMMENT_KERNEL_ND}\"\n\
+             add rule {CASTLE_FAMILY} {castle_table} output meta skuid != {uid_set} accept \
+             comment \"{NET_RULE_COMMENT_OTHERS}\"\n"
+        ));
+    }
+    script
+}
+
+/// nft's hard cap on a rule `comment`, in bytes (confirmed on nft 1.0.9). A
+/// comment over this is rejected at rule-load time, so every marker-bound
+/// comment this module emits must be proven to fit BEFORE emission — a
+/// load-time rejection mid-transaction leaves the agent with no binding at all.
+const NFT_RULE_COMMENT_MAX_LEN: usize = 128;
+
+/// Hex characters in an ownership marker's nonce: the acquisition path reads 16
+/// random bytes and hex-encodes them (see `new_owner_marker` in
+/// `runtime_providers.rs` and `fresh_install_owner_marker` below), and hex is 2
+/// characters per byte.
+const OWNER_MARKER_NONCE_HEX_LEN: usize = 2 * 16;
+
+/// Hex characters in an agent-uid seal: [`agent_uid_seal`] truncates SHA-256 to
+/// 8 bytes, and hex is 2 characters per byte.
+const AGENT_UID_SEAL_HEX_LEN: usize = 2 * 8;
+
+/// The delimiter that separates the agent id from its uid seal inside a
+/// marker-bound rule comment. Must match the split the inventory parser performs
+/// (`parse_owned_table_inventory`); the parser and the emitter share this
+/// constant precisely so the two can never disagree by a typo.
+const AGENT_UID_SEAL_INFIX: &str = ":uid:";
+
+/// The LONGEST role infix a SEALED rule comment can carry. `:jump:` is shorter,
+/// and `:failclosed:`, though longer still, carries no seal and no agent-uid
+/// suffix, so it is not the binding case (its worst comment is
+/// marker + 12 + MAX_AGENT_ID_LEN, comfortably inside the cap).
+const LONGEST_SEALED_ROLE_INFIX: &str = ":queue:";
+
+/// Longest byte length an agent id may carry and still leave every marker-bound
+/// rule comment inside nft's cap. Derived from the parts, never a literal, so a
+/// change to the marker, the seal width or the role names moves this with them:
+///
+/// ```text
+///   NFT_RULE_COMMENT_MAX_LEN      128
+/// - OWNER_MARKER_PREFIX.len()      26  "sanctuary-castle-owner:v1:"
+/// - OWNER_MARKER_NONCE_HEX_LEN     32  16 random bytes as hex
+/// - LONGEST_SEALED_ROLE_INFIX.len() 7  ":queue:"
+/// - AGENT_UID_SEAL_INFIX.len()      5  ":uid:"
+/// - AGENT_UID_SEAL_HEX_LEN         16  8 digest bytes as hex
+/// =                                42
+/// ```
+///
+/// This TIGHTENS the previous 128-byte agent-id grammar. An agent id between 43
+/// and 128 bytes that was accepted before is now refused at
+/// `validate_agent_binding_input` rather than accepted and then rejected by nft
+/// with an opaque load-time error.
+const MAX_AGENT_ID_LEN: usize = NFT_RULE_COMMENT_MAX_LEN
+    - OWNER_MARKER_PREFIX.len()
+    - OWNER_MARKER_NONCE_HEX_LEN
+    - LONGEST_SEALED_ROLE_INFIX.len()
+    - AGENT_UID_SEAL_INFIX.len()
+    - AGENT_UID_SEAL_HEX_LEN;
+
 /// The exact, verified identity of a `sanctuary-castle` table THIS daemon
 /// created and owns. (blocker 2/3)
 ///
@@ -151,6 +1038,10 @@ pub const OWNER_MARKER_PREFIX: &str = "sanctuary-castle-owner:v1:";
 /// carry our random marker, so binding readiness and teardown to this tuple —
 /// not to the name — is what makes "same-shape replacement withdraws readiness"
 /// and "release deletes only the exact owned object, never by name" true.
+///
+/// Must match `JournalActivation` in `src/ownership_journal.rs`: the journal's
+/// post-activation writers compare a record against exactly these three fields
+/// (plus the boot id and source), so a field added here must be added there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CastleTableOwnership {
     /// nft-assigned handle of the owned `inet sanctuary-castle` table.
@@ -230,8 +1121,18 @@ pub fn reset_runtime_ownership_for_tests() {
 #[cfg(all(not(target_os = "linux"), feature = "test-isolation"))]
 pub fn reset_runtime_ownership_for_tests() {}
 
+/// Prove the live table is still exactly this process's owned object BEFORE a
+/// privileged agent mutation touches it.
+///
+/// `fortress_id` is the seal domain the caller is about to emit under, so a
+/// pre-existing binding sealed under a DIFFERENT fortress fails here. The uid is
+/// deliberately NOT compared: this is a precondition on the object being
+/// mutated, and the caller may legitimately be replacing an older uid binding.
+/// The trusted manifest comparison happens on the reclaim/adoption and health
+/// paths, which read the CURRENT snapshot; the next health poll after this
+/// mutation is that comparison.
 #[cfg(target_os = "linux")]
-fn verify_active_runtime_ownership() -> Result<(), NftablesError> {
+fn verify_active_runtime_ownership(fortress_id: &str) -> Result<(), NftablesError> {
     if castle_table() != CASTLE_TABLE {
         // The integration-test namespace has no production journal. Its
         // isolation prefix and test-build mutation guard are the boundary.
@@ -249,7 +1150,12 @@ fn verify_active_runtime_ownership() -> Result<(), NftablesError> {
                     .to_string(),
             )
         })?;
-    verify_owned_castle_table(&active)
+    verify_owned_castle_table(
+        &active,
+        &ExpectedAgentBinding::SealOnly {
+            fortress_id: fortress_id.to_string(),
+        },
+    )
 }
 
 /// A single nftables rule fragment generated from a PolicySnapshot rule.
@@ -266,28 +1172,20 @@ pub struct NftRuleFragment {
 /// `sanctuary-castle` table. The chain ends with a `queue num 0` verdict
 /// for any unmatched traffic (NFQUEUE with FAIL_OPEN explicitly off).
 ///
-/// `cgroup_relative_path` is the cgroup-v2 path with the `/sys/fs/cgroup/`
-/// prefix stripped, e.g. `system.slice/sanctuary-agent-foo.service`. nft
-/// expects a quoted path string at rule-load time and walks
-/// `/sys/fs/cgroup/<path>` at depth `cgroup_level` to validate the cgroup
-/// exists. Earlier production code emitted the cgroup inode integer
-/// instead, which nft 1.x rejects: the integer is the post-resolution
-/// internal form (what `nft list rules` displays back), not the documented
-/// input form. Compute the relative path via `cgroup::cgroup_relative_path`
-/// from a `ScopeHandle.cgroup_path`.
+/// `agent_uid` is the uid the SIGNED manifest binds this agent to
+/// (`agent_origin.agent_uid` in `src/manifest/verify.rs`), never a value read
+/// from local configuration. It is emitted NUMERICALLY, never as an account
+/// name: nft renders `meta skuid` through a uid symbol table, and the ownership
+/// parser accepts only an integer, so a name in either the text or the JSON
+/// listing would read a legitimate rule as foreign. Numeric emission is the one
+/// half of that this daemon controls; the listing form is probed per nftables
+/// version before the shape is trusted.
 ///
-/// `cgroup_level` is the depth at which the agent's cgroup lives in the
-/// cgroup-v2 hierarchy (counted from `/sys/fs/cgroup` as depth 0). It comes
-/// from `cgroup::ScopeHandle::cgroup_level`, which is derived from
-/// systemd's reported ControlGroup. If the level is wrong (because the
-/// deployment is nested), nft rejects with "cgroupv2 path fails: No such
-/// file or directory". Threading the actual level through avoids that.
-pub fn build_agent_ruleset(
-    agent_id: &str,
-    cgroup_relative_path: &str,
-    cgroup_level: u32,
-    rules: &[NftRuleFragment],
-) -> String {
+/// The trailing unconditional `drop` is the chain's fail-closed tail, but note
+/// that it is not what the live guarantee rests on: the `queue num 0` above it
+/// is emitted WITHOUT `bypass`, so an unreachable or unbound NFQUEUE drops the
+/// packet in the kernel rather than releasing it.
+pub fn build_agent_ruleset(agent_id: &str, agent_uid: u32, rules: &[NftRuleFragment]) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
     let agent_mark = crate::nfqueue::register_agent_mark(agent_id);
@@ -296,8 +1194,6 @@ pub fn build_agent_ruleset(
     script.push_str(&format!(
         "flush chain {CASTLE_FAMILY} {castle_table} {chain_name}\n"
     ));
-    // cgroup match: only packets from this agent's cgroup enter this chain.
-    // The cgroup match is installed as a jump rule in the base output chain.
     // Static fragments are intentionally ignored. All signed rule semantics
     // execute in the ordered Rust evaluator behind the one NFQUEUE rule below.
     // Keeping this parameter during the API migration avoids a broad caller
@@ -307,53 +1203,48 @@ pub fn build_agent_ruleset(
     // Per scope-lock section 1: `queue num 0` without `bypass` flag.
     script.push_str(&format!(
         "add rule {CASTLE_FAMILY} {castle_table} {chain_name} \
-         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" \
+         meta skuid {agent_uid} \
          meta mark set 0x{agent_mark:08x} queue num 0\n\
          add rule {CASTLE_FAMILY} {castle_table} {chain_name} drop\n"
     ));
     script
 }
 
-/// Build the jump rule that routes packets from an agent's cgroup-v2
-/// directory into its per-agent chain in the `sanctuary-castle` output
-/// chain. Pure helper: emits the nft rule string only; callers shell out
-/// to apply it.
+/// Build the jump rule that routes an agent's uid-owned packets into its
+/// per-agent chain in the `sanctuary-castle` output chain. Pure helper: emits
+/// the nft rule string only; callers shell out to apply it.
 ///
 /// The base `output` chain created by [`install_castle_table`] is hooked
 /// into netfilter (`type filter hook output priority 0`) but has no rules
 /// of its own. Per-agent chains are non-base chains and stay dead until
 /// something jumps to them. This helper produces the `goto agent_<id>`
-/// rule that gates entry into the per-agent chain on the cgroup-v2
-/// `socket cgroupv2 level <N> "<path>"` match: only packets owned by a
-/// socket inside the agent's cgroup transit the per-agent rules. Every
-/// other packet in the operator's host (browser, OS daemons, the
-/// operator's other apps) flows past the jump and is allowed by the base
+/// rule that gates entry into the per-agent chain on `meta skuid <uid>`:
+/// only packets whose socket carries the agent's uid transit the per-agent
+/// rules. Every other packet in the operator's host (browser, OS daemons,
+/// the operator's other apps) flows past the jump and is allowed by the base
 /// chain's `policy accept`.
 ///
-/// The path is quoted at emission time (the same correctness invariant
-/// pinned for [`build_agent_ruleset`] in PR #130). `cgroup_level` mirrors
-/// the same dynamic-depth shape: depth 2 in canonical
-/// `system.slice/<unit>` placement, deeper for nested deployments.
-pub fn build_agent_jump_rule(
-    agent_id: &str,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
-) -> String {
+/// INVARIANT: the verdict is `goto`, not `jump`. `goto` is TERMINATING, so
+/// control never returns to the accept-policy base chain after the per-agent
+/// chain runs; a `jump` would fall back through to `policy accept` and silently
+/// undo the per-agent decision. `validate_owned_jump_expr` pins the same verb on
+/// the parse side.
+pub fn build_agent_jump_rule(agent_id: &str, agent_uid: u32) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
     format!(
         "add rule {CASTLE_FAMILY} {castle_table} output \
-         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" goto {chain_name}"
+         meta skuid {agent_uid} goto {chain_name}"
     )
 }
 
-/// Build a fail-closed per-agent chain body for a refreshed cgroup.
+/// Build a fail-closed per-agent chain body: one unconditional `drop`.
 ///
-/// During systemd scope recreation there is a short interval where the old
-/// base-chain jump points at an obsolete cgroup identity and the new cgroup
-/// identity is not yet wired. This ruleset is the first stage of refresh:
-/// replace the per-agent chain with a single drop verdict, then wire the
-/// refreshed cgroup jump to it before the normal policy rules are restored.
+/// Used to park an agent's chain at deny while its binding is being replaced, so
+/// the window between "old body flushed" and "new body installed" can never be a
+/// window where the agent's packets fall through to `policy accept`. The body
+/// carries NO uid match and therefore NO seal — there is nothing to seal, and
+/// `parse_owned_table_inventory` refuses a fail-closed body that carries one.
 pub fn build_agent_fail_closed_ruleset(agent_id: &str) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
@@ -403,6 +1294,29 @@ pub(crate) fn agent_chain_name(agent_id: &str) -> String {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const NFT_ABSOLUTE_PATHS: [&str; 3] = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
 
+/// TEST-ISOLATION ONLY (C2a2 harness legs H4(d) and H5): a substituted `nft`
+/// binary path, set once by `main`'s `--test-nft-binary <path>` before any nft
+/// call. Compiled out of release builds, where `nft_path` keeps the
+/// absolute-path, no-PATH-fallback rule. Must match `--test-nft-binary` in
+/// `main.rs`.
+#[cfg(feature = "test-isolation")]
+static TEST_NFT_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// TEST-ISOLATION ONLY: install the substituted `nft` binary. The path must be
+/// absolute (the no-PATH-search rule still holds for the substitute) and may be
+/// set only once per process.
+#[cfg(feature = "test-isolation")]
+pub fn use_test_nft_binary(path: String) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!(
+            "--test-nft-binary must be an absolute path, got {path:?}"
+        ));
+    }
+    TEST_NFT_BINARY
+        .set(path)
+        .map_err(|_| "--test-nft-binary may be set only once".to_string())
+}
+
 /// True iff `path` is a regular file with at least one execute bit set. The nft
 /// binary is selected by this direct check, never a PATH lookup.
 #[cfg(all(unix, any(target_os = "linux", test)))]
@@ -435,49 +1349,384 @@ pub(crate) fn resolve_nft_binary(
 
 // ---- Linux implementations ------------------------------------------------
 
+// The worst case of one bounded `nft` call, re-exported ALONE and only for
+// tests: the agent unit's `TimeoutStartSec` is pinned against it
+// (`src/agent_start.rs`, TB4). A combined import with the lister would be an
+// unused import in a release Linux build.
+// The one bounded listing the agent start gate makes (`src/agent_start.rs`).
+// It is already a row of the `run_nft` inventory above, so the gate adds no
+// `run_nft` site of its own.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::list_owned_castle_table_json_for_binding_set;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::NFT_CALL_WORST_CASE;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{Child, Command, Output};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
 
-    const NFT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Per-call deadline for an `nft` child before it is killed.
+    pub(crate) const NFT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Policy allowance for a SIGKILLed, runnable process to be observed exiting
+    /// through its pidfd (scheduler-tick scale; an allowance, not a measurement).
+    pub(crate) const NFT_KILL_GRACE: Duration = Duration::from_millis(200);
+    /// Policy allowance for pipe EOF and `waitpid` after a confirmed exit.
+    pub(crate) const NFT_REAP_GRACE: Duration = Duration::from_millis(500);
+    /// The longest one `nft` call can hold its caller: 2.7 s. Derived, used by
+    /// T13, harness leg H3 and TD2n; no inequality against the health interval
+    /// is claimed. Must match `WATCHDOG_HOOK_NFT_WAIT` in `src/daemon.rs`, the
+    /// systemd watchdog derivation's bound on the `Indeterminate` hook's one nft
+    /// call (TD2n pins the 2700 ms on this side). Read by tests and the harness
+    /// only, hence the allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const NFT_CALL_WORST_CASE: Duration = Duration::from_millis(
+        NFT_COMMAND_TIMEOUT.as_millis() as u64
+            + NFT_KILL_GRACE.as_millis() as u64
+            + NFT_REAP_GRACE.as_millis() as u64,
+    );
 
-    fn wait_nft_bounded(child: Child) -> Result<Output, NftablesError> {
-        let pid = child.id();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let waiter = std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-        match rx.recv_timeout(NFT_COMMAND_TIMEOUT) {
+    /// The three budgets of one bounded wait. Production passes
+    /// [`PRODUCTION_WAIT_BUDGET`]; tests inject short ones.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct NftWaitBudget {
+        pub(crate) command: Duration,
+        pub(crate) kill_grace: Duration,
+        pub(crate) reap_grace: Duration,
+    }
+
+    pub(crate) const PRODUCTION_WAIT_BUDGET: NftWaitBudget = NftWaitBudget {
+        command: NFT_COMMAND_TIMEOUT,
+        kill_grace: NFT_KILL_GRACE,
+        reap_grace: NFT_REAP_GRACE,
+    };
+
+    type WaitResult = std::io::Result<Output>;
+
+    /// A child held in its slot after the call that spawned it returned.
+    pub(crate) enum ParkedNftChild {
+        /// The waiter thread owns the child and will reap it; the pidfd is kept
+        /// only so it is closed when the slot is freed, never reused.
+        Waiter {
+            waiter: std::thread::JoinHandle<()>,
+            _pidfd: Option<OwnedFd>,
+        },
+        /// No waiter could be spawned: this entry owns the unreaped child (a
+        /// zombie at worst) and reaps it with a non-blocking `try_wait`.
+        Unwaited {
+            child: Child,
+            _pidfd: Option<OwnedFd>,
+        },
+    }
+
+    impl super::ParkedChild for ParkedNftChild {
+        fn poll_finished(&mut self) -> bool {
+            match self {
+                Self::Waiter { waiter, .. } => waiter.is_finished(),
+                // Ok(Some) reaped it now; Err means it can no longer be waited on
+                // (already reaped), so there is nothing left to hold.
+                Self::Unwaited { child, .. } => !matches!(child.try_wait(), Ok(None)),
+            }
+        }
+
+        fn reap(self) {
+            if let Self::Waiter { waiter, .. } = self {
+                let _ = waiter.join();
+            }
+        }
+    }
+
+    pub(crate) type NftSlotTable = super::ChildSlotTable<ParkedNftChild>;
+
+    /// The process's one slot table. Poison is recovered: the table holds only
+    /// counters and handles, and jamming it would refuse every later nft call.
+    static NFT_CHILD_SLOTS: Mutex<NftSlotTable> = Mutex::new(super::ChildSlotTable::new());
+
+    fn lock_slots(table: &Mutex<NftSlotTable>) -> MutexGuard<'_, NftSlotTable> {
+        table.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// A reserved slot. Dropping it frees the slot (the call finished and joined
+    /// its child, or never spawned one); `park` hands it to a stuck child instead.
+    pub(crate) struct SlotTicket {
+        table: &'static Mutex<NftSlotTable>,
+        id: u64,
+        armed: bool,
+    }
+
+    impl SlotTicket {
+        fn park(mut self, child: ParkedNftChild) {
+            self.armed = false;
+            if let Err(unheld) = lock_slots(self.table).park(self.id, child) {
+                // Unreachable by construction: an armed ticket's id was pushed by
+                // `admit` and only this ticket removes it (release or park, once).
+                // The table refused rather than exceed its cap; the child is
+                // dropped here (a waiter still reaps it, an unwaited one is a
+                // zombie until exit), which is the lesser escape.
+                drop(unheld);
+            }
+        }
+    }
+
+    impl Drop for SlotTicket {
+        fn drop(&mut self) {
+            if self.armed {
+                lock_slots(self.table).release(self.id);
+            }
+        }
+    }
+
+    /// `S_ADMIT` against `table`: reserve a slot for `origin` before anything is
+    /// spawned. A refusal spawns nothing and is written to stderr once.
+    pub(crate) fn admit_slot(
+        table: &'static Mutex<NftSlotTable>,
+        origin: NftOrigin,
+    ) -> Result<SlotTicket, NftablesError> {
+        let mut slots = lock_slots(table);
+        match slots.admit(origin) {
+            Ok(id) => Ok(SlotTicket {
+                table,
+                id,
+                armed: true,
+            }),
+            Err(err) => {
+                // SAFETY: stderr is the operator channel for a fail-closed
+                // refusal that adds no WAL writer; the probe reads it as an
+                // indeterminate outcome and systemd journals this line.
+                eprintln!(
+                    "castle-wall-daemon: nft child slots exhausted (origin {origin:?}, held {}); \
+                     refusing to spawn nft",
+                    slots.held()
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// `pidfd_open(pid, 0)`. `None` on any error (ENOSYS on a kernel before 5.3):
+    /// the caller then never signals at all.
+    pub(crate) fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: a plain syscall with integer arguments; the result is an fd the
+        // kernel just created for us, or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        let fd = std::os::fd::RawFd::try_from(fd)
+            .ok()
+            .filter(|fd| *fd >= 0)?;
+        // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `pidfd_send_signal(pidfd, SIGKILL, NULL, 0)`. `Err(errno)` on failure;
+    /// `ESRCH` means the process already exited and was reaped, never that a
+    /// reused pid was signalled (premise P11).
+    pub(crate) fn pidfd_kill(pidfd: &OwnedFd) -> Result<(), i32> {
+        // SAFETY: the fd is a live pidfd we own; a null siginfo is permitted.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    }
+
+    /// `S_EXITED?`: whether the pidfd becomes readable (the process exited) within
+    /// `grace`. SA_RESTART does not restart poll(2), so an EINTR (a returning
+    /// stop-guard handler) loops against the SAME deadline; it is never read as
+    /// "not readable".
+    fn pidfd_exited_within(pidfd: &OwnedFd, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Round UP to whole milliseconds so a sub-millisecond remainder still
+            // waits instead of polling with a zero timeout.
+            let millis = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+            if rc > 0 {
+                return true;
+            }
+            if rc == 0 {
+                return false;
+            }
+            let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            if !interrupted || remaining.is_zero() {
+                return false;
+            }
+        }
+    }
+
+    /// Wait for an admitted `nft` child with the production budget.
+    fn wait_nft_bounded(child: Child, ticket: SlotTicket) -> Result<Output, NftablesError> {
+        wait_nft_bounded_with(child, ticket, PRODUCTION_WAIT_BUDGET)
+    }
+
+    /// The bounded wait, in named states. Returns within
+    /// `command + kill_grace + reap_grace`; a child it cannot prove finished is
+    /// PARKED in its slot with a `ChildStuck` error rather than detached.
+    pub(crate) fn wait_nft_bounded_with(
+        child: Child,
+        ticket: SlotTicket,
+        budget: NftWaitBudget,
+    ) -> Result<Output, NftablesError> {
+        // S_SPAWNED. INVARIANT: the pidfd is opened before the waiter exists,
+        // because the waiter is the only reaper; a pidfd opened after a reap could
+        // name a reused pid.
+        let pidfd = pidfd_open(child.id());
+
+        // S_WAITING. The child is handed to the waiter through a cell rather than
+        // moved into the closure, so a failed spawn (which drops the closure)
+        // cannot drop the child with it.
+        let cell: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WaitResult>(1);
+        let waiter_cell = Arc::clone(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("castle-wall-nft-waiter".to_string())
+            .spawn(move || {
+                let taken = waiter_cell.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(child) = taken {
+                    let _ = tx.send(child.wait_with_output());
+                }
+            });
+        let waiter = match spawned {
+            Ok(waiter) => waiter,
+            Err(_) => {
+                if let Some(fd) = &pidfd {
+                    let _ = pidfd_kill(fd);
+                }
+                // Poison is recovered, never read as "no child": the closure that
+                // would have taken the child never ran, so it is still in the cell,
+                // and dropping it here would free the slot over a live, unsignalled
+                // child (round-2 code gate).
+                let taken = cell.lock().unwrap_or_else(|err| err.into_inner()).take();
+                if let Some(child) = taken {
+                    ticket.park(ParkedNftChild::Unwaited {
+                        child,
+                        _pidfd: pidfd,
+                    });
+                }
+                return Err(NftablesError::ChildStuck {
+                    stage: ChildStuckStage::WaiterSpawnFailed,
+                });
+            }
+        };
+        match rx.recv_timeout(budget.command) {
             Ok(result) => {
                 let _ = waiter.join();
-                result.map_err(|err| NftablesError::InvocationFailed(err.to_string()))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Absolute binary, direct child: terminate the process whose
-                // bounded output waiter we own, then join it so no detached nft
-                // worker survives a control-path timeout.
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                let result = rx.recv().map_err(|err| {
-                    NftablesError::InvocationFailed(format!(
-                        "nft timed out and waiter result was lost: {err}"
-                    ))
-                })?;
-                let _ = waiter.join();
-                let _ = result;
-                Err(NftablesError::InvocationFailed(format!(
-                    "nft invocation exceeded {}ms deadline",
-                    NFT_COMMAND_TIMEOUT.as_millis()
-                )))
+                drop(ticket);
+                return result.map_err(|err| NftablesError::InvocationFailed(err.to_string()));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = waiter.join();
-                Err(NftablesError::InvocationFailed(
+                drop(ticket);
+                return Err(NftablesError::InvocationFailed(
                     "nft output waiter disconnected".to_string(),
-                ))
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        // S_KILLED. Only through the pidfd: never a raw kill(pid), which after
+        // the waiter's reap could signal an unrelated process that reused the pid.
+        let Some(fd) = pidfd else {
+            ticket.park(ParkedNftChild::Waiter {
+                waiter,
+                _pidfd: None,
+            });
+            return Err(NftablesError::ChildStuck {
+                stage: ChildStuckStage::NotExited,
+            });
+        };
+        // ESRCH: it already exited; either way S_EXITED? decides.
+        let _ = pidfd_kill(&fd);
+
+        // S_EXITED?
+        if !pidfd_exited_within(&fd, budget.kill_grace) {
+            ticket.park(ParkedNftChild::Waiter {
+                waiter,
+                _pidfd: Some(fd),
+            });
+            return Err(NftablesError::ChildStuck {
+                stage: ChildStuckStage::NotExited,
+            });
+        }
+
+        // S_REAPED?
+        match rx.recv_timeout(budget.reap_grace) {
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = waiter.join();
+                // Freeing the slot drops the ticket; the pidfd closes with `fd`.
+                drop(ticket);
+                Err(NftablesError::InvocationFailed(format!(
+                    "nft invocation exceeded {}ms deadline",
+                    budget.command.as_millis()
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // S_PARKED: a descendant still holds a pipe, so the waiter never
+                // sees EOF. The slot stays held until the sweep joins it.
+                ticket.park(ParkedNftChild::Waiter {
+                    waiter,
+                    _pidfd: Some(fd),
+                });
+                Err(NftablesError::ChildStuck {
+                    stage: ChildStuckStage::NotReaped,
+                })
             }
         }
+    }
+
+    /// Write `script` to an admitted child's stdin, close it, then run the
+    /// bounded wait. `run_nft_stdin`'s body after the spawn; split out so the
+    /// write-failure path is testable with an injected child and budget.
+    pub(crate) fn feed_stdin_and_wait_with(
+        mut child: Child,
+        ticket: SlotTicket,
+        script: &str,
+        budget: NftWaitBudget,
+    ) -> Result<Output, NftablesError> {
+        use std::io::Write;
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(script.as_bytes()),
+            None => Ok(()),
+        };
+        // Closing stdin is required before waiting; otherwise nft correctly
+        // waits forever for more script bytes.
+        drop(child.stdin.take());
+        if let Err(write_err) = written {
+            // INVARIANT (per-origin slot rule): a failed write never returns past
+            // the child. Returning here with `?` would drop the ticket (freeing the
+            // slot) and the `Child` (which neither signals nor reaps), leaving a
+            // live, uncounted nft process. The child instead goes through the same
+            // kill-and-park path as a timed-out call: a zero command budget means
+            // "signal through the pidfd now", and the slot is freed only by a join
+            // or held by the parked child. The write error is what the caller sees.
+            let kill_now = NftWaitBudget {
+                command: Duration::ZERO,
+                ..budget
+            };
+            let _ = wait_nft_bounded_with(child, ticket, kill_now);
+            return Err(NftablesError::InvocationFailed(format!(
+                "writing the nft script to stdin failed: {write_err}"
+            )));
+        }
+        wait_nft_bounded_with(child, ticket, budget)
     }
 
     /// Locate the `nft` binary by DIRECT absolute-path existence/executable
@@ -485,6 +1734,10 @@ mod linux {
     /// removed in blocker 9, so a missing absolute binary is a hard error, never
     /// a silent degrade to a bare `nft` resolved through PATH.
     fn nft_path() -> Result<&'static str, NftablesError> {
+        #[cfg(feature = "test-isolation")]
+        if let Some(substitute) = super::TEST_NFT_BINARY.get() {
+            return Ok(substitute.as_str());
+        }
         super::resolve_nft_binary(&super::NFT_ABSOLUTE_PATHS, super::is_executable_file).ok_or_else(
             || {
                 NftablesError::BinaryMissing(
@@ -532,9 +1785,10 @@ mod linux {
         Ok(())
     }
 
-    fn run_nft(args: &[&str]) -> Result<String, NftablesError> {
+    fn run_nft(origin: NftOrigin, args: &[&str]) -> Result<String, NftablesError> {
         refuse_production_table_under_test()?;
         let nft = nft_path()?;
+        let ticket = admit_slot(&NFT_CHILD_SLOTS, origin)?;
         let child = Command::new(nft)
             .env("LC_ALL", "C")
             .args(args)
@@ -542,7 +1796,7 @@ mod linux {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        let output = wait_nft_bounded(child)?;
+        let output = wait_nft_bounded(child, ticket)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftablesError::InvocationFailed(format!(
@@ -555,10 +1809,11 @@ mod linux {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    fn run_nft_stdin(script: &str) -> Result<(), NftablesError> {
+    fn run_nft_stdin(origin: NftOrigin, script: &str) -> Result<(), NftablesError> {
         refuse_production_table_under_test()?;
         let nft = nft_path()?;
-        let mut child = Command::new(nft)
+        let ticket = admit_slot(&NFT_CHILD_SLOTS, origin)?;
+        let child = Command::new(nft)
             .env("LC_ALL", "C")
             .arg("-f")
             .arg("-")
@@ -567,16 +1822,7 @@ mod linux {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(script.as_bytes())
-                .map_err(|e| NftablesError::InvocationFailed(e.to_string()))?;
-        }
-        // Closing stdin is required before waiting; otherwise nft correctly
-        // waits forever for more script bytes.
-        drop(child.stdin.take());
-        let output = wait_nft_bounded(child)?;
+        let output = feed_stdin_and_wait_with(child, ticket, script, PRODUCTION_WAIT_BUDGET)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftablesError::InvocationFailed(format!(
@@ -625,7 +1871,10 @@ mod linux {
             // single-threaded test / agent-management path, so a racing writer is
             // out of scope (the ACQUISITION path uses the host-lock-guarded
             // `create_castle_table_exclusive_impl`).
-            run_nft_stdin(&super::build_create_castle_table_script(&marker))?;
+            run_nft_stdin(
+                NftOrigin::General,
+                &super::build_create_castle_table_script(&marker),
+            )?;
         } else {
             // Idempotent: the marked table already exists. Ensure the base output
             // chain is present without disturbing the marker; `add chain` is a
@@ -634,7 +1883,7 @@ mod linux {
                 "add chain {CASTLE_FAMILY} {castle_table} output \
                  {{ type filter hook output priority 0 ; policy accept ; }}\n"
             );
-            let _ = run_nft_stdin(&chain_script);
+            let _ = run_nft_stdin(NftOrigin::General, &chain_script);
         }
         Ok(())
     }
@@ -684,20 +1933,20 @@ mod linux {
     /// defect this net exists to prevent. The safety net's contract is "guarantee
     /// deny-all regardless of what currently holds the name," so add-delete-add is
     /// deliberate, not a bug to be narrowed.
-    pub fn install_deny_all_safety_net_impl() -> Result<(), NftablesError> {
-        let castle_table = castle_table();
-        // add (ensure exists) -> delete (drop any drifted/leftover contents of
-        // OUR named table) -> add (fresh empty) -> base output chain, policy DROP.
-        let script = format!(
-            "add table {CASTLE_FAMILY} {castle_table}\n\
-             delete table {CASTLE_FAMILY} {castle_table}\n\
-             add table {CASTLE_FAMILY} {castle_table}\n\
-             add chain {CASTLE_FAMILY} {castle_table} output \
-             {{ type filter hook output priority 0 ; policy drop ; }}\n"
-        );
-        run_nft_stdin(&script).map_err(|err| {
+    pub fn install_deny_all_safety_net_impl(scope: &SafetyNetScope) -> Result<(), NftablesError> {
+        // The rule text, and above all the rule ORDER, comes from the shared pure
+        // builder so the transaction this installs is byte-identical to the one
+        // the unit tests assert. Must match `build_deny_all_safety_net_script`.
+        let script = super::build_deny_all_safety_net_script(scope);
+        run_nft_stdin(NftOrigin::SafetyNet, &script).map_err(|err| {
+            let scope_text = match scope {
+                SafetyNetScope::Identity(set) => {
+                    format!("the confined identity {:?}", set.uids())
+                }
+                SafetyNetScope::HostWide => "every uid on this host".to_string(),
+            };
             NftablesError::InvocationFailed(format!(
-                "failed to install the GF1 deny-all safety net (kernel egress \
+                "failed to install the deny-all safety net for {scope_text} (kernel egress \
                  state for the owned scopes may be indeterminate): {err}"
             ))
         })
@@ -708,8 +1957,24 @@ mod linux {
     /// or an nft error reads as "not the net" (false / propagated error), so a
     /// caller only ever recovers on a positively-recognized fail-closed net.
     pub fn live_table_is_deny_all_safety_net_impl() -> Result<bool, NftablesError> {
-        match run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
-            Ok(json) => Ok(super::is_deny_all_safety_net_json(&json)),
+        // FAIL CLOSED on the recogniser's inputs: without the host's configured
+        // overflow uid the member revalidation cannot run, and an unrecognised
+        // table is the conservative answer (the caller neither resets nor deletes
+        // it). Must match the three-refusal contract in `crate::safety_net_uid`.
+        let overflow = match HostOverflowUid::from_host() {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(NftablesError::InvocationFailed(format!(
+                    "cannot classify the live table without this host's configured \
+                     kernel.overflowuid: {err}"
+                )))
+            }
+        };
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
+            Ok(json) => Ok(super::is_deny_all_safety_net_json(&json, overflow)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
             {
@@ -717,6 +1982,61 @@ mod linux {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Strict, fresh coverage for the scope whose installation just failed.
+    pub fn live_net_covers_attempt_impl(scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+        let overflow = HostOverflowUid::from_host().map_err(|e| {
+            NftablesError::InvocationFailed(format!(
+                "cannot classify live safety net without kernel.overflowuid: {e}"
+            ))
+        })?;
+        let json = run_nft(
+            NftOrigin::SafetyNet,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
+        Ok(super::deny_all_net_covers_scope_json(
+            &json, overflow, scope,
+        ))
+    }
+
+    /// List the live castle table as `nft -j` JSON, or `None` when it is absent.
+    ///
+    /// FAILURE-MODE NOTE: nft reports an absent table as an invocation failure whose
+    /// stderr names the missing file or object, so absence must be recognised from
+    /// that text and mapped to `None`. Treating it as an error would make the safety
+    /// net read "no table" as "unreadable" and lose source (c) on every fresh host.
+    /// Must match the same recognition in `live_table_is_deny_all_safety_net_impl`.
+    pub fn list_castle_table_json_impl() -> Result<Option<String>, NftablesError> {
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
+            Ok(json) => Ok(Some(json)),
+            Err(NftablesError::InvocationFailed(msg))
+                if msg.contains("No such file or directory") || msg.contains("does not exist") =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// D3: fetch the live castle table's raw JSON inventory using the existing
+    /// optional-table read, treating an absent table as a failed recovery probe.
+    /// A caller combining a recogniser answer with a second, independent property
+    /// (the disarm `ReclaimOwned` arm's comment-key check) reads both off this
+    /// ONE inventory rather than taking a further kernel snapshot. Unlike the
+    /// recogniser's own wrapper, absence here is an ERROR, not `Ok(false)`: a
+    /// caller reaching for the raw inventory already knows a table is present
+    /// from its own prior state, so a missing table is a genuine race to
+    /// surface, not an "absence reads as not-the-net" case.
+    pub fn live_castle_table_json_impl() -> Result<String, NftablesError> {
+        list_castle_table_json_impl()?.ok_or_else(|| {
+            NftablesError::InvocationFailed(
+                "castle table disappeared before the disarm recovery probe".to_string(),
+            )
+        })
     }
 
     /// GF1.1 recovery: atomically replace the deny-all safety net with a FRESH
@@ -746,7 +2066,7 @@ mod linux {
              create chain {CASTLE_FAMILY} {castle_table} output \
              {{ type filter hook output priority 0 ; policy accept ; }}\n"
         );
-        run_nft_stdin(&script).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &script).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "failed to atomically reset the deny-all net to a fresh owned table: {err}"
             ))
@@ -767,7 +2087,7 @@ mod linux {
             "add table {CASTLE_FAMILY} {castle_table}\n\
              delete table {CASTLE_FAMILY} {castle_table}\n"
         );
-        run_nft_stdin(&script).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &script).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "failed to force-delete the drifted sanctuary-castle table by name: {err}"
             ))
@@ -808,7 +2128,7 @@ mod linux {
                 "ownership marker contains characters unsafe for an nft comment".to_string(),
             ));
         }
-        run_nft_stdin(&super::build_create_castle_table_script(marker)).map_err(|err| {
+        run_nft_stdin(NftOrigin::General, &super::build_create_castle_table_script(marker)).map_err(|err| {
             NftablesError::InvocationFailed(format!(
                 "exclusive owned-table creation failed (Sanctuary requires nft table-comment and JSON-comment support): {err}"
             ))
@@ -826,8 +2146,16 @@ mod linux {
         // `-a/--handle` is mandatory: libnftables omits handles from listings by
         // default, while the ownership parser deliberately requires both the
         // table and base-chain handles as part of the exact live identity.
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        let owned = super::parse_owned_table_identity(&json)?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
+        // A table this daemon just created with `create table` holds ZERO agent
+        // chains by construction, so any per-agent binding present here is
+        // something this process did not install: refuse it rather than capture
+        // an identity over state of unknown provenance.
+        let owned =
+            super::parse_owned_table_identity(&json, &super::ExpectedAgentBinding::NoneConfined)?;
         if owned.marker != expected_marker {
             return Err(NftablesError::ForeignState(format!(
                 "captured table marker does not match the marker just written \
@@ -842,11 +2170,37 @@ mod linux {
     /// owned identity — same handles, same marker, same pristine shape. A
     /// delete/recreate (new handles), a mutation, an injected rule, an extra
     /// chain, or a marker change all fail here. (blocker 2)
+    /// The handle-bearing listing the owned-table parser needs.
+    ///
+    /// `-a` is not optional here and is the reason this is a named helper rather
+    /// than the plain `list_castle_table_json_impl`: without it nft omits the
+    /// handles, and the parser would read a perfectly good owned table as having
+    /// no table handle at all. Must match the argv in
+    /// [`verify_owned_castle_table_impl`], whose parse this one mirrors.
+    pub fn list_owned_castle_table_json_for_binding_set() -> Result<String, NftablesError> {
+        run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )
+    }
+
     pub fn verify_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
+        expectation: &super::ExpectedAgentBinding,
     ) -> Result<Vec<String>, NftablesError> {
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        let live = super::parse_owned_table_inventory(&json)?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
+        // This caller needs BOTH phases: it is a pre-mutation ownership
+        // precondition, so a drifted binding must refuse. Must match the polarity
+        // in `parse_owned_table_identity`.
+        let live = match super::parse_owned_table_inventory_phases(&json, expectation)? {
+            super::OwnedInventoryPhases::Verified(parsed) => parsed,
+            super::OwnedInventoryPhases::UidMismatch { detail, .. } => {
+                return Err(NftablesError::ForeignState(detail))
+            }
+        };
         if &live.ownership == ownership {
             Ok(live.agent_ids)
         } else {
@@ -877,32 +2231,35 @@ mod linux {
     /// or resolves to a different object we already refused above.
     pub fn remove_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
+        expectation: &super::ExpectedAgentBinding,
     ) -> Result<(), NftablesError> {
         // Prove the live table is still exactly ours before removing anything.
-        verify_owned_castle_table_impl(ownership)?;
-        run_nft(&[
-            "delete",
-            "table",
-            CASTLE_FAMILY,
-            "handle",
-            &ownership.table_handle.to_string(),
-        ])
+        verify_owned_castle_table_impl(ownership, expectation)?;
+        run_nft(
+            NftOrigin::General,
+            &[
+                "delete",
+                "table",
+                CASTLE_FAMILY,
+                "handle",
+                &ownership.table_handle.to_string(),
+            ],
+        )
         .map(|_| ())
     }
 
     fn replace_agent_chain_and_jump_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
         fail_closed: bool,
     ) -> Result<(), NftablesError> {
-        super::verify_active_runtime_ownership()?;
-        validate_agent_binding_input(id, cgroup_level, cgroup_relative_path)?;
+        verify_active_runtime_ownership(&id.fortress_id)?;
+        validate_agent_binding_input(id, binding)?;
         let expected_script = if fail_closed {
             build_agent_fail_closed_ruleset(&id.agent_id)
         } else {
-            build_agent_ruleset(&id.agent_id, cgroup_relative_path, cgroup_level, &[])
+            build_agent_ruleset(&id.agent_id, binding.agent_uid, &[])
         };
         if ruleset_script != expected_script {
             return Err(NftablesError::InvocationFailed(
@@ -912,28 +2269,39 @@ mod linux {
         }
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
-        let ownership = capture_owned_castle_table_impl_from_live_inventory()?;
+        let ownership = capture_owned_castle_table_impl_from_live_inventory(&id.fortress_id)?;
         let chain_comment = format!("{}:agent:{}", ownership.marker, id.agent_id);
         let rule_role = if fail_closed { "failclosed" } else { "queue" };
-        // GF2: seal the exact installed cgroup path into the authenticated,
-        // marker-bound comment of every rule that carries a `socket cgroupv2`
-        // match (the base-output jump always; the per-agent body only when it is
-        // the queued cgroup match, NOT the fail-closed unconditional drop, which
-        // has no cgroup match to seal). `parse_owned_table_inventory` recomputes
-        // this seal from the live match path and refuses a re-parented/widened
-        // match. Must match the seal the parser recomputes; see `cgroup_path_seal`.
-        let path_seal = super::cgroup_path_seal(cgroup_relative_path);
+        // Seal the exact installed uid into the authenticated, marker-bound
+        // comment of every rule that carries a `meta skuid` match (the
+        // base-output jump always; the per-agent body only when it is the queued
+        // uid match, NOT the fail-closed unconditional drop, which has no uid
+        // match to seal). `parse_owned_table_inventory` recomputes this seal from
+        // the live match value and refuses a rule whose uid was rewritten in
+        // place. Must match the seal the parser recomputes; see `agent_uid_seal`.
+        let uid_seal = super::agent_uid_seal(&id.fortress_id, &id.agent_id, binding.agent_uid);
         let queue_comment = if fail_closed {
             format!("{}:{rule_role}:{}", ownership.marker, id.agent_id)
         } else {
             format!(
-                "{}:{rule_role}:{}:cg:{}",
-                ownership.marker, id.agent_id, path_seal
+                "{}:{rule_role}:{}{}{}",
+                ownership.marker,
+                id.agent_id,
+                super::AGENT_UID_SEAL_INFIX,
+                uid_seal
             )
         };
-        let jump_comment = format!("{}:jump:{}:cg:{}", ownership.marker, id.agent_id, path_seal);
-        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let jump_comment = format!(
+            "{}:jump:{}{}{}",
+            ownership.marker,
+            id.agent_id,
+            super::AGENT_UID_SEAL_INFIX,
+            uid_seal
+        );
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -948,8 +2316,9 @@ mod linux {
             format!("add rule {CASTLE_FAMILY} {castle_table} {chain_name} drop comment \"{queue_comment}\"\n")
         } else {
             let agent_mark = crate::nfqueue::register_agent_mark(&id.agent_id);
+            let agent_uid = binding.agent_uid;
             format!(
-                "add rule {CASTLE_FAMILY} {castle_table} {chain_name} socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" meta mark set 0x{agent_mark:08x} queue num 0 comment \"{queue_comment}\"\n"
+                "add rule {CASTLE_FAMILY} {castle_table} {chain_name} meta skuid {agent_uid} meta mark set 0x{agent_mark:08x} queue num 0 comment \"{queue_comment}\"\n"
             )
         };
         // Chain creation/adoption, body replacement, stale-jump removal, and
@@ -965,89 +2334,120 @@ mod linux {
                 "delete rule {CASTLE_FAMILY} {castle_table} output handle {handle}\n"
             ));
         }
-        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         script.push_str(&format!("{rule} comment \"{jump_comment}\"\n"));
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     fn capture_owned_castle_table_impl_from_live_inventory(
+        fortress_id: &str,
     ) -> Result<CastleTableOwnership, NftablesError> {
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        super::parse_owned_table_identity(&json)
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
+        // Seal-only: this reads the marker off a table that may legitimately
+        // already carry an older agent binding, on the way to REPLACING it. The
+        // manifest-uid comparison belongs to the reclaim/adoption and health
+        // paths, which hold the current snapshot.
+        super::parse_owned_table_identity(
+            &json,
+            &ExpectedAgentBinding::SealOnly {
+                fortress_id: fortress_id.to_string(),
+            },
+        )
     }
 
     fn validate_agent_binding_input(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
+        // INVARIANT: an agent id that cannot fit its own sealed comment must be
+        // refused HERE, not by nft. `MAX_AGENT_ID_LEN` is derived from the
+        // comment budget, so an over-long id would otherwise be caught only by an
+        // opaque nft load-time rejection in the middle of the atomic transaction.
         if id.agent_id.is_empty()
-            || id.agent_id.len() > 128
+            || id.agent_id.len() > MAX_AGENT_ID_LEN
             || !id
                 .agent_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
         {
+            return Err(NftablesError::InvocationFailed(format!(
+                "agent id is outside the typed nft identifier grammar or exceeds the \
+                 {MAX_AGENT_ID_LEN}-byte sealed-comment budget"
+            )));
+        }
+        // The fortress id is a SEAL INPUT, so an empty one would collapse the
+        // seal's domain separation and let a rule sealed under one fortress
+        // verify under another.
+        if id.fortress_id.is_empty() {
             return Err(NftablesError::InvocationFailed(
-                "agent id is outside the typed nft identifier grammar".to_string(),
+                "agent ruleset id carries no fortress id; the uid seal has no domain".to_string(),
             ));
         }
-        if cgroup_level == 0
-            || cgroup_relative_path.is_empty()
-            || cgroup_relative_path.starts_with('/')
-            || cgroup_relative_path
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-            || !cgroup_relative_path.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'@' | b':')
-            })
-        {
-            return Err(NftablesError::InvocationFailed(
-                "cgroup path/level is outside the typed nft path grammar".to_string(),
-            ));
+        // INVARIANT: uid 0 is root and is never a confined agent, and a uid below
+        // the manifest's `system_uid_allow_ceiling` is a SYSTEM account whose
+        // egress this wall must not claim to gate. Both are already refused at
+        // manifest admission (`confined_agent_uid_from_loaded_manifest` in
+        // `src/policy.rs`); re-checking at the emission site means a caller that
+        // reaches this function by any other route cannot seal a system uid into
+        // a kernel rule. Must match the floors in that function.
+        if binding.agent_uid < 1 || binding.agent_uid < binding.system_uid_allow_ceiling {
+            return Err(NftablesError::InvocationFailed(format!(
+                "agent uid {} is root or below the manifest system-uid allow ceiling {}",
+                binding.agent_uid, binding.system_uid_allow_ceiling
+            )));
         }
+        // INVARIANT: the ceiling floor above STAYS and is not replaced by what
+        // follows. The ceiling proves the uid is outside the system-daemon band;
+        // these three refusals prove the uid names a single attestable principal
+        // at all. They answer different questions, and a uid must clear both
+        // before it is sealed into a kernel rule. Must match the same three
+        // refusals at admission in `crate::policy::confined_agent_uid_from_loaded_manifest`
+        // and the closed-set contract in `crate::safety_net_uid`.
+        let overflow = HostOverflowUid::from_host().map_err(|err| {
+            NftablesError::InvocationFailed(format!(
+                "cannot seal an agent uid into a kernel rule without this host's configured \
+                 kernel.overflowuid: {err}"
+            ))
+        })?;
+        validate_safety_net_uid(binding.agent_uid, overflow).map_err(|err| {
+            NftablesError::InvocationFailed(format!(
+                "agent uid {} may not be sealed into a kernel rule: {err}",
+                binding.agent_uid
+            ))
+        })?;
         Ok(())
     }
 
     pub fn load_agent_ruleset_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
-        // Atomically replace the per-agent chain body and the base output
-        // jump that reaches it. This keeps policy reloads and cgroup refresh
-        // from leaking a stale jump to an old cgroup identity.
-        replace_agent_chain_and_jump_impl(
-            id,
-            ruleset_script,
-            cgroup_level,
-            cgroup_relative_path,
-            false,
-        )
+        // Atomically replace the per-agent chain body and the base output jump
+        // that reaches it. This keeps a policy reload from leaking a stale jump
+        // bound to a superseded uid.
+        replace_agent_chain_and_jump_impl(id, ruleset_script, binding, false)
     }
 
     pub fn load_agent_fail_closed_ruleset_impl(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
         let ruleset_script = build_agent_fail_closed_ruleset(&id.agent_id);
-        replace_agent_chain_and_jump_impl(
-            id,
-            &ruleset_script,
-            cgroup_level,
-            cgroup_relative_path,
-            true,
-        )
+        replace_agent_chain_and_jump_impl(id, &ruleset_script, binding, true)
     }
 
     pub fn remove_agent_ruleset_impl(id: &AgentRulesetId) -> Result<(), NftablesError> {
-        super::verify_active_runtime_ownership()?;
+        super::verify_active_runtime_ownership(&id.fortress_id)?;
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
-        let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1069,7 +2469,7 @@ mod linux {
             "flush chain {CASTLE_FAMILY} {castle_table} {chain_name}\n\
              delete chain {CASTLE_FAMILY} {castle_table} {chain_name}\n"
         ));
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     /// Install the jump rule from the base `output` chain into this agent's
@@ -1080,8 +2480,7 @@ mod linux {
     /// without leaking stale jumps.
     pub fn install_agent_jump_rule_impl(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
         // Drop any existing jump rule for this agent before adding a new
         // one. Failures during the lookup are not fatal here: a missing
@@ -1089,9 +2488,9 @@ mod linux {
         // an error from `nft -a list chain`; the upcoming add will fail
         // with a clearer message if the table is genuinely absent.
         let _ = remove_agent_jump_rule_impl(id);
-        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         let script = format!("{rule}\n");
-        run_nft_stdin(&script)
+        run_nft_stdin(NftOrigin::General, &script)
     }
 
     /// Remove the jump rule from the base `output` chain that targets this
@@ -1102,14 +2501,17 @@ mod linux {
         let chain_name = agent_chain_name(&id.agent_id);
         // `-a` annotates each rule with `# handle <N>`; we parse those
         // handles for any rule whose verdict targets our chain.
-        let listing = match run_nft(&[
-            "-a",
-            "list",
-            "chain",
-            CASTLE_FAMILY,
-            castle_table(),
-            "output",
-        ]) {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &[
+                "-a",
+                "list",
+                "chain",
+                CASTLE_FAMILY,
+                castle_table(),
+                "output",
+            ],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1122,15 +2524,18 @@ mod linux {
         };
         let handles = parse_jump_rule_handles(&listing, &chain_name);
         for handle in handles {
-            run_nft(&[
-                "delete",
-                "rule",
-                CASTLE_FAMILY,
-                castle_table(),
-                "output",
-                "handle",
-                &handle.to_string(),
-            ])?;
+            run_nft(
+                NftOrigin::General,
+                &[
+                    "delete",
+                    "rule",
+                    CASTLE_FAMILY,
+                    castle_table(),
+                    "output",
+                    "handle",
+                    &handle.to_string(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -1168,8 +2573,14 @@ mod linux {
         handles
     }
 
-    pub fn list_agent_rulesets_impl() -> Result<Vec<AgentRulesetId>, NftablesError> {
-        let output = run_nft(&["list", "chains", CASTLE_FAMILY])?;
+    /// Agent ids visible as `agent_*` chain names.
+    ///
+    /// Returns bare ids, NOT [`AgentRulesetId`]: a chain listing carries no
+    /// fortress id and no uid, so an `AgentRulesetId` synthesized here would be a
+    /// half-empty identity a caller could mistake for a real binding. Callers
+    /// that need the binding read it from the inventory parser.
+    pub fn list_agent_rulesets_impl() -> Result<Vec<String>, NftablesError> {
+        let output = run_nft(NftOrigin::General, &["list", "chains", CASTLE_FAMILY])?;
         let mut results = Vec::new();
         for line in output.lines() {
             let trimmed = line.trim();
@@ -1180,10 +2591,7 @@ mod linux {
                     .and_then(|s| s.split_whitespace().next())
                 {
                     if let Some(agent_id) = name.strip_prefix("agent_") {
-                        results.push(AgentRulesetId {
-                            agent_id: agent_id.to_string(),
-                            cgroup_path: PathBuf::new(),
-                        });
+                        results.push(agent_id.to_string());
                     }
                 }
             }
@@ -1192,11 +2600,18 @@ mod linux {
     }
 
     pub fn remove_castle_table_impl() -> Result<(), NftablesError> {
-        run_nft(&["delete", "table", CASTLE_FAMILY, castle_table()]).map(|_| ())
+        run_nft(
+            NftOrigin::General,
+            &["delete", "table", CASTLE_FAMILY, castle_table()],
+        )
+        .map(|_| ())
     }
 
     pub fn table_exists_impl() -> Result<bool, NftablesError> {
-        match run_nft(&["list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(_) => Ok(true),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1214,7 +2629,10 @@ mod linux {
         // take. Structured parsing (not a substring scan) is what lets us tell a
         // base output chain from a same-named regular chain, and a chain in our
         // table from one in a foreign table. (blocker 2)
-        let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // A table that shares the `sanctuary-castle` name but lacks our exact
         // base-output-chain shape — or carries any foreign base chain — is
         // foreign/incompatible state (another owner, a hand-edited ruleset, a
@@ -1293,65 +2711,104 @@ pub fn output_chain_shape_is_ours_json(json: &str) -> bool {
     found_ours
 }
 
-/// GF1.1: whether an `nft -j list table inet sanctuary-castle` JSON document is
-/// EXACTLY this daemon's deny-all safety net (`install_deny_all_safety_net_impl`
-/// output): one `inet/sanctuary-castle` table with NO owner marker comment, one
-/// base `output` chain (`type filter hook output priority 0`, `policy DROP`), and
-/// NOTHING else -- zero rules, zero agent chains, zero sets/maps.
+/// GF1.1/D2: whether an `nft -j list table inet sanctuary-castle` JSON document is
+/// EXACTLY this daemon's deny-all safety net, in either of its two permanent
+/// shapes, as `build_deny_all_safety_net_script` emits them.
 ///
-/// This is the recognizer for the create-failure recovery state. When the
-/// authenticated journal is `Preparing` for THIS boot but `capture` fails, the
-/// live table being this exact fail-CLOSED net (never any shape the owned path
-/// emits, which is always `policy accept`) is what distinguishes "our own
-/// half-finished acquisition that ReArmLostOwned armed" from a foreign table.
-/// Combined with the authenticated Preparing-this-boot journal at the call site,
-/// it is the "this boot + source" proof that the daemon created this net, so
-/// recovery may reset/clear it. Residual (a foreign actor swapping in an
-/// identical-shape `policy drop` net in the window) is the inherent CAP_NET_ADMIN
-/// bound documented on `install_deny_all_safety_net_impl` (GF1.4), and is
-/// fail-CLOSED either way.
+/// Both shapes require ONE `inet/sanctuary-castle` table with NO table `comment`
+/// key at all, and ONE base `output` chain (`type filter hook output priority 0`,
+/// `policy drop`). They differ only in the rules:
 ///
-/// Pure and cross-platform so the recognizer is unit-testable without a kernel.
-pub fn is_deny_all_safety_net_json(json: &str) -> bool {
+///   * the V2 identity shape: exactly the three rules of `D1`, IN ORDER, each
+///     carrying its own comment constant, with rule 1's and rule 3's uid sets
+///     EQUAL, non-empty, and every member passing the shared three-refusal
+///     validator;
+///   * the V1 host-wide shape: zero rules.
+///
+/// Anything else is "not the net": refuse, never recover.
+///
+/// INVARIANT, why the table comment must be ABSENT and not merely
+/// non-`OWNER_MARKER_PREFIX`: this predicate is what authorises the disarm verb's
+/// recovery arm to DELETE a live table by name. `build_deny_all_safety_net_script`
+/// stamps no table comment on either shape, so a `policy drop` table carrying ANY
+/// comment was armed by something other than this daemon and must not be deleted
+/// as if it were ours. Reading only the owner prefix here would accept a
+/// zero-rule `policy drop` table with a foreign comment.
+///
+/// INVARIANT, why the members are revalidated: the installer type cannot produce
+/// a set containing `0`, this host's `kernel.overflowuid` or `u32::MAX`, so a live
+/// table whose set carries one of those was not armed by this daemon however
+/// well-formed the rest of it looks. Accepting it would let the recovery arm
+/// delete a table this daemon could not have installed. `overflow` is the host's
+/// own configured value; a caller that cannot read it must treat the table as NOT
+/// the net, which is the conservative side (no delete, no reset).
+///
+/// Residual, accepted and unchanged from v1: a foreign actor holding
+/// `CAP_NET_ADMIN` can swap in an identical-shape table in the window between
+/// this recognition and the caller's next transaction. That is the inherent bound
+/// documented on `install_deny_all_safety_net_impl`, and it is fail-CLOSED either
+/// way.
+///
+/// Pure and cross-platform so the recogniser is unit-testable without a kernel.
+pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> bool {
+    recognized_net_json(json, overflow).is_some()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecognizedNet {
+    HostWide,
+    Identity(Vec<u32>),
+}
+
+/// Coverage uses the identical strict parser that authorizes disarm recognition.
+pub fn deny_all_net_covers_scope_json(
+    json: &str,
+    overflow: HostOverflowUid,
+    attempted: &SafetyNetScope,
+) -> bool {
+    match (recognized_net_json(json, overflow), attempted) {
+        (Some(RecognizedNet::HostWide), _) => true,
+        (Some(RecognizedNet::Identity(live)), SafetyNetScope::Identity(attempt)) => attempt
+            .uids()
+            .iter()
+            .all(|uid| live.binary_search(uid).is_ok()),
+        _ => false,
+    }
+}
+
+fn recognized_net_json(json: &str, overflow: HostOverflowUid) -> Option<RecognizedNet> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
-        return false;
+        return None;
     };
-    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
-        return false;
-    };
+    let items = doc.get("nftables").and_then(|v| v.as_array())?;
     let mut saw_table = false;
     let mut saw_drop_base_chain = false;
+    let mut rules: Vec<&serde_json::Value> = Vec::new();
     for item in items {
-        let Some(obj) = item.as_object() else {
-            return false;
-        };
+        let obj = item.as_object()?;
         if obj.len() != 1 {
-            return false;
+            return None;
         }
         for (kind, val) in obj {
             match kind.as_str() {
                 "metainfo" => {}
                 "table" => {
                     if saw_table {
-                        return false; // more than one table object
+                        return None; // more than one table object
                     }
                     let ours = val.get("family").and_then(|v| v.as_str()) == Some(CASTLE_FAMILY)
                         && val.get("name").and_then(|v| v.as_str()) == Some(castle_table());
-                    // The net is UNMARKED by construction; an owner marker here
-                    // means this is NOT the bare safety net (it would be a captured
-                    // owned table, handled by the normal parser instead).
-                    let has_owner_marker = val
-                        .get("comment")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|c| c.starts_with(OWNER_MARKER_PREFIX));
-                    if !ours || has_owner_marker {
-                        return false;
+                    // Neither net shape carries a table comment, so ANY comment
+                    // here (owner-prefixed or foreign) means this is not our net.
+                    let has_any_comment = val.get("comment").is_some();
+                    if !ours || has_any_comment {
+                        return None;
                     }
                     saw_table = true;
                 }
                 "chain" => {
                     if saw_drop_base_chain {
-                        return false; // more than one chain
+                        return None; // more than one chain
                     }
                     let is_deny_all_base = val.get("family").and_then(|v| v.as_str())
                         == Some(CASTLE_FAMILY)
@@ -1362,17 +2819,322 @@ pub fn is_deny_all_safety_net_json(json: &str) -> bool {
                         && val.get("prio").and_then(|v| v.as_i64()) == Some(0)
                         && val.get("policy").and_then(|v| v.as_str()) == Some("drop");
                     if !is_deny_all_base {
-                        return false;
+                        return None;
                     }
                     saw_drop_base_chain = true;
                 }
-                // A rule, agent chain, set, map, flowtable, or any other object
-                // means this is NOT the bare deny-all net.
-                _ => return false,
+                "rule" => {
+                    let in_our_chain = val.get("family").and_then(|v| v.as_str())
+                        == Some(CASTLE_FAMILY)
+                        && val.get("table").and_then(|v| v.as_str()) == Some(castle_table())
+                        && val.get("chain").and_then(|v| v.as_str()) == Some("output");
+                    if !in_our_chain {
+                        return None;
+                    }
+                    rules.push(val);
+                }
+                // An agent chain, set, map, flowtable, or any other object means
+                // this is NOT the safety net in either shape.
+                _ => return None,
             }
         }
     }
-    saw_table && saw_drop_base_chain
+    if !(saw_table && saw_drop_base_chain) {
+        return None;
+    }
+    match rules.len() {
+        // V1 host-wide shape: zero rules under the drop policy.
+        0 => Some(RecognizedNet::HostWide),
+        // V2 identity shape: exactly the three rules, in order.
+        NET_V2_RULE_COUNT => net_v2_rules_match(&rules, overflow).map(RecognizedNet::Identity),
+        // One rule is a shape `build_deny_all_safety_net_script` never emits, and
+        // a fourth rule is drift or injection.
+        _ => None,
+    }
+}
+
+/// Rules in the net's v2 identity shape. Named so the recogniser's arm reads as
+/// "the three rules" rather than as a bare literal.
+/// Must match the rule count `build_deny_all_safety_net_script` emits for
+/// `SafetyNetScope::Identity`.
+const NET_V2_RULE_COUNT: usize = 3;
+
+/// Whether `rules` are EXACTLY the net's three v2 rules, in order.
+///
+/// INVARIANT: order is checked positionally, not by searching for each comment.
+/// A table carrying the same three rules in a different order is a DIFFERENT
+/// enforcement outcome (an accept ahead of the drop lets the agent out), so it
+/// must be refused, which a comment-set comparison would not do.
+fn net_v2_rules_match(rules: &[&serde_json::Value], overflow: HostOverflowUid) -> Option<Vec<u32>> {
+    let denied =
+        rule_skuid_set_with_verdict(rules[0], "==", "drop", NET_RULE_COMMENT_IDENTITY, overflow)?;
+    if !rule_is_kernel_nd_accept(rules[1]) {
+        return None;
+    }
+    let excepted =
+        rule_skuid_set_with_verdict(rules[2], "!=", "accept", NET_RULE_COMMENT_OTHERS, overflow)?;
+    // INVARIANT: the two sets must be EQUAL. If rule 3 excepted a wider set than
+    // rule 1 denied, a uid in the difference would be accepted by rule 3 having
+    // never been dropped, which is the fail-open the ordering exists to prevent;
+    // a narrower rule 3 would deny an operator the net promised to spare.
+    if denied == excepted {
+        Some(denied)
+    } else {
+        None
+    }
+}
+
+/// One uid from a bare-scalar JSON value (or a `"set"` value that itself
+/// collapsed to a bare scalar): `as_u64` refuses a string, a float, a bool
+/// and a nested object, so a name form or an unrecognised shape yields `None`
+/// rather than a wrong uid.
+fn one_skuid_scalar(value: &serde_json::Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
+}
+
+/// The uid members of a `meta skuid <op> <right>` match's `right` value, in
+/// nft's listed order and with duplicates intact: the caller validates,
+/// sorts, dedups and checks cardinality to its own contract. `None` means
+/// `right` is not one of the forms nft renders a skuid set as; a non-numeric
+/// member anywhere refuses the WHOLE match rather than silently reading a
+/// partial set, matching a shape this daemon's own installer never emits.
+///
+/// SHARED single source of truth for the safety-net recogniser
+/// (`rule_skuid_set_with_verdict`, below) and the live-binding reader
+/// (`net_rule_one_uids`): nft collapses a single-member anonymous set to a
+/// bare scalar with no `"set"` wrapper at all. The real-kernel witness for
+/// this collapse is `installed_net_rule_one_uids` in
+/// `integration_linux_runtime_activation.rs` (reading only the set form
+/// "returned an empty scope for a live one-uid net on the first privileged
+/// run of this suite") and the sibling case
+/// `nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid`
+/// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value`: that
+/// function pins a DIFFERENT rule (the per-agent chain's bare `meta skuid ==
+/// <uid>`, written without set syntax at all) and says nothing about whether
+/// an anonymous SET of one member collapses. `render_uid_set` always writes
+/// explicit `{ .. }` braces, even for one uid, so a live table with exactly
+/// one denied or excepted uid is exactly where this collapse is reachable.
+/// Reading only the multi-member array form in the recogniser would refuse
+/// to recognise this daemon's OWN single-uid net as the safety net at all;
+/// reading only the array form in the live-binding reader would drop that
+/// already-installed uid from source (c) of `resolve_safety_net_scope`. Both
+/// callers must resolve every shape nft may emit for the same one-member
+/// match identically, or they silently disagree about the SAME live kernel
+/// state.
+///
+/// The accepted surface is kept equal to the set of OBSERVED nft outputs: a
+/// `"set"` key whose own value is itself a bare scalar (rather than a
+/// one-element array) is not a shape any witness records nft emitting, and
+/// is refused rather than speculatively normalised.
+fn skuid_right_members(right: &serde_json::Value) -> Option<Vec<u32>> {
+    match right.get("set") {
+        Some(members) => members.as_array()?.iter().map(one_skuid_scalar).collect(),
+        // No "set" wrapper at all: the fully-flattened singleton form.
+        None => Some(vec![one_skuid_scalar(right)?]),
+    }
+}
+
+/// Parse one `meta skuid <op> { .. } <verdict>` rule and return its set, or
+/// `None` when the rule is not exactly that shape with exactly `comment`.
+///
+/// The returned set is ascending and deduplicated so the caller's equality check
+/// does not depend on the order nft listed the members in.
+fn rule_skuid_set_with_verdict(
+    rule: &serde_json::Value,
+    op: &str,
+    verdict: &str,
+    comment: &str,
+    overflow: HostOverflowUid,
+) -> Option<Vec<u32>> {
+    if rule.get("comment").and_then(|v| v.as_str()) != Some(comment) {
+        return None;
+    }
+    let exprs = rule.get("expr").and_then(|v| v.as_array())?;
+    // Exactly one match and one verdict: a third expression is an extra
+    // condition that narrows or widens what the rule does.
+    if exprs.len() != 2 {
+        return None;
+    }
+    let m = exprs[0].get("match")?;
+    if m.get("op").and_then(|v| v.as_str()) != Some(op) {
+        return None;
+    }
+    // `meta skuid` renders as a nested object; nothing else is accepted, so a
+    // match on any other key (a mark, an interface) is not this rule.
+    let left_key = m.get("left")?.get("meta")?.get("key")?.as_str()?;
+    if left_key != "skuid" {
+        return None;
+    }
+    // See `skuid_right_members`'s doc: this is the SAME shape-tolerant read
+    // `net_rule_one_uids` uses, so the recogniser and the live-binding reader
+    // never disagree about what a live table's rule 1/rule 3 denies.
+    let raw_members = skuid_right_members(m.get("right")?)?;
+    if raw_members.is_empty() {
+        return None;
+    }
+    let mut uids: Vec<u32> = Vec::with_capacity(raw_members.len());
+    for raw_uid in &raw_members {
+        // Revalidate through the shared three-refusal function: the closed
+        // installer type could not have produced 0, the host overflow uid or the
+        // sentinel, so a set carrying one was not armed by this daemon.
+        validate_safety_net_uid(*raw_uid, overflow).ok()?;
+        uids.push(*raw_uid);
+    }
+    uids.sort_unstable();
+    uids.dedup();
+    // A set that listed a uid twice is not the shape the installer emits (it
+    // deduplicates before rendering).
+    if uids.len() != raw_members.len() {
+        return None;
+    }
+    // The verdict object is a single key with a null value (`{"drop": null}`).
+    let v = exprs[1].as_object()?;
+    if v.len() != 1 || !v.contains_key(verdict) {
+        return None;
+    }
+    Some(uids)
+}
+
+/// Whether `rule` is exactly the kernel neighbour-discovery accept rule.
+///
+/// FAILURE-MODE NOTE for anyone editing this: in the `inet` family nft compiles
+/// `icmpv6 type { .. }` into the payload match PLUS an implicit layer-4 protocol
+/// dependency, so the listed rule can carry a leading `meta l4proto`/`nfproto`
+/// match that the emitter never wrote. That dependency only NARROWS the rule to
+/// ICMPv6 traffic, so it is accepted here; any other extra expression is refused,
+/// because a widening condition on an accept rule ahead of nothing is exactly the
+/// carve-out an agent could aim for. The exact listed form is pinned by the
+/// Linux integration probe (`nft_set_json_forms_are_the_shapes_the_parser_reads`
+/// in `tests/integration_gf1_recovery.rs`), which runs where nft exists; this
+/// tolerance is what keeps the parser honest about a form a macOS builder cannot
+/// observe.
+fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
+    if rule.get("comment").and_then(|v| v.as_str()) != Some(NET_RULE_COMMENT_KERNEL_ND) {
+        return false;
+    }
+    let Some(exprs) = rule.get("expr").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let mut saw_icmpv6_type_set = false;
+    let mut saw_accept = false;
+    // At most ONE implicit protocol dependency may be skipped.
+    let mut saw_protocol_dependency = false;
+    for expr in exprs {
+        let Some(obj) = expr.as_object() else {
+            return false;
+        };
+        if obj.len() != 1 {
+            return false;
+        }
+        if let Some(m) = obj.get("match") {
+            let Some(left) = m.get("left") else {
+                return false;
+            };
+            // The implicit protocol dependency nft adds for an `inet`-family
+            // ICMPv6 match: narrowing only, so accepted.
+            if let Some(meta_key) = left
+                .get("meta")
+                .and_then(|v| v.get("key"))
+                .and_then(|v| v.as_str())
+            {
+                // EXACTLY the implicit dependency the probe records, and at most once.
+                // A meta match is only safe to skip when it NARROWS the rule to ICMPv6;
+                // accepting any operator, any value or a repeat would let a crafted rule
+                // carry an extra condition, or a `!=` that inverts the narrowing, past a
+                // check whose whole job is to prove this is the shape the installer emits.
+                let narrowing_dependency = matches!(meta_key, "l4proto" | "nfproto")
+                    && m.get("op").and_then(|v| v.as_str()) == Some("==")
+                    && m.get("right")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|proto| matches!(proto, "icmpv6" | "ipv6-icmp"));
+                if narrowing_dependency && !saw_protocol_dependency {
+                    saw_protocol_dependency = true;
+                    continue;
+                }
+                return false;
+            }
+            let Some(payload) = left.get("payload") else {
+                return false;
+            };
+            let proto_is_icmpv6 =
+                payload.get("protocol").and_then(|v| v.as_str()) == Some("icmpv6");
+            let field_is_type = payload.get("field").and_then(|v| v.as_str()) == Some("type");
+            if !(proto_is_icmpv6 && field_is_type) || saw_icmpv6_type_set {
+                return false;
+            }
+            if m.get("op").and_then(|v| v.as_str()) != Some("==") {
+                return false;
+            }
+            let Some(members) = m
+                .get("right")
+                .and_then(|v| v.get("set"))
+                .and_then(|v| v.as_array())
+            else {
+                return false;
+            };
+            // EXACTLY the three neighbour-discovery types, as a set. An extra
+            // type (an MLD report, an echo request) is a channel the confined
+            // agent may be able to drive, so the check is equality, never
+            // containment.
+            let mut listed: Vec<&str> = Vec::with_capacity(members.len());
+            for member in members {
+                match member.as_str() {
+                    Some(name) => listed.push(name),
+                    None => return false,
+                }
+            }
+            let mut expected: Vec<&str> = KERNEL_ND_ICMPV6_TYPES.to_vec();
+            listed.sort_unstable();
+            expected.sort_unstable();
+            if listed != expected {
+                return false;
+            }
+            saw_icmpv6_type_set = true;
+        } else if obj.contains_key("accept") {
+            if saw_accept {
+                return false;
+            }
+            saw_accept = true;
+        } else {
+            return false;
+        }
+    }
+    saw_icmpv6_type_set && saw_accept
+}
+
+/// D3 fix round: an independent check, over the SAME inventory
+/// [`is_deny_all_safety_net_json`] parses, that the live table's `comment` key
+/// is absent entirely. Both disarm arms (`ReclaimOwned` and
+/// `FinalizeInterrupted`) require this alongside a
+/// positive recogniser answer before it treats a live table as this daemon's
+/// safety net (D1 installs the net with no table comment at all); this
+/// function answers only the comment-key question and never touches, narrows,
+/// or duplicates the recogniser's own shape logic above, which is unchanged
+/// and stays the single source of truth for the net's shape. A malformed
+/// inventory or a missing matching table object cannot positively prove
+/// absence, so both read as "not confirmed absent" (`false`, fail closed).
+/// Gated `any(target_os = "linux", test)`, matching this crate's convention
+/// for a Linux-only production surface a cross-platform test suite still
+/// needs to name; its own test below is the reachability anchor.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn castle_table_comment_is_absent(json: &str) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    for item in items {
+        let Some(table) = item.get("table") else {
+            continue;
+        };
+        let ours = table.get("family").and_then(|v| v.as_str()) == Some(CASTLE_FAMILY)
+            && table.get("name").and_then(|v| v.as_str()) == Some(castle_table());
+        if ours {
+            return table.get("comment").is_none();
+        }
+    }
+    false
 }
 
 /// Build the atomic nft script that CREATES the owned table + its base output
@@ -1424,26 +3186,33 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
     })
 }
 
-/// GF2 per-agent isolation seal: a fixed-length, domain-separated digest of the
-/// EXACT cgroup-v2 path the daemon installed for one agent's `socket cgroupv2`
-/// match. It is embedded in the marker-bound rule COMMENT (`:cg:<seal>`) so
-/// verification can reject a re-parented/widened match (same leaf, different
-/// parent — e.g. `other.slice/sanctuary-agent-x.service`) that the leaf-only pin
-/// accepted while the real agent's traffic missed the goto and hit `policy
-/// accept`.
+/// Per-agent isolation seal: a fixed-length, domain-separated digest of the
+/// EXACT uid the daemon installed for one agent's `meta skuid` match, bound to
+/// the fortress and the agent it was installed for. It is embedded in the
+/// marker-bound rule COMMENT (`:uid:<seal>`) so verification can reject a rule
+/// whose uid expression was rewritten in place while its comment was left
+/// intact.
 ///
-/// Why a digest, not the raw path: nft caps a comment at 128 bytes (confirmed nft
-/// 1.0.9), and `{marker}:queue:{agent_id}` already consumes most of that, so the
-/// path is sealed by its 64-bit digest. Why UNKEYED: the pure parser has no key,
-/// and the security level is deliberately exactly that of every other rule-shape
-/// check. An in-place expression mutation (the natural GF2 attack: rewrite only
-/// the `socket cgroupv2` path) leaves this comment intact, so the recomputed
-/// digest no longer matches and the rule is refused; only an actor that
-/// reconstructs a full marker-bound comment can evade it, which is the inherent
-/// CAP_NET_ADMIN nft threat boundary (see the GF1.4 note on
-/// `install_deny_all_safety_net_impl`), the same bar the ownership marker sets.
-/// 64 bits makes a second-preimage (a different path with the same seal AND the
-/// agent's own leaf) computationally infeasible.
+/// Why a digest, not the raw uid: the comment budget is already spent on the
+/// marker and the agent id (see [`MAX_AGENT_ID_LEN`]), and a raw uid in the
+/// comment would prove nothing the expression does not already say. The digest
+/// binds the uid to `fortress_id` and `agent_id` as well, so the same uid under a
+/// different fortress or a different agent does not verify.
+///
+/// Why UNKEYED: the pure parser has no key, and the security level is
+/// deliberately exactly that of every other rule-shape check. An in-place
+/// expression mutation (rewrite only the `meta skuid` value) leaves this comment
+/// intact, so the recomputed digest no longer matches and the rule is refused.
+/// An actor that reconstructs BOTH expressions AND both comments produces a
+/// self-consistent inventory this digest cannot catch — that case is caught only
+/// by the trusted uid comparison in `parse_owned_table_inventory` (the frozen
+/// manifest uid in the daemon, the unit instance in the agent start gate; the two
+/// provenances of [`ExpectedAgentBinding::Confined`]), which is why the seal is
+/// documented as a consistency check and never as authority.
+///
+/// `decimal(uid)` is ASCII decimal with no leading zeros and no sign (Rust's
+/// `u32` Display), so one uid has exactly one preimage and two spellings of the
+/// same uid cannot produce two seals.
 ///
 /// Pure and cross-platform (used by both the linux emission site and the pure
 /// parser, and by the adversarial-JSON tests) so it must not be linux-gated.
@@ -1455,78 +3224,62 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
 /// Linux CI job and every `cargo test` are green, and the break appears only in
 /// a developer's macOS build or in a cross-language test that shells out to
 /// `cargo build`, which is exactly where a gate mismatch is hardest to read.
-pub(crate) fn cgroup_path_seal(cgroup_relative_path: &str) -> String {
+pub(crate) fn agent_uid_seal(fortress_id: &str, agent_id: &str, agent_uid: u32) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // Domain separation: this digest is never interchangeable with any other
     // SHA-256 use in the daemon (WAL chaining, manifest hashing).
-    hasher.update(b"sanctuary-castle:cgroup-path-seal:v1\0");
-    hasher.update(cgroup_relative_path.as_bytes());
+    hasher.update(b"sanctuary-castle:agent-uid-seal:v1\0");
+    // NUL-separated, and neither a fortress id nor an agent id may contain NUL
+    // (both are ASCII identifier grammars), so the concatenation is unambiguous:
+    // no pair of distinct (fortress, agent, uid) triples shares a preimage.
+    hasher.update(fortress_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(agent_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(agent_uid.to_string().as_bytes());
     let digest = hasher.finalize();
-    // 8 bytes = 16 lowercase hex chars: the whole `:cg:<seal>` suffix is 20 bytes,
-    // leaving comment headroom under nft's 128-byte cap for the marker + agent id.
-    hex::encode(&digest[..8])
+    // Truncated to AGENT_UID_SEAL_HEX_LEN / 2 bytes; the hex width is what the
+    // comment budget above is derived from, so the two must move together.
+    hex::encode(&digest[..AGENT_UID_SEAL_HEX_LEN / 2])
 }
 
-fn parse_cgroup_match(expr: &serde_json::Value) -> Option<(u32, String)> {
+/// Parse an nft `meta skuid == <integer>` match expression into its uid.
+///
+/// INVARIANT: only a BARE INTEGER is accepted. nft renders `meta skuid` through
+/// a uid symbol table, so an account name could appear where the daemon wrote a
+/// number; a parser that accepted names would have to resolve them against
+/// `/etc/passwd` at verification time, making the kernel binding's meaning depend
+/// on a mutable file. Refusing a name is fail-closed (the binding reads foreign
+/// and deny-all re-arms) and the daemon always emits numerically. The listing
+/// form is probed per nftables version before this shape is trusted.
+///
+/// uid 0 is refused here as well as at emission: root is never a confined agent,
+/// and a `skuid 0` rule in an owned table is a widening, not a binding.
+fn parse_skuid_value(expr: &serde_json::Value) -> Option<u32> {
     if !has_exact_keys(expr, &["match"]) {
         return None;
     }
     let matched = expr.get("match")?;
     if !has_exact_keys(matched, &["op", "left", "right"])
-        || !has_exact_keys(matched.get("left")?, &["socket"])
+        || !has_exact_keys(matched.get("left")?, &["meta"])
+        || !has_exact_keys(matched.get("left")?.get("meta")?, &["key"])
     {
         return None;
     }
     if matched.get("op")?.as_str()? != "==" {
         return None;
     }
-    let socket = matched.get("left")?.get("socket")?;
-    // nft's JSON serializer for the cgroupv2 socket match omits the `level`
-    // field on some builds: confirmed on nft 1.0.9 / Ubuntu 24.04 (kernel 6.8),
-    // where a rule loaded with `socket cgroupv2 level 1 "system.slice"` round-
-    // trips as {"socket":{"key":"cgroupv2"}} with no `level`. Accept BOTH the
-    // level-present and level-absent shapes, and no other socket keys, so a
-    // foreign socket match (extra keys or a non-cgroupv2 key) is still rejected.
-    let level_present = if has_exact_keys(socket, &["key", "level"]) {
-        true
-    } else if has_exact_keys(socket, &["key"]) {
-        false
-    } else {
-        return None;
-    };
-    if socket.get("key")?.as_str()? != "cgroupv2" {
+    if matched.get("left")?.get("meta")?.get("key")?.as_str()? != "skuid" {
         return None;
     }
-    let path = matched.get("right")?.as_str()?.to_string();
-    if path.is_empty()
-        || path.starts_with('/')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || !path.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'@' | b':')
-        })
-    {
+    // `as_u64` refuses a string, a float, a bool and a nested object, so a name
+    // form or a structured range is rejected before the range check below.
+    let uid = u32::try_from(matched.get("right")?.as_u64()?).ok()?;
+    if uid < 1 {
         return None;
     }
-    // `level` is redundant with the path: nft requires the level to equal the
-    // path's component count at load time, so ownership is fully keyed by the
-    // marker-bound table + exact rule body + validated path, never by `level`.
-    // When nft omits it, reconstruct the depth from the already-validated path
-    // (no leading slash, no empty components) so the level-present and level-
-    // absent shapes yield the identical owned-binding tuple that body/jump
-    // agreement is checked against.
-    let level = if level_present {
-        let explicit = u32::try_from(socket.get("level")?.as_u64()?).ok()?;
-        if explicit == 0 {
-            return None;
-        }
-        explicit
-    } else {
-        u32::try_from(path.split('/').count()).ok()?
-    };
-    Some((level, path))
+    Some(uid)
 }
 
 fn parse_mark_assignment(expr: &serde_json::Value) -> Option<u32> {
@@ -1546,11 +3299,13 @@ fn parse_mark_assignment(expr: &serde_json::Value) -> Option<u32> {
     u32::try_from(mangle.get("value")?.as_u64()?).ok()
 }
 
+/// Validate one owned per-agent chain body and return the uid it binds, or
+/// `None` for the fail-closed unconditional-drop body, which binds no uid.
 fn validate_owned_body_expr(
     expr: &serde_json::Value,
     agent_id: &str,
     fail_closed: bool,
-) -> Result<Option<(u32, String)>, NftablesError> {
+) -> Result<Option<u32>, NftablesError> {
     let terms = expr.as_array().ok_or_else(|| {
         NftablesError::ForeignState("owned agent body has no expression array".to_string())
     })?;
@@ -1567,11 +3322,11 @@ fn validate_owned_body_expr(
     }
     if terms.len() != 3 {
         return Err(NftablesError::ForeignState(
-            "queued agent body is not the exact cgroup/mark/queue expression".to_string(),
+            "queued agent body is not the exact skuid/mark/queue expression".to_string(),
         ));
     }
-    let binding = parse_cgroup_match(&terms[0]).ok_or_else(|| {
-        NftablesError::ForeignState("queued agent body has no typed cgroup match".to_string())
+    let binding = parse_skuid_value(&terms[0]).ok_or_else(|| {
+        NftablesError::ForeignState("queued agent body has no typed skuid match".to_string())
     })?;
     if parse_mark_assignment(&terms[1]) != Some(crate::nfqueue::agent_mark(agent_id)) {
         return Err(NftablesError::ForeignState(
@@ -1596,20 +3351,21 @@ fn validate_owned_body_expr(
     Ok(Some(binding))
 }
 
+/// Validate the base-output jump for one agent and return the uid it routes.
 fn validate_owned_jump_expr(
     expr: &serde_json::Value,
     expected_chain: &str,
-) -> Result<(u32, String), NftablesError> {
+) -> Result<u32, NftablesError> {
     let terms = expr.as_array().ok_or_else(|| {
         NftablesError::ForeignState("owned output jump has no expression array".to_string())
     })?;
     if terms.len() != 2 {
         return Err(NftablesError::ForeignState(
-            "owned output jump is not the exact cgroup/jump expression".to_string(),
+            "owned output jump is not the exact skuid/goto expression".to_string(),
         ));
     }
-    let binding = parse_cgroup_match(&terms[0]).ok_or_else(|| {
-        NftablesError::ForeignState("owned output jump has no typed cgroup match".to_string())
+    let binding = parse_skuid_value(&terms[0]).ok_or_else(|| {
+        NftablesError::ForeignState("owned output jump has no typed skuid match".to_string())
     })?;
     // Must match `build_agent_jump_rule` and `parse_jump_rule_handles`: the base
     // output rule routes the agent cgroup with a `goto` (a TERMINATING verdict,
@@ -1642,9 +3398,60 @@ struct ParsedOwnedTableInventory {
     ownership: CastleTableOwnership,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     agent_ids: Vec<String>,
+    /// Every `agent_id -> uid` binding the owned shape declared, collected BEFORE
+    /// the trusted manifest comparison. This is source (c) of the safety net's
+    /// deny set.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    uid_bindings: std::collections::HashMap<String, u32>,
 }
 
-fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, NftablesError> {
+/// The TWO-PHASE result of parsing an owned-table inventory.
+///
+/// PHASE ONE is everything the kernel dump can prove about itself plus the
+/// ownership marker: shape, marker, handles, seal recomputation, body/jump
+/// agreement and cardinality. PHASE TWO is the single check whose input did NOT
+/// come from the dump: comparing the live uid against the uid the current signed
+/// manifest confines.
+///
+/// The two are separated because the safety net needs the uid bindings of a table
+/// that IS this daemon's own owned table but whose binding has drifted off the
+/// current manifest. Such a table is exactly the drift case the net exists for: a
+/// rotated-away uid may still have live processes, so its uid must enter the DENY
+/// set. Collapsing the two phases into one `Err` discarded those bindings and
+/// narrowed the net.
+///
+/// INVARIANT: a `Bindings` value is only ever produced after PHASE ONE has passed
+/// IN FULL. A structurally foreign table, a marker or handle mismatch, a malformed
+/// pairing or a seal failure is an `Err` and yields NOTHING, and a failure that
+/// lands after some bindings were already collected (a valid binding followed by a
+/// foreign rule) is also an `Err`, so no partial set escapes. Must match the
+/// late-failure test `owned_inventory_exposes_no_partial_binding_set_on_a_late_failure`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum OwnedInventoryPhases {
+    /// Both phases passed.
+    Verified(ParsedOwnedTableInventory),
+    /// Phase one passed IN FULL; phase two (the trusted uid comparison) failed.
+    /// The bindings are trustworthy as "what this owned table routes", which is
+    /// all source (c) claims, and `detail` is the refusal a caller that needs
+    /// phase two must still surface.
+    UidMismatch {
+        inventory: ParsedOwnedTableInventory,
+        detail: String,
+    },
+}
+
+/// Parse an owned-table inventory and check it against `expectation`.
+///
+/// `expectation` is the whole security content of the agent-binding half of this
+/// parse: shape, seal, body/jump agreement and cardinality all prove the
+/// inventory is INTERNALLY consistent, which an actor that rewrote both
+/// expressions and both comments can also achieve. Only
+/// [`ExpectedAgentBinding::Confined`] compares the live uid against a value this
+/// process did not read out of the kernel.
+fn parse_owned_table_inventory_phases(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+) -> Result<OwnedInventoryPhases, NftablesError> {
     let doc: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| NftablesError::ForeignState(format!("nft -j output did not parse: {e}")))?;
     let items = doc
@@ -1733,7 +3540,11 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
                             .strip_prefix(&format!("{}:agent:", expected_marker))
                             .filter(|id| !id.is_empty())
                             .unwrap_or("");
-                        let agent_id_is_typed = agent_id.len() <= 128
+                        // Must match `validate_agent_binding_input`: an agent id
+                        // longer than the sealed-comment budget could never have
+                        // been installed by this daemon, so one in a live table is
+                        // foreign.
+                        let agent_id_is_typed = agent_id.len() <= MAX_AGENT_ID_LEN
                             && agent_id.bytes().all(|byte| {
                                 byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
                             });
@@ -1826,14 +3637,18 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
     })?;
     let mut body_counts = std::collections::HashMap::<String, usize>::new();
     let mut jump_counts = std::collections::HashMap::<String, usize>::new();
-    let mut cgroup_bindings = std::collections::HashMap::<String, (u32, String)>::new();
+    let mut uid_bindings = std::collections::HashMap::<String, u32>::new();
+    // The deferred PHASE TWO refusal. Only the FIRST mismatch is kept: the detail
+    // names the earliest drifted binding, and a later one adds nothing a caller
+    // acts on.
+    let mut pending_uid_mismatch: Option<String> = None;
     for (chain, comment, expr) in owned_rules {
         let is_jump = chain == "output";
         let fail_closed = !is_jump && comment.contains(":failclosed:");
         // Strip the marker-bound role prefix. The remainder is `{agent_id}` for a
-        // fail-closed unconditional-drop body (no cgroup match to seal) or
-        // `{agent_id}:cg:{seal}` for any rule carrying a `socket cgroupv2` match
-        // (the base-output jump, and the queued per-agent body). See GF2 below.
+        // fail-closed unconditional-drop body (no uid match to seal) or
+        // `{agent_id}:uid:{seal}` for any rule carrying a `meta skuid` match
+        // (the base-output jump, and the queued per-agent body).
         let remainder = if is_jump {
             comment.strip_prefix(&format!("{}:jump:", expected_marker))
         } else {
@@ -1845,11 +3660,12 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
         .ok_or_else(|| {
             NftablesError::ForeignState("owned rule comment has wrong role binding".to_string())
         })?;
-        // Separate the agent id from the authenticated cgroup-path seal. Agent ids
-        // are the typed identifier grammar (ASCII alphanumeric / `-` / `_`, no
-        // `:`), so the FIRST `:cg:` is always the seal delimiter and everything
-        // before it is the agent id.
-        let (agent_id, declared_seal) = match remainder.split_once(":cg:") {
+        // Separate the agent id from the authenticated uid seal. Agent ids are
+        // the typed identifier grammar (ASCII alphanumeric / `-` / `_`, no `:`),
+        // so the FIRST `AGENT_UID_SEAL_INFIX` is always the seal delimiter and
+        // everything before it is the agent id. Must match the comment the
+        // emitter writes in `replace_agent_chain_and_jump_impl`.
+        let (agent_id, declared_seal) = match remainder.split_once(AGENT_UID_SEAL_INFIX) {
             Some((id, seal)) => (id, Some(seal)),
             None => (remainder, None),
         };
@@ -1871,73 +3687,77 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
         } else {
             validate_owned_body_expr(&expr, agent_id, fail_closed)?
         };
-        // GF2 per-agent isolation invariant: bind ownership to the EXACT per-agent
-        // cgroup, not merely to an internally-consistent pair of rules. The
-        // body/jump agreement below proves the two rules match EACH OTHER; it does
-        // NOT prove they match the AGENT they claim. A CAP_NET_ADMIN actor can
-        // rewrite BOTH the base jump `goto` and the per-agent body cgroup match to
-        // a PARENT scope (e.g. `other.slice/sanctuary-agent-x.service`, same leaf,
-        // wrong parent), keep the marker and pristine shape, and read as "owned"
-        // while the real agent's traffic misses the goto and hits `policy accept`.
-        // The old pin compared only the path LEAF (`scope_unit_name(agent_id)`) and
-        // so accepted a same-leaf re-parent. Every rule carrying a cgroup match now
-        // seals its EXACT installed path into the marker-bound comment; the live
-        // match path must hash to that seal. A mismatch (any re-parent/widening) is
-        // refused, which via verify_owned_castle_table / reclaim verification
-        // withdraws readiness or re-arms deny-all upstream (GF1).
-        if let Some((_level, ref expr_path)) = binding {
+        // Per-agent isolation invariant, in two layers that must not be
+        // confused. The body/jump agreement below proves the two rules match
+        // EACH OTHER, and the seal proves neither expression was rewritten
+        // without its comment; NEITHER proves the pair matches the uid the
+        // OPERATOR signed. An actor holding CAP_NET_ADMIN can rewrite both
+        // expressions AND recompute both unkeyed seals, producing a fully
+        // self-consistent inventory that routes some OTHER uid into the agent's
+        // chain while the real agent's traffic misses the goto and reaches
+        // `policy accept`. Only the manifest comparison below refuses that, and
+        // only where the caller supplied a trusted expectation.
+        if let Some(expr_uid) = binding {
             let declared_seal = declared_seal.ok_or_else(|| {
                 NftablesError::ForeignState(
-                    "a cgroup-matching owned rule carries no authenticated cgroup-path seal"
+                    "a skuid-matching owned rule carries no authenticated agent-uid seal"
                         .to_string(),
                 )
             })?;
-            // GF2 (round-3 re-gate) fail-closed on a numeric match value: an
-            // all-digit match is nft's RESOLVED cgroup-id display form, shown when
-            // the path no longer resolves (a DESTROYED agent cgroup) OR when an
-            // in-place expr mutation replaces the sealed path with a numeric form
-            // to DODGE the seal comparison below. Those two are indistinguishable
-            // from the dump, and the seal exists precisely to defend against an
-            // in-place match mutation, so a numeric match for an owned binding is
-            // never trustworthy: it must be refused as ForeignState (fail-closed),
-            // NOT skipped past the seal check. Skipping it let the exact attack the
-            // seal defends against read as "owned" whenever the mutated match was
-            // numeric while body/jump still agreed. Refusing it withdraws readiness
-            // / re-arms the GF1 deny-all upstream. The legitimate destroyed-cgroup
-            // rule matches no traffic, so failing it closed and re-arming deny-all
-            // is safe (nothing escapes); the owned table is re-adopted with a fresh,
-            // path-sealed binding on the next restart. INVARIANT: a live owned
-            // per-agent binding must always carry a verifiable full-path seal; a
-            // numeric-form match value never proves the owned per-agent binding.
-            let expr_is_resolved_numeric =
-                !expr_path.is_empty() && expr_path.bytes().all(|b| b.is_ascii_digit());
-            if expr_is_resolved_numeric {
-                return Err(NftablesError::ForeignState(format!(
-                    "agent {agent_id:?} cgroup match {expr_path:?} is a numeric resolved-id \
-                     form, not a verifiable full-path seal; a live owned per-agent binding \
-                     must carry its sealed cgroup path, so a numeric-form match is refused \
-                     fail-closed (re-arming deny-all), never adopted as owned"
-                )));
+            // The seal's fortress id is the caller's, never one read out of the
+            // dump: a seal recomputed under a fortress id the kernel state itself
+            // supplied would verify against whatever an attacker wrote.
+            match expectation.seal_fortress_id() {
+                Some(seal_fortress_id) => {
+                    if agent_uid_seal(seal_fortress_id, agent_id, expr_uid) != declared_seal {
+                        return Err(NftablesError::ForeignState(format!(
+                            "agent {agent_id:?} skuid match {expr_uid} does not match its \
+                             authenticated agent-uid seal; an in-place uid rewrite, a \
+                             wrong-agent or a wrong-fortress binding is not the owned \
+                             per-agent binding"
+                        )));
+                    }
+                }
+                None if expectation.tolerates_unverifiable_seal() => {}
+                None => {
+                    return Err(NftablesError::ForeignState(format!(
+                        "agent {agent_id:?} carries a live per-agent uid binding while the \
+                         current policy confines no agent uid; an unverifiable binding is \
+                         refused fail-closed rather than adopted as owned"
+                    )));
+                }
             }
-            if cgroup_path_seal(expr_path) != declared_seal {
-                return Err(NftablesError::ForeignState(format!(
-                    "agent {agent_id:?} cgroup match {expr_path:?} does not match its \
-                     authenticated cgroup-path seal; a widened or re-parented match is not \
-                     the owned per-agent binding"
-                )));
+            // The TRUSTED expectation. This is the only check here whose input
+            // did not come from the kernel dump, so it is the only one a
+            // self-consistent forgery cannot satisfy.
+            if let ExpectedAgentBinding::Confined { agent_uid, .. } = expectation {
+                if expr_uid != *agent_uid && pending_uid_mismatch.is_none() {
+                    // PHASE TWO failure, DEFERRED rather than returned here. The
+                    // rest of phase one (cardinality, body/jump agreement, the
+                    // remaining rules) must still run, because a `Bindings` result
+                    // is only honest if the WHOLE owned shape passed. Every caller
+                    // that needs phase two still refuses; the safety net is the one
+                    // consumer that needs the bindings of a drifted-but-ours table,
+                    // since a rotated-away uid may still have live processes.
+                    pending_uid_mismatch = Some(format!(
+                        "agent {agent_id:?} skuid match {expr_uid} is not the uid the current \
+                         signed manifest confines ({agent_uid}); a live binding that routes \
+                         a different uid is refused fail-closed"
+                    ));
+                }
             }
         } else if declared_seal.is_some() {
-            // A non-cgroup-matching body (the fail-closed unconditional drop) must
-            // NOT carry a path seal: a seal there is a malformed/foreign comment.
+            // A non-skuid-matching body (the fail-closed unconditional drop) must
+            // NOT carry a uid seal: a seal there is a malformed/foreign comment.
             return Err(NftablesError::ForeignState(
-                "a fail-closed owned rule must not carry a cgroup-path seal".to_string(),
+                "a fail-closed owned rule must not carry an agent-uid seal".to_string(),
             ));
         }
         if let Some(binding) = binding {
-            if let Some(prior) = cgroup_bindings.insert(agent_id.to_string(), binding.clone()) {
+            if let Some(prior) = uid_bindings.insert(agent_id.to_string(), binding) {
                 if prior != binding {
                     return Err(NftablesError::ForeignState(
-                        "owned body and output jump disagree on cgroup binding".to_string(),
+                        "owned body and output jump disagree on the agent uid binding".to_string(),
                     ));
                 }
             }
@@ -1963,20 +3783,413 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
     }
     let mut agent_ids: Vec<String> = agent_chains.into_values().collect();
     agent_ids.sort_unstable();
-    Ok(ParsedOwnedTableInventory {
+    let inventory = ParsedOwnedTableInventory {
         ownership: CastleTableOwnership {
             table_handle,
             base_chain_handle,
             marker,
         },
         agent_ids,
-    })
+        uid_bindings,
+    };
+    // Phase one has now passed IN FULL (every rule read, every pairing and count
+    // checked), so a deferred phase-two failure may safely expose the bindings.
+    match pending_uid_mismatch {
+        None => Ok(OwnedInventoryPhases::Verified(inventory)),
+        Some(detail) => Ok(OwnedInventoryPhases::UidMismatch { inventory, detail }),
+    }
+}
+
+/// The agent-id prefix the daemon derives from a manifest-admitted uid.
+///
+/// The derivation has to be a FUNCTION and not a `format!` at each site because
+/// three separate places must agree on it byte-for-byte: the acquisition that
+/// installs the binding, the readback that proves it, and the set rule that
+/// health re-applies on every poll. It is also a seal input through
+/// [`AgentRulesetId::agent_id`], so a drift here would make a legitimate rule
+/// fail to verify after a restart. Must match the protection subject
+/// `<fortress>/uid-<U>` the WAL attributes denials to.
+pub const CONFINED_AGENT_ID_PREFIX: &str = "uid-";
+
+/// The agent id for a manifest-admitted uid. See [`CONFINED_AGENT_ID_PREFIX`].
+///
+/// Public because the privileged integration suite has to name the SAME chain
+/// the daemon installs: a test that spelled the id itself would be a
+/// hand-mirrored copy of this derivation, and the first change here would leave
+/// it silently installing a second chain for the same uid.
+#[cfg(any(target_os = "linux", test))]
+pub fn confined_agent_id(agent_uid: u32) -> String {
+    format!("{CONFINED_AGENT_ID_PREFIX}{agent_uid}")
+}
+
+/// Every live `(agent_id, uid)` binding an owned table declares: the set the
+/// slice-A rule is stated over.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedBindingInventory {
+    /// Ascending by agent id, so a comparison against the expected singleton is
+    /// an equality and not a search.
+    pub(crate) bindings: Vec<(String, u32)>,
+}
+
+/// The owned table's binding set, with the slice-A set rule applied.
+///
+/// This MIRRORS `OwnedInventoryPhases` (same two variants, inventory in both)
+/// rather than re-exporting it: the phases enum is the frozen parser's own
+/// result and phase two there is the uid comparison alone, whereas the verdict
+/// here also carries the cardinality and agent-id half of the set rule. Both
+/// outcomes carry the inventory because the safety net's deny set needs the uids
+/// of a table that IS ours but whose binding set is wrong.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnedBindingSet {
+    /// The live set is exactly what the armed identity requires.
+    Verified(OwnedBindingInventory),
+    /// The owned shape passed in full, but the live set is not the one the armed
+    /// identity requires. `detail` is the refusal a caller must surface.
+    UidMismatch {
+        inventory: OwnedBindingInventory,
+        detail: String,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl OwnedBindingSet {
+    /// The inventory, whichever outcome this is.
+    pub(crate) fn inventory(&self) -> &OwnedBindingInventory {
+        match self {
+            Self::Verified(inventory) | Self::UidMismatch { inventory, .. } => inventory,
+        }
+    }
+}
+
+/// THE SET RULE, over an already-parsed owned inventory. Pure over the JSON so
+/// every arm is unit-testable without a kernel.
+///
+/// INVARIANT this states, and why a uid comparison alone does not: the frozen
+/// parser compares the uid of each live binding and never the agent id or the
+/// cardinality, so a SECOND chain bound to the same uid under another agent id
+/// reads as `Verified` there. Such a chain would take the uid's packets on rule
+/// order, and its WAL rows would attribute to the wrong protection subject. The
+/// live set must therefore be exactly `{(uid-<U>, U)}` under `Confined { U }`,
+/// and exactly empty under any expectation that confines nobody.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn owned_table_binding_set_from_json(
+    json: &str,
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<OwnedBindingSet, NftablesError> {
+    let (parsed, phase_two_detail) = match parse_owned_table_inventory_phases(json, expectation)? {
+        OwnedInventoryPhases::Verified(parsed) => (parsed, None),
+        OwnedInventoryPhases::UidMismatch { inventory, detail } => (inventory, Some(detail)),
+    };
+    if &parsed.ownership != ownership {
+        return Err(NftablesError::ForeignState(format!(
+            "sanctuary-castle table identity changed since acquisition \
+             (expected handles table={}/chain={} marker={}, found table={}/chain={} marker={}); \
+             a same-name replacement or mutation is not the owned object",
+            ownership.table_handle,
+            ownership.base_chain_handle,
+            ownership.marker,
+            parsed.ownership.table_handle,
+            parsed.ownership.base_chain_handle,
+            parsed.ownership.marker,
+        )));
+    }
+    let inventory = owned_binding_inventory(&parsed);
+    // A phase-two uid failure is already a set failure; keep the parser's wording
+    // so the two layers do not describe the same drift differently.
+    if let Some(detail) = phase_two_detail {
+        return Ok(OwnedBindingSet::UidMismatch { inventory, detail });
+    }
+    Ok(binding_set_rule(inventory, expectation))
+}
+
+/// Every live `(agent_id, uid)` binding of a phase-one-verified inventory,
+/// ascending by agent id. Shared by the wall's set rule and the agent start
+/// gate so both compare the same sorted shape.
+#[cfg(any(target_os = "linux", test))]
+fn owned_binding_inventory(parsed: &ParsedOwnedTableInventory) -> OwnedBindingInventory {
+    let mut bindings: Vec<(String, u32)> = parsed
+        .uid_bindings
+        .iter()
+        .map(|(agent_id, uid)| (agent_id.clone(), *uid))
+        .collect();
+    bindings.sort_unstable();
+    OwnedBindingInventory { bindings }
+}
+
+/// THE SET RULE ITSELF, the one implementation: the live bindings must equal
+/// exactly `[(uid-<U>, U)]` under `Confined { U }` and exactly nothing under
+/// any expectation that confines nobody. Called by
+/// [`owned_table_binding_set_from_json`] (after its ownership-handle equality)
+/// and by [`agent_start_gate_verdict`]; neither carries a second copy, and TB5s
+/// in `src/agent_start.rs` pins that (AGENTS rule 5).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn binding_set_rule(
+    inventory: OwnedBindingInventory,
+    expectation: &ExpectedAgentBinding,
+) -> OwnedBindingSet {
+    let expected: Vec<(String, u32)> = match expectation {
+        ExpectedAgentBinding::Confined { agent_uid, .. } => {
+            vec![(confined_agent_id(*agent_uid), *agent_uid)]
+        }
+        // Every other expectation means "no trusted confined uid to bind here",
+        // and the empty expected set is what makes that explicit rather than
+        // implied. The three are listed rather than folded into a wildcard so a
+        // NEW expectation variant has to state its own set-rule answer instead of
+        // silently inheriting "expect nothing", which would read a live binding
+        // as legitimate.
+        ExpectedAgentBinding::NoneConfined
+        | ExpectedAgentBinding::SealOnly { .. }
+        | ExpectedAgentBinding::StructureOnly => Vec::new(),
+    };
+    if inventory.bindings == expected {
+        return OwnedBindingSet::Verified(inventory);
+    }
+    let detail = format!(
+        "the live per-agent binding set is {:?}, not the {:?} the armed identity requires; a \
+         second chain for the same uid, a chain under another agent id, or a missing binding \
+         is refused fail-closed",
+        inventory.bindings, expected
+    );
+    OwnedBindingSet::UidMismatch { inventory, detail }
+}
+
+/// The agent start gate's reading of one owned-table listing, as named
+/// verdicts. Mapped to exit codes and stderr tokens by `src/agent_start.rs`.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentStartTableVerdict {
+    /// Uid `U` is, at this instant, the owned table's sole bound uid.
+    Admit,
+    /// Phase one failed: not the owned shape (including the deny-all net, whose
+    /// table carries no ownership marker), a seal under another fortress, or
+    /// unparseable output.
+    RefuseNotOwnedShape(String),
+    /// The owned shape passed, but the live set is not exactly `{(uid-U, U)}`.
+    RefuseBindingSet(String),
+}
+
+/// The agent start gate's table verdict: may the agent unit instance `uid`
+/// start now under `fortress_id`?
+///
+/// AGENTS rule 7. Subject: the agent unit instance `uid`. Evidence: the live
+/// owned table listed at this start. Verifier: the shared [`binding_set_rule`]
+/// under this fortress's seal. `Admit` means only "at this instant `uid` is
+/// the wall's sole bound uid"; its freshness ends at the wall's next health
+/// pass, which owns every later instant (rule 10), and the `BindsTo=` edge of
+/// the agent unit, not this read, is what ties the start to a live wall
+/// activation.
+///
+/// Omitted on purpose: the ownership-handle equality the wall's own set rule
+/// applies. The gate has no acquisition-time handles to compare, and a
+/// same-name replacement by another `CAP_NET_ADMIN` actor is outside the
+/// trust base (C2a2 premise P2).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn agent_start_gate_verdict(
+    json: &str,
+    fortress_id: &str,
+    uid: u32,
+) -> AgentStartTableVerdict {
+    // The expected uid is the unit's instance, the value systemd uses for
+    // `User=`; it is never read from the listing it is compared against, so a
+    // self-consistent table for another uid cannot admit this start. This is
+    // provenance (b) of `ExpectedAgentBinding::Confined`, and its only site.
+    let expectation = ExpectedAgentBinding::Confined {
+        fortress_id: fortress_id.to_string(),
+        agent_uid: uid,
+    };
+    let parsed = match parse_owned_table_inventory_phases(json, &expectation) {
+        Err(err) => return AgentStartTableVerdict::RefuseNotOwnedShape(err.to_string()),
+        Ok(OwnedInventoryPhases::Verified(parsed)) => parsed,
+        // Phase one yields no bindings unless the whole owned shape and the seal
+        // passed, and phase two's only check is the skuid against the expected
+        // uid; so a phase-two failure implies a live binding whose uid is not
+        // the expectation's, and the shared set rule refuses it without reading
+        // the phase-two detail. (The wall's consumer gets the same property by
+        // returning on that detail first; the gate gets it from the rule.)
+        Ok(OwnedInventoryPhases::UidMismatch { inventory, .. }) => inventory,
+    };
+    match binding_set_rule(owned_binding_inventory(&parsed), &expectation) {
+        OwnedBindingSet::Verified(_) => AgentStartTableVerdict::Admit,
+        OwnedBindingSet::UidMismatch { detail, .. } => {
+            AgentStartTableVerdict::RefuseBindingSet(detail)
+        }
+    }
+}
+
+/// [`owned_table_binding_set_from_json`] against the LIVE table.
+#[cfg(target_os = "linux")]
+pub(crate) fn owned_table_binding_set(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<OwnedBindingSet, NftablesError> {
+    let json = linux::list_owned_castle_table_json_for_binding_set()?;
+    owned_table_binding_set_from_json(&json, ownership, expectation)
+}
+
+/// The health-path reading of [`owned_table_binding_set`]: anything but the
+/// exact required set is a PROVEN loss of the owned wall.
+///
+/// INVARIANT at this line: health must require the BINDING, not merely the
+/// table. A table whose agent chain was deleted still verifies as the owned
+/// object under the ownership checks alone, and readiness would survive the
+/// removal of the only rule that confines the agent. Mapping a wrong set to
+/// `ForeignState` is what makes `classify_nft_ownership_probe` read it as a
+/// proven loss and re-arm the net that names the uid.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_owned_castle_table_binding(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    match owned_table_binding_set(ownership, expectation)? {
+        OwnedBindingSet::Verified(_) => Ok(()),
+        OwnedBindingSet::UidMismatch { detail, .. } => Err(NftablesError::ForeignState(detail)),
+    }
 }
 
 /// Pure parser used by health and ownership checks. Parsing untrusted inventory
 /// must never mutate the process-global packet-attribution registry.
-pub fn parse_owned_table_identity(json: &str) -> Result<CastleTableOwnership, NftablesError> {
-    parse_owned_table_inventory(json).map(|parsed| parsed.ownership)
+pub fn parse_owned_table_identity(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+) -> Result<CastleTableOwnership, NftablesError> {
+    // POLARITY UNCHANGED for every existing caller: a phase-two uid mismatch is
+    // still a refusal here, with the same message. Only the safety-net resolver
+    // reads the two phases apart, through `parse_owned_table_inventory_phases`.
+    match parse_owned_table_inventory_phases(json, expectation)? {
+        OwnedInventoryPhases::Verified(parsed) => Ok(parsed.ownership),
+        OwnedInventoryPhases::UidMismatch { detail, .. } => {
+            Err(NftablesError::ForeignState(detail))
+        }
+    }
+}
+
+/// List the live `sanctuary-castle` table as `nft -j` JSON, or `None` when no such
+/// table exists.
+///
+/// Absence is `Ok(None)`, not an error: "there is no table" and "the table could
+/// not be read" resolve the safety net's source (c) differently, so they must not
+/// arrive as the same value.
+#[cfg(target_os = "linux")]
+pub fn list_castle_table_json() -> Result<Option<String>, NftablesError> {
+    linux::list_castle_table_json_impl()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn list_castle_table_json() -> Result<Option<String>, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Source (c) of the safety net's deny set: the `meta skuid` bindings the LIVE
+/// owned table declares.
+///
+/// INVARIANT on the three arms, and why each is distinct: `Bindings` comes only
+/// from a table whose whole owned shape passed, so the uids are what this
+/// daemon's own table routes. `NotOurTable` is a structurally foreign or
+/// ownership-mismatched table, which yields NOTHING; an identity-parser error is
+/// NEVER read as "the table has no bindings", because those two would resolve the
+/// net to different scopes. `Unreadable` keeps the reason so the audit row's
+/// `sources` field can say the live table was not consulted rather than implying
+/// it was empty.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveTableBindings {
+    /// The owned shape passed; these are its declared uids, ascending.
+    Bindings(Vec<u32>),
+    /// The live table is not this daemon's owned table. No uids.
+    NotOurTable { detail: String },
+    /// The live table could not be read at all. No uids, and the reason is kept.
+    Unreadable { detail: String },
+}
+
+/// Read source (c) from an owned-table listing.
+///
+/// Pure over the JSON so every arm is unit-testable without a kernel.
+#[cfg(any(target_os = "linux", test))]
+pub fn live_table_uid_bindings(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+    overflow: HostOverflowUid,
+) -> LiveTableBindings {
+    // FIRST: the live table may be this daemon's OWN net rather than an owned wall.
+    // The net carries no owner marker and `policy drop`, so the owned-table parser
+    // reads it as foreign; treating that as "no bindings" would drop the uids the net
+    // itself already denies, and a restart could then install a NARROWER net than the
+    // one currently in the kernel. When the live table is our net, source (c) IS rule
+    // 1's set, and it is empty for the zero-rule host-wide shape.
+    // Must match `is_deny_all_safety_net_json`, whose shape this reads.
+    if is_deny_all_safety_net_json(json, overflow) {
+        return LiveTableBindings::Bindings(net_rule_one_uids(json));
+    }
+    match parse_owned_table_inventory_phases(json, expectation) {
+        Ok(OwnedInventoryPhases::Verified(parsed)) => {
+            LiveTableBindings::Bindings(sorted_bindings(&parsed))
+        }
+        // A table that IS ours but whose binding drifted off the current manifest
+        // is exactly the case the net exists for: the drifted uid may still have
+        // live processes, so it must be DENIED even though the binding is refused.
+        Ok(OwnedInventoryPhases::UidMismatch { inventory, .. }) => {
+            LiveTableBindings::Bindings(sorted_bindings(&inventory))
+        }
+        Err(err) => LiveTableBindings::NotOurTable {
+            detail: err.to_string(),
+        },
+    }
+}
+
+/// Rule 1's uid set from a listing already recognised as this daemon's net.
+///
+/// Empty for the v1 host-wide shape, which carries no rules at all. Only called
+/// after `is_deny_all_safety_net_json` has accepted the listing, so the shape is
+/// already proven and a missing field here means the net has no identity rule.
+#[cfg(any(target_os = "linux", test))]
+fn net_rule_one_uids(json: &str) -> Vec<u32> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        if rule.get("comment").and_then(|v| v.as_str()) != Some(NET_RULE_COMMENT_IDENTITY) {
+            continue;
+        }
+        let Some(right) = rule
+            .get("expr")
+            .and_then(|v| v.as_array())
+            .and_then(|exprs| exprs.first())
+            .and_then(|e| e.get("match"))
+            .and_then(|m| m.get("right"))
+        else {
+            return Vec::new();
+        };
+        // SHARED with the safety-net recogniser's `rule_skuid_set_with_verdict`:
+        // see `skuid_right_members`'s doc for why every shape nft may emit for a
+        // one-member `meta skuid { .. }` match must resolve to the same uid, or
+        // this reader and the recogniser silently disagree about the SAME live
+        // kernel state.
+        let mut uids = match skuid_right_members(right) {
+            Some(members) => members,
+            None => return Vec::new(),
+        };
+        uids.sort_unstable();
+        uids.dedup();
+        return uids;
+    }
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn sorted_bindings(parsed: &ParsedOwnedTableInventory) -> Vec<u32> {
+    let mut uids: Vec<u32> = parsed.uid_bindings.values().copied().collect();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
 }
 
 // ---- Public API (platform-dispatching) ------------------------------------
@@ -2008,12 +4221,12 @@ pub fn install_castle_table() -> Result<(), NftablesError> {
 /// identity: deny-all is installed BEFORE the acquisition refuses, so the loop
 /// is fail-closed and `policy accept` is never left in force for a live agent.
 #[cfg(target_os = "linux")]
-pub fn install_deny_all_safety_net() -> Result<(), NftablesError> {
-    linux::install_deny_all_safety_net_impl()
+pub fn install_deny_all_safety_net(scope: &SafetyNetScope) -> Result<(), NftablesError> {
+    linux::install_deny_all_safety_net_impl(scope)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install_deny_all_safety_net() -> Result<(), NftablesError> {
+pub fn install_deny_all_safety_net(_scope: &SafetyNetScope) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2024,8 +4237,37 @@ pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
     linux::live_table_is_deny_all_safety_net_impl()
 }
 
+#[cfg(target_os = "linux")]
+pub fn live_net_covers_attempt(scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+    linux::live_net_covers_attempt_impl(scope)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn live_net_covers_attempt(_scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// D3 fix round: fetch the live castle table's raw JSON inventory.
+/// See [`linux::live_castle_table_json_impl`]. Crate-private: consumed by both
+/// disarm arms (`ReclaimOwned` and `FinalizeInterrupted`) in
+/// `runtime_providers.rs`, and the recogniser above stays the only authority
+/// for the net's shape. Gated `any(target_os = "linux", test)`, matching this
+/// crate's convention for a Linux-only production surface that a cross-platform
+/// test suite still needs to name (its own off-Linux test below is the
+/// reachability anchor that keeps that build's dead-code check honest, rather
+/// than exempting the function from the check).
+#[cfg(target_os = "linux")]
+pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
+    linux::live_castle_table_json_impl()
+}
+
+#[cfg(all(not(target_os = "linux"), test))]
+pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2092,12 +4334,18 @@ pub fn capture_owned_castle_table(
 /// when a same-name replacement, mutation, injected rule, or extra chain has
 /// drifted the table off its owned identity, so readiness withdraws. (blocker 2)
 #[cfg(target_os = "linux")]
-pub fn verify_owned_castle_table(ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
-    linux::verify_owned_castle_table_impl(ownership).map(|_| ())
+pub fn verify_owned_castle_table(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    linux::verify_owned_castle_table_impl(ownership, expectation).map(|_| ())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn verify_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
+pub fn verify_owned_castle_table(
+    _ownership: &CastleTableOwnership,
+    _expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2107,8 +4355,9 @@ pub fn verify_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<()
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_and_register_owned_table_for_reclaim(
     ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
 ) -> Result<(), NftablesError> {
-    let agent_ids = linux::verify_owned_castle_table_impl(ownership)?;
+    let agent_ids = linux::verify_owned_castle_table_impl(ownership, expectation)?;
     for agent_id in agent_ids {
         crate::nfqueue::register_agent_mark(&agent_id);
     }
@@ -2120,63 +4369,105 @@ pub(crate) fn verify_and_register_owned_table_for_reclaim(
 /// if the identity has drifted, so a foreign table squatting the name is never
 /// clobbered. (blocker 2/3)
 #[cfg(target_os = "linux")]
-pub fn remove_owned_castle_table(ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
-    linux::remove_owned_castle_table_impl(ownership)
+pub fn remove_owned_castle_table(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    linux::remove_owned_castle_table_impl(ownership, expectation)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn remove_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
+pub fn remove_owned_castle_table(
+    _ownership: &CastleTableOwnership,
+    _expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
-/// Load a ruleset for one agent's cgroup. Atomic replace on the per-agent
-/// chain; existing connections preserved per nftables atomic-replace
-/// semantics. Also installs (or refreshes) the jump rule in the base
-/// `output` chain that gates entry into the per-agent chain on the
-/// cgroup-v2 socket match. Without that jump rule the per-agent chain is
-/// a dead chain and the kernel never consults it.
+/// Load a ruleset for one agent's uid. Atomic replace on the per-agent chain;
+/// existing connections preserved per nftables atomic-replace semantics. Also
+/// installs (or refreshes) the jump rule in the base `output` chain that gates
+/// entry into the per-agent chain on `meta skuid <uid>`. Without that jump rule
+/// the per-agent chain is a dead chain and the kernel never consults it.
 ///
-/// `cgroup_level` is the depth of the agent's cgroup in the cgroup-v2
-/// hierarchy (matches `ScopeHandle::cgroup_level`). `cgroup_relative_path`
-/// is the path with the `/sys/fs/cgroup/` prefix stripped (matches
-/// [`crate::cgroup::cgroup_relative_path`]).
+/// `binding` carries the manifest-signed uid and the ceiling it was admitted
+/// under; see [`AgentUidBinding`].
+///
+/// `receipt` is the WRITE-AHEAD proof that this uid is already durably recorded in
+/// this boot's confined history. It is a required argument rather than a convention:
+/// the kernel must never bind a uid the journal does not yet name, because a crash
+/// between the two would leave a live agent whose uid no later start can recover, and
+/// the safety net would then never deny it. A failed persist yields no receipt, so the
+/// bind is unreachable and the caller keeps its prior good policy with no kernel step.
+/// Must match `WriteAheadReceipt` in `src/ownership_journal.rs`.
 #[cfg(target_os = "linux")]
 pub fn load_agent_ruleset(
     id: &AgentRulesetId,
     ruleset: &str,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
-    linux::load_agent_ruleset_impl(id, ruleset, cgroup_level, cgroup_relative_path)
+    receipt_covers_binding(&binding, receipt)?;
+    linux::load_agent_ruleset_impl(id, ruleset, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_agent_ruleset(
     _id: &AgentRulesetId,
     _ruleset: &str,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
+    _receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
+/// Refuse a receipt that does not cover the uid being bound.
+///
+/// Holding SOME receipt is not the property that matters; holding one for THIS uid is.
+/// Without this check a caller with a receipt for an already-persisted uid could bind a
+/// different, unrecorded one.
+///
+/// Gated to Linux exactly like its two callers, the per-agent bind wrappers, so an
+/// ungated definition is not a dead-code diagnostic under `clippy -D warnings` on the
+/// macOS dev build.
+#[cfg(target_os = "linux")]
+fn receipt_covers_binding(
+    binding: &AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
+) -> Result<(), NftablesError> {
+    if receipt.uid() != binding.agent_uid {
+        return Err(NftablesError::InvocationFailed(format!(
+            "the write-ahead proof covers uid {} but the binding names uid {}; the journal \
+             must record the uid a kernel rule is about to bind",
+            receipt.uid(),
+            binding.agent_uid
+        )));
+    }
+    Ok(())
+}
+
 /// Replace an agent ruleset with a fail-closed drop chain and atomically wire
-/// the refreshed cgroup jump to that chain. Used during scope recreation
-/// before the normal policy ruleset is restored.
+/// the uid jump to that chain. Used to park an agent at deny while its binding
+/// is replaced, so no window exists in which its packets reach `policy accept`.
+///
+/// Takes the same write-ahead proof as [`load_agent_ruleset`]: this path also installs
+/// a jump keyed on the uid, so the uid becomes live in the kernel and must be recorded
+/// first even though the chain it reaches drops.
 #[cfg(target_os = "linux")]
 pub fn load_agent_fail_closed_ruleset(
     id: &AgentRulesetId,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
-    linux::load_agent_fail_closed_ruleset_impl(id, cgroup_level, cgroup_relative_path)
+    receipt_covers_binding(&binding, receipt)?;
+    linux::load_agent_fail_closed_ruleset_impl(id, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_agent_fail_closed_ruleset(
     _id: &AgentRulesetId,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
+    _receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -2195,20 +4486,17 @@ pub fn remove_agent_ruleset(_id: &AgentRulesetId) -> Result<(), NftablesError> {
 }
 
 /// Install the jump rule from the base `output` chain into the per-agent
-/// chain, gated on the cgroup-v2 socket match. Idempotent: a prior jump
-/// rule for the same agent is removed (handle-based delete) before the
-/// new one is added.
+/// chain, gated on `meta skuid <uid>`. Idempotent: a prior jump rule for the
+/// same agent is removed (handle-based delete) before the new one is added.
 ///
 /// Most callers should use [`load_agent_ruleset`], which combines the
-/// per-agent chain rules with the jump-rule wiring in one call. This
-/// granular surface is exposed for binding code that needs to refresh
-/// the jump rule independently (e.g., on a cgroup-id renumbering event
-/// where the chain rules have not changed).
+/// per-agent chain rules with the jump-rule wiring in one call. This granular
+/// surface is exposed for binding code that needs to refresh the jump rule
+/// independently.
 #[cfg(target_os = "linux")]
 pub fn install_agent_jump_rule(
     id: &AgentRulesetId,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     if castle_table() == CASTLE_TABLE {
         return Err(NftablesError::InvocationFailed(
@@ -2216,14 +4504,13 @@ pub fn install_agent_jump_rule(
                 .to_string(),
         ));
     }
-    linux::install_agent_jump_rule_impl(id, cgroup_level, cgroup_relative_path)
+    linux::install_agent_jump_rule_impl(id, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn install_agent_jump_rule(
     _id: &AgentRulesetId,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -2249,12 +4536,12 @@ pub fn remove_agent_jump_rule(_id: &AgentRulesetId) -> Result<(), NftablesError>
 
 /// List current agent rulesets in `sanctuary-castle`.
 #[cfg(target_os = "linux")]
-pub fn list_agent_rulesets() -> Result<Vec<AgentRulesetId>, NftablesError> {
+pub fn list_agent_rulesets() -> Result<Vec<String>, NftablesError> {
     linux::list_agent_rulesets_impl()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn list_agent_rulesets() -> Result<Vec<AgentRulesetId>, NftablesError> {
+pub fn list_agent_rulesets() -> Result<Vec<String>, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2321,56 +4608,130 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_cgroup_match_accepts_absent_level_like_nft_1_0_9() {
-        // nft 1.0.9 (Ubuntu 24.04, kernel 6.8) round-trips a rule loaded with
-        // `socket cgroupv2 level N "<path>"` WITHOUT the `level` field. Both the
-        // level-present shape (newer nft / our own emitter model) and the
-        // level-absent shape must parse to the identical owned-binding tuple, or
-        // a live daemon on that kernel class fails closed on every adopt.
-        let path = "system.slice/sanctuary-agent.scope";
-        let with_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "level": 2}}, "right": path}
+    fn parse_skuid_value_accepts_only_a_bare_integer_uid() {
+        // The P0 probe on nft 1.0.9 showed `meta skuid <uid>` listing as a bare
+        // integer in both text and JSON form, for a uid with an account and one
+        // without. This pins the parser to exactly that shape: a NAME, a string
+        // spelling of the number, a float, a nested range, or uid 0 are all
+        // refused, so a newer nft that renders names cannot be silently adopted.
+        let ok = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 4242}
         });
-        let without_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2"}}, "right": path}
+        assert_eq!(parse_skuid_value(&ok), Some(4242));
+
+        let by_name = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": "sanctuary-agent"}
         });
-        let a = parse_cgroup_match(&with_level).expect("with-level shape parses");
-        let b = parse_cgroup_match(&without_level).expect("absent-level shape parses");
-        assert_eq!(
-            a, b,
-            "level-present and level-absent must yield the same owned marker"
+        assert!(
+            parse_skuid_value(&by_name).is_none(),
+            "an account NAME must be refused; resolving it would make the kernel \
+             binding depend on a mutable /etc/passwd"
         );
-        assert_eq!(
-            a,
-            (2, path.to_string()),
-            "depth reconstructed from the 2-component path"
+        let stringified = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": "4242"}
+        });
+        assert!(
+            parse_skuid_value(&stringified).is_none(),
+            "string uid refused"
+        );
+        let root = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 0}
+        });
+        assert!(
+            parse_skuid_value(&root).is_none(),
+            "uid 0 is root and is never a confined agent binding"
+        );
+        let out_of_range = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 4_294_967_296u64}
+        });
+        assert!(
+            parse_skuid_value(&out_of_range).is_none(),
+            "a value past u32 is not a uid"
         );
 
-        // Foreign socket matches stay rejected in both shapes: a non-cgroupv2 key,
-        // or any extra socket key beyond {key[, level]}, is not our owned rule.
+        // A different meta key, an extra key, or a non-equality operator is a
+        // foreign match, not this daemon's binding.
         let wrong_key = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv1"}}, "right": path}
+            "match": {"op": "==", "left": {"meta": {"key": "skgid"}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&wrong_key).is_none(),
-            "non-cgroupv2 key rejected"
+            parse_skuid_value(&wrong_key).is_none(),
+            "skgid is not skuid"
         );
         let extra_key = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "foo": 1}}, "right": path}
+            "match": {"op": "==", "left": {"meta": {"key": "skuid", "foo": 1}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&extra_key).is_none(),
-            "extra socket key rejected"
+            parse_skuid_value(&extra_key).is_none(),
+            "extra meta key refused"
         );
-        // An explicit level 0 is still foreign (a real cgroup depth is >= 1).
-        let zero_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "level": 0}}, "right": path}
+        let not_equality = serde_json::json!({
+            "match": {"op": "!=", "left": {"meta": {"key": "skuid"}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&zero_level).is_none(),
-            "explicit level 0 rejected"
+            parse_skuid_value(&not_equality).is_none(),
+            "non-== op refused"
+        );
+        let socket_shape = serde_json::json!({
+            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2"}}, "right": "system.slice"}
+        });
+        assert!(
+            parse_skuid_value(&socket_shape).is_none(),
+            "the retired cgroup match shape must not parse as a uid binding"
         );
     }
+
+    #[test]
+    fn agent_uid_seal_is_bound_to_fortress_agent_and_uid() {
+        // The seal is a consistency check, not authority, but it must at least be
+        // a FUNCTION of all three inputs: a seal that ignored the fortress or the
+        // agent would let a rule sealed for one binding verify under another.
+        let base = agent_uid_seal("fortress-a", "agent-one", 4242);
+        assert_eq!(base.len(), AGENT_UID_SEAL_HEX_LEN);
+        assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(base, agent_uid_seal("fortress-b", "agent-one", 4242));
+        assert_ne!(base, agent_uid_seal("fortress-a", "agent-two", 4242));
+        assert_ne!(base, agent_uid_seal("fortress-a", "agent-one", 4243));
+        assert_eq!(base, agent_uid_seal("fortress-a", "agent-one", 4242));
+        // NUL separation, not concatenation: the shifted-boundary pair below would
+        // collide under a bare concatenation of the three fields.
+        assert_ne!(
+            agent_uid_seal("fortress", "a-agent", 1000),
+            agent_uid_seal("fortressa", "-agent", 1000)
+        );
+    }
+
+    #[test]
+    fn max_agent_id_len_leaves_every_sealed_comment_inside_the_nft_cap() {
+        // The derivation, checked rather than asserted by comment: a
+        // worst-case marker + role + agent id + seal must fit nft's comment cap,
+        // and the queue role must be the binding one.
+        let marker = format!(
+            "{OWNER_MARKER_PREFIX}{}",
+            "a".repeat(OWNER_MARKER_NONCE_HEX_LEN)
+        );
+        let agent_id = "a".repeat(MAX_AGENT_ID_LEN);
+        let seal = agent_uid_seal("fortress-id", &agent_id, 4242);
+        for role in [":queue:", ":jump:"] {
+            let comment = format!("{marker}{role}{agent_id}{AGENT_UID_SEAL_INFIX}{seal}");
+            assert!(
+                comment.len() <= NFT_RULE_COMMENT_MAX_LEN,
+                "{role} comment is {} bytes, over the {NFT_RULE_COMMENT_MAX_LEN}-byte cap",
+                comment.len()
+            );
+        }
+        // The fail-closed body carries no seal, so it is not the binding case.
+        let fail_closed = format!("{marker}:failclosed:{agent_id}");
+        assert!(fail_closed.len() <= NFT_RULE_COMMENT_MAX_LEN);
+        // One more byte of agent id would overflow the queue comment: the budget
+        // is tight, so this is a real bound and not a loose guess.
+        let over = format!(
+            "{marker}{LONGEST_SEALED_ROLE_INFIX}{}{AGENT_UID_SEAL_INFIX}{seal}",
+            "a".repeat(MAX_AGENT_ID_LEN + 1)
+        );
+        assert!(over.len() > NFT_RULE_COMMENT_MAX_LEN);
+    }
+
     use crate::policy::{AllowlistRule, RuleDisposition, RuleMatch, RuleScope};
 
     // ---- nft binary resolution: absolute-only, no PATH fallback -------------
@@ -2606,7 +4967,8 @@ mod tests {
     #[test]
     fn owned_identity_parses_handles_and_marker() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker)).expect("owned");
+        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation())
+            .expect("owned");
         assert_eq!(
             owned,
             CastleTableOwnership {
@@ -2617,28 +4979,54 @@ mod tests {
         );
     }
 
+    /// The fortress every owned-agent fixture below seals under. A single
+    /// constant so a test that means to change the FORTRESS has to say so.
+    const FIXTURE_FORTRESS: &str = "fixture-fortress";
+    /// The uid every owned-agent fixture binds. Above any plausible system-uid
+    /// ceiling, so it is a legitimate confined-agent uid.
+    const FIXTURE_AGENT_UID: u32 = 4242;
+
+    /// The trusted expectation matching the fixtures: what a healthy reclaim or
+    /// health poll would carry.
+    fn fixture_expectation() -> ExpectedAgentBinding {
+        ExpectedAgentBinding::Confined {
+            fortress_id: FIXTURE_FORTRESS.to_string(),
+            agent_uid: FIXTURE_AGENT_UID,
+        }
+    }
+
     fn owned_agent_json(marker: &str, include_body: bool, include_jump: bool) -> String {
+        owned_agent_json_with_uid(marker, include_body, include_jump, FIXTURE_AGENT_UID)
+    }
+
+    /// An owned inventory whose per-agent rules bind `uid`, sealed CORRECTLY for
+    /// that uid. Sealing correctly is the point: a test that wants to exercise
+    /// the trusted-uid comparison must not be able to pass by accident because
+    /// the seal caught the mismatch first.
+    fn owned_agent_json_with_uid(
+        marker: &str,
+        include_body: bool,
+        include_jump: bool,
+        uid: u32,
+    ) -> String {
         let chain = agent_chain_name("agent-one");
         let mark = crate::nfqueue::agent_mark("agent-one");
-        // GF2: the installed cgroup match must target THIS agent's own scope
-        // unit (`scope_unit_name("agent-one")`), not an arbitrary/parent path,
-        // and the marker-bound comment carries the authenticated seal of that
-        // exact path (`:cg:<seal>`) that the parser recomputes from the live
-        // match. The fixture mirrors the exact `cgroup_path_seal` the production
-        // emission site writes.
-        let cgroup_path = "system.slice/sanctuary-agent-agent-one.service";
-        let seal = cgroup_path_seal(cgroup_path);
-        let cgroup_match = r#""match":{"op":"==","left":{"socket":{"key":"cgroupv2","level":2}},"right":"system.slice/sanctuary-agent-agent-one.service"}"#;
+        // The fixture mirrors the exact `agent_uid_seal` the production emission
+        // site writes: seal input is (fortress, agent, uid), and the parser
+        // recomputes it from the LIVE match value.
+        let seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", uid);
+        let skuid_match =
+            format!(r#""match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{uid}}}"#);
         let body = if include_body {
             format!(
-                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":10,"comment":"{marker}:queue:agent-one:cg:{seal}","expr":[{{{cgroup_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":10,"comment":"{marker}:queue:agent-one:uid:{seal}","expr":[{{{skuid_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
             )
         } else {
             String::new()
         };
         let jump = if include_jump {
             format!(
-                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,"comment":"{marker}:jump:agent-one:cg:{seal}","expr":[{{{cgroup_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,"comment":"{marker}:jump:agent-one:uid:{seal}","expr":[{{{skuid_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
             )
         } else {
             String::new()
@@ -2654,13 +5042,332 @@ mod tests {
         )
     }
 
+    fn fixture_marker() -> String {
+        format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef")
+    }
+
+    /// An owned inventory carrying an ARBITRARY set of `(agent_id, uid)`
+    /// bindings, each correctly sealed. The set rule's whole subject is
+    /// cardinality and agent identity, so the fixture has to be able to build
+    /// tables the single-agent fixture above cannot: two chains for one uid, and
+    /// a chain under a foreign agent id bound to the admitted uid. Both are
+    /// shapes the frozen parser ACCEPTS, which is why the set rule exists.
+    fn owned_table_with_bindings(marker: &str, bindings: &[(&str, u32)]) -> String {
+        let mut chains = String::new();
+        let mut rules = String::new();
+        // Handles are distinct per object; the parser only compares the table and
+        // base-chain handles, so the per-agent values only have to be unique.
+        let mut next_handle = 9u64;
+        for (agent_id, uid) in bindings {
+            let chain = agent_chain_name(agent_id);
+            let mark = crate::nfqueue::agent_mark(agent_id);
+            let seal = agent_uid_seal(FIXTURE_FORTRESS, agent_id, *uid);
+            let skuid_match = format!(
+                r#""match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{uid}}}"#
+            );
+            chains.push_str(&format!(
+                r#",{{"chain":{{"family":"inet","table":"sanctuary-castle","name":"{chain}","handle":{next_handle},"comment":"{marker}:agent:{agent_id}"}}}}"#
+            ));
+            next_handle += 1;
+            rules.push_str(&format!(
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":{next_handle},"comment":"{marker}:queue:{agent_id}:uid:{seal}","expr":[{{{skuid_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
+            ));
+            next_handle += 1;
+            rules.push_str(&format!(
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":{next_handle},"comment":"{marker}:jump:{agent_id}:uid:{seal}","expr":[{{{skuid_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
+            ));
+            next_handle += 1;
+        }
+        format!(
+            r#"{{"nftables":[
+              {{"table":{{"family":"inet","name":"sanctuary-castle","handle":2,"comment":"{marker}"}}}},
+              {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+                "type":"filter","hook":"output","prio":0,"policy":"accept"}}}}{chains}{rules}
+            ]}}"#
+        )
+    }
+
+    fn fixture_ownership(marker: &str) -> CastleTableOwnership {
+        CastleTableOwnership {
+            table_handle: 2,
+            base_chain_handle: 1,
+            marker: marker.to_string(),
+        }
+    }
+
+    fn confined(uid: u32) -> ExpectedAgentBinding {
+        ExpectedAgentBinding::Confined {
+            fortress_id: FIXTURE_FORTRESS.to_string(),
+            agent_uid: uid,
+        }
+    }
+
+    #[test]
+    fn the_set_rule_adopts_exactly_the_required_singleton() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .expect("the owned shape passes");
+        assert!(matches!(set, OwnedBindingSet::Verified(_)));
+        assert_eq!(
+            set.inventory().bindings,
+            vec![(confined_agent_id(uid), uid)]
+        );
+    }
+
+    #[test]
+    fn the_set_rule_refuses_a_foreign_agent_id_bound_to_the_admitted_uid() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        // The frozen parser compares the UID only, so this table is `Verified`
+        // there. The set rule is the only thing that refuses it.
+        let json = owned_table_with_bindings(&marker, &[("shadow", uid)]);
+        assert!(matches!(
+            parse_owned_table_inventory_phases(&json, &confined(uid)).unwrap(),
+            OwnedInventoryPhases::Verified(_)
+        ));
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .unwrap();
+        match set {
+            OwnedBindingSet::UidMismatch { inventory, .. } => {
+                // The inventory survives the refusal: the safety net's deny set
+                // needs the uid a drifted-but-ours table routes.
+                assert_eq!(inventory.bindings, vec![("shadow".to_string(), uid)]);
+            }
+            OwnedBindingSet::Verified(_) => {
+                panic!("a chain under another agent id must not be adopted")
+            }
+        }
+    }
+
+    #[test]
+    fn the_set_rule_refuses_two_chains_for_the_same_uid() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json =
+            owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid), ("shadow", uid)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .unwrap();
+        assert!(matches!(set, OwnedBindingSet::UidMismatch { .. }));
+        assert_eq!(set.inventory().bindings.len(), 2);
+    }
+
+    #[test]
+    fn the_set_rule_reads_an_empty_table_as_a_mismatch_under_confined_and_verified_under_none() {
+        let marker = fixture_marker();
+        let json = owned_table_with_bindings(&marker, &[]);
+        // Under a confining manifest an empty set is NOT the required set. Health
+        // reads that as a proven loss; acquisition reads the same inventory and
+        // installs.
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(60123))
+                .unwrap();
+        assert!(matches!(set, OwnedBindingSet::UidMismatch { .. }));
+        assert!(set.inventory().bindings.is_empty());
+        // Under a manifest that confines nobody, empty IS the required set.
+        assert!(matches!(
+            owned_table_binding_set_from_json(
+                &json,
+                &fixture_ownership(&marker),
+                &ExpectedAgentBinding::NoneConfined,
+            )
+            .unwrap(),
+            OwnedBindingSet::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn the_set_rule_refuses_a_table_whose_handles_drifted() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid)]);
+        let wrong = CastleTableOwnership {
+            table_handle: 999,
+            base_chain_handle: 1,
+            marker: marker.clone(),
+        };
+        assert!(matches!(
+            owned_table_binding_set_from_json(&json, &wrong, &confined(uid)),
+            Err(NftablesError::ForeignState(_))
+        ));
+    }
+
+    #[test]
+    fn the_set_rule_keeps_the_parsers_wording_for_a_uid_drift() {
+        let marker = fixture_marker();
+        // The live binding routes a uid the manifest no longer admits.
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(60123), 60123)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(60125))
+                .unwrap();
+        match set {
+            OwnedBindingSet::UidMismatch { detail, inventory } => {
+                assert!(
+                    detail.contains("is not the uid the current signed manifest confines"),
+                    "the two layers must not describe one drift differently: {detail}"
+                );
+                assert_eq!(inventory.bindings, vec![(confined_agent_id(60123), 60123)]);
+            }
+            OwnedBindingSet::Verified(_) => panic!("a drifted uid must not be adopted"),
+        }
+    }
+
+    // ---- TB5 (slice B): the agent start gate's table verdict ---------------
+    //
+    // Capability: the agent unit instance `U` is admitted only when the owned
+    // table's live binding set is exactly the sealed singleton {(uid-U, U)}
+    // under this fortress. Register id:
+    // `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`.
+
+    /// The instance uid the gate fixtures start. Above any plausible
+    /// system-uid ceiling, and distinct from every other uid below.
+    const GATE_UID: u32 = 60123;
+    /// A second provisioned agent uid, for the wrong-instance cases.
+    const GATE_OTHER_UID: u32 = 60124;
+
+    fn gate(json: &str, uid: u32) -> AgentStartTableVerdict {
+        agent_start_gate_verdict(json, FIXTURE_FORTRESS, uid)
+    }
+
+    #[test]
+    fn tb5_the_gate_admits_exactly_the_sealed_singleton_for_the_instance() {
+        let json = owned_table_with_bindings(
+            &fixture_marker(),
+            &[(&confined_agent_id(GATE_UID), GATE_UID)],
+        );
+        assert_eq!(gate(&json, GATE_UID), AgentStartTableVerdict::Admit);
+    }
+
+    #[test]
+    fn tb5_the_gate_refuses_every_other_binding_set() {
+        let marker = fixture_marker();
+        let cases: Vec<(&str, String)> = vec![
+            ("the empty set", owned_table_with_bindings(&marker, &[])),
+            (
+                // Kills a verdict that derives the expected uid from the
+                // listing (self-compare): this table is self-consistent for V.
+                "{(uid-V, V)} started as U",
+                owned_table_with_bindings(
+                    &marker,
+                    &[(&confined_agent_id(GATE_OTHER_UID), GATE_OTHER_UID)],
+                ),
+            ),
+            (
+                // Kills a superset test.
+                "two chains for U",
+                owned_table_with_bindings(
+                    &marker,
+                    &[
+                        (&confined_agent_id(GATE_UID), GATE_UID),
+                        ("shadow", GATE_UID),
+                    ],
+                ),
+            ),
+            (
+                // Kills a uid-only comparison: the frozen parser verifies this.
+                "a foreign agent id bound to U",
+                owned_table_with_bindings(&marker, &[("shadow", GATE_UID)]),
+            ),
+        ];
+        for (name, json) in cases {
+            assert!(
+                matches!(
+                    gate(&json, GATE_UID),
+                    AgentStartTableVerdict::RefuseBindingSet(_)
+                ),
+                "{name} must refuse with RefuseBindingSet, got {:?}",
+                gate(&json, GATE_UID)
+            );
+        }
+    }
+
+    #[test]
+    fn tb5_the_gate_refuses_the_net_unparseable_output_and_a_foreign_seal_as_not_owned() {
+        let cases: Vec<(&str, String)> = vec![
+            // Kills a gate that accepts the net: neither net shape carries the
+            // ownership marker, so phase one refuses it.
+            ("the host-wide deny-all net", v1_host_wide_listing()),
+            (
+                "the identity deny-all net naming U",
+                v2_identity_listing(&[GATE_UID], &[GATE_UID]),
+            ),
+            ("unparseable output", "not json at all".to_string()),
+        ];
+        for (name, json) in cases {
+            assert!(
+                matches!(
+                    gate(&json, GATE_UID),
+                    AgentStartTableVerdict::RefuseNotOwnedShape(_)
+                ),
+                "{name} must refuse with RefuseNotOwnedShape, got {:?}",
+                gate(&json, GATE_UID)
+            );
+        }
+        // A binding sealed under this fixture fortress does not verify under
+        // another: the seal's fortress id is the caller's, never the dump's.
+        let json = owned_table_with_bindings(
+            &fixture_marker(),
+            &[(&confined_agent_id(GATE_UID), GATE_UID)],
+        );
+        assert!(matches!(
+            agent_start_gate_verdict(&json, "another-fortress", GATE_UID),
+            AgentStartTableVerdict::RefuseNotOwnedShape(_)
+        ));
+    }
+
+    #[test]
+    fn tb5_the_wall_and_the_gate_share_one_set_rule_verdict() {
+        // The same inventory reaches the same set-rule answer through both
+        // consumers (the wall's adds only the ownership-handle equality).
+        let marker = fixture_marker();
+        for bindings in [
+            vec![(confined_agent_id(GATE_UID), GATE_UID)],
+            vec![("shadow".to_string(), GATE_UID)],
+            vec![],
+        ] {
+            let refs: Vec<(&str, u32)> = bindings.iter().map(|(a, u)| (a.as_str(), *u)).collect();
+            let json = owned_table_with_bindings(&marker, &refs);
+            let wall = owned_table_binding_set_from_json(
+                &json,
+                &fixture_ownership(&marker),
+                &confined(GATE_UID),
+            )
+            .expect("owned shape");
+            let admitted = gate(&json, GATE_UID) == AgentStartTableVerdict::Admit;
+            assert_eq!(
+                matches!(wall, OwnedBindingSet::Verified(_)),
+                admitted,
+                "wall and gate disagree for {bindings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_confined_agent_id_derivation_is_one_function() {
+        assert_eq!(confined_agent_id(60123), "uid-60123");
+        assert!(confined_agent_id(0).starts_with(CONFINED_AGENT_ID_PREFIX));
+    }
+
     #[test]
     fn ordinary_inventory_parsing_is_pure_and_reclaim_metadata_is_complete() {
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
+        let marker = fixture_marker();
         let mark = crate::nfqueue::agent_mark("agent-one");
         let before = crate::nfqueue::resolve_agent_mark(mark);
-        let parsed = parse_owned_table_inventory(&owned_agent_json(&marker, true, true))
-            .expect("complete inventory");
+        let parsed = parse_owned_table_inventory_phases(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("complete inventory");
+        let parsed = match parsed {
+            OwnedInventoryPhases::Verified(inventory) => inventory,
+            OwnedInventoryPhases::UidMismatch { .. } => {
+                panic!("this fixture matches the manifest, so phase two passes")
+            }
+        };
         assert_eq!(parsed.agent_ids, vec!["agent-one".to_string()]);
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
@@ -2670,143 +5377,885 @@ mod tests {
         );
     }
 
+    /// The late-failure guarantee of the two-phase parse: a valid binding followed by a
+    /// FOREIGN rule exposes NO partial set.
+    ///
+    /// A `Bindings` value is only honest if the WHOLE owned shape passed. If a partial
+    /// set escaped, a caller would treat uids collected before the failure as "what this
+    /// daemon's table routes" when the document was never proven to be that table.
     #[test]
-    fn owned_inventory_refuses_parent_cgroup_path_widening() {
-        // GF2 fault injection: a CAP_NET_ADMIN actor rewrites BOTH the base jump
-        // and the per-agent body cgroup match to a PARENT scope (`system.slice`),
-        // keeping the ownership marker, the pristine shape, and body/jump
-        // agreement intact. Pre-GF2 this read as "owned" (over-broad attribution
-        // of every process in the parent). The per-agent path pin must now reject
-        // it: the match leaf no longer equals the agent's own scope unit.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let widened = owned_agent_json(&marker, true, true).replace(
-            "system.slice/sanctuary-agent-agent-one.service",
-            "system.slice",
+    fn owned_inventory_exposes_no_partial_binding_set_on_a_late_failure() {
+        let marker = fixture_marker();
+        let valid = owned_agent_json(&marker, true, true);
+        // Sanity: the untouched fixture DOES yield its binding, so the assertion below
+        // is about the late failure and not about an empty fixture.
+        assert_eq!(
+            live_table_uid_bindings(&valid, &fixture_expectation(), test_overflow()),
+            LiveTableBindings::Bindings(vec![FIXTURE_AGENT_UID])
         );
-        let err = parse_owned_table_identity(&widened).unwrap_err();
-        assert!(
-            matches!(err, NftablesError::ForeignState(_)),
-            "a widened parent-cgroup match must be refused as foreign, got: {err:?}"
+
+        // Now append a FOREIGN rule after the valid binding: an unmarked rule in our base
+        // chain, which the owned shape never contains.
+        let with_foreign = valid.replace(
+            "\n            ]}",
+            ",{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\
+             \"handle\":99,\"expr\":[{\"accept\":null}]}}\n            ]}",
         );
-        // The pristine (correct-leaf) inventory still parses: the pin rejects
-        // ONLY the widening, never the legitimate per-agent binding.
-        parse_owned_table_identity(&owned_agent_json(&marker, true, true))
-            .expect("the correct per-agent binding must still parse");
+        assert_ne!(with_foreign, valid, "the late-failure fixture must differ");
+        match live_table_uid_bindings(&with_foreign, &fixture_expectation(), test_overflow()) {
+            LiveTableBindings::NotOurTable { .. } => {}
+            other => panic!(
+                "a document that fails phase one must yield NOTHING, not a partial set: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// Source (c) across its three shapes.
+    #[test]
+    fn live_table_uid_bindings_reads_the_owned_wall_and_both_net_shapes() {
+        let ov = test_overflow();
+        // THE OWNED WALL: the declared per-agent binding.
+        assert_eq!(
+            live_table_uid_bindings(
+                &owned_agent_json(&fixture_marker(), true, true),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![FIXTURE_AGENT_UID])
+        );
+
+        // AN OWNED WALL THAT DRIFTED off the current manifest still contributes its uids:
+        // a rotated-away uid may still have live processes, so the net must deny it even
+        // though the binding itself is refused for adoption.
+        assert_eq!(
+            live_table_uid_bindings(
+                &owned_agent_json_with_uid(&fixture_marker(), true, true, 5555),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![5555])
+        );
+
+        // THE V1 NET: no rules at all, so source (c) is EMPTY. This is distinct from
+        // "not our table": the net IS ours and it names nobody.
+        assert_eq!(
+            live_table_uid_bindings(&v1_host_wide_listing(), &fixture_expectation(), ov),
+            LiveTableBindings::Bindings(Vec::new())
+        );
+
+        // THE V2 NET: rule 1's set, which is the set currently denying traffic in the
+        // kernel. Reading this as "not our table" would let a restart install a net
+        // narrower than the one already in force.
+        assert_eq!(
+            live_table_uid_bindings(
+                &v2_identity_listing(&[60123, 60124], &[60123, 60124]),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![60123, 60124])
+        );
+
+        // A STRUCTURALLY FOREIGN table yields nothing, and that is not the same value as
+        // the empty set above.
+        match live_table_uid_bindings("{\"nftables\":[]}", &fixture_expectation(), ov) {
+            LiveTableBindings::NotOurTable { .. } => {}
+            other => panic!("a foreign document must yield nothing, got {other:?}"),
+        }
+    }
+
+    /// A realistic `nft -j list ruleset` fragment for rule 1 of the deny-all
+    /// identity net when the denied set names exactly ONE uid. Real nft
+    /// collapses a single-member anonymous set to a bare scalar under
+    /// `right`, never `{"set":[..]}`; the real-kernel witness is
+    /// `installed_net_rule_one_uids` in `integration_linux_runtime_activation.rs`
+    /// and the sibling case
+    /// `nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid`
+    /// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value` (that
+    /// probe covers a different, always-bare rule and says nothing about a
+    /// one-member SET collapsing). `net_rule_one_uids` reads only rule 1, so
+    /// the fixture carries just that rule plus the table/chain wrapper the
+    /// function does not inspect.
+    fn net_rule_json_with_right(right_json: &str) -> String {
+        format!(
+            r#"{{"nftables":[
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{right}}}}},
+                      {{"drop":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            right = right_json,
+        )
+    }
+
+    /// The confirmed defect: a single-uid identity rule, in the scalar form nft
+    /// actually renders it, must still surface its uid. Reading only the
+    /// `{"set":[..]}` array form drops this daemon's own already-installed
+    /// deny-all uid from source (c) of `resolve_safety_net_scope`, and
+    /// `live_table_uid_bindings`'s own comment above is explicit that
+    /// undercounting here can install a net NARROWER than the one already
+    /// enforcing in the kernel.
+    #[test]
+    fn net_rule_one_uids_reads_the_single_member_scalar_form() {
+        let json = net_rule_json_with_right("60123");
+        assert_eq!(
+            net_rule_one_uids(&json),
+            vec![60123],
+            "a scalar `right` for a one-member meta skuid match must yield that uid"
+        );
+    }
+
+    /// The existing multi-member array form keeps working, unsorted and with a
+    /// duplicate, since the function's own contract is ascending + deduplicated.
+    #[test]
+    fn net_rule_one_uids_reads_the_multi_member_set_form() {
+        let json = net_rule_json_with_right(r#"{"set":[60124,60123,60124]}"#);
+        assert_eq!(net_rule_one_uids(&json), vec![60123, 60124]);
+    }
+
+    /// A "set" key whose own value is itself a bare scalar (rather than a
+    /// one-element array) is NOT a shape any real-kernel witness records nft
+    /// emitting (see `skuid_right_members`'s doc): the accepted surface is
+    /// kept equal to observed nft outputs, so this speculative shape refuses
+    /// exactly like the other unrecognised shapes below rather than being
+    /// normalised.
+    #[test]
+    fn net_rule_one_uids_refuses_a_scalar_nested_under_set() {
+        let json = net_rule_json_with_right(r#"{"set":60123}"#);
+        assert_eq!(net_rule_one_uids(&json), Vec::<u32>::new());
+    }
+
+    /// Malformed shapes the function does not recognise must never be read as
+    /// "this rule denies nobody" in a way that differs from "no such rule was
+    /// found at all"; both already return the empty vec, and this test pins
+    /// that the malformed cases do not instead panic or silently pick a wrong
+    /// member. `{"range":[1000,2000]}` is the one listed form nft genuinely
+    /// emits for `meta skuid 1000-2000`, so it is the case most worth pinning
+    /// here rather than only a hand-composed name/null/object/array/float;
+    /// `{"set":[60123,"root"]}` pins that ONE non-numeric member anywhere in
+    /// an otherwise-valid array refuses the WHOLE match, not a partial read.
+    #[test]
+    fn net_rule_one_uids_refuses_unrecognised_right_shapes() {
+        for right in [
+            "\"sanctuary-agent\"",
+            "null",
+            "{}",
+            "[]",
+            "4.5",
+            r#"{"range":[1000,2000]}"#,
+            r#"{"set":[60123,"root"]}"#,
+        ] {
+            let json = net_rule_json_with_right(right);
+            assert_eq!(
+                net_rule_one_uids(&json),
+                Vec::<u32>::new(),
+                "unrecognised right shape {right} must not be read as any uid"
+            );
+        }
     }
 
     #[test]
-    fn owned_inventory_refuses_same_leaf_wrong_parent_cgroup_path() {
-        // GF2 (round-2 re-gate) fault injection: the wrong-PARENT-SAME-LEAF case
-        // the leaf-only pin missed. A CAP_NET_ADMIN actor rewrites BOTH the base
-        // jump and the per-agent body cgroup match to `other.slice/<same-leaf>`,
-        // keeping the marker, pristine shape, body/jump agreement, AND the exact
-        // agent scope-unit leaf. The pre-round-2 leaf comparison accepted this
-        // (`installed_leaf == expected_leaf`) while the real agent's traffic under
-        // `system.slice/<leaf>` missed the goto and hit `policy accept`. The
-        // full-path seal must now reject it: the re-parented match hashes to a
-        // different seal than the authenticated `:cg:` in the marker-bound comment.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let reparented = owned_agent_json(&marker, true, true).replace(
-            "system.slice/sanctuary-agent-agent-one.service",
-            "other.slice/sanctuary-agent-agent-one.service",
-        );
-        // Sanity: the leaf is UNCHANGED, so a leaf-only check would still pass.
-        assert!(reparented.contains("other.slice/sanctuary-agent-agent-one.service"));
-        let err = parse_owned_table_identity(&reparented).unwrap_err();
+    fn owned_inventory_refuses_a_uid_the_manifest_does_not_confine() {
+        // THE core check of the uid migration, and the only one an actor holding
+        // CAP_NET_ADMIN cannot satisfy. Here the live table is fully
+        // self-consistent: both expressions bind uid 5555, both comments carry a
+        // CORRECTLY recomputed seal for 5555, body and jump agree, cardinality is
+        // exact, the marker is intact. Shape, seal, agreement and cardinality all
+        // pass. Only the manifest expectation refuses it — which is why the seal
+        // is documented as a consistency check and never as authority.
+        let marker = fixture_marker();
+        let other_uid = owned_agent_json_with_uid(&marker, true, true, 5555);
+        // Sanity: the forgery IS internally consistent, so it would pass every
+        // check that reads only the dump.
+        parse_owned_table_identity(
+            &other_uid,
+            &ExpectedAgentBinding::SealOnly {
+                fortress_id: FIXTURE_FORTRESS.to_string(),
+            },
+        )
+        .expect("the forgery is internally consistent and passes seal-only");
+
+        let err = parse_owned_table_identity(&other_uid, &fixture_expectation()).unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
-            "a same-leaf, wrong-parent cgroup match must be refused as foreign, got: {err:?}"
+            "a self-consistent binding for a uid the manifest does not confine must be \
+             refused as foreign, got: {err:?}"
         );
+        // The legitimate binding still parses: the check rejects ONLY the wrong uid.
+        parse_owned_table_identity(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("the correct per-agent binding must still parse");
     }
 
     #[test]
-    fn owned_inventory_refuses_missing_or_forged_cgroup_path_seal() {
-        // A cgroup-matching rule with its `:cg:` seal stripped is refused (the seal
-        // is mandatory), and one whose seal does not match its own path is refused
-        // (an in-place expr mutation that forgot to also rewrite the seal).
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let seal = cgroup_path_seal("system.slice/sanctuary-agent-agent-one.service");
+    fn owned_inventory_refuses_a_live_binding_when_the_manifest_confines_no_uid() {
+        // Absent is not passing. A manifest with no `agent_origin` (or a
+        // non-`uid` mode) confines nobody, so a live per-agent binding is
+        // something this process cannot vouch for: refuse it fail-closed rather
+        // than adopt it because nothing contradicted it.
+        let marker = fixture_marker();
+        let err = parse_owned_table_identity(
+            &owned_agent_json(&marker, true, true),
+            &ExpectedAgentBinding::NoneConfined,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, NftablesError::ForeignState(_)),
+            "got: {err:?}"
+        );
+        // A table with NO agent binding is still fine under the same expectation:
+        // that is the ordinary kernel-runtime-ready posture with nothing wrapped.
+        parse_owned_table_identity(
+            &owned_json(2, 1, &marker),
+            &ExpectedAgentBinding::NoneConfined,
+        )
+        .expect("an agent-free owned table is legitimate with nothing confined");
+    }
+
+    #[test]
+    fn owned_inventory_refuses_a_wrong_fortress_or_wrong_agent_seal() {
+        // The seal binds (fortress, agent, uid). A binding sealed under another
+        // fortress, or for another agent id, is not this fortress's owned object
+        // even when the uid and the shape are right.
+        let marker = fixture_marker();
         let pristine = owned_agent_json(&marker, true, true);
-        // Drop the seal suffix from both cgroup-matching comments.
-        let unsealed = pristine.replace(&format!(":cg:{seal}"), "");
-        assert!(parse_owned_table_identity(&unsealed).is_err());
-        // Replace the seal with a valid-length but wrong digest.
-        let wrong = pristine.replace(&seal, "ffffffffffffffff");
-        assert!(parse_owned_table_identity(&wrong).is_err());
+        let correct_seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID);
+
+        let wrong_fortress_seal =
+            agent_uid_seal("some-other-fortress", "agent-one", FIXTURE_AGENT_UID);
+        let forged = pristine.replace(&correct_seal, &wrong_fortress_seal);
+        assert!(parse_owned_table_identity(&forged, &fixture_expectation()).is_err());
+
+        let wrong_agent_seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-two", FIXTURE_AGENT_UID);
+        let forged = pristine.replace(&correct_seal, &wrong_agent_seal);
+        assert!(parse_owned_table_identity(&forged, &fixture_expectation()).is_err());
+
+        // And verifying the correct fixture under a DIFFERENT fortress fails: the
+        // recompute uses the caller's fortress id, never one read from the dump.
+        let other_fortress = ExpectedAgentBinding::Confined {
+            fortress_id: "some-other-fortress".to_string(),
+            agent_uid: FIXTURE_AGENT_UID,
+        };
+        assert!(parse_owned_table_identity(&pristine, &other_fortress).is_err());
     }
 
     #[test]
-    fn owned_inventory_refuses_numeric_form_cgroup_match() {
-        // GF2 (round-3 re-gate) fault injection: an in-place expr mutation rewrites
-        // BOTH the base jump and the per-agent body cgroup match to a numeric
-        // resolved-id FORM (nft's display for an unresolvable/destroyed cgroup),
-        // keeping the ownership marker, the pristine shape, body/jump agreement, AND
-        // the original path's `:cg:` seal in the comment. Pre-round-3 the parser
-        // SKIPPED the seal comparison whenever the match was all-digits, so this
-        // mutation -- the exact in-place-match attack the seal defends against --
-        // read as "owned". The numeric-form match must now be refused as foreign
-        // (fail-closed, re-arming GF1 deny-all upstream): a live owned per-agent
-        // binding must always carry a verifiable full-path seal.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let numeric = owned_agent_json(&marker, true, true)
-            .replace("system.slice/sanctuary-agent-agent-one.service", "12345");
-        // Sanity: both match values are now the numeric form, while the sealed
-        // comment still carries the original path's seal (the in-place dodge).
-        assert!(numeric.contains(r#""right":"12345""#));
-        assert!(numeric.contains(":cg:"));
-        let err = parse_owned_table_identity(&numeric).unwrap_err();
+    fn owned_inventory_refuses_missing_or_forged_agent_uid_seal() {
+        // A skuid-matching rule with its `:uid:` seal stripped is refused (the
+        // seal is mandatory), and one whose seal does not match its own uid is
+        // refused (an in-place expr mutation that forgot to also rewrite the
+        // seal). Retargeted from the cgroup-path-seal case, same class.
+        let marker = fixture_marker();
+        let seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID);
+        let pristine = owned_agent_json(&marker, true, true);
+        let unsealed = pristine.replace(&format!(":uid:{seal}"), "");
+        assert!(parse_owned_table_identity(&unsealed, &fixture_expectation()).is_err());
+        let wrong = pristine.replace(&seal, "ffffffffffffffff");
+        assert!(parse_owned_table_identity(&wrong, &fixture_expectation()).is_err());
+    }
+
+    #[test]
+    fn owned_inventory_refuses_an_in_place_uid_rewrite_of_one_expression() {
+        // The natural in-place attack: rewrite ONE expression's uid, leave the
+        // comment. Two independent checks fire — the seal no longer recomputes,
+        // and body and jump no longer agree — and the test pins that the
+        // DISAGREEMENT alone is caught, by using a correctly-sealed comment for
+        // the rewritten value on the jump only.
+        let marker = fixture_marker();
+        let mut document: serde_json::Value =
+            serde_json::from_str(&owned_agent_json(&marker, true, true)).unwrap();
+        let items = document["nftables"].as_array_mut().unwrap();
+        let jump = items
+            .iter_mut()
+            .find_map(|item| {
+                let rule = item.get_mut("rule")?;
+                (rule.get("chain")?.as_str()? == "output").then_some(rule)
+            })
+            .unwrap();
+        jump["expr"][0]["match"]["right"] = serde_json::json!(FIXTURE_AGENT_UID + 1);
+        jump["comment"] = serde_json::json!(format!(
+            "{marker}:jump:agent-one:uid:{}",
+            agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID + 1)
+        ));
+        let err =
+            parse_owned_table_identity(&document.to_string(), &fixture_expectation()).unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
-            "a numeric-form cgroup match must be refused as foreign (fail-closed), got: {err:?}"
+            "a body/jump uid disagreement must be refused as foreign, got: {err:?}"
         );
-        // The pristine (real-path, sealed) inventory still parses: the fix rejects
-        // ONLY the numeric-form dodge, never the legitimate per-agent binding.
-        parse_owned_table_identity(&owned_agent_json(&marker, true, true))
-            .expect("the correct per-agent binding must still parse");
     }
 
     #[test]
-    fn deny_all_safety_net_recognizer_accepts_only_the_bare_drop_net() {
-        // The exact shape `install_deny_all_safety_net_impl` produces: one unmarked
-        // inet/sanctuary-castle table + one base output chain, policy DROP, nothing
-        // else. This is the GF1.1 create-failure recovery recognizer.
+    fn owned_inventory_refuses_a_non_integer_or_out_of_range_skuid_expression() {
+        // A name form (a newer nft rendering `skuid` through the uid symbol
+        // table) and a past-u32 value both read as foreign rather than being
+        // resolved or truncated. Fail-closed: readiness withdraws and the GF1
+        // deny-all net re-arms, rather than the parser guessing.
+        let marker = fixture_marker();
+        let pristine = owned_agent_json(&marker, true, true);
+        let named = pristine.replace(
+            &format!(r#""right":{FIXTURE_AGENT_UID}"#),
+            r#""right":"sanctuary-agent""#,
+        );
+        assert!(named.contains(r#""right":"sanctuary-agent""#));
+        assert!(parse_owned_table_identity(&named, &fixture_expectation()).is_err());
+
+        let huge = pristine.replace(
+            &format!(r#""right":{FIXTURE_AGENT_UID}"#),
+            r#""right":4294967296"#,
+        );
+        assert!(parse_owned_table_identity(&huge, &fixture_expectation()).is_err());
+    }
+
+    #[test]
+    fn owned_inventory_carries_no_numeric_form_cgroup_refusal() {
+        // The numeric-form refusal existed ONLY because a destroyed cgroup and a
+        // hostile in-place rewrite displayed identically, and a bare integer was
+        // ambiguous. With a uid match an integer IS the shape, so that refusal is
+        // deleted; this test pins its ABSENCE so it is not reintroduced as
+        // cargo-culted defence that would refuse every legitimate binding.
+        let marker = fixture_marker();
+        let numeric_uid_binding = owned_agent_json_with_uid(&marker, true, true, 12345);
+        parse_owned_table_identity(
+            &numeric_uid_binding,
+            &ExpectedAgentBinding::Confined {
+                fortress_id: FIXTURE_FORTRESS.to_string(),
+                agent_uid: 12345,
+            },
+        )
+        .expect("an all-digit skuid value is the NORMAL owned shape, never a refusal trigger");
+    }
+
+    /// The overflow uid the recogniser and scope tests validate against. A real
+    /// default, so the fixtures read like a host rather than like a number picked
+    /// to pass.
+    const TEST_HOST_OVERFLOW_UID: u32 = 65534;
+
+    fn test_overflow() -> HostOverflowUid {
+        HostOverflowUid::from_value(TEST_HOST_OVERFLOW_UID)
+    }
+
+    /// Build a `SafetyNetScope::Identity` through the only admitted path.
+    fn identity_scope(uids: &[u32]) -> SafetyNetScope {
+        let validated = uids
+            .iter()
+            .map(|&uid| {
+                validate_safety_net_uid(uid, test_overflow()).expect("fixture uid is attestable")
+            })
+            .collect::<Vec<_>>();
+        SafetyNetScope::Identity(
+            ConfinedUidSet::from_validated(validated).expect("fixture set is non-empty"),
+        )
+    }
+
+    /// The v1 host-wide listing: one unmarked table, one `policy drop` base
+    /// chain, zero rules.
+    fn v1_host_wide_listing() -> String {
+        r#"{"nftables":[
+            {"metainfo":{"version":"1.0.9","json_schema_version":1}},
+            {"table":{"family":"inet","name":"sanctuary-castle","handle":7}},
+            {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}
+        ]}"#
+        .to_string()
+    }
+
+    /// The v2 identity listing, with each rule's set independently specifiable so
+    /// the unequal-set case can be constructed.
+    fn v2_identity_listing(denied: &[u32], excepted: &[u32]) -> String {
+        let set = |uids: &[u32]| {
+            uids.iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let nd_types = KERNEL_ND_ICMPV6_TYPES
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"nftables":[
+            {{"metainfo":{{"version":"1.0.9","json_schema_version":1}}}},
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{{"set":[{denied_set}]}}}}}},
+                      {{"drop":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":12,
+              "comment":"{nd}",
+              "expr":[{{"match":{{"op":"==","left":{{"payload":{{"protocol":"icmpv6","field":"type"}}}},"right":{{"set":[{nd_types}]}}}}}},
+                      {{"accept":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":13,
+              "comment":"{others}",
+              "expr":[{{"match":{{"op":"!=","left":{{"meta":{{"key":"skuid"}}}},"right":{{"set":[{excepted_set}]}}}}}},
+                      {{"accept":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            nd = NET_RULE_COMMENT_KERNEL_ND,
+            others = NET_RULE_COMMENT_OTHERS,
+            denied_set = set(denied),
+            excepted_set = set(excepted),
+        )
+    }
+
+    /// The v2 identity listing in the shape real nft renders it for exactly
+    /// ONE denied/excepted uid: a bare scalar `right`, no `{"set": [..]}`
+    /// wrapper at all (see `skuid_right_members`'s doc). `v2_identity_listing`
+    /// above always emits the array form even for one member, which is the
+    /// synthetic shape a fixture composer would reach for and NOT the shape a
+    /// single-uid net is actually listed as; this sibling exists so the
+    /// recogniser is tested against the real collapse, not just the
+    /// convenient one.
+    fn v2_identity_listing_single_uid_scalar(denied: &str, excepted: &str) -> String {
+        let nd_types = KERNEL_ND_ICMPV6_TYPES
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"nftables":[
+            {{"metainfo":{{"version":"1.0.9","json_schema_version":1}}}},
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{denied}}}}},
+                      {{"drop":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":12,
+              "comment":"{nd}",
+              "expr":[{{"match":{{"op":"==","left":{{"payload":{{"protocol":"icmpv6","field":"type"}}}},"right":{{"set":[{nd_types}]}}}}}},
+                      {{"accept":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":13,
+              "comment":"{others}",
+              "expr":[{{"match":{{"op":"!=","left":{{"meta":{{"key":"skuid"}}}},"right":{excepted}}}}},
+                      {{"accept":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            nd = NET_RULE_COMMENT_KERNEL_ND,
+            others = NET_RULE_COMMENT_OTHERS,
+        )
+    }
+
+    /// ITEM 16: the emission floor KEEPS its below-ceiling refusal.
+    ///
+    /// The three unattestable-uid refusals were added ALONGSIDE this floor, not in place
+    /// of it: the ceiling proves a uid is outside the system-daemon band, and the three
+    /// refusals prove a uid names one attestable principal. A uid must clear both before
+    /// it is sealed into a kernel rule, and this test is what keeps the ceiling half from
+    /// being dropped as redundant.
+    ///
+    /// The emission floor itself is Linux-only, so this asserts the invariant at the
+    /// source: the ceiling comparison is present and the three-refusal call does not
+    /// replace it.
+    #[test]
+    fn the_emission_floor_keeps_its_below_ceiling_refusal() {
+        let whole = include_str!("nftables.rs");
+        let start = whole
+            .find("fn validate_agent_binding_input(")
+            .expect("the emission floor is in this file");
+        let end = whole[start..]
+            .find("\n    pub fn load_agent_ruleset_impl(")
+            .map(|o| start + o)
+            .expect("the floor ends before the ruleset loader");
+        let region = &whole[start..end];
+        assert!(
+            region.contains("binding.agent_uid < binding.system_uid_allow_ceiling"),
+            "the below-ceiling refusal must stay at the emission site"
+        );
+        assert!(
+            region.contains("binding.agent_uid < 1"),
+            "the root refusal must stay at the emission site"
+        );
+        // And the three refusals are applied IN ADDITION, after the ceiling check.
+        let ceiling_at = region
+            .find("binding.agent_uid < binding.system_uid_allow_ceiling")
+            .expect("ceiling check");
+        let validator_at = region
+            .find("validate_safety_net_uid(binding.agent_uid")
+            .expect("the three-refusal call is present");
+        assert!(
+            ceiling_at < validator_at,
+            "the ceiling floor runs first and is never replaced by the three refusals"
+        );
+    }
+
+    #[test]
+    fn identity_scope_transaction_text_has_the_three_rules_in_order() {
+        let script = build_deny_all_safety_net_script(&identity_scope(&[60124, 60123]));
+        let rule_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| line.starts_with("add rule "))
+            .collect();
+        assert_eq!(
+            rule_lines.len(),
+            NET_V2_RULE_COUNT,
+            "the identity net is exactly three rules: {script}"
+        );
+        // ORDER is the invariant: drop the confined identity FIRST, then the
+        // kernel's own neighbour discovery, then every other principal.
+        assert!(
+            rule_lines[0].contains("meta skuid { 60123, 60124 } drop")
+                && rule_lines[0].contains(NET_RULE_COMMENT_IDENTITY),
+            "rule 1: {}",
+            rule_lines[0]
+        );
+        assert!(
+            rule_lines[1].contains(
+                "icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept"
+            ) && rule_lines[1].contains(NET_RULE_COMMENT_KERNEL_ND),
+            "rule 2: {}",
+            rule_lines[1]
+        );
+        assert!(
+            rule_lines[2].contains("meta skuid != { 60123, 60124 } accept")
+                && rule_lines[2].contains(NET_RULE_COMMENT_OTHERS),
+            "rule 3: {}",
+            rule_lines[2]
+        );
+        // MLD is not in the carve-out; an accepted MLD report would be a
+        // link-local channel an unprivileged multicast join can drive.
+        assert!(
+            !script.contains("mld"),
+            "MLD must not be accepted: {script}"
+        );
+        // Still one transaction with the add-delete-add fresh table and the drop
+        // policy, so no fail-open window exists between teardown and enforcement.
+        assert!(script.contains("policy drop"));
+        assert!(script.contains("delete table inet sanctuary-castle"));
+    }
+
+    #[test]
+    fn host_wide_scope_transaction_text_has_no_rules() {
+        let script = build_deny_all_safety_net_script(&SafetyNetScope::HostWide);
+        assert!(
+            !script.contains("add rule "),
+            "the host-wide shape is the bare drop policy: {script}"
+        );
+        assert!(script.contains("policy drop"));
+        assert_eq!(SafetyNetScope::HostWide.denied_uids(), Vec::<u32>::new());
+        assert_eq!(SafetyNetScope::HostWide.shape_tag(), "v1-host-wide");
+        assert_eq!(identity_scope(&[60123]).shape_tag(), "v2-confined-identity");
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_accepts_both_permanent_shapes() {
+        let v1 = v1_host_wide_listing();
+        assert!(is_deny_all_safety_net_json(&v1, test_overflow()));
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        assert!(is_deny_all_safety_net_json(&v2, test_overflow()));
+        // Set member order in the listing must not decide recognition.
+        let reordered_members = v2_identity_listing(&[60124, 60123], &[60123, 60124]);
+        assert!(is_deny_all_safety_net_json(
+            &reordered_members,
+            test_overflow()
+        ));
+    }
+
+    /// The confirmed defect's recogniser-side twin: a live table whose ONE
+    /// denied uid nft rendered as a bare scalar (the real collapse, not the
+    /// convenient array `v2_identity_listing` composes) must still be
+    /// recognised as this daemon's OWN deny-all safety net, and
+    /// `net_rule_one_uids`/`live_table_uid_bindings` must agree with the
+    /// recogniser on the uid it denies. Before `rule_skuid_set_with_verdict`
+    /// shared `skuid_right_members` with `net_rule_one_uids`, this scalar
+    /// shape refused recognition entirely (`is_deny_all_safety_net_json`
+    /// false), which would have let a restart re-arm a net that dropped the
+    /// live kernel's already-installed single-uid deny rule.
+    #[test]
+    fn deny_all_safety_net_recognizer_accepts_a_single_denied_uid_scalar_net() {
+        let ov = test_overflow();
+        let json = v2_identity_listing_single_uid_scalar("60123", "60123");
+        assert!(
+            is_deny_all_safety_net_json(&json, ov),
+            "a single-uid net in nft's real scalar form must be recognised: {json}"
+        );
+        assert_eq!(
+            net_rule_one_uids(&json),
+            vec![60123],
+            "the live-binding reader must agree with the recogniser on the same JSON"
+        );
+        assert_eq!(
+            live_table_uid_bindings(&json, &fixture_expectation(), ov),
+            LiveTableBindings::Bindings(vec![60123])
+        );
+    }
+
+    /// The recogniser must still REJECT a scalar-shaped look-alike whose rule 1
+    /// and rule 3 name different uids: accepting it would let rule 3 accept a
+    /// uid that rule 1 never actually drops (the ordering-invariant this
+    /// module documents at `net_v2_rules_match`), and the scalar form must not
+    /// get a laxer equality check than the array form already enforces.
+    #[test]
+    fn deny_all_safety_net_recognizer_rejects_a_single_uid_scalar_mismatch() {
+        let ov = test_overflow();
+        let mismatched = v2_identity_listing_single_uid_scalar("60123", "60124");
+        assert!(
+            !is_deny_all_safety_net_json(&mismatched, ov),
+            "rule 1 and rule 3 naming different uids must never be recognised as the net"
+        );
+    }
+
+    /// And a scalar `right` that is not a valid attestable uid at all (root,
+    /// the host overflow uid, or a value past `u32`) must be refused exactly
+    /// as the array form already is, since the shared extractor must not
+    /// bypass the three-refusal revalidation `rule_skuid_set_with_verdict`
+    /// applies to every member.
+    #[test]
+    fn deny_all_safety_net_recognizer_rejects_an_unattestable_scalar_uid() {
+        let ov = test_overflow();
+        let root = v2_identity_listing_single_uid_scalar("0", "0");
+        assert!(
+            !is_deny_all_safety_net_json(&root, ov),
+            "uid 0 must never be recognised as a live denied identity: {root}"
+        );
+        let past_u32 = v2_identity_listing_single_uid_scalar("4294967296", "4294967296");
+        assert!(
+            !is_deny_all_safety_net_json(&past_u32, ov),
+            "a value past u32 must never be recognised: {past_u32}"
+        );
+        // The host overflow uid is the one of the three refusals that depends
+        // on the injected `overflow` argument actually reaching
+        // `validate_safety_net_uid` through the new shared extractor, rather
+        // than on a constant this test would pass even if `overflow` were
+        // silently dropped on the scalar path.
+        let overflow_uid = TEST_HOST_OVERFLOW_UID.to_string();
+        let overflow_net = v2_identity_listing_single_uid_scalar(&overflow_uid, &overflow_uid);
+        assert!(
+            !is_deny_all_safety_net_json(&overflow_net, ov),
+            "the host's own overflow uid must never be recognised: {overflow_net}"
+        );
+    }
+
+    #[test]
+    fn strict_live_net_coverage_matches_the_attempted_scope() {
+        let ov = test_overflow();
+        let host = SafetyNetScope::HostWide;
+        let narrow = identity_scope(&[60123]);
+        let wide = identity_scope(&[60123, 60124]);
+        let v1 = v1_host_wide_listing();
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        assert!(deny_all_net_covers_scope_json(&v1, ov, &host));
+        assert!(deny_all_net_covers_scope_json(&v1, ov, &wide));
+        assert!(deny_all_net_covers_scope_json(&v2, ov, &narrow));
+        assert!(deny_all_net_covers_scope_json(&v2, ov, &wide));
+        assert!(!deny_all_net_covers_scope_json(&v2, ov, &host));
+        assert!(!deny_all_net_covers_scope_json(
+            &v2_identity_listing(&[60123], &[60123]),
+            ov,
+            &wide
+        ));
+        assert!(!deny_all_net_covers_scope_json(
+            &v1.replace("\"policy\":\"drop\"", "\"policy\":\"accept\""),
+            ov,
+            &host
+        ));
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_refuses_every_near_miss() {
+        let v1 = v1_host_wide_listing();
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        let ov = test_overflow();
+
+        // A `policy accept` base (the owned shape) is NOT the net, in either shape.
+        assert!(!is_deny_all_safety_net_json(
+            &v1.replace("\"drop\"", "\"accept\""),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace("\"policy\":\"drop\"", "\"policy\":\"accept\""),
+            ov
+        ));
+        // A table carrying an owner marker is a captured owned table.
+        let owner_marked = v1.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"sanctuary-castle-owner:v1:deadbeef\"",
+        );
+        assert!(!is_deny_all_safety_net_json(&owner_marked, ov));
+        // Neither net shape stamps a table comment, so a zero-rule `policy drop`
+        // table carrying any table comment is not the net; the disarm recovery
+        // arm relies on this refusal (PR-2's matrix case (h) names this fixture).
+        let foreign_comment = v1.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"someone-elses-drop-table\"",
+        );
+        assert!(!is_deny_all_safety_net_json(&foreign_comment, ov));
+        let v2_foreign_comment = v2.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"someone-elses-drop-table\"",
+        );
+        assert!(!is_deny_all_safety_net_json(&v2_foreign_comment, ov));
+
+        // A REORDERED v2 is a different enforcement outcome (an accept ahead of the
+        // drop lets the agent out), so recognition is positional and a swap must be
+        // refused rather than normalised. Swapping the two skuid rules' comments
+        // puts the `!=` accept in position 1 and the `==` drop in position 3.
+        let swapped = v2
+            .replace(NET_RULE_COMMENT_IDENTITY, "@@RULE1@@")
+            .replace(NET_RULE_COMMENT_OTHERS, NET_RULE_COMMENT_IDENTITY)
+            .replace("@@RULE1@@", NET_RULE_COMMENT_OTHERS);
+        assert!(!is_deny_all_safety_net_json(&swapped, ov));
+
+        // The ND accept rule MISSING (two rules) is not the three-rule shape.
+        let nd_removed: String = v2
+            .lines()
+            .filter(|line| !line.contains(NET_RULE_COMMENT_KERNEL_ND))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_deny_all_safety_net_json(&nd_removed, ov));
+
+        // UNEQUAL sets: rule 3 excepting a uid rule 1 never dropped is the
+        // fail-open the ordering exists to prevent.
+        assert!(!is_deny_all_safety_net_json(
+            &v2_identity_listing(&[60123, 60124], &[60123]),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json(
+            &v2_identity_listing(&[60123], &[60123, 60124]),
+            ov
+        ));
+
+        // A FOURTH rule is drift or injection, even a bare accept.
+        let with_extra = v2.replace(
+            "\n        ]}",
+            ",{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\
+             \"handle\":14,\"expr\":[{\"accept\":null}]}}\n        ]}",
+        );
+        assert_ne!(
+            with_extra, v2,
+            "the fourth-rule fixture must actually differ"
+        );
+        assert!(!is_deny_all_safety_net_json(&with_extra, ov));
+
+        // A DIFFERENT rule comment on any of the three.
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                NET_RULE_COMMENT_IDENTITY,
+                "sanctuary-castle-net:v2:something-else"
+            ),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                NET_RULE_COMMENT_KERNEL_ND,
+                "sanctuary-castle-net:v2:something-else"
+            ),
+            ov
+        ));
+
+        // An extra ICMPv6 type in the carve-out (an MLD report) is a channel the
+        // agent may drive, so rule 2 is checked for EQUALITY, never containment.
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                "\"nd-router-solicit\"",
+                "\"nd-router-solicit\",\"mld-listener-report\""
+            ),
+            ov
+        ));
+
+        // A wrong family/name table is not ours, and malformed input is not the net.
+        assert!(!is_deny_all_safety_net_json(
+            &v1.replace("sanctuary-castle", "sanctuary-castle-test-x"),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json("not json", ov));
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_refuses_sets_the_installer_could_not_have_armed() {
+        // The closed installer type cannot place 0, this host's kernel.overflowuid
+        // or the invalid sentinel in rule 1, so a well-formed three-rule table
+        // carrying one of them was armed by something other than this daemon and
+        // must not be recognised (the disarm recovery arm would otherwise delete
+        // it as ours).
+        let ov = test_overflow();
+        for refused in [0u32, TEST_HOST_OVERFLOW_UID, u32::MAX] {
+            let listing = v2_identity_listing(&[refused, 60123], &[refused, 60123]);
+            assert!(
+                !is_deny_all_safety_net_json(&listing, ov),
+                "a set carrying {refused} must not be recognised as this daemon's net"
+            );
+        }
+        // A mapped high uid IS attestable and stays recognised.
+        assert!(is_deny_all_safety_net_json(
+            &v2_identity_listing(&[65535, 100_000], &[65535, 100_000]),
+            ov
+        ));
+    }
+
+    #[test]
+    fn castle_table_comment_absence_check_is_independent_of_the_recognizer() {
         let net = r#"{"nftables":[
             {"metainfo":{"version":"1.0.9","json_schema_version":1}},
             {"table":{"family":"inet","name":"sanctuary-castle","handle":7}},
             {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
               "type":"filter","hook":"output","prio":0,"policy":"drop"}}
         ]}"#;
-        assert!(is_deny_all_safety_net_json(net));
+        // No comment key at all: absent, as [`is_deny_all_safety_net_json`]
+        // also independently requires for this shape.
+        assert!(castle_table_comment_is_absent(net));
 
-        // A `policy accept` base (the owned shape) is NOT the deny-all net.
-        assert!(!is_deny_all_safety_net_json(
-            &net.replace("\"drop\"", "\"accept\"")
-        ));
-        // A table carrying an owner marker is a captured owned table, not the net.
-        let marked = net.replace(
+        // A comment key with ANY content (owner-prefixed or not) is present,
+        // regardless of what the recognizer's own owner-marker check answers.
+        let owner_commented = net.replace(
             "\"name\":\"sanctuary-castle\",\"handle\":7",
             "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"sanctuary-castle-owner:v1:deadbeef\"",
         );
-        assert!(!is_deny_all_safety_net_json(&marked));
-        // Any extra rule means it is not the BARE net.
-        let with_rule = net.replace(
-            "\"policy\":\"drop\"}}",
-            "\"policy\":\"drop\"}},{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\"handle\":9,\"expr\":[{\"accept\":null}]}}",
+        assert!(!castle_table_comment_is_absent(&owner_commented));
+        let other_commented = net.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"unrelated text\"",
         );
-        assert!(!is_deny_all_safety_net_json(&with_rule));
-        // A wrong family/name table is not ours.
-        assert!(!is_deny_all_safety_net_json(
+        assert!(!castle_table_comment_is_absent(&other_commented));
+
+        // A missing matching table object, or unparseable JSON, cannot
+        // positively prove absence: fail closed (`false`), never `true`.
+        assert!(!castle_table_comment_is_absent(
             &net.replace("sanctuary-castle", "sanctuary-castle-test-x")
         ));
-        assert!(!is_deny_all_safety_net_json("not json"));
+        assert!(!castle_table_comment_is_absent("not json"));
+    }
+
+    // Off-Linux reachability anchor for `live_castle_table_json`'s stub, the
+    // same shape `disarm_is_not_available_off_linux` (runtime_providers.rs)
+    // proves for the disarm entry point: there is no nft runtime to read off
+    // Linux, so the crate-private inventory fetch reports
+    // `NotAvailableOnPlatform` rather than pretending to have read anything.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn live_castle_table_json_is_not_available_off_linux() {
+        assert!(matches!(
+            live_castle_table_json(),
+            Err(NftablesError::NotAvailableOnPlatform)
+        ));
     }
 
     #[test]
     fn owned_identity_refuses_partial_agent_inventory_after_interrupted_mutation() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, true)).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, true, false)).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, false)).is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, true),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, true, false),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, false),
+            &fixture_expectation()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2826,7 +6275,7 @@ mod tests {
         // binding with a match-all queue. Comment-only verification would
         // falsely accept this as the owned runtime.
         body["expr"] = serde_json::json!([{ "queue": { "num": 0 } }]);
-        assert!(parse_owned_table_identity(&document.to_string()).is_err());
+        assert!(parse_owned_table_identity(&document.to_string(), &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2839,7 +6288,7 @@ mod tests {
                 "handle":1,"type":"filter","hook":"output","prio":0,"policy":"accept"}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&missing_table_handle).is_err());
+        assert!(parse_owned_table_identity(&missing_table_handle, &fixture_expectation()).is_err());
 
         let missing_chain_handle = format!(
             r#"{{"nftables":[
@@ -2849,7 +6298,7 @@ mod tests {
                 "type":"filter","hook":"output","prio":0,"policy":"accept"}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&missing_chain_handle).is_err());
+        assert!(parse_owned_table_identity(&missing_chain_handle, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2866,7 +6315,7 @@ mod tests {
                 "expr":[{{"accept":null}}]}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2882,7 +6331,7 @@ mod tests {
               {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"extra","handle":3}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2896,7 +6345,7 @@ mod tests {
               {{"set":{{"family":"inet","table":"sanctuary-castle","name":"s","handle":4}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2908,7 +6357,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("metainfo".to_string(), serde_json::json!({}));
-        assert!(parse_owned_table_identity(&document.to_string()).is_err());
+        assert!(parse_owned_table_identity(&document.to_string(), &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2919,14 +6368,14 @@ mod tests {
           {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
             "type":"filter","hook":"output","prio":0,"policy":"accept"}}
         ]}"#;
-        assert!(parse_owned_table_identity(no_comment).is_err());
+        assert!(parse_owned_table_identity(no_comment, &fixture_expectation()).is_err());
         // A comment that is not our marker prefix -> foreign.
         let foreign_comment = r#"{"nftables":[
           {"table":{"family":"inet","name":"sanctuary-castle","handle":2,"comment":"someone else"}},
           {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
             "type":"filter","hook":"output","prio":0,"policy":"accept"}}
         ]}"#;
-        assert!(parse_owned_table_identity(foreign_comment).is_err());
+        assert!(parse_owned_table_identity(foreign_comment, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2936,8 +6385,10 @@ mod tests {
         // verify against the captured tuple (handle-bound) refuses it. This is
         // what makes "same-shape replacement withdraws readiness" hold.
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let first = parse_owned_table_identity(&owned_json(2, 1, &marker)).unwrap();
-        let recreated = parse_owned_table_identity(&owned_json(7, 5, &marker)).unwrap();
+        let first =
+            parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation()).unwrap();
+        let recreated =
+            parse_owned_table_identity(&owned_json(7, 5, &marker), &fixture_expectation()).unwrap();
         assert_ne!(
             first, recreated,
             "a same-shape recreate must not compare equal to the captured identity"
@@ -2946,9 +6397,9 @@ mod tests {
 
     #[test]
     fn owned_identity_refuses_unparseable_or_empty() {
-        assert!(parse_owned_table_identity("").is_err());
-        assert!(parse_owned_table_identity("{}").is_err());
-        assert!(parse_owned_table_identity(r#"{"nftables":[]}"#).is_err());
+        assert!(parse_owned_table_identity("", &fixture_expectation()).is_err());
+        assert!(parse_owned_table_identity("{}", &fixture_expectation()).is_err());
+        assert!(parse_owned_table_identity(r#"{"nftables":[]}"#, &fixture_expectation()).is_err());
     }
 
     fn make_rule(
@@ -3004,58 +6455,57 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_ruleset_includes_cgroup_queue() {
+    fn build_agent_ruleset_queues_only_the_agent_uid() {
         let frags = vec![NftRuleFragment {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset(
-            "test-agent",
-            "system.slice/sanctuary-agent-test.service",
-            2,
-            &frags,
-        );
+        let script = build_agent_ruleset("test-agent", 4242, &frags);
         assert!(script.contains("flush chain"));
         assert!(!script.contains("tcp dport 443 accept"));
+        assert!(script.contains("meta skuid 4242"));
         assert!(script.contains("queue num 0"));
         assert!(script.contains("meta mark set"));
-        // Path is quoted, comes after the level, no leading slash. Level 2
-        // is the canonical depth for `/system.slice/<unit>`; nested
-        // deployments pass higher values, hence the rule encoding the level.
-        assert!(
-            script.contains("level 2 \"system.slice/sanctuary-agent-test.service\""),
-            "rule must emit quoted cgroup-relative path after level: {script}"
-        );
+        // No `bypass` flag: an unbound or unreachable NFQUEUE must drop, never
+        // release. This is the property the live guarantee actually rests on.
+        assert!(!script.contains("bypass"));
+        // The retired cgroup match must not reappear anywhere in the emission.
+        assert!(!script.contains("cgroupv2"));
+        assert!(!script.contains("level "));
     }
 
     #[test]
-    fn build_agent_ruleset_threads_dynamic_level() {
-        // In nested environments (CI runners, Docker-in-Docker) the agent's
-        // cgroup may be at depth 3 or 4; the rule must reflect that or nft
-        // rejects with "cgroupv2 path fails" at load time.
-        let frags = vec![NftRuleFragment {
-            rule_id: "r1".to_string(),
-            nft_expr: "tcp dport 443 accept".to_string(),
-        }];
-        let script = build_agent_ruleset(
-            "nested",
-            "system.slice/parent.service/sanctuary-agent-nested.service",
-            3,
-            &frags,
+    fn build_agent_ruleset_emits_a_bare_integer_uid_never_an_account_name() {
+        // The parser accepts only a bare integer (see
+        // `parse_skuid_value_accepts_only_a_bare_integer_uid`). Emitting a name
+        // here would produce a rule this daemon's own verifier reads as foreign,
+        // so the emitter and the parser are pinned to the same form from both
+        // sides. Failure mode if this regresses: the wall installs, then the very
+        // first health poll declares it foreign and re-arms deny-all.
+        let script = build_agent_ruleset("regression", 60123, &[]);
+        let skuid_lines: Vec<&str> = script.lines().filter(|l| l.contains("skuid")).collect();
+        assert_eq!(
+            skuid_lines.len(),
+            1,
+            "exactly one skuid rule expected: {script}"
         );
-        assert!(script
-            .contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""));
-        assert!(!script.contains("level 2"));
+        let after = skuid_lines[0]
+            .split("meta skuid ")
+            .nth(1)
+            .expect("expected 'meta skuid ' marker");
+        assert!(
+            after.starts_with("60123 "),
+            "uid must be emitted as a bare decimal integer, got: {after}"
+        );
+        assert!(
+            !after.starts_with('"'),
+            "a quoted/name form is never emitted"
+        );
     }
 
     #[test]
     fn build_agent_ruleset_registers_mark_for_nfqueue_attribution() {
-        let script = build_agent_ruleset(
-            "attributed-agent",
-            "system.slice/sanctuary-agent-attributed-agent.service",
-            2,
-            &[],
-        );
+        let script = build_agent_ruleset("attributed-agent", 4242, &[]);
         let mark = crate::nfqueue::agent_mark("attributed-agent");
         assert!(
             script.contains(&format!("meta mark set 0x{mark:08x} queue num 0")),
@@ -3064,42 +6514,6 @@ mod tests {
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
             Some("attributed-agent".to_string())
-        );
-    }
-
-    #[test]
-    fn build_agent_ruleset_emits_quoted_path_not_inode_integer() {
-        // Regression guard: earlier production code emitted the post-resolution
-        // inode integer where nft expects a quoted cgroup-relative path string.
-        // nft 1.x rejects integer input at rule-load time. This test pins the
-        // emission to the documented input form.
-        let frags = vec![NftRuleFragment {
-            rule_id: "r1".to_string(),
-            nft_expr: "tcp dport 443 accept".to_string(),
-        }];
-        let script = build_agent_ruleset(
-            "regression",
-            "system.slice/sanctuary-agent-regression.service",
-            2,
-            &frags,
-        );
-        // Path must be quoted.
-        assert!(
-            script.contains("\"system.slice/sanctuary-agent-regression.service\""),
-            "cgroup path must be quoted: {script}"
-        );
-        // Must not emit a bare integer where the path goes (i.e. no
-        // `level 2 <digit>` pattern without a quote).
-        let lines: Vec<&str> = script.lines().filter(|l| l.contains("cgroupv2")).collect();
-        assert_eq!(lines.len(), 1, "exactly one cgroupv2 rule expected");
-        let cgroupv2_line = lines[0];
-        let post_level = cgroupv2_line
-            .split("level 2 ")
-            .nth(1)
-            .expect("expected 'level 2 ' marker");
-        assert!(
-            post_level.starts_with('"'),
-            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
         );
     }
 
@@ -3220,60 +6634,24 @@ mod tests {
 
     #[test]
     fn build_agent_jump_rule_emits_canonical_shape() {
-        // Pin the exact rule string for the canonical case: depth-2 cgroup
-        // under system.slice, single-segment agent id. This is what the
-        // base output chain needs to route packets from the agent's cgroup
-        // into the per-agent chain.
-        let rule = build_agent_jump_rule("alpha", 2, "system.slice/sanctuary-agent-alpha.service");
+        // Pin the exact rule string. This is what the base output chain needs to
+        // route the agent's uid-owned packets into the per-agent chain.
+        let rule = build_agent_jump_rule("alpha", 4242);
         assert_eq!(
             rule,
-            "add rule inet sanctuary-castle output \
-             socket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" \
-             goto agent_alpha"
+            "add rule inet sanctuary-castle output meta skuid 4242 goto agent_alpha"
         );
     }
 
     #[test]
-    fn build_agent_jump_rule_quotes_cgroup_path() {
-        // Defense against the integer-bug recurrence pattern PR #130 fixed
-        // for build_agent_ruleset: nft 1.x rejects unquoted path strings
-        // and unquoted integer-only inputs at rule-load time. The jump
-        // rule must always emit a quoted path.
-        let rule = build_agent_jump_rule(
-            "regression",
-            2,
-            "system.slice/sanctuary-agent-regression.service",
-        );
-        assert!(
-            rule.contains("\"system.slice/sanctuary-agent-regression.service\""),
-            "cgroup path must be quoted: {rule}"
-        );
-        // No bare integer where the path goes.
-        let post_level = rule
-            .split("level 2 ")
-            .nth(1)
-            .expect("expected 'level 2 ' marker");
-        assert!(
-            post_level.starts_with('"'),
-            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
-        );
-    }
-
-    #[test]
-    fn build_agent_jump_rule_threads_dynamic_level() {
-        // Mirror the build_agent_ruleset dynamic-depth shape: nested
-        // deployments place the agent's cgroup deeper than depth 2, and
-        // the jump rule must reflect the actual depth or nft rejects with
-        // "cgroupv2 path fails".
-        let rule = build_agent_jump_rule(
-            "nested",
-            3,
-            "system.slice/parent.service/sanctuary-agent-nested.service",
-        );
-        assert!(
-            rule.contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\"")
-        );
-        assert!(!rule.contains("level 2"));
+    fn build_agent_jump_rule_uses_goto_not_jump() {
+        // INVARIANT: `goto` is terminating; `jump` returns to the accept-policy
+        // base chain and would silently undo the per-agent verdict. The parse
+        // side pins the same verb (`validate_owned_jump_expr`), so a regression
+        // on either side is caught by the other.
+        let rule = build_agent_jump_rule("alpha", 4242);
+        assert!(rule.contains(" goto agent_alpha"));
+        assert!(!rule.contains(" jump "));
     }
 
     #[test]
@@ -3282,7 +6660,7 @@ mod tests {
         // the per-agent chain created by load_agent_ruleset_impl is the
         // chain reached by this jump.
         for agent_id in &["alpha", "my-agent", "team_a.svc1", "weird/id"] {
-            let rule = build_agent_jump_rule(agent_id, 2, "system.slice/x.service");
+            let rule = build_agent_jump_rule(agent_id, 4242);
             let chain = agent_chain_name(agent_id);
             assert!(
                 rule.ends_with(&format!("goto {chain}")),
@@ -3290,6 +6668,18 @@ mod tests {
                  agent={agent_id} chain={chain} rule={rule}"
             );
         }
+    }
+
+    #[test]
+    fn body_and_jump_emit_the_same_uid_the_parser_requires_them_to_agree_on() {
+        // Cross-emitter agreement, pinned at the source: `parse_owned_table_inventory`
+        // refuses a body and jump that disagree on the uid, so the two emitters
+        // must derive their match from the same value. A drift here would install
+        // a wall that fails its own next health poll.
+        let body = build_agent_ruleset("agreed", 4242, &[]);
+        let jump = build_agent_jump_rule("agreed", 4242);
+        assert!(body.contains("meta skuid 4242"));
+        assert!(jump.contains("meta skuid 4242"));
     }
 
     #[test]
@@ -3311,12 +6701,17 @@ mod tests {
         // Synthetic `nft -a list chain` output with three rules: one
         // jumping to our chain, one jumping to a different chain, one
         // doing something else entirely.
+        //
+        // The jump lines carry the PRODUCTION `meta skuid <uid>` match this
+        // emitter now builds (`build_agent_jump_rule`); a fixture still depicting
+        // the retired `socket cgroupv2` match would keep testing the parser
+        // against a listing the kernel can no longer produce.
         let listing = "\
 table inet sanctuary-castle {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" goto agent_alpha # handle 5
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-beta.service\" goto agent_beta # handle 7
+\t\tmeta skuid 4242 goto agent_alpha # handle 5
+\t\tmeta skuid 4243 goto agent_beta # handle 7
 \t\tudp dport 53 accept # handle 9
 \t}
 }";
@@ -3336,8 +6731,8 @@ table inet sanctuary-castle {
         // substring match for `agent_foo` would wrongly hit the line
         // ending in `goto agent_foo_bar`.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"system.slice/foo.service\" goto agent_foo # handle 11
-\t\tsocket cgroupv2 level 2 \"system.slice/foo_bar.service\" goto agent_foo_bar # handle 13
+\t\tmeta skuid 4242 goto agent_foo # handle 11
+\t\tmeta skuid 4243 goto agent_foo_bar # handle 13
 ";
         let handles_foo = linux::parse_jump_rule_handles(listing, "agent_foo");
         assert_eq!(handles_foo, vec![11], "must not match agent_foo_bar");
@@ -3353,11 +6748,540 @@ table inet sanctuary-castle {
         // delete-then-add prevents going forward), the parser must surface
         // every handle so a remove call cleans them all out.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 21
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 22
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 23
+\t\tmeta skuid 4242 goto agent_dup # handle 21
+\t\tmeta skuid 4242 goto agent_dup # handle 22
+\t\tmeta skuid 4242 goto agent_dup # handle 23
 ";
         let handles = linux::parse_jump_rule_handles(listing, "agent_dup");
         assert_eq!(handles, vec![21, 22, 23]);
+    }
+}
+
+/// LINUX-NFT-PID-REUSE-KILL-01: every `nft` child is admitted into a bounded,
+/// per-origin slot table, killed only through a pidfd, and either proven
+/// finished within a bounded wait or held in its slot until it is joined.
+#[cfg(test)]
+mod child_slot_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A fake parked child: finishes when the test says so, counts its polls.
+    struct FakeChild {
+        finished: Rc<Cell<bool>>,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl ParkedChild for FakeChild {
+        fn poll_finished(&mut self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            self.finished.get()
+        }
+        fn reap(self) {}
+    }
+
+    impl<P: ParkedChild> ChildSlotTable<P> {
+        fn held_by(&self, origin: NftOrigin) -> usize {
+            self.in_flight.iter().filter(|(_, o)| *o == origin).count()
+                + self.parked.iter().filter(|(o, _)| *o == origin).count()
+        }
+    }
+
+    fn fake(polls: &Rc<Cell<usize>>) -> (FakeChild, Rc<Cell<bool>>) {
+        let finished = Rc::new(Cell::new(false));
+        (
+            FakeChild {
+                finished: Rc::clone(&finished),
+                polls: Rc::clone(polls),
+            },
+            finished,
+        )
+    }
+
+    fn check_bounds(table: &ChildSlotTable<FakeChild>) {
+        assert!(
+            table.held() <= NFT_CHILD_SLOTS_TOTAL,
+            "held {} over the cap",
+            table.held()
+        );
+        assert!(
+            table.held_by(NftOrigin::General) <= NFT_CHILD_SLOTS_GENERAL,
+            "General took the reserved slot"
+        );
+        assert!(
+            table.last_sweep_polls() <= NFT_CHILD_SLOTS_TOTAL,
+            "unbounded sweep work"
+        );
+    }
+
+    /// T10 (AGENTS rules 8 and 12): 10 x NFT_CHILD_SLOTS_TOTAL wedge episodes in
+    /// waves of admit, time-out, park, late completion, sweep and re-admit, driven
+    /// by explicit schedules with no processes and no sleeps.
+    #[test]
+    fn t10_slots_hold_their_cap_and_reserve_under_timeout_then_release_waves() {
+        let polls = Rc::new(Cell::new(0));
+        let mut table: ChildSlotTable<FakeChild> = ChildSlotTable::new();
+        let mut episodes = 0;
+        let mut pending: Vec<Rc<Cell<bool>>> = Vec::new();
+        while episodes < 10 * NFT_CHILD_SLOTS_TOTAL {
+            // A call that completes normally frees its slot at once.
+            let done = table
+                .admit(NftOrigin::General)
+                .expect("an empty table admits");
+            table.release(done);
+            assert_eq!(table.held(), 0, "a completed call holds nothing");
+            // Admit: general until refused, never past its pool.
+            let mut general = Vec::new();
+            loop {
+                match table.admit(NftOrigin::General) {
+                    Ok(id) => general.push(id),
+                    Err(NftablesError::ChildSlotsExhausted {
+                        origin: NftOrigin::General,
+                    }) => break,
+                    Err(other) => panic!("unexpected {other:?}"),
+                }
+                check_bounds(&table);
+            }
+            assert!(
+                table.held() >= NFT_CHILD_SLOTS_GENERAL,
+                "general refused only when full"
+            );
+            // While general is exhausted and the reserved slot is free, the net
+            // install still gets in.
+            let net = if table.held() < NFT_CHILD_SLOTS_TOTAL {
+                Some(
+                    table
+                        .admit(NftOrigin::SafetyNet)
+                        .expect("the reserved slot admits a net"),
+                )
+            } else {
+                None
+            };
+            check_bounds(&table);
+            assert!(table.admit(NftOrigin::General).is_err());
+            // Time out and park every in-flight call: the slots stay held.
+            for id in general.into_iter().chain(net) {
+                let (child, finished) = fake(&polls);
+                assert!(table.park(id, child).is_ok());
+                pending.push(finished);
+                episodes += 1;
+                check_bounds(&table);
+            }
+            assert_eq!(
+                table.held(),
+                NFT_CHILD_SLOTS_TOTAL,
+                "parking never frees a slot"
+            );
+            assert!(table.admit(NftOrigin::General).is_err());
+            assert!(table.admit(NftOrigin::SafetyNet).is_err());
+            check_bounds(&table);
+            // Late completion of half the wave; the next admission sweeps it.
+            let half = pending.len() / 2;
+            for finished in pending.drain(..half) {
+                finished.set(true);
+            }
+            table.sweep();
+            check_bounds(&table);
+            assert_eq!(
+                table.parked(),
+                pending.len(),
+                "the sweep frees exactly the finished"
+            );
+            // The rest complete before the next wave.
+            for finished in pending.drain(..) {
+                finished.set(true);
+            }
+        }
+        table.sweep();
+        assert_eq!(table.held(), 0, "every finished child was reclaimed");
+    }
+
+    /// T10: the stated bound, not a stronger one. Four held General calls plus
+    /// one parked SafetyNet child that never finishes refuse the next net
+    /// install, and General never takes the reserved slot.
+    #[test]
+    fn t10_a_parked_safety_net_child_refuses_the_next_net_install() {
+        let polls = Rc::new(Cell::new(0));
+        let mut table: ChildSlotTable<FakeChild> = ChildSlotTable::new();
+        for _ in 0..NFT_CHILD_SLOTS_GENERAL {
+            table.admit(NftOrigin::General).expect("general admitted");
+            check_bounds(&table);
+        }
+        assert!(matches!(
+            table.admit(NftOrigin::General),
+            Err(NftablesError::ChildSlotsExhausted {
+                origin: NftOrigin::General
+            })
+        ));
+        // General is exhausted and the reserved slot is free: the net gets in.
+        let net = table
+            .admit(NftOrigin::SafetyNet)
+            .expect("the reserved slot admits");
+        let (child, _never_finishes) = fake(&polls);
+        assert!(table.park(net, child).is_ok());
+        check_bounds(&table);
+        // Four General held plus one parked SafetyNet child that never finishes:
+        // the next net install is refused, as stated, and General stays refused.
+        assert!(matches!(
+            table.admit(NftOrigin::SafetyNet),
+            Err(NftablesError::ChildSlotsExhausted {
+                origin: NftOrigin::SafetyNet
+            })
+        ));
+        assert!(table.admit(NftOrigin::General).is_err());
+        assert_eq!(table.held_by(NftOrigin::General), NFT_CHILD_SLOTS_GENERAL);
+        check_bounds(&table);
+    }
+
+    /// T12 (LINUX-NFT-PID-REUSE-KILL-01): the nft site inventory. Every field is
+    /// parsed at the call site (kind from the callee token, origin from the
+    /// `NftOrigin::` first argument, mutating from the verb) and compared to
+    /// `NFT_INVOCATION_SITES` by multiset equality over the full tuple; there are
+    /// exactly two spawn paths and the bounded wait is reached only through them.
+    #[test]
+    fn t12_the_nft_invocation_inventory_matches_every_call_site() {
+        use crate::source_scan::{
+            enclosing_fn, fn_body, offsets_of, production_part, without_comment_lines,
+        };
+        let code = without_comment_lines(&production_part(include_str!("nftables.rs")));
+        let mut found: Vec<String> = Vec::new();
+        for (token, kind) in [
+            ("run_nft(", NftSiteKind::Argv),
+            ("run_nft_stdin(", NftSiteKind::Stdin),
+        ] {
+            for at in offsets_of(&code, token) {
+                let before = &code[..at];
+                if before.ends_with("fn ")
+                    || before
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let args = code[at + token.len()..].trim_start();
+                let origin = if args.starts_with("NftOrigin::General") {
+                    NftOrigin::General
+                } else if args.starts_with("NftOrigin::SafetyNet") {
+                    NftOrigin::SafetyNet
+                } else {
+                    panic!("a call site at {at} does not name its NftOrigin first");
+                };
+                let mutating = match kind {
+                    NftSiteKind::Stdin => true,
+                    NftSiteKind::Argv => {
+                        let open = args.find('"').expect("an argv site names its verb");
+                        let verb = &args[open + 1..];
+                        let verb = &verb[..verb.find('"').expect("closed literal")];
+                        match verb {
+                            "delete" => true,
+                            "-j" | "-a" | "list" => false,
+                            other => panic!(
+                                "unclassified nft argv verb {other:?}: classify it by hand \
+                                 in NFT_INVOCATION_SITES"
+                            ),
+                        }
+                    }
+                };
+                found.push(format!(
+                    "{:?}",
+                    (enclosing_fn(&code, at), kind, mutating, origin)
+                ));
+            }
+        }
+        let mut expected: Vec<String> = NFT_INVOCATION_SITES
+            .iter()
+            .map(|(f, kind, mutating, origin)| {
+                format!("{:?}", (f.to_string(), *kind, *mutating, *origin))
+            })
+            .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        let spawns: Vec<String> = offsets_of(&code, "Command::new(")
+            .into_iter()
+            .map(|at| enclosing_fn(&code, at))
+            .collect();
+        assert_eq!(
+            spawns,
+            vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
+        );
+        let callers_of = |callee: &str| -> Vec<String> {
+            offsets_of(&code, callee)
+                .into_iter()
+                .filter(|at| !code[..*at].ends_with("fn "))
+                .map(|at| enclosing_fn(&code, at))
+                .collect()
+        };
+        // The bounded wait is reached only from the two runners: `run_nft`
+        // through `wait_nft_bounded`, `run_nft_stdin` through the stdin feeder,
+        // whose write-failure path also ends in the bounded wait (kill-and-park).
+        assert_eq!(callers_of("wait_nft_bounded("), vec!["run_nft".to_string()]);
+        assert_eq!(
+            callers_of("feed_stdin_and_wait_with("),
+            vec!["run_nft_stdin".to_string()]
+        );
+        assert_eq!(
+            callers_of("wait_nft_bounded_with("),
+            vec![
+                "wait_nft_bounded".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+                "feed_stdin_and_wait_with".to_string(),
+            ]
+        );
+        for runner in ["run_nft", "run_nft_stdin"] {
+            assert!(fn_body(&code, runner).contains("admit_slot(&NFT_CHILD_SLOTS, origin)?"));
+        }
+    }
+
+    /// T11 (structural half): production code never signals a bare pid.
+    #[test]
+    fn t11_no_raw_pid_kill_in_nftables_production_code() {
+        let code = crate::source_scan::without_comment_lines(&crate::source_scan::production_part(
+            include_str!("nftables.rs"),
+        ));
+        assert!(
+            !code.contains("libc::kill("),
+            "an nft child is signalled only through its pidfd"
+        );
+    }
+
+    /// T13: the syscall numbers this crate relies on for the two architectures
+    /// it ships for, and the one derived worst-case figure.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn t13_pidfd_syscall_numbers_and_the_worst_case_are_pinned() {
+        assert_eq!(libc::SYS_pidfd_open, 434);
+        assert_eq!(libc::SYS_pidfd_send_signal, 424);
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            linux::NFT_COMMAND_TIMEOUT + linux::NFT_KILL_GRACE + linux::NFT_REAP_GRACE
+        );
+    }
+
+    /// TD2n (LINUX-SUPERVISOR-WEDGE-R1-01): the one nft call's worst case is
+    /// 2700 ms, the figure the systemd watchdog interval is derived from. Must
+    /// match `WATCHDOG_HOOK_NFT_WAIT` in `src/daemon.rs`, which pins the same
+    /// literal on its side (TD2), so an nft budget edited here turns this red
+    /// and names the daemon mirror that must move with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn td2n_nft_call_worst_case_matches_the_watchdog_hook_nft_wait() {
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            std::time::Duration::from_millis(2700)
+        );
+        assert_eq!(
+            linux::NFT_CALL_WORST_CASE,
+            crate::daemon::WATCHDOG_HOOK_NFT_WAIT
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux_children {
+        use super::super::linux::{
+            admit_slot, feed_stdin_and_wait_with, pidfd_kill, pidfd_open, wait_nft_bounded_with,
+            NftSlotTable, NftWaitBudget,
+        };
+        use super::super::{ChildSlotTable, ChildStuckStage, NftOrigin, NftablesError};
+        use std::process::{Command, Stdio};
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        /// A slot table owned by one test, so no test shares the process table.
+        fn local_table() -> &'static Mutex<NftSlotTable> {
+            Box::leak(Box::new(Mutex::new(ChildSlotTable::new())))
+        }
+
+        fn held(table: &'static Mutex<NftSlotTable>) -> usize {
+            table.lock().unwrap_or_else(|e| e.into_inner()).held()
+        }
+
+        fn piped(command: &mut Command) -> std::process::Child {
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn test child")
+        }
+
+        /// These tests spawn real children and T11 (d) counts the process's open
+        /// pidfds, so they run one at a time: a concurrent sibling's pidfd would
+        /// otherwise read as a leak (flake risk named by the round-1 code gate).
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn serial() -> std::sync::MutexGuard<'static, ()> {
+            SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// A command budget far below `sleep 5`, so T11 (a) always reaches the
+        /// kill. 20 ms is short on purpose; it is only ever used against a child
+        /// that is meant to overrun it.
+        const WEDGE_COMMAND_BUDGET: Duration = Duration::from_millis(20);
+
+        const SHORT: NftWaitBudget = NftWaitBudget {
+            command: WEDGE_COMMAND_BUDGET,
+            kill_grace: Duration::from_millis(200),
+            reap_grace: Duration::from_millis(500),
+        };
+
+        /// For children that are meant to COMPLETE (`true`): a command budget with
+        /// slack for a loaded CI runner, so a slow fork is never read as a wedge.
+        /// 5 s = 250 x the wedge budget; `true` finishes in well under 100 ms.
+        const COMPLETES: NftWaitBudget = NftWaitBudget {
+            command: Duration::from_secs(5),
+            ..SHORT
+        };
+
+        /// T11 (a): a child past its budget is killed through its pidfd and the
+        /// call returns within the budget, freeing its slot.
+        #[test]
+        fn t11_a_a_wedged_child_is_killed_through_its_pidfd_within_the_budget() {
+            let _serial = serial();
+            let table = local_table();
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = piped(Command::new("sleep").arg("5"));
+            let started = Instant::now();
+            let result = wait_nft_bounded_with(child, ticket, SHORT);
+            let took = started.elapsed();
+            assert!(
+                matches!(&result, Err(NftablesError::InvocationFailed(m)) if m.contains("exceeded")),
+                "{result:?}"
+            );
+            assert!(
+                took < SHORT.command + SHORT.kill_grace + SHORT.reap_grace,
+                "took {took:?}"
+            );
+            assert_eq!(held(table), 0, "a reaped child frees its slot");
+        }
+
+        /// T11 (b): a child whose descendant holds its stdout cannot be reaped, so
+        /// it stays parked in its slot until the descendant dies and a sweep joins it.
+        #[test]
+        fn t11_b_an_unreapable_child_stays_parked_until_a_sweep_joins_it() {
+            let _serial = serial();
+            let table = local_table();
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let pid_file = dir.path().join("descendant.pid");
+            let script = format!("sleep 30 & echo $! > {}; exec sleep 30", pid_file.display());
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = piped(Command::new("sh").args(["-c", &script]));
+            let result = wait_nft_bounded_with(child, ticket, SHORT);
+            assert!(
+                matches!(
+                    result,
+                    Err(NftablesError::ChildStuck {
+                        stage: ChildStuckStage::NotReaped
+                    })
+                ),
+                "{result:?}"
+            );
+            assert_eq!(held(table), 1, "the stuck child keeps its slot");
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("descendant pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            // SAFETY: the pid names this test's own live grandchild (it is still
+            // holding the pipe, so it has not exited and cannot have been reused).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while held(table) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the sweep never reclaimed the slot"
+                );
+                table.lock().unwrap_or_else(|e| e.into_inner()).sweep();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// T11 (c): once the child is reaped its pidfd refuses the signal with
+        /// ESRCH; it can never reach a process that reused the pid.
+        #[test]
+        fn t11_c_a_pidfd_after_reap_answers_esrch() {
+            let _serial = serial();
+            let mut child = Command::new("true").spawn().expect("spawn");
+            let fd = pidfd_open(child.id()).expect("pidfd_open on a 5.3+ kernel");
+            child.wait().expect("reap");
+            assert_eq!(pidfd_kill(&fd), Err(libc::ESRCH));
+        }
+
+        fn open_pidfds() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("procfs")
+                .filter_map(|e| e.ok())
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .filter(|target| target.to_string_lossy().contains("pidfd"))
+                .count()
+        }
+
+        /// T11 (d): the pidfd is closed on every non-parked path, so 100 completed
+        /// calls leave the process's open pidfd count unchanged. Uses the
+        /// `COMPLETES` budget: with the 20 ms wedge budget a slow fork of `true`
+        /// on a loaded runner was killed and read as a failure (flake risk).
+        #[test]
+        fn t11_d_completed_calls_leak_no_pidfd() {
+            let _serial = serial();
+            let table = local_table();
+            let before = open_pidfds();
+            for _ in 0..100 {
+                let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+                let child = piped(&mut Command::new("true"));
+                wait_nft_bounded_with(child, ticket, COMPLETES).expect("true completes");
+            }
+            assert_eq!(open_pidfds(), before, "a completed call leaked its pidfd");
+            assert_eq!(held(table), 0);
+        }
+
+        /// R1 (LINUX-NFT-PID-REUSE-KILL-01): a stdin write that fails (the child
+        /// closed its stdin and kept running) never returns past a live child. The
+        /// child is killed through its pidfd and joined, or parked with its slot
+        /// held; a free slot with a live child is the escape this pins.
+        #[test]
+        fn r1_a_failed_stdin_write_kills_and_joins_or_parks_the_child() {
+            let _serial = serial();
+            let table = local_table();
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let pid_file = dir.path().join("child.pid");
+            // `exec sleep` keeps the shell's pid, so `$$` names the live child.
+            let program = format!("echo $$ > {}; exec 0<&-; exec sleep 30", pid_file.display());
+            let ticket = admit_slot(table, NftOrigin::General).expect("admit");
+            let child = Command::new("sh")
+                .args(["-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn test child");
+            // 1 MiB: larger than any pipe buffer, so the write is still blocked
+            // when the child closes its read end and fails with EPIPE.
+            let script = "x".repeat(1 << 20);
+            let result = feed_stdin_and_wait_with(child, ticket, &script, COMPLETES);
+            assert!(
+                matches!(&result, Err(NftablesError::InvocationFailed(m)) if m.contains("stdin")),
+                "{result:?}"
+            );
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("child pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            // SAFETY: signal 0 only probes; the pid is this test's own child.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            let slots = held(table);
+            if alive && slots == 0 {
+                // SAFETY: as above; reap the escaped child so the run leaves nothing.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                slots == 1 || !alive,
+                "a failed stdin write freed its slot ({slots} held) with the child still alive"
+            );
+        }
     }
 }

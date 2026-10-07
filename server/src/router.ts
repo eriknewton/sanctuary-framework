@@ -14,6 +14,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { isNamespaceDiscoveryLimitError, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "./storage/interface.js";
 import { randomBytes } from "node:crypto";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
@@ -52,6 +53,8 @@ export type ToolHandler = (
 ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
 
 export interface ToolExecutionContext {
+  /** SDK-owned cancellation, consumed by proxy/response-runtime.ts. */
+  readonly signal?: AbortSignal;
   /** Gate-minted durable id for the exact approved, normalized arguments. */
   readonly approvalAuditId?: string;
 }
@@ -74,6 +77,8 @@ const AGENT_CATALOG_HIDDEN_TOOLS = new Set([
   "context_gate_apply_template",
 ]);
 
+// Must match GENERIC_GATE_DENIAL_REMEDIATION in
+// test/security/f5-dashboard-bind-degrade.test.ts (not exported; the test pins it).
 const GENERIC_GATE_DENIAL_REMEDIATION = "unavailable" as const;
 
 /** Options for server creation */
@@ -151,7 +156,7 @@ export function createServer(
   });
 
   // Register tool execution - validation + gate sit between router and handler
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
     const currentAgentId = options?.currentAgentId?.();
@@ -227,7 +232,7 @@ export function createServer(
       let gateArgs: Record<string, unknown>;
       try {
         gateArgs = (await tool.approvalTargetArgs?.(handlerArgs)) ?? handlerArgs;
-      } catch {
+      } catch (error) {
         const errorPayload = fixedDenial(
           `audit:gate:${name}`,
           GENERIC_GATE_DENIAL_REMEDIATION,
@@ -237,7 +242,12 @@ export function createServer(
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify(errorPayload),
+              // Only state_export's fixed capacity guidance may cross this
+              // boundary; policy and ownership denials keep their coarse schema.
+              // Must match the preserved discovery error in cognitive/tools.ts.
+              text: JSON.stringify(name === "state_export" && isNamespaceDiscoveryLimitError(error)
+                ? { ...errorPayload, remediation: NAMESPACE_DISCOVERY_LIMIT_REMEDIATION }
+                : errorPayload),
             },
           ],
           isError: true,
@@ -322,7 +332,7 @@ export function createServer(
         // ToolHandler's doc) — this is what lets handshake/federation
         // per-origin quotas bind to a value the calling agent cannot mint
         // more of, instead of a caller-supplied identity_id.
-        return tool.handler(handlerArgs, callerIdentity, { approvalAuditId });
+        return tool.handler(handlerArgs, callerIdentity, { approvalAuditId, signal: extra.signal });
       };
 
       // Read tools bypass the audit-integrity gate unconditionally (an
@@ -395,6 +405,7 @@ export function createServer(
 
 /**
  * Helper to create a successful tool response.
+ * Pretty JSON serialization must match normalizeScreenedResponse in proxy/response-bounds.ts.
  */
 export function toolResult(
   data: object

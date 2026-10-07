@@ -1,4 +1,4 @@
-import type { StatusResponse } from "../castle-wall/ipc/messages.js";
+import type { SafetyNetAuditState, StatusResponse } from "../castle-wall/ipc/messages.js";
 import type { CastleWallProvisionState } from "../castle-wall/provision-state.js";
 import {
   castleWallRuntimeReadiness,
@@ -87,6 +87,7 @@ export interface CastleWallRuntimeSnapshot {
     | "kernel_runtime_ready"
     | "enforcing"
     | "runtime_health"
+    | "safety_net"
   >;
   /**
    * State of the signed-evidence channel behind this runtime. Anything other
@@ -128,6 +129,8 @@ export interface CastleWallEvidence {
   status: RuntimeStatus;
   last_event_at: string | null;
   detector_evidence: string;
+  /** The daemon's tagged installed predicate, when its status reported one. */
+  safety_net?: SafetyNetAuditState;
   /**
    * ADDITIVE: the vault-level wall claim, carried verbatim from the snapshot.
    * Present only when the fortress carries the claim, so every report about a
@@ -438,6 +441,9 @@ function castleWallResult(
     status,
     last_event_at: snapshot.lastEventAt ?? null,
     detector_evidence,
+    ...(snapshot.statusResponse?.safety_net !== undefined
+      ? { safety_net: snapshot.statusResponse.safety_net }
+      : {}),
   };
 }
 

@@ -96,6 +96,11 @@ local-human channel ships; this does not prevent encrypted ingest/search/get.
 classifier refuses are skipped and named in the result, so a partial mirror is
 never mistaken for a complete one; if `MEMORY.md` is refused, `memory_emit`
 reports `index_present: false` and the emitted tree is not a closed re-import.
+The CLI form of `memory_ingest` needs `SANCTUARY_AGENT_ID` set to the wrapped
+harness id in its environment; without it, ingest refuses instead of guessing
+an identity for you. `memory_emit`, `memory_transcode`, and
+`memory_transcode_restore` need the same environment variable set for the
+same reason.
 
 `memory_transcode` and `memory_transcode_restore` materialize a memory tree in
 another harness layout (for example Claude Code to Codex). They cross the same

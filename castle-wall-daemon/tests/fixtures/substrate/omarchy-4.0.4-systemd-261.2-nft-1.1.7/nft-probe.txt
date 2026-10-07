@@ -1,0 +1,16 @@
+=== scratch-table-test
+table-added
+chain-added
+queue-rule-added
+{"nftables":[{"metainfo":{"version":"1.1.7","release_name":"Commodore Bullmoose #8","json_schema_version":1}},{"table":{"family":"inet","name":"recon_probe","handle":3}},{"chain":{"family":"inet","table":"recon_probe","name":"out","handle":1,"type":"filter","hook":"output","prio":-10,"policy":"accept"}},{"rule":{"family":"inet","table":"recon_probe","chain":"out","handle":4,"expr":[{"match":{"op":"==","left":{"meta":{"key":"skuid"}},"right":1000}},{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":65000}},{"queue":{"num":7,"flags":["bypass"]}}]}}]}
+table inet recon_probe {
+	chain out {
+		type filter hook output priority filter - 10; policy accept;
+		meta skuid 1000 tcp dport 65000 queue flags bypass to 7
+	}
+}
+nft_queue              12288  1
+nf_tables             409600  722 nft_queue,nft_compat,nft_limit
+table-deleted
+table ip filter
+table ip6 filter

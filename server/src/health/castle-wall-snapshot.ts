@@ -127,6 +127,7 @@ export function castleWallSnapshotFromHealth(
       kernel_runtime_ready: status.kernel_runtime_ready,
       enforcing: status.enforcing,
       runtime_health: status.runtime_health,
+      safety_net: status.safety_net,
     },
   };
   if (evidenceChannel === "faulted") {

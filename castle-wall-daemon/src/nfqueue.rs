@@ -143,12 +143,16 @@ fn verdict_deadline_fail_stop(deadline: Duration) -> Result<(), NfqueueError> {
     // return through ordinary runtime release while it is still running: that
     // would detach authority-bearing work after the wall reports stopped.
     // SAFETY: stderr is the fail-stop contract. This runs immediately before
-    // `process::exit`, so no structured channel survives to carry it, and the
+    // the exit gate's `_exit`, so no structured channel survives to carry it, and the
     // systemd journal is the only place the operator can read why the process died.
     eprintln!(
         "castle-wall-daemon: FATAL NFQUEUE verdict deadline exceeded ({deadline:?}); fail-stopping process so systemd kills the stuck worker"
     );
-    std::process::exit(75)
+    // INVARIANT (single exit gate): this path exits only by winning the same
+    // compare-exchange as the stop guard and `main`'s return, and it exits with the
+    // DECIDED code (78 once RepairRequired was decided), never a literal 75 that
+    // could invert RestartPreventExitStatus=78. A loser parks; the winner exits.
+    crate::exit_guard::terminate_with_decided_code()
 }
 
 #[cfg(test)]

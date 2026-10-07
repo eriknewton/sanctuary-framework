@@ -106,6 +106,16 @@ const execFileAsync = promisify(execFile);
  */
 const DEFAULT_RESOLVER_LIFECYCLE_REFRESH_INTERVAL_SECONDS = 30;
 
+// 128 KiB / 1 KiB per approval = 128 entries. Two 128-character identifiers
+// cost at most 512 UTF-16 bytes, leaving half for the map, record and TTL.
+const PENDING_APPROVAL_MEMORY_BUDGET_BYTES = 128 * 1024;
+const PENDING_APPROVAL_ENTRY_BUDGET_BYTES = 1024;
+const MAX_PENDING_APPROVALS = PENDING_APPROVAL_MEMORY_BUDGET_BYTES / PENDING_APPROVAL_ENTRY_BUDGET_BYTES;
+// Reserve three quarters of capacity for other subjects when one floods it.
+const MAX_PENDING_APPROVALS_PER_AGENT = MAX_PENDING_APPROVALS / 4;
+const MAX_PENDING_APPROVAL_ID_CHARACTERS = 128;
+const DEFAULT_PENDING_APPROVAL_TIMEOUT_SECONDS = 30;
+
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR;
@@ -817,7 +827,17 @@ export async function startMacOSCastleWallDaemon(
     operatorBaseline,
     exclusiveEgressGate,
   });
-  const pendingRequests = new Set<string>();
+  const pendingRequests = new Map<string, { deadline: number; agentId: string }>();
+  const prunePendingRequests = (): void => {
+    let expired = 0;
+    for (const [requestId, { deadline }] of pendingRequests) {
+      if (deadline <= nowMs()) {
+        pendingRequests.delete(requestId);
+        expired++;
+      }
+    }
+    if (expired > 0) consumer.noteIngressDrop("approval_expired", expired);
+  };
   const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
   const stopLeaseHeartbeat = (): void => {
@@ -908,7 +928,7 @@ export async function startMacOSCastleWallDaemon(
    * loss window is one heartbeat interval, or a crash/SIGKILL before the
    * next carry. This is availability-of-evidence in a crash window, not a
    * forgery path; the full-chain verification is unchanged.
-   * DEBT: if a drill ever shows that window matters, persist the pending
+   * DEBT(CASTLE-WALL-MACOS-DAEMON-PENDING-WINDOW): if a drill ever shows that window matters, persist the pending
    * count alongside the existing daemon state (the active-config /
    * fortress-path files) instead of building a retry queue.
    *
@@ -1226,7 +1246,35 @@ export async function startMacOSCastleWallDaemon(
     },
     approvalQueue: {
       async enqueue(input) {
-        pendingRequests.add(input.requestId);
+        // Shutdown cannot admit requests after its pending-loss count is taken.
+        if (daemonStopping) {
+          consumer.noteIngressDrop("approval_shutdown");
+          return false;
+        }
+        prunePendingRequests();
+        if (input.requestId.length > MAX_PENDING_APPROVAL_ID_CHARACTERS ||
+            input.agent.id.length > MAX_PENDING_APPROVAL_ID_CHARACTERS) {
+          consumer.noteIngressDrop("approval_id_too_large");
+          return false;
+        }
+        if (pendingRequests.has(input.requestId)) return false;
+        let agentPending = 0;
+        for (const entry of pendingRequests.values()) {
+          if (entry.agentId === input.agent.id) agentPending++;
+        }
+        // Admission is synchronous and reject-new: retransmission cannot renew
+        // an old request or evict another request's operator decision window.
+        if (pendingRequests.size >= MAX_PENDING_APPROVALS || agentPending >= MAX_PENDING_APPROVALS_PER_AGENT) {
+          consumer.noteIngressDrop("approval_capacity");
+          return false;
+        }
+        pendingRequests.set(input.requestId, {
+          agentId: input.agent.id,
+          deadline: nowMs() + Math.min(
+            input.expiresInSeconds,
+            DEFAULT_PENDING_APPROVAL_TIMEOUT_SECONDS,
+          ) * 1000,
+        });
       },
     },
     auditSink: input.auditLog,
@@ -1235,7 +1283,7 @@ export async function startMacOSCastleWallDaemon(
     // Same log instance the sink appends to — the anchor is recomputed from
     // entries this consumer persisted, never from the wire.
     chainAnchorSource,
-    defaultApprovalTimeoutSeconds: 30,
+    defaultApprovalTimeoutSeconds: DEFAULT_PENDING_APPROVAL_TIMEOUT_SECONDS,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
     fortressId: input.fortressId,
     emissionLiveness: emissionLivenessWatchdog,
@@ -1278,6 +1326,7 @@ export async function startMacOSCastleWallDaemon(
         return reloadPolicy(request);
       },
       async handleDecision(response) {
+        prunePendingRequests();
         if (!pendingRequests.has(response.request_id)) {
           return { ok: false, error: `no pending request matches ${response.request_id}` };
         }
@@ -1507,6 +1556,8 @@ export async function startMacOSCastleWallDaemon(
     // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
     // real flow, so the reader keeps it OUT of the green/armed determination.
     const emitAuditHeartbeat = async (): Promise<void> => {
+      prunePendingRequests();
+      void consumer.flushIngressDrops();
       // RESERVATION carry (fix-round HIGH): take ownership of the pending
       // units synchronously BEFORE the append, so an overlapping beat (slow
       // append + short interval) reserves 0 and can never double-subtract
@@ -1996,6 +2047,8 @@ export async function startMacOSCastleWallDaemon(
     async stop() {
       try {
         daemonStopping = true;
+        if (pendingRequests.size > 0) consumer.noteIngressDrop("approval_shutdown", pendingRequests.size);
+        pendingRequests.clear();
         stopLeaseHeartbeat();
         stopResolverLifecycleTimer();
         await resolverLifecycleRefresh?.catch(() => undefined);
@@ -2011,6 +2064,21 @@ export async function startMacOSCastleWallDaemon(
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
+        let discardDrainTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          // A hung discard write must not block filter_stopped or finally cleanup:
+          // use the same deadline as audit appends, keeping unflushed counts (including
+          // the in-flight reservation) in memory. A late commit may report a count
+          // twice, but it must never be lost or turned into an allow.
+          await Promise.race([
+            consumer.drainIngressDrops(),
+            new Promise<void>((resolve) => {
+              discardDrainTimer = setTimeout(resolve, input.auditLog.writeLockHoldDeadlineMs);
+            }),
+          ]);
+        } finally {
+          if (discardDrainTimer) clearTimeout(discardDrainTimer);
+        }
         // #912 MED-1: carry any still-pending degraded-write count into the
         // shutdown audit write too, not only the next heartbeat -- a reload
         // that drops its audit write shortly before `stop()` must not lose the

@@ -85,6 +85,48 @@
 
 import http from "node:http";
 import net from "node:net";
+import https from "node:https";
+import { checkServerIdentity, type TLSSocket } from "node:tls";
+import {
+  SURROGATE_STATUS, SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS, SURROGATE_BOUND_PORT,
+  parseSurrogateForwardTarget, reconcileSurrogateHost, checkSurrogateRawHeaders,
+  scanSurrogateRequest, surrogateContentLength, buildSurrogateUpstreamHeaders, isSurrogateQueryLocation,
+  SurrogateEchoScanner, SURROGATE_ECHO_BLOCKED,
+  type SurrogateEchoCause, type SurrogateEchoCode,
+  type SurrogateCorrelationId, type SurrogateRefusal,
+} from "../credential-surrogate/index.js";
+import type { SurrogateHelperClient } from "./surrogate-helper-client.js";
+
+/** Trusted transport seam. Production uses https.request and its bundled roots. */
+export type SurrogateUpstreamRequest = (options: https.RequestOptions, listener: (response: http.IncomingMessage) => void) => http.ClientRequest;
+
+/** Forward mode has no advisory variant and always needs the helper authority. */
+export interface SurrogateForwardMode {
+  destinations: readonly string[];
+  helperClient: SurrogateHelperClient;
+}
+
+/** Fixed fields only; binding attribution belongs to the helper, never the gate. */
+export type SurrogateGateEvent = {
+  kind: "surrogate_swap" | "surrogate_denied" | "surrogate_helper_unavailable";
+  authority: string;
+  correlationId?: SurrogateCorrelationId;
+  requestBytes: number;
+  responseBytes: number;
+  status: number;
+  code: SurrogateRefusal | "swap";
+  reason?: SurrogateRefusal;
+};
+/** Echo outcomes join the same helper query IDs as swap events, never a binding ordinal.
+ * Fixed codes and causes must match credential-surrogate/echo-scanner.ts. */
+export type SurrogateEchoEvent = {
+  authority: string;
+  correlationId: SurrogateCorrelationId;
+  requestBytes: number;
+  responseBytes: number;
+  status: number;
+} & ({ kind: "surrogate_echo_blocked"; code: Extract<SurrogateEchoCode, "echo_blocked"> }
+  | { kind: "surrogate_echo_unscanned"; code: Extract<SurrogateEchoCode, "echo_unscanned">; cause: SurrogateEchoCause });
 import type { Duplex } from "node:stream";
 
 import {
@@ -176,6 +218,8 @@ export interface GateLivenessProbe {
 
 /** Events the gate emits for audit/posture wiring. */
 export type EgressGateEvent =
+  | SurrogateGateEvent
+  | SurrogateEchoEvent
   | { kind: "liveness_refused"; authority: string; reasons: string[] }
   | { kind: "peer_uid_mismatch"; authority: string; peerUid: number; peerPid: number; agentUid: number }
   | { kind: "peer_unresolved"; authority: string }
@@ -187,6 +231,10 @@ export type EgressGateEvent =
 export interface ExclusiveEgressGateOptions {
   /** The single-source gate policy (agent uid + gate port). */
   policy: ExclusiveEgressGatePolicy;
+  forwardMode?: SurrogateForwardMode;
+  /** A broken destinations artifact refuses plain requests by name; CONNECT retains its policy. */
+  forwardUnavailable?: "destinations_unavailable";
+  upstreamRequest?: SurrogateUpstreamRequest;
   /** Destination rules the gate enforces per CONNECT. */
   rules: AllowlistRule[];
   /**
@@ -296,6 +344,15 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   const rules = deepFreeze(structuredClone(options.rules)) as AllowlistRule[];
   const isRoutable = options.isRoutable;
   const onEvent = options.onEvent;
+  const forward = options.forwardMode;
+  const forwardUnavailable = options.forwardUnavailable;
+  const destinations = new Set(forward?.destinations ?? []);
+  const helperQuery = forward?.helperClient?.query.bind(forward.helperClient);
+  const upstreamRequest = options.upstreamRequest ?? https.request;
+  // A missing authority must fail at construction, never become advisory forwarding.
+  if ((forward || forwardUnavailable) && (!clientAuthorize || (forward && !helperQuery))) {
+    throw new Error("forward mode requires clientAuth and a surrogate helper client");
+  }
 
   if (validateExclusiveEgressGatePolicy(policy) === null) {
     throw new Error("createExclusiveEgressGate: malformed exclusive-egress gate policy");
@@ -459,13 +516,389 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     return { kind: "resolved", uid: peer.uid, pid: peer.pid };
   }
 
-  const server = http.createServer((_request, response) => {
+  // This bounded observer selects refusal bytes only; llhttp alone accepts HTTP requests.
+  const parserProvenance = new WeakMap<object, { forward: boolean }>();
+  const bodyRefusals = new WeakMap<object, { request: http.IncomingMessage; refuse: () => void }>();
+  // Budget: one active response and zero queued forward handlers per connection.
+  // A WeakSet implements the cap of one; finish/close evicts it, with constant work per parsed request.
+  const activeForward = new WeakSet<net.Socket>();
+  const admitForward = (request: http.IncomingMessage, response: http.ServerResponse): void => {
+    if (request.socket.destroyed) return;
+    if (activeForward.has(request.socket)) {
+      // Destroy rather than queue a refusal behind a streaming response: queued refusals are also retained state.
+      onEvent?.({ kind: "surrogate_denied", authority: parseSurrogateForwardTarget(request.url ?? "")?.authority ?? "",
+        code: "limit", reason: "limit", status: 403, requestBytes: 0, responseBytes: 0 });
+      request.socket.destroy();
+      return;
+    }
+    activeForward.add(request.socket);
+    const release = (): void => { activeForward.delete(request.socket); };
+    response.once("finish", release);
+    response.once("close", release);
+    void state_FORWARD(request, response);
+  };
+  const server = http.createServer((request, response) => {
+    if (forward || forwardUnavailable) {
+      admitForward(request, response);
+      return;
+    }
     // The gate speaks CONNECT only; plain requests get a terse 405 that
     // names the sanctioned path (enforcement-as-teacher, design Section 5).
     response.statusCode = 405;
     response.setHeader("Allow", "CONNECT");
     response.end("Sanctuary egress gate: use HTTP CONNECT via your configured proxy.");
   });
+
+  if (forward || forwardUnavailable) {
+    server.on("connection", socket => {
+      const provenance = { forward: false };
+      parserProvenance.set(socket, provenance);
+      let phase: "HEADERS" | "BODY" | "STOP" = "HEADERS";
+      let line = "";
+      let headerBytes = 0;
+      let firstLine = true;
+      let sawLength = false;
+      let remaining = 0;
+      // Four raw bytes per counted header byte cover a one-byte name plus colon and CRLF;
+      // llhttp excludes separators from its budget. This observer never admits a request.
+      const provenanceBudget = 4 * http.maxHeaderSize;
+      // One header budget per connection, linear work per chunk, no retained body or request history.
+      socket.prependListener("data", (chunk: Buffer) => {
+        for (let offset = 0; offset < chunk.length && phase !== "STOP"; offset++) {
+          if (phase === "BODY") {
+            const consumed = Math.min(remaining, chunk.length - offset);
+            remaining -= consumed;
+            offset += consumed - 1;
+            if (remaining === 0) { phase = "HEADERS"; provenance.forward = false; }
+            continue;
+          }
+          if (++headerBytes > provenanceBudget) { line = ""; phase = "STOP"; break; }
+          line += String.fromCharCode(chunk[offset]!);
+          if (!line.endsWith("\r\n")) continue;
+          if (firstLine) {
+            provenance.forward = /^[A-Z]+ http:\/\//i.test(line);
+            firstLine = false;
+            if (/^CONNECT /i.test(line)) phase = "STOP";
+          } else if (line === "\r\n") {
+            phase = remaining ? "BODY" : "HEADERS";
+            firstLine = true;
+            sawLength = false;
+            headerBytes = 0;
+          } else if (/^content-length:/i.test(line)) {
+            // Ambiguous framing ends observation; it must never borrow a later request's identity.
+            const length = /^content-length:[ \t]*(\d+)[ \t]*\r\n$/i.exec(line);
+            if (sawLength || !length || !Number.isSafeInteger(Number(length[1]))) phase = "STOP";
+            else { remaining = Number(length[1]); sawLength = true; }
+          } else if (/^transfer-encoding:/i.test(line)) {
+            // Forward mode refuses transfer coding; no body interpretation is needed for refusal provenance.
+            phase = "STOP";
+          }
+          line = "";
+        }
+      });
+      socket.once("close", () => { line = ""; parserProvenance.delete(socket); bodyRefusals.delete(socket); });
+    });
+    // llhttp refuses duplicated framing before rawHeaders reaches the request callback.
+    server.on("clientError", (error, socket) => {
+      const failure = error as NodeJS.ErrnoException;
+      const body = bodyRefusals.get(socket);
+      if (failure.code === "HPE_INVALID_EOF_STATE" && body && !body.request.complete) {
+        // A parsed request owns its short-body refusal before Node can replace it with generic 400 bytes.
+        body.refuse();
+        return;
+      }
+      const forwardFraming = failure.code === "HPE_UNEXPECTED_CONTENT_LENGTH" &&
+        parserProvenance.get(socket)?.forward;
+      if (forwardFraming && socket.writable) {
+        socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nX-Sanctuary-Gate: surrogate-duplicate-header\r\n\r\n");
+        return;
+      }
+      // Preserve Node's parser-error statuses and bytes for CONNECT and unclassified input.
+      const status = failure.code === "HPE_HEADER_OVERFLOW" ? 431
+        : failure.code === "HPE_CHUNK_EXTENSIONS_OVERFLOW" ? 413
+        : failure.code === "ERR_HTTP_REQUEST_TIMEOUT" ? 408 : 400;
+      if (socket.writable) socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\n\r\n`);
+      else socket.destroy();
+    });
+    // Upgrade is an HTTP server event, so it must not bypass the forward checks.
+    server.on("upgrade", (request, socket) => {
+      const response = new http.ServerResponse(request);
+      response.assignSocket(socket as net.Socket);
+      // Upgrade bypasses Node's normal response-finish owner; drain the refusal and release its socket explicitly.
+      response.once("finish", () => { response.detachSocket(socket as net.Socket); socket.end(); });
+      admitForward(request, response);
+    });
+  }
+
+  async function state_FORWARD(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+    let state: "AUTH" | "PARSE" | "QUERY" | "POLICY" | "HANDSHAKE" | "STREAM" | "DONE" = "AUTH";
+    let authority = "";
+    let requestBytes = 0;
+    let responseBytes = 0;
+    let upstream: http.ClientRequest | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    // The placeholder admission cap bounds retained join keys; the request closure owns their lifetime.
+    const queryIds = new Set<SurrogateCorrelationId>();
+    let swapSentUpstream = false;
+    const emit = (kind: SurrogateGateEvent["kind"], code: SurrogateGateEvent["code"], status: number, correlationId?: SurrogateCorrelationId): void => {
+      // DEBT(SURROGATE-GATE-EVENTS-CHAIN): per-request events reach the root-readable gate log only, not the fortress chain; assurance stays partial.
+      // Binding attribution joins correlationId with the helper event; the gate never asserts which binding answered.
+      // correlationId must match the helper event's correlationId in surrogate-helper-daemon.ts.
+      // An absent correlationId means "no query was issued"; every sent query is retained through terminal events (A3).
+      onEvent?.({ kind, authority, requestBytes, responseBytes, status, code,
+        ...(correlationId ? { correlationId } : {}), ...(code !== "swap" ? { reason: code } : {}) });
+    };
+    const refuse = (reason: SurrogateRefusal, correlationId?: SurrogateCorrelationId, unavailable = false): void => {
+      if (state === "DONE") return;
+      state = "DONE";
+      clearTimeout(deadline);
+      upstream?.destroy();
+      const [status, code] = SURROGATE_STATUS[reason];
+      if (correlationId) queryIds.add(correlationId);
+      const kind = unavailable ? "surrogate_helper_unavailable" : "surrogate_denied";
+      // This code describes the whole request outcome, including for earlier answered ids; the helper row owns each query's outcome.
+      if (queryIds.size) for (const id of queryIds) emit(kind, reason, status, id);
+      else emit(kind, reason, status);
+      if (response.destroyed || request.socket.destroyed) return;
+      if (response.headersSent) { response.destroy(); return; }
+      response.writeHead(status, { "Connection": "close", "X-Sanctuary-Gate": code });
+      response.end();
+    };
+    const bodyOwner = { request, refuse: () => refuse("body_length_mismatch") };
+    bodyRefusals.set(request.socket, bodyOwner);
+    request.once("end", () => { if (bodyRefusals.get(request.socket) === bodyOwner) bodyRefusals.delete(request.socket); });
+    request.on("error", bodyOwner.refuse);
+    const onSocketError = (): void => { refuse("socket_error"); };
+    request.socket.on("error", onSocketError);
+    const state_DONE = (): void => {
+      state = "DONE";
+      clearTimeout(deadline);
+      // The 405 can reuse a socket; a completed request must not retain its closure on that socket.
+      request.socket.removeListener("error", onSocketError);
+      if (bodyRefusals.get(request.socket) === bodyOwner) bodyRefusals.delete(request.socket);
+      upstream?.destroy();
+    };
+    response.once("finish", () => {
+      // A committed swap's completion records final body octets and upstream status; a refused request cannot become a success.
+      if (state !== "DONE" && swapSentUpstream) for (const id of queryIds) emit("surrogate_swap", "swap", response.statusCode, id);
+      state_DONE();
+    });
+    response.once("close", () => {
+      // A client close before response finish is a terminal failure even after a value was committed.
+      if (!response.writableFinished) refuse("socket_error");
+      state_DONE();
+    });
+    const stopped = (): boolean => state === "DONE" || response.destroyed || request.socket.destroyed;
+    try {
+      // state_AUTH: every request gets fresh liveness and peer/credential decisions.
+      if (!(await probeLiveness()).live) return refuse("not_live");
+      if (stopped()) return;
+      const peer = await resolvePeerForAuth(request.socket, boundPeerRunner);
+      if (stopped()) return;
+      if (!(await clientAuthorize!({ credentialHeader: request.headers["proxy-authorization"], peer })).allow) return refuse("client_denied");
+      if (stopped()) return;
+      if (forwardUnavailable) return refuse(forwardUnavailable);
+      state = "PARSE";
+      const target = parseSurrogateForwardTarget(request.url ?? "");
+      if (!target) return refuse("invalid_target");
+      authority = target.authority;
+      const rawRefusal = checkSurrogateRawHeaders(request.rawHeaders);
+      if (rawRefusal) return refuse(rawRefusal);
+      if (!reconcileSurrogateHost(target.host, request.headers.host)) return refuse("host_mismatch");
+      const occurrences = scanSurrogateRequest(request.url ?? "", request.headers);
+      // Count before admission: an over-cap request creates no query and no queue.
+      if (!occurrences) return refuse("limit");
+      state = "QUERY";
+      const swaps: { header: string; start: number; length: number; value: string; correlationId: SurrogateCorrelationId }[] = [];
+      for (const occurrence of occurrences) {
+        // The shared wire grammar cannot name an overlong header; this is a request refusal, not helper downtime.
+        if (!isSurrogateQueryLocation(occurrence.location)) return refuse("wrong_location");
+        const result = await helperQuery!({ placeholder: occurrence.placeholder, host: target.host, port: SURROGATE_BOUND_PORT, location: occurrence.location }, id => {
+          // Must match surrogate-helper-client.ts onSent: capture the sent id before any terminal callback.
+          queryIds.add(id);
+          // A client can close before helper connect; the later send still needs a joinable denial without resuming forwarding.
+          if (stopped()) emit("surrogate_denied", "socket_error", SURROGATE_STATUS.socket_error[0], id);
+        });
+        if (result.correlationId) queryIds.add(result.correlationId);
+        if (stopped()) return;
+        if (result.kind === "failure") return refuse(result.code, result.correlationId, true);
+        if (result.response.kind === "deny") return refuse(result.response.reason, result.correlationId);
+        if (!occurrence.header) return refuse("wrong_location", result.correlationId);
+        swaps.push({ header: occurrence.header, start: occurrence.start, length: occurrence.placeholder.length, value: result.response.value, correlationId: result.correlationId });
+      }
+      if (!occurrences.length && !destinations.has(authority)) {
+        state = "DONE";
+        response.statusCode = 405;
+        response.setHeader("Allow", "CONNECT");
+        response.end("Sanctuary egress gate: use HTTP CONNECT via your configured proxy.");
+        return;
+      }
+      state = "POLICY";
+      const decision = await decideEgressProxyConnect(authority, {
+        rules, ...(boundResolver ? { resolver: boundResolver } : {}), ...(isRoutable ? { isRoutable } : {}),
+      });
+      if (stopped()) return;
+      if (decision.disposition === "deny") return refuse("policy_denied");
+      const length = surrogateContentLength(request.headers);
+      if (length === null) return refuse("body_length_mismatch");
+      const headers = { ...request.headers };
+      // Descending original offsets prevent an inserted value becoming a later replacement target.
+      for (const swap of [...swaps].sort((a, b) => b.start - a.start)) {
+        const original = headers[swap.header];
+        if (typeof original !== "string") return refuse("header_write_failed", swap.correlationId);
+        headers[swap.header] = original.slice(0, swap.start) + swap.value + original.slice(swap.start + swap.length);
+      }
+      state = "HANDSHAKE";
+      // All helper queries settled successfully before this site; deadline/error returns above can never resume a dial.
+      try {
+        upstream = upstreamRequest({
+          hostname: decision.address, port: SURROGATE_BOUND_PORT, servername: target.host,
+          checkServerIdentity: (_hostname, certificate) => checkServerIdentity(target.host, certificate),
+          rejectUnauthorized: true, agent: false, method: request.method, path: target.path,
+          headers: buildSurrogateUpstreamHeaders(headers, target.host, length, swaps.length > 0),
+        }, (incoming) => {
+          if (state === "DONE") { incoming.destroy(); return; }
+          let scanner: SurrogateEchoScanner | undefined;
+          let echoTerminated = false;
+          const emitEcho = (cause?: SurrogateEchoCause): void => {
+            // Every sent swap gets a join key; the helper, not response content, supplies binding attribution.
+            for (const swap of swaps) onEvent?.({ authority, correlationId: swap.correlationId,
+              requestBytes, responseBytes, status: response.statusCode,
+              ...(cause ? { kind: "surrogate_echo_unscanned", code: "echo_unscanned", cause } as const
+                : { kind: "surrogate_echo_blocked", code: "echo_blocked" } as const) });
+          };
+          const terminateEcho = (cause?: SurrogateEchoCause, beforeHeaders = false): void => {
+            if (echoTerminated) return;
+            echoTerminated = true;
+            scanner?.abort();
+            if (cause === "scan_error" || cause === "upstream_reset") {
+              // Preserve the existing transport refusal and its query attribution while
+              // recording separately why response screening could not complete.
+              try { refuse("upstream_reset"); }
+              finally {
+                incoming.destroy();
+                try { emitEcho(cause); }
+                finally { if (!response.writableEnded) response.destroy(); }
+              }
+              return;
+            }
+            // Terminal state precedes teardown and logging: no failure callback may resume forwarding.
+            state = "DONE";
+            clearTimeout(deadline);
+            incoming.destroy();
+            upstream?.destroy();
+            const sendRefusal = beforeHeaders && !response.headersSent && !response.destroyed && !request.socket.destroyed;
+            if (sendRefusal) {
+              const [status, code] = SURROGATE_ECHO_BLOCKED;
+              response.writeHead(status, { "Connection": "close", "X-Sanctuary-Gate": code });
+            }
+            // Even a failing event sink cannot leave a response writable after a failed scan.
+            try { emitEcho(cause); }
+            finally { if (sendRefusal) response.end(); else response.destroy(); }
+          };
+          try {
+            if (!swaps.length) {
+              incoming.on("error", () => refuse("upstream_reset"));
+              response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+              incoming.on("data", (chunk: Buffer) => { responseBytes += chunk.length; });
+              incoming.pipe(response);
+              return;
+            }
+            // Header normalization does not prove whether Node removed chunk framing.
+            // Every transfer-coded response screens delivered and stripped bytes together.
+            scanner = new SurrogateEchoScanner(swaps.map(swap => swap.value), incoming.headers["transfer-encoding"] !== undefined);
+            // Screen the raw fields and the exact normalized fields Node will forward.
+            const forwardedHeaders = Object.entries(incoming.headers).flatMap(([name, value]) =>
+              (Array.isArray(value) ? value : [value ?? ""]).flatMap(entry => [name, entry]));
+            if (scanner.headersEcho(incoming.rawHeaders) || scanner.headersEcho(forwardedHeaders)) {
+              terminateEcho(undefined, true); return;
+            }
+            const encoding = incoming.headers["content-encoding"];
+            // Repeated identity codings are still plaintext; an empty field applies no transform.
+            const identity = encoding === undefined || (typeof encoding === "string" &&
+              (encoding.trim() === "" || encoding.split(",").every(coding => coding.trim().toLowerCase() === "identity")));
+            const transfer = incoming.headers["transfer-encoding"];
+            // Unsupported transfer transformations cannot be covered by the two plaintext views.
+            const decodedTransfer = transfer === undefined || (typeof transfer === "string" &&
+              transfer.toLowerCase() === "chunked");
+            if (!identity || !decodedTransfer) { terminateEcho("encoding", true); return; }
+            response.writeHead(incoming.statusCode ?? 502, incoming.headers);
+            // No response deadline or retry is added. Existing client cancellation now owns
+            // carry disposal; late end/data/drain callbacks must never write after that abort.
+            const resume = (): void => { if (!stopped()) incoming.resume(); };
+            response.on("drain", resume);
+            response.once("close", () => {
+              response.removeListener("drain", resume);
+              if (scanner!.metrics.state !== "FINISHED") terminateEcho("client_abort");
+              incoming.destroy();
+            });
+            incoming.once("error", () => terminateEcho("upstream_reset"));
+            incoming.once("aborted", () => terminateEcho("upstream_reset"));
+            incoming.on("data", (chunk: Buffer) => {
+              if (stopped()) { scanner!.abort(); return; }
+              // Stream callbacks are separate stacks; setup's catch cannot contain a scanner failure here.
+              try {
+                responseBytes += chunk.length;
+                const result = scanner!.scan(chunk);
+                if (result.blocked) { terminateEcho(result.cause); return; }
+                if (result.ceiling) { terminateEcho("ceiling"); return; }
+                if (result.output.length && !response.write(result.output)) incoming.pause();
+              } catch { terminateEcho("scan_error"); }
+            });
+            incoming.once("end", () => {
+              if (stopped()) { scanner!.abort(); return; }
+              try {
+                const tail = scanner!.finish();
+                // Must match encodingFailed in credential-surrogate/echo-scanner.ts.
+                if (scanner!.encodingFailed) { terminateEcho("encoding"); return; }
+                response.end(tail);
+              }
+              catch { terminateEcho("scan_error"); }
+            });
+          } catch {
+            // Only fixed causes leave the response boundary; upstream text can contain credential material.
+            if (swaps.length) terminateEcho("scan_error", true);
+            else { incoming.destroy(); refuse("upstream_reset"); }
+          }
+        });
+      } catch { return refuse("header_write_failed"); }
+      const recordCommit = (): void => {
+        if (swapSentUpstream) return;
+        swapSentUpstream = true;
+        // The first successful write/end commits headers to TLS; status 0 means no upstream response exists yet.
+        for (const swap of swaps) emit("surrogate_swap", "swap", 0, swap.correlationId);
+      };
+      deadline = setTimeout(() => refuse("upstream_tls_failed"), SURROGATE_UPSTREAM_CONNECT_DEADLINE_MS);
+      upstream.on("error", () => refuse(state === "HANDSHAKE" ? "upstream_tls_failed" : "upstream_reset"));
+      upstream.on("socket", (socket: TLSSocket) => {
+        socket.once("secureConnect", () => {
+          if (state !== "HANDSHAKE") return;
+          clearTimeout(deadline);
+          // No write/end/flushHeaders occurs until TLS authenticates the bound hostname.
+          if (!socket.authorized) return refuse("upstream_tls_failed");
+          state = "STREAM";
+          request.on("data", (chunk: Buffer) => {
+            if (state !== "STREAM") return;
+            requestBytes += chunk.length;
+            if (requestBytes > length) return refuse("body_length_mismatch");
+            try { const writable = upstream!.write(chunk); recordCommit(); if (!writable) request.pause(); }
+            catch { refuse("header_write_failed"); }
+          });
+          upstream!.on("drain", () => request.resume());
+          request.on("end", () => {
+            if (state === "DONE") return;
+            if (requestBytes !== length) return refuse("body_length_mismatch");
+            try { upstream!.end(); recordCommit(); } catch { refuse("header_write_failed"); }
+          });
+          request.on("aborted", () => refuse("body_length_mismatch"));
+          request.resume();
+        });
+      });
+    } catch {
+      // Error text can contain a credential-bearing header; only fixed codes leave this handler.
+      refuse("socket_error");
+    }
+  }
 
   server.on("error", (err) => {
     // Accept-time server errors (canonically EMFILE under FD exhaustion,

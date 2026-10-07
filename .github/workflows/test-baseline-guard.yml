@@ -68,7 +68,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Set up Python 3.12 for Concordia sidecar
         uses: actions/setup-python@v7
@@ -93,6 +93,16 @@ jobs:
           scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
             sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
+      - name: Install the system Hermes YAML parser fixture
+        uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: python3-yaml
+
+      - name: Provision the root-owned workstation signer interpreter
+        # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
+        # Copy the selected runtime into the fixed trusted path checked by the real signer.
+        run: sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
+
       # ── Gate 0: build (populates dist/templates for tarball tests) ─
       - name: Gate 0 - build
         working-directory: server
@@ -106,6 +116,15 @@ jobs:
       - name: Install libsecret + Secret Service backend
         if: runner.os == 'Linux'
         uses: ./.github/actions/setup-linux-secret-service
+
+      - name: Pin the full-suite Python YAML fixture
+        # Bare python3 gates the real cases; the product also probes /usr/bin/python3.
+        # Secret Service prepends its venv to PATH, so install after that action.
+        timeout-minutes: 5
+        run: |
+          scripts/ci/retry-with-timeout.sh "pip install (Hermes parser fixture, hash-pinned)" -- \
+            python3 -m pip install --only-binary=:all: --require-hashes -r scripts/ci/hermes-parity-requirements.txt
+          python3 -c "import yaml"
 
       # ── Gate 2: npm test + transform/collection error detection ───
       #

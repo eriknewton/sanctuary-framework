@@ -59,6 +59,8 @@ import {
 import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 import { ASCII_LABEL_RE } from "../core/token-grammar.js";
+import type { DashboardReadFlightMap } from "./read-response.js";
+
 
 export { constantTimeEquals };
 
@@ -69,6 +71,14 @@ export interface ApprovalHandlers {
 
 export interface APIDeps {
   sources: AggregatorSources;
+  /**
+   * The started server's single bounded-read flight map. Required, and created
+   * once per server by the caller (never per request): deps objects are rebuilt
+   * on every request, so a map made here per call would never join concurrent
+   * reads, and a process-wide one would join reads across servers.
+   * Must match the required `readFlights` option in ./read-response.ts.
+   */
+  readFlightMap: DashboardReadFlightMap;
   authToken?: string;
   sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
@@ -393,6 +403,7 @@ export async function handleRequest(
     }
     const handled = await handlePostureRoute(
       {
+        readFlightMap: deps.readFlightMap,
         auditLog: deps.sources.auditLog ?? null,
         originMachine:
           deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",

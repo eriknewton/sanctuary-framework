@@ -28,7 +28,7 @@ function loadClient(options: {
     const setTimeout = env.setTimeout;
     const setInterval = env.setInterval;
     ${script}
-    return { api, policyApi, autoTriggerApi, honeypotApi, loadInboxPrefs, fetchSovereignty, fetchPostureHome, connectStream };
+    return { api, policyApi, autoTriggerApi, honeypotApi, loadInboxPrefs, fetchSovereignty, fetchPostureHome, fetchPostureAnomalies, connectStream };
   `) as (env: Record<string, unknown>) => Record<string, (...args: unknown[]) => Promise<unknown> | void>;
 
   const configElement = { textContent: JSON.stringify(config) };
@@ -50,13 +50,13 @@ function loadClient(options: {
         }
         return { ok: true, status: 200, json: async () => ({ session_id: options.streamSession ?? "" }) };
       }
-      return { ok: true, status: 200, json: async () => ({ data: { findings: [] } }) };
+      return { ok: true, status: 200, json: async () => ({ data: { findings: [], agents: [], rules: [], view: {} } }) };
     },
     EventSource: class {
       constructor(url: string) { streams.push(url); }
       addEventListener() {}
     },
-    setTimeout: () => 0,
+    setTimeout: (_fn: unknown, ms: number) => { pollingIntervals.push(ms); return 0; },
     setInterval: (_fn: unknown, ms: number) => { pollingIntervals.push(ms); return 0; },
   });
   return { client, calls, streams, pollingIntervals };
@@ -76,6 +76,7 @@ describe("v1.1 launch-session read propagation", () => {
     await client.loadInboxPrefs();
     await client.fetchSovereignty();
     await client.fetchPostureHome();
+    await client.fetchPostureAnomalies();
     client.connectStream();
     await Promise.resolve();
 
@@ -134,7 +135,7 @@ describe("v1.1 launch-session read propagation", () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(failed.calls.map((call) => call.url)).toEqual(["/auth/session"]);
       expect(failed.streams).toEqual([]);
-      expect(failed.pollingIntervals).toEqual([5000]);
+      expect(failed.pollingIntervals).toEqual([5000, 5000]); // Session deadline, then bounded fallback.
     }
   });
 });

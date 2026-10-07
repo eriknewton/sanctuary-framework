@@ -1,0 +1,73 @@
+# Workflow YAML Parse Check (standalone)
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# ci.yml's `lint` job already parses every file under .github/workflows/
+# (see its "Workflow YAML parse check" step) so a malformed workflow file
+# is caught loudly instead of silently producing a zero-job, no-check run
+# (PR #1398, 2026-09-09). But a check defined INSIDE ci.yml cannot report
+# on a ci.yml that itself fails to parse , a run driven by a broken
+# ci.yml has zero jobs, full stop, regardless of what any of its own
+# steps would have asserted.
+#
+# This is that check moved to its own minimal workflow, so a broken
+# ci.yml is still reported by a workflow that itself still parses. The
+# ci.yml step stays in place as defense for every OTHER workflow file
+# (this one included); this file is defense specifically for ci.yml.
+#
+# Residual: this file's own YAML is the one case neither check can
+# defend , a broken workflow-yaml-parse.yml reports on nothing. Keep
+# this file deliberately minimal (checkout, install, one parse step) so
+# there is as little surface as possible for that residual to bite.
+
+name: Workflow YAML Parse Check
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-yaml-parse:
+    name: workflow-yaml-parse
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci --ignore-scripts
+
+      - name: Workflow YAML parse check
+        # Same check as ci.yml's lint job (see that file's comment for the
+        # full rationale and why js-yaml over pip). Kept identical on
+        # purpose: a hand-diverged copy here would defeat the point of
+        # having two independent checks agree on what "parses" means.
+        working-directory: server
+        timeout-minutes: 5
+        run: |
+          node -e "
+          const yaml = require('js-yaml');
+          const fs = require('fs');
+          for (const f of process.argv.slice(1)) {
+            try {
+              yaml.load(fs.readFileSync(f, 'utf8'));
+            } catch (e) {
+              console.error(f + ': ' + e.message);
+              process.exit(1);
+            }
+          }
+          " ../.github/workflows/*.yml

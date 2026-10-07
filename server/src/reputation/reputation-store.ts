@@ -940,8 +940,10 @@ export interface ReputationStoreTestOverrides {
  * timeout. Reachability remains as before: both importBundle paths are
  * OPERATOR-gated
  * (`reputation_import` is tier1_always_approve; the exit CLI is a separate
- * operator process). Cross-process concurrency is the separate accepted
- * DEBT (bridge/tools.ts). The per-refusal `admission_busy` audit append is
+ * operator process). Cross-process admission concurrency is separately
+ * accepted as debt under the handle DISCLOSURE-QUOTA-CROSS-PROCESS-RACE
+ * (declared in disclosure/policies.ts); the bridge handles are unrelated.
+ * The per-refusal `admission_busy` audit append is
  * 1:1 with a real MCP round-trip (not N×M); the uncapped audit queue it
  * feeds is the separately-tracked systemic item (register AUD-BP-01).
  */
@@ -1533,7 +1535,7 @@ export class ReputationStore {
         // round-trips), so this is occupied-but-unverified, not absence.
         return "occupied_unverified";
       }
-      // DEBT (LD6 gate fix-round F1, import pre-seed vector): importBundle()
+      // DEBT(REPUTATION-IMPORT-PRESEED-VECTOR) (LD6 gate fix-round F1, import pre-seed vector): importBundle()
       // deliberately writes at the CALLER-SUPPLIED `attestation.attestation_id`
       // (the id is not part of the signed attestation bytes, and
       // `deriveReputationAttestationId` is exported and publicly computable),
@@ -1771,7 +1773,7 @@ export class ReputationStore {
    * that would put `origin` over quota, and undercounting would let the
    * caller record past its cap.
    *
-   * DEBT (LD3 BRIDGE-BP-01, scope; corrected LD3 gate fix-round DEFECT 3 —
+   * DEBT(REPUTATION-DECRYPT-SCAN-COMPLEXITY) (LD3 BRIDGE-BP-01, scope; corrected LD3 gate fix-round DEFECT 3 —
    * see the register): a second full-namespace decrypt scan of
    * `_reputation`, alongside the dedup scan bridge_attest already runs via
    * findExistingAttestationForDedup. Both exist because `_reputation` has
@@ -1779,7 +1781,7 @@ export class ReputationStore {
    * maintained incrementally) would remove this, but is a larger
    * structural change than this narrow scan-shape goal —
    * BridgeStore.assertOriginWithinQuota in bridge/tools.ts records the
-   * matching DEBT note for `_bridge`. CORRECTED CLAIM (fix-round-2
+   * matching note for `_bridge` (BRIDGE-DECRYPT-SCAN-COMPLEXITY). CORRECTED CLAIM (fix-round-2
    * RECHECK): the fix-round-1 text here asserted this scan's worst case was
    * bounded by "this fix" while `_reputation`'s total SIZE was in fact
    * still unbounded through TWO other paths — the `reputation_record` tool
@@ -1794,7 +1796,7 @@ export class ReputationStore {
    * gate fix-round-2 MUST-FIX 2), so `_reputation`'s total size is bounded
    * for every writer, which is what actually bounds this scan's worst case.
    * The scan's algorithmic shape (a full O(N) decrypt pass) is unchanged and
-   * remains DEBT, now honestly bounded rather than falsely claimed bounded.
+   * remains tracked as REPUTATION-DECRYPT-SCAN-COMPLEXITY, now honestly bounded rather than falsely claimed bounded.
    */
   async countAttestationsByOriginForContext(
     origin: string,

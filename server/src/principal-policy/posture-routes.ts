@@ -48,6 +48,10 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  respondWithBoundedDashboardRead,
+  type DashboardReadFlightMap,
+} from "../dashboard/read-response.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
@@ -139,6 +143,10 @@ export interface PostureRouteDeps {
   auditLog: AuditLog | null;
   /** Origin-machine attribution for `/v1`-compatible shapes. */
   originMachine: string;
+  /** Owning dashboard instance's bounded-read flights (one map per running dashboard server). */
+  // Required: each dashboard instance owns its flight map (must match the required
+  // `readFlights` option in src/dashboard/read-response.ts).
+  readFlightMap: DashboardReadFlightMap;
   /**
    * Recognition precursor: the resolved `composition_enabled` flag (default-off
    * via `resolveCompositionConfig()`). This is CONFIG, not evidence: it is the
@@ -308,6 +316,18 @@ export interface PostureRouteDeps {
     | Promise<ExclusiveEgressStatus | null>
     | ExclusiveEgressStatus
     | null;
+}
+
+export function buildLockedAuditPostureUnavailableBody(originMachine: string): {
+  error: "posture_unavailable";
+  reason: "audit log not unlocked; posture cannot be evidenced";
+  origin_machine: string;
+} {
+  return {
+    error: "posture_unavailable",
+    reason: "audit log not unlocked; posture cannot be evidenced",
+    origin_machine: originMachine,
+  };
 }
 
 /**
@@ -484,11 +504,7 @@ export async function handlePostureRoute(
   // cannot prove enforcement or count operations - fail closed to a 503 that
   // says so honestly (never an empty-but-green payload).
   if (deps.auditLog === null) {
-    writeJSON(res, 503, {
-      error: "posture_unavailable",
-      reason: "audit log not unlocked; posture cannot be evidenced",
-      origin_machine: om,
-    });
+    writeJSON(res, 503, buildLockedAuditPostureUnavailableBody(om));
     return true;
   }
 
@@ -670,9 +686,18 @@ export async function handlePostureRoute(
     }
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/home`) {
-      const home = await buildHome(deps);
-      writeJSON(res, 200, home);
-      return true;
+      return respondWithBoundedDashboardRead({
+        route: "posture_home",
+        req: _req,
+        res,
+        operation: "get_posture_home",
+        readFlights: deps.readFlightMap,
+        originMachine: om,
+        produce: async () => ({
+          status: 200,
+          body: await buildHome(deps),
+        }),
+      });
     }
 
     // Within the posture namespace but no match - 404 here (do not fall
@@ -1113,7 +1138,7 @@ function buildReach(
 // site (`import type { PostureHome } from "./posture-routes.js"`).
 export type { PostureHome };
 
-async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
+export async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // S5-P (codex BLOCKER fix): resolve the exclusive-egress provider EXACTLY
   // ONCE for the whole home payload, then thread the SAME snapshot into both
   // the wall posture and the feature-health panel. Resolving per-builder would

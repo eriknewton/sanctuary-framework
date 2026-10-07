@@ -17,12 +17,15 @@
 //!   binds (there is no in-process bind timeout anymore).
 //! * `TimeoutStopSec` + `KillMode=control-group` — bound shutdown and reap an
 //!   isolated nft health child if its fork/netlink transaction wedged.
-//! * `Restart=on-failure` — fail-before and post-ready health loss exit nonzero;
-//!   systemd must restart so the preserved kernel object is re-adopted.
 //! * `WantedBy=multi-user.target` — the reboot-survival / persistence path.
+//! * `WatchdogSec` + `WatchdogSignal=SIGKILL` + `NotifyAccess=main` — the liveness
+//!   watchdog (C2a3): a supervisor that stops completing health passes is killed
+//!   without a core and restarted; the interval is derived in `daemon.rs`
+//!   (`WATCHDOG_SEC`) and only the main process can pet it.
 
 use castle_wall_daemon::ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH;
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
+use sha2::{Digest, Sha256};
 
 fn unit_text() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -44,12 +47,52 @@ fn directive_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn section_text<'a>(unit: &'a str, name: &str) -> &'a str {
+    let header = format!("[{name}]");
+    let start = unit.find(&header).expect("required unit section") + header.len();
+    let tail = &unit[start..];
+    let end = tail.find("\n[").unwrap_or(tail.len());
+    &tail[..end]
+}
+
+fn section_values<'a>(section: &'a str, key: &str) -> Vec<&'a str> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim())
+        .collect()
+}
+
 #[test]
 fn unit_is_type_notify() {
     assert_eq!(
         directive_values(&unit_text(), "Type"),
         vec!["notify"],
         "the daemon fires sd_notify READY=1; the unit must be Type=notify"
+    );
+}
+
+#[test]
+fn shipped_wall_unit_identity_bytes_are_pinned() {
+    let unit = unit_text();
+    // The audited unit has one [Service] section with User=root and
+    // Group=sanctuary. Pin its exact bytes: the generic section helper below
+    // does not model systemd's comments, continuations, or repeated sections.
+    // Any unit edit needs a fresh review of the effective identity before this
+    // digest is updated. Drop-ins and host configuration require host checks.
+    // Refreshed for C2a2 (2026-09-27): a comment-only edit, the TimeoutStopSec
+    // must-match pin to the stop guard; no directive changed.
+    // TU7, refreshed for C2a3 (2026-09-28): three directives added under
+    // [Service] (WatchdogSec=19, WatchdogSignal=SIGKILL, NotifyAccess=main, each
+    // pinned by TU1 to TU4 below) plus comment edits to the start-limit
+    // derivation and its failure-mode paragraph; User and Group unchanged.
+    assert_eq!(
+        format!("{:x}", Sha256::digest(unit.as_bytes())),
+        "905c138d5240e8ee5b3fce9e1207cdd5707afe6a08ded2f03d56811e5b9ccdf0",
+        "the audited castle-wall service identity or unit bytes changed"
     );
 }
 
@@ -62,6 +105,30 @@ fn unit_restarts_after_fail_before_or_runtime_loss() {
     );
 }
 
+#[test]
+fn repair_required_exit_is_failed_without_automatic_restart() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    let prevent: Vec<&str> = section_values(service, "RestartPreventExitStatus")
+        .iter()
+        .flat_map(|value| value.split_whitespace())
+        .collect();
+    assert!(
+        prevent.contains(&"78"),
+        "exit 78 must suppress automatic restart in [Service]"
+    );
+    for directive in ["SuccessExitStatus", "RestartForceExitStatus"] {
+        let values: Vec<&str> = section_values(service, directive)
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .collect();
+        assert!(
+            !values.contains(&"78"),
+            "{directive} must not reclassify exit 78"
+        );
+    }
+    assert_eq!(section_values(service, "Restart"), vec!["on-failure"]);
+}
 #[test]
 fn unit_requires_explicit_trusted_service_uid_configuration() {
     let unit = unit_text();
@@ -93,6 +160,115 @@ fn unit_provisions_the_runtime_directory_for_the_ipc_socket() {
         ],
         "the fortress-specific socket parent and the custody lock root must both be \
          recreated after every /run tmpfs reboot"
+    );
+}
+
+/// Reads the stop-owner unit that ships in the crate as a source artifact.
+/// Nothing installs, enables, or starts it in this slice; see the header of
+/// `systemd/sanctuary-stop-owner.service`, which states the same bound.
+fn stop_owner_unit_text() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("systemd/sanctuary-stop-owner.service"),
+    )
+    .expect("the stop-owner unit ships beside the daemon unit in this crate")
+}
+
+#[test]
+fn the_shipped_daemon_unit_starts_independently_of_the_stop_owner_artifact() {
+    // The stop owner refuses READY until launch artifacts that no package
+    // delivers today are installed, so the filter daemon's start must not
+    // depend on it in any direction. Failure mode if this pin is dropped: the
+    // package installs cleanly and Castle Wall simply never reaches active on
+    // a host that has the package and nothing else.
+    let daemon = unit_text();
+    assert!(
+        !daemon.contains("sanctuary-stop-owner"),
+        "the shipped daemon unit must not name the stop-owner unit, its socket, \
+         or its private state while that owner is an uninstalled artifact"
+    );
+    assert!(
+        directive_values(&daemon, "BindsTo").is_empty(),
+        "no BindsTo edge may tie filter enforcement to a unit that is not installed"
+    );
+    assert!(
+        directive_values(&daemon, "ExecStopPost").is_empty(),
+        "shutdown must not call a stop notifier that the package does not install"
+    );
+}
+
+/// TB3 (slice B): the agent template unit depends on the wall, never the
+/// reverse. The wall's bytes are pinned above and stay unchanged by slice B;
+/// this pins the direction, so a wall-side `Wants=`, `Requires=` or `Before=`
+/// naming the agent (which would let the agent pull or order the wall) is a
+/// visible failure. The wall digest is also what pins the socket parent's
+/// `RuntimeDirectoryMode=0710` `root:sanctuary`, the second defence an agent
+/// process meets at the control socket.
+#[test]
+fn the_shipped_daemon_unit_names_no_agent_unit() {
+    assert!(
+        !unit_text().contains("sanctuary-agent"),
+        "the wall unit must not name the agent unit; the edge is agent to wall only"
+    );
+}
+
+#[test]
+fn the_stop_owner_unit_grants_no_cgroup_write_path_and_keeps_its_socket_parent_volatile() {
+    let owner = stop_owner_unit_text();
+    assert_eq!(directive_values(&owner, "User"), vec!["root"]);
+    assert_eq!(directive_values(&owner, "Group"), vec!["root"]);
+    assert_eq!(
+        directive_values(&owner, "StateDirectory"),
+        vec!["sanctuary-stop-owner"]
+    );
+    assert_eq!(directive_values(&owner, "StateDirectoryMode"), vec!["0700"]);
+    assert_eq!(
+        directive_values(&owner, "RuntimeDirectoryMode"),
+        vec!["0700"]
+    );
+    assert_eq!(
+        directive_values(&owner, "InaccessiblePaths"),
+        vec!["/var/lib/sanctuary"]
+    );
+    assert!(directive_values(&owner, "BindsTo").is_empty());
+    assert_eq!(
+        directive_values(&owner, "ReadWritePaths"),
+        vec!["/var/lib/sanctuary-stop-owner /run/sanctuary-stop-owner"]
+    );
+    // `ProtectSystem=strict` leaves `/sys` writable on its own, so the cgroup
+    // hierarchy is read-only for this unit ONLY while ProtectControlGroups is
+    // true. Failure mode if this flips: nothing visibly breaks, because the
+    // unit GAINS write access to every cgroup on the host rather than losing
+    // access to one, so the loss of the bound is silent on a running system and
+    // this assertion is the only place it shows.
+    assert_eq!(
+        directive_values(&owner, "ProtectSystem"),
+        vec!["strict"],
+        "the owner's filesystem must stay read-only except its two declared paths"
+    );
+    assert_eq!(
+        directive_values(&owner, "ProtectControlGroups"),
+        vec!["true"],
+        "a release-disabled owner is granted no writable cgroup path anywhere"
+    );
+    assert!(
+        !owner.contains("/sys/fs/cgroup"),
+        "no explicit cgroup path may be added to the owner's writable set"
+    );
+    // MUST MATCH the restart-custody invariant at the socket-bind refusal in
+    // `src/protected_agent/owner.rs` (`serve_production`): the owner refuses to
+    // start when its socket path already exists, which is safe to do only
+    // because systemd removes RuntimeDirectory= on every stop. Declaring
+    // RuntimeDirectoryPreserve here would keep a crashed run's socket inode
+    // and turn each crash into a permanent refusal to start.
+    assert_eq!(
+        directive_values(&owner, "RuntimeDirectory"),
+        vec!["sanctuary-stop-owner"],
+        "the socket parent must be systemd-owned so it is recreated empty per start"
+    );
+    assert!(
+        directive_values(&owner, "RuntimeDirectoryPreserve").is_empty(),
+        "preserving the runtime directory would carry a stale socket across a restart"
     );
 }
 
@@ -171,6 +347,157 @@ fn unit_bounds_startup_at_the_process_level() {
         "TimeoutStartSec must be a concrete duration, got {:?}",
         values[0]
     );
+    // PINNED BY VALUE, not merely "a duration": the start-limit interval below is
+    // DERIVED from this number, so a change here without a matching change there
+    // silently makes the limit untrippable. Must match TimeoutStartSec and the
+    // derivation comment in systemd/sanctuary-castle-wall.service.
+    assert_eq!(
+        values[0], TIMEOUT_START_SEC,
+        "TimeoutStartSec is pinned; the start-limit interval is derived from it"
+    );
+}
+
+/// The unit's startup timeout, in seconds. Raised with the safety net because a
+/// startup ownership loss now installs the net inside the start window.
+/// Must match `TimeoutStartSec` in systemd/sanctuary-castle-wall.service.
+const TIMEOUT_START_SEC: &str = "60";
+
+/// The unit's restart delay, in seconds.
+/// Must match `RestartSec` in systemd/sanctuary-castle-wall.service.
+const RESTART_SEC: &str = "2";
+
+/// The unit's start burst.
+/// Must match `StartLimitBurst` in systemd/sanctuary-castle-wall.service.
+const START_LIMIT_BURST: &str = "5";
+
+/// The unit's start-limit window, in seconds.
+/// Must match `StartLimitIntervalSec` in systemd/sanctuary-castle-wall.service.
+const START_LIMIT_INTERVAL_SEC: &str = "600";
+
+/// The unit's liveness watchdog interval, in seconds (TU6's I4 reads it).
+/// Must match `WatchdogSec` in systemd/sanctuary-castle-wall.service and
+/// `WATCHDOG_SEC` in src/daemon.rs (TU1 checks both).
+const WATCHDOG_SEC_UNIT: &str = "19";
+
+/// The INI section a directive appears in, or None when it is absent.
+///
+/// systemd reads a directive only in its own section and ignores it elsewhere, so a
+/// test that asserts a value without asserting the section cannot tell a live
+/// directive from a decorative one.
+fn section_of(unit: &str, directive: &str) -> Option<String> {
+    let mut current: Option<String> = None;
+    for line in unit.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            current = Some(name.to_string());
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some((key, _)) = trimmed.split_once('=') {
+            if key.trim() == directive {
+                return current.clone();
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn unit_ships_a_finite_start_limit_whose_window_outlasts_five_worst_case_activations() {
+    let unit = unit_text();
+    // SECTION MATTERS: `StartLimitBurst` and `StartLimitIntervalSec` are `[Unit]`
+    // directives. systemd silently IGNORES them under `[Service]`, so a unit that
+    // carries them in the wrong section has no start limit at all while reading as
+    // though it does. Assert the section, not just the value.
+    assert_eq!(
+        section_of(&unit, "StartLimitBurst").as_deref(),
+        Some("Unit"),
+        "StartLimitBurst must sit in [Unit]; systemd ignores it under [Service]"
+    );
+    assert_eq!(
+        section_of(&unit, "StartLimitIntervalSec").as_deref(),
+        Some("Unit"),
+        "StartLimitIntervalSec must sit in [Unit]; systemd ignores it under [Service]"
+    );
+    // And the directives that ARE per-service stay where they belong, so this test
+    // cannot pass by moving everything into one section.
+    assert_eq!(
+        section_of(&unit, "TimeoutStartSec").as_deref(),
+        Some("Service")
+    );
+    assert_eq!(section_of(&unit, "RestartSec").as_deref(), Some("Service"));
+
+    let burst = directive_values(&unit, "StartLimitBurst");
+    let interval = directive_values(&unit, "StartLimitIntervalSec");
+    assert_eq!(burst.len(), 1, "exactly one StartLimitBurst must be set");
+    assert_eq!(
+        interval.len(),
+        1,
+        "exactly one StartLimitIntervalSec must be set"
+    );
+    assert_eq!(burst[0], START_LIMIT_BURST);
+    assert_eq!(interval[0], START_LIMIT_INTERVAL_SEC);
+
+    // INVARIANT, and the reason both values are pinned: systemd refuses a start
+    // only when MORE than `burst` starts fall inside one window, so all `burst`
+    // worst-case activations must FIT in the window. A worst case is an activation
+    // killed at TimeoutStartSec plus RestartSec. If this arithmetic ever fails, the
+    // unit restarts forever while network.target waits on the ordering edge, which
+    // is the boot lockout moved from nftables into systemd.
+    let burst_n: u64 = burst[0].parse().expect("burst is a count");
+    let interval_n: u64 = interval[0].parse().expect("interval is seconds");
+    let start_timeout: u64 = TIMEOUT_START_SEC.parse().expect("timeout is seconds");
+    let restart_delay: u64 = RESTART_SEC.parse().expect("restart delay is seconds");
+    let worst_case_span = burst_n * (start_timeout + restart_delay);
+    assert!(
+        interval_n > worst_case_span,
+        "StartLimitIntervalSec {interval_n} must exceed {burst_n} x ({start_timeout} + \
+         {restart_delay}) = {worst_case_span} seconds, or the limit never trips"
+    );
+
+    // TU6 (I4, LINUX-SUPERVISOR-WEDGE-R1-01): the watchdog's own worst cycle, start
+    // to start, must fit five times too, or a watchdog crash wave never reaches the
+    // terminal failed state. A cycle is READY at the TimeoutStartSec edge, one first
+    // pass shorter than WatchdogSec that pets, a wedge killed WatchdogSec after that
+    // pet, then RestartSec: start_timeout + 2 x watchdog + restart_delay.
+    let watchdog = directive_values(&unit, "WatchdogSec");
+    assert_eq!(watchdog.len(), 1, "exactly one WatchdogSec must be set");
+    assert_eq!(
+        watchdog_secs(watchdog[0]),
+        WATCHDOG_SEC_UNIT.parse::<u64>().unwrap()
+    );
+    let watchdog_n: u64 = WATCHDOG_SEC_UNIT.parse().expect("watchdog is seconds");
+    let watchdog_cycle = start_timeout + 2 * watchdog_n + restart_delay;
+    let watchdog_span = burst_n * watchdog_cycle;
+    assert!(
+        interval_n > watchdog_span,
+        "StartLimitIntervalSec {interval_n} must exceed {burst_n} x ({start_timeout} + 2 x \
+         {watchdog_n} + {restart_delay}) = {watchdog_span} seconds, or a watchdog crash \
+         wave never reaches the terminal failed state"
+    );
+
+    // And the unlimited form is never shipped here: it is what would move the boot
+    // lockout into systemd.
+    assert!(
+        !interval.contains(&"0"),
+        "StartLimitIntervalSec=0 (unlimited restarts) must never ship on a unit \
+         ordered Before=network.target"
+    );
+
+    // RestartSec is pinned too, because the derivation above reads it.
+    let restart = directive_values(&unit, "RestartSec");
+    assert_eq!(restart.len(), 1, "exactly one RestartSec must be set");
+    assert_eq!(restart[0], RESTART_SEC);
+
+    // The recovery an operator needs is named in the unit itself, because a plain
+    // `systemctl start` after the limit trips reports only "start request repeated
+    // too quickly" and reads as a broken unit file.
+    assert!(
+        unit.contains("reset-failed"),
+        "the unit must name `systemctl reset-failed` as the recovery"
+    );
 }
 
 #[test]
@@ -178,19 +505,130 @@ fn unit_bounds_shutdown_and_kills_wedged_health_children() {
     let unit = unit_text();
     let timeout = directive_values(&unit, "TimeoutStopSec");
     assert_eq!(timeout.len(), 1, "exactly one TimeoutStopSec must be set");
-    assert!(
-        timeout[0]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit()),
-        "TimeoutStopSec must be a concrete duration, got {:?}",
-        timeout[0]
+    // T2u (LINUX-STOP-PATH-BUDGET-01): pinned EXACTLY, on both sides. The stop
+    // guard's deadline is derived from this value minus a margin, so a longer
+    // timeout would leave the guard firing needlessly early and a shorter one
+    // would let systemd's SIGKILL beat it. Must match
+    // `exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS`.
+    assert_eq!(
+        timeout,
+        vec!["10"],
+        "TimeoutStopSec must be exactly 10 seconds, got {:?}",
+        timeout
+    );
+    assert_eq!(
+        timeout[0],
+        castle_wall_daemon::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS.to_string(),
+        "TimeoutStopSec must match the stop guard's STOP_GUARD_TIMEOUT_STOP_SECS"
     );
     assert_eq!(
         directive_values(&unit, "KillMode"),
         vec!["control-group"],
         "a wedged nft health child must be killed with the service"
     );
+}
+
+// ---- C2a3: the liveness watchdog directives (LINUX-SUPERVISOR-WEDGE-R1-01) ----
+
+/// A systemd time span in whole seconds, bare (`19`) or `s`-suffixed (`19s`).
+/// Any other unit spelling panics, so a respelled directive cannot pass by
+/// parsing as something else.
+fn watchdog_secs(value: &str) -> u64 {
+    value
+        .strip_suffix('s')
+        .unwrap_or(value)
+        .parse()
+        .unwrap_or_else(|e| panic!("a whole-second time span, got {value:?}: {e}"))
+}
+
+/// The single value of `directive`, asserted to sit in `[Service]`.
+fn service_directive(unit: &str, directive: &str) -> String {
+    assert_eq!(
+        section_of(unit, directive).as_deref(),
+        Some("Service"),
+        "{directive} must sit in [Service]; systemd ignores it elsewhere"
+    );
+    let service = section_text(unit, "Service");
+    let values = section_values(service, directive);
+    assert_eq!(values.len(), 1, "exactly one {directive}: {values:?}");
+    values[0].to_string()
+}
+
+/// TU1: `WatchdogSec` is set once in `[Service]` and equals the derived
+/// `WATCHDOG_SEC`.
+#[test]
+fn tu1_watchdog_sec_matches_the_derived_constant() {
+    let unit = unit_text();
+    let secs = watchdog_secs(&service_directive(&unit, "WatchdogSec"));
+    assert_eq!(secs, u64::from(castle_wall_daemon::daemon::WATCHDOG_SEC));
+    assert_eq!(
+        WATCHDOG_SEC_UNIT,
+        castle_wall_daemon::daemon::WATCHDOG_SEC.to_string()
+    );
+}
+
+/// TU2: I1 and I7. The watchdog is never the tighter bound on a manager stop,
+/// and a stop of a healthy daemon (at most one pet gap after a pet) ends by
+/// `TimeoutStopSec` before any watchdog systemd kept running could fire.
+#[test]
+fn tu2_watchdog_outlasts_a_manager_stop() {
+    let unit = unit_text();
+    let watchdog = watchdog_secs(&service_directive(&unit, "WatchdogSec"));
+    let stop = watchdog_secs(&service_directive(&unit, "TimeoutStopSec"));
+    assert!(
+        watchdog > stop,
+        "I1: WatchdogSec {watchdog} > TimeoutStopSec {stop}"
+    );
+    const _: () = assert!(
+        castle_wall_daemon::daemon::WATCHDOG_SEC
+            > castle_wall_daemon::exit_guard::STOP_GUARD_TIMEOUT_STOP_SECS
+    );
+    let watchdog = std::time::Duration::from_secs(watchdog);
+    assert!(
+        watchdog - castle_wall_daemon::daemon::WATCHDOG_PET_GAP_BOUND
+            > std::time::Duration::from_secs(stop),
+        "I7: WatchdogSec minus the pet gap must exceed TimeoutStopSec"
+    );
+}
+
+/// TU3: `WatchdogSignal=SIGKILL`. The default SIGABRT would core-dump a process
+/// that holds the audit producer's private seed. The one pin for this directive.
+#[test]
+fn tu3_watchdog_signal_is_sigkill() {
+    assert_eq!(service_directive(&unit_text(), "WatchdogSignal"), "SIGKILL");
+}
+
+/// TU4: `NotifyAccess=main`, so a child that inherits `NOTIFY_SOCKET` can neither
+/// pet nor send `READY=1`. Must match `WatchdogBeacon`'s `WATCHDOG_PID` check.
+#[test]
+fn tu4_notify_access_is_main() {
+    assert_eq!(service_directive(&unit_text(), "NotifyAccess"), "main");
+}
+
+/// TU5: a watchdog kill is never read as success and never suppresses restart.
+/// `RestartPreventExitStatus` is exactly `78`, and neither success nor forced
+/// restart lists name 78 or the watchdog's signals.
+#[test]
+fn tu5_a_watchdog_kill_is_never_success_and_always_restarts() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    let tokens = |directive: &str| -> Vec<String> {
+        section_values(service, directive)
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(tokens("RestartPreventExitStatus"), vec!["78".to_string()]);
+    for directive in ["SuccessExitStatus", "RestartForceExitStatus"] {
+        let listed = tokens(directive);
+        for forbidden in ["78", "KILL", "SIGKILL", "9", "ABRT", "SIGABRT"] {
+            assert!(
+                !listed.iter().any(|t| t == forbidden),
+                "{directive} must not list {forbidden}: {listed:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -247,4 +685,606 @@ fn unit_has_a_reboot_persistence_target_and_safe_mode() {
         .iter()
         .any(|v| v.contains("CAP_NET_ADMIN")));
     assert_eq!(directive_values(&unit, "NoNewPrivileges"), vec!["true"]);
+}
+
+// ---------------------------------------------------------------------------
+// The finite start limit, exercised against a real systemd rather than parsed.
+//
+// The structural tests above prove the unit CARRIES the four values in the right
+// sections and that the window outlasts five worst-case activations. They cannot prove
+// what the values DO: that a service which keeps failing reaches a terminal failed state
+// instead of restarting forever, and that a unit ordered behind it is released. This leg
+// builds a transient service from those exact shipped values, drives it to the limit, and
+// reads the outcome back from systemd.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod start_limit_against_real_systemd {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// Seconds subtracted from `TimeoutStartSec` for the one slow activation. It must be
+    /// strictly less than the start timeout so the activation FAILS on its own rather
+    /// than being killed by the timeout: both count toward the limit, and the first is
+    /// the one a test can drive deterministically.
+    const SLOW_ACTIVATION_HEADROOM_SECS: u64 = 5;
+
+    /// Extra seconds added to the derived wait before the terminal state is expected.
+    /// Absorbs scheduling and bus latency only; it is not a retry budget.
+    const TERMINAL_STATE_SLACK_SECS: u64 = 20;
+
+    /// How often the unit's state is re-read while waiting.
+    const POLL_SPACING: Duration = Duration::from_millis(500);
+
+    /// One directive value, parsed from the SHIPPED unit rather than restated here, so
+    /// this leg exercises what the unit actually carries.
+    /// Must match the directive of the same name in
+    /// systemd/sanctuary-castle-wall.service.
+    fn shipped(directive: &str) -> String {
+        let unit = super::unit_text();
+        let values = super::directive_values(&unit, directive);
+        assert_eq!(
+            values.len(),
+            1,
+            "the shipped unit must set exactly one {directive}"
+        );
+        values[0].to_string()
+    }
+
+    /// One unit property as systemd reports it, or an empty string when the read failed.
+    /// An empty value never satisfies an assertion below, so a failed read cannot pass.
+    fn systemctl_property(unit: &str, property: &str) -> String {
+        Command::new("systemctl")
+            .args(["show", "--value", "-p", property, unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The fixture-owned counter is the portable proof of actual activations. Some systemd
+    /// releases retain `Result=exit-code` after the manager refuses a rate-limited restart,
+    /// so that manager diagnostic cannot be the pass condition here.
+    fn activation_count(counter: &std::path::Path) -> Option<u64> {
+        std::fs::read_to_string(counter).ok()?.trim().parse().ok()
+    }
+
+    /// Transient units this leg created, torn down on EVERY exit path.
+    ///
+    /// A `Drop` guard rather than teardown at the end of the test body: a panicking
+    /// assertion would otherwise leave a failed transient unit and its start-limit state
+    /// on the host for the whole window, and the next run of this leg would inherit it.
+    struct TransientUnits {
+        names: Vec<String>,
+    }
+
+    impl Drop for TransientUnits {
+        fn drop(&mut self) {
+            for name in &self.names {
+                let _ = Command::new("systemctl").args(["stop", name]).output();
+                // `reset-failed` is required as well as `stop`: a unit that hit the start
+                // limit stays in the failed state with its counter armed until it is
+                // reset, which is the same recovery the shipped unit's comment names for
+                // an operator.
+                let _ = Command::new("systemctl")
+                    .args(["reset-failed", name])
+                    .output();
+            }
+        }
+    }
+
+    /// True when a transient unit can be created at all. Reports the reason it cannot, so
+    /// a skip is never silent.
+    fn systemd_run_available() -> bool {
+        match Command::new("systemd-run").arg("--version").output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "SKIP (systemd-run unusable): exit {:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return false;
+            }
+            Err(err) => {
+                eprintln!("SKIP (systemd-run not present): {err}");
+                return false;
+            }
+        }
+        // A system bus is the second requirement: without it (a container with no
+        // systemd, or an unprivileged caller with no polkit agent) a transient unit
+        // cannot be created and the leg has nothing to drive.
+        match Command::new("systemctl")
+            .args(["show", "--value", "-p", "Version"])
+            .output()
+        {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                eprintln!(
+                    "SKIP (no usable system bus): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("SKIP (systemctl not present): {err}");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_failures_reach_a_terminal_failed_state_and_release_the_ordered_dependent() {
+        if !systemd_run_available() {
+            return;
+        }
+        let burst: u64 = shipped("StartLimitBurst")
+            .parse()
+            .expect("burst is a count");
+        let interval = shipped("StartLimitIntervalSec");
+        let restart_secs: u64 = shipped("RestartSec")
+            .parse()
+            .expect("restart delay is seconds");
+        let start_timeout: u64 = shipped("TimeoutStartSec")
+            .parse()
+            .expect("start timeout is seconds");
+        assert!(
+            start_timeout > SLOW_ACTIVATION_HEADROOM_SECS,
+            "the slow activation must fit inside the shipped start timeout"
+        );
+        let slow_activation_secs = start_timeout - SLOW_ACTIVATION_HEADROOM_SECS;
+
+        let work = tempfile::tempdir().expect("a work directory for the transient unit");
+        let counter = work.path().join("starts");
+        let script = work.path().join("failing-activation.sh");
+        // The activation: count this start, sleep only on the FIRST one, then fail
+        // without ever notifying readiness. That is the shape the unit's own worst case
+        // has, a Type=notify activation that never reaches READY=1, and the reason the
+        // first start is the slow one is that the ordered dependent below must be shown
+        // waiting behind a slow activation rather than behind an instant failure.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n+1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 if [ \"$n\" = \"1\" ]; then sleep {slow_activation_secs}; fi\n\
+                 exit 1\n",
+                counter = counter.display(),
+                slow_activation_secs = slow_activation_secs,
+            ),
+        )
+        .expect("write the activation script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        std::fs::set_permissions(&script, perms).expect("make the activation executable");
+
+        // Unique per process AND per run: a name reused while its predecessor is still in
+        // the failed state would inherit that unit's armed start counter.
+        let tag = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        );
+        let service = format!("sanctuary-start-limit-{tag}.service");
+        let dependent = format!("sanctuary-start-limit-dependent-{tag}.service");
+        let _cleanup = TransientUnits {
+            names: vec![dependent.clone(), service.clone()],
+        };
+
+        let started = Command::new("systemd-run")
+            .args([
+                format!("--unit={service}"),
+                "--property=Type=notify".to_string(),
+                "--property=Restart=on-failure".to_string(),
+                format!("--property=RestartSec={restart_secs}"),
+                format!("--property=TimeoutStartSec={start_timeout}"),
+                format!("--property=StartLimitBurst={burst}"),
+                format!("--property=StartLimitIntervalSec={interval}"),
+                "--no-block".to_string(),
+                "/bin/sh".to_string(),
+                script.display().to_string(),
+            ])
+            .output()
+            .expect("run systemd-run");
+        if !started.status.success() {
+            eprintln!(
+                "SKIP (the transient service could not be created): {}",
+                String::from_utf8_lossy(&started.stderr).trim()
+            );
+            return;
+        }
+
+        // The ordered dependent, which stands in for the shipped unit's
+        // `Before=network.target` edge: a WEAK requirement plus an ordering edge, so the
+        // failing unit delays it and a failure does not fail it. If the failing unit
+        // never reached a terminal state, this would never become active, which is the
+        // boot lockout the finite limit exists to prevent.
+        let dep = Command::new("systemd-run")
+            .args([
+                format!("--unit={dependent}"),
+                "--property=Type=oneshot".to_string(),
+                "--property=RemainAfterExit=yes".to_string(),
+                format!("--property=After={service}"),
+                format!("--property=Wants={service}"),
+                "--no-block".to_string(),
+                "/bin/true".to_string(),
+            ])
+            .output()
+            .expect("run systemd-run for the dependent unit");
+        if !dep.status.success() {
+            eprintln!(
+                "SKIP (the ordered dependent could not be created): {}",
+                String::from_utf8_lossy(&dep.stderr).trim()
+            );
+            return;
+        }
+
+        // DERIVED, not chosen: one slow activation, then the remaining starts of the
+        // burst each separated by the shipped restart delay, plus scheduling slack.
+        let deadline = Duration::from_secs(
+            slow_activation_secs + burst * (restart_secs + 1) + TERMINAL_STATE_SLACK_SECS,
+        );
+        let waited_from = Instant::now();
+        let mut active_state = String::new();
+        let mut result = String::new();
+        let mut sub_state = String::new();
+        let mut n_restarts = String::new();
+        let mut starts = None;
+        while waited_from.elapsed() < deadline {
+            active_state = systemctl_property(&service, "ActiveState");
+            result = systemctl_property(&service, "Result");
+            sub_state = systemctl_property(&service, "SubState");
+            n_restarts = systemctl_property(&service, "NRestarts");
+            starts = activation_count(&counter);
+            if starts.is_some_and(|count| count > burst) {
+                panic!(
+                    "systemd ran more than the shipped burst of {burst} activations: \
+                     starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+                     Result={result}, NRestarts={n_restarts}"
+                );
+            }
+            // The fixture counter, rather than Result, proves the service reached the exact
+            // allowed burst. `Result` is retained below as a diagnostic because some managers
+            // leave it at `exit-code` after a rate-limited restart is refused.
+            if active_state == "failed" && starts == Some(burst) {
+                break;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        let diagnostic = format!(
+            "starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+             Result={result}, NRestarts={n_restarts}"
+        );
+        assert_eq!(
+            active_state, "failed",
+            "a unit whose activation keeps failing must reach a TERMINAL failed state \
+             within {deadline:?}; {diagnostic}"
+        );
+        assert_eq!(
+            starts,
+            Some(burst),
+            "the fixture must run exactly the shipped start burst before a retry is refused; \
+             {diagnostic}"
+        );
+
+        // The next automatic retry is the one systemd must refuse. Keep observing for that
+        // full retry period plus the existing scheduler slack: a sixth activation fails
+        // immediately above, while a stable counter proves the restart loop is bounded.
+        let stability_deadline = Instant::now();
+        let stability_window = Duration::from_secs(restart_secs + TERMINAL_STATE_SLACK_SECS);
+        while stability_deadline.elapsed() < stability_window {
+            active_state = systemctl_property(&service, "ActiveState");
+            result = systemctl_property(&service, "Result");
+            sub_state = systemctl_property(&service, "SubState");
+            n_restarts = systemctl_property(&service, "NRestarts");
+            starts = activation_count(&counter);
+            if starts.is_some_and(|count| count > burst) {
+                panic!(
+                    "the retry after the shipped burst started a sixth activation: \
+                     starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+                     Result={result}, NRestarts={n_restarts}"
+                );
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        let diagnostic = format!(
+            "starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+             Result={result}, NRestarts={n_restarts}"
+        );
+        assert_eq!(
+            active_state, "failed",
+            "the service must remain terminally failed after its refused retry; {diagnostic}"
+        );
+        assert_eq!(
+            starts,
+            Some(burst),
+            "the activation counter must remain at the shipped burst after the refused retry; \
+             {diagnostic}"
+        );
+
+        // And the ordered dependent is released by that terminal state.
+        let mut dependent_state = String::new();
+        let dependent_deadline = Instant::now();
+        while dependent_deadline.elapsed() < Duration::from_secs(TERMINAL_STATE_SLACK_SECS) {
+            dependent_state = systemctl_property(&dependent, "ActiveState");
+            if dependent_state == "active" {
+                break;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        assert_eq!(
+            dependent_state, "active",
+            "the unit ordered behind the failing service must become active once that \
+             service reaches its terminal state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Premise witnesses for the agent template unit (slice B, TB0a and TB0b).
+    //
+    // They exercise systemd, not product code, so they pass on any tree whose
+    // manager behaves as the agent unit assumes; their value is that they run
+    // UNCONDITIONALLY on a real systemd PID 1 before the agent unit's digest is
+    // pinned, and again on every PR (the CI rerun refuses a `SKIP`). Register
+    // id: LINUX-AGENT-TRUSTED-UID-COLLISION-01 closes on the gate plus TB0a.
+    // -----------------------------------------------------------------------
+
+    /// The runtime unit directory systemd reads before `/etc`; a file here is
+    /// gone after a reboot and never touches the shipped fragment path.
+    const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
+
+    /// The value the arrival witness places in the environment file. It is
+    /// `TEST_AGENT_UID` in `tests/integration_linux_runtime_activation.rs`, a
+    /// non-system uid admission accepts, so the witness carries the same shape
+    /// of value the gate's `--trusted-service-uid` argument will.
+    const PROBE_VALUE: &str = "60123";
+
+    /// Overflow uid/gid ("nobody"/"nogroup") on the Ubuntu runner: the account
+    /// exists, and no admission is involved in these premise witnesses.
+    const OVERFLOW_ID: &str = "65534";
+
+    /// `CAP_NET_ADMIN` is capability number 12 (linux/capability.h).
+    const CAP_NET_ADMIN_BIT: u32 = 12;
+
+    /// A root-owned scratch directory under `/run` plus one runtime unit,
+    /// removed with a `daemon-reload` on EVERY exit path, including a
+    /// panicking assertion, so a failed run leaves no unit for the next one.
+    struct RuntimeUnitFixture {
+        dir: std::path::PathBuf,
+        unit_name: String,
+        unit_path: std::path::PathBuf,
+    }
+
+    impl RuntimeUnitFixture {
+        fn new(label: &str, dir_mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let tag = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or_default()
+            );
+            let dir = std::path::PathBuf::from(format!("/run/sanctuary-{label}-{tag}"));
+            std::fs::create_dir(&dir).expect("create the root-owned scratch directory");
+            // set_permissions, not the create mode: the process umask would
+            // otherwise strip the 0777 the unprivileged probe line needs.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(dir_mode))
+                .expect("set the scratch directory mode");
+            let unit_name = format!("sanctuary-{label}-{tag}.service");
+            let unit_path = std::path::Path::new(RUNTIME_UNIT_DIR).join(&unit_name);
+            Self {
+                dir,
+                unit_name,
+                unit_path,
+            }
+        }
+
+        /// Writes the unit, reloads the manager and runs one `systemctl start`
+        /// (a oneshot, so it returns when the unit's commands have ended).
+        /// Returns whether the start succeeded; the caller reads the probe files.
+        fn start(&self, unit_text: &str) -> bool {
+            std::fs::create_dir_all(RUNTIME_UNIT_DIR).expect("the runtime unit directory");
+            std::fs::write(&self.unit_path, unit_text).expect("write the runtime unit");
+            let reload = Command::new("systemctl")
+                .arg("daemon-reload")
+                .output()
+                .expect("run systemctl daemon-reload");
+            assert!(reload.status.success(), "daemon-reload must succeed");
+            Command::new("timeout")
+                .args(["60", "systemctl", "start", &self.unit_name])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for RuntimeUnitFixture {
+        fn drop(&mut self) {
+            let _ = Command::new("systemctl")
+                .args(["stop", &self.unit_name])
+                .output();
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", &self.unit_name])
+                .output();
+            let _ = std::fs::remove_file(&self.unit_path);
+            let _ = Command::new("systemctl").arg("daemon-reload").output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// True when the caller is root and a system manager answers. Reports the
+    /// reason it cannot run, so a skip is never silent; the CI rerun refuses it.
+    fn root_and_systemd_available() -> bool {
+        // SAFETY: geteuid() is always successful and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP (premise witness needs root to write {RUNTIME_UNIT_DIR})");
+            return false;
+        }
+        systemd_run_available()
+    }
+
+    /// The first `systemctl --version` line, written at the head of the evidence.
+    fn systemd_version_line() -> String {
+        Command::new("systemctl")
+            .arg("--version")
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The arrival probe unit. `%%s` is a literal `%s` (a bare `%s` is the
+    /// systemd user-shell specifier, and a probe whose output names a shell
+    /// path hit that, not the premise); `$$#` and `$$@` are the shell's `$#` and
+    /// `$@` (a bare `$` is systemd's own variable syntax, and a probe whose count
+    /// line is empty or literal hit that instead). `${PROBE}` is the braced
+    /// form the agent unit's gate line uses. `User=` mirrors the agent unit: the
+    /// `+` line ignores it, and PID 1, not that user, parses the 0600 file.
+    fn arrival_unit(dir: &std::path::Path, env_file: &std::path::Path, unset: bool) -> String {
+        let unset_line = if unset {
+            "UnsetEnvironment=PROBE\n"
+        } else {
+            ""
+        };
+        format!(
+            "[Service]\n\
+             Type=oneshot\n\
+             User={OVERFLOW_ID}\n\
+             Group={OVERFLOW_ID}\n\
+             EnvironmentFile={env}\n\
+             {unset_line}\
+             ExecStartPre=+/bin/sh -c 'printf \"%%s\\n\" \"$$#\" \"$$@\" > {dir}/arrival.out' sh ${{PROBE}}\n\
+             ExecStart=/bin/true\n",
+            env = env_file.display(),
+            dir = dir.display(),
+        )
+    }
+
+    /// TB0a (PB12): under the agent unit's shape, a `+` `ExecStartPre=` fed
+    /// `${VAR}` from a root-owned 0600 `EnvironmentFile=` receives exactly one
+    /// argv token equal to the file's value. The control case with
+    /// `UnsetEnvironment=` is RECORDED (count 0 means the braced argument was
+    /// dropped, count 1 with an empty token means it expanded empty); it does
+    /// not decide the test because the directive is not in the agent unit.
+    #[test]
+    fn tb0a_a_plus_exec_start_pre_receives_the_environment_file_value_as_one_token() {
+        if !root_and_systemd_available() {
+            return;
+        }
+        let evidence_version = systemd_version_line();
+        eprintln!("TB0a systemd: {evidence_version}");
+
+        let run = |unset: bool| -> (bool, Option<String>) {
+            let fixture = RuntimeUnitFixture::new(if unset { "tb0a-ctl" } else { "tb0a" }, 0o700);
+            let env_file = fixture.dir.join("probe.env");
+            {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&env_file)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "PROBE={PROBE_VALUE}")
+                    })
+                    .expect("write the root-owned 0600 environment file");
+                std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600))
+                    .expect("mode 0600 on the environment file");
+            }
+            let started = fixture.start(&arrival_unit(&fixture.dir, &env_file, unset));
+            let out = std::fs::read_to_string(fixture.dir.join("arrival.out")).ok();
+            (started, out)
+        };
+
+        let (control_started, control_out) = run(true);
+        eprintln!(
+            "TB0a control (UnsetEnvironment=PROBE, recorded not blocking): started={control_started} \
+             arrival.out={control_out:?} branch={}",
+            match control_out.as_deref() {
+                Some("0\n") => "argument dropped (count 0)",
+                Some("1\n\n") => "argument expanded empty (count 1, empty token)",
+                Some(other) if other.starts_with(&format!("1\n{PROBE_VALUE}")) => {
+                    "value still arrived (the two-family reading is refuted)"
+                }
+                _ => "other (see arrival.out)",
+            }
+        );
+
+        let (started, out) = run(false);
+        eprintln!("TB0a positive: started={started} arrival.out={out:?}");
+        assert!(started, "the positive arrival unit must start");
+        assert_eq!(
+            out.as_deref(),
+            Some(format!("1\n{PROBE_VALUE}\n").as_str()),
+            "a `+` ExecStartPre= must receive ${{PROBE}} from the EnvironmentFile= as exactly \
+             one argv token equal to the file value (PB12)"
+        );
+    }
+
+    /// Parses a `/proc/<pid>/status` `CapEff:` line into its bit set.
+    fn cap_eff(line: &str) -> u64 {
+        let hex = line
+            .trim()
+            .strip_prefix("CapEff:")
+            .map(str::trim)
+            .unwrap_or_else(|| panic!("not a CapEff line: {line:?}"));
+        u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("CapEff hex {hex:?}: {e}"))
+    }
+
+    /// TB0b (PB5, the `+` half): under `User=`, `NoNewPrivileges=yes` and an
+    /// empty `CapabilityBoundingSet=`, a `+` `ExecStartPre=` still holds
+    /// `CAP_NET_ADMIN` (so the kernel gate can list the owned table) and a
+    /// non-prefixed one holds no capability at all.
+    #[test]
+    fn tb0b_a_plus_exec_start_pre_keeps_cap_net_admin_under_an_empty_bounding_set() {
+        if !root_and_systemd_available() {
+            return;
+        }
+        eprintln!("TB0b systemd: {}", systemd_version_line());
+        // 0777: the unprivileged line runs as the overflow uid and must write here.
+        let fixture = RuntimeUnitFixture::new("tb0b", 0o777);
+        let dir = fixture.dir.display().to_string();
+        let unit = format!(
+            "[Service]\n\
+             Type=oneshot\n\
+             User={OVERFLOW_ID}\n\
+             Group={OVERFLOW_ID}\n\
+             NoNewPrivileges=yes\n\
+             CapabilityBoundingSet=\n\
+             ExecStartPre=/bin/sh -c 'grep -m1 \"^CapEff:\" /proc/self/status > {dir}/unpriv.caps'\n\
+             ExecStartPre=+/bin/sh -c 'grep -m1 \"^CapEff:\" /proc/self/status > {dir}/plus.caps'\n\
+             ExecStart=/bin/true\n"
+        );
+        let started = fixture.start(&unit);
+        let plus = std::fs::read_to_string(fixture.dir.join("plus.caps")).unwrap_or_default();
+        let unpriv = std::fs::read_to_string(fixture.dir.join("unpriv.caps")).unwrap_or_default();
+        eprintln!("TB0b: started={started} plus.caps={plus:?} unpriv.caps={unpriv:?}");
+        assert!(started, "the capability probe unit must start");
+        assert!(
+            cap_eff(&plus) & (1u64 << CAP_NET_ADMIN_BIT) != 0,
+            "the `+` ExecStartPre= must hold CAP_NET_ADMIN under an empty bounding set: {plus:?}"
+        );
+        assert_eq!(
+            cap_eff(&unpriv),
+            0,
+            "the non-prefixed ExecStartPre= must hold no capability: {unpriv:?}"
+        );
+    }
 }

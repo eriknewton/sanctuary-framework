@@ -34,22 +34,48 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use castle_wall_daemon::config::LinuxRuntimePaths;
 use castle_wall_daemon::daemon::{self, DaemonError, DaemonRuntimeState};
-use castle_wall_daemon::nftables::{self, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX};
+use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
+use castle_wall_daemon::manifest::verify::{
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+};
+use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+use castle_wall_daemon::nftables::{
+    self, SafetyNetScope, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX,
+};
 use castle_wall_daemon::ownership_journal::{
-    DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
+    self, DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
 };
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
+use castle_wall_daemon::runtime_providers::{
+    self, arm_shutdown_after_slice_a_scope_resolution_for_test,
+    force_next_agent_binding_readback_mismatch_for_test,
+    force_next_agent_binding_write_ahead_error_for_test,
+};
+use castle_wall_daemon::safety_net_uid::{
+    validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
+};
 use castle_wall_daemon::DaemonConfig;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+/// The uid these two A7 tests confine, and the manifest ceiling it clears.
+/// `bind_admitted_uid_before_ready`'s install and readback steps (A3, A4) only
+/// run under a `Confined` identity, so both the fail-before and the ordering
+/// test need a manifest that actually confines someone.
+const TEST_AGENT_UID: u32 = 60123;
+const TEST_UID_CEILING: u32 = 1000;
 
 /// The host-global runtime dir the boot path's lock lives under in PRODUCTION.
 /// Named here only so the isolation assertions can prove this suite stays out
@@ -62,7 +88,7 @@ mod isolation;
 /// Suite-entry guard: serializes this binary's tests and re-asserts, on every
 /// entry, that no production runtime object has been resolved. See
 /// [`isolation`] for why both halves are needed.
-fn suite_guard() -> std::sync::MutexGuard<'static, ()> {
+fn suite_guard() -> isolation::SuiteGuard {
     isolation::guard()
 }
 
@@ -143,8 +169,13 @@ fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
     }
     let json = std::str::from_utf8(&output.stdout)
         .map_err(|err| format!("nft JSON was not UTF-8: {err}"))?;
-    nftables::parse_owned_table_identity(json)
-        .map_err(|err| format!("nft JSON lacked the required owned handles/shape: {err}"))
+    // NoneConfined: this suite installs no per-agent binding, so one appearing in
+    // the live table is state the helper cannot vouch for and must refuse.
+    nftables::parse_owned_table_identity(
+        json,
+        &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
+    )
+    .map_err(|err| format!("nft JSON lacked the required owned handles/shape: {err}"))
 }
 
 /// The isolated equivalent of the production `RuntimeDirectory=` /
@@ -179,7 +210,120 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         // The host-global lock / ownership journal / journal MAC key all land in
         // the suite's temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolated_paths(),
+        test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
     }
+}
+
+/// Like [`fresh_config`], but keyed to a CALLER-SUPPLIED signing key, so the
+/// caller can also sign a manifest under that same key before boot. The pinned
+/// key and the manifest signature must trace to one key pair, or the daemon
+/// rejects the manifest at signature verification for a reason that has
+/// nothing to do with the confined uid these two A7 tests mean to exercise.
+fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
+    DaemonConfig {
+        fortress_id: "deadbeef".to_string(),
+        socket_path: dir.path().join("filter.sock"),
+        policy_dir: dir.path().to_path_buf(),
+        wal_path: dir.path().join("wal.jsonl"),
+        pinned_public_key_path: write_pinned_key(dir, signing),
+        producer_key_path: dir.path().join("audit-producer.key"),
+        producer_pub_key_path: dir.path().join("audit-producer.pub"),
+        prompt_timeout: Duration::from_secs(30),
+        no_wall_max_duration: Duration::from_secs(3600),
+        wal_ttl: Duration::from_secs(86_400),
+        wal_size_cap_bytes: 16 * 1024 * 1024,
+        trusted_service_uid: Some(unsafe { libc::geteuid() }),
+        linux_runtime_paths: isolated_paths(),
+        test_boot_time_shutdown_requested: false,
+        test_delay_before_ready_ms: None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out.iter() {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Write a manifest the daemon admits, confining [`TEST_AGENT_UID`]. Mirrors
+/// `write_signed_manifest_one_rule_with_uid_origin` in
+/// `integration_failure_modes.rs`: a per-agent kernel binding is only
+/// legitimate because a manifest in force confines that uid, and both A7 tests
+/// below need `bind_admitted_uid_before_ready` to actually reach the install
+/// and readback steps (A3, A4), which run only under a `Confined` identity.
+fn write_confining_manifest(policy_dir: &Path, signing: &SigningKey) {
+    std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let body = b"{\"id\":\"rule-allow-ip\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{\"ip\":[\"203.0.113.10\"],\"port\":[443],\"protocol\":\"tcp\"},\"disposition\":\"allow\"}";
+    std::fs::write(
+        policy_dir.join(RULES_SUBDIR).join("rule-allow-ip.json"),
+        body,
+    )
+    .unwrap();
+    // Every composed manifest must carry the genuine habeas local lane
+    // (always-on-lane gate), or the daemon rejects it at parse.
+    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    std::fs::write(
+        policy_dir
+            .join(RULES_SUBDIR)
+            .join("reserved_habeas_distress_local.json"),
+        habeas_body,
+    )
+    .unwrap();
+    let manifest = AllowlistManifest {
+        schema_version: 1,
+        fortress_id: "deadbeef".to_string(),
+        issued_at: "2026-05-06T00:00:00Z".to_string(),
+        generation: 1,
+        // Must match TEST_AGENT_UID / TEST_UID_CEILING above.
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: None,
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
+        operator_baseline: None,
+        rules: vec![
+            ManifestRuleEntry {
+                rule_id: "rule-allow-ip".to_string(),
+                file: "rule-allow-ip.json".to_string(),
+                sha256: sha256_hex(body),
+            },
+            ManifestRuleEntry {
+                rule_id: "reserved_habeas_distress_local".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
+                sha256: sha256_hex(habeas_body),
+            },
+        ],
+    };
+    let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+    let sig = signing.sign(&canonical);
+    let signed = SignedManifest {
+        manifest,
+        signature: ManifestSignature {
+            signature_scheme: "ed25519-v1".to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
+            signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sig.to_bytes()),
+        },
+    };
+    std::fs::write(
+        policy_dir.join(MANIFEST_FILENAME),
+        serde_json::to_string_pretty(&signed).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Assert a boot error is the typed kernel-runtime activation fail-before, not
@@ -541,8 +685,11 @@ fn structured_owned_table_listing_contains_required_live_handles() {
     let independent_identity =
         live_owned_identity().expect("independent nft -a -j listing must contain both handles");
     assert_eq!(production_identity, independent_identity);
-    nftables::verify_owned_castle_table(&production_identity)
-        .expect("the captured live handle identity must verify unchanged");
+    nftables::verify_owned_castle_table(
+        &production_identity,
+        &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
+    )
+    .expect("the captured live handle identity must verify unchanged");
     cleanup_castle_table();
 }
 
@@ -614,6 +761,14 @@ fn spawn_long_running_daemon(
         // and delete the operator's real `sanctuary-castle` table.
         .args(isolation_args())
         .env("NOTIFY_SOCKET", notify_socket)
+        // Piped so a caller that needs to observe the daemon's own stderr (the
+        // A7 readback-ordering test below) can read it incrementally while the
+        // daemon is still running, without waiting for it to exit. A caller
+        // that never takes `child.stderr` is unaffected: the daemon's own
+        // startup/shutdown stderr output stays well under a pipe buffer, so an
+        // undrained pipe cannot make it block on a full buffer during this
+        // suite's short-lived runs.
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the shipped daemon binary (long-running)")
 }
@@ -1037,6 +1192,432 @@ fn gf1_lost_owned_table_then_restart_re_arms_deny_all_never_fresh_accept() {
     cleanup_journal();
 }
 
+// --- A162 (register LINUX-BOOT-STOP-HOSTWIDE-NET-01): a stop requested during
+// the BOOT phase never installs a host-wide net, extending A155's post-READY
+// rule to the reclaim-drift, ReArmLostOwned and startup-loss install sites;
+// the slice-A refusal path is covered by its own tests below
+// (LINUX-BOOT-STOP-SLICEA-REFUSAL-01). Both tests below drive the
+// SAME ReArmLostOwned site the two GF1 tests above exercise (boot to ready,
+// stop, delete the table out from under the surviving journal, boot again),
+// but the second boot pre-arms `test_boot_time_shutdown_requested` (the
+// boot-phase counterpart of `--test-shutdown-at pre-recovery`, applied to
+// `DaemonConfig` directly here since these are in-process `daemon::boot()`
+// wired-consumer tests, the same production composition root the GF1 tests
+// above exercise). AGENTS.md rule 4: this proves the production acquisition
+// path reaches the A162 skip, not merely that `stop_time_hostwide_skip` (a
+// unit test in `runtime_providers.rs`) returns the right bool in isolation.
+
+/// A162, unknown-identity leg: the first boot admits no agent (no confining
+/// manifest), so its journal record's `confined` key is absent. On restart the
+/// vanished table resolves ReArmLostOwned with UNKNOWN history -> HostWide
+/// scope. With a stop already requested, the host-wide install must be
+/// SKIPPED entirely (the table stays absent), never installed and then
+/// refused -- unlike the ordinary (no-stop) GF1 re-arm above, which DOES
+/// install it.
+#[test]
+fn a162_boot_stop_skips_hostwide_net_with_unknown_confined_history() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the lost-owned-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+    // The journal survived the ordinary stop; delete the table out from under
+    // it, exactly like the GF1 restart test above.
+    assert!(ownership_journal_path().exists());
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "precondition: the owned table was deleted while the journal asserts ownership"
+    );
+
+    // Boot again with a stop ALREADY requested before kernel activation (the
+    // A162 seam). decide -> ReArmLostOwned; this boot's history is unknown
+    // (no confining manifest was ever admitted), so the resolution is HostWide.
+    let mut config = fresh_config(&dir);
+    config.test_boot_time_shutdown_requested = true;
+    let err = daemon::boot(config).err().expect(
+        "a boot-phase stop over an unknown identity must still fail-before (never reach READY)",
+    );
+    assert_activation_failure(&err);
+
+    // POST-CONDITION, the A162 assertion: unlike the ordinary GF1 re-arm, NO
+    // net was installed. The table stays absent.
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "a stop already requested with no confined identity known must skip the host-wide \
+         install entirely, never install-then-refuse"
+    );
+    // SPECIFICITY (Claude Lens B round 1): the table's absence alone would also
+    // pass if boot failed earlier for an unrelated reason. Pin the failure to
+    // THIS skip: the error names the register id and the skip verb, never the
+    // install arm's text, AND the residual audit row this skip is required to
+    // attempt is actually present in the WAL.
+    assert!(
+        error_names_the_hostwide_skip(&err.to_string()),
+        "the boot error must specifically name the LINUX-BOOT-STOP-HOSTWIDE-NET-01 skip, \
+         not just fail for some other reason that happens to leave the table absent: {err}"
+    );
+    assert!(
+        wal_contains_hostwide_skip_residual_row(&dir),
+        "the residual audit row `stop_time_net_skipped_no_known_identity` must be present"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// A162, known-identity sibling: the first boot DOES admit a confined agent
+/// (a confining manifest), so the journal record's `confined` key names
+/// [`TEST_AGENT_UID`]. On restart the vanished table resolves ReArmLostOwned
+/// with a KNOWN identity -> `SafetyNetScope::Identity`. A stop already
+/// requested must NOT skip this install (memo `Linux_C2a_FailClosed_Architecture_v2`
+/// §1 invariant: a proven loss with a known confined identity always gets its
+/// one net attempt) -- the table must be re-armed exactly as the ordinary
+/// (no-stop) GF1 test above re-arms it.
+#[test]
+fn a162_boot_stop_still_installs_identity_scope_net_with_known_confined_history() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    match daemon::boot(fresh_confining_config(&dir, &signing)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the confined lost-owned-table precondition: \
+                 {err}"
+            ));
+            return;
+        }
+    }
+    assert!(ownership_journal_path().exists());
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "precondition: the owned table was deleted while the journal asserts ownership"
+    );
+
+    let mut config = fresh_confining_config(&dir, &signing);
+    config.test_boot_time_shutdown_requested = true;
+    let err = daemon::boot(config)
+        .err()
+        .expect("a vanished owned table must still fail-before even with a stop already requested");
+    assert_activation_failure(&err);
+
+    // POST-CONDITION: a KNOWN confined identity still gets its one net attempt
+    // under a requested boot-phase stop; the table is re-armed as an
+    // Identity-scoped deny-all net, never skipped.
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "a known confined identity must still install its net even under a boot-phase stop"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net, never HostWide"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- LINUX-BOOT-STOP-SLICEA-REFUSAL-01: the slice-A refusal path's own
+// stop-time HostWide skip, extending A162 to the fourth pre-READY install
+// site. `refuse_after_owned_table` loads the shared shutdown flag live, after
+// the caller's scope resolution has already produced a scope to install and
+// immediately before the one nft transaction this path can issue. Both tests
+// below arm `arm_shutdown_after_slice_a_scope_resolution_for_test` BEFORE
+// calling `daemon::boot`, exactly like the two A162 siblings above arm
+// `test_boot_time_shutdown_requested`; the seam itself only flips the flag
+// once this boot's resolution has already returned a scope, so a stop
+// "already requested" here is observed at the same point a genuine SIGTERM
+// landing in that window would be.
+
+/// Slice-A, widened-scope leg: first boot admits nobody, leaving an owned,
+/// jump-free table. Before the second boot, this boot's KNOWN history is
+/// planted naming uid 0 (root) as a previously confined identity: a same-boot
+/// `Owned` record with an ABSENT `confined` key never reaches this function at
+/// all, because `bind_admitted_uid_before_ready`'s own caller reroutes that
+/// shape (a same-boot record whose history is UNKNOWN) straight to the
+/// `ReArmLostOwned` boot-owner arm before the slice-A decision ever runs (see
+/// the `history_unknown_this_boot` reroute a few lines above the call into
+/// this module's acquisition match). A KNOWN history naming an uncovered uid
+/// does reach it. The second boot admits [`TEST_AGENT_UID`]; since root is
+/// never equal to the admitted uid, `plan_admitted_binding`'s history
+/// reconciliation returns `RefuseWithNet` with `uncovered_uids = [0]` before
+/// any write-ahead runs (the forced write-ahead failure is armed as a belt for
+/// the known-history sibling below and is not what reaches this arm here).
+/// `net_scope_for_refusal` then widens the scope: `validate_safety_net_uid`
+/// refuses uid 0 outright (`SafetyNetUidError::Root`), so the resolved
+/// deny set cannot name it, and a member the validator dropped still widens
+/// the installed scope past `Identity` to `HostWide` rather than silently
+/// disappearing. With the seam armed, the host-wide install must be SKIPPED
+/// entirely: the pre-existing table is left exactly as the first boot made
+/// it, never mutated into a deny-all net.
+#[test]
+fn a162_slicea_boot_stop_after_resolution_skips_hostwide_net() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+
+    // First boot: no manifest written yet, so the admitted identity is
+    // Unconfined and the table is created with no per-agent binding.
+    match daemon::boot(fresh_confining_config(&dir, &signing)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the reclaim precondition: {err}"
+            ));
+            return;
+        }
+    }
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "precondition: the owned table survives an ordinary clean stop"
+    );
+
+    // Rewrite the journal in place: keep the real identity/handles (so the
+    // second boot's ownership match still verifies against the live table),
+    // but plant a KNOWN history naming uid 0 (root) as a previously confined
+    // identity. Root can never be the admitted uid, so this boot's history
+    // reconciliation always treats it as uncovered, and `validate_safety_net_uid`
+    // always refuses it (`SafetyNetUidError::Root`), which is what drives the
+    // widened HostWide scope this test asserts on. Planting `confined: None`
+    // (UNKNOWN history) instead would never reach this function's decision at
+    // all: the acquisition match a few lines above the call into this module
+    // reroutes a same-boot record with an ABSENT `confined` key straight to
+    // `ReArmLostOwned` before the slice-A path runs.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let existing = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must authenticate")
+        .expect("the first boot must have left an Owned record");
+    let (identity, table_handle, base_chain_handle) = match existing {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => (identity, table_handle, base_chain_handle),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    let stale_root_history = ownership_journal::OwnershipJournal::owned_with_known_history(
+        identity,
+        table_handle,
+        base_chain_handle,
+        vec![ownership_journal::ConfinedIdentity {
+            uid: 0,
+            role: ownership_journal::ConfinedRole::Agent,
+        }],
+    )
+    .expect("the planted record must be constructible");
+    ownership_journal::store_atomic(&ownership_journal_path(), &stale_root_history, &key)
+        .expect("rewriting the journal to the planted history must store");
+
+    // Second boot: a CONFINING manifest admitting TEST_AGENT_UID (never equal
+    // to the planted root uid, so the history reconciliation's install-net arm
+    // is reached from the reconciliation step itself, before any write-ahead
+    // would run; the forced write-ahead failure is armed only as a belt for
+    // the known-history sibling below), and the seam armed so a stop is
+    // observed once this boot's scope resolution has already run.
+    write_confining_manifest(dir.path(), &signing);
+    let _forced_write_ahead_error = force_next_agent_binding_write_ahead_error_for_test();
+    let _armed_stop_after_resolution = arm_shutdown_after_slice_a_scope_resolution_for_test();
+    let err = daemon::boot(fresh_confining_config(&dir, &signing))
+        .err()
+        .expect("a boot-phase stop observed at the refusal decision must still fail-before");
+    assert_activation_failure(&err);
+
+    let after = nft_list_isolated_table();
+    assert!(
+        !after.contains("policy drop"),
+        "a stop observed at the refusal decision must skip the host-wide install, not race it \
+         in: {after}"
+    );
+    assert!(
+        after.contains("policy accept"),
+        "the pre-existing table (from the first, Unconfined boot) must be left exactly as it \
+         was, never mutated by the skipped install: {after}"
+    );
+    assert!(
+        error_names_the_slicea_refusal_skip(&err.to_string()),
+        "the boot error must specifically name the LINUX-BOOT-STOP-SLICEA-REFUSAL-01 skip, not \
+         just fail for some other reason that happens to leave the table unchanged: {err}"
+    );
+    assert!(
+        wal_contains_hostwide_skip_residual_row(&dir),
+        "the residual audit row `stop_time_net_skipped_no_known_identity` must be present"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// Slice-A, known-identity sibling of the widened-scope leg above: the first
+/// boot runs without a confining manifest and the test then plants
+/// [`TEST_AGENT_UID`] in this boot's history (see the body), so the journal
+/// names it before the second boot. The second boot's forced write-ahead
+/// failure routes through the same `install_net=true` arm, but this time the
+/// pre-match history names only the uid the second boot itself admits, so
+/// nothing is uncovered and `validate_safety_net_uid` accepts it, and the
+/// resolution is `SafetyNetScope::Identity` with no widening. Memo
+/// `Linux_C2a_FailClosed_Architecture_v2` §1 invariant: a known confined
+/// identity always gets its one net attempt, so even with the seam armed the
+/// install must proceed, never skip.
+#[test]
+fn a162_slicea_boot_stop_after_resolution_still_installs_identity_scope_net() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    // First boot, over a manifest that confines nobody: it creates and owns
+    // the table and writes this boot's record with no per-agent jump.
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the owned-empty-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+
+    // Rewrite the record so this boot's confined history names the uid,
+    // keeping the identity and both kernel handles the first boot captured.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = match ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the first boot's record must authenticate")
+        .expect("the first boot must leave an ownership record")
+    {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => ownership_journal::OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            vec![ownership_journal::ConfinedIdentity {
+                uid: TEST_AGENT_UID,
+                role: ownership_journal::ConfinedRole::Agent,
+            }],
+        )
+        .expect("the planted record must be constructible"),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    // Second boot: the manifest now admits the uid, the write-ahead is forced
+    // to fail, and the seam is armed so a stop is observed once this boot's
+    // scope resolution has already run.
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+    let _forced_error = force_next_agent_binding_write_ahead_error_for_test();
+    let _armed_stop_after_resolution = arm_shutdown_after_slice_a_scope_resolution_for_test();
+    let boot_result = daemon::boot(config);
+
+    let message = match boot_result {
+        Ok(_handle) => panic!("a failed write-ahead must withhold READY=1"),
+        Err(err) => {
+            assert_activation_failure(&err);
+            err.to_string()
+        }
+    };
+    if !message.contains("write-ahead forced to fail") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced write-ahead seam: {message}"
+        ));
+        return;
+    }
+    assert!(
+        message.contains("Installed the safety net and refusing readiness"),
+        "a known confined identity must still get its one net attempt under a boot-phase stop \
+         observed at the refusal decision, via the slice-A refusal site \
+         (`refuse_after_owned_table`'s exact sentence), never via the `ReArmLostOwned` boot-owner \
+         arm (whose own install sentence differs: \"table vanished (external delete)\" with a \
+         lower-case \"installed\"): {message}"
+    );
+    assert!(
+        !message.contains("table vanished (external delete)"),
+        "this leg must reach the slice-A refusal path (`bind_admitted_uid_before_ready`), not the \
+         `ReArmLostOwned` boot-owner arm that a same-boot record with UNKNOWN history would \
+         reroute to: {message}"
+    );
+    let denied = installed_net_rule_one_uids();
+    assert!(
+        denied.contains(&TEST_AGENT_UID),
+        "rule 1 of the installed net must deny the uid the bind was about to make live; \
+         denied={denied:?}, refusal={message}"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
 /// Explicit disarm REFUSES a foreign table (no ownership proof) and leaves it
 /// intact. (blockers 1, 2, 6: disarm never deletes by name)
 #[test]
@@ -1165,4 +1746,2420 @@ fn the_isolation_seam_cannot_be_aimed_at_a_production_or_foreign_table() {
     let err = nftables::use_isolated_castle_table(&format!("{ISOLATED_TABLE_PREFIX}other"))
         .expect_err("switching tables mid-process must be refused");
     assert!(err.contains("already resolved"), "{err}");
+}
+
+// ---- A7: readback fail-before, and readback-before-readiness ordering -----
+//
+// Slice A design packet section 2 (A4) and section 5 (leg L-A): `READY=1`
+// implies the admitted uid's jump was READ BACK from the kernel, not merely
+// that the load call returned `Ok`. The two tests below are the builder's
+// deviation item 6 ("the clearest gap against A7"), closed here.
+
+/// A7 fail-before: a forced kernel readback mismatch must withhold readiness.
+///
+/// `bind_admitted_uid_before_ready`'s readback step (A4) is the ONLY thing
+/// standing between "the kernel accepted the load call" and "the kernel
+/// actually holds the admitted uid's jump"; an `Ok` from the load proves
+/// nothing about what a concurrent actor did a moment later. This test cannot
+/// wait for a genuine race to lose that way on demand, so it drives the exact
+/// branch through the test-isolation seam
+/// (`force_next_agent_binding_readback_mismatch_for_test`,
+/// `runtime_providers.rs`) and asserts the daemon takes the IDENTICAL
+/// production refusal a real kernel divergence would, never a parallel
+/// test-only path: the forced detail is folded into the same
+/// `readback_failure` variable a genuine `UidMismatch` would produce, before
+/// the branch that returns `refuse_after_owned_table`.
+///
+/// In-process (not `spawn_long_running_daemon`): the seam is a static in this
+/// same address space, and a subprocess would boot with its own fresh, unarmed
+/// copy of it, so nothing here would need to reach across a process boundary.
+///
+/// BOUND on what it observes: the ABSENCE of the readback-success line is NOT
+/// asserted here. Rust's default test harness captures `eprintln!` inside the
+/// harness before it reaches file descriptor 2, so an fd-2 swap in this process
+/// reads empty whether or not the line was emitted, and an assertion over that
+/// buffer would stay green if the emission moved above the readback guard. That
+/// absence is NOT covered out of process either:
+/// `readback_line_is_emitted_on_a_boot_that_reaches_readiness` boots
+/// successfully and asserts the line's PRESENCE on that different, non-failing
+/// boot, never its absence on this one. What this test asserts instead is the
+/// readiness datagram's absence, which crosses a socket the harness does not
+/// touch; moving the emission above the readback guard would still leave both
+/// tests green, which is a named residual, not a covered case.
+#[test]
+fn a_forced_readback_mismatch_withholds_readiness() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // Bound, not discarded: the guard's `Drop` clears the latch, so it must
+    // outlive the one `daemon::boot` call below it exists to cover, exactly as
+    // `force_next_reclaim_owned_probe_error_for_test`'s callers already do in
+    // `integration_gf1_recovery.rs`.
+    let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
+
+    // The NEGATIVE observation this test owes: no readiness datagram may reach a
+    // configured NOTIFY_SOCKET. Armed BEFORE the boot call, because the beacon
+    // reads the variable once.
+    let readiness = ReadinessProbe::armed();
+    let boot_result = daemon::boot(config);
+
+    match boot_result {
+        Ok(_handle) => panic!(
+            "a forced readback mismatch must withhold READY=1 (return Err), not hand back a \
+             ready handle"
+        ),
+        Err(err) => {
+            assert_activation_failure(&err);
+            let message = err.to_string();
+            if !message.contains("forced to mismatch") {
+                // The daemon failed-before for some OTHER reason (most likely an
+                // unprivileged runner that cannot acquire nft/CAP_NET_ADMIN at
+                // all) before ever reaching the A4 readback step this test means
+                // to exercise. Skip like every other privileged-path test in this
+                // file, rather than asserting text this run could never produce;
+                // `SANCTUARY_EXPECT_PRIVILEGED_LINUX=1` turns this into a hard
+                // failure on the privileged CI job, same as the rest of the file.
+                cleanup_castle_table();
+                cleanup_journal();
+                skip_or_fail_unprivileged(&format!(
+                    "boot did not reach the forced readback seam: {message}"
+                ));
+                return;
+            }
+            assert!(
+                message.contains("did not read back from the kernel"),
+                "the refusal must go through the A4 readback guard, not some unrelated \
+                 acquisition failure; got: {message}"
+            );
+            readiness.assert_silent();
+        }
+    }
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// CAPABILITY: after a fresh acquisition, the ownership journal names THIS
+/// boot's identity, owner marker and kernel handles, and a refusal that
+/// withholds readiness leaves that record exactly as the acquisition wrote it.
+///
+/// Why it needs a wired test rather than a unit test: the property is about what
+/// the whole acquisition leaves on disk, not about one function's return value.
+/// The schedule drives it end to end: a valid previous-boot `Owned` record is
+/// planted (authenticated with the real key, so the acquisition treats it as
+/// genuine) with no live table, which routes the acquisition to `FreshCreate`;
+/// the readback is then forced to fail, which drives the refusal path. The
+/// journal is READ BACK and must hold the FRESH record, its confined history
+/// exactly the one uid the write-ahead put there.
+///
+/// BOUND on what it proves: the refusal path no longer writes the journal at
+/// all, so this is a regression guard on the record's contents, not a
+/// discriminator between a correct write and a stale one. The property that
+/// there is no write to get wrong is pinned at the source by
+/// `the_slice_a_refusal_path_never_reads_or_writes_the_journal`.
+/// Register: defect.linux-pr3b-refusal-record.
+#[test]
+fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // PLANT the previous boot's record. The values are deliberately distinctive
+    // so a restored record is unmistakable in the assertion below.
+    const PLANTED_TABLE_HANDLE: u64 = 999_001;
+    const PLANTED_BASE_CHAIN_HANDLE: u64 = 999_002;
+    // CROSS-FILE PIN: the prefix must match `OWNER_MARKER_PREFIX` in
+    // `src/nftables.rs`; the 32 hex digits are the 128-bit nonce `new_owner_marker`
+    // emits, spelled out here so this planted value can never collide with a real
+    // one drawn from /dev/urandom.
+    let planted_marker = format!(
+        "{}deadbeefdeadbeefdeadbeefdeadbeef",
+        nftables::OWNER_MARKER_PREFIX
+    );
+    // CROSS-FILE PIN: the journal's boot-id grammar is hexadecimal digits and
+    // hyphens only (`ownership_journal::store_atomic` validates it before
+    // writing), so a mnemonic suffix makes the plant unstorable and the test
+    // panics before the schedule it means to drive. These 32 hex digits are
+    // distinct from any real `/proc/sys/kernel/random/boot_id` by construction:
+    // the host's value is random and this one is a fixed pattern.
+    let planted_boot_id = "00000000-0000-4000-8000-00000000d1fe".to_string();
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = ownership_journal::OwnershipJournal::owned_with_known_history(
+        ownership_journal::JournalIdentity {
+            schema_version: ownership_journal::JOURNAL_SCHEMA_VERSION,
+            marker: planted_marker.clone(),
+            boot_id: planted_boot_id.clone(),
+            source: ownership_journal::current_source(),
+        },
+        PLANTED_TABLE_HANDLE,
+        PLANTED_BASE_CHAIN_HANDLE,
+        Vec::new(),
+    )
+    .expect("the planted record must be constructible");
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
+    let boot_result = daemon::boot(config);
+    let message = match boot_result {
+        Ok(_handle) => panic!("a forced readback mismatch must withhold READY=1"),
+        Err(err) => err.to_string(),
+    };
+    if !message.contains("forced to mismatch") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced readback seam: {message}"
+        ));
+        return;
+    }
+
+    // READ THE JOURNAL BACK: the record this acquisition created, unchanged by
+    // the refusal that followed it.
+    let after = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must still authenticate after the refusal")
+        .expect("the refusal must not clear the ownership record");
+    match after {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            confined,
+        } => {
+            assert_ne!(
+                identity.boot_id, planted_boot_id,
+                "a refusal must not restore a previous boot's identity"
+            );
+            assert_eq!(
+                identity.boot_id,
+                ownership_journal::current_boot_id().expect("a readable boot id"),
+                "the record must name THIS boot"
+            );
+            assert_ne!(
+                identity.marker, planted_marker,
+                "a refusal must not restore a previous boot's owner marker"
+            );
+            assert_ne!(
+                table_handle, PLANTED_TABLE_HANDLE,
+                "a refusal must not restore a previous boot's table handle"
+            );
+            assert_ne!(
+                base_chain_handle, PLANTED_BASE_CHAIN_HANDLE,
+                "a refusal must not restore a previous boot's base chain handle"
+            );
+            // The history is EXACTLY what the acquisition's own write-ahead put
+            // there: one entry, the admitted uid. A refusal that appended to it
+            // would show up here as a second member or a changed role.
+            let history = confined.expect("the fresh record's history is known, not absent");
+            let uids: Vec<u32> = history.iter().map(|entry| entry.uid).collect();
+            assert_eq!(
+                uids,
+                vec![TEST_AGENT_UID],
+                "the refusal must leave the write-ahead's history untouched"
+            );
+        }
+        other => panic!("the refusal must leave an Owned record, got {other:?}"),
+    }
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// CAPABILITY: when the confined-uid write-ahead fails, the daemon refuses
+/// readiness AND the kernel is left holding a safety net whose rule 1 denies the
+/// uid it was about to bind.
+///
+/// Why it needs a fault-injected wired test rather than a unit test: neither the
+/// pure planner's tests nor a source-region pin can show what the kernel ends up
+/// holding on this arm, and the arm needs a journal failure to reach. The seam
+/// forces the SAME `Result` the real persist returns, so the branch taken here
+/// is the production one. Register: defect.linux-pr3b-refusal-record.
+///
+/// THE PLANTED SCHEDULE, and why a fresh first start is the wrong one: the
+/// net-on-refusal predicate reads this boot's confined history and the live
+/// binding set, and on a first start both are empty, so the production answer is
+/// correctly NO NET and an assertion that a net was installed fails on a correct
+/// daemon. The schedule that requires one is the deleted-jump shape: the wall
+/// owns a table, this boot's authenticated record already names the uid, and the
+/// per-agent jump is not in the table. That is planted here by booting once over
+/// a manifest that confines nobody (which leaves an owned, jump-free table),
+/// rewriting the record it wrote to carry this boot's history `[TEST_AGENT_UID]`
+/// under the real MAC key, and only then arming the fault.
+///
+/// FAILURE MODE worth stating: on an unprivileged runner the boot fails before
+/// it ever reaches the write-ahead, which looks identical to a pass unless the
+/// refusal text is checked; that is what the skip branches below are for, and
+/// `SANCTUARY_EXPECT_PRIVILEGED_LINUX=1` turns a skip into a hard failure.
+///
+/// BOUND on what it observes: as in `a_forced_readback_mismatch_withholds_readiness`,
+/// the absence of the two pinned stderr lines is not asserted in this process,
+/// because the default test harness captures `eprintln!` before file descriptor
+/// 2 and such an assertion would be vacuous. The readiness datagram and the
+/// INSTALLED kernel scope are what this test observes, and neither goes through
+/// the harness.
+#[test]
+fn a_failed_write_ahead_refuses_readiness_and_installs_a_net_naming_the_uid() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    // FIRST BOOT, over a manifest that confines nobody: it creates and owns the
+    // table and writes this boot's record, and it installs no per-agent jump, so
+    // what it leaves behind is exactly the owned, EMPTY table the schedule needs.
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the owned-empty-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+
+    // REWRITE THE RECORD so this boot's confined history names the uid, keeping
+    // the identity and both kernel handles the first boot captured: those are
+    // what the reclaim matches the live table against, and a synthesised marker
+    // or handle would route the next boot to a refusal before the bind.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = match ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the first boot's record must authenticate")
+        .expect("the first boot must leave an ownership record")
+    {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => ownership_journal::OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            vec![ownership_journal::ConfinedIdentity {
+                uid: TEST_AGENT_UID,
+                role: ownership_journal::ConfinedRole::Agent,
+            }],
+        )
+        .expect("the planted record must be constructible"),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    // SECOND BOOT: the manifest now admits the uid, the table is owned and holds
+    // no jump for it, and the write-ahead is forced to fail.
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // Bound, not discarded: the guard's `Drop` clears the latch, so it must
+    // outlive the one `daemon::boot` call it exists to cover.
+    let _forced_error = force_next_agent_binding_write_ahead_error_for_test();
+    let readiness = ReadinessProbe::armed();
+    let boot_result = daemon::boot(config);
+
+    let message = match boot_result {
+        Ok(_handle) => panic!("a failed write-ahead must withhold READY=1"),
+        Err(err) => {
+            assert_activation_failure(&err);
+            err.to_string()
+        }
+    };
+    if !message.contains("write-ahead forced to fail") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced write-ahead seam: {message}"
+        ));
+        return;
+    }
+    assert!(
+        message.contains("could not be written into this boot's confined history"),
+        "the refusal must go through the write-ahead guard: {message}"
+    );
+    assert!(
+        message.contains("Installed the safety net"),
+        "a failed write-ahead over a history that names a uid must not leave the refusal \
+         netless: {message}"
+    );
+    // THE KERNEL, not the sentence. The refusal's introductory text names the
+    // admitted uid whatever scope was installed, so searching the message for it
+    // would pass on a net that protects somebody else. This reads rule 1 back out
+    // of the table the daemon left behind.
+    let denied = installed_net_rule_one_uids();
+    assert!(
+        denied.contains(&TEST_AGENT_UID),
+        "rule 1 of the installed net must deny the uid the bind was about to make live; \
+         denied={denied:?}, refusal={message}"
+    );
+    readiness.assert_silent();
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// Rule 1's uid set, read back out of the live isolated table.
+///
+/// CROSS-FILE PIN: the rule is recognised by its comment, which must match
+/// `NET_RULE_COMMENT_IDENTITY` in `src/nftables.rs`; the emitter and this reader
+/// share that one constant rather than two copies of a string. The uid set is
+/// taken from the PARSED ruleset for the same reason `integration_kernel_binding.rs`
+/// parses rather than greps: a text search for the number finds it in a comment,
+/// in a handle, or in another rule, none of which is rule 1's scope.
+///
+/// FAILURE MODE worth stating: an empty return reads the same whether the net is
+/// host-wide (the v1 shape carries no rules) or absent, so a caller asserting
+/// membership must also have asserted that a net was installed at all.
+///
+/// DELIBERATELY LAXER than the product's shared `skuid_right_members`
+/// (`src/nftables.rs`), and not a hand-mirrored copy of it in the sense that
+/// rule warns against: neither `skuid_right_members` nor `one_skuid_scalar`
+/// is `pub`, so this integration-test crate cannot call either one at all,
+/// only the crate's public surface. This helper's `filter_map` on a mixed
+/// `{"set":[60123,"root"]}` member list silently drops the non-numeric entry
+/// rather than refusing the whole match; the product function refuses. That
+/// divergence is safe here because this is a read-only diagnostic reader over
+/// a table THIS test just installed (never adversarial input), and no real
+/// nft output mixes a numeric and a non-numeric member in one skuid set, so
+/// the laxer read never fires on anything but a hand-crafted test fixture the
+/// product-level unit tests already cover separately.
+fn installed_net_rule_one_uids() -> Vec<u32> {
+    let out = Command::new("nft")
+        .args(["-j", "list", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("nft -j list table");
+    let listing = String::from_utf8_lossy(&out.stdout).to_string();
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&listing) else {
+        return Vec::new();
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        if rule.get("comment").and_then(|v| v.as_str()) != Some(nftables::NET_RULE_COMMENT_IDENTITY)
+        {
+            continue;
+        }
+        // nft renders a one-member anonymous set as a bare scalar (`meta skuid
+        // 60123`) and a larger one as `{"set": [..]}`; both are rule 1's scope.
+        // Reading only the set form returned an empty scope for a live one-uid
+        // net on the first privileged run of this suite.
+        let Some(right) = rule
+            .get("expr")
+            .and_then(|v| v.as_array())
+            .and_then(|exprs| exprs.first())
+            .and_then(|e| e.get("match"))
+            .and_then(|m| m.get("right"))
+        else {
+            return Vec::new();
+        };
+        let members: Vec<u64> = match right.get("set").and_then(|v| v.as_array()) {
+            Some(set) => set.iter().filter_map(|m| m.as_u64()).collect(),
+            None => right.as_u64().into_iter().collect(),
+        };
+        let mut uids: Vec<u32> = members
+            .into_iter()
+            .filter_map(|v| u32::try_from(v).ok())
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        return uids;
+    }
+    Vec::new()
+}
+
+/// Room for any datagram the beacon can send, with margin to spare.
+///
+/// DERIVATION: `READY_DATAGRAM` in `src/systemd_notify.rs` is `READY=1\n`, which
+/// is 8 bytes, and it is the ONLY datagram `signal_ready` writes. 64 is 8 times
+/// that, so a datagram this probe receives is reported whole in the panic message
+/// rather than truncated into bytes that read like a different message. The
+/// margin exists because a truncated read here would be indistinguishable from a
+/// correct one, and the failure would be a misleading panic string rather than a
+/// missed refusal.
+const READINESS_DATAGRAM_BUFFER_BYTES: usize = 64;
+
+/// A bound `NOTIFY_SOCKET` that can answer "was `READY=1` ever sent".
+///
+/// FAILURE MODE worth stating: the beacon reads the environment variable ONCE
+/// per boot, so the variable has to be set before `daemon::boot` is called, not
+/// after; set it late and the test proves nothing because no socket was ever
+/// configured.
+struct ReadinessProbe {
+    socket: UnixDatagram,
+    _dir: TempDir,
+}
+
+impl ReadinessProbe {
+    fn armed() -> Self {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).expect("a bindable notify socket");
+        socket
+            .set_nonblocking(true)
+            .expect("the probe must never block the test");
+        std::env::set_var("NOTIFY_SOCKET", &path);
+        Self { socket, _dir: dir }
+    }
+
+    /// Assert nothing was delivered. A readiness datagram that arrives after a
+    /// refusal is the failure this exists to catch.
+    fn assert_silent(&self) {
+        let mut buf = [0u8; READINESS_DATAGRAM_BUFFER_BYTES];
+        match self.socket.recv(&mut buf) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(n) => panic!(
+                "a refused boot must send no readiness datagram; got {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(err) => panic!("unexpected notify-socket error: {err}"),
+        }
+    }
+}
+
+impl Drop for ReadinessProbe {
+    fn drop(&mut self) {
+        std::env::remove_var("NOTIFY_SOCKET");
+    }
+}
+
+/// The pinned readback line is emitted on a boot that reaches readiness.
+///
+/// BOUND: this asserts PRESENCE, not order. Timestamping a stderr line on one
+/// consumer thread and a `NOTIFY_SOCKET` datagram on another measures when THIS
+/// process was scheduled to observe each, so a correctly emitted line can sit in
+/// a pipe buffer until after readiness is seen (a red on a correct daemon) and a
+/// slow reader can hide a reversed emission (a green on a wrong one). A test that
+/// can fail on correct code and pass on wrong code is not evidence either way, so
+/// the ordering claim is carried elsewhere.
+///
+/// The ORDERING claim is carried by two things that do not depend on reader
+/// scheduling: the line is emitted from the readback parse result and from
+/// nowhere else (`AGENT_BINDING_READBACK_LINE_PREFIX` has exactly one emission
+/// site), and `agent_binding_readback_mismatch_withholds_readiness` proves a
+/// failed readback withholds `READY=1` entirely. The L-A drill leg orders the two
+/// on the real unit using journald `__MONOTONIC_TIMESTAMP` and the unit's
+/// `ActiveEnterTimestampMonotonic`, which is one clock rather than two threads.
+#[test]
+fn readback_line_is_emitted_on_a_boot_that_reaches_readiness() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    let mut child = spawn_long_running_daemon(&dir, &pinned, &notify_path);
+
+    // Drain stderr on a background thread so a full pipe can never make the
+    // daemon block on a write while this thread waits on the notify socket.
+    let stderr = child.stderr.take().expect("stderr must be piped");
+    let seen: Arc<Mutex<(bool, bool)>> = Arc::new(Mutex::new((false, false)));
+    let seen_writer = Arc::clone(&seen);
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF: the child closed its stderr end.
+                Ok(_) => {
+                    let mut flags = seen_writer.lock().unwrap();
+                    if line.contains(runtime_providers::AGENT_BINDING_READBACK_LINE_PREFIX) {
+                        flags.0 = true;
+                    }
+                    // CROSS-FILE PIN: the write-ahead needle L-A3 run 1 greps.
+                    // Must match `AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX` in
+                    // `src/runtime_providers.rs`.
+                    if line.contains(runtime_providers::AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX) {
+                        flags.1 = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let _ = child.wait();
+    // Joining the reader after the child has exited drains stderr to EOF, so the
+    // flags below are read after every line the daemon wrote, not after whatever
+    // this thread happened to be scheduled to see.
+    let _ = reader.join();
+
+    let (readback_seen, write_ahead_seen) = *seen.lock().unwrap();
+    assert!(
+        readback_seen,
+        "the pinned readback line must appear on stderr for a boot that reaches READY=1"
+    );
+    assert!(
+        write_ahead_seen,
+        "the pinned write-ahead line must appear for a boot that installed the binding"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- W1a/W1b: wired-consumer tests for C2a1(a), register id
+// LINUX-STOP-LOSS-RACE-01 (design memo `Linux_C2a_FailClosed_Architecture_v2`
+// §4 test table). AGENTS.md rule 4: a capability that claims a live effect
+// needs a test that constructs the real production object graph and proves
+// the consumer is reached; U1-U4 (this crate's unit tests) prove the decision
+// function and the runtime-provider skip removal in isolation, not that the
+// real `main` binary reaches them. These two tests close that gap.
+
+/// Spawn the shipped daemon exactly like [`spawn_long_running_daemon`], with
+/// additional argv appended after the isolation args. Kept as a separate
+/// function (rather than widening the existing signature) so W1a/W1b's
+/// test-isolation-only seam arguments cannot leak onto the three call sites
+/// above that must keep exercising the daemon's ordinary long-running argv.
+fn spawn_long_running_daemon_with_extra_args(
+    dir: &TempDir,
+    pinned: &std::path::Path,
+    notify_socket: &std::path::Path,
+    extra_args: &[&str],
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .args([
+            "--fortress-id",
+            "deadbeef",
+            "--socket-path",
+            dir.path().join("filter.sock").to_str().unwrap(),
+            "--policy-dir",
+            dir.path().to_str().unwrap(),
+            "--wal-path",
+            dir.path().join("wal.jsonl").to_str().unwrap(),
+            "--pinned-public-key",
+            pinned.to_str().unwrap(),
+            "--producer-key",
+            dir.path().join("audit-producer.key").to_str().unwrap(),
+            "--producer-pub-key",
+            dir.path().join("audit-producer.pub").to_str().unwrap(),
+        ])
+        .args(isolation_args())
+        .args(extra_args)
+        .env("NOTIFY_SOCKET", notify_socket)
+        // C2a3 (LINUX-SUPERVISOR-WEDGE-R1-01): the direct-spawn equivalent of a
+        // drop-in's `WatchdogSec=0`. These seams stretch the health interval, so
+        // an inherited watchdog interval would make this a watchdog run; with no
+        // `WATCHDOG_USEC` the beacon never pets. Failure mode if dropped: an
+        // environment that exports one reads here as extra datagrams, not READY=1.
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the shipped daemon binary (long-running, with test seam args)")
+}
+
+/// Wait up to `timeout` for `child` to exit on its own, polling like
+/// [`wait_for_ready`] rather than blocking indefinitely. On timeout the child
+/// is SIGKILLed and reaped so a wedged daemon cannot hang the suite; the
+/// caller sees that as a failed bound, not a hang.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("could not inspect daemon child: {err}"))?
+        {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "daemon did not exit within {timeout:?} of the loss/shutdown seam"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Build an `Identity` scope through the ONLY admitted constructor path,
+/// mirroring `identity_scope` in `integration_gf1_recovery.rs` (AGENTS.md rule
+/// 5: one source rather than a second hand-mirrored copy would be preferable,
+/// but the two suites are separate compilation units with no shared non-`isolation`
+/// module today, so this is the smallest faithful duplication).
+fn identity_scope(uids: &[u32]) -> SafetyNetScope {
+    let overflow = HostOverflowUid::from_host().expect("a Linux host exposes kernel.overflowuid");
+    let validated: Vec<_> = uids
+        .iter()
+        .map(|&uid| validate_safety_net_uid(uid, overflow).expect("an attestable uid"))
+        .collect();
+    SafetyNetScope::Identity(ConfinedUidSet::from_validated(validated).expect("a non-empty set"))
+}
+
+/// Whether the WAL this run wrote holds a `kernel_runtime_lost` control row
+/// carrying a recovery attempt. Deliberately a raw substring scan rather than
+/// parsing the nested canonical-JSON-inside-JSON `WalEntry` shape
+/// (`audit.rs`'s `append_control_audit_bounded_with_safety_net` embeds the
+/// operation event as an escaped string field): the row's `operation` and
+/// `detail` text survive that escaping unbroken, and this test only needs to
+/// prove the row is present, not parse its full structure.
+fn wal_contains_recovery_row(dir: &TempDir) -> bool {
+    let Ok(contents) = std::fs::read_to_string(dir.path().join("wal.jsonl")) else {
+        return false;
+    };
+    contents.contains("kernel_runtime_lost") && contents.contains("recovery=")
+}
+
+/// Whether the WAL this run wrote holds the LINUX-BOOT-STOP-HOSTWIDE-NET-01 /
+/// A155 residual row `stop_time_hostwide_skip` appends on every host-wide skip
+/// under a requested stop. Same raw-substring-scan rationale as
+/// `wal_contains_recovery_row` above: the operation name is the one literal
+/// every caller's audit trail and any operator grep for this residual class
+/// relies on (`runtime_providers.rs`'s `RESIDUAL_REASON` constant), and this
+/// test only needs to prove the row is present, not parse its full structure.
+fn wal_contains_hostwide_skip_residual_row(dir: &TempDir) -> bool {
+    let Ok(contents) = std::fs::read_to_string(dir.path().join("wal.jsonl")) else {
+        return false;
+    };
+    contents.contains("stop_time_net_skipped_no_known_identity")
+}
+
+/// Whether a boot error's text is SPECIFICALLY the LINUX-BOOT-STOP-HOSTWIDE-NET-01
+/// host-wide skip (never a generic install or an unrelated failure that would
+/// also leave the table absent). Checked by the register id every A162 skip
+/// message carries plus the "skipped" verb, and the ABSENCE of the install
+/// arm's "Installed the safety net" text, so a test asserting on this cannot
+/// pass because the daemon failed for some other reason before ever reaching
+/// the skip decision.
+fn error_names_the_hostwide_skip(message: &str) -> bool {
+    message.contains("LINUX-BOOT-STOP-HOSTWIDE-NET-01")
+        && message.contains("safety net install was skipped")
+        && !message.contains("Installed the safety net")
+}
+
+/// The slice-A-specific sibling of [`error_names_the_hostwide_skip`]: pins the
+/// failure to the LINUX-BOOT-STOP-SLICEA-REFUSAL-01 skip, never to some other
+/// reason that happens to leave the table unchanged.
+fn error_names_the_slicea_refusal_skip(message: &str) -> bool {
+    message.contains("LINUX-BOOT-STOP-SLICEA-REFUSAL-01")
+        && message.contains("safety net install was skipped")
+        && !message.contains("Installed the safety net")
+}
+
+/// W1a (memo §4 test table): the real `main` binary, `--test-health-interval-ms`
+/// set large so no periodic tick follows the initial one, then a proven loss
+/// (the isolated table deleted out from under a READY daemon) racing a manager
+/// stop (SIGTERM). Exercises sites 2/3 (`stop_final_health_outcome` /
+/// `S_STOP_FINAL_HEALTH`): on `174475fe` this exits 0 with the table absent
+/// (mutants M2/M3 restore that bare shutdown-wins-over-loss ordering); after
+/// C2a1(a) it must exit 78 with a freshly installed, recognised net.
+#[test]
+fn stop_racing_a_proven_loss_installs_the_net_w1a() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    // A known confined identity, so the stop-time install is Identity-scoped
+    // (A155): with no confined identity a HostWide install is skipped under
+    // shutdown and only a residual audit row is recorded instead.
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify-w1a.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // 600000ms (10 minutes): far longer than this test's bounded wait below, so
+    // the periodic health tick cannot fire a second time and race the SIGTERM;
+    // the daemon's OWN stop-time final health pass must be what proves the loss.
+    const NO_SECOND_TICK_MS: &str = "600000";
+    let mut child = spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &["--test-health-interval-ms", NO_SECOND_TICK_MS],
+    );
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    // Inject the loss: delete the isolated owned table out from under the
+    // ready daemon, the same real-kernel loss an external delete or `nft
+    // flush` would produce.
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "the loss injection must actually remove the isolated table before SIGTERM races it"
+    );
+
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let status = match wait_for_exit(&mut child, Duration::from_secs(15)) {
+        Ok(status) => status,
+        Err(reason) => {
+            cleanup_castle_table();
+            cleanup_journal();
+            panic!("{reason}");
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(78),
+        "a proven loss racing a manager stop must exit 78 (RepairRequired), never 0; got {status:?}"
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "the stop-time recovery must have installed a fresh table before exit"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net for the \
+         confined uid (A155: a known confined identity gets Identity scope, never HostWide)"
+    );
+    assert!(
+        wal_contains_recovery_row(&dir),
+        "the audit WAL must hold a kernel_runtime_lost row carrying the recovery attempt result"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// W1b (memo §4 test table, site 5): the real `main` binary with the
+/// `--test-shutdown-at pre-recovery` seam armed, which flips the real
+/// shutdown flag on the first live shutdown read inside the recovery
+/// controller, after the component's probe has already seen the loss, so it
+/// proves the site-5 precedence fix (a first-entry proven loss still gets its
+/// one net-install attempt when a stop lands between the probe and the
+/// decision) without racing an OS signal.
+/// No SIGTERM is sent in this test; the daemon stops itself. On `174475fe`
+/// this exits 0 with `NoInstall` (mutant M1's skip, and M3); after C2a1(a) it
+/// must exit 78 with the net live.
+#[test]
+fn shutdown_observed_at_pre_recovery_still_installs_the_net_w1b() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify-w1b.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // A short interval: the seam must fire on the NEXT periodic health call
+    // after the loss is injected below, well inside this test's bounded wait.
+    const HEALTH_TICK_MS: &str = "200";
+    let mut child = spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &[
+            "--test-health-interval-ms",
+            HEALTH_TICK_MS,
+            "--test-shutdown-at",
+            "pre-recovery",
+        ],
+    );
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "the loss injection must actually remove the isolated table before the next health tick"
+    );
+
+    // No external signal: the armed seam sets the shutdown flag itself on the
+    // next health call, immediately before the recovery attempt it protects.
+    let status = match wait_for_exit(&mut child, Duration::from_secs(15)) {
+        Ok(status) => status,
+        Err(reason) => {
+            cleanup_castle_table();
+            cleanup_journal();
+            panic!("{reason}");
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(78),
+        "shutdown observed at the pre-recovery call boundary must still exit 78 \
+         (RepairRequired), never 0; got {status:?}"
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "the recovery attempt this seam races must have installed a fresh table"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- TB9 (slice B): the agent unit's two verbs, run as the REAL binary against
+// a real daemon boot whose isolated table admits TEST_AGENT_UID. Capability:
+// the kernel gate admits only the uid the live owned table binds, refuses the
+// trusted control uid, a missing binding and the deny-all net; the credential
+// check matches only the exact instance credentials. Register ids:
+// `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`,
+// `LINUX-AGENT-TRUSTED-UID-COLLISION-01`. Every assertion names the exit code
+// AND the stderr token, because a binary without the verbs exits 2 (usage)
+// and a code alone could read that as a refusal.
+
+/// A second provisioned-looking agent uid: admission-clean, not the bound one.
+const TB9_OTHER_UID: u32 = TEST_AGENT_UID + 1;
+/// A trusted service uid distinct from both agent uids.
+const TB9_TRUSTED_UID: u32 = TEST_AGENT_UID + 2;
+/// Exit code of a named refusal. Must match `agent_start::EXIT_REFUSED`.
+const TB9_EXIT_REFUSED: i32 = 1;
+/// Exit code of a usage error. Must match `agent_start::EXIT_USAGE`.
+const TB9_EXIT_USAGE: i32 = 64;
+
+/// argv tail that lands a spawned verb on this run's isolated table. Only the
+/// table tag: it is drained before the verb route, so the verb's own argv stays
+/// exact. (`--isolated-runtime-root` and `--trusted-service-uid` from
+/// `isolation_args()` are daemon flags and would make it a usage error.)
+fn tb9_isolated_table_tail() -> [String; 2] {
+    let args = isolation_args();
+    let at = args
+        .iter()
+        .position(|a| a == "--isolated-castle-table-tag")
+        .expect("isolation carries a table tag");
+    [args[at].clone(), args[at + 1].clone()]
+}
+
+fn tb9_gate(uid: u32, trusted: u32, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .args([
+            "--agent-start-gate",
+            &uid.to_string(),
+            "--fortress-id",
+            "deadbeef",
+            "--trusted-service-uid",
+            &trusted.to_string(),
+        ])
+        .args(extra)
+        .args(tb9_isolated_table_tail())
+        .output()
+        .expect("run the agent start gate")
+}
+
+fn tb9_assert(out: &std::process::Output, code: i32, stream_token: &str, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "{what}: exit code; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains(stream_token) || stderr.contains(stream_token),
+        "{what}: expected token {stream_token:?}; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+/// Delete the isolated agent chain for `uid` and its output jump, leaving the
+/// owned table otherwise intact: the L-A2 binding-loss fault.
+fn tb9_delete_agent_chain(uid: u32) {
+    let table = nftables::castle_table();
+    let listing = Command::new("nft")
+        .args(["-a", "-j", "list", "table", CASTLE_FAMILY, table])
+        .output()
+        .expect("list the isolated table");
+    let doc: serde_json::Value = serde_json::from_slice(&listing.stdout).expect("nft JSON listing");
+    let items = doc["nftables"].as_array().expect("nftables array");
+    let suffix = format!(":agent:{}", nftables::confined_agent_id(uid));
+    let chain = items
+        .iter()
+        .filter_map(|i| i.get("chain"))
+        .find(|c| c["comment"].as_str().is_some_and(|m| m.ends_with(&suffix)))
+        .and_then(|c| c["name"].as_str())
+        .expect("the agent chain for the bound uid")
+        .to_string();
+    let jump = items
+        .iter()
+        .filter_map(|i| i.get("rule"))
+        .find(|r| {
+            r["chain"] == "output"
+                && r["expr"].as_array().is_some_and(|e| {
+                    e.iter()
+                        .any(|x| x["goto"]["target"].as_str() == Some(chain.as_str()))
+                })
+        })
+        .and_then(|r| r["handle"].as_u64())
+        .expect("the output jump to the agent chain");
+    for argv in [
+        vec![
+            "delete".to_string(),
+            "rule".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            "output".to_string(),
+            "handle".to_string(),
+            jump.to_string(),
+        ],
+        vec![
+            "flush".to_string(),
+            "chain".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            chain.clone(),
+        ],
+        vec![
+            "delete".to_string(),
+            "chain".to_string(),
+            CASTLE_FAMILY.to_string(),
+            table.to_string(),
+            chain.clone(),
+        ],
+    ] {
+        let out = Command::new("nft").args(&argv).output().expect("run nft");
+        assert!(
+            out.status.success(),
+            "nft {argv:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A 0755 copy of the test binary, so a non-root uid can execute it whatever
+/// the build directory's own modes are (a runner home can be 0750).
+fn tb9_world_executable_binary(dir: &TempDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("0755 scratch dir");
+    let copy = dir.path().join("castle-wall-daemon");
+    std::fs::copy(env!("CARGO_BIN_EXE_castle-wall-daemon"), &copy).expect("copy the binary");
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).expect("0755 binary");
+    copy
+}
+
+fn tb9_credential_check(binary: &Path, setpriv: Option<&[&str]>) -> std::process::Output {
+    let uid = TEST_AGENT_UID.to_string();
+    let mut command = match setpriv {
+        Some(flags) => {
+            let mut c = Command::new("setpriv");
+            c.args(flags).arg("--").arg(binary);
+            c
+        }
+        None => Command::new(binary),
+    };
+    command
+        .args(["--agent-credential-check", &uid])
+        .output()
+        .expect("run the credential check")
+}
+
+/// Reaps the spawned daemon and removes the isolated table and journal on
+/// EVERY exit path, including a failed assertion. Without it a failing TB9
+/// orphans a live daemon holding the isolated table, the host lock and the
+/// test's stdout pipe, and every later run on the host inherits them.
+struct Tb9Daemon(Child);
+
+impl Drop for Tb9Daemon {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+        // The isolated table and any net are removed, and leftovers refused, by
+        // the test's `SuiteGuard` (tests/isolation/mod.rs), which drops after
+        // this with the daemon reaped; no second sweep here.
+    }
+}
+
+#[test]
+fn tb9_the_real_verbs_admit_only_the_bound_uid_and_refuse_by_name() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+    let notify_path = dir.path().join("notify-tb9.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // No second periodic health tick inside this test: the binding-loss case
+    // must be read by the gate BEFORE the wall's own health pass installs the
+    // net, and the net case is then produced by the stop-time final pass.
+    const NO_SECOND_TICK_MS: &str = "600000";
+    let mut daemon = Tb9Daemon(spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &["--test-health-interval-ms", NO_SECOND_TICK_MS],
+    ));
+    // READY=1 follows the pinned readback line (A4), so every gate below runs
+    // after the binding was read back from the kernel.
+    if let Err(reason) = wait_for_ready(&mut daemon.0, &listener, Duration::from_secs(10)) {
+        drop(daemon);
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    let admit = format!("agent_start_gate=admit uid={TEST_AGENT_UID}");
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        0,
+        &admit,
+        "gate for U",
+    );
+    tb9_assert(
+        &tb9_gate(TB9_OTHER_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseBindingSet",
+        "gate for V",
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TEST_AGENT_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseTrustedUidCollision",
+        "gate for U with trusted uid U",
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &["--disarm"]),
+        TB9_EXIT_USAGE,
+        "agent verb usage error",
+        "gate with a smuggled --disarm",
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "a smuggled --disarm must leave the isolated owned table in place"
+    );
+
+    // The credential self-check, as the agent uid through setpriv.
+    let scratch = TempDir::new().unwrap();
+    let binary = tb9_world_executable_binary(&scratch);
+    let reuid = format!("--reuid={TEST_AGENT_UID}");
+    let regid = format!("--regid={TEST_AGENT_UID}");
+    let extra_group = format!("--groups={TB9_OTHER_UID}");
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[
+                &reuid,
+                &regid,
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+            ]),
+        ),
+        0,
+        &format!("agent_credential_check=match uid={TEST_AGENT_UID}"),
+        "credential check as U",
+    );
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[&reuid, &regid, "--clear-groups", "--bounding-set=-all"]),
+        ),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseNoNewPrivs",
+        "credential check without no-new-privs",
+    );
+    tb9_assert(
+        &tb9_credential_check(
+            &binary,
+            Some(&[
+                &reuid,
+                &regid,
+                &extra_group,
+                "--no-new-privs",
+                "--bounding-set=-all",
+            ]),
+        ),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseGroups",
+        "credential check with an extra group",
+    );
+    tb9_assert(
+        &tb9_credential_check(&binary, None),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseUid",
+        "credential check as root",
+    );
+
+    // The binding-loss fault: the owned table survives, the binding does not.
+    tb9_delete_agent_chain(TEST_AGENT_UID);
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseBindingSet",
+        "gate for U after the agent chain was deleted",
+    );
+
+    // The daemon's stop-time final health pass proves the loss and installs
+    // the net naming U; the gate then refuses the net as not the owned shape.
+    let pid = daemon.0.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let status = wait_for_exit(&mut daemon.0, Duration::from_secs(15));
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the stop-time pass must have installed a recognised net (daemon exit {status:?})"
+    );
+    // `live_net_covers_attempt` is also true for the HOST-WIDE net, which drops
+    // every uid on the host. Require the IDENTITY shape: a rule carrying the
+    // identity comment whose skuid scope is exactly {U}. A host-wide net has no
+    // such rule, so this reads empty and fails.
+    assert_eq!(
+        installed_net_rule_one_uids(),
+        vec![TEST_AGENT_UID],
+        "the stop-time net must be the identity net naming exactly U, never host-wide \
+         (daemon exit {status:?})"
+    );
+    tb9_assert(
+        &tb9_gate(TEST_AGENT_UID, TB9_TRUSTED_UID, &[]),
+        TB9_EXIT_REFUSED,
+        "verdict=RefuseNotOwnedShape",
+        "gate for U against the deny-all net",
+    );
+    // `daemon` drops here: the child has exited, and the table and journal go.
+}
+
+// --- TB10 (slice B): the SHIPPED agent template unit under a real systemd PID 1.
+//
+// Capability: the agent unit starts only after its wall's READY=1, is never
+// started behind a wall that failed to start, is stopped before the wall is
+// signalled, is stopped and not restarted when the wall's process dies or
+// exits 75 or 78, never reaches ExecStart when the wall stops during a start,
+// runs as the instance uid, and comes back only through a propagated wall
+// restart. Register ids:
+// `defect.linux-no-agent-launcher-assigns-or-drops-to-the-agent-uid`,
+// `LINUX-AGENT-BOOT-AUTOSTART-01`.
+//
+// Each schedule derives runtime units in /run/systemd/system from the SHIPPED
+// unit by exact, counted textual substitution (so a drifted shipped unit
+// fails the derivation, not silently the schedule), and tears them down with
+// a daemon-reload on every exit path. Schedules (i) to (viii) replace the two
+// verbs and the agent with shell fixtures and bind instance 65534 (the
+// runner's overflow account, which exists and needs no admission); (ix) runs
+// the REAL verbs against a real isolated-table daemon under instance 60123.
+mod tb10_agent_unit_against_real_systemd {
+    use super::*;
+    use std::time::Instant;
+
+    /// Instance for schedules (i) to (viii): the runner's overflow account
+    /// ("nobody"/"nogroup"), present on Ubuntu, so `User=%i` resolves.
+    pub(super) const FIXTURE_INSTANCE: u32 = 65534;
+    /// Fixture READY=1 delay and fixture ExecStartPre= sleep, in seconds: long
+    /// enough that an ordering inversion or a missed cancellation is visible.
+    const FIXTURE_DELAY_SECS: u64 = 5;
+    /// Poll spacing for unit state.
+    const POLL: Duration = Duration::from_millis(100);
+    /// Scheduling and bus latency allowance on top of a derived bound. It is not
+    /// a retry budget.
+    const SLACK: Duration = Duration::from_secs(20);
+
+    pub(super) fn shipped_agent_unit() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("systemd/sanctuary-agent@.service"),
+        )
+        .expect("the shipped agent unit")
+    }
+
+    fn shipped_wall_value(key: &str) -> String {
+        let wall = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("systemd/sanctuary-castle-wall.service"),
+        )
+        .expect("the shipped wall unit");
+        let values: Vec<&str> = wall
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .collect();
+        assert_eq!(values.len(), 1, "the shipped wall sets exactly one {key}");
+        values[0].to_string()
+    }
+
+    fn secs(value: &str) -> u64 {
+        value.parse().expect("whole seconds")
+    }
+
+    /// X = agent `TimeoutStopSec` + 1 s manager and sampling allowance
+    /// (design section 8): the bound on "the agent is inactive" after a wall
+    /// death. Read from the shipped agent unit.
+    fn stop_bound_x() -> Duration {
+        let agent = shipped_agent_unit();
+        let stop = agent
+            .lines()
+            .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+            .expect("agent TimeoutStopSec");
+        Duration::from_secs(secs(stop) + 1)
+    }
+
+    /// W = 2 x (wall `RestartSec` + wall `TimeoutStartSec`) = 124 s today: the
+    /// no-restart observation window (design section 8), read from the
+    /// shipped wall unit so it moves with it.
+    fn no_restart_window_w() -> Duration {
+        Duration::from_secs(
+            2 * (secs(&shipped_wall_value("RestartSec"))
+                + secs(&shipped_wall_value("TimeoutStartSec"))),
+        )
+    }
+
+    /// Replace `from` with `to`, requiring exactly `count` occurrences.
+    pub(super) fn substitute(text: &str, from: &str, to: &str, count: usize) -> String {
+        assert_eq!(
+            text.matches(from).count(),
+            count,
+            "the shipped agent unit must contain {from:?} exactly {count} time(s)"
+        );
+        text.replace(from, to)
+    }
+
+    pub(super) fn systemctl(args: &[&str]) -> std::process::Output {
+        Command::new("timeout")
+            .arg("90")
+            .arg("systemctl")
+            .args(args)
+            .output()
+            .expect("run systemctl")
+    }
+
+    /// The program every teardown `systemctl` call is spawned through (the
+    /// same bounding wrapper `systemctl` above uses).
+    const TEARDOWN_SPAWN_PROGRAM: &str = "timeout";
+
+    /// `systemctl` for TEARDOWN paths: a spawn failure is an `Err`, never a
+    /// panic. A panic inside `Drop` would still drop the struct's fields, and
+    /// any directory still held as a `TempDir` would be deleted under a live
+    /// unit; so nothing reachable from `Tb10Units::drop` may panic.
+    fn try_systemctl(args: &[&str]) -> Result<std::process::Output, String> {
+        Command::new(TEARDOWN_SPAWN_PROGRAM)
+            .arg("90")
+            .arg("systemctl")
+            .args(args)
+            .output()
+            .map_err(|err| format!("spawn {TEARDOWN_SPAWN_PROGRAM} systemctl {args:?}: {err}"))
+    }
+
+    /// `prop` for teardown paths, spawn failure as `Err`.
+    fn try_prop(unit: &str, property: &str) -> Result<String, String> {
+        try_systemctl(&["show", "--value", "-p", property, unit])
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    pub(super) fn prop(unit: &str, property: &str) -> String {
+        String::from_utf8_lossy(&systemctl(&["show", "--value", "-p", property, unit]).stdout)
+            .trim()
+            .to_string()
+    }
+
+    fn mono(unit: &str, property: &str) -> u64 {
+        prop(unit, property).parse().unwrap_or(0)
+    }
+
+    pub(super) fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        done()
+    }
+
+    /// Root, a system manager as PID 1, and a bus that answers. Anything else
+    /// is a skip, which the privileged contract and the CI rerun refuse.
+    pub(super) fn real_systemd_available() -> Result<(), String> {
+        // SAFETY: geteuid() is always successful and has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("TB10 needs root to write /run/systemd/system".to_string());
+        }
+        let init = std::fs::read_to_string("/proc/1/comm").unwrap_or_default();
+        if init.trim() != "systemd" {
+            return Err(format!("PID 1 is {:?}, not systemd", init.trim()));
+        }
+        if !systemctl(&["show", "--value", "-p", "Version"])
+            .status
+            .success()
+        {
+            return Err("no usable system bus".to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether every unit a `Tb10Units` started has been confirmed settled
+    /// (inactive or failed). Shared with `IsolatedKernelState`, whose table
+    /// delete DEPENDS on it rather than on declaration order alone: a daemon
+    /// still in its stop path can recreate the isolated table after a delete.
+    /// Starts true (no units, nothing to wait for); `Tb10Units::guarding` sets
+    /// it false, and only a settled teardown sets it true again.
+    pub(super) type UnitsSettled = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+    /// Runtime units plus scratch state. Teardown, on EVERY exit path: stop
+    /// each unit (agents first, then walls), escalate to SIGKILL when a stop
+    /// does not settle, and ONLY when every unit is settled remove the unit
+    /// files, `daemon-reload`, the per-instance directories and the scratch
+    /// and owned state directories. A unit STILL PRESENT after the kill leaves
+    /// all of that in place, reported, because deleting a live unit's files
+    /// or table is worse than a reported leak.
+    pub(super) struct Tb10Units {
+        pub(super) tag: String,
+        dir: Option<TempDir>,
+        stop_order: Vec<String>,
+        pub(super) files: Vec<PathBuf>,
+        pub(super) extra_dirs: Vec<PathBuf>,
+        /// Directories a live unit reads (the (ix) wall's policy, key and WAL),
+        /// removed only after a settled teardown.
+        owned: Vec<TempDir>,
+        settled: Option<UnitsSettled>,
+        /// The guarding kernel-state guard's copy of `stop_order`.
+        watched: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// `unit_stop_bound()`, computed at construction: it reads the shipped
+        /// unit files and may panic, which is allowed here and never in Drop.
+        stop_bound: Duration,
+    }
+
+    /// What one teardown observed.
+    #[derive(Debug, Default)]
+    pub(super) struct StopReport {
+        /// Units that needed SIGKILL to settle (a stop-path failure).
+        pub(super) escalated: Vec<String>,
+        /// Units still neither inactive nor failed after the kill.
+        pub(super) still_present: Vec<String>,
+    }
+
+    /// Settle allowance after a SIGKILL of the unit's whole cgroup
+    /// (KillMode=control-group): the kernel delivers it immediately, so this
+    /// covers only reaping and the manager's state change. It is an
+    /// allowance, not a retry budget.
+    const KILL_SETTLE: Duration = Duration::from_secs(5);
+
+    /// The stop budget of every unit a TB10 fixture starts: the shipped agent's
+    /// `TimeoutStopSec` (read by `stop_bound_x`, which adds the 1 s manager and
+    /// sampling allowance) and the fixture walls' `TimeoutStopSec`, which every
+    /// fixture wall pins to the shipped wall's value (`fixture_wall_stop_secs`).
+    /// The larger one bounds the wait; the holder units are oneshot and stop at
+    /// once.
+    fn unit_stop_bound() -> Duration {
+        stop_bound_x().max(Duration::from_secs(secs(&fixture_wall_stop_secs()) + 1))
+    }
+
+    /// The `TimeoutStopSec` every fixture wall carries, pinned to the shipped
+    /// wall's so the teardown bound derives from a stated value, not systemd's
+    /// 90 s default. Must match `TimeoutStopSec` in
+    /// systemd/sanctuary-castle-wall.service.
+    pub(super) fn fixture_wall_stop_secs() -> String {
+        shipped_wall_value("TimeoutStopSec")
+    }
+
+    /// Settled means the manager reports inactive or failed. A read that could
+    /// not be made is NOT settled; the error is kept for the report.
+    fn settled_state(unit: &str, errors: &mut Vec<String>) -> bool {
+        match try_prop(unit, "ActiveState") {
+            Ok(state) => state == "inactive" || state == "failed",
+            Err(err) => {
+                errors.push(err);
+                false
+            }
+        }
+    }
+
+    impl Tb10Units {
+        pub(super) fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::Builder::new()
+                .prefix("sanctuary-tb10-")
+                .tempdir_in("/var/lib")
+                .expect("visible scratch dir");
+            // Scripts remain root-custodied outside hidden temporary paths; only
+            // the separately mounted workspace admits fixture writes.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("0755 scratch dir");
+            let tag = format!(
+                "{:x}{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or_default()
+            );
+            Self {
+                tag,
+                dir: Some(dir),
+                stop_order: Vec::new(),
+                files: Vec::new(),
+                extra_dirs: Vec::new(),
+                owned: Vec::new(),
+                settled: None,
+                watched: None,
+                stop_bound: unit_stop_bound(),
+            }
+        }
+
+        /// Units whose settled teardown gates `kernel`'s table delete.
+        pub(super) fn guarding(kernel: &IsolatedKernelState) -> Self {
+            let mut units = Self::new();
+            kernel
+                .settled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            units.settled = Some(std::sync::Arc::clone(&kernel.settled));
+            units.watched = Some(std::sync::Arc::clone(&kernel.units));
+            units
+        }
+
+        /// The units to stop, agents first. Also published to the guarding
+        /// kernel-state guard, which re-reads them itself before any sweep.
+        pub(super) fn set_stop_order(&mut self, units: Vec<String>) {
+            if let Some(watched) = &self.watched {
+                if let Ok(mut list) = watched.lock() {
+                    *list = units.clone();
+                }
+            }
+            self.stop_order = units;
+        }
+
+        /// Hand a directory a live unit reads to the settled teardown.
+        pub(super) fn own(&mut self, dir: TempDir) {
+            self.owned.push(dir);
+        }
+
+        pub(super) fn dir_path(&self) -> &Path {
+            self.dir
+                .as_ref()
+                .expect("scratch dir held until teardown")
+                .path()
+        }
+
+        pub(super) fn path(&self, name: &str) -> PathBuf {
+            if matches!(name, "marker" | "check-view") {
+                self.dir_path().join("workspace").join(name)
+            } else {
+                self.dir_path().join(name)
+            }
+        }
+
+        pub(super) fn write_unit(&mut self, name: &str, text: &str) {
+            let path = Path::new("/run/systemd/system").join(name);
+            std::fs::create_dir_all("/run/systemd/system").expect("runtime unit dir");
+            std::fs::write(&path, text).expect("write runtime unit");
+            self.files.push(path);
+        }
+
+        pub(super) fn write_script(&self, name: &str, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
+            std::fs::write(&path, body).expect("write fixture script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("0755 fixture script");
+            path
+        }
+
+        /// A root-owned 0600 environment file, as the shipped one is.
+        pub(super) fn write_env(&self, body: &str) -> PathBuf {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = self.path("castle-wall.env");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+                .expect("write the 0600 env file");
+            path
+        }
+
+        /// Preserve the shipped mount dependency and limits under an isolated
+        /// path. Scripts stay outside noexec tmpfs; only observations go inside.
+        fn workspace(&mut self, agent: &str) -> (String, String) {
+            let path = self.dir_path().join("workspace");
+            std::fs::create_dir(&path).expect("workspace backing");
+            let out = Command::new("systemd-escape")
+                .args(["--path", "--suffix=mount", path.to_str().unwrap()])
+                .output()
+                .expect("escape fixture mount");
+            assert!(out.status.success());
+            let name = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            let mount = include_str!("../systemd/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount");
+            let mount = substitute(
+                mount,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                1,
+            );
+            self.write_unit(&name, &mount);
+            let derived = substitute(
+                agent,
+                "/var/lib/sanctuary-agent-workspace",
+                path.to_str().unwrap(),
+                3,
+            );
+            let derived = substitute(
+                &derived,
+                r"var-lib-sanctuary\x2dagent\x2dworkspace.mount",
+                &name,
+                2,
+            );
+            (derived, name)
+        }
+
+        pub(super) fn reload(&self) {
+            assert!(
+                systemctl(&["daemon-reload"]).status.success(),
+                "daemon-reload"
+            );
+        }
+    }
+
+    impl Tb10Units {
+        /// Stop every unit in `stop_order`; a unit that is not settled within
+        /// its stop budget is SIGKILLed (whole cgroup) and waited for again.
+        /// Settled means `ActiveState` is inactive or failed, read from the
+        /// manager, never inferred from the `systemctl stop` client's exit: a
+        /// client killed by its 90 s `timeout` wrapper after the unit already
+        /// settled is not a unit still present.
+        pub(super) fn stop_all(&self) -> StopReport {
+            let mut report = StopReport::default();
+            for unit in &self.stop_order {
+                let mut errors = Vec::new();
+                let stop_ok = match try_systemctl(&["stop", unit]) {
+                    Ok(out) => out.status.success(),
+                    Err(err) => {
+                        errors.push(err);
+                        false
+                    }
+                };
+                if !wait_until(self.stop_bound, || settled_state(unit, &mut errors)) {
+                    let kill_ok = match try_systemctl(&["kill", "-s", "SIGKILL", unit]) {
+                        Ok(out) => out.status.success(),
+                        Err(err) => {
+                            errors.push(err);
+                            false
+                        }
+                    };
+                    report
+                        .escalated
+                        .push(format!("{unit} (stop ok={stop_ok}, SIGKILL ok={kill_ok})"));
+                    if !wait_until(KILL_SETTLE, || settled_state(unit, &mut errors)) {
+                        let read = |p: &str| try_prop(unit, p).unwrap_or_else(|e| format!("<{e}>"));
+                        errors.dedup();
+                        report.still_present.push(format!(
+                            "{unit} (ActiveState={}, SubState={}, errors={errors:?})",
+                            read("ActiveState"),
+                            read("SubState"),
+                        ));
+                    }
+                }
+                let _ = try_systemctl(&["reset-failed", unit]);
+            }
+            report
+        }
+    }
+
+    impl Drop for Tb10Units {
+        fn drop(&mut self) {
+            // PRESERVE FIRST, before any command can fail: release every
+            // directory a live unit may read from its `TempDir`, so no failure
+            // below (and no field drop after it) can delete it. The paths are
+            // removed only on the settled path at the end.
+            let mut dirs: Vec<(&str, PathBuf)> = Vec::new();
+            if let Some(dir) = self.dir.take() {
+                dirs.push(("scratch", dir.into_path()));
+            }
+            for dir in self.owned.drain(..) {
+                dirs.push(("state", dir.into_path()));
+            }
+            let report = self.stop_all();
+            for unit in &report.escalated {
+                eprintln!("TB10 teardown: stop did not settle, SIGKILL sent: {unit}");
+            }
+            if !report.still_present.is_empty() {
+                // Leave everything a live unit uses in place and say so loudly:
+                // the unit files, the scratch and state dirs and, through the
+                // shared flag, the isolated table.
+                for unit in &report.still_present {
+                    let status = match try_systemctl(&["status", "--no-pager", &unit_name(unit)]) {
+                        Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+                        Err(err) => format!("<status unavailable: {err}>"),
+                    };
+                    eprintln!(
+                        "TB10 teardown: STILL PRESENT after stop and SIGKILL: {unit}; unit files, \
+                         state and the isolated table are LEFT IN PLACE.\n{status}"
+                    );
+                }
+                for (kind, dir) in &dirs {
+                    eprintln!("TB10 teardown: {kind} dir left at {}", dir.display());
+                }
+                for file in &self.files {
+                    eprintln!("TB10 teardown: unit file left at {}", file.display());
+                }
+                return;
+            }
+            for file in &self.files {
+                let _ = std::fs::remove_file(file);
+            }
+            let _ = try_systemctl(&["daemon-reload"]);
+            for dir in &self.extra_dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            for (_, dir) in &dirs {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            if let Some(settled) = &self.settled {
+                settled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The unit name at the head of a report entry.
+    fn unit_name(entry: &str) -> String {
+        entry
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// One schedule's fixture wall plus the derived agent.
+    struct Fixture {
+        units: Tb10Units,
+        wall: String,
+        agent: String,
+    }
+
+    impl Fixture {
+        /// `wall_restart` is the fixture wall's `Restart=`; the rest of its
+        /// restart shape (`RestartSec`, `RestartPreventExitStatus`,
+        /// `TimeoutStartSec`) is read from the shipped wall.
+        fn new(wall_restart: &str) -> Self {
+            let mut units = Tb10Units::new();
+            let tag = units.tag.clone();
+            let d = units.dir_path().display().to_string();
+            let wall = format!("sanctuary-tb10-wall-{tag}.service");
+            let template = format!("sanctuary-tb10-agent-{tag}@.service");
+            let agent = format!("sanctuary-tb10-agent-{tag}@{FIXTURE_INSTANCE}.service");
+            // The fixture wall: optional READY delay, optional start failure,
+            // then READY=1 from a process that stays alive (`--exec`), then a
+            // loop that exits with whatever code the test writes.
+            units.write_script(
+                "wall.sh",
+                &format!(
+                    "#!/bin/sh\n\
+                     [ -f {d}/delay ] && sleep {FIXTURE_DELAY_SECS}\n\
+                     [ -f {d}/fail-start ] && exit 1\n\
+                     exec systemd-notify --ready --exec ';' /bin/sh {d}/wall-run.sh\n"
+                ),
+            );
+            units.write_script(
+                "wall-run.sh",
+                &format!(
+                    "#!/bin/sh\n\
+                     while [ ! -f {d}/exit-code ]; do sleep 0.1; done\n\
+                     c=$(cat {d}/exit-code); rm -f {d}/exit-code; exit \"$c\"\n"
+                ),
+            );
+            units.write_unit(
+                &wall,
+                &format!(
+                    "[Unit]\nDescription=TB10 fixture wall\n\n[Service]\nType=notify\n\
+                     NotifyAccess=all\nExecStart=/bin/sh {d}/wall.sh\nRestart={wall_restart}\n\
+                     RestartPreventExitStatus={}\nRestartSec={}\nTimeoutStartSec={}\n\
+                     TimeoutStopSec={}\n",
+                    shipped_wall_value("RestartPreventExitStatus"),
+                    shipped_wall_value("RestartSec"),
+                    shipped_wall_value("TimeoutStartSec"),
+                    fixture_wall_stop_secs(),
+                ),
+            );
+            // The fixture verbs and agent. The check runs as the instance and
+            // records its own kernel view; the gate runs as root (`+`) and can
+            // be made to sleep; the agent writes a marker and stays up.
+            units.write_script(
+                "check.sh",
+                &format!(
+                    "#!/bin/sh\ngrep -E '^(Uid|Gid):' /proc/self/status > {d}/workspace/check-view\nexit 0\n"
+                ),
+            );
+            units.write_script(
+                "gate.sh",
+                &format!(
+                    "#!/bin/sh\n[ -f {d}/gate-sleep ] && sleep {FIXTURE_DELAY_SECS}\nexit 0\n"
+                ),
+            );
+            units.write_script(
+                "agent.sh",
+                &format!("#!/bin/sh\necho started >> {d}/workspace/marker\nexec sleep infinity\n"),
+            );
+            let env = units
+                .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
+            let shipped = shipped_agent_unit();
+            let derived = substitute(&shipped, "sanctuary-castle-wall.service", &wall, 5);
+            let derived = substitute(
+                &derived,
+                "ExecStartPre=/usr/local/libexec/sanctuary/castle-wall-daemon --agent-credential-check %i",
+                &format!("ExecStartPre=/bin/sh {d}/check.sh %i"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "ExecStartPre=+/usr/local/libexec/sanctuary/castle-wall-daemon --agent-start-gate %i --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}",
+                &format!("ExecStartPre=+/bin/sh {d}/gate.sh %i"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1",
+                &format!("ExecStart=/bin/sh {d}/agent.sh"),
+                1,
+            );
+            let derived = substitute(
+                &derived,
+                "EnvironmentFile=/etc/sanctuary/castle-wall.env",
+                &format!("EnvironmentFile={}", env.display()),
+                1,
+            );
+            let (derived, mount) = units.workspace(&derived);
+            units.write_unit(&template, &derived);
+            // A holder that only ORDERS after both units keeps them loaded once
+            // they go inactive; without it systemd garbage-collects an inactive
+            // runtime unit and its timestamps read back as 0. It adds no
+            // requirement edge, so it changes nothing the schedules observe.
+            let holder = format!("sanctuary-tb10-hold-{tag}.service");
+            units.write_unit(
+                &holder,
+                &format!(
+                    "[Unit]\nDescription=TB10 timestamp holder\nAfter={agent} {wall}\n\n\
+                     [Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+                ),
+            );
+            units.set_stop_order(vec![agent.clone(), wall.clone(), holder.clone(), mount]);
+            units.reload();
+            assert!(
+                systemctl(&["start", &holder]).status.success(),
+                "start the holder"
+            );
+            Self { units, wall, agent }
+        }
+
+        fn touch(&self, name: &str) {
+            std::fs::write(self.units.path(name), b"1").expect("touch control file");
+        }
+
+        fn marker_present(&self) -> bool {
+            self.units.path("marker").exists()
+        }
+
+        /// Wall first (to READY), then the agent: the schedules that test the
+        /// STOP side isolate it from the start-side pull and ordering.
+        fn start_wall_then_agent(&self) {
+            let wall = systemctl(&["start", &self.wall]);
+            assert!(
+                wall.status.success(),
+                "wall start: {}",
+                String::from_utf8_lossy(&wall.stderr)
+            );
+            let out = systemctl(&["start", &self.agent]);
+            assert!(
+                out.status.success(),
+                "agent start: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(prop(&self.agent, "ActiveState"), "active");
+            assert_eq!(prop(&self.wall, "ActiveState"), "active");
+        }
+
+        fn wall_exit(&self, code: u8) {
+            std::fs::write(self.units.path("exit-code"), code.to_string()).expect("exit code");
+        }
+
+        /// The agent is inactive now and stays inactive for `window`.
+        fn assert_agent_stays_down(&self, window: Duration, what: &str) {
+            let start = Instant::now();
+            while start.elapsed() < window {
+                let state = prop(&self.agent, "ActiveState");
+                assert!(
+                    state == "inactive" || state == "failed",
+                    "{what}: the agent came back ({state}) {:?} into the window",
+                    start.elapsed()
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
+    fn require_systemd() -> bool {
+        match real_systemd_available() {
+            Ok(()) => true,
+            Err(reason) => {
+                skip_or_fail_unprivileged(&reason);
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn tb10_i_the_agent_starts_only_after_the_walls_ready() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("delay");
+        // The wall is still inside its READY delay when the agent start is
+        // requested, so only the After= edge can hold the agent back.
+        assert!(systemctl(&["start", "--no-block", &f.wall])
+            .status
+            .success());
+        assert!(
+            systemctl(&["start", &f.agent]).status.success(),
+            "(i) agent start"
+        );
+        assert_eq!(prop(&f.agent, "ActiveState"), "active");
+        let agent_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        let wall_ready = mono(&f.wall, "ActiveEnterTimestampMonotonic");
+        assert!(
+            wall_ready > 0 && agent_start > wall_ready,
+            "(i) agent ExecMainStart {agent_start} must follow wall ActiveEnter {wall_ready}"
+        );
+    }
+
+    #[test]
+    fn tb10_ii_a_wall_that_fails_to_start_fails_the_agent_start() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("fail-start");
+        let out = systemctl(&["start", &f.agent]);
+        assert!(!out.status.success(), "(ii) the agent start job must fail");
+        assert_ne!(prop(&f.agent, "ActiveState"), "active");
+        assert!(
+            !f.marker_present(),
+            "(ii) the agent must never reach ExecStart"
+        );
+    }
+
+    #[test]
+    fn tb10_iii_a_wall_stop_stops_the_agent_first() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        assert!(systemctl(&["stop", &f.wall]).status.success());
+        let agent_down = mono(&f.agent, "InactiveEnterTimestampMonotonic");
+        let wall_exit = mono(&f.wall, "ActiveExitTimestampMonotonic");
+        assert_ne!(
+            prop(&f.agent, "ActiveState"),
+            "active",
+            "(iii) agent stopped"
+        );
+        assert!(
+            agent_down > 0 && agent_down <= wall_exit,
+            "(iii) agent InactiveEnter {agent_down} must not follow wall ActiveExit {wall_exit}"
+        );
+    }
+
+    #[test]
+    fn tb10_iv_a_killed_wall_restarts_alone() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("on-failure");
+        f.start_wall_then_agent();
+        let restarts_before: u64 = prop(&f.wall, "NRestarts").parse().unwrap_or(0);
+        let killed_at = Instant::now();
+        assert!(
+            systemctl(&["kill", "--kill-whom=main", "--signal=SIGKILL", &f.wall])
+                .status
+                .success()
+        );
+        assert!(
+            wait_until(stop_bound_x(), || prop(&f.agent, "ActiveState") != "active"),
+            "(iv) agent must be inactive within X of the wall's death"
+        );
+        assert!(killed_at.elapsed() <= stop_bound_x() + SLACK);
+        assert!(
+            wait_until(no_restart_window_w(), || {
+                prop(&f.wall, "ActiveState") == "active"
+                    && prop(&f.wall, "NRestarts").parse().unwrap_or(0) > restarts_before
+            }),
+            "(iv) the fixture wall must restart on its own"
+        );
+        f.assert_agent_stays_down(no_restart_window_w(), "(iv)");
+    }
+
+    fn exit_code_schedule(code: u8, expect_wall_restart: bool) {
+        let f = Fixture::new("on-failure");
+        f.start_wall_then_agent();
+        f.wall_exit(code);
+        assert!(
+            wait_until(stop_bound_x() + SLACK, || prop(&f.agent, "ActiveState")
+                != "active"),
+            "(v) exit {code}: agent must be stopped"
+        );
+        if expect_wall_restart {
+            assert!(
+                wait_until(no_restart_window_w(), || prop(&f.wall, "ActiveState")
+                    == "active"),
+                "(v) exit {code}: the fixture wall must restart on its own"
+            );
+        } else {
+            assert!(
+                wait_until(SLACK, || prop(&f.wall, "ActiveState") == "failed"),
+                "(v) exit {code}: RestartPreventExitStatus must leave the wall failed"
+            );
+        }
+        f.assert_agent_stays_down(no_restart_window_w(), &format!("(v) exit {code}"));
+    }
+
+    #[test]
+    fn tb10_v_a_wall_exit_78_stops_the_agent_and_nothing_restarts_it() {
+        if !require_systemd() {
+            return;
+        }
+        exit_code_schedule(78, false);
+    }
+
+    #[test]
+    fn tb10_v_a_wall_exit_75_stops_the_agent_and_only_the_wall_returns() {
+        if !require_systemd() {
+            return;
+        }
+        exit_code_schedule(75, true);
+    }
+
+    #[test]
+    fn tb10_vi_a_wall_stop_during_the_agents_start_cancels_it() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.touch("gate-sleep");
+        assert!(systemctl(&["start", &f.wall]).status.success());
+        assert!(systemctl(&["start", "--no-block", &f.agent])
+            .status
+            .success());
+        assert!(
+            wait_until(SLACK, || prop(&f.agent, "SubState") == "start-pre"),
+            "(vi) the agent must be inside its ExecStartPre= stage"
+        );
+        assert!(systemctl(&["stop", &f.wall]).status.success());
+        assert!(wait_until(SLACK, || {
+            let s = prop(&f.agent, "ActiveState");
+            s == "inactive" || s == "failed"
+        }));
+        // Past the fixture gate's own sleep: a start that was not cancelled
+        // would have reached ExecStart by now.
+        std::thread::sleep(Duration::from_secs(FIXTURE_DELAY_SECS + 1));
+        assert!(
+            !f.marker_present(),
+            "(vi) the agent must never reach ExecStart"
+        );
+    }
+
+    #[test]
+    fn tb10_vii_the_agent_and_its_check_run_as_the_instance() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        let pid = prop(&f.agent, "MainPID");
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("agent /proc status");
+        let ids: String = status
+            .lines()
+            .filter(|l| l.starts_with("Uid:") || l.starts_with("Gid:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        for line in ids.lines() {
+            let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+            assert_eq!(fields.len(), 4, "{line}");
+            assert!(
+                fields.iter().all(|v| *v == FIXTURE_INSTANCE.to_string()),
+                "(vii) every id must be the instance: {line}"
+            );
+        }
+        let view = std::fs::read_to_string(f.units.path("check-view")).expect("check view");
+        assert_eq!(
+            view, ids,
+            "(vii) the check saw exactly the agent's credentials"
+        );
+    }
+
+    #[test]
+    fn tb10_viii_a_wall_restart_restarts_the_agent_behind_the_new_ready() {
+        if !require_systemd() {
+            return;
+        }
+        let f = Fixture::new("no");
+        f.start_wall_then_agent();
+        let first_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        assert!(systemctl(&["restart", &f.wall]).status.success());
+        assert!(
+            wait_until(SLACK, || {
+                prop(&f.agent, "ActiveState") == "active"
+                    && mono(&f.agent, "ExecMainStartTimestampMonotonic") > first_start
+            }),
+            "(viii) the agent must be started again by the propagated restart"
+        );
+        let agent_down = mono(&f.agent, "InactiveEnterTimestampMonotonic");
+        let wall_exit = mono(&f.wall, "ActiveExitTimestampMonotonic");
+        let wall_ready = mono(&f.wall, "ActiveEnterTimestampMonotonic");
+        let agent_start = mono(&f.agent, "ExecMainStartTimestampMonotonic");
+        assert!(
+            agent_down <= wall_exit,
+            "(viii) agent stopped {agent_down} before the wall's ActiveExit {wall_exit}"
+        );
+        assert!(
+            agent_start > wall_ready,
+            "(viii) agent restarted {agent_start} after the new ActiveEnter {wall_ready}"
+        );
+    }
+
+    /// The agent account section 4.1 of the slice B design provisions, with the
+    /// exact argv an operator runs, removed on every exit path IF this test
+    /// created it (a pre-existing matching account is left alone).
+    struct ProvisionedAccount {
+        name: String,
+        created_user: bool,
+        created_group: bool,
+    }
+
+    impl ProvisionedAccount {
+        fn provision(uid: u32) -> Result<Self, String> {
+            let name = format!("sanctuary-agent-{uid}");
+            let getent = |db: &str| {
+                Command::new("getent")
+                    .args([db, &uid.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default()
+            };
+            // Classify first; anything but absent or the exact expected entry
+            // stops the test without modifying the account database.
+            let (user, group) = (getent("passwd"), getent("group"));
+            let want_group = format!("{name}:x:{uid}:");
+            let want_user_prefix = format!("{name}:x:{uid}:{uid}:");
+            if !group.is_empty() && group != want_group {
+                return Err(format!("gid {uid} is held by another entry: {group:?}"));
+            }
+            let user_is_expected =
+                user.starts_with(&want_user_prefix) && user.ends_with(":/usr/sbin/nologin");
+            if !user.is_empty() && !user_is_expected {
+                return Err(format!("uid {uid} is held by another entry: {user:?}"));
+            }
+            let mut account = Self {
+                name: name.clone(),
+                created_user: false,
+                created_group: false,
+            };
+            if group.is_empty() {
+                let out = Command::new("groupadd")
+                    .args(["--system", "--gid", &uid.to_string(), &name])
+                    .output()
+                    .map_err(|e| format!("groupadd: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "groupadd: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                account.created_group = true;
+            }
+            if user.is_empty() {
+                let out = Command::new("useradd")
+                    .args([
+                        "--system",
+                        "--uid",
+                        &uid.to_string(),
+                        "--gid",
+                        &uid.to_string(),
+                        "--no-create-home",
+                        "--home-dir",
+                        "/nonexistent",
+                        "--shell",
+                        "/usr/sbin/nologin",
+                        &name,
+                    ])
+                    .output()
+                    .map_err(|e| format!("useradd: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("useradd: {}", String::from_utf8_lossy(&out.stderr)));
+                }
+                account.created_user = true;
+            }
+            Ok(account)
+        }
+    }
+
+    impl Drop for ProvisionedAccount {
+        fn drop(&mut self) {
+            if self.created_user {
+                let _ = Command::new("userdel").arg(&self.name).output();
+            }
+            if self.created_group {
+                let _ = Command::new("groupdel").arg(&self.name).output();
+            }
+        }
+    }
+
+    /// Removes the isolated table and journal, but ONLY once the units that
+    /// could still write them are confirmed settled (`settled`, set by the
+    /// `Tb10Units` built with `Tb10Units::guarding`). Otherwise the table is
+    /// left in place and reported with the live ruleset: a reported leak, never
+    /// a delete under a daemon that could recreate it.
+    pub(super) struct IsolatedKernelState {
+        settled: UnitsSettled,
+        /// The suite's own isolation guard, whose Drop deletes the isolated
+        /// table and refuses leftovers. Owned here so that sweep runs ONLY when
+        /// the units are confirmed settled.
+        suite: Option<isolation::SuiteGuard>,
+        /// The units whose liveness gates the sweep, published by
+        /// `Tb10Units::set_stop_order`.
+        units: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl IsolatedKernelState {
+        fn new(suite: isolation::SuiteGuard) -> Self {
+            Self {
+                settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                suite: Some(suite),
+                units: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Drop for IsolatedKernelState {
+        fn drop(&mut self) {
+            let Some(suite) = self.suite.take() else {
+                return;
+            };
+            if !self.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                // The units guard did not confirm a settled teardown. Re-read
+                // every unit through the isolation module: only its proof can
+                // skip the sweep, and taking that branch FAILS the test, leaves
+                // the table and poisons the suite. If every unit now reads
+                // settled there is no proof and the normal sweep below runs.
+                let units = self.units.lock().map(|u| u.clone()).unwrap_or_default();
+                if let Some(proof) = isolation::confirm_units_not_settled(&units) {
+                    suite.fail_leaving_kernel_state(proof);
+                    return;
+                }
+            }
+            // Settled: the suite guard's own sweep and leftover refusal run now.
+            drop(suite);
+        }
+    }
+
+    /// (ix): the REAL verbs under the shipped directives. The daemon runs as a
+    /// runtime `Type=notify` unit on an isolated table admitting 60123; the
+    /// agent unit is derived from the shipped one keeping both real
+    /// `ExecStartPre=` lines and their prefixes, `CapabilityBoundingSet=`,
+    /// `NoNewPrivileges=` and `EnvironmentFile=` (a root 0600 test file), with
+    /// no `UnsetEnvironment=`. Reaching ExecStart with the admit line in the
+    /// journal is the integrated proof that the `+` gate kept CAP_NET_ADMIN
+    /// under the empty bounding set and received the trusted uid.
+    #[test]
+    fn tb10_ix_the_real_verbs_admit_the_bound_instance_under_the_shipped_directives() {
+        let suite = suite_guard();
+        if !require_systemd() {
+            return;
+        }
+        let kernel = IsolatedKernelState::new(suite);
+        cleanup_castle_table();
+        cleanup_journal();
+        let _account = match ProvisionedAccount::provision(TEST_AGENT_UID) {
+            Ok(account) => account,
+            Err(reason) => panic!("(ix) could not provision the agent account: {reason}"),
+        };
+        // The wall's policy, key and WAL; handed to `units` below so it is
+        // removed only by a settled teardown.
+        let state = TempDir::new().unwrap();
+        let mut units = Tb10Units::guarding(&kernel);
+        let tag = units.tag.clone();
+        let d = units.dir_path().display().to_string();
+        let binary = units.path("castle-wall-daemon");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::copy(env!("CARGO_BIN_EXE_castle-wall-daemon"), &binary).expect("copy");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("0755 binary");
+        }
+        let bin = binary.display().to_string();
+        // Daemon state lives in `state`, its own 0700 root dir (the scratch
+        // dir is 0777).
+        let signing = SigningKey::generate(&mut OsRng);
+        let pinned = write_pinned_key(&state, &signing);
+        write_confining_manifest(state.path(), &signing);
+        let st = state.path().display().to_string();
+        let isolation = isolation_args().join(" ");
+        let wall = format!("sanctuary-tb10ix-wall-{tag}.service");
+        units.write_unit(
+            &wall,
+            &format!(
+                "[Unit]\nDescription=TB10 ix isolated wall\n\n[Service]\nType=notify\n\
+                 ExecStart={bin} --fortress-id deadbeef --socket-path {st}/filter.sock \
+                 --policy-dir {st} --wal-path {st}/wal.jsonl --pinned-public-key {} \
+                 --producer-key {st}/audit-producer.key --producer-pub-key {st}/audit-producer.pub \
+                 {isolation}\nRestart=no\nTimeoutStartSec=60\nTimeoutStopSec={}\n",
+                pinned.display(),
+                fixture_wall_stop_secs()
+            ),
+        );
+        units.own(state);
+        units.write_script(
+            "agent.sh",
+            &format!("#!/bin/sh\necho started >> {d}/workspace/marker\nexec sleep infinity\n"),
+        );
+        let env = units
+            .write_env("SANCTUARY_FORTRESS_ID=deadbeef\nSANCTUARY_TRUSTED_SERVICE_UID=60125\n");
+        let table_tag = tb9_isolated_table_tail().join(" ");
+        let template = format!("sanctuary-tb10ix-agent-{tag}@.service");
+        let agent = format!("sanctuary-tb10ix-agent-{tag}@{TEST_AGENT_UID}.service");
+        let shipped = shipped_agent_unit();
+        assert!(
+            !shipped.lines().any(|l| l.starts_with("UnsetEnvironment")),
+            "(ix) the shipped unit carries no UnsetEnvironment= directive"
+        );
+        let derived = substitute(&shipped, "sanctuary-castle-wall.service", &wall, 5);
+        let derived = substitute(
+            &derived,
+            "/usr/local/libexec/sanctuary/castle-wall-daemon",
+            &bin,
+            2,
+        );
+        let derived = substitute(
+            &derived,
+            "--trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}",
+            &format!("--trusted-service-uid ${{SANCTUARY_TRUSTED_SERVICE_UID}} {table_tag}"),
+            1,
+        );
+        let derived = substitute(
+            &derived,
+            "ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1",
+            &format!("ExecStart=/bin/sh {d}/agent.sh"),
+            1,
+        );
+        let derived = substitute(
+            &derived,
+            "EnvironmentFile=/etc/sanctuary/castle-wall.env",
+            &format!("EnvironmentFile={}", env.display()),
+            1,
+        );
+        // This legacy verb witness needs the precheck diagnostics. Only its
+        // observation sink differs; the actual packaged-unit tests retain null.
+        let derived = substitute(&derived, "StandardOutput=null", "StandardOutput=journal", 1);
+        let derived = substitute(&derived, "StandardError=null", "StandardError=journal", 1);
+        let (derived, mount) = units.workspace(&derived);
+        units.write_unit(&template, &derived);
+        units.set_stop_order(vec![agent.clone(), wall.clone(), mount]);
+        units.reload();
+
+        let out = systemctl(&["start", &agent]);
+        let journal = || {
+            Command::new("journalctl")
+                .args(["-u", &agent, "-o", "cat", "--no-pager"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default()
+        };
+        let admit = format!("agent_start_gate=admit uid={TEST_AGENT_UID}");
+        assert!(
+            out.status.success(),
+            "(ix) the agent start must succeed: {} / wall {} / journal: {}",
+            String::from_utf8_lossy(&out.stderr),
+            prop(&wall, "ActiveState"),
+            journal()
+        );
+        assert!(
+            units.path("marker").exists(),
+            "(ix) the agent must reach ExecStart"
+        );
+        assert!(
+            wait_until(SLACK, || journal().contains(&admit)),
+            "(ix) the agent journal must carry {admit:?}: {}",
+            journal()
+        );
+        assert!(
+            journal().contains(&format!(
+                "agent_credential_check=match uid={TEST_AGENT_UID}"
+            )),
+            "(ix) the credential check must have matched as the instance"
+        );
+        // Stop the agent and the isolated wall and prove both settled by an
+        // ordinary stop (a stop that needed SIGKILL is a stop-path failure).
+        // The table delete then waits on the units' settled teardown through
+        // the shared flag, whatever order the guards drop in.
+        let report = units.stop_all();
+        assert!(
+            report.escalated.is_empty() && report.still_present.is_empty(),
+            "(ix) stop did not settle: {report:?}"
+        );
+        drop(units);
+        drop(kernel);
+    }
 }

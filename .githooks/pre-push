@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+#
+# Sanctuary pre-push hook - full test-baseline guard
+# Copyright 2026 Erik Newton
+# sanctuary-managed-hook: install-hooks.js owns this file
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defends against the specific failure class documented in
+# docs/audit/commit-4ac95830-postmortem.md: a parse / transform
+# error at vitest collection time silently dropping test files
+# from the suite, causing the passing count to look lower without
+# vitest reporting a hard failure.
+#
+# HISTORY / SCOPE SPLIT (2026-09-26): this is the FULL gate that used to run
+# inline in .githooks/pre-commit on every commit. It moved here, to run once
+# per push instead, because the full suite's wall-clock cost (15 to 19
+# minutes measured 2026-09-26) makes it impractical as a per-commit gate - a
+# check that slow gets routinely bypassed with --no-verify, which defeats
+# it. .githooks/pre-commit now runs a fast tier (typecheck + `vitest
+# related` scoped to the commit's own changed files, no baseline
+# comparison) on every commit instead. The logic below - the transform-error
+# scan, the silent-test-file-drop check, and the baseline-floor comparison -
+# is UNCHANGED from what pre-commit used to run; only the trigger point
+# (commit -> push) and the "what changed" source (the staged index -> the
+# range of commits being pushed) are different, because a pre-push hook has
+# no staging index to read.
+#
+# FAILURE MODE this is honest about: a clean .githooks/pre-commit run on
+# every individual commit does NOT mean this gate has run. If someone pushes
+# with `git push --no-verify`, or from a clone where `npm run install-hooks`
+# was never run, this hook simply does not fire and the only remaining
+# defense is the CI mirror (.github/workflows/test-baseline-guard.yml),
+# which runs on the PR, not the push.
+#
+# ONE CONSOLIDATED GATE. The push is blocked if any of its checks fail: the
+# commit-binding check below, the full-suite run, the transform-error scan,
+# the silent-test-file-drop check, and the two floor rules described next.
+#
+#   Commit-binding check (2026-09-26, MANDATORY): before anything else
+#     runs, this hook refuses the push unless the working tree is clean for
+#     tracked files (and for untracked files under server/ and
+#     scripts/synthetic-coverage/test/ - see the refusal site below for
+#     why), HEAD's COMMIT equals the local SHA of every non-delete ref
+#     being pushed once both sides are peeled through `^{commit}` (an
+#     annotated tag's local SHA is the TAG object, not the commit it
+#     points at - peeling is what lets a tag pointing at HEAD bind
+#     correctly instead of always mismatching), and no file under server/
+#     is marked skip-worktree or assume-unchanged.
+#
+#     INVARIANT enforced at the refusal site below: this gate validates
+#     exactly the commit being pushed, so the worktree must BE that commit.
+#     Without this check, the floor this hook reads (`.test-baseline` from
+#     `$local_sha`, the object git is about to send) and the `npm test` run
+#     against whatever the working tree happens to contain right now could
+#     silently diverge: an uncommitted edit, an untracked test file under
+#     server/, a detached HEAD, a push of a ref other than the one checked
+#     out, or a skip-worktree/assume-unchanged flag hiding local drift from
+#     `git status` would let this hook "prove" something about a commit
+#     that is not what actually gets sent. Binding both sides to the same
+#     commit is what makes "the floor for this push" and "the suite this
+#     push runs" the same claim. FAILURE MODE: each of these looks like a
+#     clean push from the outside - the hook prints PASS - while the bytes
+#     it tested and the bytes git sends have quietly diverged.
+#
+#   TWO FLOOR RULES (2026-09-26, replaces the previous previous-tip/
+#   strict-upward machinery - see docs/audit/ for the design note):
+#
+#     Rule (a) - passing count vs. the pushed commit's own .test-baseline,
+#     with the macOS-over-Linux platform-delta carve-out. The push is
+#     blocked if the local passing count falls below the pushed commit's
+#     own committed `.test-baseline`. FAILURE MODE: a regression on a
+#     branch whose own floor was never bumped looks identical to a healthy
+#     push right up until this count comparison runs. If the count is
+#     ABOVE the floor, this hook only WARNS (see the carve-out note below
+#     the test run) - it does not try to tell a genuine new test apart from
+#     the known macOS-over-Linux delta locally; CI, which runs on Linux and
+#     has no such delta, is what actually enforces an unaccounted excess.
+#
+#     Rule (b) - the pushed `.test-baseline` must never fall below the
+#     PREVIOUS floor for the ref being updated (2026-09-26, round 3
+#     correction). Per non-delete ref, git's pre-push stdin already
+#     supplies the LIVE remote SHA of that ref (the tip it is about to
+#     replace) - this is authoritative and needs no fetch to learn. If that
+#     remote SHA is non-zero, the previous floor is that commit's own
+#     `.test-baseline` (`git show "<remote_sha>":.test-baseline`); if the
+#     object does not resolve locally (a shallow clone or a stale fetch),
+#     the push is REFUSED rather than falling back to a merge-base or a
+#     local tracking ref, because either stand-in could silently compare
+#     against a floor older than the one actually being replaced. If the
+#     remote SHA is all zeros (the ref is new), there is no remote tip to
+#     read, so this hook runs `git fetch --quiet origin main` itself (the
+#     push is about to talk to that remote regardless) and reads
+#     `origin/main:.test-baseline` fresh - never a local `origin/main` that
+#     was not just confirmed current, since a stale tracking ref is exactly
+#     the gap a comparison against a LOCAL `origin/main` (the previous
+#     design, corrected here) could silently pass through. FAILURE MODE:
+#     CI (.github/workflows/test-baseline-guard.yml) only checks the PUSHED
+#     COMMIT's count against that SAME commit's own `.test-baseline` - a
+#     branch that lowers `.test-baseline` to match a deliberately shrunk
+#     suite passes CI's self-consistent check with no complaint, so nothing
+#     in CI catches a silently lowered floor on its own. This rule is what
+#     catches it: a legitimate lowering (for example after removing tests)
+#     still has to land through a reviewed PR with an explicit, scoped
+#     `.test-baseline` commit explaining why, not a silent push.
+#
+#   Together, (a) and (b) lose nothing CI enforces: (a) is CI's own
+#   comparison, run locally first for fast feedback; (b) covers the one
+#   thing CI's per-commit self-consistency check cannot see. Earlier
+#   machinery in this hook's history is documented at the enforcement site
+#   below, not repeated here, because each revision's failure mode is only
+#   meaningful next to the code it describes.
+#
+# Runtime budget: the full suite's own wall-clock time. Measured 2026-09-26:
+# 15 to 19 minutes. This is why this gate runs at push time, not on every
+# commit - see the scope-split note above.
+#
+# Emergency override: set SKIP_TEST_BASELINE=1 to bypass this hook.
+# Use only for emergency pushes. The override is REFUSED unless a
+# human-readable justification is also supplied in SKIP_REASON, e.g.:
+#   SKIP_TEST_BASELINE=1 SKIP_REASON="hotfix: CI runner outage, see #NNN" git push ...
+# The override is checked and logged AFTER stdin is parsed (see below), so
+# the log records every ref this push actually targets, not just HEAD - a
+# push can target a ref other than the checked-out branch, and logging HEAD
+# in that case would misattribute the audit record.
+# The override is logged to .test-baseline-overrides.log with timestamp,
+# the pushed refs and SHAs, branch, author (whoami), and the reason for audit.
+#
+# Enforcement status (be precise - do NOT call this hook "not
+# bypassable"): this LOCAL hook is CI-backed with an audited emergency
+# override - it can be skipped with `SKIP_TEST_BASELINE=1` (documented +
+# logged above) or with `git push --no-verify`, and it is absent in
+# environments where the hook was never installed. The HARD merge gate is
+# the CI mirror at .github/workflows/test-baseline-guard.yml (made a
+# required status check via the branch-protection runbook in
+# docs/audit/branch-protection-setup.md). Treat this hook as the fast local
+# convenience copy of that authority, not a guarantee on its own - "fast"
+# here meaning "runs before the remote does," not "cheap": it is the
+# expensive gate, deliberately kept off the per-commit path.
+#
+# Installation:
+#   cd server && npm run install-hooks
+#
+# This hook is a shared script at .githooks/pre-push; the install script
+# copies it to .git/hooks/pre-push and chmods it executable, alongside
+# .githooks/pre-commit.
+
+set -euo pipefail
+
+# ── Colour helpers (graceful fallback if TTY is not colour) ─────────
+if [[ -t 2 ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[0;33m'
+  BLUE=$'\033[0;34m'
+  NC=$'\033[0m'
+else
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  NC=""
+fi
+
+log()  { printf '%s[baseline-guard]%s %s\n' "$BLUE" "$NC" "$1" >&2; }
+warn() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$YELLOW" "$1" "$NC" >&2; }
+fail() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$RED" "$1" "$NC" >&2; }
+ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC" >&2; }
+
+# ── Counter validation (fail CLOSED) ────────────────────────────────
+# The vitest-derived counters (`actual_total`, `passing`) are extracted from
+# vitest's text output with `grep -oE "[0-9]+"`. The capture is *shaped* like a
+# non-negative integer, but two pathological inputs are still possible and both
+# would corrupt the arithmetic guards downstream:
+#
+#   - a leading-zero string (e.g. "007") - historically a source of octal-parse
+#     surprises in `(( ... ))`; we reject it for the same reason we reject a
+#     leading-zero .test-baseline above; and
+#   - an absurdly large value (e.g. a 19-digit string) that overflows bash's
+#     signed-64-bit `(( ... ))` arithmetic and silently wraps (the macOS system
+#     bash is 3.2), so a numeric `(( _val > MAX ))` guard CANNOT catch it - the
+#     comparison itself overflows. Left unchecked, a wrapped-negative count would
+#     turn a "passing < baseline" regression check into a false PASS.
+#
+# So before ANY arithmetic touches a counter, validate it here and fail CLOSED.
+# This MUST stay identical to .githooks/pre-commit's retained copy (that copy
+# is pinned verbatim by server/test/scripts/precommit-counter-validation.test.ts
+# and is not itself load-bearing any more; THIS copy is the one that actually
+# gates arithmetic below) and to scripts/gate2b-check.sh's own copy, used by
+# CI's Gate 2b and by this hook's own call into that script.
+#
+# This MUST be invoked as a plain statement (`validate_counter NAME "$v"`), NOT
+# inside a command substitution: bash 3.2 does not propagate an `exit` out of a
+# `$(...)` subshell to abort the parent under `set -e`, which would fail OPEN.
+COUNTER_MAX=100000000   # 9 digits; see digit-count guard below.
+validate_counter() {
+  local _name="$1" _val="$2"
+  if ! [[ "$_val" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "$_name from vitest output is not a canonical integer, got: '$_val' - push blocked"
+    exit 1
+  fi
+  # Reject by digit count first (overflow-safe), then numerically for same-length
+  # values. A value with MORE digits than COUNTER_MAX is definitely larger; a
+  # value with the SAME digit count is compared with (( )), which is safe because
+  # it is known to fit in 64-bit.
+  if (( ${#_val} > ${#COUNTER_MAX} )) \
+     || { (( ${#_val} == ${#COUNTER_MAX} )) && (( _val > COUNTER_MAX )); }; then
+    fail "$_name from vitest output ($_val) exceeds the sane upper bound ($COUNTER_MAX) - push blocked"
+    printf '[baseline-guard]   This is almost certainly a parse-corrupted or adversarial value; refusing\n' >&2
+    printf '[baseline-guard]   to run arithmetic on it (overflow could mask a regression).\n' >&2
+    exit 1
+  fi
+  return 0
+}
+
+zero_sha="0000000000000000000000000000000000000000"
+
+# ── Read stdin FIRST, before the emergency-override check ───────────
+# Git feeds pre-push exactly one line per ref update on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# Parsing this before SKIP_TEST_BASELINE is checked (finding 2026-09-26) is
+# what lets the override's audit log record the actual pushed refs and SHAs
+# instead of HEAD: HEAD is not necessarily what is being pushed (a detached
+# checkout, or a push of a ref other than the one checked out), so logging
+# HEAD there was an inaccurate audit record, not just an early convenience.
+#
+# Built with plain arrays and a while-read loop, not `mapfile`/`readarray`:
+# the macOS system bash is 3.2 (mapfile/readarray are bash-4+ builtins).
+push_local_refs=()
+push_local_shas=()
+push_remote_refs=()
+push_remote_shas=()
+# git passes the remote name as $1 and its URL as $2 to every pre-push hook.
+push_remote_name="${1:-origin}"
+while IFS=' ' read -r _local_ref _local_sha _remote_ref _remote_sha; do
+  [[ -z "${_local_ref:-}" ]] && continue
+  push_local_refs+=("$_local_ref")
+  push_local_shas+=("${_local_sha:-}")
+  push_remote_refs+=("${_remote_ref:-}")
+  push_remote_shas+=("${_remote_sha:-}")
+done
+
+# ── Emergency override ───────────────────────────────────────────────
+if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
+  # An accountable override REQUIRES a reason. Refuse a bare bypass: an
+  # unexplained skip is exactly the unaudited shortcut this audit log exists to
+  # prevent. `SKIP_REASON` must be a non-empty, non-whitespace string.
+  skip_reason="${SKIP_REASON:-}"
+  if [[ -z "${skip_reason//[[:space:]]/}" ]]; then
+    fail "SKIP_TEST_BASELINE=1 was set WITHOUT a justification - override refused."
+    printf '[baseline-guard]   An emergency override must be accountable. Re-run with a reason:\n' >&2
+    printf '[baseline-guard]     SKIP_TEST_BASELINE=1 SKIP_REASON="why you are bypassing" git push ...\n' >&2
+    exit 1
+  fi
+  # Collapse newlines/tabs so a multi-line reason cannot corrupt the single-line
+  # log record (each override is exactly one tab-delimited line).
+  skip_reason=$(printf '%s' "$skip_reason" | tr '\n\t' '  ')
+  warn "SKIP_TEST_BASELINE=1 - emergency override active"
+  warn "This push is being made without running the baseline guard."
+  warn "Override is logged to .test-baseline-overrides.log for audit."
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # Record every pushed ref and SHA (not just HEAD - see the header comment
+  # on why HEAD is not a reliable stand-in for what is actually being pushed).
+  # Deletions (local sha all zeros) are included too, since the override
+  # bypasses this hook's checks entirely regardless of ref type.
+  pushed_refs_summary=""
+  for _i in "${!push_local_refs[@]}"; do
+    _entry="${push_local_refs[$_i]}=${push_local_shas[$_i]:-<none>}"
+    if [[ -z "$pushed_refs_summary" ]]; then
+      pushed_refs_summary="$_entry"
+    else
+      pushed_refs_summary="${pushed_refs_summary},${_entry}"
+    fi
+  done
+  [[ -z "$pushed_refs_summary" ]] && pushed_refs_summary="<no-ref-updates-on-stdin>"
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")
+  author=$(whoami 2>/dev/null || echo "unknown-user")
+  repo_root_for_log=$(git rev-parse --show-toplevel)
+  # Tab-delimited: timestamp <tab> pushed-refs <tab> branch <tab> author <tab> reason.
+  # Append-only; union-merged on rebase via .gitattributes (DoE 3a/N-3).
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp" "$pushed_refs_summary" "$branch" "$author" "$skip_reason" \
+    >> "$repo_root_for_log/.test-baseline-overrides.log"
+  exit 0
+fi
+
+# Resolve repo root (allows hook to run from any subdirectory).
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# ── Collect every non-delete ref update ──────────────────────────────
+# Every ref on stdin is collected here (not just the first). A deletion
+# (local sha all zeros) is skipped - there is nothing to test for a ref
+# that is going away.
+non_delete_local_refs=()
+non_delete_local_shas=()
+non_delete_remote_shas=()
+for _i in "${!push_local_refs[@]}"; do
+  _lsha="${push_local_shas[$_i]:-}"
+  [[ -z "$_lsha" ]] && continue
+  [[ "$_lsha" == "$zero_sha" ]] && continue
+  non_delete_local_refs+=("${push_local_refs[$_i]}")
+  non_delete_local_shas+=("$_lsha")
+  non_delete_remote_shas+=("${push_remote_shas[$_i]:-}")
+done
+
+if (( ${#non_delete_local_shas[@]} == 0 )); then
+  log "No non-delete ref updates to check. Push allowed."
+  exit 0
+fi
+
+# ── Commit-binding check (2026-09-26, MANDATORY) ─────────────────────
+# INVARIANT: this gate validates exactly the commit being pushed - the
+# worktree must BE that commit, or the floor this hook reads and the suite
+# it runs are claims about two different commits. Refuse before running
+# anything expensive.
+#
+# 1. The working tree must be clean for TRACKED files, and must have no
+#    UNTRACKED file under either vitest include root (server/, and
+#    scripts/synthetic-coverage/test/ - see server/vitest.config.ts's
+#    `test.include` array, which is the actual source of truth this list
+#    must track: any root added there needs the same addition here).
+#    `git status` failing outright (a corrupted index, a missing object) is
+#    itself refused rather than read as clean - a failing status command
+#    produces empty output, and empty output must never be mistaken for
+#    "nothing changed."
+#
+#    Untracked files OUTSIDE these roots are still excluded deliberately:
+#    an untracked scratch file elsewhere cannot affect a commit that does
+#    not reference it, and demanding a fully clean `git status` would also
+#    block routine local scratch state unrelated to what is being pushed.
+#    Untracked files under a vitest include root are different: `npm test`
+#    runs vitest over both roots named in `test.include`, so an untracked
+#    `server/**/*.test.ts` or `scripts/synthetic-coverage/test/**/*.test.ts`
+#    (or any file vitest's config would pick up) would be EXECUTED by the
+#    suite this hook is about to run, even though it is not part of any
+#    commit on the pushed ref - the run below would silently test bytes the
+#    push does not contain.
+tracked_status=$(git status --porcelain --untracked-files=no)
+tracked_status_exit=$?
+if (( tracked_status_exit != 0 )); then
+  fail "'git status' failed (exit $tracked_status_exit) - cannot verify a clean working tree - push blocked"
+  printf '[baseline-guard]   A failing status command must never be read as \"clean\": empty output from a\n' >&2
+  printf '[baseline-guard]   failed command looks identical to a genuinely clean tree.\n' >&2
+  exit 1
+fi
+
+untracked_server_status=$(git status --porcelain --untracked-files=all -- server scripts/synthetic-coverage/test)
+untracked_server_status_exit=$?
+if (( untracked_server_status_exit != 0 )); then
+  fail "'git status' failed (exit $untracked_server_status_exit) checking untracked files under the vitest include roots - push blocked"
+  exit 1
+fi
+# `git status ... -- server scripts/synthetic-coverage/test` also reports
+# tracked modifications under those roots, which are already covered by
+# $tracked_status above; filter to the untracked ('??') lines only so they
+# are not double-reported.
+untracked_server_only=$(printf '%s\n' "$untracked_server_status" | grep -E '^\?\? ' || true)
+
+dirty_report="$tracked_status"
+if [[ -n "$untracked_server_only" ]]; then
+  if [[ -n "$dirty_report" ]]; then
+    dirty_report=$(printf '%s\n%s' "$dirty_report" "$untracked_server_only")
+  else
+    dirty_report="$untracked_server_only"
+  fi
+fi
+
+if [[ -n "$(printf '%s' "$dirty_report" | tr -d '[:space:]')" ]]; then
+  fail "WORKING TREE HAS UNCOMMITTED OR UNTRACKED CHANGES - push blocked"
+  printf '\n' >&2
+  fail "This gate validates exactly the commit being pushed: it reads the"
+  fail ".test-baseline floor from the pushed commit and then runs the suite"
+  fail "against the working tree. An uncommitted change, or an untracked file"
+  fail "under a vitest include root that vitest would pick up, means those"
+  fail "would be two different claims about two different sets of bytes."
+  printf '\n' >&2
+  printf '%s\n' "$dirty_report" >&2
+  printf '\n' >&2
+  fail "Commit, stage, or remove the paths above, then push again."
+  exit 1
+fi
+
+# 1b. No file under server/ may be marked skip-worktree or assume-unchanged.
+#     Either flag makes `git status`/`git diff` blind to real local drift on
+#     that path - the working tree could differ from what HEAD (and the
+#     pushed commit) records while every check above reads it as clean.
+#     `git ls-files -v` marks such an entry with an initial 'S' (skip-
+#     worktree) or a lowercase letter (assume-unchanged, e.g. 'h' for a
+#     normally-cached file).
+ls_files_output=$(git ls-files -v -- server)
+ls_files_exit=$?
+if (( ls_files_exit != 0 )); then
+  fail "'git ls-files' failed (exit $ls_files_exit) checking skip-worktree/assume-unchanged flags under server/ - push blocked"
+  exit 1
+fi
+# The `|| true` here belongs to `grep` alone (no match under server/ is the
+# common, healthy case, and must not itself refuse the push) - it is NOT
+# attached to `git ls-files` above, whose own failure is checked and
+# refused explicitly instead of being silently absorbed into "no entries."
+skip_worktree_entries=$(printf '%s\n' "$ls_files_output" | grep -E '^[Sh]' || true)
+if [[ -n "$skip_worktree_entries" ]]; then
+  fail "server/ HAS FILES MARKED skip-worktree OR assume-unchanged - push blocked"
+  printf '\n' >&2
+  fail "These flags make git status/diff blind to real local drift on the path,"
+  fail "so the checks above could read the tree as clean while it silently"
+  fail "differs from what is being pushed:"
+  printf '\n' >&2
+  printf '%s\n' "$skip_worktree_entries" >&2
+  printf '\n' >&2
+  fail "Clear the flag (git update-index --no-skip-worktree <path>, or"
+  fail "--no-assume-unchanged <path>) and push again."
+  exit 1
+fi
+
+# 2. HEAD's COMMIT must equal the commit of every non-delete ref being
+#    pushed. Both sides are peeled through `^{commit}` before comparing:
+#    INVARIANT - an annotated tag's own local SHA (what git's pre-push
+#    stdin reports) is the TAG object's SHA, not the commit it points at,
+#    so a raw string compare against $head_sha would refuse a tag pointing
+#    exactly at HEAD as though it were a mismatch. Peeling both sides is
+#    what makes "the ref being pushed" and "the commit checked out" the
+#    same claim for a tag as well as a branch. A local SHA that fails to
+#    peel at all (garbage input) is treated as mismatched, not skipped.
+head_sha=$(git rev-parse "HEAD^{commit}")
+mismatched=()
+for _i in "${!non_delete_local_refs[@]}"; do
+  _peeled_sha=$(git rev-parse "${non_delete_local_shas[$_i]}^{commit}" 2>/dev/null || true)
+  if [[ -z "$_peeled_sha" || "$_peeled_sha" != "$head_sha" ]]; then
+    mismatched+=("${non_delete_local_refs[$_i]} (pushing ${non_delete_local_shas[$_i]})")
+  fi
+done
+if (( ${#mismatched[@]} > 0 )); then
+  fail "PUSHED REF DOES NOT MATCH THE CHECKED-OUT COMMIT - push blocked"
+  printf '\n' >&2
+  fail "This worktree's HEAD is $head_sha. This gate validates exactly the"
+  fail "commit being pushed, so the worktree must be checked out to that"
+  fail "same commit - otherwise the suite run below proves nothing about"
+  fail "what is actually being sent."
+  printf '\n' >&2
+  for _m in "${mismatched[@]}"; do
+    printf '[baseline-guard]   %s\n' "$_m" >&2
+  done
+  printf '\n' >&2
+  fail "Check out the commit you intend to push (or push HEAD), then push again."
+  exit 1
+fi
+
+# ── Gate 1: transform-error detection + test baseline ───────────────
+log "Gate 1/1: npm test + transform-error detection + baseline check"
+
+# All non-delete refs are now proven to be HEAD (the commit-binding check
+# above). One SHA to test, one SHA to read the floor from.
+local_sha="$head_sha"
+
+# Resolve the enforcement floor from the TIP OF WHAT IS BEING PUSHED
+# (`$local_sha:.test-baseline`), never the unstaged working tree. The floor
+# in effect for this push is that commit's own committed blob.
+baseline=$(git show "$local_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+if [[ -z "$baseline" ]]; then
+  fail ".test-baseline is missing at the commit being pushed ($local_sha)"
+  printf '[baseline-guard]   Create it with a single integer (the current passing count) and commit it.\n' >&2
+  exit 1
+fi
+if ! [[ "$baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  fail "committed .test-baseline ($local_sha:.test-baseline) is not a single integer, got: '$baseline'"
+  exit 1
+fi
+
+# ── Rule (b): the pushed floor never falls below the PREVIOUS floor ─────
+# for the ref being updated. INVARIANT (round 3 correction, 2026-09-26):
+# the previous floor comes from the tip git is about to replace on the
+# remote, or from freshly fetched main for a brand-new ref - NEVER from a
+# local tracking ref (a local `origin/main`) that may be stale. Git's own
+# pre-push stdin already carries the LIVE remote SHA of each ref being
+# updated; reading the floor from that SHA (or from a fetch this hook just
+# ran) is what makes this comparison actually current, where comparing
+# against a local `origin/main` could silently compare against a floor
+# older than the one the remote is really about to replace.
+#
+# Extract a ref's short branch name for the fetch/refusal hint (best-effort
+# cosmetic only - refs/heads/<name> -> <name>; anything else is printed
+# as-is).
+ref_branch_name() {
+  local _ref="$1"
+  case "$_ref" in
+    refs/heads/*) printf '%s' "${_ref#refs/heads/}" ;;
+    *) printf '%s' "$_ref" ;;
+  esac
+}
+
+fetched_origin_main=""
+for _i in "${!non_delete_local_refs[@]}"; do
+  _ref="${non_delete_local_refs[$_i]}"
+  _remote_sha="${non_delete_remote_shas[$_i]:-}"
+
+  if [[ -n "$_remote_sha" && "$_remote_sha" != "$zero_sha" ]]; then
+    # The ref already exists on the remote: the previous floor is the
+    # commit git is about to replace, read from that exact remote SHA -
+    # never a merge-base or a local tracking ref standing in for it.
+    if ! git cat-file -e "${_remote_sha}^{commit}" 2>/dev/null; then
+      fail "THE REMOTE TIP OF $_ref IS NOT AVAILABLE LOCALLY - push blocked"
+      printf '\n' >&2
+      fail "the remote tip $_remote_sha of $_ref is not available locally; run \`git fetch origin $(ref_branch_name "$_ref")\` and push again"
+      exit 1
+    fi
+    prev_floor=$(git show "$_remote_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+    prev_floor_source="the remote tip $_remote_sha of $_ref"
+  else
+    # New ref (remote SHA is all zeros): there is no remote tip to read, so
+    # the floor comes from main - fetched fresh right here, since this push
+    # is about to talk to that same remote anyway. Fetched at most once
+    # even if several new refs are being pushed in the same invocation.
+    # The floor is read from FETCH_HEAD of the remote this push targets
+    # ($1 is the remote name git hands every pre-push hook), never from a
+    # remote-tracking ref: whether `git fetch <remote> main` also moves
+    # refs/remotes/<remote>/main depends on the configured refspec, and a
+    # push to a remote other than origin must be ratcheted against THAT
+    # remote's main.
+    if [[ -z "$fetched_origin_main" ]]; then
+      if ! git fetch --quiet "$push_remote_name" main; then
+        fail "could not fetch main from remote '$push_remote_name'"
+        exit 1
+      fi
+      fetched_origin_main=1
+    fi
+    prev_floor=$(git show FETCH_HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+    prev_floor_source="freshly fetched main of remote '$push_remote_name'"
+  fi
+
+  if [[ -z "$prev_floor" ]] || ! [[ "$prev_floor" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "$prev_floor_source's .test-baseline is unreadable - push blocked"
+    exit 1
+  fi
+
+  if (( baseline < prev_floor )); then
+    fail "PUSHED .test-baseline IS BELOW THE PREVIOUS FLOOR - push blocked"
+    printf '[baseline-guard]   Previous floor (%s): %s\n' "$prev_floor_source" "$prev_floor" >&2
+    printf '[baseline-guard]   Pushed .test-baseline:                     %s\n' "$baseline" >&2
+    printf '\n' >&2
+    fail "The floor never falls below the previous one. A deliberate lowering"
+    fail "(for example after removing tests) lands through a reviewed PR whose"
+    fail "CI guard proves the new count, not a silent push. Raise"
+    fail ".test-baseline back to at least $prev_floor, or open this as a"
+    fail "reviewed PR."
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git push ...\n' >&2
+    exit 1
+  fi
+done
+
+# Run the test suite and capture BOTH output and exit code.
+#
+# SANCTUARY_PREPUSH_TEST_CMD exists ONLY so this hook's own test suite
+# (server/test/scripts/prepush-floor-rules.test.ts) can stub the real
+# suite's 15-to-19-minute wall-clock cost while still exercising every
+# other check in this file end to end. It is never set, and never read as
+# meaningful, by CI or by an operator's real push - an unset value falls
+# through to the real `npm test` below unconditionally.
+# An environment variable that replaces the suite is a bypass surface on a
+# real push, so it is honored only when this repo's origin is a local
+# filesystem path (the test fixture's bare clone); any origin with a URL
+# scheme or an ssh host is a real remote and the override is refused.
+if [[ -n "${SANCTUARY_PREPUSH_TEST_CMD:-}" ]]; then
+  origin_url=$(git remote get-url origin 2>/dev/null || echo "")
+  # Refused shapes: any URL scheme, ssh user@host:path, and scp-style
+  # host:path with no user (a colon before the first slash). Only a plain
+  # filesystem path, absolute or relative, is a fixture origin.
+  if [[ -z "$origin_url" || "$origin_url" == *://* || "$origin_url" == *@*:* || "${origin_url%%/*}" == *:* ]]; then
+    echo "[baseline-guard] SANCTUARY_PREPUSH_TEST_CMD is set but origin '${origin_url:-<none>}' is a real remote; refusing the override - push blocked"
+    exit 1
+  fi
+  echo "[baseline-guard] test-only suite override active (origin is a local path: $origin_url)"
+fi
+set +e
+if [[ -n "${SANCTUARY_PREPUSH_TEST_CMD:-}" ]]; then
+  test_output=$(eval "$SANCTUARY_PREPUSH_TEST_CMD" 2>&1)
+else
+  test_output=$(cd server && npm test 2>&1 | node ../scripts/redact-test-output.mjs)
+fi
+test_exit=$?
+set -e
+
+# ── Check: transform / collection failure classification ────────────
+#
+# The 2026-04-10 incident (commit 4ac95830) was a parse error at
+# vitest's transform step that caused test files to drop silently.
+# The PRIMARY signal is vitest's exit code - if `npm test` returns
+# non-zero, the push MUST be blocked regardless of any substring
+# parsing. The substring match then runs as a classifier to decide
+# whether to name the error as the specific 4ac95830 failure class
+# or as a generic test failure.
+#
+# Patterns covered (case-insensitive) - MUST stay identical to
+# .githooks/pre-commit's copy (pinned by
+# server/test/scripts/precommit-transform-classifier.test.ts, which
+# extracts pre-commit's copy, not this one - keep both in sync by hand):
+#
+#   "transform failed"           - vite:esbuild plugin message
+#                                  (e.g. "Transform failed with 1 error")
+#   "transform error"            - alternate vitest transform message
+#   "failed to parse"            - esbuild / swc parse error
+#   "failed to collect"          - vitest collection failure
+#   "failed to load source"      - vitest source-loading failure
+#   "cannot find module"         - missing import or dependency
+#   "Failed Suites"              - vitest summary header for
+#                                  suite-level failures (shown when
+#                                  a test file fails to register)
+TRANSFORM_ERROR_PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
+
+# Vite 8 can emit a benign "failed to load source map" warning while the
+# suite still runs cleanly; filtering that exact phrase prevents a false
+# positive without weakening the real source-load, transform, parse,
+# collect, missing-module, or failed-suite signatures.
+classify_transform_errors() {
+  local _output="$1"
+  printf '%s\n' "$_output" \
+    | grep -Eqi "$TRANSFORM_ERROR_PATTERNS" >/dev/null && \
+    printf '%s\n' "$_output" \
+      | grep -Ei "$TRANSFORM_ERROR_PATTERNS" \
+      | grep -viE 'failed to load source map' || true
+}
+
+transform_error_hits=$(classify_transform_errors "$test_output")
+
+if (( test_exit != 0 )); then
+  if [[ -n "$transform_error_hits" ]]; then
+    fail "TRANSFORM/COLLECTION ERROR DETECTED - push blocked"
+    printf '\n' >&2
+    printf '%s\n' "$transform_error_hits" | head -20 >&2
+    printf '\n' >&2
+    fail "This is the specific failure class from commit 4ac95830:"
+    printf '[baseline-guard]   a parse/transform error causing test files to fail at\n' >&2
+    printf '[baseline-guard]   vitest collection time. See\n' >&2
+    printf '[baseline-guard]   docs/audit/commit-4ac95830-postmortem.md\n' >&2
+    exit 1
+  fi
+  fail "TEST SUITE FAILED (exit code $test_exit) - push blocked"
+  printf '\n' >&2
+  echo "$test_output" | tail -40 >&2
+  exit 1
+fi
+
+# Exit code was zero, but ALSO scan for transform-error substrings
+# as defense-in-depth.
+if [[ -n "$transform_error_hits" ]]; then
+  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) - push blocked"
+  printf '\n' >&2
+  printf '%s\n' "$transform_error_hits" | head -20 >&2
+  printf '\n' >&2
+  fail "This is the specific failure class from commit 4ac95830."
+  printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
+  exit 1
+fi
+
+# ── Check: silent test file drop ─────────────────────────────────────
+#
+# Delegates to scripts/gate2b-check.sh - the SAME implementation
+# .github/workflows/test-baseline-guard.yml's Gate 2b calls (and the same
+# script the old inline pre-commit copy of this gate used to call). See
+# that script for the vitest-own-discovery expected count
+# (server/scripts/count-vitest-test-files.mjs, via `vitest list
+# --filesOnly`) and its self-test (scripts/gate2b-self-test.sh).
+GATE2B_LOG="$(mktemp)"
+trap 'rm -f "$GATE2B_LOG"' EXIT
+printf '%s\n' "$test_output" > "$GATE2B_LOG"
+
+set +e
+gate2b_output=$(bash scripts/gate2b-check.sh "$GATE2B_LOG" 2>&1)
+gate2b_status=$?
+set -e
+
+# FAILURE MODE: gate2b-check.sh's own messages use GitHub Actions'
+# "::error::" annotation prefix, which is meaningless outside Actions but
+# harmless - it just prints as literal text here. Re-prefixing every line
+# with this hook's own "[baseline-guard]" tag keeps the local output visually
+# consistent with every other check in this script instead of leaving one
+# check's output in a different voice.
+while IFS= read -r gate2b_line; do
+  printf '[baseline-guard] %s\n' "$gate2b_line" >&2
+done <<< "$gate2b_output"
+
+if (( gate2b_status != 0 )); then
+  fail "SILENT TEST FILE DROP DETECTED (or an inconsistency in vitest's own file discovery) - push blocked"
+  printf '\n' >&2
+  fail "This is the specific failure class from commit 4ac95830."
+  printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
+  exit 1
+fi
+
+# Recover actual_total (needed for the summary line below) from
+# gate2b-check.sh's own output instead of re-parsing test_output a second
+# time with a second copy of the same regex.
+actual_total=$(echo "$gate2b_output" | grep -oE "Files vitest loaded for the run:[[:space:]]+[0-9]+" | grep -oE "[0-9]+")
+if [[ -z "$actual_total" ]]; then
+  fail "Could not recover the test-file count from scripts/gate2b-check.sh output - internal error"
+  exit 1
+fi
+validate_counter "Test Files count" "$actual_total"
+
+# ── Check: passing count >= baseline (Rule (a)) ──────────────────────
+passing=$(echo "$test_output" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+if [[ -z "$passing" ]]; then
+  fail "Could not parse passing-test count from vitest output"
+  echo "$test_output" | tail -30 >&2
+  exit 1
+fi
+validate_counter "passing-test count" "$passing"
+
+if (( passing < baseline )); then
+  fail "TEST BASELINE REGRESSION - push blocked"
+  printf '[baseline-guard]   Committed floor (%s:.test-baseline): %s\n' "$local_sha" "$baseline" >&2
+  printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
+  printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
+  printf '\n' >&2
+  fail "Fix the regression, or bump .test-baseline in an explicitly-scoped"
+  fail "commit explaining why, then push again."
+  exit 1
+fi
+
+# PLATFORM-DELTA CARVE-OUT: a macOS dev box legitimately runs more tests
+# than the Linux CI floor (macOS-gated suites that skip on Linux), so
+# `passing > baseline` alone is not a signal of an unaccounted-for test on
+# this local hook. This hook does not attempt to distinguish that delta from
+# a genuinely new test the way the old ref-diffed "did this push touch
+# server/" accounting tried to - it only warns. CI
+# (.github/workflows/test-baseline-guard.yml), which runs on Linux and has
+# no such delta, is the authoritative gate for an unaccounted excess: it
+# fails outright on `passing > baseline` with no carve-out, so a real
+# unaccounted new test is still caught before merge even though this local
+# hook let the push through.
+if (( passing > baseline )); then
+  warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
+  warn "This is expected on macOS when platform-gated suites that skip on Linux run"
+  warn "locally; it can also mean a new test was added without bumping .test-baseline."
+  warn "This local hook does not distinguish the two - if you added tests, bump"
+  warn ".test-baseline to $passing (the Linux CI count, not blindly your local count)"
+  warn "in this push. CI enforces the exact match with no platform carve-out, so an"
+  warn "unaccounted excess is still blocked before merge either way."
+fi
+
+ok "Gate 1/1: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."
+ok "All baseline-guard checks passed. Push allowed."
+exit 0

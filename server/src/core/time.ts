@@ -56,6 +56,8 @@
  */
 const ISO_INSTANT_WITH_OFFSET_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+// Must match parseEvidenceTimestamp in server/src/dashboard/v1_1/client.ts;
+// both sides reject offset-less freshness evidence before trust arithmetic.
 
 /** 60_000 = 60 seconds per minute x 1000 milliseconds per second. */
 const MS_PER_MINUTE = 60 * 1000;

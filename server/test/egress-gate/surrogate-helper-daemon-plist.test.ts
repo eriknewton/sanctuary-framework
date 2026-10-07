@@ -1,0 +1,220 @@
+/**
+ * Capability: no process that holds a bound credential value can write a core
+ * file, and the helper refuses to start with an argv that would put its unlock
+ * socket in the wrong hands.
+ *
+ * Both plists are PARSED, not string-matched, so a key rendered into the wrong
+ * dictionary or at the wrong nesting depth fails here rather than passing a
+ * substring check.
+ *
+ * Host-free: pure renderers and a pure argv parser. Nothing is written, nothing
+ * is loaded, and `launchctl` is never invoked.
+ *
+ * Defect id: SURROGATE-CORE-DUMP, SURROGATE-HELPER-ARGV.
+ */
+
+import { describe, expect, it } from "vitest";
+
+import {
+  GATE_SURROGATE_DIR,
+  SurrogateHelperArgvError,
+  parseSurrogateHelperDaemonArgs,
+  renderSurrogateHelperDaemonPlist,
+  surrogateBindingsPath,
+  surrogateDestinationsPath,
+  surrogateHelperDaemonLabel,
+  surrogateHelperDaemonPlistPath,
+  surrogateQuerySocketPath,
+  surrogateUnlockSocketPath,
+} from "../../src/egress-gate/surrogate-helper-daemon.js";
+import { renderEgressGateDaemonPlist } from "../../src/egress-gate/gate-daemon.js";
+
+/**
+ * Minimal plist reader: enough to answer "what is the value at <dict key>.<key>"
+ * for the integer and boolean shapes these two plists use. Deliberately NOT a
+ * substring search, because a `Core` key rendered inside `KeepAlive` would
+ * satisfy a substring check and disable nothing.
+ */
+function plistDictInteger(xml: string, outerKey: string, innerKey: string): number | null {
+  const outer = new RegExp(
+    `<key>${outerKey}</key>\\s*<dict>([\\s\\S]*?)</dict>`,
+  ).exec(xml);
+  if (!outer) return null;
+  const inner = new RegExp(
+    `<key>${innerKey}</key>\\s*<integer>(-?\\d+)</integer>`,
+  ).exec(outer[1]!);
+  if (!inner) return null;
+  return Number(inner[1]);
+}
+
+function plistProgramArguments(xml: string): string[] {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml);
+  if (!block) return [];
+  return Array.from(block[1]!.matchAll(/<string>([\s\S]*?)<\/string>/g)).map((m) => m[1]!);
+}
+
+const HELPER_OPTIONS = {
+  agentUid: 502,
+  gateUid: 503,
+  operatorUid: 501,
+  generation: 7,
+  programArguments: [process.execPath, "/opt/sanctuary/cli.js", "castle-wall", "surrogate-helper-daemon"],
+  fortressPath: "/fortress/a",
+};
+
+describe("neither plist permits a core dump", () => {
+  it("the helper plist sets Core to 0 in BOTH limit dictionaries", () => {
+    const xml = renderSurrogateHelperDaemonPlist(HELPER_OPTIONS);
+    expect(plistDictInteger(xml, "HardResourceLimits", "Core")).toBe(0);
+    expect(plistDictInteger(xml, "SoftResourceLimits", "Core")).toBe(0);
+  });
+
+  it("the gate plist sets Core to 0 in BOTH limit dictionaries", () => {
+    // FAIL-BEFORE: on the base tree this renderer emits neither key, so both
+    // lookups return null.
+    const xml = renderEgressGateDaemonPlist({
+      agentUid: 502,
+      gateAccount: "_sanctuary_gate_502",
+      gateHomeDirectory: "/var/db/sanctuary/gate-home/_sanctuary_gate_502",
+      programArguments: [process.execPath, "/opt/sanctuary/cli.js", "castle-wall", "egress-gate-daemon"],
+      fortressPath: "/fortress/a",
+    });
+    expect(plistDictInteger(xml, "HardResourceLimits", "Core")).toBe(0);
+    expect(plistDictInteger(xml, "SoftResourceLimits", "Core")).toBe(0);
+  });
+
+  it("the helper's Core keys are not inside KeepAlive", () => {
+    // The nesting matters: a limit in the wrong dictionary disables nothing and
+    // would still satisfy a substring assertion.
+    const xml = renderSurrogateHelperDaemonPlist(HELPER_OPTIONS);
+    expect(plistDictInteger(xml, "KeepAlive", "Core")).toBeNull();
+  });
+});
+
+describe("the helper plist starts the helper LOCKED and per agent", () => {
+  it("does not run at load and restarts only on a crash", () => {
+    const xml = renderSurrogateHelperDaemonPlist(HELPER_OPTIONS);
+    expect(xml).toContain("<key>RunAtLoad</key>\n\t<false/>");
+    expect(xml).toContain("<key>KeepAlive</key>\n\t<dict>\n\t\t<key>Crashed</key>\n\t\t<true/>");
+  });
+
+  it("bakes all four uid and generation arguments into the argv", () => {
+    const args = plistProgramArguments(renderSurrogateHelperDaemonPlist(HELPER_OPTIONS));
+    expect(args.slice(-8)).toEqual([
+      "--agent-uid",
+      "502",
+      "--gate-uid",
+      "503",
+      "--operator-uid",
+      "501",
+      "--generation",
+      "7",
+    ]);
+    // What the plist bakes is what the child parses; one contract, both sides.
+    expect(parseSurrogateHelperDaemonArgs(args)).toEqual({
+      agentUid: 502,
+      gateUid: 503,
+      operatorUid: 501,
+      generation: 7,
+    });
+  });
+
+  it("labels and paths are per agent uid", () => {
+    expect(surrogateHelperDaemonLabel(502)).toBe("ai.sanctuaryprotocol.surrogate-helper.502");
+    expect(surrogateHelperDaemonPlistPath(502)).toBe(
+      "/Library/LaunchDaemons/ai.sanctuaryprotocol.surrogate-helper.502.plist",
+    );
+    // The two sockets differ by NAME, not only by mode: two nodes that differed
+    // only by permission would be one typo away from swapping principals.
+    expect(surrogateQuerySocketPath(502)).toBe(`${GATE_SURROGATE_DIR}/502.query.sock`);
+    expect(surrogateUnlockSocketPath(502)).toBe(`${GATE_SURROGATE_DIR}/502.unlock.sock`);
+    expect(surrogateQuerySocketPath(502)).not.toBe(surrogateUnlockSocketPath(502));
+    expect(surrogateBindingsPath(502)).toBe(`${GATE_SURROGATE_DIR}/502.bindings`);
+    expect(surrogateDestinationsPath(502)).toBe(`${GATE_SURROGATE_DIR}/502.destinations`);
+  });
+
+  it("refuses a control character in a program argument rather than escaping it", () => {
+    expect(() =>
+      renderSurrogateHelperDaemonPlist({
+        ...HELPER_OPTIONS,
+        programArguments: [...HELPER_OPTIONS.programArguments, "ok\u0000</string><string>evil"],
+      }),
+    ).toThrow(/control characters/);
+  });
+
+  it("refuses a relative program path", () => {
+    expect(() =>
+      renderSurrogateHelperDaemonPlist({ ...HELPER_OPTIONS, programArguments: ["node", "cli.js"] }),
+    ).toThrow(/absolute/);
+  });
+});
+
+describe("the helper refuses an argv that misplaces its unlock socket", () => {
+  const base = ["--agent-uid", "502", "--gate-uid", "503", "--operator-uid", "501", "--generation", "7"];
+
+  function argvWith(flag: string, value: string): string[] {
+    const out = [...base];
+    out[out.indexOf(flag) + 1] = value;
+    return out;
+  }
+
+  it("refuses --operator-uid 0", () => {
+    // Root would own the unlock socket, so the operator's own session could
+    // never unlock the helper it installed.
+    const err = (() => {
+      try {
+        parseSurrogateHelperDaemonArgs(argvWith("--operator-uid", "0"));
+      } catch (e) {
+        return e as SurrogateHelperArgvError;
+      }
+      throw new Error("expected a refusal");
+    })();
+    expect(err).toBeInstanceOf(SurrogateHelperArgvError);
+    expect(err.refusal).toBe("operator_uid_is_root");
+  });
+
+  it("refuses an --operator-uid equal to the agent uid", () => {
+    // This is the account the whole design exists to keep the value away from.
+    expect(() => parseSurrogateHelperDaemonArgs(argvWith("--operator-uid", "502"))).toThrow(
+      SurrogateHelperArgvError,
+    );
+  });
+
+  it("refuses an --operator-uid equal to the gate uid", () => {
+    expect(() => parseSurrogateHelperDaemonArgs(argvWith("--operator-uid", "503"))).toThrow(
+      SurrogateHelperArgvError,
+    );
+  });
+
+  it("refuses an agent uid equal to the gate uid", () => {
+    const argv = ["--agent-uid", "503", "--gate-uid", "503", "--operator-uid", "501", "--generation", "7"];
+    expect(() => parseSurrogateHelperDaemonArgs(argv)).toThrow(SurrogateHelperArgvError);
+  });
+
+  it("refuses a missing flag rather than defaulting it", () => {
+    expect(() =>
+      parseSurrogateHelperDaemonArgs(["--agent-uid", "502", "--gate-uid", "503", "--generation", "7"]),
+    ).toThrow(SurrogateHelperArgvError);
+  });
+
+  it("refuses a uid that is not plain decimal digits", () => {
+    // `Number("0x10")` and `Number(" 7 ")` both parse. A uid read one way here
+    // and another way by the arming side is a mismatch nothing would report.
+    for (const bad of ["0x1f6", " 502", "502 ", "+502", "50.2", ""]) {
+      expect(() => parseSurrogateHelperDaemonArgs(argvWith("--agent-uid", bad))).toThrow(
+        SurrogateHelperArgvError,
+      );
+    }
+  });
+
+  it("accepts the --flag=value spelling the same way", () => {
+    expect(
+      parseSurrogateHelperDaemonArgs([
+        "--agent-uid=502",
+        "--gate-uid=503",
+        "--operator-uid=501",
+        "--generation=7",
+      ]),
+    ).toEqual({ agentUid: 502, gateUid: 503, operatorUid: 501, generation: 7 });
+  });
+});

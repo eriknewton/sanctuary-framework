@@ -39,8 +39,9 @@ function liftPrivacyRenderer(): {
     var document = { getElementById: () => null };
     var window = { matchMedia: () => null };
     var sessionStorage = { getItem: () => null, setItem: () => null };
-    var location = { hash: "", host: "test" };
+    var location = { hash: "", host: "test", origin: "http://test" };
     ${beforeBoot}
+    sourceRead(HUB + "/activity?category=privacy").state = "state_LOADED";
     return function (s) { state = s; return renderPrivacyPage(); };
   `;
   // eslint-disable-next-line no-new-func

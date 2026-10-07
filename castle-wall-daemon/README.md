@@ -17,20 +17,25 @@ Per-agent mutation is one atomic nft transaction and all signed rule semantics
 run in one ordered Rust evaluator behind NFQUEUE; caller-provided nft fragments
 never reach the root daemon.
 
-This is still **drill-gated**. Source and automated tests do not establish that
-the reference Ubuntu host, its nft build, queue pressure behavior, reboot
-recovery, and real wrapped-agent traffic satisfy the release claim. Until the
-captured Gate A hardware drill passes, the published assurance stays
-`not_implemented`, the status this row carries in `ASSURANCE_MATRIX.md`, never
-“Linux enforcement available.”
+The 2026-10-04 drill proves only the narrowed Ubuntu 24.04 (x86-64) claim in
+`ASSURANCE_MATRIX.md`: a fresh install of the shipped package enforces a signed
+operator policy per user account, blocked destinations stay blocked and allowed
+ones connect, through five reboots, on three fresh servers, with evidence
+checked by two independent reviewers. Source and automated tests still do not
+establish the open fault-injection, queue-pressure fail-closed, audit drain
+durability, DNS, hostname, other-platform, upgrade, removal, or real
+wrapped-agent claims.
 
 ## Status
 
-Linux L2 kernel-runtime activation: boot/runtime ownership, queue verdicts,
+Linux kernel-runtime activation: boot/runtime ownership, queue verdicts,
 signed policy reload, restart reconciliation, and live health/evidence are
-wired. Launching or wrapping a protected agent, and binding one to a per-agent
-cgroup, are NOT built here: that lifecycle is reserved for a later slice, so
-this daemon never reports `Enforcing`. Hostname, hostname-pattern, template-id, and time
+wired. The explicit Ubuntu cold-install variant now provisions a dedicated uid,
+admits signed IP policy and launches a root-installed ELF with literal argv
+through the packaged unit and trampoline. Fresh host-network sockets are
+attributed by kernel socket uid; the service cgroup supplies lifecycle control.
+The daemon still never reports `Enforcing`. See the
+[operator guide](packaging/ubuntu/README.md) for the shipped path and its bounds. Hostname, hostname-pattern, template-id, and time
 window rules are deliberately refused at policy admission: the packet path has
 no authenticated DNS/SNI correlation or template attestation yet. Enforceable
 rules must name a non-empty IP or CIDR destination and may narrow by port and
@@ -56,10 +61,12 @@ Two deployment profiles are intentionally distinct:
   residual same-UID availability limitation and must never inherit the server
   assurance claim.
 
-Phase 2 macOS Network Extension: queued behind Apple Developer Program
-filing.
+macOS Castle Wall is a separate Swift system-extension path. Its Assurance
+Matrix row is proven for a signed operator policy with a clean per-uid
+allow/deny demo plus attended reboot-survival on a Dev-ID-signed and notarized
+binary; the per-flow rule-attributed audit trail, the unattended reboot path, wider host and OS coverage, the p99 measurement, a sustained-operation drill, the TTL-expiry leg through the real CLI enable path and hardware boot verification of the GUI host app remain the named gaps (Assurance Matrix macOS row).
 
-Phase 3 Windows WFP: queued behind Phase 2.
+Windows WFP: queued behind the macOS proof gaps above.
 
 ## Architecture
 
@@ -100,12 +107,13 @@ Three layers of source, named after the surface they own.
    `src/thread_component.rs`) into the ordered enforcement runtime that
    `src/enforcement.rs` acquires with all-or-nothing startup, readiness gating,
    and reverse-order teardown. The shipped boot path stops at
-   `KernelRuntimeReady`, and that is the end of what this tree does: the agent
-   lifecycle (launching or wrapping a protected agent, and the marker-bound
-   cgroup jump plus NFQUEUE body that would confine one) is NOT built here, as
-   the Status section above states. Reporting enforcement would require that
-   unbuilt lifecycle, so this daemon never reports `Enforcing`. Tracked as
-   `ic-sweep-linux-enforcement-actually-enforces`.
+   `KernelRuntimeReady`. The install variant adds a required Configured record,
+   READY-ordered uid launch, mandatory capped ephemeral workspace and bounded
+   descendant stop. Kernel uid matching supplies traffic attribution; membership
+   in a service cgroup alone is not that evidence. The finite stand-in is the
+   current workload witness, and third-party workloads need separate evidence.
+   These mechanisms do not promote status to `Enforcing` or change the Linux
+   public assurance claim.
    Once acquired, the owned nftables table and its authenticated, root-owned
    ownership journal are PRESERVED across every ordinary userspace loss
    (SIGTERM, `systemctl stop`, a crash, a readiness-notify failure, a partial

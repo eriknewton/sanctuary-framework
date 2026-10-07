@@ -81,7 +81,7 @@
  * `unverified`, never a false `met`; the bounded-wait timeout means a mint
  * never blocks indefinitely -- the operator retries).
  *
- * DEBT (uid-basis re-resolution): cleanup currently re-resolves the agent
+ * DEBT(FS-OPS-UID-BASIS-CLEANUP) (uid-basis re-resolution): cleanup currently re-resolves the agent
  * uid from the live agent-origin descriptor at removal time. The durable fix
  * is to persist the uid basis on the grant record at mint time so cleanup
  * never consults mutable current policy; that lands with a multi-uid
@@ -773,8 +773,8 @@ export class PosixFileGrantFsOps implements FsOps {
    * one logical agent's subtree while a DIFFERENT subject agent id still
    * holds an active grant would strip the shared uid's traverse and break
    * the other agent's still-live reach path. See the module doc comment's
-   * DEBT note for the durable multi-uid fix (persist the uid basis on the
-   * grant record).
+   * note (handle FS-OPS-UID-BASIS-CLEANUP) for the durable multi-uid fix
+   * (persist the uid basis on the grant record).
    *
    * Revoke-vs-concurrent-mint race close (FIX-ROUND, fail-CLOSED): the
    * drain-check + removal (+ a defensive re-check/re-apply) run UNDER the

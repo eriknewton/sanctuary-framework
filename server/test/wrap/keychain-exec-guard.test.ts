@@ -9,8 +9,8 @@
  * finish inside 30 minutes with zero code change.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,16 @@ import {
   setKeychainExec,
   type KeychainExec,
 } from "../../src/wrap/keychain-exec.js";
+import {
+  createTestRunMarkerLifecycle,
+  createTestRunMarker,
+  MAX_TEST_RUN_AGE_MS,
+  refreshRunToken,
+  removeTestRunMarker,
+  RUN_TOKEN_REFRESH_INTERVAL_MS,
+  type TestRunMarkerTimers,
+  testRunMarkerPath,
+} from "../setup/test-run-marker.js";
 import {
   getOrCreateKeychainCustodyKey,
   readKeychainCustodyKey,
@@ -124,6 +134,15 @@ describe("the credential CLI is UNREACHABLE from the suite", () => {
     );
     expect(surface).not.toMatch(/export function resetKeychainExec/);
     expect(surface).toMatch(/export function setKeychainExec\(fn: KeychainExec\): void/);
+  });
+
+  it("tells operators to remove the marker directory recursively", () => {
+    const surface = readFileSync(
+      fileURLToPath(new URL("../../src/wrap/keychain-exec.ts", import.meta.url)),
+      "utf8"
+    );
+    expect(surface).toContain("`  rm -r ${markerPathForDiagnostics()}`");
+    expect(surface).not.toContain("`  rm ${markerPathForDiagnostics()}`");
   });
 
   it("routes through an installed store instead of spawning anything", async () => {
@@ -609,6 +628,86 @@ describe("no code path in server/test can reach the real credential binary", () 
     expect(latchUnderTest(false, true)).toBe(true);
     expect(latchUnderTest(true, true)).toBe(true);
     expect(latchUnderTest(false, false)).toBe(false);
+  });
+
+  it("keeps the package marker alive until every overlapping test run tears down", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+
+    try {
+      createTestRunMarker(root, "run-a");
+      createTestRunMarker(root, "run-b");
+      removeTestRunMarker(root, "run-a");
+      expect(existsSync(marker)).toBe(true);
+      removeTestRunMarker(root, "run-b");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes only unrefreshed tokens older than the ceiling, keeping refreshed and fresh tokens", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+    try {
+      // 2147483646 = largest pid-shaped integer below INT32_MAX; no live process
+      // holds it, so a pid-liveness pruner would delete this fresh token.
+      createTestRunMarker(root, "2147483646-fresh");
+      createTestRunMarker(root, "refreshed-run");
+      createTestRunMarker(root, "unrefreshed-old-run");
+      const past = (Date.now() - MAX_TEST_RUN_AGE_MS - RUN_TOKEN_REFRESH_INTERVAL_MS) / 1000;
+      utimesSync(join(marker, "refreshed-run"), past, past);
+      utimesSync(join(marker, "unrefreshed-old-run"), past, past);
+      refreshRunToken(root, "refreshed-run");
+      createTestRunMarker(root, `${process.pid}-live`);
+      expect(readdirSync(marker).sort()).toEqual(
+        ["2147483646-fresh", "refreshed-run", `${process.pid}-live`].sort()
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates this run's token when a later run pruned it before refresh", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+    try {
+      createTestRunMarker(root, "paused-run");
+      rmSync(join(marker, "paused-run"));
+
+      expect(() => refreshRunToken(root, "paused-run")).not.toThrow();
+      expect(existsSync(join(marker, "paused-run"))).toBe(true);
+
+      // A later run's teardown can also remove the then-empty directory.
+      rmSync(marker, { recursive: true, force: true });
+      expect(() => refreshRunToken(root, "paused-run")).not.toThrow();
+      expect(existsSync(join(marker, "paused-run"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("unrefs the run-token refresh interval and clears it during marker teardown", () => {
+    const root = mkdtempSync(join(tmpdir(), "sanctuary-test-run-marker-"));
+    const marker = testRunMarkerPath(root);
+    const interval = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
+    const timers: TestRunMarkerTimers = {
+      setInterval: vi.fn(() => interval),
+      clearInterval: vi.fn(),
+    };
+    const lifecycle = createTestRunMarkerLifecycle(root, "run-with-refresh", timers);
+    try {
+      lifecycle.setup();
+      expect(timers.setInterval).toHaveBeenCalledWith(expect.any(Function), RUN_TOKEN_REFRESH_INTERVAL_MS);
+      expect(interval.unref).toHaveBeenCalledTimes(1);
+      expect(existsSync(marker)).toBe(true);
+      lifecycle.teardown();
+      expect(timers.clearInterval).toHaveBeenCalledWith(interval);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      lifecycle.teardown();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   /**

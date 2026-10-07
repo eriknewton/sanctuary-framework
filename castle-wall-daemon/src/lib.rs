@@ -17,6 +17,9 @@
 //! Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 1, 4, 5,
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
 
+#[cfg(target_os = "linux")]
+pub mod agent_launch;
+pub mod agent_start;
 pub mod approval;
 pub mod audit;
 pub mod cgroup;
@@ -25,6 +28,13 @@ pub mod crypto;
 pub mod daemon;
 pub mod decision;
 pub mod enforcement;
+// Premise P6: `AtomicU8` (the exit and guard state cells, read by the SIGALRM
+// handler) and `AtomicU32` (the deadline, loaded by `arm_with`, which the SIGTERM
+// handler reaches through `request_daemon_stop`) must both be lock-free for the
+// signal-reachable paths to be async-signal-safe, so a target without 8- and
+// 32-bit atomics fails to compile here.
+#[cfg(all(target_has_atomic = "8", target_has_atomic = "32"))]
+pub mod exit_guard;
 pub mod failure;
 pub mod habeas;
 pub mod health_probe;
@@ -32,15 +42,20 @@ pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;
 pub mod launcher;
+pub mod linux_install;
 pub mod live_status;
 pub mod manifest;
 pub mod nfqueue;
 pub mod nftables;
 pub mod ownership_journal;
 pub mod policy;
+pub mod protected_agent;
 pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
+pub mod safety_net_uid;
+#[cfg(test)]
+pub(crate) mod source_scan;
 pub mod systemd_notify;
 pub mod thread_component;
 

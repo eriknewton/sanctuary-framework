@@ -1,0 +1,112 @@
+# Sanctuary confined agent, one instance per agent uid: the instance name IS the
+# numeric uid, so `sanctuary-agent@<uid>.service` runs the agent as that uid.
+#
+# What this unit declares: the agent starts only after the Castle Wall unit has
+# signalled READY=1 (which it does only once the admitted uid is bound and read
+# back from the kernel), only when the uid-matching credential check and the
+# kernel gate below both exit 0, and it stops when the wall stops or its process ends. An explicit wall restart
+# propagates a new activation behind READY; Restart=no forbids failure retries.
+# Boot intent is the single multi-user target link.
+# Must match EXPECTED_DIRECTIVES in tests/agent_unit.rs (install design 4.3).
+#
+# FAILURE MODE an operator will meet: starting an instance while the wall is
+# stopped or failed PULLS a wall start (BindsTo= is a stronger Requires=). After
+# a wall exit 78 that pull is an explicit wall start, not an automatic restart.
+# If the wall has hit its start limit, the pulled start fails with "start request
+# repeated too quickly" and this unit fails as a dependency; the repair is
+# `systemctl reset-failed sanctuary-castle-wall`, not an edit of this unit.
+[Unit]
+Description=Sanctuary confined agent (uid %i)
+# The agent may run only while the wall that bound its uid is active; this edge,
+# not the agent, decides when the agent stops. With After= below, the start job
+# waits for the wall's READY=1, a wall stop or failure replaces a pending start
+# with a stop, and on stop the agent is stopped BEFORE the wall is signalled.
+# This edge is the single point of freshness: the kernel gate reads the table
+# but not which activation wrote it. Must match the unit name of
+# sanctuary-castle-wall.service and UNIT_NAME in
+# packaging/ubuntu/lifecycle-guard.py.
+BindsTo=sanctuary-castle-wall.service
+After=sanctuary-castle-wall.service network-online.target var-lib-sanctuary\x2dagent\x2dworkspace.mount
+Wants=network-online.target
+Requires=var-lib-sanctuary\x2dagent\x2dworkspace.mount
+
+[Service]
+# exec, not simple: the start job fails if execve of the agent fails, so a
+# missing executable never reads as a started agent.
+Type=exec
+# The credential drop is derived from the instance, the same value the kernel
+# gate compares with the live binding; never a literal uid or group name.
+User=%i
+Group=%i
+# PID 1 reads this root-owned 0600 file, not the agent; the agent does receive
+# both values in its environment, an accepted bound because neither is a secret
+# (a uid and a fortress id). If this file ever gains a secret, the agent must
+# stop inheriting it. No leading dash: a missing file fails the start.
+# Must match EnvironmentFile= in sanctuary-castle-wall.service.
+EnvironmentFile=/etc/sanctuary/castle-wall.env
+# ORDER MATTERS. First the unprivileged credential check, run with exactly the
+# credentials ExecStart= will get, then the root kernel gate (the plus prefix
+# keeps CAP_NET_ADMIN for one nft read under the empty bounding set below). For
+# every instance except 0, no root process runs for a wrongly credentialed
+# unit; for instance 0 the check itself runs as root and refuses at its uid
+# parse before any read. Both executable paths must match DAEMON_PATH in
+# packaging/ubuntu/lifecycle-guard.py. The trusted-service uid argument must
+# arrive: no UnsetEnvironment= may be added, because systemd applies it before
+# expanding the variable and the gate would then refuse every start.
+ExecStartPre=/usr/local/libexec/sanctuary/castle-wall-daemon --agent-credential-check %i
+ExecStartPre=+/usr/local/libexec/sanctuary/castle-wall-daemon --agent-start-gate %i --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}
+# Fixed packaged trampoline, no caller argv; the required Configured record
+# selects a root-custodied ELF and literal arguments for a second exec.
+# Must match EXECUTABLE_PATH in src/protected_agent/profile.rs.
+# Must match LAUNCHER_PATH in src/linux_install/contract.rs.
+ExecStart=/usr/local/libexec/sanctuary/protected-agent-v1
+# Failure does not trigger retries. An operator wall restart propagates through
+# BindsTo; every activation re-runs both checks above.
+Restart=no
+# Policy, not a derivation. The only derived part is the inequality pinned in
+# src/agent_start.rs: this must exceed one bounded nft call (NFT_CALL_WORST_CASE
+# = 2 s timeout + 0.2 s kill grace + 0.5 s reap grace = 2.7 s). The rest is
+# headroom for systemd's own resolution of User= and Group= and two process
+# executions; the timer starts after the wall's start job has completed.
+TimeoutStartSec=30
+# Equal to the wall's TimeoutStopSec, so an ordered wall stop is bounded by
+# 10 s for the agent plus 10 s for the wall. Must match TimeoutStopSec in
+# sanctuary-castle-wall.service.
+TimeoutStopSec=10
+# Every process the agent forks is in this cgroup and is killed on stop.
+KillMode=control-group
+# Explicit although it is the default: without the SIGKILL after TimeoutStopSec
+# the stop, and so the agent's egress window after a wall death, is unbounded.
+SendSIGKILL=yes
+# A uid-U process that could gain root or CAP_NET_ADMIN no longer runs only as
+# U; the credential check proves both at every start.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# The mount is mandatory: the underlying root directory is never U-writable.
+# Must match WORKSPACE_PATH and the fixed budgets in src/linux_install/contract.rs.
+WorkingDirectory=/var/lib/sanctuary-agent-workspace
+Environment=HOME=/var/lib/sanctuary-agent-workspace
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/sanctuary-agent-workspace
+InaccessiblePaths=/tmp /var/tmp /dev/shm /run/user
+PrivateDevices=yes
+# Code-gate amendment A-IPC: per-unit IPC and removal bound activation residue.
+PrivateIPC=yes
+RemoveIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# Fixed bounded-v1 policy: 512 MiB aggregate memory, 64 tasks, no core dumps.
+MemoryMax=512M
+TasksMax=64
+LimitCORE=0
+StandardInput=null
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

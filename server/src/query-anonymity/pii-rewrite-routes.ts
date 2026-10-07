@@ -23,7 +23,7 @@
  *       Honesty: the response and the audit event report
  *       `effective_tier_b_enabled: false` with an `inactive_reason`
  *       while no redactor is wired into the production substrate path
- *       (see DEBT below). The operator's `enabled` preference is still
+ *       (see the WIRED section below). The operator's `enabled` preference is still
  *       persisted; it just does not produce live scrubbing yet, and
  *       the surface must not claim otherwise (never-overclaim rule).
  *

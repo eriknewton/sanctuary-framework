@@ -1,6 +1,6 @@
 # @sanctuary-framework/mcp-server
 
-Operator-sovereign substrate for AI agents. Open source. Operator-held keys. Operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet. Composes with any MCP-speaking agent harness.
+Operator-sovereign substrate for AI agents. Open source. Operator-held keys. Operating-system enforcement is live on macOS today; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven within Assurance Matrix bounds. Windows is roadmap. Composes with any MCP-speaking agent harness.
 
 Your agent. Your machine. Your keys.
 
@@ -125,7 +125,7 @@ See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
 
 Sanctuary's enforcement model is the Castle Architecture. Four layers, each with a distinct enforcement contract.
 
-**Castle Wall: the perimeter.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS only in v1.x: the signed Network Extension or pf path enforces when installed and armed. The Linux netfilter / NFQUEUE modules are tested against a real kernel, but the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see). Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
+**Castle Wall: the perimeter.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS in v1.x: the signed Network Extension or pf path enforces when installed and armed. On Ubuntu 24.04 x86-64, a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with evidence checked by two independent reviewers. Other Linux platforms, DNS and hostname paths, a real-agent harness, and the remaining IC-02, IC-03 and IC-04 scopes stay open. Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
 
 **Sentinels: the nerves.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. The observation surface is shipped; the real eBPF probe loader is not.
 
@@ -198,7 +198,8 @@ On first initialization, Sanctuary will:
 3. Preserve the harness's existing MCP entries while adding Sanctuary as the
    cooperative gateway
 4. Report explicit operator actions for any macOS Castle Wall consent or
-   privileged step; Linux egress enforcement remains unshipped
+   privileged step; Linux enforcement is bounded to the Ubuntu 24.04 x86-64
+   fresh-install per-account signed-policy claim in the Assurance Matrix
 
 ## Key protection modes
 
@@ -351,9 +352,9 @@ See [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-
 
 Sanctuary's security claims are structural, not cooperative-only.
 
-**Castle Wall enforcement (macOS live; Linux not implemented; Windows roadmap):**
+**Castle Wall enforcement (macOS live; Ubuntu 24.04 x86-64 bounded proof; Windows roadmap):**
 - macOS Network Extension or pf rules intercept outbound calls before leaving the operator's machine when the signed extension is installed and armed
-- Linux netfilter / NFQUEUE is source-tested but not wired into the shipped daemon boot path; Windows Filtering Platform is roadmap
+- Ubuntu 24.04 x86-64 fresh installs have the narrowed per-account signed-policy proof in the Assurance Matrix; other Linux platforms, DNS and hostname paths, a real-agent harness, and Windows Filtering Platform are roadmap
 - Per-process policy with per-agent-template defaults
 - Default-deny outbound with first-run wizard pre-allowing common developer endpoints where the macOS wall is armed
 - A prompt-injected agent cannot bypass the macOS wall within the proven scope: one host, one OS version, signed extension installed and armed
@@ -381,7 +382,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Concordia receipts for cross-castle commitments
 - Verascore reputation aggregating across operators
 - Portable reputation bundles for cross-platform portability
-- Hash-chained audit with current checkpoint-signing bounds as compliance evidence. Production audit checkpoints are currently unsigned until **IC-05** closes
+- Hash-chained audit with current checkpoint-signing bounds as compliance evidence; production call sites sign checkpoints when the fortress holds an identity, and the audit-chain row stays partial pending the external-verifier drill (**IC-05**)
 
 ## Development
 
