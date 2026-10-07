@@ -87,6 +87,7 @@ assert_inert() {
 
 assert_systemd
 id build >/dev/null 2>&1 || useradd -m build
+# mktemp creates a root-owned 0700 parent; makepkg as build needs access to its scratch PKGBUILD tree.
 chown build:build "$work"
 pacman -Syu --noconfirm --needed base-devel zstd systemd nftables iproute2 util-linux shadow python libnetfilter_queue >/dev/null
 
@@ -96,6 +97,7 @@ guard_path=/usr/share/libalpm/scripts/sanctuary-castle-wall-guard
 
 if [[ "$mode" == --noextract-witness ]]; then
   record 'NoExtract witness keeps the image pacman.conf rules; base failure was captured in run 37365438647 attempt 2'
+  pacman-conf NoExtract | grep -Fx 'usr/share/doc/*' >/dev/null
   expect_ok noextract-head-install pacman -U --noconfirm "$pkg"
   pacman -Qkk sanctuary-castle-wall >"$evidence/noextract-head-qkk.out"
   if pacman -Ql sanctuary-castle-wall | grep -F '/usr/share/doc' >"$evidence/noextract-head-doc-paths.out"; then
@@ -117,7 +119,8 @@ if [[ "$mode" == --noextract-witness ]]; then
   unmask_hooks
   rm -f /etc/sanctuary/provisioned
 
-  printf '\nNoExtract = %s\n' "$identity_rel" >>/etc/pacman.conf
+  sed -i "/^\[options\]/a NoExtract = $identity_rel" /etc/pacman.conf
+  pacman-conf NoExtract | grep -Fx "$identity_rel" >/dev/null
   expect_ok noextract-missing-identity-install pacman -U --noconfirm "$pkg"
   [[ ! -e "$identity_path" ]]
   if pacman -Qkk sanctuary-castle-wall >"$evidence/noextract-missing-qkk.out" 2>"$evidence/noextract-missing-qkk.err"; then

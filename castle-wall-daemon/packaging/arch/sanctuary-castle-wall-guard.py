@@ -1,7 +1,8 @@
 # ruff: noqa: F821, EXE002
 """Template embedded in the Arch libalpm guard.
 
-The generated package prepends immutable constants above this file. The guard is
+The generated package prepends IDENTITY_SHA256 and then STATIC above this file.
+STATIC must match the brief 3.1 definition and the CLI pin in P2a. The guard is
 read-only: hooks may admit or refuse a transaction, never mutate host state.
 """
 
@@ -18,6 +19,7 @@ import time
 from pathlib import Path
 
 PACKAGE = "sanctuary-castle-wall"
+# Must match GUARD in build-arch-package.py.
 GUARD_PATH = "/usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
 UNIT_NAME = "sanctuary-castle-wall.service"
 AGENT_UNIT_PREFIX = "sanctuary-agent@"
@@ -248,11 +250,15 @@ def build_identity():
         identity = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         refuse("invalid Arch install identity")
+    payload_hashes = identity.get("payload_sha256")
+    expected_payloads = set(PAYLOAD_MODES) - {IDENTITY_PATH.lstrip("/"), GUARD_PATH.lstrip("/")}
     if (
         identity.get("artifact_kind") != "arch-install-pkg-v1"
         or identity.get("package") != PACKAGE
         or identity.get("package_version") != PACKAGE_VERSION
-        or identity.get("payload_sha256") != PAYLOAD_HASHES
+        or not isinstance(payload_hashes, dict)
+        or set(payload_hashes) != expected_payloads
+        or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in payload_hashes.values())
         or not isinstance(identity.get("file_count"), int)
         or "guard_sha256" in identity
     ):
@@ -262,13 +268,19 @@ def build_identity():
 
 def static_guard_source():
     raw = stable_read(GUARD_PATH, PAYLOAD_BYTES)
-    marker = b"# BEGIN_STATIC_GUARD\n"
-    try:
-        static = raw.split(marker, 1)[1]
-    except IndexError:
-        refuse("installed guard lacks static boundary")
-    if hashlib.sha256(static).hexdigest() != STATIC_SHA256:
-        refuse("installed guard static body differs from hook binding")
+    lines = raw.splitlines(keepends=True)
+    expected_identity = f"IDENTITY_SHA256 = {IDENTITY_SHA256!r}\n".encode()
+    expected_static = (
+        f"PACKAGE_VERSION = {PACKAGE_VERSION!r}\n".encode(),
+        f"IDENTITY_PATH = {IDENTITY_PATH!r}\n".encode(),
+        f"PAYLOAD_MODES = {PAYLOAD_MODES!r}\n".encode(),
+    )
+    if len(lines) < 2 or lines[0] != b"#!/usr/bin/python3 -I\n" or lines[1] != expected_identity:
+        refuse("installed guard header differs from hook binding")
+    if len(lines) < 5 or tuple(lines[2:5]) != expected_static:
+        refuse("installed guard static header differs from hook binding")
+    # Hash exactly the bytes after line 2; this is the same object P2a pins as STATIC.
+    return hashlib.sha256(raw[len(lines[0]) + len(lines[1]) :]).hexdigest()
 
 
 def hash_file(relpath):
@@ -281,7 +293,7 @@ def installed_identity():
     for relpath in sorted(PAYLOAD_MODES):
         checked_payload_path(relpath, True)
         package_owner(relpath)
-    for relpath, digest in PAYLOAD_HASHES.items():
+    for relpath, digest in identity["payload_sha256"].items():
         if hash_file(relpath) != digest:
             refuse(f"installed payload differs from bound identity: /{relpath}")
     return identity
@@ -357,10 +369,7 @@ def systemd_pid1_comm():
 
 
 def systemd_manager(unit_name=UNIT_NAME, unit_path=UNIT_PATH):
-    try:
-        systemd_pid1_comm()
-    except OSError:
-        refuse("cannot verify systemd PID 1")
+    systemd_pid1_comm()
     properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")
     output = probe(["/usr/bin/systemctl", "show", unit_name, "--no-pager", "--all", "--property=" + ",".join(properties)])
     fields = {}

@@ -29,22 +29,75 @@ IDENTITY = {
     "payload_sha256": {"usr/bin/sanctuary-linux": "b" * 64},
 }
 IDENTITY_BYTES = (json.dumps(IDENTITY, sort_keys=True, indent=2) + "\n").encode()
-TEMPLATE_BYTES = (HERE / "sanctuary-castle-wall-guard.py").read_bytes()
-GUARD = runpy.run_path(
-    str(HERE / "sanctuary-castle-wall-guard.py"),
-    init_globals={
-        "PACKAGE_VERSION": "0.1.0-1",
-        "IDENTITY_SHA256": hashlib.sha256(IDENTITY_BYTES).hexdigest(),
-        "STATIC_SHA256": hashlib.sha256(TEMPLATE_BYTES).hexdigest(),
-        "IDENTITY_PATH": "/usr/lib/sanctuary-castle-wall/build-identity",
-        "PAYLOAD_MODES": {
-            "usr/bin/sanctuary-linux": 0o755,
-            "usr/lib/sanctuary-castle-wall/build-identity": 0o644,
-            "usr/share/libalpm/scripts/sanctuary-castle-wall-guard": 0o755,
-        },
-        "PAYLOAD_HASHES": IDENTITY["payload_sha256"],
-    },
-)
+PRE_P2B_GUARD_TEXT = """
+# Reconstructed from fc1bc892:castle-wall-daemon/packaging/arch/sanctuary-castle-wall-guard.py.
+class Refusal(Exception):
+    pass
+
+
+PACKAGE = "sanctuary-castle-wall"
+IDENTITY_PATH = "/usr/lib/sanctuary-castle-wall/build-identity"
+MOUNT_NAME = r"var-lib-sanctuary\\\\x2dagent\\\\x2dworkspace.mount"
+
+
+def refuse(reason):
+    raise Refusal(reason)
+
+
+def systemd_manager(unit_name="sanctuary-castle-wall.service", unit_path="/etc/systemd/system/sanctuary-castle-wall.service"):
+    output = probe([])
+    fields = dict(line.split("=", 1) for line in output.splitlines())
+    if fields["ActiveState"] != "inactive" or fields["SubState"] != "dead":
+        refuse("unit not positively inactive")
+    if fields["LoadState"] not in ("loaded", "not-found") or fields["FragmentPath"] not in ("", unit_path):
+        refuse("installed unit not exact, inert and disabled")
+    return fields
+
+
+def build_identity():
+    if lstat(IDENTITY_PATH) is None:
+        return None
+    return {"file_count": 3}
+
+
+def installed_identity():
+    return build_identity()
+
+
+def state_REMOVE():
+    installed_identity()
+    first = systemd_manager()
+    mount_first = systemd_manager(MOUNT_NAME, "/etc/systemd/system/" + MOUNT_NAME)
+    second = systemd_manager()
+    systemd_manager(MOUNT_NAME, "/etc/systemd/system/" + MOUNT_NAME)
+    if first["LoadState"] == "loaded" and second["LoadState"] == "not-found":
+        pass
+    runtime_absent()
+"""
+
+
+def generated_guard_bytes(identity: dict[str, object] | None = None) -> bytes:
+    model = IDENTITY if identity is None else identity
+    identity_bytes = (json.dumps(model, sort_keys=True, indent=2) + "\n").encode()
+    return BUILD.guard_bytes("0.1.0-1", identity_bytes, HERE)
+
+
+def module_from_bytes(source: bytes) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "guard.py"
+        path.write_bytes(source)
+        compile(source, str(path), "exec")
+        return runpy.run_path(str(path))
+
+
+def pre_p2b_guard() -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pre-p2b-guard.py"
+        path.write_text(PRE_P2B_GUARD_TEXT)
+        return runpy.run_path(str(path))
+
+
+GUARD = module_from_bytes(generated_guard_bytes())
 
 
 class GuardTests(unittest.TestCase):
@@ -58,10 +111,13 @@ class GuardTests(unittest.TestCase):
                 GUARD["main"](["upgrade"])
 
     def test_generated_guard_compiles_and_refuses_upgrade(self):
-        identity = json.dumps(IDENTITY, sort_keys=True, indent=2).encode()
-        guard = BUILD.guard_bytes("0.1.0-1", identity, IDENTITY["payload_sha256"], HERE)
+        identity = (json.dumps(IDENTITY, sort_keys=True, indent=2) + "\n").encode()
+        guard = BUILD.guard_bytes("0.1.0-1", identity, HERE)
         self.assertEqual(guard.splitlines()[1].decode().split(" = ", 1)[0], "IDENTITY_SHA256")
-        self.assertEqual(guard.splitlines()[2].decode().split(" = ", 1)[0], "STATIC_SHA256")
+        self.assertEqual(guard.splitlines()[2].decode().split(" = ", 1)[0], "PACKAGE_VERSION")
+        self.assertEqual(guard.splitlines()[3].decode().split(" = ", 1)[0], "IDENTITY_PATH")
+        self.assertEqual(guard.splitlines()[4].decode().split(" = ", 1)[0], "PAYLOAD_MODES")
+        self.assertNotIn(b"PAYLOAD_HASHES", b"\n".join(guard.splitlines()[:8]))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "guard.py"
             path.write_bytes(guard)
@@ -69,6 +125,35 @@ class GuardTests(unittest.TestCase):
             result = subprocess.run([sys.executable, "-I", str(path), "upgrade"], check=False, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Castle Wall package guard refused:", result.stdout + result.stderr)
+
+    def test_generated_static_hash_is_everything_after_identity_line(self):
+        guard = generated_guard_bytes()
+        lines = guard.splitlines(keepends=True)
+        expected = hashlib.sha256(guard[len(lines[0]) + len(lines[1]) :]).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "guard.py"
+            path.write_bytes(guard)
+            with patch.dict(GUARD["static_guard_source"].__globals__, {"GUARD_PATH": str(path)}):
+                self.assertEqual(GUARD["static_guard_source"](), expected)
+
+    def test_generated_guard_refuses_static_header_edits(self):
+        guard = generated_guard_bytes()
+        for old, new in (
+            (b"PACKAGE_VERSION = '0.1.0-1'\n", b"PACKAGE_VERSION = '0.1.0-2'\n"),
+            (
+                b"IDENTITY_PATH = '/usr/lib/sanctuary-castle-wall/build-identity'\n",
+                b"IDENTITY_PATH = '/missing/build-identity'\n",
+            ),
+        ):
+            with self.subTest(old=old):
+                altered = guard.replace(old, new, 1)
+                self.assertNotEqual(altered, guard)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "guard.py"
+                    path.write_bytes(altered)
+                    with patch.dict(GUARD["static_guard_source"].__globals__, {"GUARD_PATH": str(path)}):
+                        with self.assertRaisesRegex(GUARD["Refusal"], "static header"):
+                            GUARD["static_guard_source"]()
 
     def test_unknown_phase_and_non_root_refuse(self):
         with patch.dict(GUARD["main"].__globals__, {"os": self.root()}):
@@ -213,13 +298,75 @@ class GuardTests(unittest.TestCase):
             }):
                 with self.assertRaises(GUARD["Refusal"]):
                     GUARD["systemd_manager"]()
-        for mutation in ({"NeedDaemonReload": "yes"}, {"NeedDaemonReload": "maybe"}, {"LoadState": "not-found", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service"}):
+        contracted = (
+            ({"NeedDaemonReload": "yes"}, "unit needs daemon reload"),
+            ({"NeedDaemonReload": "maybe"}, "unit needs daemon reload"),
+            ({"LoadState": "not-found", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service"}, "not-found unit reports a fragment path"),
+        )
+        for mutation, message in contracted:
             with self.subTest(mutation=mutation), patch.dict(GUARD["systemd_manager"].__globals__, {
                 "systemd_pid1_comm": lambda: None,
                 "probe": lambda *_a, **_k: render(dict(clean, **mutation)),
             }):
-                with self.assertRaises(GUARD["Refusal"]):
+                with self.assertRaisesRegex(GUARD["Refusal"], message):
                     GUARD["systemd_manager"]()
+
+    def test_pre_p2b_guard_admits_systemd_gap_witnesses(self):
+        base = pre_p2b_guard()
+        properties = ("Id", "Names", "Following", "LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths", "Job", "NeedDaemonReload")
+        clean = {
+            "Id": "sanctuary-castle-wall.service",
+            "Names": "sanctuary-castle-wall.service",
+            "Following": "",
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "disabled",
+            "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service",
+            "DropInPaths": "",
+            "Job": "",
+            "NeedDaemonReload": "no",
+        }
+
+        def render(fields):
+            return "\n".join(f"{key}={fields[key]}" for key in properties) + "\n"
+
+        for mutation in (
+            {"NeedDaemonReload": "yes"},
+            {"LoadState": "not-found", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service"},
+        ):
+            with self.subTest(mutation=mutation), patch.dict(base["systemd_manager"].__globals__, {"probe": lambda *_a, mutation=mutation, **_k: render(dict(clean, **mutation))}):
+                base["systemd_manager"]()
+
+    def test_pre_p2b_guard_admits_mount_second_read_drift(self):
+        base = pre_p2b_guard()
+        first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
+        mount_first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/" + base["MOUNT_NAME"], "ActiveState": "inactive"}
+        mount_second = dict(mount_first, LoadState="not-found", FragmentPath="")
+        reads = iter((first, mount_first, first, mount_second))
+        with patch.dict(base["state_REMOVE"].__globals__, {
+            "installed_identity": lambda: {"file_count": 3},
+            "systemd_manager": lambda *_a, **_k: next(reads),
+            "runtime_absent": lambda: None,
+        }):
+            base["state_REMOVE"]()
+
+    def test_pre_p2b_guard_admits_pid1_decode_error_witness(self):
+        base = pre_p2b_guard()
+        clean = """Id=sanctuary-castle-wall.service
+Names=sanctuary-castle-wall.service
+Following=
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+UnitFileState=disabled
+FragmentPath=/etc/systemd/system/sanctuary-castle-wall.service
+DropInPaths=
+Job=
+NeedDaemonReload=no
+"""
+        with patch.dict(base["systemd_manager"].__globals__, {"probe": lambda *_a, **_k: clean, "stable_read": lambda *_a, **_k: b"\xff"}):
+            base["systemd_manager"]()
 
     def test_remove_allows_only_systemd_load_state_transition(self):
         first = {"LoadState": "loaded", "FragmentPath": "/etc/systemd/system/sanctuary-castle-wall.service", "ActiveState": "inactive"}
@@ -288,6 +435,26 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(GUARD["Refusal"], "identity absent"):
                 GUARD["state_REMOVE"]()
 
+    def test_build_identity_refuses_missing_identity_directly(self):
+        with patch.dict(GUARD["build_identity"].__globals__, {"lstat": lambda _p: None}):
+            with self.assertRaisesRegex(GUARD["Refusal"], "identity absent"):
+                GUARD["build_identity"]()
+
+    def test_pre_p2b_missing_identity_scratch_guard_treats_host_as_inert(self):
+        base = pre_p2b_guard()
+        reached = {"runtime": False}
+
+        def runtime_absent():
+            reached["runtime"] = True
+
+        with patch.dict(base["state_REMOVE"].__globals__, {
+            "lstat": lambda _p: None,
+            "systemd_manager": lambda *_a, **_k: {"LoadState": "not-found"},
+            "runtime_absent": runtime_absent,
+        }):
+            base["state_REMOVE"]()
+        self.assertTrue(reached["runtime"])
+
     def test_bounded_capture_caps_output_and_deadline(self):
         with self.assertRaises(ValueError):
             GUARD["bounded_capture"](["/bin/sh", "-c", "printf 123456789"], timeout=5, limit=4)
@@ -313,6 +480,47 @@ class GuardTests(unittest.TestCase):
         self.assertIn('"binary_features"', identity_block)
         self.assertIn('"rustflags"', identity_block)
         self.assertIn('"file_count"', identity_block)
+
+    def test_optional_rust_constants_compare_absolute_cli_and_relative_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            src = crate / "src"
+            src.mkdir()
+            source = src / "lib.rs"
+            source.write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
+                'pub const ARCH_CLI_PATH: &str = "/usr/bin/sanctuary-linux";\n'
+            )
+            BUILD.check_optional_rust_constants(crate)
+            source.write_text(
+                'pub const ARCH_BUILD_IDENTITY: &str = "usr/lib/sanctuary-castle-wall/build-identity";\n'
+                'pub const ARCH_CLI_PATH: &str = "usr/bin/sanctuary-linux";\n'
+            )
+            with self.assertRaisesRegex(ValueError, "ARCH_CLI_PATH"):
+                BUILD.check_optional_rust_constants(crate)
+
+    def test_pkgbuild_scrubs_rust_environment_by_prefix(self):
+        text = (HERE / "PKGBUILD").read_text()
+        self.assertIn("CARGO_*|RUSTFLAGS*|RUSTC*|RUSTDOC*|RUSTUP_TOOLCHAIN*", text)
+        self.assertIn("Rust build environment survived scrub", text)
+        scrub_function = text.split("_scrub_rust_env() {", 1)[1].split("\n}\n\nbuild() {", 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"""
+set -euo pipefail
+srcdir={tmp!r}
+_scrub_rust_env() {{{scrub_function}
+}}
+export RUSTC_WRAPPER=wrapper RUSTC_WORKSPACE_WRAPPER=workspace RUSTDOCFLAGS=doc RUSTFLAGS=flags RUSTUP_TOOLCHAIN=toolchain CARGO_CACHE_RUSTC_INFO=cache
+_scrub_rust_env
+for name in RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTDOCFLAGS RUSTFLAGS RUSTUP_TOOLCHAIN; do
+  if printenv "$name" >/dev/null; then
+    echo "$name survived scrub" >&2
+    exit 1
+  fi
+  grep -Fx "$name" "$srcdir/rust-env-scrubbed.txt" >/dev/null
+done
+"""
+            subprocess.run(["bash", "-c", script], check=True)
 
 
 if __name__ == "__main__":

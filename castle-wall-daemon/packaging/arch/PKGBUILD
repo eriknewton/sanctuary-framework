@@ -26,11 +26,21 @@ _crate_root() {
 }
 
 _scrub_rust_env() {
-  local name
+  local name scrubbed="$srcdir/rust-env-scrubbed.txt"
+  : >"$scrubbed"
   while IFS='=' read -r name _; do
     case "$name" in
-      CARGO_*|RUSTFLAGS|RUSTC|RUSTDOC|RUSTUP_TOOLCHAIN)
+      CARGO_*|RUSTFLAGS*|RUSTC*|RUSTDOC*|RUSTUP_TOOLCHAIN*)
+        printf '%s\n' "$name" >>"$scrubbed"
         unset "$name"
+        ;;
+    esac
+  done < <(env)
+  while IFS='=' read -r name _; do
+    case "$name" in
+      RUSTC*|RUSTDOC*|RUSTFLAGS*|RUSTUP_TOOLCHAIN*)
+        echo "Rust build environment survived scrub: $name" >&2
+        return 1
         ;;
     esac
   done < <(env)
@@ -43,6 +53,7 @@ build() {
   cd "$crate"
   rustc --version | grep -F "rustc ${_toolchain} " >/dev/null
   _scrub_rust_env
+  printf '%s' "${RUSTFLAGS-}" >"$srcdir/rustflags.txt"
   cargo build --locked --release --target "${_target}" \
     --target-dir "$srcdir/cargo-target" \
     --message-format=json \
@@ -55,7 +66,7 @@ build() {
 package() {
   local crate source_commit rustc_version
   crate="$(_crate_root)"
-  source_commit="$(git -C "${crate}/.." rev-parse HEAD)"
+  source_commit="${SOURCE_COMMIT:?SOURCE_COMMIT must be supplied by the build job; package() does not open root-owned linked-worktree gitdirs as the build user}"
   rustc_version="$(rustc --version)"
   python3 "${startdir}/build-arch-package.py" \
     --crate "$crate" \
@@ -66,5 +77,6 @@ package() {
     --rustc-version "$rustc_version" \
     --glibc-floor "$_glibc_floor" \
     --target-dir "$srcdir/cargo-target" \
-    --cargo-json "$srcdir/cargo.jsonl"
+    --cargo-json "$srcdir/cargo.jsonl" \
+    --rustflags-file "$srcdir/rustflags.txt"
 }

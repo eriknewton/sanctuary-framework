@@ -47,9 +47,11 @@ jobs:
           build_one() {
             local checkout="$1" out="$2" extra_env="${3:-}"
             install -d -o build -g build "$out"
-            git -C "$checkout" config --global --add safe.directory "$checkout"
             chown -R build:build "$checkout"
-            runuser -u build -- bash -lc "cd '$checkout/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" PKGDEST='$out' $extra_env makepkg --noconfirm --syncdeps --needed"
+            # SOURCE_COMMIT avoids opening root-owned linked-worktree gitdirs from makepkg's build user.
+            local source_commit
+            source_commit="$(git -C "$checkout" rev-parse HEAD)"
+            runuser -u build -- bash -lc "cd '$checkout/castle-wall-daemon/packaging/arch' && PATH=\"\$HOME/.cargo/bin:\$PATH\" PKGDEST='$out' SOURCE_COMMIT='$source_commit' $extra_env makepkg --noconfirm --syncdeps --needed"
           }
           compare_packages() {
             local left="$1" right="$2" root="$3"
@@ -58,6 +60,7 @@ jobs:
             bsdtar -xf "$right" -C "$root/right"
             python3 - "$root/left" "$root/right" <<'PY'
           import hashlib
+          import stat
           import sys
           from pathlib import Path
 
@@ -70,12 +73,13 @@ jobs:
                   rel = path.relative_to(root).as_posix()
                   if rel in excluded:
                       continue
+                  mode = stat.S_IMODE(path.lstat().st_mode)
                   if path.is_dir():
-                      entries[rel] = ("dir", "")
+                      entries[rel] = ("dir", mode, "")
                   elif path.is_symlink():
-                      entries[rel] = ("symlink", path.readlink().as_posix())
+                      entries[rel] = ("symlink", mode, path.readlink().as_posix())
                   elif path.is_file():
-                      entries[rel] = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+                      entries[rel] = ("file", mode, hashlib.sha256(path.read_bytes()).hexdigest())
                   else:
                       raise SystemExit(f"unsupported package entry: {rel}")
               return entries
@@ -99,11 +103,17 @@ jobs:
           root = Path(__import__("sys").argv[1])
           pkgbuild = root / "castle-wall-daemon/packaging/arch/PKGBUILD"
           text = pkgbuild.read_text()
-          pkgbuild.write_text(text.replace("  _scrub_rust_env\n  cargo build", "  : # negative witness leaves caller RUSTFLAGS live\n  cargo build"))
+          mutated = text.replace("  _scrub_rust_env\n  printf '%s' \"${RUSTFLAGS-}\" >\"$srcdir/rustflags.txt\"\n  cargo build", "  printf '%s' \"${RUSTFLAGS-}\" >\"$srcdir/rustflags.txt\"\n  cargo build")
+          if mutated == text:
+              raise SystemExit("RUSTFLAGS negative failed to remove the scrub call")
+          pkgbuild.write_text(mutated)
           builder = root / "castle-wall-daemon/packaging/arch/build-arch-package.py"
           text = builder.read_text()
           old = '    if rustflags:\n        raise ValueError("RUSTFLAGS must be scrubbed before staging the Arch package")\n'
-          builder.write_text(text.replace(old, ""))
+          mutated = text.replace(old, "")
+          if mutated == text:
+              raise SystemExit("RUSTFLAGS negative failed to remove the stage refusal")
+          builder.write_text(mutated)
           PY
           build_one "$work/rustflags-negative" "$RUNNER_TEMP/arch-package-rustflags-negative" "RUSTFLAGS='-C metadata=sanctuary_negative_rustflags'"
           pkg_rustflags=("$RUNNER_TEMP/arch-package-rustflags-negative"/*.pkg.tar.zst)

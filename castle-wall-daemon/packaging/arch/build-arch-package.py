@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 from pathlib import Path
@@ -18,6 +17,7 @@ PRIVATE = "usr/lib/" + PACKAGE
 SHARE = "usr/share/" + PACKAGE
 # Must match pacman::ARCH_BUILD_IDENTITY when that P2a Rust constant exists.
 IDENTITY = PRIVATE + "/build-identity"
+# Must match GUARD_PATH in sanctuary-castle-wall-guard.py.
 GUARD = "usr/share/libalpm/scripts/sanctuary-castle-wall-guard"
 HOOKS = (
     "00-sanctuary-castle-wall-upgrade-guard.hook",
@@ -71,6 +71,7 @@ def sha(path: Path) -> str:
 
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+    # The package records directory modes; an inherited restrictive umask would make guarded removal refuse.
     path.chmod(0o755)
 
 
@@ -86,21 +87,23 @@ def copy_file(source: Path, destination: Path, mode: int) -> None:
     destination.chmod(mode)
 
 
-def guard_bytes(version: str, identity_bytes: bytes, payload_hashes: dict[str, str], here: Path) -> bytes:
+def guard_static_bytes(version: str, here: Path) -> bytes:
     template = (here / "sanctuary-castle-wall-guard.py").read_bytes()
-    # The identity intentionally omits the guard hash because this header embeds
-    # the identity hash; including both would make a self-referential digest loop.
-    header = (
-        "#!/usr/bin/python3 -I\n"
-        + f"IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n"
-        + f"STATIC_SHA256 = {hashlib.sha256(template).hexdigest()!r}\n"
-        + f"PACKAGE_VERSION = {version!r}\n"
+    # Must match the STATIC definition in brief 3.1 and the CLI pin in P2a.
+    return (
+        f"PACKAGE_VERSION = {version!r}\n"
         + f"IDENTITY_PATH = {('/' + IDENTITY)!r}\n"
         + f"PAYLOAD_MODES = {PAYLOAD_MODES!r}\n"
-        + f"PAYLOAD_HASHES = {payload_hashes!r}\n"
-        + "# BEGIN_STATIC_GUARD\n"
-    )
-    return header.encode() + template
+    ).encode() + template
+
+
+def guard_bytes(version: str, identity_bytes: bytes, here: Path) -> bytes:
+    # The identity intentionally omits the guard hash because this header embeds
+    # the identity hash; including both would make a self-referential digest loop.
+    return (
+        "#!/usr/bin/python3 -I\n"
+        + f"IDENTITY_SHA256 = {hashlib.sha256(identity_bytes).hexdigest()!r}\n"
+    ).encode() + guard_static_bytes(version, here)
 
 
 def binary_features(cargo_json: Path) -> dict[str, list[str]]:
@@ -132,8 +135,8 @@ def package_file_count(root: Path) -> int:
 def check_optional_rust_constants(crate: Path) -> None:
     expected = {
         "ARCH_BUILD_IDENTITY": IDENTITY,
-        # Must match pacman::ARCH_CLI_PATH when that P2a Rust constant exists.
-        "ARCH_CLI_PATH": BINARIES["sanctuary-linux"],
+        # Rust verifies opened absolute paths; payload keys remain relative.
+        "ARCH_CLI_PATH": "/" + BINARIES["sanctuary-linux"],
     }
     found: dict[str, str] = {}
     src = crate / "src"
@@ -169,7 +172,10 @@ def stage(args: argparse.Namespace) -> None:
     hashed_paths = sorted(set(PAYLOAD_MODES) - {IDENTITY, GUARD})
     payload_hashes = {path: sha(dest / path) for path in hashed_paths}
     features = binary_features(args.cargo_json)
-    rustflags = os.environ.get("RUSTFLAGS", "")
+    rustflags_file = args.rustflags_file.resolve()
+    if not rustflags_file.is_file():
+        raise ValueError("scrubbed RUSTFLAGS witness is absent")
+    rustflags = rustflags_file.read_text()
     if rustflags:
         raise ValueError("RUSTFLAGS must be scrubbed before staging the Arch package")
     identity = {
@@ -196,9 +202,8 @@ def stage(args: argparse.Namespace) -> None:
         },
     }
     identity_bytes = (json.dumps(identity, sort_keys=True, indent=2) + "\n").encode()
-    verified_identity = json.loads(identity_bytes)
     write_file(dest / IDENTITY, identity_bytes, PAYLOAD_MODES[IDENTITY])
-    write_file(dest / GUARD, guard_bytes(version, identity_bytes, verified_identity["payload_sha256"], here), PAYLOAD_MODES[GUARD])
+    write_file(dest / GUARD, guard_bytes(version, identity_bytes, here), PAYLOAD_MODES[GUARD])
 
 
 def main() -> None:
@@ -212,6 +217,7 @@ def main() -> None:
     parser.add_argument("--glibc-floor", required=True)
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--cargo-json", type=Path, required=True)
+    parser.add_argument("--rustflags-file", type=Path, required=True)
     stage(parser.parse_args())
 
 
