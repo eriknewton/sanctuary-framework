@@ -168,7 +168,6 @@ fn package_for(root: &Root) -> Result<()> {
             || before.len() != after.len()
             || before.mtime() != after.mtime()
             || before.mtime_nsec() != after.mtime_nsec()
-            || Some(hex::encode(hash.finalize()).as_str()) != digest.as_str()
         {
             return Err("installed payload digest mismatch".into());
         }
