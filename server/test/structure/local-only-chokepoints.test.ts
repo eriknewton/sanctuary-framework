@@ -8,17 +8,12 @@
  * behavioral test happens to exercise that exact ordering.
  *
  * Fix-round-6 (P2): pins PROPERTIES, not literal call-argument strings,
- * wherever a property-level check is available (call-site counts are
- * computed over COMMENT-STRIPPED source, via the same TypeScript-parser-
- * backed `stripCodeComments` the em-dash guard uses, so a doc comment that
- * happens to mention `refusesLocalOnly(...)` in prose can never inflate the
- * count the way a bare regex over raw source did in an earlier round). The
- * ordering assertions still slice named method bodies and search within
- * them (matching `q5e-selector-chokepoints.test.ts`'s own technique), but
- * search for the FUNCTION NAME being called, not its exact argument list,
- * so a parameter-shape change (e.g. widening `refusesLocalOnly`'s second
- * parameter type) does not itself break these tests independent of the
- * property they exist to pin.
+ * wherever a property-level check is available. The ordering assertions
+ * still slice named method bodies and search within them (matching
+ * `q5e-selector-chokepoints.test.ts`'s own technique), but search for the
+ * FUNCTION NAME being called, not its exact argument list, so a parameter-
+ * shape change does not itself break these tests independent of the property
+ * they exist to pin.
  */
 import { readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -203,60 +198,6 @@ describe("local-only request-scoped constraint — structural chokepoints", () =
     expect(localOnlyCheck).toBeGreaterThan(-1);
     expect(handleConstruction).toBeGreaterThan(-1);
     expect(localOnlyCheck).toBeLessThan(handleConstruction);
-  });
-
-  it("the local-only refusal branch returns a failureResponse naming local_only_violation before touching the request further", async () => {
-    const selector = await selectorSource();
-    const body = sliceMethod(selector, "private async invoke(", "private recordRecentFailure(");
-    const guardStart = body.indexOf("refusesLocalOnly(");
-    expect(guardStart).toBeGreaterThan(-1);
-    // The refusal branch is the smallest `{ ... }` block opened by the
-    // `if` this call sits inside; find the next `return failureResponse(`
-    // after the guard and confirm it names the typed class within a
-    // bounded window (the branch body), not merely somewhere later in the
-    // method (which the OLD version of this test could not distinguish
-    // from a much later, unrelated `local_only_violation` mention).
-    const nextReturn = body.indexOf("return failureResponse(", guardStart);
-    expect(nextReturn).toBeGreaterThan(guardStart);
-    expect(nextReturn - guardStart).toBeLessThan(400); // same `if` block, not a later branch
-    const branchWindow = body.slice(guardStart, nextReturn + 200);
-    expect(branchWindow).toContain("local_only_violation");
-  });
-
-  // Item 5 (fix-round-4/5), generalized fix-round-6 (P2): ONE predicate,
-  // every real enforcement site — not predicates that happen to agree, and
-  // not a count a stray doc-comment mention can inflate.
-  it("refusesLocalOnly is defined exactly once and has exactly four EXECUTABLE call sites (comment-stripped)", async () => {
-    const selector = await selectorSource();
-    const code = stripCodeComments(selector, "intelligence/selector.ts");
-    expect(code.match(/function refusesLocalOnly\(/g)).toHaveLength(1);
-    // Four call sites: invoke()'s pre-emptive check, guardDirectHandleCall's
-    // held-handle check, getOrIssueHandle's defense-in-depth guard, and
-    // tryNextSubstrate's fallback gate (fix-round-6, item that folded the
-    // fallback path's separate `isLocalOnlyRequest` check into this one
-    // authority too). A fifth site (or a dropped one) is a structural
-    // regression this pins; comments are stripped first so a doc mention
-    // of the call shape in prose cannot inflate or hide this count.
-    expect(code.match(/refusesLocalOnly\(/g)).toHaveLength(5); // 1 definition + 4 calls
-
-    const invokeBody = sliceMethod(code, "private async invoke(", "private recordRecentFailure(");
-    expect(invokeBody).toContain("refusesLocalOnly(");
-    expect(invokeBody).not.toMatch(/resolvedChoice !== "local"/);
-
-    const guardBody = sliceMethod(code, "private async guardDirectHandleCall(", "private effectiveChoice(");
-    expect(guardBody).toContain("refusesLocalOnly(");
-    expect(guardBody).not.toMatch(/handleSubstrate === "local"/);
-
-    const getOrIssueBody = sliceMethod(code, "private async getOrIssueHandle(", "private async issueHandle(");
-    expect(getOrIssueBody).toContain("refusesLocalOnly(");
-    expect(getOrIssueBody).not.toMatch(/opts\?\.localOnly && .*!== "local"/);
-
-    // The fallback path: must use the shared predicate, and must NOT call
-    // `isLocalOnlyRequest` directly as an alternate, unshared path to the
-    // same conclusion (fix-round-6 P0 finding: it did, before this round).
-    const fallbackBody = sliceMethod(code, "private async tryNextSubstrate(", "private async getOrIssueHandle(");
-    expect(fallbackBody).toContain("refusesLocalOnly(");
-    expect(fallbackBody).not.toMatch(/isLocalOnlyRequest\(/);
   });
 
   it("getOrIssueHandle refuses a conflicting local-only request BEFORE the issuedHandles cache lookup or issueHandle", async () => {

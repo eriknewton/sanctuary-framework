@@ -197,26 +197,19 @@ function refusesLocalOnly(
  * once, keeps its OWN request/opts object unchanged for content, and
  * threads the RESULT — not the request — to every guard, predicate,
  * audit, and fallback decision from that line on. Nothing downstream
- * reads `.localOnly` off the original object again: every function that
- * used to accept a `LocalOnlyRequest` purely to re-derive this boolean
- * (`refusesLocalOnly`, `guardDirectHandleCall`) now accepts a boolean
- * parameter instead.
+ * reads `.localOnly` off the original object again for an enforcement
+ * decision: every function that used to accept a `LocalOnlyRequest`
+ * purely to re-derive this boolean (`refusesLocalOnly`,
+ * `guardDirectHandleCall`) now accepts a boolean parameter instead.
  *
  * Fix-round-10 (P1, item 2): returns the RAW read value
  * (`boolean | undefined`), NOT pre-coerced to a boolean. Every call site
  * except `invoke()` immediately coerces it (`readLocalOnlyOnce(x) ===
  * true`) and never looks at the raw value again, so this is not a
- * behavior change for them. `invoke()` is the one caller that needs the
- * RAW value too: the LEGACY `request_hash` preimage (see `hashOfRequest`)
- * must stay byte-identical to what `JSON.stringify(req)` produced before
- * this file coerced `localOnly` at all -- an omitted `localOnly` (the
- * overwhelming majority of historical production requests, which never
- * set the field) must still serialize with NO `localOnly` key, not a
- * coerced `false`. Returning the raw value here, once, is what lets
- * `invoke()` serve both needs (the coerced DECISION boolean, and the
- * raw-preserving HASH input) from the SAME single property read, rather
- * than reading `.localOnly` a second time to recover what coercion threw
- * away.
+ * behavior change for them. `invoke()` keeps the raw value for decision
+ * provenance only; the legacy `request_hash` is deliberately a separate
+ * `JSON.stringify(req)` serialization of the caller's object at entry
+ * (see `hashOfRequest`), not another meaning layered onto this snapshot.
  */
 function readLocalOnlyOnce(request: LocalOnlyRequest): boolean | undefined {
   const { localOnly: rawFlag } = request;
@@ -1514,6 +1507,12 @@ export class SubstrateSelector {
     // (below) of why the RAW read value is kept alongside the coerced one.
     const requestLocalOnlyRaw = readLocalOnlyOnce(req);
     const requestLocalOnly = requestLocalOnlyRaw === true;
+    // P1 round 7: `request_hash` keeps its legacy meaning: the caller's
+    // own object as `JSON.stringify` serialized it at entry, before any
+    // await can let caller-owned mutable fields drift. The materialized
+    // content below is a separate projection used for screening, sending,
+    // and `request_projection_hash`.
+    const requestHash = hashOfRequest(req);
     // P1 fix-round-10, item 3: every NAMED CONTENT FIELD is read from
     // `req` EXACTLY ONCE too, right here, immediately after the single
     // `localOnly` read and before this method's first `await` — mirroring
@@ -1611,15 +1610,11 @@ export class SubstrateSelector {
     // All local generation reaches the async selector-load chokepoint; a
     // direct synchronous local-handle construction would bypass Q5E.
     const handle = await this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly });
-    // Fix-round-10, item 2: `requestHash` is the LEGACY preimage (byte-
-    // identical to what this file hashed before fix-round-9), built from
-    // the single materialized `content` snapshot plus the RAW (not
-    // coerced) `localOnly` read — see `hashOfRequest`'s doc comment.
     // `requestProjectionHash` is the NEW, more complete projection (bound
     // to `surface`, coerced `localOnly`, explicit nulls for omitted
     // fields) under its own field, `request_projection_hash`, so nothing
-    // historical breaks while the more correct hash is still committed.
-    const requestHash = hashOfRequest(content, requestLocalOnlyRaw);
+    // historical breaks while the materialized content hash is still
+    // committed.
     const requestProjectionHash = hashOfRequestProjection(surface, requestLocalOnly, content);
     const primary = await this.invokeHandle(surface, handle, method, content);
     let response = primary.response;
@@ -2796,10 +2791,11 @@ function makeEventId(): string {
  * FIELDS exactly once, via ordinary property access (which works
  * identically on a plain data property or a prototype getter, enumerable
  * or not), and returns a plain object holding those single-read values.
- * `invoke()` calls this ONCE, immediately after its own single
- * `localOnly` read, and uses the RESULT for screening, both hashes, and
- * the actual substrate invocation from that point on -- `req` itself is
- * never read for its content again. Without this, a STATEFUL getter
+ * `invoke()` calls this ONCE, immediately after its own local-only read
+ * and legacy request serialization, and uses the RESULT for screening,
+ * the v2 projection hash, and the actual substrate invocation from that
+ * point on -- `req` itself is never read for selector-known content
+ * again. Without this, a STATEFUL getter
  * (one that returns different content on each read) could present
  * DIFFERENT content to the pre-egress context scanner, the audit hash,
  * and the substrate actually invoked: the thing screened, the thing
@@ -2807,12 +2803,10 @@ function makeEventId(): string {
  * which is not auditable at all.
  *
  * Field VALUES are preserved exactly as read -- including `undefined`
- * for an omitted optional field -- rather than coerced or defaulted.
- * This is what keeps `hashOfRequest`'s LEGACY preimage byte-identical to
- * what `JSON.stringify(req)` produced for any well-formed (non-stateful)
- * caller: `JSON.stringify` itself already skips an `undefined`-valued
- * property, so a materialized object that preserves `undefined` exactly
- * where the original had it serializes identically to the original.
+ * for an omitted optional field -- rather than coerced or defaulted, so
+ * `request_projection_hash` can describe the exact selector-known bytes
+ * screened and sent without inheriting the legacy hash's raw-object
+ * meaning.
  */
 function materializeRequestContent(
   req: SummarizeRequest | ClassifyRequest | RedactRequest,
@@ -2827,47 +2821,34 @@ function materializeRequestContent(
     };
   }
   if (req.kind === "classify") {
-    return { kind: "classify", items: req.items, categories: req.categories, maxTokens: req.maxTokens };
+    return {
+      kind: "classify",
+      // The caller owns these arrays and screening awaits before send; clone
+      // at materialization so the bytes screened are exactly the bytes later
+      // sent even if the caller mutates the original arrays during the await.
+      items: [...req.items],
+      categories: [...req.categories],
+      maxTokens: req.maxTokens,
+    };
   }
   return { kind: "redact", text: req.text };
 }
 
 /**
- * Fix-round-10 (P1, item 2): reverted to the EXACT preimage shape this
- * function had before fix-round-9 (Codex round-5 finding: fix-round-9's
- * version silently changed `request_hash`'s MEANING -- adding `surface`,
- * coercing `localOnly` to an always-present boolean, and turning omitted
- * optional fields into explicit `null`s -- with no version bump, so an
- * identical HISTORICAL request would hash differently after that round,
- * and a request that never set `localOnly` at all, the common case for
- * every pre-2026-09-15 caller, would suddenly hash as `localOnly: false`
- * instead of omitting the key). This function's ONLY job is to reproduce
- * what `JSON.stringify(req)` produced originally: the request's own named
- * fields (from `content`, the fix-round-10 single-read materialization --
- * see `materializeRequestContent`), `undefined`-valued/omitted fields
- * skipped (`JSON.stringify`'s own behavior, not special-cased here), and
- * `localOnly` present ONLY when the original request actually set it
- * (`rawLocalOnly`, the UNCOERCED value `readLocalOnlyOnce` returned --
- * seeing `undefined` here reproduces "the caller never set this field"
- * exactly, where a pre-coerced `false` could not).
+ * P1 round 7: the legacy `request_hash` preimage is exactly the caller's
+ * object as `JSON.stringify` serializes it at `invoke()` entry: own
+ * enumerable fields in insertion order, omitted/`undefined` skipped by
+ * JSON itself, explicit `false` preserved, and any caller-owned extra
+ * fields preserved. It is NOT redefined to mean the selector's
+ * materialized request projection.
  *
- * `content` and `rawLocalOnly` are both read ONCE, at `invoke()`'s entry,
- * never re-read here -- this function hashes the MATERIALIZED snapshot,
- * never the caller's live object, so a stateful getter cannot make this
- * hash disagree with what was actually screened and invoked, while a
- * well-behaved caller's historical hash is unaffected byte-for-byte.
- *
- * The NEW, more complete projection (surface-bound, coerced-boolean,
- * explicit-null) lives separately in `hashOfRequestProjection`, under a
- * NEW audit field, `request_projection_hash`, documented there and on
- * the contract as preimage version 2 -- so nothing historical breaks
- * while the more correct hash is still committed to.
+ * The selector-known content that was screened and sent lives separately
+ * in `hashOfRequestProjection`, under `request_projection_hash`.
  */
 function hashOfRequest(
-  content: SummarizeRequest | ClassifyRequest | RedactRequest,
-  rawLocalOnly: boolean | undefined,
+  req: SummarizeRequest | ClassifyRequest | RedactRequest,
 ): string {
-  return hashToString(sha256(stringToBytes(JSON.stringify({ ...content, localOnly: rawLocalOnly }))));
+  return hashToString(sha256(stringToBytes(JSON.stringify(req))));
 }
 
 /**
@@ -2879,9 +2860,9 @@ function hashOfRequest(
  * VERSION 2: more complete than `hashOfRequest`'s legacy preimage, but
  * under its OWN field (`request_projection_hash`) so it never collides
  * with or silently reinterprets the legacy one. `content` (the
- * fix-round-10 single-read materialization) is what this hashes, never
- * `req` directly, for the same stateful-getter reason `hashOfRequest`
- * documents.
+ * single-read materialization) is what this hashes, never `req` directly,
+ * so the projection describes the exact selector-known bytes screened and
+ * sent.
  */
 function canonicalRequestProjection(
   surface: Surface,

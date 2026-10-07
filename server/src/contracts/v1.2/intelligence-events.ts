@@ -127,10 +127,10 @@ export interface IntelligenceSubstrateInvokedPayload extends IntelligenceAuditPa
    * deliberately does not attempt: `{ surface, kind, localOnly, ...the
    * request kind's own named content fields }`, with `localOnly` coerced
    * to a real boolean (never omitted) and every omitted optional content
-   * field made an EXPLICIT `null` (never silently absent) -- so this
-   * hash is sensitive to the surface a request was submitted against and
-   * to a genuinely-absent `localOnly` (which `request_hash` cannot
-   * distinguish from an explicit `false`). Present on every payload this
+   * field made an EXPLICIT `null` (never silently absent). By design, this
+   * v2 projection treats an omitted `localOnly` the same as explicit
+   * `false`; the legacy `request_hash` is the field that distinguishes
+   * those two caller-object serializations. Present on every payload this
    * file's producer emits from the 2026-09-15 slice onward; absent only
    * on a payload persisted before this field existed.
    */

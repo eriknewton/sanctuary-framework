@@ -36,6 +36,11 @@ import type {
   RedactRequest,
   SummarizeRequest,
 } from "../../src/intelligence/types.js";
+import type { CompiledContextScanner } from "../../src/compiled-context/scanner.js";
+import type {
+  CompiledContextScanRequest,
+  CompiledContextScanResult,
+} from "../../src/compiled-context/types.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { hash, hashToString } from "../../src/core/hashing.js";
@@ -116,6 +121,18 @@ function fetchMock(
   impl: (input: FetchInput, init?: RequestInit) => Promise<Response>,
 ) {
   return vi.fn<typeof fetch>(impl);
+}
+
+function cleanScreeningResult(request: CompiledContextScanRequest): CompiledContextScanResult {
+  return {
+    outcome: "clean",
+    contentHash: "test-clean-content-hash",
+    byteLength: request.observedByteLength ?? Buffer.byteLength(request.artifact, "utf8"),
+    contributorCount: request.metadata.contributors.length,
+    confidence: 1,
+    signals: [],
+    cacheHit: false,
+  };
 }
 
 /**
@@ -992,7 +1009,7 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     return { req, reads: () => count };
   }
 
-  it("invoke(): a getter answering true-then-false still refuses, constructs no hosted client, and is read exactly once", async () => {
+  it("invoke(): a getter answering true-then-false still refuses from the first decision read before legacy hash serialization rereads it", async () => {
     const fetchImpl = fetchMock(async () => new Response("", { status: 500 }));
     const { selector, auditLog } = buildSelector({ fetchImpl });
     await selector.load();
@@ -1007,7 +1024,7 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     expect(resp.failureClass).toBe("local_only_violation");
     expect(VeniceClient).not.toHaveBeenCalled();
     expect(fetchImpl).not.toHaveBeenCalled();
-    expect(reads()).toBe(1);
+    expect(reads()).toBe(2);
 
     const failures = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_FAILURE });
     expect(
@@ -1110,21 +1127,11 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
   // refusesLocalOnly is false regardless of the boolean's value), proves
   // these tests are not vacuously passing because the accessor itself
   // throws or misbehaves -- the request is genuinely accepted and served
-  // when there is no conflicting binding to refuse against. Fix-round-9
-  // (P1, item 1): this path now ALSO asserts `reads() === 1`. A prior
-  // round's comment here exempted this specific test from that assertion,
-  // because `hashOfRequest` used to run `JSON.stringify(req)` directly on
-  // the caller's object, which read `req.localOnly` a SECOND time as an
-  // unavoidable side effect of serializing the whole request. Now that
-  // `hashOfRequest` takes the already-read `localOnly` boolean as an
-  // explicit parameter and builds its hash input from a named-field
-  // projection instead of the raw object (see `hashOfRequest`'s and
-  // `canonicalRequestProjection`'s doc comments in selector.ts), there is
-  // no second read anywhere on the ACCEPTED path either -- the exemption
-  // no longer describes real behavior, so keeping it would let a
-  // regression that reintroduces a second read pass silently on exactly
-  // this path.
-  it("positive control: the same true-then-false accessor on a LOCAL binding is served normally, and is still read exactly once", async () => {
+  // when there is no conflicting binding to refuse against. P1 round 7
+  // deliberately restores `request_hash` to raw `JSON.stringify(req)`, so
+  // accepted `invoke()` calls read this accessor once for the decision and
+  // once for legacy serialization; the decision still uses the first read.
+  it("positive control: the same true-then-false accessor on a LOCAL binding is served normally, with a separate legacy-hash serialization read", async () => {
     const fetchImpl = fetchMock(async () =>
       new Response(JSON.stringify({ response: "local answer" }), {
         status: 200,
@@ -1138,33 +1145,14 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     const resp = await selector.invokeSummarize("concierge", req);
 
     expect(resp.failureClass).toBeNull();
-    expect(reads()).toBe(1);
+    expect(reads()).toBe(2);
   });
 
-  // P1 fix-round-9 -> fix-round-10 (item 1 -> items 2/3): the original
-  // `hashOfRequest` ran `JSON.stringify(req)` on the caller's raw object,
-  // which (a) re-read `req.localOnly` a second time and (b) serialized
-  // only OWN ENUMERABLE properties, so a class-backed request (content as
-  // prototype getters) hashed as `{}`. Fix-round-9 tried fixing this by
-  // changing `request_hash`'s own preimage shape (adding `surface`,
-  // coercing `localOnly`, making omitted fields explicit `null`s) --
-  // which round 4's review correctly flagged as an undocumented MEANING
-  // change to an existing field (identical historical requests would
-  // hash differently with no version bump). Fix-round-10 reverted
-  // `request_hash` to its EXACT original preimage shape and instead fixed
-  // the ROOT problem underneath both bugs: `invoke()` now materializes
-  // every content field ONCE, via ordinary property access (works on a
-  // getter same as a plain field), and hashes THAT materialized snapshot
-  // -- never `JSON.stringify`ing the live object directly. This test
-  // still proves what it always proved (a getter-backed request is not
-  // silently hashing as `{}`, and the hash is genuinely content-sensitive)
-  // but now against `request_hash`, the LEGACY field, which fix-round-10
-  // made robust to getters WITHOUT changing its preimage shape for a
-  // well-behaved plain-object caller. The NEW `request_projection_hash`
-  // field (preimage v2: surface-bound, coerced boolean, explicit nulls)
-  // is checked alongside it for the same parity, since it is built from
-  // the SAME materialized snapshot.
-  it("a getter-backed request hashes identically, in the audit record, to its plain-object equivalent -- and differently from a request with different content", async () => {
+  // P1 round 7: `request_hash` is again the legacy raw-object
+  // `JSON.stringify(req)` preimage, while `request_projection_hash`
+  // describes the selector-known content that was materialized,
+  // screened, and sent.
+  it("a getter-backed request keeps legacy request_hash semantics, while request_projection_hash matches its plain-object equivalent", async () => {
     const fetchImpl = fetchMock(async () =>
       new Response(JSON.stringify({ response: "ok" }), {
         status: 200,
@@ -1214,12 +1202,13 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     const [plainRow, getterRow, differentRow] = rows;
 
     expect(plainRow.request_hash).toBeTruthy();
-    expect(getterRow.request_hash).toBe(plainRow.request_hash);
+    expect(getterRow.request_hash).toBe(hashToString(hash(stringToBytes(JSON.stringify({})))));
+    expect(getterRow.request_hash).not.toBe(plainRow.request_hash);
     expect(differentRow.request_hash).not.toBe(plainRow.request_hash);
 
-    // Fix-round-10, item 2: the NEW preimage-v2 field is built from the
-    // SAME single-read materialized content, so it carries the identical
-    // parity property.
+    // The NEW preimage-v2 field is built from the materialized content,
+    // so a prototype-getter request and a plain object with the same
+    // selector-known fields still match there.
     expect(plainRow.request_projection_hash).toBeTruthy();
     expect(getterRow.request_projection_hash).toBe(plainRow.request_projection_hash);
     expect(differentRow.request_projection_hash).not.toBe(plainRow.request_projection_hash);
@@ -1262,17 +1251,123 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     expect(row.request_hash).toBe(expectedHash);
   });
 
+  // P1 round 7: `request_hash` keeps exactly the legacy meaning: the
+  // caller's own object as JSON-stringified at entry. The v2 projection
+  // hash is the field that deliberately narrows to selector-known content.
+  it("request_hash includes an extra caller-owned enumerable field because it is the legacy JSON.stringify(req) preimage", async () => {
+    const fetchImpl = fetchMock(async () =>
+      new Response(JSON.stringify({ response: "ok" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    const { selector, auditLog } = buildSelector({ fetchImpl });
+    await selector.load();
+
+    const req = {
+      kind: "summarize" as const,
+      context: "legacy-context",
+      query: "legacy-query",
+      localOnly: false,
+      callerTrace: "legacy-extra-field",
+    } satisfies SummarizeRequest & { callerTrace: string };
+
+    await selector.invokeSummarize("concierge", req);
+
+    const invoked = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_INVOKED });
+    const row = invoked.entries[invoked.entries.length - 1]!.details as {
+      request_hash: string;
+      request_projection_hash?: string;
+    };
+
+    const expectedHash = hashToString(hash(stringToBytes(JSON.stringify(req))));
+    expect(row.request_hash).toBe(expectedHash);
+    expect(row.request_projection_hash).toBeTruthy();
+    expect(row.request_projection_hash).not.toBe(row.request_hash);
+  });
+
+  // P0 round 7: arrays are caller-owned mutable containers. A caller that
+  // mutates them while screening is awaiting must not change what is later
+  // sent to the local model; the screened bytes and sent bytes must match.
+  it("a caller mutating classify arrays during the screening await cannot change the content sent afterward", async () => {
+    let releaseScreening: () => void = () => {
+      throw new Error("screening was not started");
+    };
+    const screeningMayFinish = new Promise<void>((resolve) => {
+      releaseScreening = resolve;
+    });
+    let markScreeningStarted: () => void = () => undefined;
+    const screeningStarted = new Promise<void>((resolve) => {
+      markScreeningStarted = resolve;
+    });
+    let screenedArtifact = "";
+    const scanner = {
+      screen: vi.fn(async (request: CompiledContextScanRequest): Promise<CompiledContextScanResult> => {
+        screenedArtifact = request.artifact;
+        markScreeningStarted();
+        await screeningMayFinish;
+        return cleanScreeningResult(request);
+      }),
+    } as unknown as CompiledContextScanner;
+    const fetchImpl = fetchMock(async (input, init) => {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/generate")) {
+        return new Response(
+          JSON.stringify({ response: '[{"category":"screened-category","confidence":1}]' }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response("", { status: 404 });
+    });
+    const { selector } = buildSelector({ fetchImpl });
+    selector.setCompiledContextScanner(scanner);
+    await selector.load();
+
+    const req: ClassifyRequest = {
+      kind: "classify",
+      items: ["screened-item"],
+      categories: ["screened-category"],
+      localOnly: true,
+    };
+
+    const invocation = selector.invokeClassify("concierge", req);
+    await screeningStarted;
+    req.items[0] = "mutated-item";
+    req.items.push("late-item");
+    req.categories[0] = "mutated-category";
+    req.categories.push("late-category");
+    releaseScreening();
+
+    const resp = await invocation;
+    expect(resp.failureClass).toBeNull();
+    expect(screenedArtifact).toContain("screened-item");
+    expect(screenedArtifact).toContain("screened-category");
+    expect(screenedArtifact).not.toContain("mutated-item");
+    expect(screenedArtifact).not.toContain("late-item");
+    expect(screenedArtifact).not.toContain("mutated-category");
+    expect(screenedArtifact).not.toContain("late-category");
+
+    const generateCall = fetchImpl.mock.calls.find(([input]) => urlPathnameIs(requestUrl(input), "/api/generate"));
+    expect(generateCall).toBeDefined();
+    const body = JSON.parse(String(generateCall![1]?.body)) as { prompt: string };
+    expect(body.prompt).toContain("screened-item");
+    expect(body.prompt).toContain("screened-category");
+    expect(body.prompt).not.toContain("mutated-item");
+    expect(body.prompt).not.toContain("late-item");
+    expect(body.prompt).not.toContain("mutated-category");
+    expect(body.prompt).not.toContain("late-category");
+  });
+
   // P1 fix-round-10, item 3: the stateful-getter proof. A request whose
   // CONTENT (not just `localOnly`) is an accessor returning a DIFFERENT
   // value on each read would, without materializing content once at
-  // entry, present one value to the pre-egress context scanner, a
-  // DIFFERENT value to the audit hash, and a THIRD value to the substrate
-  // actually invoked. This proves all three now agree: the fetch body
-  // the local substrate actually received, and the audited `request_hash`
-  // (independently recomputed from the FIRST-read content, matching what
-  // `materializeRequestContent` should have captured), both reflect the
-  // SAME single read.
-  it("a stateful getter (different content on each read) is screened, hashed, and sent using the SAME single-read content", async () => {
+  // entry, present one value to the pre-egress context scanner and a
+  // different value to the substrate actually invoked. P1 round 7 keeps
+  // `request_hash` as raw legacy serialization; the projection hash is
+  // the audit field that must match the screened-and-sent content.
+  it("a stateful getter (different content on each read) is screened, projection-hashed, and sent using the SAME materialized content", async () => {
     let contextReads = 0;
     const contextValues = ["first-read-content", "second-read-content", "third-read-content"];
     const req = {
@@ -1304,26 +1399,30 @@ describe("SubstrateSelector — fix-round-8: readLocalOnlyOnce closes the re-rea
     const resp = await selector.invokeSummarize("concierge", req);
     expect(resp.failureClass).toBeNull();
 
-    // The FIRST read is the one and only value every consumer must see.
-    expect(contextReads).toBe(1);
+    // The first read belongs to legacy `request_hash`; the second read is
+    // the materialized content that every selector-known consumer must see.
+    expect(contextReads).toBe(2);
 
     const generateCall = fetchImpl.mock.calls.find(([input]) => urlPathnameIs(requestUrl(input), "/api/generate"));
     expect(generateCall).toBeDefined();
     const body = JSON.parse(String(generateCall![1]?.body));
-    expect(body.prompt).toContain("first-read-content");
-    expect(body.prompt).not.toContain("second-read-content");
+    expect(body.prompt).not.toContain("first-read-content");
+    expect(body.prompt).toContain("second-read-content");
     expect(body.prompt).not.toContain("third-read-content");
 
     const invoked = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_INVOKED });
-    const row = invoked.entries[invoked.entries.length - 1]!.details as { request_hash: string };
+    const row = invoked.entries[invoked.entries.length - 1]!.details as { request_projection_hash?: string };
     const expectedPreimage = JSON.stringify({
+      surface: "concierge",
       kind: "summarize",
-      context: "first-read-content",
-      query: "q",
       localOnly: true,
+      context: "second-read-content",
+      query: "q",
+      maxTokens: null,
+      contextProvenance: null,
     });
     const expectedHash = hashToString(hash(stringToBytes(expectedPreimage)));
-    expect(row.request_hash).toBe(expectedHash);
+    expect(row.request_projection_hash).toBe(expectedHash);
   });
 
   // P1 fix-round-10, item 4: `invoke()` promises ONE `substrate_invoked`
