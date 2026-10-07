@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
+  readFile,
   mkdir,
   mkdtemp,
   rename,
@@ -35,6 +36,14 @@ import {
 import type { VerifiedLocalBindingV2 } from "../../src/intelligence/model-manifest-v2.js";
 
 const roots: string[] = [];
+const QWEN35_9B_MANIFEST_FIXTURE = new URL(
+  "./__fixtures__/qwen3.5-9b.manifest.json",
+  import.meta.url,
+);
+const QWEN3_4B_MANIFEST_FIXTURE = new URL(
+  "./__fixtures__/qwen3-4b.manifest.json",
+  import.meta.url,
+);
 const CONFIG_BYTES = Buffer.from('{"model_format":"gguf"}');
 const LAYER_A_BYTES = Buffer.from("authenticated-layer-a");
 const LAYER_B_BYTES = Buffer.from("authenticated-layer-b");
@@ -179,6 +188,36 @@ describe("Q5C bounded OCI manifest parser", () => {
     expect(parsed.totalDescriptorBytes).toBe(
       CONFIG_BYTES.byteLength * 2 + LAYER_A_BYTES.byteLength + LAYER_B_BYTES.byteLength,
     );
+  });
+
+  it("accepts the real qwen3.5 manifest with observed descriptor provenance keys", async () => {
+    const parsed = parseBoundedOciManifest(await readFile(QWEN35_9B_MANIFEST_FIXTURE));
+    expect(parsed.layers).toHaveLength(5);
+    expect(parsed.distinctDescriptors).toHaveLength(6);
+  });
+
+  it("keeps accepting the real qwen3 control manifest without descriptor provenance keys", async () => {
+    const parsed = parseBoundedOciManifest(await readFile(QWEN3_4B_MANIFEST_FIXTURE));
+    expect(parsed.layers).toHaveLength(4);
+    expect(parsed.distinctDescriptors).toHaveLength(5);
+  });
+
+  it("refuses qwen3.5 descriptor provenance when the value is not a string", async () => {
+    const value = JSON.parse(await readFile(QWEN35_9B_MANIFEST_FIXTURE, "utf8"));
+    value.layers[0].from = { path: "mmproj.gguf" };
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses unrelated descriptor extension keys", () => {
+    const value = manifestValue();
+    const layerWithUnknownKey: Record<string, unknown> = {
+      ...value.layers[0],
+      provenance: "model.gguf",
+    };
+    value.layers[0] = layerWithUnknownKey as typeof value.layers[number];
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
   });
 
   it.each([

@@ -1,0 +1,1 @@
+URL: https://registry.ollama.ai/v2/library/qwen3.5/manifests/9b; fetched: 2026-10-07; sha256: 56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90

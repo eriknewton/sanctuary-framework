@@ -4,9 +4,9 @@
  * No production composition root imports or invokes this module. A caller must
  * explicitly supply a Q5A-validated immune binding, an absolute persisted root,
  * and an injected filesystem adapter before any filesystem read can occur.
- * Residual: real Ollama layer descriptors may carry a `from` key, which this
- * strict parser refuses as `disk_manifest_invalid`; the Q5E disposable-host
- * drill must watch for this as a false-refusal source.
+ * Residual: the parser admits the observed Ollama descriptor `from` provenance
+ * key as inert metadata only; descriptor authority remains digest, size, and
+ * media type, and every other extension key stays refused.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -43,8 +43,10 @@ const SHA256_BYTES = 32;
 const SHA256_HEX_CHARS = SHA256_BYTES * 2;
 /** Design section 6.4 requires OCI schemaVersion 2 exactly. */
 const OCI_MANIFEST_SCHEMA_VERSION = 2;
-/** Each accepted descriptor has exactly mediaType, digest, and size authority. */
-const OCI_DESCRIPTOR_REQUIRED_KEY_COUNT = 3;
+/** Each accepted descriptor always has mediaType, digest, and size authority. */
+const OCI_DESCRIPTOR_REQUIRED_KEYS = ["mediaType", "digest", "size"] as const;
+/** Observed Ollama descriptor provenance key, ignored by verification. */
+const OCI_DESCRIPTOR_PROVENANCE_FROM_KEY = "from";
 /** Design section 6.3 permits the first changed read plus one retry. */
 const STABLE_FILE_MAX_ATTEMPTS = 2;
 
@@ -60,6 +62,8 @@ export const IMMUNE_OCI_MAX_DESCRIPTOR_BYTES = 128 * GIBIBYTE_BYTES;
 export const IMMUNE_OCI_MAX_TOTAL_DESCRIPTOR_BYTES = 512 * GIBIBYTE_BYTES;
 /** Design section 6.4 bounds every descriptor media type to 256 ASCII chars. */
 export const IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS = 256;
+/** Reuse the reviewed 256-character ASCII envelope for inert descriptor provenance. */
+const OCI_DESCRIPTOR_PROVENANCE_FROM_MAX_CHARS = IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS;
 /** Design section 6.5 permits at most four MiB per streaming hash buffer. */
 export const IMMUNE_HASH_MAX_BUFFER_BYTES = 4 * MEBIBYTE_BYTES;
 /** A smaller fixed buffer remains below the reviewed four-MiB ceiling. */
@@ -260,14 +264,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function exactDescriptorKeys(value: Record<string, unknown>): boolean {
+function validDescriptorKeys(value: Record<string, unknown>): boolean {
   const keys = Object.keys(value);
-  return keys.length === OCI_DESCRIPTOR_REQUIRED_KEY_COUNT &&
-    keys.includes("mediaType") && keys.includes("digest") && keys.includes("size");
+  for (const required of OCI_DESCRIPTOR_REQUIRED_KEYS) {
+    if (!keys.includes(required)) return false;
+  }
+  for (const key of keys) {
+    if ((OCI_DESCRIPTOR_REQUIRED_KEYS as readonly string[]).includes(key)) continue;
+    const provenanceValue = value[key];
+    // Ollama's `from` names the source artifact only; digest-derived blob paths
+    // and byte verification never consume it, while every unknown key remains
+    // refused so new descriptor authority cannot arrive silently.
+    if (
+      key !== OCI_DESCRIPTOR_PROVENANCE_FROM_KEY ||
+      typeof provenanceValue !== "string" ||
+      provenanceValue.length === 0 ||
+      provenanceValue.length > OCI_DESCRIPTOR_PROVENANCE_FROM_MAX_CHARS ||
+      !ASCII_MEDIA_TYPE.test(provenanceValue)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function parseDescriptor(value: unknown): OciDescriptor {
-  if (!isRecord(value) || !exactDescriptorKeys(value)) {
+  if (!isRecord(value) || !validDescriptorKeys(value)) {
     refuse("disk_manifest_invalid");
   }
   if (
