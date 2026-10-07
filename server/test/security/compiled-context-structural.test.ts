@@ -1,7 +1,9 @@
+// fail-before-exempt: this change rewrites the existing scan-then-handle-then-invoke ordering assertion as a parser-based callee match; the ordering already holds on the base, so the test passing there is expected
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const SERVER_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const SRC_ROOT = join(SERVER_ROOT, "src");
@@ -18,6 +20,42 @@ function sourceFiles(dir = SRC_ROOT): string[] {
 
 function rel(path: string): string {
   return relative(SRC_ROOT, path).replaceAll("\\", "/");
+}
+
+/**
+ * Fix-round-8 (P2, round 4 item 4): finds the FIRST call, inside a named
+ * method, to a function/method matching `calleeName` (an Identifier, e.g.
+ * `compileSubstrateContext`, or a `this.<name>` PropertyAccessExpression,
+ * e.g. `this.getOrIssueHandle`), and returns its AST position. The PRIOR
+ * version of this ordering check used `indexOf` on the call's EXACT
+ * argument text (`"this.getOrIssueHandle(surface, choice, { localOnly:
+ * requestLocalOnly })"`), which breaks on a purely cosmetic change to that
+ * call's arguments (a rename, a reformat, an added parameter) with the
+ * property it exists to pin -- ordering -- completely intact. Matching on
+ * the CALLEE NAME via the parser, not the full call text, survives that
+ * class of change; only a change that removes the call, or reorders it
+ * relative to its siblings, moves this position.
+ */
+function firstCallPosition(methodSource: string, calleeName: string): number {
+  const sourceFile = ts.createSourceFile("method.ts", `class C { ${methodSource} }`, ts.ScriptTarget.Latest, true);
+  let found = -1;
+  const matches = (expr: ts.Expression): boolean => {
+    if (ts.isIdentifier(expr)) return expr.text === calleeName;
+    if (ts.isPropertyAccessExpression(expr) && expr.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      return expr.name.text === calleeName;
+    }
+    return false;
+  };
+  const visit = (node: ts.Node): void => {
+    if (found !== -1) return;
+    if (ts.isCallExpression(node) && matches(node.expression)) {
+      found = node.getStart(sourceFile);
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
 }
 
 describe("Memory Integrity Slice B — frozen production assembler inventory", () => {
@@ -63,13 +101,22 @@ describe("Memory Integrity Slice B — frozen production assembler inventory", (
   it("requires scan-after-final-assembly and scan-before-provider ordering", () => {
     const selector = readFileSync(join(SRC_ROOT, "intelligence/selector.ts"), "utf8");
     const invoke = selector.slice(selector.indexOf("  private async invoke("), selector.indexOf("  /**\n   * Append a failure entry"));
-    expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeGreaterThan(-1);
-    expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeLessThan(
-      invoke.indexOf("this.getOrIssueHandle(surface, choice)"),
-    );
-    expect(invoke.indexOf("this.getOrIssueHandle(surface, choice)")).toBeLessThan(
-      invoke.indexOf("this.invokeHandle(surface, handle, method, req)"),
-    );
+    // 2026-09-15 slice: `getOrIssueHandle` now also takes the request-scoped
+    // local-only opts (see `test/structure/local-only-chokepoints.test.ts`
+    // for the dedicated assertions on that addition); this still pins the
+    // original claim, that context screening precedes handle construction
+    // precedes invocation. Fix-round-8 (P2): pinned by CALLEE NAME via the
+    // parser (`firstCallPosition`), not by the exact call text (arguments
+    // included) — see that function's doc comment for why the prior
+    // exact-text version was fragile independent of this property.
+    const compilePos = firstCallPosition(invoke, "compileSubstrateContext");
+    const getOrIssuePos = firstCallPosition(invoke, "getOrIssueHandle");
+    const invokeHandlePos = firstCallPosition(invoke, "invokeHandle");
+    expect(compilePos).toBeGreaterThan(-1);
+    expect(getOrIssuePos).toBeGreaterThan(-1);
+    expect(invokeHandlePos).toBeGreaterThan(-1);
+    expect(compilePos).toBeLessThan(getOrIssuePos);
+    expect(getOrIssuePos).toBeLessThan(invokeHandlePos);
 
     // `getOrIssueHandle` creates provider handles but is not a context assembler:
     // production callers use getSubstrate only for capability/display metadata,
