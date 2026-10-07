@@ -414,6 +414,81 @@ fn synthetic_show_maps_are_differential_witnesses_for_shared_unit_reader() {
     }
 }
 
+/// Every file under an `arch-ci-*` directory other than PROVENANCE itself, recursively, as paths relative to it.
+fn arch_ci_committed_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            arch_ci_committed_files(root, &path, out);
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if rel != "PROVENANCE" {
+                out.push(rel);
+            }
+        }
+    }
+}
+
+/// A PROVENANCE pin line reads `<relative path> sha256 <64 lowercase hex> [...]`; other lines are prose.
+fn arch_ci_provenance_pins(provenance: &str) -> BTreeMap<String, String> {
+    // 64 = hex length of a SHA-256 digest.
+    const SHA256_HEX_LEN: usize = 64;
+    let mut pins = BTreeMap::new();
+    for line in provenance.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(path), Some("sha256"), Some(hex)) = (parts.next(), parts.next(), parts.next())
+        {
+            if hex.len() == SHA256_HEX_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                pins.insert(path.to_string(), hex.to_string());
+            }
+        }
+    }
+    pins
+}
+
+#[test]
+fn arch_ci_captures_are_byte_pinned_by_provenance() {
+    // The replay below checks VERDICTS, and several readers accept more than one byte shape, so an edited capture
+    // can keep its verdict; this pin is what keeps the corpus equal to the bytes the named CI run produced
+    // (P3 closure read F1). Captures landed with brief 16.6, so an empty arch-ci directory is now a failure too.
+    for dir in fixture_dirs_with_prefix("arch-ci-") {
+        let provenance = fs::read_to_string(dir.join("PROVENANCE"))
+            .unwrap_or_else(|err| panic!("{}: PROVENANCE unreadable: {err}", dir.display()));
+        let pins = arch_ci_provenance_pins(&provenance);
+        let mut files = Vec::new();
+        arch_ci_committed_files(&dir, &dir, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "{}: no committed captures",
+            dir.display()
+        );
+        for rel in &files {
+            let pinned = pins
+                .get(rel)
+                .unwrap_or_else(|| panic!("{}: {rel} is not pinned in PROVENANCE", dir.display()));
+            let actual = sha256(&fs::read(dir.join(rel)).unwrap());
+            assert_eq!(
+                &actual,
+                pinned,
+                "{}: {rel} bytes differ from PROVENANCE",
+                dir.display()
+            );
+        }
+        for rel in pins.keys() {
+            assert!(
+                files.contains(rel),
+                "{}: PROVENANCE pins missing file {rel}",
+                dir.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn arch_ci_capture_directories_replay_recorded_readers_when_present() {
     for dir in fixture_dirs_with_prefix("arch-ci-") {

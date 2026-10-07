@@ -284,12 +284,14 @@ if status["agent_uid"] != agent or status["service_uid"] != service:
     raise SystemExit("uid mismatch")
 if status["package_pins"] != pins:
     raise SystemExit("package_pins mismatch")
+# The eight login.defs keys the CLI reports under system_id_ranges (lowercased there).
+range_keys = {"UID_MIN", "UID_MAX", "GID_MIN", "GID_MAX", "SYS_UID_MIN", "SYS_UID_MAX", "SYS_GID_MIN", "SYS_GID_MAX"}
 values = {}
 for line in login_defs:
     parts = line.split()
-    if len(parts) >= 2 and parts[0] in {"SYS_GID_MIN", "SYS_GID_MAX"}:
+    if len(parts) >= 2 and parts[0] in range_keys:
         values[parts[0]] = int(parts[1])
-if set(values) != {"SYS_GID_MIN", "SYS_GID_MAX"}:
+if not {"SYS_GID_MIN", "SYS_GID_MAX"} <= set(values):
     raise SystemExit("captured login.defs did not include SYS_GID_MIN/MAX")
 if len(group) < 3:
     raise SystemExit("captured getent group sanctuary was malformed")
@@ -300,11 +302,15 @@ if not (values["SYS_GID_MIN"] <= gid <= values["SYS_GID_MAX"]):
     raise SystemExit("captured login.defs did not admit sanctuary_gid")
 # Brief 7.1 step 1: the CLI's own system_id_ranges must agree with the captured file, not only admit the gid
 # (gate round 2 N4: the round-1 rewrite dropped this field check).
+# Every range key the captured file defines must equal the CLI's value (closure F2: the restored check compared two of eight).
 ranges = status.get("system_id_ranges")
-if not ranges or (ranges.get("sys_gid_min"), ranges.get("sys_gid_max")) != (values["SYS_GID_MIN"], values["SYS_GID_MAX"]):
-    raise SystemExit("status system_id_ranges disagrees with captured login.defs")
+if not ranges:
+    raise SystemExit("status system_id_ranges missing")
+for key, value in values.items():
+    if ranges.get(key.lower()) != value:
+        raise SystemExit(f"status system_id_ranges {key.lower()} disagrees with captured login.defs")
 PY
-  record "status asserted: $label package pins, login.defs gid range (CLI ranges equal the file), and getent group"
+  record "status asserted: $label package pins, login.defs gid range, every CLI range key the file defines, and getent group"
 }
 
 assert_configured_status() {
@@ -834,12 +840,14 @@ PY
     record 'harness left the package altered before retire (see pre-retire-qkk.err)'
     exit 1
   fi
-  # With the workspace mounted, the remove guard's integrity probe refuses before its footprint check; without the
-  # mount it refuses on the provisioned footprint. Expect the one the measured state predicts and record which.
-  local retire_refusal="$provisioned_refusal"
-  if grep -q -F '(Permissions mismatch)' "$evidence/pre-retire-qkk.err"; then
-    retire_refusal='probe failed or incomplete'
+  # Brief 16.7: this leg runs with the agent workspace mounted, where the remove guard's integrity probe refuses first;
+  # an unmounted provisioned host refuses earlier on other checks (wall enablement, agent unit, accounts), so there is
+  # no footprint-phrase branch here. A run that reaches retire without the mount is a harness failure, not a variant.
+  if ! grep -q -F '(Permissions mismatch)' "$evidence/pre-retire-qkk.err"; then
+    record 'retire precondition failed: the workspace mount is not active (brief 16.7 requires the mounted state)'
+    exit 1
   fi
+  local retire_refusal='probe failed or incomplete'
   record "retire removal expects: $retire_refusal"
   # This broad guard phrase depends on the immediately preceding -Qkk filter admitting only the workspace permission mismatch.
   expect_refused retire-remove-provisioned "$retire_refusal" pacman -R --noconfirm sanctuary-castle-wall
