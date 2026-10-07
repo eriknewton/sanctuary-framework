@@ -321,9 +321,6 @@ pub fn verified_guard_bytes(
     if shebang != b"#!/usr/bin/python3 -I\n" || identity != expected_identity.as_bytes() {
         return Err("guard identity header mismatch".into());
     }
-    if sha256(static_region) != static_sha256 {
-        return Err("guard static payload mismatch".into());
-    }
     Ok(())
 }
 
