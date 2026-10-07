@@ -186,16 +186,12 @@ pub fn installed(_root: &Root, package: &str) -> Result<Snapshot> {
         "a pacman transaction holds the database lock; wait for it, or if no package manager is running remove the stale lock as pacman's own message says",
     )?;
     let (desc, files) = snapshot_for(pins.version)?;
-    let package_line = checked(PACMAN, &["--root", "/", "--dbpath", DB_PATH, "-Q", PACKAGE])?;
+    let package_line = checked(PACMAN, &["-Q", PACKAGE])?;
     parse_q(&package_line, pins.version)?;
     for path in expected_payloads_with_identity_and_guard() {
         let owner = checked(
             PACMAN,
             &[
-                "--root",
-                "/",
-                "--dbpath",
-                DB_PATH,
                 "-Qo",
                 "--",
                 &format!("/{path}"),
@@ -333,7 +329,7 @@ pub fn recheck(root: &Root, snapshot: &Snapshot) -> Result<()> {
         &db_lock(),
         "package database or identity changed during verification",
     )?;
-    let package_line = checked(PACMAN, &["--root", "/", "--dbpath", DB_PATH, "-Q", PACKAGE])?;
+    let package_line = checked(PACMAN, &["-Q", PACKAGE])?;
     let (desc, files) = snapshot_for(pins.version)?;
     if package_line != snapshot.package_line || desc != snapshot.desc || files != snapshot.files {
         return Err("package database or identity changed during verification".into());
