@@ -349,9 +349,8 @@ fn arch_ci_capture_kind(name: &str) -> Option<ArchCiCaptureKind> {
 }
 
 fn assert_arch_ci_shape(dir: &Path, files: &[PathBuf]) {
-    if files.is_empty() {
-        return;
-    }
+    // Captures landed with brief 16.6: an arch-ci directory without reader captures is a corpus defect, not a pending state.
+    assert!(!files.is_empty(), "{}: no reader captures", dir.display());
     let names = files
         .iter()
         .map(|path| path.file_name().and_then(|name| name.to_str()).unwrap())
@@ -455,7 +454,13 @@ fn arch_ci_captures_are_byte_pinned_by_provenance() {
     // The replay below checks VERDICTS, and several readers accept more than one byte shape, so an edited capture
     // can keep its verdict; this pin is what keeps the corpus equal to the bytes the named CI run produced
     // (P3 closure read F1). Captures landed with brief 16.6, so an empty arch-ci directory is now a failure too.
-    for dir in fixture_dirs_with_prefix("arch-ci-") {
+    let arch_ci_dirs = fixture_dirs_with_prefix("arch-ci-");
+    // Deleting or renaming the corpus off the prefix must fail, not leave these tests looping over nothing.
+    assert!(
+        !arch_ci_dirs.is_empty(),
+        "no arch-ci-* capture directory under {SUBSTRATE}"
+    );
+    for dir in arch_ci_dirs {
         let provenance = fs::read_to_string(dir.join("PROVENANCE"))
             .unwrap_or_else(|err| panic!("{}: PROVENANCE unreadable: {err}", dir.display()));
         let pins = arch_ci_provenance_pins(&provenance);
@@ -491,7 +496,13 @@ fn arch_ci_captures_are_byte_pinned_by_provenance() {
 
 #[test]
 fn arch_ci_capture_directories_replay_recorded_readers_when_present() {
-    for dir in fixture_dirs_with_prefix("arch-ci-") {
+    let arch_ci_dirs = fixture_dirs_with_prefix("arch-ci-");
+    // Deleting or renaming the corpus off the prefix must fail, not leave these tests looping over nothing.
+    assert!(
+        !arch_ci_dirs.is_empty(),
+        "no arch-ci-* capture directory under {SUBSTRATE}"
+    );
+    for dir in arch_ci_dirs {
         assert_every_fixture_has_expectation(&dir);
         let files = fixture_files(&dir);
         assert_arch_ci_shape(&dir, &files);
