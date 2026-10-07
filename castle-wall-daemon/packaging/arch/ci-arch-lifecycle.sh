@@ -465,7 +465,9 @@ PY
   write_vacuous_witnesses "$cgroup_file"
 
   record 'state_NEGATIVES: isolated refusal witnesses'
-  local daemon=/usr/local/libexec/sanctuary/castle-wall-daemon
+  # The payload byte goes on a payload the digest loop covers that is NOT executing: `stop` stops the agent and
+  # leaves the wall running by design, so appending to the daemon binary fails with ETXTBSY (CI run 37639891427).
+  local daemon=/usr/local/libexec/sanctuary/network-agent-standin
   cp "$daemon" "$work/daemon.backup"
   printf x >>"$daemon"
   expect_cli_refused negative-payload 'installed payload digest mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
