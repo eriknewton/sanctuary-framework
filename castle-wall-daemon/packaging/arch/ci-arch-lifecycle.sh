@@ -349,7 +349,8 @@ PY
 }
 
 run_unpinned_witness() {
-  local unpinned="$work/unpinned-target/x86_64-unknown-linux-gnu/release/sanctuary-linux-arch"
+  # Built for the host triple (no --target), so cargo writes release/ directly under the target directory.
+  local unpinned="$work/unpinned-target/release/sanctuary-linux-arch"
   if [[ ! -x "$unpinned" ]]; then
     record 'building unpinned sanctuary-linux-arch for C0 witness'
     pacman -S --noconfirm --needed rustup git >/dev/null
@@ -357,7 +358,7 @@ run_unpinned_witness() {
     # The target directory does not exist yet on a first build; create it owned by the build user (run 8 failed on
     # a chown of the missing path).
     install -d -o build -g build -m 0755 "$work/unpinned-target"
-    runuser -u build -- bash -lc "cd /workspace/castle-wall-daemon && PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR='$work/unpinned-target' cargo +1.95.0 build --release --features arch-install --bin sanctuary-linux-arch >/dev/null"
+    runuser -u build -- bash -lc "cd /workspace/castle-wall-daemon && PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR='$work/unpinned-target' cargo +1.95.0 build --locked --release --features arch-install --bin sanctuary-linux-arch >/dev/null"
   fi
   local saved="$work/sanctuary-linux.pinned"
   cp "$cli" "$saved"
