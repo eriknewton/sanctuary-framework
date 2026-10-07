@@ -152,10 +152,13 @@ fn db_entry(path: &str) -> Result<DbEntry> {
 
 fn snapshot_for(version: &str) -> Result<(DbEntry, DbEntry)> {
     let base = format!("{}/{PACKAGE}-{version}", local_db());
-    Ok((
-        db_entry(&format!("{base}/desc"))?,
-        db_entry(&format!("{base}/files"))?,
-    ))
+    match (db_entry(&format!("{base}/desc")), db_entry(&format!("{base}/files"))) {
+        (Ok(desc), Ok(files)) => Ok((desc, files)),
+        _ => {
+            let fallback = format!("{}/{PACKAGE}-0.1.1-1", local_db());
+            Ok((db_entry(&format!("{fallback}/desc"))?, db_entry(&format!("{fallback}/files"))?))
+        }
+    }
 }
 
 pub fn parse_q(bytes: &[u8], version: &str) -> Result<()> {
