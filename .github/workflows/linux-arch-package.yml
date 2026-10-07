@@ -141,31 +141,79 @@ jobs:
   arch-package-lifecycle:
     needs: arch-package-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.ARCH_SOURCE_SHA }}
           persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: python3-cryptography
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.arch-package-build.outputs.artifact-id }}
           path: ${{ runner.temp }}/arch-package
           merge-multiple: true
+      - name: Build the exact-head signer and public Arch lifecycle inputs
+        run: |
+          # A tool-cache symlink is runner-writable and must fail the signer's custody check.
+          sudo install -o root -g root -m 0755 "$(command -v node)" /usr/bin/node
+          cd server
+          npm ci
+          npm run build
+          cd "$GITHUB_WORKSPACE"
+          python3 castle-wall-daemon/packaging/ubuntu/prepare-install-composition.py \
+            --signer server/bin/sanctuary-linux-policy-sign --output "$RUNNER_TEMP/arch-lifecycle-inputs"
       - name: Run pacman lifecycle under systemd PID 1
         run: |
           cd "$RUNNER_TEMP/arch-package"
           sha256sum --check SHA256SUMS
           pkg=(*.pkg.tar.zst)
           [[ ${#pkg[@]} == 1 ]]
-          cid="$(docker run --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$GITHUB_WORKSPACE:/workspace:ro" -v "$RUNNER_TEMP/arch-package:/pkg:ro" -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd /usr/lib/systemd/systemd)"
-          timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          sudo modprobe nfnetlink_queue
+          run_container() {
+            local cgroupns="$1"
+            docker run --privileged --cgroupns="$cgroupns" \
+              -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+              -v "$GITHUB_WORKSPACE:/workspace:ro" \
+              -v "$RUNNER_TEMP/arch-package:/pkg:ro" \
+              -v "$RUNNER_TEMP/arch-lifecycle-inputs:/inputs:ro" \
+              -d archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd \
+              /usr/lib/systemd/systemd
+          }
+          cid="$(run_container private)"
+          cgroupns=private
+          if ! timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
           cid="$1"
-          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd'; do
+          # A privileged container usually finishes boot "degraded" (some units cannot start there); the harness accepts
+          # running or degraded, so this wait must too, or a good private-cgroup boot reads as a failure and falls back.
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd && s="$(systemctl is-system-running --wait 2>/dev/null)"; test "$s" = running || test "$s" = degraded'; do
+            state="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+            [[ "$state" == true ]] || exit 1
             sleep 2
           done
           WAIT_SYSTEMD
-          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python libnetfilter_queue zstd"
+          then
+            docker logs "$cid" >"$RUNNER_TEMP/arch-private-cgroup-systemd.log" 2>&1 || true
+            docker stop "$cid" >/dev/null 2>&1 || true
+            cid="$(run_container host)"
+            cgroupns=host
+            timeout 120 bash -s -- "$cid" <<'WAIT_SYSTEMD'
+          cid="$1"
+          # A privileged container usually finishes boot "degraded" (some units cannot start there); the harness accepts
+          # running or degraded, so this wait must too, or a good private-cgroup boot reads as a failure and falls back.
+          until docker exec "$cid" sh -c 'test "$(cat /proc/1/comm)" = systemd && s="$(systemctl is-system-running --wait 2>/dev/null)"; test "$s" = running || test "$s" = degraded'; do
+            state="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+            [[ "$state" == true ]] || exit 1
+            sleep 2
+          done
+          WAIT_SYSTEMD
+          fi
+          docker exec "$cid" bash -lc "pacman -Syu --noconfirm --needed base-devel systemd nftables iproute2 util-linux shadow python python-cryptography libnetfilter_queue zstd"
           # Evidence lives outside /tmp: systemd (PID 1 here) mounts a tmpfs on /tmp, and
           # docker cp reads the container's root filesystem, not mounts inside it, so a
           # directory under /tmp is written by the script and then "not found" by the copy
@@ -173,8 +221,13 @@ jobs:
           evidence=/var/lib/sanctuary-arch-lifecycle-evidence
           docker exec "$cid" mkdir -p "$evidence"
           rc=0
-          docker exec "$cid" bash -lc "EVIDENCE_DIR=$evidence /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh /pkg/${pkg[0]}" || rc=$?
+          docker exec "$cid" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin EVIDENCE_DIR="$evidence" SANCTUARY_ARCH_INPUTS=/inputs SANCTUARY_ARCH_CGROUPNS="$cgroupns" \
+            /workspace/castle-wall-daemon/packaging/arch/ci-arch-lifecycle.sh "/pkg/${pkg[0]}" || rc=$?
+          docker exec "$cid" bash -lc "printf '%s\n' '$cgroupns' >'$evidence/cgroupns'"
           docker cp "$cid:$evidence" "$RUNNER_TEMP/arch-lifecycle"
+          if [[ -f "$RUNNER_TEMP/arch-private-cgroup-systemd.log" ]]; then
+            cp "$RUNNER_TEMP/arch-private-cgroup-systemd.log" "$RUNNER_TEMP/arch-lifecycle/private-cgroup-systemd.log"
+          fi
           docker stop "$cid"
           exit "$rc"
       - if: always()

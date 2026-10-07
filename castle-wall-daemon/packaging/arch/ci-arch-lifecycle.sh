@@ -7,6 +7,15 @@ pkg="$(realpath "$pkg")"
 work="$(mktemp -d)"
 evidence="${EVIDENCE_DIR:-$work/evidence}"
 mkdir -p "$evidence"
+cli=/usr/bin/sanctuary-linux
+fortress=0123456789abcdef
+agent_uid=60123
+service_uid=60124
+wall_unit=sanctuary-castle-wall.service
+agent_unit=sanctuary-agent@60123.service
+mount_unit='var-lib-sanctuary\x2dagent\x2dworkspace.mount'
+inputs_dir="${SANCTUARY_ARCH_INPUTS:-/inputs}"
+inputs_dir="${inputs_dir%/}"
 
 assert_systemd() {
   [[ "$(cat /proc/1/comm)" == systemd ]]
@@ -15,6 +24,485 @@ assert_systemd() {
 
 record() {
   printf '%s\n' "$*" | tee -a "$evidence/lifecycle.log"
+}
+
+capture() {
+  local label="$1"
+  shift
+  set +e
+  "$@" >"$evidence/$label.out" 2>"$evidence/$label.err"
+  local rc=$?
+  set -e
+  printf '%s\n' "$rc" >"$evidence/$label.rc"
+  cat "$evidence/$label.out" "$evidence/$label.err" >"$evidence/$label.combined"
+  return "$rc"
+}
+
+cli_capture() {
+  local label="$1"
+  shift
+  # HOME is deliberately absent: operator identity must come from loginuid and root custody, not a user environment.
+  capture "$label" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "$cli" "$@"
+}
+
+expect_cli_ok() {
+  local label="$1"
+  shift
+  cli_capture "$label" "$@"
+  record "cli ok: $label"
+}
+
+expect_cli_refused() {
+  local label="$1"
+  local phrase="$2"
+  shift 2
+  if cli_capture "$label" "$@"; then
+    echo "$label unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -F "$phrase" "$evidence/$label.combined" >/dev/null
+  record "cli refused: $label -> $phrase"
+}
+
+expect_cli_status_missing() {
+  local label="$1"
+  shift
+  expect_cli_ok "$label" status --json
+  python3 - "$evidence/$label.out" "$@" <<'PY'
+import json
+import sys
+
+status = json.loads(open(sys.argv[1]).read())
+required = set(sys.argv[2:])
+missing = set(status.get("missing_evidence", []))
+if not required.issubset(missing):
+    raise SystemExit(f"missing_evidence {sorted(missing)} lacks {sorted(required)}")
+PY
+}
+
+expect_cli_evidence_incomplete() {
+  local label="$1"
+  shift
+  if cli_capture "$label" evidence --output "$evidence/$label"; then
+    echo "$label unexpectedly completed evidence" >&2
+    exit 1
+  fi
+  python3 - "$evidence/$label.out" "$@" <<'PY'
+import json
+import sys
+
+result = json.loads(open(sys.argv[1]).read())
+required = set(sys.argv[2:])
+missing = set(result.get("missing", []))
+status_missing = set(result.get("status", {}).get("missing_evidence", []))
+if result.get("complete") is not False:
+    raise SystemExit("evidence did not report complete:false")
+if not required.issubset(missing | status_missing):
+    raise SystemExit(f"missing evidence {sorted(missing | status_missing)} lacks {sorted(required)}")
+PY
+}
+
+save_raw_captures() {
+  local phase="$1"
+  systemctl show "$wall_unit" --no-pager >"$evidence/systemctl-show-wall-$phase"
+  systemctl show "$agent_unit" --no-pager >"$evidence/systemctl-show-agent-$phase" || true
+  systemctl show "$mount_unit" --no-pager >"$evidence/systemctl-show-mount-$phase" || true
+  systemctl list-jobs --no-pager >"$evidence/systemctl-list-jobs-$phase" || true
+  pacman -Q sanctuary-castle-wall >"$evidence/pacman-Q-$phase" 2>"$evidence/pacman-Q-$phase.err" || true
+  pacman -Qo /usr/bin/sanctuary-linux >"$evidence/pacman-Qo-cli-$phase" 2>"$evidence/pacman-Qo-cli-$phase.err" || true
+  pacman -Qkk sanctuary-castle-wall >"$evidence/pacman-Qkk-$phase" 2>"$evidence/pacman-Qkk-$phase.err" || true
+  cp /etc/login.defs "$evidence/login.defs"
+  cp /etc/nsswitch.conf "$evidence/nsswitch.conf"
+  nft -j -a list table inet sanctuary-castle >"$evidence/nft-table-$phase.json" 2>"$evidence/nft-table-$phase.err" || true
+  nft -j -a list ruleset >"$evidence/nft-ruleset-$phase.json" 2>"$evidence/nft-ruleset-$phase.err" || true
+}
+
+write_expectation_files() {
+  for path in "$evidence"/login.defs "$evidence"/pacman-Q-* "$evidence"/pacman-Qo-cli-* "$evidence"/systemctl-show-*; do
+    [[ -f "$path" ]] || continue
+    printf 'accept\n' >"$path.expect"
+  done
+}
+
+write_vacuous_witnesses() {
+  local cgroup_file="$1"
+  python3 - "$evidence/vacuous-witnesses.json" "$cgroup_file" "${SANCTUARY_ARCH_CGROUPNS:-unknown}" <<'PY'
+import json
+import sys
+
+cgroup_file = sys.argv[2]
+data = {
+    "reboot": "not witnessed in the PID 1 container",
+    "kernel": "runner kernel, not linux-omarchy 7.2.5",
+    "systemd": "container corpus, not the Omarchy 261.2 corpus",
+    "reimage": "not performed; intended retirement remains reimage",
+    "loginuid": "harness wrote /proc/self/loginuid before CLI execution",
+    "cgroupns": sys.argv[3],
+    "descendants_check": "read cgroup.events" if cgroup_file else "vacuous: cgroup.events was not read",
+}
+open(sys.argv[1], "w").write(json.dumps(data, sort_keys=True, indent=2) + "\n")
+PY
+}
+
+assert_status_json() {
+  local label="$1"
+  local pins="$2"
+  python3 - "$evidence/$label.out" "$pins" "$agent_uid" "$service_uid" <<'PY'
+import json
+import sys
+
+status = json.loads(open(sys.argv[1]).read())
+pins = json.load(open(sys.argv[2]))
+agent = int(sys.argv[3])
+service = int(sys.argv[4])
+if status["package_manager"] != "pacman":
+    raise SystemExit("package_manager mismatch")
+if status["agent_uid"] != agent or status["service_uid"] != service:
+    raise SystemExit("uid mismatch")
+if status["package_pins"] != pins:
+    raise SystemExit("package_pins mismatch")
+ranges = status.get("system_id_ranges")
+if not ranges or not (ranges["sys_gid_min"] <= status["sanctuary_gid"] <= ranges["sys_gid_max"]):
+    raise SystemExit("system_id_ranges did not admit sanctuary_gid")
+PY
+}
+
+assert_configured_status() {
+  local label="$1"
+  python3 - "$evidence/$label.out" <<'PY'
+import json
+import sys
+
+status = json.loads(open(sys.argv[1]).read())
+if status.get("configured_valid") is not True:
+    raise SystemExit("configured_valid was not true")
+PY
+}
+
+assert_enabled_status() {
+  local label="$1"
+  python3 - "$evidence/$label.out" <<'PY'
+import json
+import sys
+
+status = json.loads(open(sys.argv[1]).read())
+if status.get("effective_units_valid") is not True:
+    raise SystemExit("effective_units_valid was not true")
+for unit in ("agent", "wall"):
+    if status.get(unit, {}).get("UnitFileState") != "enabled":
+        raise SystemExit(f"{unit} was not enabled")
+PY
+}
+
+assert_started_status() {
+  local label="$1"
+  python3 - "$evidence/$label.out" <<'PY'
+import json
+import sys
+
+status = json.loads(open(sys.argv[1]).read())
+if "binding_observation" not in status or status["binding_observation"] is None:
+    raise SystemExit("binding_observation missing")
+if not status.get("workload"):
+    raise SystemExit("stable workload identity missing")
+PY
+}
+
+run_sentinels_and_wait_observation() {
+  python3 - "$inputs_dir/endpoints.json" "$evidence/sentinel-receipts.json" <<'PY'
+import json
+import selectors
+import socket
+import sys
+import threading
+import time
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+endpoints = json.load(open(sys.argv[1]))["endpoints"]
+receipts_path = sys.argv[2]
+key = Ed25519PrivateKey.from_private_bytes(bytes([22]) * 32)
+selector = selectors.DefaultSelector()
+stop = threading.Event()
+receipts = []
+errors = []
+
+for family, ip in [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]:
+    for kind, port in [(socket.SOCK_STREAM, 41001), (socket.SOCK_DGRAM, 41002), (socket.SOCK_STREAM, 41003)]:
+        s = socket.socket(family, kind)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind((ip, port))
+        if kind == socket.SOCK_STREAM:
+            s.listen(8)
+        selector.register(s, selectors.EVENT_READ, (kind, port))
+
+def loop():
+    try:
+        while not stop.is_set():
+            for selected, _ in selector.select(0.1):
+                sock = selected.fileobj
+                kind, port = selected.data
+                if kind == socket.SOCK_DGRAM:
+                    data, peer = sock.recvfrom(257)
+                else:
+                    conn, peer = sock.accept()
+                    with conn:
+                        conn.settimeout(3)
+                        data = b""
+                        while len(data) < 32:
+                            part = conn.recv(32 - len(data))
+                            if not part:
+                                break
+                            data += part
+                        if port == 41003 and len(data) == 32:
+                            conn.sendall(data + key.sign(data))
+                receipts.append({"port": port, "nonce_hex": data.hex(), "peer": str(peer)})
+    except Exception as exc:
+        errors.append(str(exc))
+
+thread = threading.Thread(target=loop)
+thread.start()
+deadline = time.monotonic() + 120
+observation = "/var/lib/sanctuary-agent-workspace/observations.json"
+try:
+    while time.monotonic() < deadline:
+        if errors:
+            raise SystemExit(errors[0])
+        try:
+            record = json.load(open(observation))
+            if record.get("attempt_count", 0) >= sum(endpoint["attempts"] for endpoint in endpoints):
+                break
+        except FileNotFoundError:
+            pass
+        time.sleep(0.2)
+    else:
+        raise SystemExit("stand-in observation did not complete")
+finally:
+    stop.set()
+    thread.join(timeout=4)
+    for item in list(selector.get_map().values()):
+        item.fileobj.close()
+    selector.close()
+    open(receipts_path, "w").write(json.dumps({"receipts": receipts, "errors": errors}, sort_keys=True, indent=2) + "\n")
+if errors:
+    raise SystemExit(errors[0])
+PY
+}
+
+rewrite_identity_field() {
+  local path="$1"
+  local field="$2"
+  local value="$3"
+  python3 - "$path" "$field" "$value" <<'PY'
+import json
+import sys
+
+path, field, value = sys.argv[1:]
+data = json.load(open(path))
+if value == "false":
+    data[field] = False
+else:
+    data[field] = value
+open(path, "w").write(json.dumps(data, sort_keys=True, indent=2) + "\n")
+PY
+}
+
+set_guard_identity_to_current_file() {
+  local identity="$1"
+  local guard="$2"
+  local digest
+  digest="$(sha256sum "$identity" | cut -d' ' -f1)"
+  python3 - "$guard" "$digest" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+digest = sys.argv[2]
+lines = path.read_text().splitlines(keepends=True)
+lines[1] = f"IDENTITY_SHA256 = '{digest}'\n"
+path.write_text("".join(lines))
+PY
+}
+
+run_unpinned_witness() {
+  local unpinned="$work/unpinned-target/x86_64-unknown-linux-gnu/release/sanctuary-linux-arch"
+  if [[ ! -x "$unpinned" ]]; then
+    record 'building unpinned sanctuary-linux-arch for C0 witness'
+    pacman -S --noconfirm --needed rustup git >/dev/null
+    runuser -u build -- rustup toolchain install 1.95.0 --profile minimal >/dev/null
+    chown -R build:build "$work/unpinned-target"
+    runuser -u build -- bash -lc "cd /workspace/castle-wall-daemon && PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR='$work/unpinned-target' cargo +1.95.0 build --release --features arch-install --bin sanctuary-linux-arch >/dev/null"
+  fi
+  local saved="$work/sanctuary-linux.pinned"
+  cp "$cli" "$saved"
+  cp "$unpinned" "$cli"
+  chmod 0755 "$cli"
+  expect_cli_refused negative-unpinned-root 'Arch CLI built without package pins' status --json
+  if runuser -u build -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "$cli" status --json >"$evidence/negative-unpinned-nonroot.out" 2>"$evidence/negative-unpinned-nonroot.err"; then
+    echo "negative-unpinned-nonroot unexpectedly succeeded" >&2
+    exit 1
+  fi
+  cat "$evidence/negative-unpinned-nonroot.out" "$evidence/negative-unpinned-nonroot.err" >"$evidence/negative-unpinned-nonroot.combined"
+  grep -F 'Arch CLI built without package pins' "$evidence/negative-unpinned-nonroot.combined" >/dev/null
+  cp "$saved" "$cli"
+}
+
+run_arch_cli_lifecycle() {
+  record 'state_INERT: pinned CLI installed inert'
+  if cli_capture state-inert-status status --json; then
+    echo "inert status unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -F 'not provisioned' "$evidence/state-inert-status.combined" >/dev/null
+  if grep -F 'Arch CLI built without package pins' "$evidence/state-inert-status.combined" >/dev/null; then
+    echo "inert status hit unpinned refusal" >&2
+    exit 1
+  fi
+
+  local operator_uid
+  operator_uid="$(stat -c %u "$inputs_dir/endpoints.json")"
+  if ! getent passwd "$operator_uid" >/dev/null; then
+    useradd --uid "$operator_uid" --no-create-home --system lifecycle-operator
+  fi
+  # CI has no PAM login ceremony. The harness establishes the audit session so the CLI reads kernel loginuid, not an environment claim.
+  printf '%s' "$operator_uid" >/proc/self/loginuid
+  [[ "$(cat /proc/self/loginuid)" == "$operator_uid" ]]
+  python3 - "$evidence/operator-session.json" "$operator_uid" <<'PY'
+import json
+import sys
+open(sys.argv[1], "w").write(json.dumps({
+    "uid": int(sys.argv[2]),
+    "loginuid": int(sys.argv[2]),
+    "setup": "explicit disposable Arch CI audit session; normal operator uses PAM",
+}, sort_keys=True, indent=2) + "\n")
+PY
+
+  python3 - "$identity_path" "$evidence/arch-pins.json" <<'PY'
+import json
+import sys
+identity = json.load(open(sys.argv[1]))
+open(sys.argv[2], "w").write(json.dumps(identity["cli_pins"], sort_keys=True, indent=2) + "\n")
+PY
+
+  record 'state_PROVISIONED: provision account and command identity'
+  expect_cli_ok state-provisioned provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  getent passwd "$agent_uid" >"$evidence/getent-passwd-agent"
+  getent passwd "$service_uid" >"$evidence/getent-passwd-service"
+  getent group sanctuary >"$evidence/getent-group-sanctuary"
+  expect_cli_ok state-provisioned-status status --json
+  assert_status_json state-provisioned-status "$evidence/arch-pins.json"
+
+  record 'state_POLICY: signed policy installed'
+  expect_cli_ok state-policy policy-install --bundle "$inputs_dir/policy.bundle.json" --expected-key-sha256 "$(cat "$inputs_dir/policy-key-sha256")"
+  expect_cli_ok state-policy-status status --json
+  assert_configured_status state-policy-status
+
+  record 'state_ENABLED: units enabled, observed, then disabled for explicit start witness'
+  expect_cli_ok state-enabled enable
+  expect_cli_ok state-enabled-status status --json
+  assert_enabled_status state-enabled-status
+  expect_cli_ok state-enabled-disable disable
+
+  record 'state_STARTED: wall ready, agent second exec and binding observation'
+  expect_cli_ok state-started start
+  run_sentinels_and_wait_observation
+  expect_cli_ok state-started-status status --json
+  assert_started_status state-started-status
+  expect_cli_ok state-started-evidence evidence --output "$evidence/cli"
+  python3 - "$evidence/state-started-evidence.out" <<'PY'
+import json
+import sys
+if json.loads(open(sys.argv[1]).read()).get("complete") is not True:
+    raise SystemExit("evidence was not complete")
+PY
+  save_raw_captures running
+  cgroup_path="$(python3 - "$evidence/systemctl-show-agent-running" <<'PY'
+import sys
+for line in open(sys.argv[1]):
+    if line.startswith("ControlGroup="):
+        print(line.split("=", 1)[1].strip())
+PY
+)"
+  cgroup_file=
+  if [[ -n "$cgroup_path" && -f "/sys/fs/cgroup$cgroup_path/cgroup.events" ]]; then
+    cgroup_file="/sys/fs/cgroup$cgroup_path/cgroup.events"
+  fi
+  expect_cli_ok state-started-stop stop
+  write_vacuous_witnesses "$cgroup_file"
+
+  record 'state_NEGATIVES: isolated refusal witnesses'
+  local daemon=/usr/local/libexec/sanctuary/castle-wall-daemon
+  cp "$daemon" "$work/daemon.backup"
+  printf x >>"$daemon"
+  expect_cli_refused negative-payload 'installed payload digest mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  cp "$work/daemon.backup" "$daemon"
+
+  cp "$identity_path" "$work/identity-edited.backup"
+  rewrite_identity_field "$identity_path" rustc_version edited-by-lifecycle
+  expect_cli_refused negative-identity 'guard identity header mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  cp "$work/identity-edited.backup" "$identity_path"
+
+  cp "$guard_path" "$work/guard-body.backup"
+  printf '\n# lifecycle negative\n' >>"$guard_path"
+  expect_cli_refused negative-guard-body 'guard static payload mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  cp "$work/guard-body.backup" "$guard_path"
+
+  cp -a /var/lib/pacman "$work/pacman-copy"
+  rm -rf "$work/pacman-copy/local/sanctuary-castle-wall-"*
+  cp /etc/pacman.conf "$work/pacman.conf.backup"
+  printf '\nDBPath = %s\n' "$work/pacman-copy" >>/etc/pacman.conf
+  if pacman -Q sanctuary-castle-wall >"$evidence/negative-dbpath-bare-pacman.out" 2>"$evidence/negative-dbpath-bare-pacman.err"; then
+    echo "DBPath redirect did not make bare pacman disagree" >&2
+    exit 1
+  fi
+  expect_cli_ok negative-dbpath-cli-status status --json
+  cp "$work/pacman.conf.backup" /etc/pacman.conf
+  record 'negative dbpath-redirect isolated check: fixed --dbpath /var/lib/pacman'
+
+  version_swap_extra=$'  install -D -m 0755 /usr/bin/sanctuary-linux "$pkgdir/usr/bin/sanctuary-linux"'
+  scratch_pkg sanctuary-castle-wall 0.1.1 "$work/version-swap.pkg.tar.zst" "$version_swap_extra"
+  mask_hook 00-sanctuary-castle-wall-upgrade-guard.hook
+  expect_ok version-swap-install pacman -U --noconfirm "$work/version-swap.pkg.tar.zst"
+  expect_cli_refused negative-version-swap 'pinned package database entry absent' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  expect_ok version-swap-restore pacman -U --noconfirm "$pkg"
+  unmask_hooks
+
+  touch /var/lib/pacman/db.lck
+  expect_cli_refused negative-db-lock 'pacman transaction holds the database lock' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  rm -f /var/lib/pacman/db.lck
+
+  cp "$identity_path" "$work/install-ready.identity"
+  cp "$guard_path" "$work/install-ready.guard"
+  rewrite_identity_field "$identity_path" install_ready false
+  set_guard_identity_to_current_file "$identity_path" "$guard_path"
+  expect_cli_refused negative-install-ready 'install build identity mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  cp "$work/install-ready.identity" "$identity_path"
+  cp "$work/install-ready.guard" "$guard_path"
+
+  run_unpinned_witness
+
+  record 'state_RETIRED: provisioned removal refused, masked removal, copied CLI refuses after removal'
+  expect_refused retire-remove-provisioned "$provisioned_refusal" pacman -R --noconfirm sanctuary-castle-wall
+  expect_refused retire-remove-dd-provisioned "$provisioned_refusal" pacman -Rdd --noconfirm sanctuary-castle-wall
+  install -d -m 0755 "$evidence/copied-cli"
+  cp "$cli" "$evidence/copied-cli/sanctuary-linux"
+  chmod 0755 "$evidence/copied-cli/sanctuary-linux"
+  mask_hook 00-sanctuary-castle-wall-remove-guard.hook
+  expect_ok retire-remove-provisioned-masked pacman -Rdd --noconfirm sanctuary-castle-wall
+  unmask_hooks
+  cli="$evidence/copied-cli/sanctuary-linux"
+  expect_cli_refused retire-provision-not-installed 'pinned package database entry absent' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
+  expect_cli_refused retire-policy-not-installed 'pinned package database entry absent' policy-install --bundle "$inputs_dir/policy.bundle.json" --expected-key-sha256 "$(cat "$inputs_dir/policy-key-sha256")"
+  expect_cli_refused retire-disable-not-installed 'pinned package database entry absent' disable
+  expect_cli_refused retire-stop-not-installed 'pinned package database entry absent' stop
+  expect_cli_refused retire-start-config-missing 'No such file or directory' start
+  expect_cli_refused retire-enable-config-missing 'No such file or directory' enable
+  expect_cli_status_missing retire-status-missing 'verified package and effective units' 'validated configuration' 'build identity'
+  expect_cli_evidence_incomplete retire-evidence-missing 'verified package and effective units' 'validated configuration' 'build identity'
+  save_raw_captures retired
+  write_expectation_files
+  record 'state_RETIRED complete'
 }
 
 scratch_pkg() {
@@ -229,6 +717,9 @@ rm -f /etc/sanctuary/provisioned
 
 expect_ok reinstall-after-remove pacman -U --noconfirm "$pkg"
 expect_ok inert-remove pacman -R --noconfirm sanctuary-castle-wall
+expect_ok reinstall-for-cli-lifecycle pacman -U --noconfirm "$pkg"
+run_arch_cli_lifecycle
+expect_ok reinstall-for-sbin-conflict pacman -U --noconfirm "$pkg"
 
 if pacman -U --noconfirm "$work/sbin.pkg.tar.zst" >"$evidence/sbin-conflict.out" 2>"$evidence/sbin-conflict.err"; then
   echo "usr/sbin conflict witness unexpectedly installed" >&2

@@ -1,0 +1,8 @@
+captured arch-ci pending P3 lifecycle artifact
+
+The first CI run writes this directory's raw captures from
+/var/lib/sanctuary-arch-lifecycle-evidence before the coordinator commits them.
+Every captured reader input committed here must have a sibling .expect file:
+login.defs, systemctl-show-*, pacman-Q-* and pacman-Qo-* use "accept" or
+"refuse <needle>". A directory with only this provenance file is intentionally
+not a fixture failure before the captures arrive.

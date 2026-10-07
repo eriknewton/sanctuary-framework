@@ -109,6 +109,21 @@ fn fixture_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn fixture_dirs_with_prefix(prefix: &str) -> Vec<PathBuf> {
+    let mut dirs = fs::read_dir(SUBSTRATE)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
 #[test]
 fn login_defs_accepts_recon_and_recorded_synthetic_verdicts() {
     let captured_dir = fixture_dir("omarchy-4.0.4-systemd-261.2-nft-1.1.7");
@@ -321,5 +336,52 @@ fn synthetic_show_maps_are_differential_witnesses_for_shared_unit_reader() {
             path.display()
         );
         assert_expected(arch_result.map_err(Into::into), expected);
+    }
+}
+
+#[test]
+fn arch_ci_capture_directories_replay_recorded_readers_when_present() {
+    for dir in fixture_dirs_with_prefix("arch-ci-") {
+        assert_every_fixture_has_expectation(&dir);
+        for path in fixture_files(&dir) {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name == "login.defs" {
+                assert_expected(
+                    login_defs::parse(&fs::read(&path).unwrap()).map(|_| ()),
+                    expectation(&path),
+                );
+            } else if name.starts_with("pacman-Qo-") {
+                assert_expected(
+                    pacman::parse_qo(&fs::read(&path).unwrap(), QO_PATH, PACKAGE_VERSION),
+                    expectation(&path),
+                );
+            } else if name.starts_with("pacman-Q-") && !name.starts_with("pacman-Qkk-") {
+                assert_expected(
+                    pacman::parse_q(&fs::read(&path).unwrap(), PACKAGE_VERSION),
+                    expectation(&path),
+                );
+            } else if name.starts_with("systemctl-show-") {
+                let expected = expectation(&path);
+                let values = parse_show_fixture(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                let (unit, expected_path) = unit_for(&path);
+                let ubuntu_result =
+                    ubuntu_command::verify_unit_observation(&values, unit, expected_path)
+                        .map_err(|error| error.to_string());
+                let arch_result =
+                    arch_command::verify_unit_observation(&values, unit, expected_path)
+                        .map_err(|error| error.to_string());
+                assert_eq!(
+                    ubuntu_result.as_ref().map(|_| ()).map_err(String::clone),
+                    arch_result.as_ref().map(|_| ()).map_err(String::clone),
+                    "Ubuntu/Arch verdict drift for {}",
+                    path.display()
+                );
+                assert_expected(arch_result.map_err(Into::into), expected);
+            }
+        }
     }
 }
