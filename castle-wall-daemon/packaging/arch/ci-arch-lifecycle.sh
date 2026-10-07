@@ -298,8 +298,13 @@ if status["sanctuary_gid"] != gid:
     raise SystemExit("status sanctuary_gid did not match getent")
 if not (values["SYS_GID_MIN"] <= gid <= values["SYS_GID_MAX"]):
     raise SystemExit("captured login.defs did not admit sanctuary_gid")
+# Brief 7.1 step 1: the CLI's own system_id_ranges must agree with the captured file, not only admit the gid
+# (gate round 2 N4: the round-1 rewrite dropped this field check).
+ranges = status.get("system_id_ranges")
+if not ranges or (ranges.get("sys_gid_min"), ranges.get("sys_gid_max")) != (values["SYS_GID_MIN"], values["SYS_GID_MAX"]):
+    raise SystemExit("status system_id_ranges disagrees with captured login.defs")
 PY
-  record "status asserted: $label package pins, login.defs gid range, and getent group"
+  record "status asserted: $label package pins, login.defs gid range (CLI ranges equal the file), and getent group"
 }
 
 assert_configured_status() {
@@ -842,14 +847,11 @@ PY
   expect_ok retire-wall-stop systemctl stop "$wall_unit"
   expect_ok retire-daemon-disarm /usr/local/libexec/sanctuary/castle-wall-daemon --disarm
   expect_ok retire-mount-stop systemctl stop "$mount_unit"
-  pacman -Qkk sanctuary-castle-wall >"$evidence/retire-footprint-qkk.out" 2>"$evidence/retire-footprint-qkk.err" || true
-  if grep -q 'warning:' "$evidence/retire-footprint-qkk.err"; then
-    record 'retire footprint leg did not reach a clean -Qkk state'
-    exit 1
-  fi
-  expect_refused retire-remove-provisioned-footprint "$provisioned_refusal" pacman -R --noconfirm sanctuary-castle-wall
-  expect_refused retire-remove-dd-provisioned-footprint "$provisioned_refusal" pacman -Rdd --noconfirm sanctuary-castle-wall
-  record 'retire footprint leg asserted: clean -Qkk then provisioned-footprint refusal for -R and -Rdd'
+  # Gate round 2 (D5 subtraction, brief 16.7): no footprint-phrase leg here. On a really provisioned host the remove
+  # guard refuses earlier (the wall's enablement link, the agent unit, the existing accounts), so a leg expecting the
+  # footprint phrase can never pass; the footprint phrase stays witnessed by the pre-CLI provisioned witness, and a
+  # real-host retire is a leg of the Omarchy drill.
+  record 'retire: provisioned removal refused while mounted (probe); footprint phrase witnessed pre-CLI; real-host retire is a drill leg'
   install -d -m 0755 "$evidence/copied-cli"
   cp "$cli" "$evidence/copied-cli/sanctuary-linux"
   chmod 0755 "$evidence/copied-cli/sanctuary-linux"
