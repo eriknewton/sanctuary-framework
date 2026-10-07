@@ -8,6 +8,6 @@ A routine `omarchy update` does not include this package while no same-named AUR
 
 Kernel, systemd and nftables updates are outside this package claim. Reboot after those updates. Failure mode: a same-boot substrate change has not been drilled for this package.
 
-The package's build identity is installed under `/usr/share/doc/sanctuary-castle-wall/`, and the remove guard binds to it. A host whose `pacman.conf` excludes `usr/share/doc/*` from extraction (the official Arch container image does; stock Arch and Omarchy do not) never receives that file. Such hosts are outside this package's claim. Failure mode: `pacman -Qkk sanctuary-castle-wall` reports an altered file right after install, and the remove guard refuses every removal there because its identity is absent; removal there is an operator action outside the guard.
+The package's build identity is installed under `/usr/lib/sanctuary-castle-wall/`, outside the documentation tree, so hosts whose `pacman.conf` excludes `usr/share/doc/*` from extraction receive it.
 
-`sanctuary-linux` does not yet operate on Arch. This package records the Arch CLI path deviation, but the Rust package checks still expect the Ubuntu install identity until the portability slice lands.
+`sanctuary-linux` on this package is built against the Arch install identity and installs inert; its verbs are not yet exercised in CI.

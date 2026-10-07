@@ -56,7 +56,9 @@ Checks:
 - Audit log exists and chain-verifies through the same export plus verifier
   logic used by `sanctuary audit-chain`.
 - On shipped installs, `WARN audit chain / no checkpoint signature was verified`
-  is expected until a production checkpoint signer is wired.
+  is expected for identity-less fortresses and the root daemon split audit
+  store. Production call sites derive the signer when the fortress holds an
+  identity.
 - Package, Node.js, and npm versions are reported.
 - Castle Wall system-extension status is reported on macOS. Other platforms
   print `n/a (not macOS)`.

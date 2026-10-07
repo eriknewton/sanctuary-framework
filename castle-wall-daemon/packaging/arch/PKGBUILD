@@ -13,7 +13,7 @@ _glibc_floor="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
 depends=("glibc>=${_glibc_floor}" 'systemd' 'nftables' 'python' 'libnetfilter_queue' 'iproute2' 'util-linux' 'shadow')
 makedepends=('rustup')
 # docs and emptydirs must stay enabled; deleting them after package() would remove the bound identity and make every guarded removal refuse.
-options=('!strip' 'docs' 'emptydirs')
+options=('!strip' '!debug' 'docs' 'emptydirs')
 backup=()
 source=()
 sha256sums=()
@@ -25,29 +25,77 @@ _crate_root() {
   cd "${startdir}/../.." && pwd -P
 }
 
+_scrub_rust_env() {
+  local name scrubbed="$srcdir/rust-env-scrubbed.txt"
+  : >"$scrubbed"
+  while IFS='=' read -r name _; do
+    case "$name" in
+      CARGO_*|RUSTFLAGS*|RUSTC*|RUSTDOC*|RUSTUP_TOOLCHAIN*)
+        printf '%s\n' "$name" >>"$scrubbed"
+        unset "$name"
+        ;;
+    esac
+  done < <(env)
+  while IFS='=' read -r name _; do
+    case "$name" in
+      RUSTC*|RUSTDOC*|RUSTFLAGS*|RUSTUP_TOOLCHAIN*)
+        echo "Rust build environment survived scrub: $name" >&2
+        return 1
+        ;;
+    esac
+  done < <(env)
+  export CARGO_TERM_COLOR=never
+}
+
 build() {
   local crate
   crate="$(_crate_root)"
   cd "$crate"
   rustc --version | grep -F "rustc ${_toolchain} " >/dev/null
+  _scrub_rust_env
+  printf '%s' "${RUSTFLAGS-}" >"$srcdir/rustflags.txt"
   cargo build --locked --release --target "${_target}" \
+    --target-dir "$srcdir/target-shared" \
+    --message-format=json \
     --bin castle-wall-daemon \
     --bin protected-agent-v1 \
-    --bin network-agent-standin \
-    --bin sanctuary-linux
+    --bin network-agent-standin >"$srcdir/cargo-shared.jsonl"
+  python3 "${startdir}/build-arch-package.py" pin \
+    --crate "$crate" \
+    --pkgver "$pkgver" \
+    --pkgrel "$pkgrel" \
+    --target-dir "$srcdir/target-shared" \
+    --output "$srcdir/arch-pins.json"
+  # Must match option_env! names in src/linux_install/arch/pacman.rs.
+  SANCTUARY_ARCH_PIN_PACKAGE_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_version"])' "$srcdir/arch-pins.json")" \
+  SANCTUARY_ARCH_PIN_PAYLOAD_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["payload_sha256"])' "$srcdir/arch-pins.json")" \
+  SANCTUARY_ARCH_PIN_GUARD_STATIC_SHA256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["guard_static_sha256"])' "$srcdir/arch-pins.json")" \
+  cargo build --locked --release --target "${_target}" \
+    --target-dir "$srcdir/target-arch-cli" \
+    --message-format=json \
+    --features arch-install \
+    --bin sanctuary-linux-arch >"$srcdir/cargo-arch-cli.jsonl"
 }
 
 package() {
   local crate source_commit rustc_version
   crate="$(_crate_root)"
-  source_commit="$(git -C "${crate}/.." rev-parse HEAD)"
+  # Recorded in the identity for traceability; the guard and P2a pins do not verify this field.
+  source_commit="${SOURCE_COMMIT:?SOURCE_COMMIT must be supplied by the build job; package() does not open root-owned linked-worktree gitdirs as the build user}"
   rustc_version="$(rustc --version)"
   python3 "${startdir}/build-arch-package.py" \
+    stage \
     --crate "$crate" \
     --dest "$pkgdir" \
     --pkgver "$pkgver" \
     --pkgrel "$pkgrel" \
     --source-commit "$source_commit" \
     --rustc-version "$rustc_version" \
-    --glibc-floor "$_glibc_floor"
+    --glibc-floor "$_glibc_floor" \
+    --shared-target-dir "$srcdir/target-shared" \
+    --cli-target-dir "$srcdir/target-arch-cli" \
+    --shared-cargo-json "$srcdir/cargo-shared.jsonl" \
+    --cli-cargo-json "$srcdir/cargo-arch-cli.jsonl" \
+    --rustflags-file "$srcdir/rustflags.txt" \
+    --pins "$srcdir/arch-pins.json"
 }

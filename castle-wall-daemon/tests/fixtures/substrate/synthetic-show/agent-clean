@@ -1,0 +1,7 @@
+Id=sanctuary-agent@60123.service
+Names=sanctuary-agent@60123.service
+FragmentPath=/etc/systemd/system/sanctuary-agent@.service
+LoadState=loaded
+DropInPaths=
+NeedDaemonReload=no
+UnitFileState=disabled

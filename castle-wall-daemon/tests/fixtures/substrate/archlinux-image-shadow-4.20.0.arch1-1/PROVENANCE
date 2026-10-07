@@ -1,0 +1,2 @@
+captured archlinux:latest@sha256:4e77cf2ea5f410e6f8be5abf93ccf17ce2436e87a138c167208356711a405dbd 2026-10-06 command: docker create then docker cp <container>:/etc/login.defs (linux/amd64; pacman -Q shadow = 4.20.0.arch1-1, the version the Omarchy 4.0.4 recon host runs)
+login.defs sha256 65b7e950a3de5320773586157054a4d86e98d3593fb49e4ec47f08221a0d9789; the whole stock file, 346 lines, including the valueless MOTD_FILE line

@@ -1,0 +1,99 @@
+=== cgroup-mounts
+cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting)
+cgroup2fs
+0::/user.slice/user-1000.slice/session-8.scope
+cpuset cpu io memory hugetlb pids rdma misc dmem
+=== systemd-run-scope
+Running as unit: run-p851-i4402.service
+0::/system.slice/run-p851-i4402.service
+          Finished with result: success
+Main processes terminated with: code=exited, status=0/SUCCESS
+               Service runtime: 14ms
+             CPU time consumed: 6ms
+                   Memory peak: 2M (swap: 0B)
+=== systemd-unit-paths
+/etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early /etc/systemd/system /etc/systemd/system.attached /run/systemd/system /run/systemd/system.attached /run/systemd/generator /usr/local/lib/systemd/system /usr/lib/systemd/system /run/systemd/generator.late
+/etc/systemd/system.control
+/run/systemd/system.control
+/run/systemd/transient
+/run/systemd/generator.early
+/etc/systemd/system
+/etc/systemd/system.attached
+/run/systemd/system
+/run/systemd/system.attached
+/run/systemd/generator
+/usr/local/lib/systemd/system
+/usr/lib/systemd/system
+/run/systemd/generator.late
+=== systemd-version-prop
+261.2-1-arch
+=== lib-aliases
+lrwxrwxrwx 1 root root    7 Oct 12  2025 /bin -> usr/bin
+lrwxrwxrwx 1 root root    7 Oct 12  2025 /lib -> usr/lib
+drwxr-xr-x 1 root root 3908 Oct  4 18:41 /lib/systemd
+lrwxrwxrwx 1 root root    7 Oct 12  2025 /lib64 -> usr/lib
+lrwxrwxrwx 1 root root    7 Oct 12  2025 /sbin -> usr/bin
+drwxr-xr-x 1 root root 3908 Oct  4 18:41 /usr/lib/systemd
+lrwxrwxrwx 1 root root    3 Oct 12  2025 /usr/sbin -> bin
+/usr/lib/systemd/system
+bin
+usr/bin
+usr/bin
+usr/lib
+=== usr-local
+ls: cannot access '/usr/local/libexec': No such file or directory
+/usr/local:
+total 0
+drwxr-xr-x 1 root root 72 Oct  4 18:41 .
+drwxr-xr-x 1 root root 80 Oct  4 18:42 ..
+drwxr-xr-x 1 root root 20 Oct  4 18:41 bin
+drwxr-xr-x 1 root root  0 Oct 12  2025 etc
+drwxr-xr-x 1 root root  0 Oct 12  2025 games
+drwxr-xr-x 1 root root  0 Oct 12  2025 include
+drwxr-xr-x 1 root root  0 Oct 12  2025 lib
+drwxr-xr-x 1 root root  0 Oct 12  2025 man
+drwxr-xr-x 1 root root  0 Oct 12  2025 sbin
+drwxr-xr-x 1 root root 38 Oct  4 18:41 share
+drwxr-xr-x 1 root root  0 Oct 12  2025 src
+
+/usr/local/bin:
+total 4
+drwxr-xr-x 1 root root  20 Oct  4 18:41 .
+drwxr-xr-x 1 root root  72 Oct  4 18:41 ..
+-rwxr-xr-x 1 root root 711 Sep  5 06:27 mkinitcpio
+
+/usr/local/lib:
+total 0
+drwxr-xr-x 1 root root  0 Oct 12  2025 .
+drwxr-xr-x 1 root root 72 Oct  4 18:41 ..
+drwxr-xr-x 1 root root 1264 Oct  4 18:42 /etc/systemd/system
+drwxr-xr-x 1 root root   30 Oct  4 18:41 /etc/systemd/system/cups-browsed.service.d
+drwxr-xr-x 1 root root   36 Oct  4 18:41 /etc/systemd/system/docker.service.d
+drwxr-xr-x 1 root root   24 Oct  4 18:41 /etc/systemd/system/plocate-updatedb.service.d
+drwxr-xr-x 1 root root   46 Oct  4 18:41 /etc/systemd/system/user@.service.d
+=== timedatectl
+               Local time: Sun 2026-10-04 18:46:36 UTC
+           Universal time: Sun 2026-10-04 18:46:36 UTC
+                 RTC time: Sun 2026-10-04 18:46:37
+                Time zone: UTC (UTC, +0000)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+=== analyze
+Startup finished in 1.973s (kernel) + 5.744s (userspace) = 7.718s 
+graphical.target reached after 5.639s in userspace.
+1.933s ldconfig.service
+1.394s dev-sda2.device
+1.039s systemd-tmpfiles-setup-dev-early.service
+ 992ms systemd-userdbd.service
+ 217ms sshdgenkeys.service
+ 198ms ufw.service
+ 149ms NetworkManager.service
+ 130ms user@1000.service
+ 121ms user@959.service
+ 121ms systemd-udev-trigger.service
+ 119ms systemd-remount-fs.service
+ 108ms power-profiles-daemon.service
+  95ms systemd-journald.service
+  86ms plymouth-quit-wait.service
+  83ms plymouth-quit.service

@@ -51,7 +51,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-80+ MCP tools across the named layers (Cognitive, Operational, Selective Disclosure, Verifiable Reputation), plus the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge, and system tools. See the skill documentation for the featured workflows.
+111 registered MCP tools across the named layers (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`), spanning the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge and system tools. See the skill documentation for the featured workflows.
 
 ## License
 

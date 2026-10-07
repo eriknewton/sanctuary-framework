@@ -28,7 +28,7 @@ wrapped-agent claims.
 
 ## Status
 
-Linux L2 kernel-runtime activation: boot/runtime ownership, queue verdicts,
+Linux kernel-runtime activation: boot/runtime ownership, queue verdicts,
 signed policy reload, restart reconciliation, and live health/evidence are
 wired. The explicit Ubuntu cold-install variant now provisions a dedicated uid,
 admits signed IP policy and launches a root-installed ELF with literal argv
@@ -61,10 +61,12 @@ Two deployment profiles are intentionally distinct:
   residual same-UID availability limitation and must never inherit the server
   assurance claim.
 
-Phase 2 macOS Network Extension: queued behind Apple Developer Program
-filing.
+macOS Castle Wall is a separate Swift system-extension path. Its Assurance
+Matrix row is proven for a signed operator policy with a clean per-uid
+allow/deny demo plus attended reboot-survival on a Dev-ID-signed and notarized
+binary; the per-flow rule-attributed audit trail, the unattended reboot path, wider host and OS coverage, the p99 measurement, a sustained-operation drill, the TTL-expiry leg through the real CLI enable path and hardware boot verification of the GUI host app remain the named gaps (Assurance Matrix macOS row).
 
-Phase 3 Windows WFP: queued behind Phase 2.
+Windows WFP: queued behind the macOS proof gaps above.
 
 ## Architecture
 

@@ -51,6 +51,11 @@ name = "sanctuary-linux"
 path = "src/bin/sanctuary-linux.rs"
 
 [[bin]]
+name = "sanctuary-linux-arch"
+path = "src/bin/sanctuary-linux-arch.rs"
+required-features = ["arch-install"]
+
+[[bin]]
 name = "protected-agent-v1"
 path = "src/bin/protected-agent-v1.rs"
 
@@ -67,6 +72,7 @@ path = "src/bin/network-agent-standin.rs"
 # AGENTS.md: "the operator's machine is not a fixture". The seam is structural,
 # not a convention the next test author has to remember.
 test-isolation = []
+arch-install = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -162,6 +168,16 @@ required-features = ["test-isolation"]
 name = "integration_gf1_recovery"
 path = "tests/integration_gf1_recovery.rs"
 required-features = ["test-isolation"]
+
+[[test]]
+name = "linux_install_arch_cli"
+path = "tests/linux_install_arch_cli.rs"
+required-features = ["arch-install"]
+
+[[test]]
+name = "linux_install_arch_fixtures"
+path = "tests/linux_install_arch_fixtures.rs"
+required-features = ["arch-install"]
 
 [profile.release]
 opt-level = 3

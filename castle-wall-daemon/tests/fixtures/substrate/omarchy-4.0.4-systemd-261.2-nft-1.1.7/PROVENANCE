@@ -1,0 +1,7 @@
+captured omarchy-4.0.4 2026-10-04 recon capture.sh section 'login.defs' (a grep of the eight range keys from /etc/login.defs, two more key lines, then directory listings of login.defs.d and sysusers.d): an EXCERPT and probe transcript, not the whole file; the whole stock file is archlinux-image-shadow-4.20.0.arch1-1/login.defs
+source /Users/eriknewton/Code/Claude/Review/Sanctuary/Omarchy_Scoping_2026-10-04/recon-raw/static-target/login.defs.txt sha256 4773460bce2e0b867ae091ea9126cc65f0b8d9b7ab3c739223cf9fec537cd54e byte-copy login.defs
+captured omarchy-4.0.4 2026-10-04 command: systemctl show --property=UnitPath --value --no-pager
+source /Users/eriknewton/Code/Claude/Review/Sanctuary/Omarchy_Scoping_2026-10-04/recon-raw/runtime/systemd.txt consumed here by the guard UnitPath roots check
+captured omarchy-4.0.4 2026-10-04 command: nft probe script with nft -j list ruleset and nft list tables
+source /Users/eriknewton/Code/Claude/Review/Sanctuary/Omarchy_Scoping_2026-10-04/recon-raw/runtime/nft-probe.txt; the JSON ruleset is not the guard's nft -j list tables shape, so P3 lifecycle and the Omarchy drill consume the real ruleset capture
+P2a note: no real systemctl show corpus and no real Sanctuary nft table corpus existed before P3.
