@@ -61,12 +61,13 @@ interface ToolRun {
   stderr: string;
 }
 
-function fakeManifest(tag: string): Buffer {
+// `identity` is "<model>:<tag>", so two models sharing a tag (qwen3:9b vs qwen3.5:9b) get different bytes and digests.
+function fakeManifest(identity: string): Buffer {
   return Buffer.from(JSON.stringify({
     schemaVersion: 2,
     mediaType: "application/vnd.docker.distribution.manifest.v2+json",
     config: { mediaType: "application/vnd.docker.container.image.v1+json", digest: `sha256:${"a".repeat(64)}`, size: 400 },
-    layers: [{ mediaType: "application/vnd.ollama.image.model", digest: `sha256:${createHash("sha256").update(tag).digest("hex")}`, size: 1 }],
+    layers: [{ mediaType: "application/vnd.ollama.image.model", digest: `sha256:${createHash("sha256").update(identity).digest("hex")}`, size: 1 }],
   }));
 }
 
@@ -133,8 +134,11 @@ describe("sign-model-manifest-v2 tool", () => {
         pump();
         return;
       }
-      const body = fakeManifest(match[2]!);
-      served.set(match[2]!, body);
+      // Served evidence is keyed by the full model:tag the signer asked for, so fetching the wrong model with the
+      // right tag cannot satisfy the per-model digest check below (gate finding, PR #1531).
+      const identity = `${match[1]!}:${match[2]!}`;
+      const body = fakeManifest(identity);
+      served.set(identity, body);
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": String(body.length) });
       response.end(body);
     });
@@ -185,13 +189,18 @@ describe("sign-model-manifest-v2 tool", () => {
     if (!verified.ok) return;
     expect(verified.body.manifest_version).toBe(SOURCE_VERSION);
     for (const [modelId, model] of Object.entries(verified.body.models)) {
-      const bytes = served.get(model.ollama_identity.tag);
+      const bytes = served.get(`${model.ollama_identity.model}:${model.ollama_identity.tag}`);
       expect(bytes, `registry served ${modelId}`).toBeDefined();
       expect(model.ollama_identity.ollama_manifest_sha256)
         .toBe(createHash("sha256").update(bytes!).digest("hex"));
       expect(model.ollama_identity.registry).toBe("registry.ollama.ai");
     }
     expect(Object.keys(verified.body.models).sort()).toEqual(SOURCE_MODEL_IDS);
+    // Every source identity, and nothing else, was fetched from the registry.
+    const expectedIdentities = Object.values(SOURCE_JSON.models)
+      .map((m) => `${m.ollama_identity.model}:${(m.ollama_identity as { tag: string }).tag}`)
+      .sort();
+    expect([...served.keys()].filter((k) => !k.endsWith(`:${OVERSIZE_TAG}`)).sort()).toEqual(expectedIdentities);
     const signedDigest = createHash("sha256").update(signedText).digest("hex");
     for (const [file, name] of PIN_FILES) expect(readPin(work, file, name)).toBe(signedDigest);
     expect(signed.stderr).toContain(`asset sha256=${signedDigest}`);
