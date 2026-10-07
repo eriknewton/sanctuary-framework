@@ -22,6 +22,28 @@ assert_systemd() {
   systemctl is-system-running --wait >/dev/null || [[ "$(systemctl is-system-running)" =~ ^(running|degraded)$ ]]
 }
 
+# Failure diagnostics: a red run must leave the units' own account of why in the evidence; without it a failure
+# such as "helper deadline exceeded" at start says only that the wall never reported ready (CI run 37636956109).
+diagnose_on_failure() {
+  local rc=$?
+  if [[ "$rc" != 0 ]]; then
+    local d="$evidence/failure-diagnostics"
+    mkdir -p "$d"
+    printf '%s\n' "$rc" >"$d/exit-code"
+    systemctl status --no-pager --full "$wall_unit" "sanctuary-agent@${agent_uid}.service" >"$d/systemctl-status.txt" 2>&1 || true
+    journalctl --no-pager -o short-precise -u "$wall_unit" -n 400 >"$d/journal-wall.txt" 2>&1 || true
+    journalctl --no-pager -o short-precise -u "sanctuary-agent@${agent_uid}.service" -n 400 >"$d/journal-agent.txt" 2>&1 || true
+    journalctl --no-pager -o short-precise -b -p warning -n 400 >"$d/journal-warnings.txt" 2>&1 || true
+    systemctl list-jobs --no-pager >"$d/list-jobs.txt" 2>&1 || true
+    systemctl --failed --no-pager >"$d/failed-units.txt" 2>&1 || true
+    nft -j list ruleset >"$d/nft-ruleset.json" 2>&1 || true
+    grep -E '^nfnetlink|^nf_' /proc/modules >"$d/modules.txt" 2>&1 || true
+    record "failure diagnostics saved (exit $rc)"
+  fi
+  return "$rc"
+}
+trap diagnose_on_failure EXIT
+
 record() {
   printf '%s\n' "$*" | tee -a "$evidence/lifecycle.log"
 }
