@@ -117,11 +117,16 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/apt-install-resilient
         with:
-          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml
+          # python3-pytest: the hosted image ships no pytest for /usr/bin/python3; without it the
+          # next step fails before the gate runs and every later step is skipped (round-2 Grok 2).
+          packages: libnetfilter-queue-dev libnfnetlink-dev nftables iproute2 python3-yaml python3-pytest
+      - name: Run Arch packaging Python tests
+        run: python3 -m pytest castle-wall-daemon/packaging/arch -q
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: 1.95.0
-      - name: Resolve comparison base
+      - id: resolve
+        name: Resolve comparison base
         run: |
           event="${{ github.event_name }}"
           case "$event" in
@@ -146,67 +151,224 @@ jobs:
             echo "Arch .deb unchanged gate cannot resolve base commit: $base" >&2
             exit 1
           }
-          echo "ARCH_COMPARE_BASE=$base" >>"$GITHUB_ENV"
-          # The gate binds the Arch slice to the proven .deb: a diff that touches the
-          # Arch packaging tree or this workflow may not touch any .deb input. A diff
-          # that touches neither is not this gate's subject (the .deb inputs have their
-          # own workflow), so the two enforcing steps below run only when a slice path
-          # changed and the job records "not applicable" otherwise. Without this scope
-          # every unrelated PR and every merge to main would fail here (round-2 R1).
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          # The workflow derives the trigger predicate from is_arch_trigger_path in
+          # castle-wall-daemon/packaging/arch/assert-deb-unchanged.py; keep the
+          # cross-file contract comment there in sync when this call path changes.
+          # A diff that touches an allowed .deb input but no trigger path is not this
+          # gate's subject, so the job records "not applicable" rather than failing
+          # every unrelated Ubuntu package PR.
           # NUL-separated names: git C-quotes `"`, `\` and control bytes on every
           # line-oriented listing whatever core.quotePath says, so a slice path made of
           # those bytes would match neither alternative and the gate would record NOT
           # APPLICABLE on a diff that touched the slice (binding reads, both families).
-          # With -z nothing is quoted; the reader splits on NUL. The allowlist step reads
-          # this same file with the same predicate (must match the Python there).
+          # With -z nothing is quoted; the reader splits on NUL.
           git diff --name-only --no-renames -z "$base"...HEAD >"$RUNNER_TEMP/changed-paths.nul"
-          touched="$(python3 - <<'PY'
-          import os
-          raw = open(os.path.join(os.environ["RUNNER_TEMP"], "changed-paths.nul"), "rb").read()
-          paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
-          # must match is_slice_path in the "Enforce slice path allowlist" step
-          def is_slice_path(p):
-              return p == ".github/workflows/linux-arch-package.yml" or p.startswith("castle-wall-daemon/packaging/arch/")
-          print("yes" if any(is_slice_path(p) for p in paths) else "no")
+          touched="$(python3 - "$RUNNER_TEMP/changed-paths.nul" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          changed = Path(sys.argv[1]).read_bytes().split(b"\0")
+          paths = [p.decode("utf-8", "surrogateescape") for p in changed if p]
+          spec = importlib.util.spec_from_file_location(
+              "deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"
+          )
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          print("yes" if any(gate.is_arch_trigger_path(p) for p in paths) else "no")
           PY
           )"
           [[ "$touched" == yes || "$touched" == no ]]
-          echo "ARCH_SLICE_TOUCHED=$touched" >>"$GITHUB_ENV"
+          echo "touched=$touched" >>"$GITHUB_OUTPUT"
       - name: Enforce slice path allowlist
-        if: env.ARCH_SLICE_TOUCHED == 'yes'
+        if: steps.resolve.outputs.touched == 'yes'
         run: |
-          python3 - <<'PY'
-          import os
-          raw = open(os.path.join(os.environ["RUNNER_TEMP"], "changed-paths.nul"), "rb").read()
+          # The workflow derives the allowlist predicate from is_arch_allowed_path in
+          # castle-wall-daemon/packaging/arch/assert-deb-unchanged.py; keep the
+          # cross-file contract comment there in sync when this call path changes.
+          python3 - "$RUNNER_TEMP/changed-paths.nul" "$GITHUB_ENV" "$RUNNER_TEMP/allowlist-refused.txt" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          changed_path = Path(sys.argv[1])
+          github_env = Path(sys.argv[2])
+          refused_path = Path(sys.argv[3])
+          raw = changed_path.read_bytes()
           paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
-          # must match is_slice_path in the "Resolve comparison base" step
-          def is_slice_path(p):
-              return p == ".github/workflows/linux-arch-package.yml" or p.startswith("castle-wall-daemon/packaging/arch/")
-          bad = [p for p in paths if not is_slice_path(p)]
+          spec = importlib.util.spec_from_file_location(
+              "deb_gate", "castle-wall-daemon/packaging/arch/assert-deb-unchanged.py"
+          )
+          gate = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gate)
+          bad = [p for p in paths if not gate.is_arch_allowed_path(p)]
+          verdict = "refused" if bad else "ok"
+          with github_env.open("a") as env:
+              env.write(f"ARCH_ALLOWLIST={verdict}\n")
+          refused_path.write_text(gate.repr_path_lines(bad), encoding="utf-8")
+          print(f"allowlist: {verdict}")
           if bad:
-              raise SystemExit("outside Arch packaging slice:\n" + "\n".join(repr(p) for p in bad))
-          print(f"allowlist: {len(paths)} changed path(s), all inside the Arch slice")
+              for path in bad:
+                  print(f"allowlist refused path: {path!r}")
+          else:
+              print(f"allowlist: {len(paths)} changed path(s), all allowed for the Arch slice")
           PY
       - name: Rebuild base and head install debs and compare protected fields
-        if: env.ARCH_SLICE_TOUCHED == 'yes'
+        if: steps.resolve.outputs.touched == 'yes'
         run: |
-          work="$RUNNER_TEMP/deb-unchanged"
-          git worktree add "$work/base" "$ARCH_COMPARE_BASE"
-          git worktree add "$work/head" HEAD
-          for side in base head; do
-            (cd "$work/$side" && sudo git config --global --add safe.directory "$PWD")
-            sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-              python3 "$work/$side/castle-wall-daemon/packaging/ubuntu/build-install-deb.py" \
-              --revision 1 --output "$work/$side-out"
-          done
-          base_deb=("$work/base-out"/*.deb)
-          head_deb=("$work/head-out"/*.deb)
-          python3 castle-wall-daemon/packaging/arch/assert-deb-unchanged.py "${base_deb[0]}" "${head_deb[0]}"
+          log="$RUNNER_TEMP/deb-comparator.log"
+          set +e
+          (
+            set -e
+            work="$RUNNER_TEMP/deb-unchanged"
+            : >"$RUNNER_TEMP/deb-declared-paths.json"
+            : >"$RUNNER_TEMP/deb-declared-summary.txt"
+            git worktree add "$work/base" "${{ steps.resolve.outputs.base }}"
+            git worktree add "$work/head" HEAD
+            for side in base head; do
+              (cd "$work/$side" && sudo git config --global --add safe.directory "$PWD")
+              sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+                python3 "$work/$side/castle-wall-daemon/packaging/ubuntu/build-install-deb.py" \
+                --revision 1 --output "$work/$side-out"
+            done
+            base_deb=("$work/base-out"/*.deb)
+            head_deb=("$work/head-out"/*.deb)
+            printf '%s\n' "${base_deb[0]}" >"$RUNNER_TEMP/arch-base-deb.path"
+            printf '%s\n' "${head_deb[0]}" >"$RUNNER_TEMP/arch-head-deb.path"
+            python3 castle-wall-daemon/packaging/arch/assert-deb-unchanged.py \
+              --base-source-commit "${{ steps.resolve.outputs.base }}" \
+              --head-source-commit "$(git rev-parse HEAD)" \
+              --changed-paths-nul "$RUNNER_TEMP/changed-paths.nul" \
+              --declared-paths-json "$RUNNER_TEMP/deb-declared-paths.json" \
+              --declared-summary "$RUNNER_TEMP/deb-declared-summary.txt" \
+              "${base_deb[0]}" "${head_deb[0]}"
+          ) 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$rc" == 0 ]]; then verdict=ok; else verdict=refused; fi
+          echo "ARCH_COMPARATOR=$verdict" >>"$GITHUB_ENV"
+          exit 0
+      - name: Compare inherited published install deb
+        if: steps.resolve.outputs.touched == 'yes'
+        run: |
+          log="$RUNNER_TEMP/deb-inheritance.log"
+          set +e
+          (
+            set -e
+            if [[ ! -s "$RUNNER_TEMP/arch-base-deb.path" || ! -s "$RUNNER_TEMP/arch-head-deb.path" ]]; then
+              echo "base/head deb paths missing from comparator step" >&2
+              exit 1
+            fi
+            ARCH_BASE_DEB="$(<"$RUNNER_TEMP/arch-base-deb.path")"
+            ARCH_HEAD_DEB="$(<"$RUNNER_TEMP/arch-head-deb.path")"
+            # Update procedure: when a later Ubuntu release is drilled and published,
+            # change this tag and SHA-256 in the same PR that updates DECISION.md's
+            # inheritance anchor. Never rebuild or replace the 0.1.0-1 asset.
+            asset_url="https://github.com/eriknewton/sanctuary-framework/releases/download/castle-wall-linux-0.1.0-1/sanctuary-castle-wall_0.1.0-1_amd64.deb"
+            expected="0be0eedb7a3ba3f217a3e580b8d893b884d16291a10e79eb28ece3ac86ef8f5b"
+            asset="$RUNNER_TEMP/castle-wall-linux-0.1.0-1.deb"
+            curl -fsSL "$asset_url" -o "$asset"
+            actual="$(sha256sum "$asset" | cut -d' ' -f1)"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "published asset SHA-256 mismatch: expected $expected got $actual" >&2
+              exit 1
+            fi
+            root="$RUNNER_TEMP/deb-inheritance"
+            mkdir -p "$root/asset/fs" "$root/base/fs" "$root/head/fs"
+            dpkg-deb -x "$asset" "$root/asset/fs"
+            dpkg-deb -x "$ARCH_BASE_DEB" "$root/base/fs"
+            dpkg-deb -x "$ARCH_HEAD_DEB" "$root/head/fs"
+          python3 - "$root/asset/fs" "$root/base/fs" "$root/head/fs" "$RUNNER_TEMP/deb-declared-paths.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          asset, base, head, declared_path = [Path(arg) for arg in sys.argv[1:]]
+          declared = set()
+          if declared_path.is_file() and declared_path.read_text().strip():
+              declared = set(json.loads(declared_path.read_text()))
+          # Must match install-layout.py BINARIES, SOURCES and MOUNT_NAME for proof inheritance.
+          compared = [
+              "usr/local/libexec/sanctuary/castle-wall-daemon",
+              "usr/local/libexec/sanctuary/protected-agent-v1",
+              "usr/local/libexec/sanctuary/network-agent-standin",
+              "usr/sbin/sanctuary-linux",
+              "etc/systemd/system/sanctuary-castle-wall.service",
+              "etc/systemd/system/sanctuary-agent@.service",
+              r"etc/systemd/system/var-lib-sanctuary\x2dagent\x2dworkspace.mount",
+              "usr/share/doc/sanctuary-castle-wall/schemas/contract.rs",
+          ]
+          printed_only = [
+              "usr/share/doc/sanctuary-castle-wall/operator-guide.md",
+              "usr/share/doc/sanctuary-castle-wall/build-identity",
+          ]
+
+          def digest(root: Path, rel: str) -> str | None:
+              path = root / rel
+              if not path.is_file():
+                  return None
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          print("inheritance table against castle-wall-linux-0.1.0-1")
+          print("path\tbase\thead\tasset")
+          failed = False
+          for rel in compared:
+              asset_hash = digest(asset, rel)
+              base_hash = digest(base, rel)
+              head_hash = digest(head, rel)
+              if asset_hash is None:
+                  raise SystemExit(f"published asset missing expected row: {rel}")
+              base_state = "MATCH" if base_hash == asset_hash else "DIFFERS"
+              head_state = "MATCH" if head_hash == asset_hash else "DIFFERS"
+              print(f"{rel}\t{base_state}\t{head_state}\t{asset_hash}")
+              if base_state == "MATCH" and head_state != "MATCH" and f"fs/{rel}" not in declared:
+                  failed = True
+          print("printed without comparison")
+          for rel in printed_only:
+              print(f"{rel}\tbase={digest(base, rel)}\thead={digest(head, rel)}\tasset={digest(asset, rel)}")
+          if failed:
+              raise SystemExit("head differs from the published asset on a row base still matched")
+          PY
+          ) 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$rc" == 0 ]]; then verdict=ok; else verdict=refused; fi
+          echo "ARCH_INHERITANCE=$verdict" >>"$GITHUB_ENV"
+          exit 0
       - name: Record gate disposition
         if: always()
         run: |
-          case "${ARCH_SLICE_TOUCHED:-unset}" in
-            yes) echo "deb-unchanged gate: ENFORCED (a slice path changed between $ARCH_COMPARE_BASE and $GITHUB_SHA)" ;;
-            no) echo "deb-unchanged gate: NOT APPLICABLE (no Arch slice path changed between $ARCH_COMPARE_BASE and $GITHUB_SHA); the .deb inputs are gated by their own workflow" ;;
+          case "${{ steps.resolve.outputs.touched }}" in
+            yes)
+              echo "deb-unchanged gate: ENFORCED (a trigger path changed between ${{ steps.resolve.outputs.base }} and $GITHUB_SHA)"
+              echo "allowlist verdict: ${ARCH_ALLOWLIST:-missing}"
+              if [[ -s "$RUNNER_TEMP/allowlist-refused.txt" ]]; then
+                echo "allowlist refused paths:"
+                cat "$RUNNER_TEMP/allowlist-refused.txt"
+              fi
+              echo "comparator verdict: ${ARCH_COMPARATOR:-missing}"
+              if [[ -s "$RUNNER_TEMP/deb-comparator.log" ]]; then
+                cat "$RUNNER_TEMP/deb-comparator.log"
+              fi
+              echo "inheritance verdict: ${ARCH_INHERITANCE:-missing}"
+              if [[ -s "$RUNNER_TEMP/deb-inheritance.log" ]]; then
+                cat "$RUNNER_TEMP/deb-inheritance.log"
+              fi
+              declared_delta=no
+              if [[ "${ARCH_COMPARATOR:-missing}" == ok && -s "$RUNNER_TEMP/deb-declared-summary.txt" ]]; then
+                declared_delta=yes
+                echo "ENFORCED, DECLARED DELTA: $(<"$RUNNER_TEMP/deb-declared-summary.txt")"
+              fi
+              allowlist_ok=no
+              if [[ "${ARCH_ALLOWLIST:-missing}" == ok || ( "${ARCH_ALLOWLIST:-missing}" == refused && "$declared_delta" == yes ) ]]; then
+                allowlist_ok=yes
+              fi
+              if [[ "$allowlist_ok" != yes || "${ARCH_COMPARATOR:-missing}" != ok || "${ARCH_INHERITANCE:-missing}" != ok ]]; then
+                exit 1
+              fi
+              ;;
+            no) echo "deb-unchanged gate: NOT APPLICABLE (no Arch slice path changed between ${{ steps.resolve.outputs.base }} and $GITHUB_SHA); the .deb inputs are gated by their own workflow" ;;
             *) echo "deb-unchanged gate: base resolution failed; see the Resolve comparison base step" >&2; exit 1 ;;
           esac
