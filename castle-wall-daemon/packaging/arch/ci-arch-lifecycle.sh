@@ -361,7 +361,7 @@ run_unpinned_witness() {
     runuser -u build -- bash -lc "cd /workspace/castle-wall-daemon && PATH=\"\$HOME/.cargo/bin:\$PATH\" CARGO_TARGET_DIR='$work/unpinned-target' cargo +1.95.0 build --locked --release --features arch-install --bin sanctuary-linux-arch >/dev/null"
   fi
   local saved="$work/sanctuary-linux.pinned"
-  cp "$cli" "$saved"
+  cp -p "$cli" "$saved"
   cp "$unpinned" "$cli"
   chmod 0755 "$cli"
   expect_cli_refused negative-unpinned-root 'Arch CLI built without package pins' status --json
@@ -371,7 +371,7 @@ run_unpinned_witness() {
   fi
   cat "$evidence/negative-unpinned-nonroot.out" "$evidence/negative-unpinned-nonroot.err" >"$evidence/negative-unpinned-nonroot.combined"
   grep -F 'Arch CLI built without package pins' "$evidence/negative-unpinned-nonroot.combined" >/dev/null
-  cp "$saved" "$cli"
+  cp -p "$saved" "$cli"
 }
 
 run_arch_cli_lifecycle() {
@@ -471,20 +471,20 @@ PY
   # The payload byte goes on a payload the digest loop covers that is NOT executing: `stop` stops the agent and
   # leaves the wall running by design, so appending to the daemon binary fails with ETXTBSY (CI run 37639891427).
   local daemon=/usr/local/libexec/sanctuary/network-agent-standin
-  cp "$daemon" "$work/daemon.backup"
+  cp -p "$daemon" "$work/daemon.backup"
   printf x >>"$daemon"
   expect_cli_refused negative-payload 'installed payload digest mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
-  cp "$work/daemon.backup" "$daemon"
+  cp -p "$work/daemon.backup" "$daemon"
 
-  cp "$identity_path" "$work/identity-edited.backup"
+  cp -p "$identity_path" "$work/identity-edited.backup"
   rewrite_identity_field "$identity_path" rustc_version edited-by-lifecycle
   expect_cli_refused negative-identity 'guard identity header mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
-  cp "$work/identity-edited.backup" "$identity_path"
+  cp -p "$work/identity-edited.backup" "$identity_path"
 
-  cp "$guard_path" "$work/guard-body.backup"
+  cp -p "$guard_path" "$work/guard-body.backup"
   printf '\n# lifecycle negative\n' >>"$guard_path"
   expect_cli_refused negative-guard-body 'guard static payload mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
-  cp "$work/guard-body.backup" "$guard_path"
+  cp -p "$work/guard-body.backup" "$guard_path"
 
   cp -a /var/lib/pacman "$work/pacman-copy"
   rm -rf "$work/pacman-copy/local/sanctuary-castle-wall-"*
@@ -510,19 +510,33 @@ PY
   expect_cli_refused negative-db-lock 'pacman transaction holds the database lock' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
   rm -f /var/lib/pacman/db.lck
 
-  cp "$identity_path" "$work/install-ready.identity"
-  cp "$guard_path" "$work/install-ready.guard"
+  cp -p "$identity_path" "$work/install-ready.identity"
+  cp -p "$guard_path" "$work/install-ready.guard"
   rewrite_identity_field "$identity_path" install_ready false
   set_guard_identity_to_current_file "$identity_path" "$guard_path"
   expect_cli_refused negative-install-ready 'install build identity mismatch' provision --agent-uid "$agent_uid" --service-uid "$service_uid" --fortress-id "$fortress" --stage-file "$inputs_dir/endpoints.json" -- /usr/local/libexec/sanctuary/network-agent-standin --endpoints /etc/sanctuary/agent/endpoints.json
-  cp "$work/install-ready.identity" "$identity_path"
-  cp "$work/install-ready.guard" "$guard_path"
+  cp -p "$work/install-ready.identity" "$identity_path"
+  cp -p "$work/install-ready.guard" "$guard_path"
 
   run_unpinned_witness
 
   record 'state_RETIRED: provisioned removal refused, masked removal, copied CLI refuses after removal'
-  expect_refused retire-remove-provisioned "$provisioned_refusal" pacman -R --noconfirm sanctuary-castle-wall
-  expect_refused retire-remove-dd-provisioned "$provisioned_refusal" pacman -Rdd --noconfirm sanctuary-castle-wall
+  # The negatives restore with cp -p, so the only integrity finding allowed here is the mounted workspace directory's
+  # mode (brief 3.2); any other -Qkk warning means the harness left the package altered (CI run 37649666312).
+  pacman -Qkk sanctuary-castle-wall >"$evidence/pre-retire-qkk.out" 2>"$evidence/pre-retire-qkk.err" || true
+  if grep -v -F '/var/lib/sanctuary-agent-workspace (Permissions mismatch)' "$evidence/pre-retire-qkk.err" | grep -q 'warning:'; then
+    record 'harness left the package altered before retire (see pre-retire-qkk.err)'
+    exit 1
+  fi
+  # With the workspace mounted, the remove guard's integrity probe refuses before its footprint check; without the
+  # mount it refuses on the provisioned footprint. Expect the one the measured state predicts and record which.
+  local retire_refusal="$provisioned_refusal"
+  if grep -q -F '(Permissions mismatch)' "$evidence/pre-retire-qkk.err"; then
+    retire_refusal='probe failed or incomplete'
+  fi
+  record "retire removal expects: $retire_refusal"
+  expect_refused retire-remove-provisioned "$retire_refusal" pacman -R --noconfirm sanctuary-castle-wall
+  expect_refused retire-remove-dd-provisioned "$retire_refusal" pacman -Rdd --noconfirm sanctuary-castle-wall
   install -d -m 0755 "$evidence/copied-cli"
   cp "$cli" "$evidence/copied-cli/sanctuary-linux"
   chmod 0755 "$evidence/copied-cli/sanctuary-linux"
