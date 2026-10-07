@@ -23,6 +23,16 @@ import {
 const SERVER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const SCRIPT = join(SERVER_ROOT, "scripts", "sign-model-manifest-v2.mjs");
 const SOURCE = join(SERVER_ROOT, "model-catalog", "model-manifest-v2.source.json");
+// The round-trip signs the REAL reviewed source, so its expectations are derived from it, never hard-coded:
+// a catalog update (a new model, a version bump) must not break this test of the signing tool itself.
+const SOURCE_JSON = JSON.parse(readFileSync(SOURCE, "utf8")) as {
+  manifest_version: number;
+  models: Record<string, { ollama_identity: { model: string } }>;
+};
+const SOURCE_VERSION = SOURCE_JSON.manifest_version;
+const SOURCE_MODEL_IDS = Object.keys(SOURCE_JSON.models).sort();
+// Every Ollama model name the source references; the loopback registry answers exactly these.
+const SOURCE_REGISTRY_MODELS = new Set(Object.values(SOURCE_JSON.models).map((m) => m.ollama_identity.model));
 const SEED_ENV = "SANCTUARY_MODEL_CATALOG_ROOT_SEED_B64URL";
 const SEED = new Uint8Array(32).fill(59);
 const SEED_B64URL = toBase64url(SEED);
@@ -94,12 +104,16 @@ describe("sign-model-manifest-v2 tool", () => {
 
   beforeAll(async () => {
     server = createServer((request, response) => {
-      const match = /^\/v2\/library\/qwen3\/manifests\/([a-z0-9]+)$/.exec(request.url ?? "");
-      if (!match || request.headers.accept !== "application/vnd.docker.distribution.manifest.v2+json") {
+      const match = /^\/v2\/library\/([a-z0-9.]+)\/manifests\/([a-z0-9]+)$/.exec(request.url ?? "");
+      if (
+        !match ||
+        !SOURCE_REGISTRY_MODELS.has(match[1]!) ||
+        request.headers.accept !== "application/vnd.docker.distribution.manifest.v2+json"
+      ) {
         response.writeHead(404).end();
         return;
       }
-      if (match[1] === OVERSIZE_TAG) {
+      if (match[2] === OVERSIZE_TAG) {
         // No Content-Length (chunked), body far past the cap, written with
         // backpressure so an early client abort leaves the response unfinished.
         response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -119,8 +133,8 @@ describe("sign-model-manifest-v2 tool", () => {
         pump();
         return;
       }
-      const body = fakeManifest(match[1]!);
-      served.set(match[1]!, body);
+      const body = fakeManifest(match[2]!);
+      served.set(match[2]!, body);
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": String(body.length) });
       response.end(body);
     });
@@ -158,7 +172,7 @@ describe("sign-model-manifest-v2 tool", () => {
     const placeholderText = readFileSync(out, "utf8");
     const placeholderParsed = parseModelManifestV2Json(placeholderText);
     expect(placeholderParsed.ok && placeholderParsed.value.signature).toBe(ALL_ZERO_SIGNATURE);
-    expect(placeholderParsed.ok && placeholderParsed.value.body.manifest_version).toBe(1);
+    expect(placeholderParsed.ok && placeholderParsed.value.body.manifest_version).toBe(SOURCE_VERSION);
     const placeholderDigest = createHash("sha256").update(placeholderText).digest("hex");
     for (const [file, name] of PIN_FILES) expect(readPin(work, file, name)).toBe(placeholderDigest);
     expect(placeholder.stderr).toContain("mode=PLACEHOLDER");
@@ -169,7 +183,7 @@ describe("sign-model-manifest-v2 tool", () => {
     const verified = verifyModelManifestV2WithKey(signedText, ed25519.getPublicKey(SEED));
     expect(verified.ok).toBe(true);
     if (!verified.ok) return;
-    expect(verified.body.manifest_version).toBe(1);
+    expect(verified.body.manifest_version).toBe(SOURCE_VERSION);
     for (const [modelId, model] of Object.entries(verified.body.models)) {
       const bytes = served.get(model.ollama_identity.tag);
       expect(bytes, `registry served ${modelId}`).toBeDefined();
@@ -177,7 +191,7 @@ describe("sign-model-manifest-v2 tool", () => {
         .toBe(createHash("sha256").update(bytes!).digest("hex"));
       expect(model.ollama_identity.registry).toBe("registry.ollama.ai");
     }
-    expect(Object.keys(verified.body.models).sort()).toEqual(["qwen3-14b", "qwen3-32b", "qwen3-4b"]);
+    expect(Object.keys(verified.body.models).sort()).toEqual(SOURCE_MODEL_IDS);
     const signedDigest = createHash("sha256").update(signedText).digest("hex");
     for (const [file, name] of PIN_FILES) expect(readPin(work, file, name)).toBe(signedDigest);
     expect(signed.stderr).toContain(`asset sha256=${signedDigest}`);
@@ -187,7 +201,7 @@ describe("sign-model-manifest-v2 tool", () => {
   it("refuses a non-monotonic version against a verified asset, a foreign seed, and a missing seed", async () => {
     const sameVersion = await run(["--test-trust-root-b64url", PUBLIC_B64URL], { [SEED_ENV]: SEED_B64URL });
     expect(sameVersion.status).toBe(1);
-    expect(sameVersion.stderr).toContain("is not greater than the verified existing asset version 1");
+    expect(sameVersion.stderr).toContain(`is not greater than the verified existing asset version ${SOURCE_VERSION}`);
 
     const foreign = await run(["--test-trust-root-b64url", PUBLIC_B64URL], { [SEED_ENV]: FOREIGN_SEED_B64URL });
     expect(foreign.status).toBe(1);

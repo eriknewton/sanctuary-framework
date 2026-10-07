@@ -63,7 +63,7 @@ export const PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH =
  * by `scripts/sign-model-manifest-v2.mjs` when a new asset is produced.
  */
 export const PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256 =
-  "edc2091d555ee61a3ba760ef33c9bca4ba3dad5d83c44878cba2e0ba774d6b90";
+  "95412ab157fdb1747c5fd074033a4a25fd5672bb050ef887a5de87a28e59663d";
 
 /**
  * Byte cap applied before any parse. Equals the catalog wire cap
