@@ -64,9 +64,9 @@ Two deployment profiles are intentionally distinct:
 macOS Castle Wall is a separate Swift system-extension path. Its Assurance
 Matrix row is proven for a signed operator policy with a clean per-uid
 allow/deny demo plus attended reboot-survival on a Dev-ID-signed and notarized
-binary; the per-flow rule-attributed audit trail remains the named gap.
+binary; the per-flow rule-attributed audit trail, the unattended reboot path, wider host and OS coverage, the p99 measurement, a sustained-operation drill and hardware boot verification of the GUI host app remain the named gaps (Assurance Matrix macOS row).
 
-Phase 3 Windows WFP: queued behind Phase 2.
+Windows WFP: queued behind the macOS proof gaps above.
 
 ## Architecture
 

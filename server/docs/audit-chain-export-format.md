@@ -3,7 +3,7 @@
 Version: 1.0
 Produced by: `sanctuary audit-chain export`
 Verified by: `sanctuary audit-chain verify`, with current bounds below.
-Production checkpoints are unsigned today. Open defect: **IC-05**.
+Production call sites sign checkpoints when the fortress holds an identity; a fortress with no identity yet, and the root daemon's split audit store, write honestly unsigned checkpoints. The Assurance Matrix row stays partial pending the external-verifier drill. Open defect: **IC-05**.
 
 ## Overview
 

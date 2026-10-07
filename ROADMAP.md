@@ -26,7 +26,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 ### Wrap any AI agent harness in one command
 
-`sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, and Cline today (others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
+`sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, Cline, and Mastra today (Mastra fixture-tested only; no live Mastra-agent drill is recorded; others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
 *Status: shipped through v1.7.0 (latest release tag, 2026-07-26).*
 
@@ -110,7 +110,7 @@ Wrap many agents on one machine. Coordinate workflows across them with handoff v
 
 ### Fleet licensing and node-count enforcement (the first commercial tier)
 
-Cross-machine federation has hardware drill evidence recorded on the roadmap with signed policy distribution, but it does not yet have a dedicated Assurance Matrix row. The fleet layer issues and verifies licenses locally and enforces the licensed node count on the daemon roster, failing safe to the free Community tier. The node-count reboot-survival result is roadmap-asserted; no captured drill artifact for that result is checked into this repository, so the Assurance Matrix row stays partial. Single-operator and individual-developer use is always free; the commercial tier only ever prices team and fleet scale. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) scales across the operator's hardware, not across a vendor's network, and the free line stays generous by design.
+Cross-machine federation has hardware drill evidence recorded on the roadmap with signed policy distribution, but it does not yet have a dedicated Assurance Matrix row. The fleet layer issues and verifies licenses locally and enforces the licensed node count on the daemon roster, failing safe to the free Community tier. A durable node-count reboot-survival result (3 of 3) was observed during development; no captured drill artifact for it is checked into this repository, so the Assurance Matrix treats it as roadmap-asserted, not proven. Single-operator and individual-developer use is always free; the commercial tier only ever prices team and fleet scale. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) scales across the operator's hardware, not across a vendor's network, and the free line stays generous by design.
 
 *Status: licensing and enforcement core shipped. Next slices: the enrollment "Add Machine" flow and signed compliance-attestation export.*
 

@@ -18,7 +18,7 @@ per-flow rule-attributed audit trail remains owed.
 |-------|-------|--------|
 | Signed app and system extension | Host app, content-filter provider, signer helper, launcher, signed app bundle, notarization | Shipped |
 | Proven enforcement claim | Signed operator policy with clean per-uid allow/deny demo + reboot-survival | Proven in the Assurance Matrix |
-| Remaining macOS proof gaps | Per-flow rule-attributed audit trail, wider host and OS coverage, p99 overhead, unattended reboot path | Owed |
+| Remaining macOS proof gaps | Per-flow rule-attributed audit trail, wider host and OS coverage, p99 overhead, unattended reboot path, a sustained-operation drill, the TTL-expiry leg through the real CLI enable path, hardware boot verification of the GUI host-app launch (the Assurance Matrix macOS row is the full list) | Owed |
 
 ## Relationship to `castle-wall-daemon/` (Linux)
 
@@ -160,6 +160,7 @@ identity binding is the primary trust anchor.
 - Wider host and OS coverage.
 - p99 performance measurement on allowed traffic.
 - Unattended reboot path.
+- A sustained-operation drill, the TTL-expiry leg through the real CLI enable path, and hardware boot verification of the GUI host-app launch (see the Assurance Matrix macOS row).
 
 Phase 2 (Windows) and Phase 3 (container/microVM) are out of scope for
 the macOS work package.
