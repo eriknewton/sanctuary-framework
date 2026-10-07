@@ -1,3 +1,4 @@
+// fail-before-exempt: this change rewrites the existing scan-then-handle-then-invoke ordering assertion as a parser-based callee match; the ordering already holds on the base, so the test passing there is expected
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
