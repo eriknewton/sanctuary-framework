@@ -8,7 +8,7 @@
 
 An AI agent running on your machine can do anything your account can do. It holds your credentials, reads your files, and talks to the whole internet, and a single poisoned web page can turn that into exfiltration. Every sandbox on offer today is one the agent, or its vendor, chooses to run inside. That is not a wall. That is a request.
 
-Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra, or any MCP-compatible agent, on your machine or in your cloud, one agent or a fleet.
+Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your machine or in your cloud, one agent or a fleet.
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --claude-code
@@ -25,7 +25,7 @@ Every capability claim in this repository traces to a row in the [Assurance Matr
 | **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only.** On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
 | **Custody.** Keys and state under your passphrase, on your hardware | **Proven.** Ed25519 identity, Argon2id unlock, per-purpose derived subkeys, encrypted state at rest. The passphrase lives in the macOS Keychain or Linux Secret Service and generation fails closed without it. |
 | **The gate.** Policy you set, frozen at startup, the agent cannot read or infer; three approval tiers with a human on the irreversible ones | **Proven.** Cooperative gates on every MCP call. The wall is what makes the gate more than a request. |
-| **The record.** Append-only, hash-chained audit of what the agent did | **Partial.** The chain is live; production checkpoints are unsigned (open defect IC-05). |
+| **The record.** Append-only, hash-chained audit of what the agent did | **Partial.** The chain is live; production call sites sign checkpoints when the fortress holds an identity. Fortresses with no identity and the root daemon split audit store write honest unsigned checkpoints. The row stays partial pending the IC-05 external-verifier drill and the remaining local tamper-evidence follow-up. |
 | **Exit.** Keys, state, memory and reputation leave with you | **Partial.** Export and import ship; three exit-bundle gaps are open (IC-07, IC-08, IC-09). |
 
 ## Why this shape
@@ -40,7 +40,7 @@ In this order, about an hour:
 
 1. [ASSURANCE_MATRIX.md](ASSURANCE_MATRIX.md). Every claim, its platform, its evidence, its gap, and the next proof owed. A row reads `proven` only on a captured drill; a green suite is not a claim.
 2. [SANCTUARY_ARCHITECTURE.md](SANCTUARY_ARCHITECTURE.md). Entry points, data flow, trust model, and the sovereignty properties stated as testable assertions.
-3. [server/src/README.md](server/src/README.md). The module map: 56 modules, what each owns, and the names that collide.
+3. [server/src/README.md](server/src/README.md). The module map: 63 modules (counted 2026-10-06), what each owns, and the names that collide.
 4. The macOS wall drills the matrix cites: [allow/deny](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md), [boot survival](docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md), [full scope](docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md).
 5. [ROADMAP.md](ROADMAP.md). What ships today with its bounds, and what is next. The Linux row moved only for Ubuntu 24.04 (x86-64) after an install-grade proof of kernel enforcement on a shipped artifact with independent adjudication; the next Linux gates are fault injection, a real-agent harness, and broader platform coverage.
 6. [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html), for the why.
@@ -51,13 +51,13 @@ The vocabulary, so the rest reads: **Castle Wall** is the kernel-level egress fi
 
 ## Install
 
-Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra? One command wraps it.
+Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? One command wraps it.
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --openclaw
 ```
 
-Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
 
 What happens when you run protect:
 
@@ -115,7 +115,7 @@ Current capability summary:
 | Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
 | Context gating, sensitive-field redaction, query-layer anonymity (header strip default-on; opt-in PII rewrite live, classifier surface pinned local-only) | Shipped |
 | Portable identity, state export/import, recovery flows, reputation bundles | Partial for exit bundles until **IC-07, IC-08, IC-09** are fixed |
-| Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveat: production checkpoints are unsigned. Open defect: **IC-05** |
+| Local multi-agent coordination, fortress-local hub APIs, audit chain | Shipped with audit-chain verifier caveat: production call sites sign checkpoints when the fortress holds an identity, but the Assurance Matrix row stays partial pending the IC-05 external-verifier drill and the remaining local tamper-evidence follow-up |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Local intelligence (signed model manifest, macOS) | Shipped: the provisioning ceremony verifies the Sanctuary-signed model manifest before it pulls a model, refuses tampered or foreign-signed manifests before any download, and the dashboard shows which route answered. Bounds: macOS only today; verification confirms the digest Ollama reports against the signed manifest and does not by itself prove every model byte on disk; the concierge is read-only over fortress state; no TEE. See [Local intelligence](docs/local-intelligence.md) |
@@ -263,7 +263,7 @@ Sanctuary installs the protections your body used to provide by default: a perim
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
-**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit with rollback detection. Production audit checkpoints are currently unsigned until **IC-05** closes. Open defect: **IC-05**.
+**Charter: the will.** What you train your agent to choose voluntarily. The additive cooperative MCP surface for compliant agents. Operator-rooted cryptographic identity (Ed25519 signing, Argon2id passphrase unlock, per-purpose HKDF subkeys). Per-agent encrypted state at rest (AES-256-GCM). Three-tier Principal Policy gates with channel-template binding. Hash-chained audit with rollback detection. Production call sites sign checkpoints when the fortress holds an identity, while identity-less fortresses and the root daemon split audit store write honest unsigned checkpoints. Open defect: **IC-05**.
 
 **Heralds: the voice.** How you speak to and are recognized by other sovereigns. Optional composition surface (Concordia for structured negotiation, Verascore for portable reputation). Receipts and reputation attestations can be exported through current paths; the full exit guarantee remains partial while the remaining exit-bundle gaps are open. Default off; both compositions are optional.
 
@@ -271,7 +271,7 @@ Sanctuary installs the protections your body used to provide by default: a perim
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the roadmap.
 
-**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 56-module index of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 63-module index (counted 2026-10-06) of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -282,7 +282,7 @@ The substrate enforces rights that normally only ship to enterprises with dedica
 - **Identity.** Your agent has a key you own. No provider can impersonate you or revoke your agent. You can prove the agent is yours without asking anyone's permission.
 - **Data.** Your agent's state is encrypted against the provider running it. The platform sees the calls going out; it does not see your life going in. Your conversations, your memory, and your plans stay yours.
 - **Portability.** Your agent's memory, reputation, and commitments travel through current export paths, with exit-bundle gaps still open for dashboard export, skipped import counters, and rotated-key imports.
-- **Attestation.** What your agent did is provable through hash-chained audit entries and signed receipt surfaces. Production audit checkpoints are currently unsigned.
+- **Attestation.** What your agent did is provable through hash-chained audit entries and signed receipt surfaces. Production call sites sign checkpoints when the fortress holds an identity; the audit-chain row remains partial under **IC-05**.
 - **Exit.** Keys, state, reputation, and commitments are yours to move, copy, or keep offline through the shipped paths, with the full exit guarantee partial while the remaining exit-bundle gaps are open.
 
 Sanctuary ships the rights substrate. Access (compute, devices, bandwidth, literacy) belongs to civic-infrastructure partners (public libraries, legal-aid organizations, labor unions, public-interest tech groups, community colleges) who host agentic AI on behalf of users who do not self-host. The partner provides access; Sanctuary provides rights. The two compose; they do not substitute.
@@ -298,7 +298,7 @@ Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercise
 - **Claude Code** (`sanctuary protect --claude-code`)
 - **Cursor** (`sanctuary protect --cursor`)
 - **Cline** (`sanctuary protect --cline`)
-- **Mastra** (`sanctuary protect --mastra`)
+- **Mastra** (`sanctuary protect --mastra`; fixture-tested only, no live Mastra-agent drill recorded)
 - **LangGraph** and custom harnesses (`sanctuary protect --wrap <path>`)
 - Any other MCP-compatible harness via direct MCP config
 

@@ -17,6 +17,10 @@ Sanctuary has four sovereignty layers. The L1..L4 numbering is being retired in 
 `L1Status..L4Status` exports) and must survive byte-for-byte. Use the named layer in writing; never
 edit the wire token.
 
+This table is an internal module-map grouping; the public four-name Castle story is the one in
+[`server/rfcs/RFC-0003-castle-architecture.md`](../rfcs/RFC-0003-castle-architecture.md) and the
+root README.
+
 | Layer | Named layer (human / property) | Wire token | Owning module(s) | One line |
 |-------|--------------------------------|-----------|------------------|----------|
 | L1 | Castle Wall / Cognitive | `l1` / `l1_cognitive` | `cognitive`, `core`, `castle-wall` | Encrypted at-rest state + identity keys; the crypto foundation |

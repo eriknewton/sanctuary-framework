@@ -138,7 +138,7 @@ A verifier reading a JSONL export MUST:
 4. **prev_hash walk:** Assert that each entry's `prev_hash` equals the `entry_hash` of the previous entry (or `"GENESIS"` for the first, or the legacy anchor `root_hash` after migration).
 5. **Hash recomputation:** For each entry, recompute `entry_hash` from the envelope fields and compare to the stored value.
 6. **Checkpoint root:** For each checkpoint, collect the `entry_hash` values for `[from_sequence, checkpoint_sequence]` and recompute the root hash; compare to `root_hash`.
-7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production checkpoints are unsigned because no production boot path supplies the checkpoint signer, so this leg is skipped on shipped installs. Open defect: **IC-05**.
+7. **Checkpoint signature:** For each non-unsigned checkpoint, verify the Ed25519 signature over the domain-separated signing payload using the `public_key` field (or a supplied trusted key). Current bound: production call sites derive the checkpoint signer when the fortress holds an identity; identity-less fortresses and the root daemon split audit store write honest unsigned checkpoints. Open defect: **IC-05**.
 8. **Legacy anchor:** Assert that `root_hash` is a valid 64-character hex string.
 
 In strict mode (default), any single failure causes the verdict to be `FAIL` and the process exits 1. With `--no-strict`, verification still reports `FAIL` with findings and exits 10 after completing the full scan. A clean verification exits 0.
@@ -189,4 +189,4 @@ The verifier (`server/src/cli/audit-chain-verify.ts`) imports only:
 - `@noble/hashes/sha256` -- SHA-256 hashing
 - `node:fs` -- reading the JSONL file
 
-It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation. Current bound: production checkpoints are unsigned until **IC-05** closes.
+It does not import from the Sanctuary server runtime (no storage backend, no encryption key, no audit log class). A security reviewer can copy `audit-chain-verify.ts`, install `@noble/curves` and `@noble/hashes`, and run it against an exported chain file without a Sanctuary installation. Current bound: production call sites sign checkpoints when the fortress holds an identity, while identity-less fortresses and the root daemon split audit store write honest unsigned checkpoints until **IC-05** closes.
