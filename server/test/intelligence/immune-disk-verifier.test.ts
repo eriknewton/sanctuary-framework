@@ -1,4 +1,3 @@
-// fail-before-exempt: adds a witness for an existing parser rule (control bytes in metadata strings); the parser is unchanged in this PR, so the test passes before and after by design
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
