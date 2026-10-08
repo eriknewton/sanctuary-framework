@@ -261,6 +261,17 @@ describe("Q5C bounded OCI manifest parser", () => {
       .toThrow("disk_manifest_invalid");
   });
 
+  it("refuses control bytes in inert manifest metadata CATALOG-SIGNER-NO-ONDISK-PARSE-PRECHECK-01", () => {
+    const layerValue = manifestValue();
+    layerValue.layers[0] = { ...layerValue.layers[0], from: "model\u0007.gguf" } as typeof layerValue.layers[number];
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(layerValue))))
+      .toThrow("disk_manifest_invalid");
+
+    const topLevelValue = { ...manifestValue(), format: "gguf\tq4" };
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(topLevelValue))))
+      .toThrow("disk_manifest_invalid");
+  });
+
   it("refuses descriptor provenance on the config descriptor", () => {
     const value = manifestValue();
     value.config = { ...value.config, from: "model.gguf" } as typeof value.config;

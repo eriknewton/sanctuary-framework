@@ -57,7 +57,10 @@ import { fileURLToPath } from "node:url";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { fromBase64urlStrict, toBase64url } from "../src/core/encoding.js";
-import { IMMUNE_OCI_MANIFEST_MAX_BYTES } from "../src/intelligence/immune-disk-verifier.js";
+import {
+  IMMUNE_OCI_MANIFEST_MAX_BYTES,
+  parseBoundedOciManifest,
+} from "../src/intelligence/immune-disk-verifier.js";
 import { loadPinnedModelManifestKey } from "../src/intelligence/model-manifest.js";
 import {
   MODEL_MANIFEST_V2_REGISTRY,
@@ -210,20 +213,29 @@ async function fetchManifestDigest(origin, identity) {
   }
   const bytes = new Uint8Array(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   if (bytes.length === 0) die(`manifest for ${url} is empty`);
+  try {
+    // Invariant: must match `parseBoundedOciManifest` in `server/src/intelligence/immune-disk-verifier.ts`.
+    // The signer and the on-disk check must agree on what a manifest is: a
+    // signed entry whose manifest the on-disk check refuses cannot install, so
+    // failing here preserves ceremony time while retaining fail-closed runtime behavior.
+    parseBoundedOciManifest(bytes);
+  } catch (error) {
+    die(`manifest for ${url} refused by on-disk parser: ${error instanceof Error ? error.message : "disk_manifest_invalid"}`);
+  }
+  // `parseBoundedOciManifest` enforces schemaVersion 2 and descriptor bounds,
+  // but treats top-level mediaType as inert bounded metadata; the signer still
+  // requires the Docker distribution media type that the registry endpoint is
+  // expected to serve.
   let manifest;
   try {
-    manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    manifest = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
     die(`manifest for ${url} is not UTF-8 JSON`);
   }
   if (
-    !isRecord(manifest) || manifest.schemaVersion !== 2
-    || manifest.mediaType !== DOCKER_MANIFEST_V2_MEDIA_TYPE
-    || !isRecord(manifest.config) || typeof manifest.config.digest !== "string"
-    || !/^sha256:[0-9a-f]{64}$/.test(manifest.config.digest)
-    || !Array.isArray(manifest.layers) || manifest.layers.length === 0
+    !isRecord(manifest) || manifest.mediaType !== DOCKER_MANIFEST_V2_MEDIA_TYPE
   ) {
-    die(`manifest for ${url} is not a schemaVersion-2 Docker distribution manifest`);
+    die(`manifest for ${url} is not a Docker distribution manifest`);
   }
   return {
     digest: createHash("sha256").update(bytes).digest("hex"),
