@@ -363,7 +363,11 @@ function validManifestTopLevelKeys(value: Record<string, unknown>): boolean {
   return true;
 }
 
-/** Parse only authenticated config/layers after the design's byte cap is enforced. */
+/**
+ * Parse only authenticated config/layers after the design's byte cap is enforced.
+ * Catalog signing also runs this parser before signing; changing it changes what
+ * `server/scripts/sign-model-manifest-v2.mjs` can sign.
+ */
 export function parseBoundedOciManifest(bytes: Uint8Array): ParsedOciManifest {
   if (bytes.byteLength > IMMUNE_OCI_MANIFEST_MAX_BYTES) {
     refuse("disk_manifest_invalid");

@@ -71,11 +71,33 @@ function fakeManifest(identity: string): Buffer {
   }));
 }
 
+function fakeManifestWithUnknownLayerKey(identity: string): Buffer {
+  const manifest = JSON.parse(fakeManifest(identity).toString("utf8")) as { layers: Array<Record<string, unknown>> };
+  manifest.layers[0]!.annotations = { source: identity };
+  return Buffer.from(JSON.stringify(manifest));
+}
+
+function fakeManifestWithUnknownTopLevelKey(identity: string): Buffer {
+  const manifest = JSON.parse(fakeManifest(identity).toString("utf8")) as Record<string, unknown>;
+  manifest.subject = identity;
+  return Buffer.from(JSON.stringify(manifest));
+}
+
 function readPin(root: string, file: string, name: string): string {
   const source = readFileSync(join(root, file), "utf8");
   const match = new RegExp(`${name}\\s*=\\s*\\n?\\s*"([0-9a-f]{64})"`).exec(source);
   expect(match, `${file} declares ${name}`).not.toBeNull();
   return match![1]!;
+}
+
+function readPinFiles(root: string): Buffer[] {
+  return PIN_FILES.map(([file]) => readFileSync(join(root, file)));
+}
+
+function expectPinFilesUnchanged(root: string, before: readonly Buffer[]) {
+  for (const [index, [file]] of PIN_FILES.entries()) {
+    expect(readFileSync(join(root, file)).equals(before[index]!), file).toBe(true);
+  }
 }
 
 /** Async spawn so the in-process loopback registry can answer the tool. */
@@ -102,6 +124,7 @@ describe("sign-model-manifest-v2 tool", () => {
   let work: string;
   let out: string;
   const served = new Map<string, Buffer>();
+  const manifestOverrides = new Map<string, "unknown-layer-key" | "unknown-top-level-key">();
 
   beforeAll(async () => {
     server = createServer((request, response) => {
@@ -137,7 +160,12 @@ describe("sign-model-manifest-v2 tool", () => {
       // Served evidence is keyed by the full model:tag the signer asked for, so fetching the wrong model with the
       // right tag cannot satisfy the per-model digest check below (gate finding, PR #1531).
       const identity = `${match[1]!}:${match[2]!}`;
-      const body = fakeManifest(identity);
+      const override = manifestOverrides.get(identity);
+      const body = override === "unknown-layer-key"
+        ? fakeManifestWithUnknownLayerKey(identity)
+        : override === "unknown-top-level-key"
+          ? fakeManifestWithUnknownTopLevelKey(identity)
+          : fakeManifest(identity);
       served.set(identity, body);
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": String(body.length) });
       response.end(body);
@@ -168,6 +196,39 @@ describe("sign-model-manifest-v2 tool", () => {
     expect(result.stderr).not.toContain(SEED_B64URL);
     expect(result.stdout).not.toContain(SEED_B64URL);
     return result;
+  }
+
+  async function runOneModelWithManifestOverride(
+    override: "unknown-layer-key" | "unknown-top-level-key",
+    assetName: string,
+  ): Promise<{ result: ToolRun; tag: string }> {
+    const source = JSON.parse(readFileSync(SOURCE, "utf8")) as {
+      models: Record<string, { ollama_identity: { model: string; tag: string } }>;
+    };
+    const [, firstModel] = Object.entries(source.models)[0]!;
+    const identity = `${firstModel.ollama_identity.model}:${firstModel.ollama_identity.tag}`;
+    manifestOverrides.set(identity, override);
+    try {
+      return {
+        result: await spawnTool(
+          [
+            "--source",
+            SOURCE,
+            "--out",
+            join(work, `${assetName}.json`),
+            "--registry-origin",
+            origin,
+            "--repin-root",
+            work,
+            "--placeholder",
+          ],
+          {},
+        ),
+        tag: firstModel.ollama_identity.tag,
+      };
+    } finally {
+      manifestOverrides.delete(identity);
+    }
   }
 
   it("writes a refused placeholder, then a signed asset the runtime verifier accepts, repinning both constants", async () => {
@@ -248,6 +309,28 @@ describe("sign-model-manifest-v2 tool", () => {
     expect(result.stderr).toContain(`exceeded the ${IMMUNE_OCI_MANIFEST_MAX_BYTES}-byte cap while streaming; request aborted`);
     // The server never finished writing: the client aborted mid-stream.
     expect(oversizeFinished).toBe(false);
+  }, TOOL_TIMEOUT_MS);
+
+  it("refuses a registry manifest with a layer descriptor extension CATALOG-SIGNER-NO-ONDISK-PARSE-PRECHECK-01", async () => {
+    const asset = join(work, "bad-layer.json");
+    const beforePins = readPinFiles(work);
+    const { result, tag } = await runOneModelWithManifestOverride("unknown-layer-key", "bad-layer");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`/manifests/${tag}`);
+    expect(result.stderr).toContain("refused by on-disk parser: disk_manifest_invalid");
+    expect(() => readFileSync(asset)).toThrow();
+    expectPinFilesUnchanged(work, beforePins);
+  }, TOOL_TIMEOUT_MS);
+
+  it("refuses a registry manifest with a top-level extension CATALOG-SIGNER-NO-ONDISK-PARSE-PRECHECK-01", async () => {
+    const asset = join(work, "bad-top.json");
+    const beforePins = readPinFiles(work);
+    const { result, tag } = await runOneModelWithManifestOverride("unknown-top-level-key", "bad-top");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`/manifests/${tag}`);
+    expect(result.stderr).toContain("refused by on-disk parser: disk_manifest_invalid");
+    expect(() => readFileSync(asset)).toThrow();
+    expectPinFilesUnchanged(work, beforePins);
   }, TOOL_TIMEOUT_MS);
 
   it("refuses to repin the compiled constants or write the packaged asset under a test trust root", async () => {
