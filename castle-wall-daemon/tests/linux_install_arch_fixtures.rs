@@ -10,7 +10,7 @@ use castle_wall_daemon::linux_install::{
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -22,6 +22,19 @@ const GUARD_BODY: &[u8] = b"PACKAGE_VERSION = '0.1.0-1'\n";
 const CLEAN_IDENTITY: &str = "clean";
 const IDENTITY_EDITED: &str = "identity-edited";
 const GENERATED: &str = "generated";
+const ARCH_CI_REQUIRED_READERS: &[&str] = &[
+    "login.defs",
+    "pacman-Q-retired",
+    "pacman-Q-running",
+    "pacman-Qo-cli-retired",
+    "pacman-Qo-cli-running",
+    "systemctl-show-agent-retired",
+    "systemctl-show-agent-running",
+    "systemctl-show-mount-retired",
+    "systemctl-show-mount-running",
+    "systemctl-show-wall-retired",
+    "systemctl-show-wall-running",
+];
 
 #[derive(Debug, Clone)]
 enum Expected {
@@ -78,7 +91,13 @@ fn assert_every_fixture_has_expectation(dir: &Path) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name == "PROVENANCE" || name.ends_with(".expect") {
+        if name == "PROVENANCE"
+            || name.ends_with(".expect")
+            || matches!(
+                arch_ci_capture_kind(name),
+                Some(ArchCiCaptureKind::RawSystemctlShow)
+            )
+        {
             continue;
         }
         let _ = expectation(&path);
@@ -107,6 +126,21 @@ fn fixture_files(dir: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     files.sort();
     files
+}
+
+fn fixture_dirs_with_prefix(prefix: &str) -> Vec<PathBuf> {
+    let mut dirs = fs::read_dir(SUBSTRATE)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
 }
 
 #[test]
@@ -260,10 +294,14 @@ fn parse_show_fixture(
 }
 
 fn unit_for(path: &Path) -> (&'static str, &'static str) {
-    let name = path
+    let mut name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
+    // Must match save_raw_captures in packaging/arch/ci-arch-lifecycle.sh: harness captures include the reader prefix.
+    if let Some(rest) = name.strip_prefix("systemctl-show-") {
+        name = rest;
+    }
     if name.starts_with("mount-") {
         (
             WORKSPACE_MOUNT_UNIT,
@@ -279,6 +317,57 @@ fn unit_for(path: &Path) -> (&'static str, &'static str) {
             "sanctuary-castle-wall.service",
             "/etc/systemd/system/sanctuary-castle-wall.service",
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchCiCaptureKind {
+    LoginDefs,
+    PacmanQ,
+    PacmanQo,
+    SystemctlShow,
+    RawSystemctlShow,
+}
+
+fn arch_ci_capture_kind(name: &str) -> Option<ArchCiCaptureKind> {
+    if name.ends_with(".err") || name.ends_with(".rc") || name.ends_with(".combined") {
+        return None;
+    }
+    if name == "login.defs" {
+        Some(ArchCiCaptureKind::LoginDefs)
+    } else if name.starts_with("pacman-Qo-cli-") {
+        Some(ArchCiCaptureKind::PacmanQo)
+    } else if name.starts_with("pacman-Q-") && !name.starts_with("pacman-Qkk-") {
+        Some(ArchCiCaptureKind::PacmanQ)
+    } else if name.starts_with("systemctl-show-") {
+        Some(ArchCiCaptureKind::SystemctlShow)
+    } else if name.starts_with("raw-systemctl-show-") && name.ends_with(".full") {
+        Some(ArchCiCaptureKind::RawSystemctlShow)
+    } else {
+        None
+    }
+}
+
+fn assert_arch_ci_shape(dir: &Path, files: &[PathBuf]) {
+    // Captures landed with brief 16.6: an arch-ci directory without reader captures is a corpus defect, not a pending state.
+    assert!(!files.is_empty(), "{}: no reader captures", dir.display());
+    let names = files
+        .iter()
+        .map(|path| path.file_name().and_then(|name| name.to_str()).unwrap())
+        .collect::<BTreeSet<_>>();
+    for name in &names {
+        assert!(
+            arch_ci_capture_kind(name).is_some(),
+            "unrecognised arch-ci capture kind in {}: {name}",
+            dir.display()
+        );
+    }
+    for required in ARCH_CI_REQUIRED_READERS {
+        assert!(
+            names.contains(required),
+            "arch-ci fixture {} is missing required reader-shaped capture {required}",
+            dir.display()
+        );
     }
 }
 
@@ -322,4 +411,159 @@ fn synthetic_show_maps_are_differential_witnesses_for_shared_unit_reader() {
         );
         assert_expected(arch_result.map_err(Into::into), expected);
     }
+}
+
+/// Every file under an `arch-ci-*` directory other than PROVENANCE itself, recursively, as paths relative to it.
+fn arch_ci_committed_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            arch_ci_committed_files(root, &path, out);
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if rel != "PROVENANCE" {
+                out.push(rel);
+            }
+        }
+    }
+}
+
+/// A PROVENANCE pin line reads `<relative path> sha256 <64 lowercase hex> [...]`; other lines are prose.
+fn arch_ci_provenance_pins(provenance: &str) -> BTreeMap<String, String> {
+    // 64 = hex length of a SHA-256 digest.
+    const SHA256_HEX_LEN: usize = 64;
+    let mut pins = BTreeMap::new();
+    for line in provenance.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(path), Some("sha256"), Some(hex)) = (parts.next(), parts.next(), parts.next())
+        {
+            if hex.len() == SHA256_HEX_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                pins.insert(path.to_string(), hex.to_string());
+            }
+        }
+    }
+    pins
+}
+
+#[test]
+fn arch_ci_captures_are_byte_pinned_by_provenance() {
+    // The replay below checks VERDICTS, and several readers accept more than one byte shape, so an edited capture
+    // can keep its verdict; this pin is what keeps the corpus equal to the bytes the named CI run produced
+    // (P3 closure read F1). Captures landed with brief 16.6, so an empty arch-ci directory is now a failure too.
+    let arch_ci_dirs = fixture_dirs_with_prefix("arch-ci-");
+    // Deleting or renaming the corpus off the prefix must fail, not leave these tests looping over nothing.
+    assert!(
+        !arch_ci_dirs.is_empty(),
+        "no arch-ci-* capture directory under {SUBSTRATE}"
+    );
+    for dir in arch_ci_dirs {
+        let provenance = fs::read_to_string(dir.join("PROVENANCE"))
+            .unwrap_or_else(|err| panic!("{}: PROVENANCE unreadable: {err}", dir.display()));
+        let pins = arch_ci_provenance_pins(&provenance);
+        let mut files = Vec::new();
+        arch_ci_committed_files(&dir, &dir, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "{}: no committed captures",
+            dir.display()
+        );
+        for rel in &files {
+            let pinned = pins
+                .get(rel)
+                .unwrap_or_else(|| panic!("{}: {rel} is not pinned in PROVENANCE", dir.display()));
+            let actual = sha256(&fs::read(dir.join(rel)).unwrap());
+            assert_eq!(
+                &actual,
+                pinned,
+                "{}: {rel} bytes differ from PROVENANCE",
+                dir.display()
+            );
+        }
+        for rel in pins.keys() {
+            assert!(
+                files.contains(rel),
+                "{}: PROVENANCE pins missing file {rel}",
+                dir.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn arch_ci_capture_directories_replay_recorded_readers_when_present() {
+    let arch_ci_dirs = fixture_dirs_with_prefix("arch-ci-");
+    // Deleting or renaming the corpus off the prefix must fail, not leave these tests looping over nothing.
+    assert!(
+        !arch_ci_dirs.is_empty(),
+        "no arch-ci-* capture directory under {SUBSTRATE}"
+    );
+    for dir in arch_ci_dirs {
+        assert_every_fixture_has_expectation(&dir);
+        let files = fixture_files(&dir);
+        assert_arch_ci_shape(&dir, &files);
+        for path in files {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            match arch_ci_capture_kind(name).expect("shape checked above") {
+                ArchCiCaptureKind::LoginDefs => {
+                    assert_expected(
+                        login_defs::parse(&fs::read(&path).unwrap()).map(|_| ()),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::PacmanQo => {
+                    assert_expected(
+                        pacman::parse_qo(&fs::read(&path).unwrap(), QO_PATH, PACKAGE_VERSION),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::PacmanQ => {
+                    assert_expected(
+                        pacman::parse_q(&fs::read(&path).unwrap(), PACKAGE_VERSION),
+                        expectation(&path),
+                    );
+                }
+                ArchCiCaptureKind::SystemctlShow => {
+                    let expected = expectation(&path);
+                    let values = parse_show_fixture(&path)
+                        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                    let (unit, expected_path) = unit_for(&path);
+                    let ubuntu_result =
+                        ubuntu_command::verify_unit_observation(&values, unit, expected_path)
+                            .map_err(|error| error.to_string());
+                    let arch_result =
+                        arch_command::verify_unit_observation(&values, unit, expected_path)
+                            .map_err(|error| error.to_string());
+                    assert_eq!(
+                        ubuntu_result.as_ref().map(|_| ()).map_err(String::clone),
+                        arch_result.as_ref().map(|_| ()).map_err(String::clone),
+                        "Ubuntu/Arch verdict drift for {}",
+                        path.display()
+                    );
+                    assert_expected(arch_result.map_err(Into::into), expected);
+                }
+                ArchCiCaptureKind::RawSystemctlShow => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn arch_ci_harness_names_route_to_their_units_and_unknowns_fail_shape() {
+    let agent = Path::new("systemctl-show-agent-running");
+    let mount = Path::new("systemctl-show-mount-running");
+    let unknown = PathBuf::from("nft-table-running.json");
+    assert_eq!(unit_for(agent).0, "sanctuary-agent@60123.service");
+    assert_eq!(unit_for(mount).0, WORKSPACE_MOUNT_UNIT);
+    assert!(
+        arch_ci_capture_kind(unknown.to_str().unwrap()).is_none(),
+        "unknown top-level arch-ci captures must fail once any capture is committed"
+    );
 }

@@ -1,7 +1,7 @@
 {
   "body": {
     "schema_version": 2,
-    "manifest_version": 1,
+    "manifest_version": 2,
     "models": {
       "qwen3-4b": {
         "model_id": "qwen3-4b",
@@ -74,6 +74,30 @@
         },
         "open_weights": true,
         "open_source": false
+      },
+      "qwen3.5-9b": {
+        "model_id": "qwen3.5-9b",
+        "model_name": "Qwen3.5 9B",
+        "model_version": "3.5",
+        "provider": "Alibaba Cloud",
+        "runtime": "ollama",
+        "ollama_identity": {
+          "registry": "registry.ollama.ai",
+          "namespace": "library",
+          "model": "qwen3.5",
+          "tag": "9b",
+          "ollama_manifest_sha256": "56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90"
+        },
+        "params_b": 9,
+        "license": {
+          "identifier": "Apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://www.apache.org/licenses/LICENSE-2.0",
+          "osi_approved": true,
+          "redistribution": "permitted"
+        },
+        "open_weights": true,
+        "open_source": false
       }
     },
     "tiers": {
@@ -81,7 +105,8 @@
         "qwen3-4b"
       ],
       "mid": [
-        "qwen3-14b"
+        "qwen3-14b",
+        "qwen3.5-9b"
       ],
       "pro": [
         "qwen3-32b"
@@ -114,5 +139,5 @@
       }
     }
   },
-  "signature": "5zrGnNotLoSdDDCxOI7d69C0P8bc6oTX6Eg1beX1XRsrNNI_vu5XLOujSme5Rx_9FVcjLhAdqbrWQR_WNA23Cw"
+  "signature": "Ib0k5asz_GiRHzlImcE7A72Xk4Dcnd9MGz2ga8JWykeQcywwhhB5Sv20XlZYdwPMeML8IFNPLGmD7Ml78n8rCw"
 }
