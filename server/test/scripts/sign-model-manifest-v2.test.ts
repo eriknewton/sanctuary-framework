@@ -1,3 +1,4 @@
+// fail-before-exempt: the fix lives in server/scripts/sign-model-manifest-v2.mjs, which the fail-before job does not revert; the two new refusal tests fail on origin/main's signer (shown in the #1532 gate log)
 /**
  * Round trip of the model-manifest signing tool with an ephemeral key against
  * a loopback registry: placeholder mode, signed mode with the shared verifier,
