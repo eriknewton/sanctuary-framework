@@ -335,6 +335,9 @@ describe("packaged model manifest loader", () => {
   // Flip this constant to "signed" in the same change that lands the signed
   // asset; each branch is a strict expectation for its state.
   const COMMITTED_ASSET_STATE = "signed" as "placeholder" | "signed";
+  // Must match `manifest_version` in src/intelligence/model-manifest/model-manifest.v2.json; bump with every signing
+  // ceremony (2026-10-07: version 2 adds qwen3.5-9b to the mid tier).
+  const COMMITTED_MANIFEST_VERSION = 2;
 
   it("loads the committed asset through the real candidates under the compiled pin", async () => {
     const bytes = await readFile(
@@ -352,7 +355,7 @@ describe("packaged model manifest loader", () => {
       });
     } else {
       expect(result).toMatchObject({ ok: true, source: "packaged", assetSha256: PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256 });
-      expect(result.ok && result.body.manifest_version).toBe(1);
+      expect(result.ok && result.body.manifest_version).toBe(COMMITTED_MANIFEST_VERSION);
     }
   });
 });

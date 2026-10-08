@@ -33,7 +33,7 @@ const ASSET_RELATIVE_PATH = "intelligence/model-manifest/model-manifest.v2.json"
 // PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256 in
 // src/intelligence/packaged-model-manifest.ts; both constants are rewritten
 // only by scripts/sign-model-manifest-v2.mjs when a new asset is produced.
-const EXPECTED_MODEL_MANIFEST_V2_ASSET_SHA256 = "edc2091d555ee61a3ba760ef33c9bca4ba3dad5d83c44878cba2e0ba774d6b90";
+const EXPECTED_MODEL_MANIFEST_V2_ASSET_SHA256 = "95412ab157fdb1747c5fd074033a4a25fd5672bb050ef887a5de87a28e59663d";
 
 // Must match MAX_CATALOG_WIRE_JSON_BYTES in src/intelligence/model-catalog-v3.ts
 // (65,536 = 64 KiB), the cap the runtime loader applies before parsing.

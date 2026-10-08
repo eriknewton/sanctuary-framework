@@ -202,6 +202,9 @@ describe("shared protect/init local-intelligence adapter", () => {
   // signature) until the coordinator signs; flip to "signed" in the change
   // that lands the signed asset. Each branch is strict for its state.
   const COMMITTED_ASSET_STATE = "signed" as "placeholder" | "signed";
+  // Must match `manifest_version` in src/intelligence/model-manifest/model-manifest.v2.json; bump with every signing
+  // ceremony (2026-10-07: version 2 adds qwen3.5-9b to the mid tier).
+  const COMMITTED_MANIFEST_VERSION = 2;
 
   it("reaches the packaged signed-manifest loader by default and refuses with its typed reason", async () => {
     const { storage, masterKey, auditLog, client } = fixture();
@@ -277,7 +280,7 @@ describe("shared protect/init local-intelligence adapter", () => {
       expect(loadRow?.result).toBe("success");
       expect(loadRow?.details).toMatchObject({
         asset_sha256: PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256,
-        manifest_version: 1,
+        manifest_version: COMMITTED_MANIFEST_VERSION,
       });
       // The loader verified the packaged manifest; the operator then declined.
       expect(result).toEqual({ kind: "refused", reason: "declined" });

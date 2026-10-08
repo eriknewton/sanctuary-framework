@@ -1,12 +1,16 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "models": {
     "qwen3-4b": {
       "model_name": "Qwen3 4B",
       "model_version": "3",
       "provider": "Alibaba Cloud",
-      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "4b" },
-      "params_b": 4.0,
+      "ollama_identity": {
+        "namespace": "library",
+        "model": "qwen3",
+        "tag": "4b"
+      },
+      "params_b": 4,
       "license": {
         "identifier": "Apache-2.0",
         "name": "Apache License 2.0",
@@ -21,7 +25,11 @@
       "model_name": "Qwen3 14B",
       "model_version": "3",
       "provider": "Alibaba Cloud",
-      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "14b" },
+      "ollama_identity": {
+        "namespace": "library",
+        "model": "qwen3",
+        "tag": "14b"
+      },
       "params_b": 14.8,
       "license": {
         "identifier": "Apache-2.0",
@@ -37,8 +45,32 @@
       "model_name": "Qwen3 32B",
       "model_version": "3",
       "provider": "Alibaba Cloud",
-      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "32b" },
+      "ollama_identity": {
+        "namespace": "library",
+        "model": "qwen3",
+        "tag": "32b"
+      },
       "params_b": 32.8,
+      "license": {
+        "identifier": "Apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "osi_approved": true,
+        "redistribution": "permitted"
+      },
+      "open_weights": true,
+      "open_source": false
+    },
+    "qwen3.5-9b": {
+      "model_name": "Qwen3.5 9B",
+      "model_version": "3.5",
+      "provider": "Alibaba Cloud",
+      "ollama_identity": {
+        "namespace": "library",
+        "model": "qwen3.5",
+        "tag": "9b"
+      },
+      "params_b": 9,
       "license": {
         "identifier": "Apache-2.0",
         "name": "Apache License 2.0",
@@ -51,9 +83,16 @@
     }
   },
   "tiers": {
-    "baseline": ["qwen3-4b"],
-    "mid": ["qwen3-14b"],
-    "pro": ["qwen3-32b"]
+    "baseline": [
+      "qwen3-4b"
+    ],
+    "mid": [
+      "qwen3-14b",
+      "qwen3.5-9b"
+    ],
+    "pro": [
+      "qwen3-32b"
+    ]
   },
   "surface_defaults": {
     "baseline": {
