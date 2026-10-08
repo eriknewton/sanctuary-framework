@@ -49,16 +49,19 @@ const OCI_MANIFEST_SCHEMA_VERSION = 2;
 const OCI_DESCRIPTOR_REQUIRED_KEYS = ["mediaType", "digest", "size"] as const;
 /** Observed Ollama descriptor provenance key, ignored by verification. */
 const OCI_DESCRIPTOR_PROVENANCE_FROM_KEY = "from";
-/** Top-level Ollama metadata keys are inert and never enter the parsed result. */
-const INERT_OCI_MANIFEST_TOP_LEVEL_KEYS = [
+/** Top-level keys that supply the verifier's authority-bearing parsed result. */
+const OCI_MANIFEST_AUTHORITY_KEYS = [
   "schemaVersion",
-  "mediaType",
   "config",
   "layers",
+] as const;
+/** Top-level Ollama metadata keys are bounded and never enter the parsed result. */
+const INERT_OCI_MANIFEST_METADATA_KEYS = [
+  "mediaType",
   "runner",
   "format",
 ] as const;
-const INERT_OCI_MANIFEST_STRING_KEYS = ["runner", "format"] as const;
+const INERT_OCI_MANIFEST_STRING_KEYS = INERT_OCI_MANIFEST_METADATA_KEYS;
 /** Design section 6.3 permits the first changed read plus one retry. */
 const STABLE_FILE_MAX_ATTEMPTS = 2;
 
@@ -345,10 +348,11 @@ function parseDescriptor(
 }
 
 function validManifestTopLevelKeys(value: Record<string, unknown>): boolean {
-  const allowedKeys = INERT_OCI_MANIFEST_TOP_LEVEL_KEYS as readonly string[];
+  const authorityKeys = OCI_MANIFEST_AUTHORITY_KEYS as readonly string[];
+  const metadataKeys = INERT_OCI_MANIFEST_METADATA_KEYS as readonly string[];
   const inertStringKeys = INERT_OCI_MANIFEST_STRING_KEYS as readonly string[];
   for (const key of Object.keys(value)) {
-    if (!allowedKeys.includes(key)) return false;
+    if (!authorityKeys.includes(key) && !metadataKeys.includes(key)) return false;
     if (
       inertStringKeys.includes(key) &&
       !isPrintableAsciiInertString(value[key])
@@ -381,9 +385,9 @@ export function parseBoundedOciManifest(bytes: Uint8Array): ParsedOciManifest {
   if (value.layers.length < 1 || value.layers.length > IMMUNE_OCI_MAX_LAYERS) {
     refuse("descriptor_bounds_exceeded");
   }
-  // These inert top-level keys are not consumed for paths, bytes, sizes, or the
-  // verdict, and this closed list matches the descriptor policy so an
-  // unreviewed Ollama format change trades availability for fail-closed parsing.
+  // Only schemaVersion/config/layers feed the parsed authority result; bounded
+  // top-level metadata is discarded so an unreviewed Ollama format change
+  // trades availability for fail-closed parsing.
   const config = parseDescriptor(value.config, { allowLayerProvenanceFrom: false });
   const layers = value.layers.map((descriptor) =>
     parseDescriptor(descriptor, { allowLayerProvenanceFrom: true })

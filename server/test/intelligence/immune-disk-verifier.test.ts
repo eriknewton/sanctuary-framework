@@ -286,8 +286,49 @@ describe("Q5C bounded OCI manifest parser", () => {
       .toThrow("disk_manifest_invalid");
   });
 
-  it("refuses wrong-typed inert top-level manifest strings", () => {
-    const value = { ...manifestValue(), runner: { argv: ["sh"] } };
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses wrong-typed top-level manifest metadata string %s",
+    (key) => {
+      const value = { ...manifestValue(), [key]: { argv: ["sh"] } };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses oversized top-level manifest metadata string %s",
+    (key) => {
+      const value = {
+        ...manifestValue(),
+        [key]: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS + 1),
+      };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses non-ASCII top-level manifest metadata string %s",
+    (key) => {
+      const value = { ...manifestValue(), [key]: "metadata-☃" };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it("accepts top-level manifest metadata at the shared string cap", () => {
+    const value = {
+      ...manifestValue(),
+      runner: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+      format: "b".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+      mediaType: "c".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+    };
+    expect(parseBoundedOciManifest(Buffer.from(JSON.stringify(value))).layers)
+      .toHaveLength(value.layers.length);
+  });
+
+  it("refuses empty top-level manifest metadata strings", () => {
+    const value = { ...manifestValue(), format: "" };
     expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
       .toThrow("disk_manifest_invalid");
   });
