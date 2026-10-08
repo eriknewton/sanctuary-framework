@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
+  readFile,
   mkdir,
   mkdtemp,
   rename,
@@ -18,6 +19,7 @@ import {
   IMMUNE_HASH_BUFFER_BYTES,
   IMMUNE_HASH_MAX_BUFFER_BYTES,
   IMMUNE_OCI_MANIFEST_MAX_BYTES,
+  IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS,
   IMMUNE_OCI_MAX_DESCRIPTOR_BYTES,
   IMMUNE_OCI_MAX_LAYERS,
   IMMUNE_OCI_MAX_TOTAL_DESCRIPTOR_BYTES,
@@ -35,6 +37,14 @@ import {
 import type { VerifiedLocalBindingV2 } from "../../src/intelligence/model-manifest-v2.js";
 
 const roots: string[] = [];
+const QWEN35_9B_MANIFEST_FIXTURE = new URL(
+  "./__fixtures__/qwen3.5-9b.manifest.json",
+  import.meta.url,
+);
+const QWEN3_4B_MANIFEST_FIXTURE = new URL(
+  "./__fixtures__/qwen3-4b.manifest.json",
+  import.meta.url,
+);
 const CONFIG_BYTES = Buffer.from('{"model_format":"gguf"}');
 const LAYER_A_BYTES = Buffer.from("authenticated-layer-a");
 const LAYER_B_BYTES = Buffer.from("authenticated-layer-b");
@@ -57,6 +67,16 @@ function manifestValue() {
       descriptor(LAYER_A_BYTES, "application/vnd.ollama.image.model"),
       descriptor(LAYER_B_BYTES, "application/vnd.ollama.image.adapter"),
     ],
+  };
+}
+
+function manifestDescriptorCounts(value: {
+  config: { digest: string };
+  layers: Array<{ digest: string }>;
+}) {
+  return {
+    layers: value.layers.length,
+    distinct: new Set([value.config, ...value.layers].map(({ digest }) => digest)).size,
   };
 }
 
@@ -179,6 +199,149 @@ describe("Q5C bounded OCI manifest parser", () => {
     expect(parsed.totalDescriptorBytes).toBe(
       CONFIG_BYTES.byteLength * 2 + LAYER_A_BYTES.byteLength + LAYER_B_BYTES.byteLength,
     );
+  });
+
+  it("accepts the real qwen3.5 manifest with observed descriptor provenance keys", async () => {
+    const fixtureText = await readFile(QWEN35_9B_MANIFEST_FIXTURE, "utf8");
+    const fixtureValue = JSON.parse(fixtureText);
+    const expected = manifestDescriptorCounts(fixtureValue);
+    const parsed = parseBoundedOciManifest(Buffer.from(fixtureText));
+    expect(parsed.layers).toHaveLength(expected.layers);
+    expect(parsed.distinctDescriptors).toHaveLength(expected.distinct);
+    expect(Object.keys(parsed.layers[0]).sort()).toEqual([
+      "digest",
+      "digestHex",
+      "mediaType",
+      "size",
+    ]);
+    expect(Object.keys(parsed).sort()).toEqual([
+      "config",
+      "distinctDescriptors",
+      "layers",
+      "totalDescriptorBytes",
+    ]);
+  });
+
+  it("keeps accepting the real qwen3 control manifest without descriptor provenance keys", async () => {
+    const fixtureText = await readFile(QWEN3_4B_MANIFEST_FIXTURE, "utf8");
+    const fixtureValue = JSON.parse(fixtureText);
+    const expected = manifestDescriptorCounts(fixtureValue);
+    const parsed = parseBoundedOciManifest(Buffer.from(fixtureText));
+    expect(parsed.layers).toHaveLength(expected.layers);
+    expect(parsed.distinctDescriptors).toHaveLength(expected.distinct);
+  });
+
+  it("refuses qwen3.5 descriptor provenance when the value is not a string", async () => {
+    const value = JSON.parse(await readFile(QWEN35_9B_MANIFEST_FIXTURE, "utf8"));
+    value.layers[0].from = { path: "mmproj.gguf" };
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("accepts layer provenance at the string cap and refuses one byte over", () => {
+    const value = manifestValue();
+    value.layers[0] = {
+      ...value.layers[0],
+      from: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+    } as typeof value.layers[number];
+    expect(parseBoundedOciManifest(Buffer.from(JSON.stringify(value))).layers[0])
+      .toMatchObject({ digest: value.layers[0].digest });
+    value.layers[0] = {
+      ...value.layers[0],
+      from: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS + 1),
+    } as typeof value.layers[number];
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses non-ASCII layer provenance", () => {
+    const value = manifestValue();
+    value.layers[0] = { ...value.layers[0], from: "model-☃.gguf" } as typeof value.layers[number];
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses descriptor provenance on the config descriptor", () => {
+    const value = manifestValue();
+    value.config = { ...value.config, from: "model.gguf" } as typeof value.config;
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses duplicate descriptor provenance through the strict parser", () => {
+    const valid = JSON.stringify(manifestValue());
+    const duplicateFrom = valid.replace(
+      '"mediaType":"application/vnd.ollama.image.model"',
+      '"from":"first.gguf","from":"second.gguf","mediaType":"application/vnd.ollama.image.model"',
+    );
+    // The shared strict parser sees duplicate object keys before JSON object
+    // materialization, so no collapsed `from` value reaches descriptor parsing.
+    expect(() => parseBoundedOciManifest(Buffer.from(duplicateFrom)))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses unreviewed top-level manifest keys", () => {
+    const value = { ...manifestValue(), subject: "unexpected" };
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses wrong-typed top-level manifest metadata string %s",
+    (key) => {
+      const value = { ...manifestValue(), [key]: { argv: ["sh"] } };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses oversized top-level manifest metadata string %s",
+    (key) => {
+      const value = {
+        ...manifestValue(),
+        [key]: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS + 1),
+      };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it.each(["runner", "format", "mediaType"] as const)(
+    "refuses non-ASCII top-level manifest metadata string %s",
+    (key) => {
+      const value = { ...manifestValue(), [key]: "metadata-☃" };
+      expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+        .toThrow("disk_manifest_invalid");
+    },
+  );
+
+  it("accepts top-level manifest metadata at the shared string cap", () => {
+    const value = {
+      ...manifestValue(),
+      runner: "a".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+      format: "b".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+      mediaType: "c".repeat(IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS),
+    };
+    expect(parseBoundedOciManifest(Buffer.from(JSON.stringify(value))).layers)
+      .toHaveLength(value.layers.length);
+  });
+
+  it("refuses empty top-level manifest metadata strings", () => {
+    const value = { ...manifestValue(), format: "" };
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
+  });
+
+  it("refuses unrelated descriptor extension keys", () => {
+    const value = manifestValue();
+    const layerWithUnknownKey: Record<string, unknown> = {
+      ...value.layers[0],
+      provenance: "model.gguf",
+    };
+    value.layers[0] = layerWithUnknownKey as typeof value.layers[number];
+    expect(() => parseBoundedOciManifest(Buffer.from(JSON.stringify(value))))
+      .toThrow("disk_manifest_invalid");
   });
 
   it.each([
