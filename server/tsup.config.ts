@@ -6,7 +6,8 @@ const SANCTUARY_SOURCE_SHA_ENV = "SANCTUARY_SOURCE_SHA";
 const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
 const HEX_CHARS_PER_BYTE = 2;
 const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
-// Must match SOURCE_SHA_HEX_PATTERN in server/src/cli/install.ts and server/scripts/build-castle-wall-runtime-manifest.mjs.
+// Must match SOURCE_SHA_HEX_PATTERN in server/src/cli/install.ts, server/src/cli/castle-wall.ts,
+// and server/scripts/build-castle-wall-runtime-manifest.mjs.
 const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
 const GIT_REV_PARSE_TIMEOUT_MS = 5_000; // 5_000 ms = 5 seconds for one local metadata read.
 

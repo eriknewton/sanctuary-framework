@@ -1482,7 +1482,7 @@ describe("sanctuary install agent contract", () => {
     expect((plan.next_action?.description ?? "").toLowerCase()).toContain("re-pin");
   });
 
-  it("does not render macOS re-pin wording in Linux full-profile plans", () => {
+  it("renders platform-neutral re-pin wording in Linux full-profile plans", () => {
     const plan = buildAgentInstallPlan({
       profile: "full",
       harness: "hermes",
@@ -1500,7 +1500,13 @@ describe("sanctuary install agent contract", () => {
     });
 
     const rendered = JSON.stringify(plan);
-    expect(plan.status).toBe("blocked");
+    expect(plan.status).toBe("human_action");
+    expect(plan.next_action?.id).toBe("repin_trust_anchor");
+    expect(plan.next_action?.description ?? "").toContain("this machine's Castle Wall");
+    expect(plan.next_action?.description ?? "").toContain(
+      "a mismatched anchor keeps the boot service from becoming stable",
+    );
+    expect(plan.next_action?.description ?? "").toContain("private local shell");
     expect(rendered).not.toContain("macOS restart it");
     expect(rendered).not.toContain("private local Terminal");
   });

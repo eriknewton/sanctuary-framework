@@ -1975,6 +1975,81 @@ export function buildAgentInstallPlan(input: {
     return plan;
   }
 
+  // Finding B: a fresh install can provision a root-owned global pin that does
+  // not match the live signer-helper key, so the boot daemon cannot sign a
+  // manifest and KeepAlive crash-loops it forever (observed as
+  // boot_service=mismatch with no named remedy). Re-pin is the fix and MUST be
+  // named before any further mutating retry: re-running the privileged protect
+  // flow does not migrate the anchor, so leaving install_full_surface as the
+  // only action would loop the operator through the crash-loop. Keyed on the
+  // authoritative `trust_anchor=broken` verdict; `unknown` (pin unreadable, no
+  // reachable comparison key) is never treated as broken, so no remedy is
+  // fabricated when the mismatch cannot actually be observed from here. Re-pin
+  // is a Tier-1 operator-present migration and is never agent-triggerable, so
+  // this is a human action naming the exact command (no sudo: the root signer
+  // helper writes the pin, the CLI only asks it to).
+  // THREE observations route to the SAME human action now, because the remedy
+  // is the same command and the failure they cause is the same one:
+  //   - `broken`        the anchor holds a key that is not the helper's, so the
+  //                     boot daemon cannot sign a manifest and crash-loops.
+  //   - `unprovisioned` there is no anchor at all. This is the ORDINARY state of
+  //                     a fresh Mac since init stopped publishing one, and boot
+  //                     install refuses outright on a missing pin
+  //                     (cli/castle-wall-boot.ts, "Helper mode requires the
+  //                     root-owned global pin"). Leaving it with no remedy
+  //                     action was a dead end: the planner observed the state,
+  //                     named nothing, and the operator's next mutating retry
+  //                     failed the same way.
+  //   - `not-yet-walled` this VAULT has never been put on the wall, whatever the
+  //                     machine's own state is. A leftover activated extension
+  //                     from an earlier install must not stand in for it.
+  //
+  // INVARIANT on the third term: a `not-yet-walled` vault routes here ONLY
+  // while the anchor is not already CONSISTENT. `re-pin` is idempotent; on a
+  // consistent anchor it re-asserts the same key and changes nothing, so once
+  // the anchor is consistent it can no longer advance this vault, and the
+  // remaining gap is ARMING, which the privileged install action below
+  // performs. Without this term the planner emits `repin_trust_anchor` on every
+  // rerun of an already-re-pinned, not-yet-armed host: the operator runs the
+  // command, the anchor is consistent, the vault is still not on the wall, and
+  // the next plan asks for the same command again.
+  const trustAnchorNeedsRepin =
+    input.observed.trustAnchor === "broken" ||
+    input.observed.trustAnchor === "unprovisioned" ||
+    (input.observed.vaultProvision === "not-yet-walled" &&
+      input.observed.trustAnchor !== "consistent");
+  if (trustAnchorNeedsRepin) {
+    const repinCliPath = input.observed.persistentCliPath;
+    if (repinCliPath === null) {
+      plan.notes.push("The trust anchor needs to be installed or migrated, but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
+      return plan;
+    }
+    const restartClause = input.platform === "darwin"
+      ? "a mismatched anchor makes macOS restart it in a loop"
+      : "a mismatched anchor keeps the boot service from becoming stable";
+    const localShellName = input.platform === "darwin" ? "private local Terminal" : "private local shell";
+    plan.status = "human_action";
+    plan.next_action = {
+      id: "repin_trust_anchor",
+      actor: "human",
+      description:
+        `This vault is not on ${localPlatformSubject}'s Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (${restartClause}). Run this exact 'castle-wall re-pin' command in a ${localShellName} to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.`,
+      argv: [
+        "/usr/bin/env",
+        `SANCTUARY_STORAGE_PATH=${input.fortress}`,
+        `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
+        input.observed.nodePath,
+        ...(sealedFullRuntime ? [] : [repinCliPath]),
+        "castle-wall",
+        "re-pin",
+      ],
+      completion:
+        "A rerun observes trust_anchor consistent and the boot service stable (no longer crash-looping).",
+      secret_boundary:
+        "Re-pin is operator-present and never agent-triggerable. The agent must not run it, retry it, or automate the operator's approval of the signer helper.",
+    };
+    return plan;
+  }
   if (input.platform !== "darwin") {
     plan.notes.push("The full profile has no shipped live-enforcement path on this platform.");
     return plan;
@@ -2057,81 +2132,6 @@ export function buildAgentInstallPlan(input: {
         ? "An operator-side Hermes twin is present; stand it down and rerun the planner before declaring or installing the full surface."
         : "The operator-side Hermes twin probe is unknown; repair that observation before declaring or installing the full surface.",
     );
-    return plan;
-  }
-  // Finding B: a fresh install can provision a root-owned global pin that does
-  // not match the live signer-helper key, so the boot daemon cannot sign a
-  // manifest and KeepAlive crash-loops it forever (observed as
-  // boot_service=mismatch with no named remedy). Re-pin is the fix and MUST be
-  // named before any further mutating retry: re-running the privileged protect
-  // flow does not migrate the anchor, so leaving install_full_surface as the
-  // only action would loop the operator through the crash-loop. Keyed on the
-  // authoritative `trust_anchor=broken` verdict; `unknown` (pin unreadable, no
-  // reachable comparison key) is never treated as broken, so no remedy is
-  // fabricated when the mismatch cannot actually be observed from here. Re-pin
-  // is a Tier-1 operator-present migration and is never agent-triggerable, so
-  // this is a human action naming the exact command (no sudo: the root signer
-  // helper writes the pin, the CLI only asks it to).
-  // THREE observations route to the SAME human action now, because the remedy
-  // is the same command and the failure they cause is the same one:
-  //   - `broken`        the anchor holds a key that is not the helper's, so the
-  //                     boot daemon cannot sign a manifest and crash-loops.
-  //   - `unprovisioned` there is no anchor at all. This is the ORDINARY state of
-  //                     a fresh Mac since init stopped publishing one, and boot
-  //                     install refuses outright on a missing pin
-  //                     (cli/castle-wall-boot.ts, "Helper mode requires the
-  //                     root-owned global pin"). Leaving it with no remedy
-  //                     action was a dead end: the planner observed the state,
-  //                     named nothing, and the operator's next mutating retry
-  //                     failed the same way.
-  //   - `not-yet-walled` this VAULT has never been put on the wall, whatever the
-  //                     machine's own state is. A leftover activated extension
-  //                     from an earlier install must not stand in for it.
-  //
-  // INVARIANT on the third term: a `not-yet-walled` vault routes here ONLY
-  // while the anchor is not already CONSISTENT. `re-pin` is idempotent — on a
-  // consistent anchor it re-asserts the same key and changes nothing — so once
-  // the anchor is consistent it can no longer advance this vault, and the
-  // remaining gap is ARMING, which the privileged install action below
-  // performs. Without this term the planner emits `repin_trust_anchor` on every
-  // rerun of an already-re-pinned, not-yet-armed host: the operator runs the
-  // command, the anchor is consistent, the vault is still not on the wall, and
-  // the next plan asks for the same command again.
-  const trustAnchorNeedsRepin =
-    input.observed.trustAnchor === "broken" ||
-    input.observed.trustAnchor === "unprovisioned" ||
-    (input.observed.vaultProvision === "not-yet-walled" &&
-      input.observed.trustAnchor !== "consistent");
-  if (trustAnchorNeedsRepin) {
-    const repinCliPath = input.observed.persistentCliPath;
-    if (repinCliPath === null) {
-      plan.notes.push("The trust anchor needs to be installed or migrated, but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
-      return plan;
-    }
-    const restartClause = input.platform === "darwin"
-      ? "a mismatched anchor makes macOS restart it in a loop"
-      : "a mismatched anchor keeps the boot service from becoming stable";
-    const localShellName = input.platform === "darwin" ? "private local Terminal" : "private local shell";
-    plan.status = "human_action";
-    plan.next_action = {
-      id: "repin_trust_anchor",
-      actor: "human",
-      description:
-        `This vault is not on ${localPlatformSubject}'s Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (${restartClause}). Run this exact 'castle-wall re-pin' command in a ${localShellName} to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.`,
-      argv: [
-        "/usr/bin/env",
-        `SANCTUARY_STORAGE_PATH=${input.fortress}`,
-        `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
-        input.observed.nodePath,
-        ...(sealedFullRuntime ? [] : [repinCliPath]),
-        "castle-wall",
-        "re-pin",
-      ],
-      completion:
-        "A rerun observes trust_anchor consistent and the boot service stable (no longer crash-looping).",
-      secret_boundary:
-        "Re-pin is operator-present and never agent-triggerable. The agent must not run it, retry it, or automate the operator's approval of the signer helper.",
-    };
     return plan;
   }
   // INVARIANT: every term in this predicate is a MACHINE fact, and a Mac armed

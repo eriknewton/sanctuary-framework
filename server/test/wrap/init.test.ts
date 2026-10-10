@@ -2019,4 +2019,25 @@ describe("parseInitArgs", () => {
       "     mean to, and it is the installer's next action.",
     ].join("\n"));
   });
+
+  it("uses the generic local machine wording in Linux init help step 8", () => {
+    let output = "";
+    const log = vi.spyOn(console, "log").mockImplementation((message?: unknown) => {
+      output += String(message ?? "");
+    });
+    try {
+      printInitHelp("linux");
+    } finally {
+      log.mockRestore();
+    }
+
+    expect(output).toContain([
+      "  8. Creates this vault's own Castle Wall key pair, inside the fortress",
+      "     directory, and records that the vault is not yet on the Castle Wall of",
+      "     this machine. Init never reads or changes this machine's Castle Wall settings:",
+      "     turning the wall on for a vault is a separate step you run when you",
+      "     mean to, and it is the installer's next action.",
+    ].join("\n"));
+    expect(output).not.toContain("this Mac. Init never reads or changes this Mac's Castle Wall settings:");
+  });
 });

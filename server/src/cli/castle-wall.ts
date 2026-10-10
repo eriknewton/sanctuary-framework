@@ -5180,6 +5180,11 @@ function parseHeadlessReport(stdout: string): HeadlessReport | null {
  * reproduces the exact value validateHeadlessBuildIdentity compares against.
  */
 const CASTLE_WALL_SHORT_SHA_LENGTH = 12;
+const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
+const HEX_CHARS_PER_BYTE = 2;
+const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
+// Must match SOURCE_SHA_HEX_PATTERN in server/tsup.config.ts.
+const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
 
 /**
  * Substring that marks a path as living inside a macOS `.app` bundle. Detecting
@@ -5232,7 +5237,7 @@ function resolveSealedBundleBuildSha(
     };
     const sourceSha =
       typeof parsed.source_sha === "string" ? parsed.source_sha.trim() : "";
-    if (!/^[a-f0-9]{40}$/.test(sourceSha)) return null;
+    if (!SOURCE_SHA_HEX_PATTERN.test(sourceSha)) return null;
     return sourceSha.slice(0, CASTLE_WALL_SHORT_SHA_LENGTH);
   } catch {
     return null;

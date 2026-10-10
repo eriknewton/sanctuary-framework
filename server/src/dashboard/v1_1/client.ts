@@ -3327,7 +3327,7 @@ function renderPostureScreen() {
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
   const vaultNotice =
     vaultProvision === "not_yet_walled"
-      ? '<p class="muted">This vault is not on __SANCTUARY_LOCAL_CASTLE_WALL_SUBJECT__\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+      ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
       : "";
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
