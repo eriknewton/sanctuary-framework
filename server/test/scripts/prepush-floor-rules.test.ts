@@ -45,6 +45,15 @@ const REAL_GATE2B_PATH = resolve(
   "gate2b-check.sh",
 );
 
+const REAL_PARSE_VITEST_SUMMARY_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "scripts",
+  "parse-vitest-summary.sh",
+);
+
 const ZERO_SHA = "0".repeat(40);
 const UNRESOLVABLE_SHA = "1234567890abcdef1234567890abcdef12345678";
 
@@ -107,6 +116,10 @@ function buildRepo(opts: {
   fs.copyFileSync(
     REAL_GATE2B_PATH,
     path.join(repoDir, "scripts", "gate2b-check.sh"),
+  );
+  fs.copyFileSync(
+    REAL_PARSE_VITEST_SUMMARY_PATH,
+    path.join(repoDir, "scripts", "parse-vitest-summary.sh"),
   );
   fs.writeFileSync(
     path.join(repoDir, "server", "scripts", "count-vitest-test-files.mjs"),
