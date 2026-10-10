@@ -137,23 +137,24 @@ reads retain older lexical service names; new writes use the canonical identity.
 
 `sanctuary protect`, `export-passphrase`, the install planner, the MCP stdio
 server and the dashboard all resolve the fortress credential through one shared
-chain, in this order:
+chain. Within this chain, only `sanctuary protect` accepts
+`--passphrase-stdin`; the other entries begin at `--passphrase`.
 
-1. `--passphrase-stdin`
-2. `--passphrase`
-3. `SANCTUARY_PASSPHRASE`
-4. `SANCTUARY_RECOVERY_KEY`
-5. the enrolled OS-keyring custody factor for this fortress, the one
+1. `--passphrase`
+2. `SANCTUARY_PASSPHRASE`
+3. `SANCTUARY_RECOVERY_KEY`
+4. the enrolled OS-keyring custody factor for this fortress, the one
    interactive `init` writes
-6. the exact-fortress stored passphrase: the OS keyring, else the encrypted
+5. the exact-fortress stored passphrase: the OS keyring, else the encrypted
    fallback file
 
-The first non-empty operator credential (1 to 4) wins outright and is used as
+The first non-empty operator credential (1 to 3) wins outright and is used as
 given, so a credential you name that turns out to be wrong fails loudly instead
-of being masked by a factor that happens to work. An empty value counts as not
-set. `--passphrase-stdin` reads the first piped line and refuses an empty line,
-a TTY, or combination with `--passphrase`. The two host-local factors (5 and 6)
-fall through to each other, and each
+of being masked by a factor that happens to work. On `sanctuary protect`,
+`--passphrase-stdin` precedes `--passphrase`, reads the first piped line, and
+refuses an empty line, a TTY, or combination with `--passphrase`, `--unwrap`, or
+`--dry-run`. An empty value counts as not set. The two host-local factors (4 and
+5) fall through to each other, and each
 one is checked against this fortress before it is used, so a leftover
 credential from an earlier install is skipped rather than tried and failed.
 

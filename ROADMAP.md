@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-06. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-10. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -29,6 +29,8 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, Cline, and Mastra today (Mastra fixture-tested only; no live Mastra-agent drill is recorded; others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
 *Status: shipped through v1.7.0 (latest release tag, 2026-07-26).*
+
+*`sanctuary protect --passphrase-stdin` reads the passphrase from stdin for scripted setup.*
 
 *Clean uninstall verb (built 2026-08-09, CLI wiring + tests; release pending): `sanctuary uninstall` removes the reachable installed enforcement footprint by disarming the macOS wall when available, uninstalling the auto-provisioned harness daemon, scrubbing provisioned egress rules, and removing the boot LaunchDaemon when run with the needed root privilege. It preserves operator data by default: fortress state, keys, passphrase custody, recovery material, and the audit log stay in place and are named in the output. Honest bounds: a root-owned boot service requires sudo, the host-wide Castle Wall global pin is left for explicit operator removal, system-extension deactivation still belongs to the Castle Wall host app and may require reboot, and successful re-home replay is not claimed because the current shipped record does not persist a replay manifest for this CLI to consume.*
 

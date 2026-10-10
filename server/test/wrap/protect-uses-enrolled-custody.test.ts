@@ -98,6 +98,30 @@ class ProcessExit extends Error {
   }
 }
 
+function captureOperatorOutput(): { text: () => string } {
+  const chunks: string[] = [];
+  const push = (...values: unknown[]): void => {
+    chunks.push(values.map((value) => String(value)).join(" "));
+  };
+
+  vi.mocked(console.error).mockImplementation((...args) => push(...args));
+  vi.mocked(console.info).mockImplementation((...args) => push(...args));
+  vi.mocked(console.warn).mockImplementation((...args) => push(...args));
+  vi.spyOn(console, "log").mockImplementation((...args) => push(...args));
+  vi.mocked(process.stderr.write).mockImplementation(((chunk: unknown) => {
+    push(chunk);
+    return true;
+  }) as typeof process.stderr.write);
+  vi.spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
+    push(chunk);
+    return true;
+  }) as typeof process.stdout.write);
+
+  return {
+    text: () => chunks.join("\n"),
+  };
+}
+
 function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
   return {
     cooperativeWrap: "absent",
@@ -198,6 +222,12 @@ describe("protect uses the custody factor init enrolled", () => {
     expect(() =>
       parseWrapArgs(["--passphrase-stdin", "--passphrase", "hunter2"]),
     ).toThrow("--passphrase-stdin cannot be combined with --passphrase");
+    expect(() => parseWrapArgs(["--passphrase-stdin", "--passphrase"])).toThrow(
+      "--passphrase-stdin cannot be combined with --passphrase",
+    );
+    expect(() => parseWrapArgs(["--passphrase", "--passphrase-stdin"])).toThrow(
+      "--passphrase-stdin cannot be combined with --passphrase",
+    );
   });
 
   /** `sanctuary init` on the documented interactive path: enrolls an OS-keyring custody factor and no passphrase. */
@@ -400,6 +430,7 @@ describe("protect uses the custody factor init enrolled", () => {
 
   it("accepts the same explicit protect passphrase from stdin as from argv", async () => {
     const passphrase = "protect-stdin-passphrase-not-printed";
+    const output = captureOperatorOutput();
     const argvFortress = join(home, "argv-fortress");
     const stdinFortress = join(home, "stdin-fortress");
     const argvConfig = join(home, "argv-config.json");
@@ -453,12 +484,52 @@ describe("protect uses the custody factor init enrolled", () => {
       master.fill(0);
     }
 
-    const captured =
-      vi.mocked(console.error).mock.calls.map((call) => call.join(" ")).join("\n") +
-      vi.mocked(console.info).mock.calls.map((call) => call.join(" ")).join("\n") +
-      vi.mocked(console.warn).mock.calls.map((call) => call.join(" ")).join("\n");
-    expect(captured).not.toContain(passphrase);
+    expect(output.text()).not.toContain(passphrase);
   }, 120_000);
+
+  it("refuses protect --passphrase-stdin combined with --unwrap", async () => {
+    const output = captureOperatorOutput();
+    await expect(
+      runWrap(
+        {
+          unwrap: true,
+          passphraseFromStdin: true,
+          protectCommand: true,
+        },
+        {
+          ...wrapDeps(),
+          stdin: Readable.from(["unwrap-passphrase-not-printed\n"]),
+        },
+      ),
+    ).rejects.toThrow("process.exit(2)");
+    expect(output.text()).toContain(
+      "--passphrase-stdin cannot be combined with --unwrap",
+    );
+    expect(output.text()).not.toContain("unwrap-passphrase-not-printed");
+  });
+
+  it("refuses protect --passphrase-stdin combined with --dry-run", async () => {
+    const output = captureOperatorOutput();
+    await expect(
+      runWrap(
+        {
+          wrap: join(home, "unused-config.json"),
+          fortress,
+          dryRun: true,
+          passphraseFromStdin: true,
+          protectCommand: true,
+        },
+        {
+          ...wrapDeps(),
+          stdin: Readable.from(["dry-run-passphrase-not-printed\n"]),
+        },
+      ),
+    ).rejects.toThrow("process.exit(2)");
+    expect(output.text()).toContain(
+      "--passphrase-stdin cannot be combined with --dry-run",
+    );
+    expect(output.text()).not.toContain("dry-run-passphrase-not-printed");
+  });
 
   it("refuses an empty protect --passphrase-stdin value", async () => {
     await expect(
@@ -511,6 +582,7 @@ describe("protect uses the custody factor init enrolled", () => {
   });
 
   it("refuses protect --passphrase-stdin combined with --passphrase", async () => {
+    const output = captureOperatorOutput();
     await expect(
       runWrap(
         {
@@ -527,12 +599,11 @@ describe("protect uses the custody factor init enrolled", () => {
         },
       ),
     ).rejects.toThrow("process.exit(2)");
-    const captured = vi.mocked(console.error).mock.calls
-      .map((call) => call.join(" "))
-      .join("\n");
-    expect(captured).toContain("--passphrase-stdin cannot be combined with --passphrase");
-    expect(captured).not.toContain("argv-value-not-printed");
-    expect(captured).not.toContain("stdin-value-not-printed");
+    expect(output.text()).toContain(
+      "--passphrase-stdin cannot be combined with --passphrase",
+    );
+    expect(output.text()).not.toContain("argv-value-not-printed");
+    expect(output.text()).not.toContain("stdin-value-not-printed");
   });
 
   it("export-passphrase returns the enrolled factor after init", async () => {

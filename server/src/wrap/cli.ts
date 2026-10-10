@@ -3160,6 +3160,22 @@ export async function runWrap(
     );
     process.exit(2);
   }
+  if (options.passphraseFromStdin === true && options.unwrap === true) {
+    // SAFETY: fixed operator-facing refusal; unwrap has no passphrase input
+    // path, so no stdin bytes are read or echoed before the command stops.
+    console.error(
+      "\n  Sanctuary protect: --passphrase-stdin cannot be combined with --unwrap.\n",
+    );
+    process.exit(2);
+  }
+  if (options.passphraseFromStdin === true && options.dryRun === true) {
+    // SAFETY: fixed operator-facing refusal; dry-run must not consume an
+    // operator credential because it performs no custody mutation.
+    console.error(
+      "\n  Sanctuary protect: --passphrase-stdin cannot be combined with --dry-run.\n",
+    );
+    process.exit(2);
+  }
   const operatorCustodyShapeInvalid =
     options.operatorCustody === true &&
     ((deps.osPlatform ?? platform)() !== "darwin" ||
@@ -6733,6 +6749,8 @@ function parseDashboardPortFlag(flag: string, value: string | undefined): number
 
 export function parseWrapArgs(argv: string[]): WrapOptions {
   const options: WrapOptions = {};
+  const passphraseFlagPresent = argv.includes("--passphrase");
+  const passphraseStdinFlagPresent = argv.includes("--passphrase-stdin");
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -6895,7 +6913,7 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
   if (options.devDist !== undefined && options.sealedLauncher !== undefined) {
     throw new Error("--sealed-launcher cannot be combined with --dev-dist.");
   }
-  if (options.passphraseFromStdin === true && options.passphrase !== undefined) {
+  if (passphraseStdinFlagPresent && passphraseFlagPresent) {
     throw new Error("--passphrase-stdin cannot be combined with --passphrase.");
   }
 
