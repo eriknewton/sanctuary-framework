@@ -1150,7 +1150,7 @@ export interface RotateMasterOptions {
   /** Test only: observe the real kernel holder and kill it to prove fencing. */
   __testAfterKernelHolderAcquired?: (pid: number) => void;
   /** Test only: observe the process-owned lock socket for loss fencing. */
-  __testAfterKernelSocketAcquired?: (path: string) => void;
+  __testAfterKernelSocketAcquired?: (path: string) => void | Promise<void>;
   /** Test only: pause after durable Castle-pin publish but before the lease fence. */
   __testAfterCastlePinPublished?: () => void | Promise<void>;
   /** Test only: storage-only fixtures may inject an isolated file capability. */

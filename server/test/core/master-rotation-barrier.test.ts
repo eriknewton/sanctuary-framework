@@ -83,6 +83,10 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
 
     let exclusiveBound!: () => void;
     const exclusiveIsBound = new Promise<void>((resolve) => { exclusiveBound = resolve; });
+    let allowExclusiveDrain!: () => void;
+    const exclusiveDrainMayStart = new Promise<void>((resolve) => {
+      allowExclusiveDrain = resolve;
+    });
     const rotation = rotateMaster({
       storage,
       fortressPath: root,
@@ -93,19 +97,22 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
       __testMasterRotationBarrierOptions: {
         timeoutMs: 10_000,
         retryMs: 10,
-        __testAfterExclusiveSocketAcquired: () => exclusiveBound(),
+        __testAfterExclusiveSocketAcquired: async () => {
+          exclusiveBound();
+          await exclusiveDrainMayStart;
+        },
       },
     });
     await exclusiveIsBound;
 
     // The writer was admitted before the exclusive gate. Its last write is
     // allowed to finish; no later reader can unlock until rotation finalizes.
-    writer.stdin.end("WRITE\n");
-    const writerExit = await new Promise<number | null>((resolve, reject) => {
+    const writerExit = new Promise<number | null>((resolve, reject) => {
       writer.once("error", reject);
       writer.once("close", resolve);
-    });
-    expect(writerExit, stderr).toBe(0);
+    }).finally(() => allowExclusiveDrain());
+    writer.stdin.end("WRITE\n");
+    expect(await writerExit, stderr).toBe(0);
     expect(stdout).toContain("WROTE\n");
     await rotation;
 

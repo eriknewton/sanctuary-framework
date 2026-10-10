@@ -291,7 +291,7 @@ export interface CrossProcessLockOptions {
   /** TEST ONLY: observe the serialized stale-socket reaper process. */
   __testAfterStaleReaperStarted?: (pid: number) => void;
   /** TEST ONLY: observe the process-owned socket path after identity capture. */
-  __testAfterKernelSocketAcquired?: (path: string) => void;
+  __testAfterKernelSocketAcquired?: (path: string) => void | Promise<void>;
   /**
    * TEST ONLY: force a kernel socket-owner probe to report `unknown`. This seam
    * cannot manufacture the `stale` or `live` states that authorize progress.
@@ -375,7 +375,7 @@ export interface MasterWriteBarrierOptions {
   /** TEST ONLY: observe the shared reader socket after it is fully admitted. */
   __testAfterSharedSocketAcquired?: (path: string) => void;
   /** TEST ONLY: observe the exclusive gate after it is live. */
-  __testAfterExclusiveSocketAcquired?: (path: string) => void;
+  __testAfterExclusiveSocketAcquired?: (path: string) => void | Promise<void>;
   /** TEST ONLY: pause after the exclusive gate drained every prior reader. */
   __testAfterExclusiveDrain?: () => void | Promise<void>;
   /** TEST ONLY: shorten the release bound. */
@@ -1522,7 +1522,9 @@ async function acquireKernelLock(
       if (!server.listening) {
         throw new Error("listener stopped before custody callback admission");
       }
-      options.__testAfterKernelSocketAcquired?.(socketPath);
+      // The awaited hook is test-only scheduling control; production never
+      // passes it, so production lock timing cannot be delayed here.
+      await options.__testAfterKernelSocketAcquired?.(socketPath);
       let testHelper: ChildProcessWithoutNullStreams | undefined;
       if (options.__testAfterKernelHolderAcquired) {
         testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
