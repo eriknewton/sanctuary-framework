@@ -369,6 +369,28 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     expect(stderr).toContain("Tests <N> passed");
   });
 
+  it("(xii) a second summary-shaped line in test output blocks the push instead of choosing the count (L14a)", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    // Test stdout printing a colored look-alike at the floor before vitest's
+    // real (lower) summary: after the ANSI strip both lines parse, so the
+    // hook must refuse the ambiguity rather than take either one.
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD:
+        "printf '\\033[2m      Tests \\033[22m \\033[1m\\033[32m50 passed\\033[39m\\033[22m\\n" +
+        "Test Files  3 passed (3)\\n      Tests  4 passed (4)\\n'",
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("expected exactly one");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {
     const { repoDir, mainSha } = buildRepo({ baselineMain: 10, baselineHead: 10 });
     track(repoDir);
