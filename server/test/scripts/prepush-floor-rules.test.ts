@@ -45,6 +45,15 @@ const REAL_GATE2B_PATH = resolve(
   "gate2b-check.sh",
 );
 
+const REAL_PARSE_VITEST_SUMMARY_PATH = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "scripts",
+  "parse-vitest-summary.sh",
+);
+
 const ZERO_SHA = "0".repeat(40);
 const UNRESOLVABLE_SHA = "1234567890abcdef1234567890abcdef12345678";
 
@@ -107,6 +116,10 @@ function buildRepo(opts: {
   fs.copyFileSync(
     REAL_GATE2B_PATH,
     path.join(repoDir, "scripts", "gate2b-check.sh"),
+  );
+  fs.copyFileSync(
+    REAL_PARSE_VITEST_SUMMARY_PATH,
+    path.join(repoDir, "scripts", "parse-vitest-summary.sh"),
   );
   fs.writeFileSync(
     path.join(repoDir, "server", "scripts", "count-vitest-test-files.mjs"),
@@ -387,6 +400,25 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     });
 
     expect(status).not.toBe(0);
+    expect(stderr).toContain("expected exactly one");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
+  it("(xiii) two summary counts on one physical line block the push instead of choosing the first count", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD:
+        "printf 'Test Files  3 passed (3)\\n      Tests  50 passed (50)      Tests  4 passed (4)\\n'",
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("count-shaped matches");
     expect(stderr).toContain("expected exactly one");
     expect(stderr).not.toContain("All baseline-guard checks passed");
   });
