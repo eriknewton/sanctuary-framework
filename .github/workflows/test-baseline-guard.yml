@@ -217,12 +217,10 @@ jobs:
       - name: Gate 2c - passing count >= baseline
         run: |
           baseline="${{ steps.baseline.outputs.baseline }}"
-          passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
-          if [[ -z "$passing" ]]; then
-            echo "::error::Could not parse passing-test count from vitest output."
-            tail -30 /tmp/vitest-output.log
-            exit 1
-          fi
+          # Must match the caller pin in .githooks/pre-push and the header in
+          # scripts/parse-vitest-summary.sh: the shared parser strips ANSI and
+          # requires exactly one Vitest summary line.
+          passing=$(VITEST_SUMMARY_ERROR_STYLE=github bash scripts/parse-vitest-summary.sh /tmp/vitest-output.log)
           echo "Baseline floor: $baseline"
           echo "Passing tests:  $passing"
           if (( passing < baseline )); then

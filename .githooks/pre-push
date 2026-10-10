@@ -725,39 +725,19 @@ fi
 validate_counter "Test Files count" "$actual_total"
 
 # ── Check: passing count >= baseline (Rule (a)) ──────────────────────
-# INVARIANT: the passing count comes from exactly ONE summary-shaped line,
-# and any parse failure is LOUD and blocks the push. Test stdout is part of
-# the capture and is not trusted: a test (or a dependency) can print its own
-# "Tests <N> passed" line, and after the ANSI strip above a colored look-alike
-# reads the same as vitest's real summary. Taking the first or last match
-# would let such a line choose the count, so more than one candidate is a
-# refusal, never a guess. A real full run prints the line once (vitest's
-# summary: "      Tests  <N> passed | <M> skipped (<T>)", label right-padded
-# to 11 columns, hence the leading-whitespace anchor).
-# Every grep here ends in `|| true`: an empty match must reach the named
-# refusals below, never end the hook at the assignment under
-# `set -euo pipefail` (a silent non-zero exit that git reports only as
-# "failed to push some refs").
-SUMMARY_LINE_RE='^[[:space:]]*Tests[[:space:]]+[0-9]+ passed'
-summary_lines=$(echo "$test_output" | grep -E "$SUMMARY_LINE_RE" || true)
-summary_line_count=$(printf '%s' "$summary_lines" | grep -c '' || true)
-if [[ -z "$summary_lines" ]]; then
-  fail "Could not parse passing-test count from vitest output - push blocked"
-  fail "Expected one vitest summary line matching 'Tests <N> passed' (after ANSI stripping); none was found."
-  echo "$test_output" | tail -30 >&2
-  exit 1
-fi
-if [[ "$summary_line_count" != "1" ]]; then
-  fail "Could not parse passing-test count from vitest output - push blocked"
-  fail "Found $summary_line_count lines shaped like the vitest 'Tests <N> passed' summary; expected exactly one."
-  fail "Test output that prints its own summary-shaped line makes the count ambiguous, so this hook refuses to pick one:"
-  printf '%s\n' "$summary_lines" >&2
-  exit 1
-fi
-passing=$(printf '%s\n' "$summary_lines" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" || true)
-if [[ -z "$passing" ]]; then
-  fail "Could not parse passing-test count from vitest output - push blocked"
-  fail "The summary line was found but no count could be read from it: $summary_lines"
+# INVARIANT: the passing count parser is shared with
+# .github/workflows/test-baseline-guard.yml through
+# scripts/parse-vitest-summary.sh, whose header must match this caller pin.
+# The script strips ANSI and requires exactly one summary-shaped line, so the
+# local hook and CI read the same count instead of keeping separate regexes.
+set +e
+passing=$(
+  VITEST_SUMMARY_ERROR_PREFIX="[baseline-guard] " \
+    bash scripts/parse-vitest-summary.sh "$GATE2B_LOG"
+)
+parse_passing_status=$?
+set -e
+if (( parse_passing_status != 0 )); then
   exit 1
 fi
 validate_counter "passing-test count" "$passing"
