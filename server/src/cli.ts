@@ -1766,6 +1766,7 @@ function printWrapHelpEarly(): void {
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)
+    --passphrase-stdin Read the fortress passphrase from piped stdin
     --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
                        SANCTUARY_FORTRESS_PATH env var when the flag is
                        absent. Use to keep multiple fortresses isolated

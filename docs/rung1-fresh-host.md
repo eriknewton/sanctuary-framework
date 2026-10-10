@@ -139,18 +139,21 @@ reads retain older lexical service names; new writes use the canonical identity.
 server and the dashboard all resolve the fortress credential through one shared
 chain, in this order:
 
-1. `--passphrase`
-2. `SANCTUARY_PASSPHRASE`
-3. `SANCTUARY_RECOVERY_KEY`
-4. the enrolled OS-keyring custody factor for this fortress, the one
+1. `--passphrase-stdin`
+2. `--passphrase`
+3. `SANCTUARY_PASSPHRASE`
+4. `SANCTUARY_RECOVERY_KEY`
+5. the enrolled OS-keyring custody factor for this fortress, the one
    interactive `init` writes
-5. the exact-fortress stored passphrase: the OS keyring, else the encrypted
+6. the exact-fortress stored passphrase: the OS keyring, else the encrypted
    fallback file
 
-The first non-empty operator credential (1 to 3) wins outright and is used as
+The first non-empty operator credential (1 to 4) wins outright and is used as
 given, so a credential you name that turns out to be wrong fails loudly instead
 of being masked by a factor that happens to work. An empty value counts as not
-set. The two host-local factors (4 and 5) fall through to each other, and each
+set. `--passphrase-stdin` reads the first piped line and refuses an empty line,
+a TTY, or combination with `--passphrase`. The two host-local factors (5 and 6)
+fall through to each other, and each
 one is checked against this fortress before it is used, so a leftover
 credential from an earlier install is skipped rather than tried and failed.
 
@@ -164,7 +167,7 @@ that factor is the only host-local credential that exists, so a host where
 Memory verbs use a narrower chain of their own, and its last two entries are in
 the opposite order:
 
-1. `--passphrase-stdin` (memory-file verbs only)
+1. `--passphrase-stdin`
 2. a legacy `--passphrase` argv value
 3. `SANCTUARY_PASSPHRASE`
 4. `SANCTUARY_RECOVERY_KEY`
