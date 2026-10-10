@@ -201,6 +201,7 @@ import {
   registerHostTenant,
   TENANTS_REGISTRY_FILE_NAME,
 } from "../cli/agents/tenant-registry.js";
+import { readPassphraseFromStdin } from "../cli/passphrase-stdin.js";
 import {
   disclosePassphrase,
   PassphraseConfirmationDeclinedError,
@@ -520,6 +521,8 @@ export interface WrapOptions {
   unwrap?: boolean;
   /** Explicit passphrase override. If unset, one is generated and stored. */
   passphrase?: string;
+  /** Read the explicit passphrase from the first line of stdin. */
+  passphraseFromStdin?: boolean;
   /**
    * Operator-supplied fortress path. Overrides SANCTUARY_FORTRESS_PATH and
    * SANCTUARY_STORAGE_PATH env vars. v1.1.0 silently ignored this flag
@@ -3004,6 +3007,8 @@ async function resolveProtectCredential(
 }
 
 export interface RunWrapDeps {
+  /** Stdin source for `--passphrase-stdin` (tests inject a Readable). */
+  stdin?: NodeJS.ReadableStream;
   /**
    * Override the read-only protect preflight (for tests). Production callers
    * leave this undefined and get the real preflight probes.
@@ -3147,6 +3152,14 @@ export async function runWrap(
     options.cline,
     options.mastra,
   ].filter((selected) => selected === true).length;
+  if (options.passphraseFromStdin === true && options.passphrase !== undefined) {
+    // SAFETY: fixed operator-facing refusal; it names only flag sources and
+    // never prints either supplied credential value.
+    console.error(
+      "\n  Sanctuary protect: --passphrase-stdin cannot be combined with --passphrase.\n",
+    );
+    process.exit(2);
+  }
   const operatorCustodyShapeInvalid =
     options.operatorCustody === true &&
     ((deps.osPlatform ?? platform)() !== "darwin" ||
@@ -3156,6 +3169,7 @@ export async function runWrap(
       selectedHarnessCount !== 1 ||
       options.wrap !== undefined ||
       options.passphrase !== undefined ||
+      options.passphraseFromStdin === true ||
       options.writePassphraseBackup !== undefined ||
       options.devDist !== undefined ||
       (options.sealedLauncher !== undefined &&
@@ -3205,6 +3219,33 @@ export async function runWrap(
   // no-op when neither --fortress nor SANCTUARY_FORTRESS_PATH is set, so the
   // ambient/default unwrap path is byte-identical.
   promoteFortressToStoragePath(options);
+
+  let explicitPassphrase = options.passphrase;
+  if (
+    options.passphraseFromStdin === true &&
+    options.unwrap !== true &&
+    options.dryRun !== true
+  ) {
+    const stdin = deps.stdin ?? process.stdin;
+    const stdinIsTty = (stdin as NodeJS.ReadStream).isTTY === true;
+    if (stdinIsTty) {
+      // SAFETY: fixed operator-facing refusal; it names only the input channel,
+      // never any credential value.
+      console.error(
+        "\n  Sanctuary protect: --passphrase-stdin requires piped input. Pipe the passphrase on stdin.\n",
+      );
+      process.exit(2);
+    }
+    explicitPassphrase = await readPassphraseFromStdin(stdin);
+    if (explicitPassphrase.length === 0) {
+      // SAFETY: fixed operator-facing refusal; empty input carries no secret
+      // and no captured bytes are echoed.
+      console.error(
+        "\n  Sanctuary protect: --passphrase-stdin received an empty passphrase. Pipe a non-empty value.\n",
+      );
+      process.exit(2);
+    }
+  }
 
   // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
@@ -3351,7 +3392,7 @@ export async function runWrap(
     try {
       preResolvedAgentCredential = await resolveProtectCredential(
         earlyStoragePath,
-        options.passphrase,
+        explicitPassphrase,
         deps,
       );
     } catch (err) {
@@ -3868,7 +3909,7 @@ export async function runWrap(
     passphraseLocation = protectCredential.location;
     passphraseSource = protectCredential.source;
     passphraseValue = protectCredential.passphraseValue;
-    if (options.passphrase === undefined && passphraseSource === "generated") {
+    if (explicitPassphrase === undefined && passphraseSource === "generated") {
       // SAFETY: destination description only; never the generated value.
       console.error(
         `\n  \u{1F510} Generated and stored passphrase (${passphraseLocation}).`,
@@ -3880,7 +3921,7 @@ export async function runWrap(
     try {
       protectCredential = await resolveProtectCredential(
         storagePath,
-        options.passphrase,
+        explicitPassphrase,
         deps,
       );
       passphraseLocation = protectCredential.location;
@@ -4004,7 +4045,7 @@ export async function runWrap(
   const isFallbackGenerated = passphraseSource === "generated" && usingFallback;
   const isFallbackUserProvided =
     passphraseSource === "fallback-file" && usingFallback;
-  if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
+  if (isFallbackGenerated || (explicitPassphrase && isFallbackUserProvided)) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
@@ -6657,6 +6698,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--unprotect-egress-gate",
   "--stand-down-agent",
   "--override-transient-pf-rules",
+  "--passphrase-stdin",
   "--preflight",
   "--json",
   "--strict",
@@ -6740,6 +6782,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--passphrase":
         options.passphrase = argv[++i];
+        break;
+      case "--passphrase-stdin":
+        options.passphraseFromStdin = true;
         break;
       case "--port":
       case "--dashboard-port":
@@ -6850,6 +6895,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
   if (options.devDist !== undefined && options.sealedLauncher !== undefined) {
     throw new Error("--sealed-launcher cannot be combined with --dev-dist.");
   }
+  if (options.passphraseFromStdin === true && options.passphrase !== undefined) {
+    throw new Error("--passphrase-stdin cannot be combined with --passphrase.");
+  }
 
   return options;
 }
@@ -6883,6 +6931,7 @@ function printWrapHelp(): void {
     --json             Render --preflight output as machine-readable JSON
     --strict           Make UNDETERMINED preflight rows exit non-zero
     --passphrase <p>   Override the stored passphrase (one-off)
+    --passphrase-stdin Read the fortress passphrase from piped stdin
     --fortress <path>  Fortress directory (default: ~/.sanctuary). Honors
                        SANCTUARY_FORTRESS_PATH env var when the flag is
                        absent. Use to keep multiple fortresses isolated

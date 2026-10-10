@@ -25,9 +25,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 
 const castleWallMocks = vi.hoisted(() => ({
   runProvisionPin: vi.fn(async () => 0),
@@ -190,6 +191,13 @@ describe("protect uses the custody factor init enrolled", () => {
     });
     vi.restoreAllMocks();
     await rm(home, { recursive: true, force: true });
+  });
+
+  it("parses the protect passphrase stdin flag and rejects the argv combination", () => {
+    expect(parseWrapArgs(["--passphrase-stdin"]).passphraseFromStdin).toBe(true);
+    expect(() =>
+      parseWrapArgs(["--passphrase-stdin", "--passphrase", "hunter2"]),
+    ).toThrow("--passphrase-stdin cannot be combined with --passphrase");
   });
 
   /** `sanctuary init` on the documented interactive path: enrolls an OS-keyring custody factor and no passphrase. */
@@ -389,6 +397,143 @@ describe("protect uses the custody factor init enrolled", () => {
     );
     expect(await readStoredPassphrase({ storagePath: fortress })).toBeNull();
   }, 120_000);
+
+  it("accepts the same explicit protect passphrase from stdin as from argv", async () => {
+    const passphrase = "protect-stdin-passphrase-not-printed";
+    const argvFortress = join(home, "argv-fortress");
+    const stdinFortress = join(home, "stdin-fortress");
+    const argvConfig = join(home, "argv-config.json");
+    const stdinConfig = join(home, "stdin-config.json");
+    for (const configPath of [argvConfig, stdinConfig]) {
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          mcpServers: {
+            demo: { command: "node", args: ["demo.js"] },
+          },
+        }),
+        "utf-8",
+      );
+    }
+
+    await runWrap(
+      {
+        wrap: argvConfig,
+        fortress: argvFortress,
+        passphrase,
+        noOpen: true,
+        noDashboard: true,
+        protectCommand: true,
+      },
+      wrapDeps(),
+    );
+    await runWrap(
+      {
+        wrap: stdinConfig,
+        fortress: stdinFortress,
+        passphraseFromStdin: true,
+        noOpen: true,
+        noDashboard: true,
+        protectCommand: true,
+      },
+      {
+        ...wrapDeps(),
+        stdin: Readable.from([`${passphrase}\nignored second line\n`]),
+      },
+    );
+
+    for (const fortressPath of [argvFortress, stdinFortress]) {
+      const stored = await readStoredPassphrase({ storagePath: fortressPath });
+      expect(stored?.value).toBe(passphrase);
+      const master = await unlockExistingMasterReadOnly(
+        new FilesystemStorage(join(fortressPath, "state")),
+        { passphrase, storagePathHint: fortressPath },
+      );
+      expect(master.length).toBe(32);
+      master.fill(0);
+    }
+
+    const captured =
+      vi.mocked(console.error).mock.calls.map((call) => call.join(" ")).join("\n") +
+      vi.mocked(console.info).mock.calls.map((call) => call.join(" ")).join("\n") +
+      vi.mocked(console.warn).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(captured).not.toContain(passphrase);
+  }, 120_000);
+
+  it("refuses an empty protect --passphrase-stdin value", async () => {
+    await expect(
+      runWrap(
+        {
+          wrap: join(home, "unused-config.json"),
+          fortress,
+          passphraseFromStdin: true,
+          noOpen: true,
+          protectCommand: true,
+        },
+        {
+          ...wrapDeps(),
+          stdin: Readable.from(["\n"]),
+        },
+      ),
+    ).rejects.toThrow("process.exit(2)");
+    const captured = vi.mocked(console.error).mock.calls
+      .map((call) => call.join(" "))
+      .join("\n");
+    expect(captured).toContain("--passphrase-stdin received an empty passphrase");
+  });
+
+  it("refuses protect --passphrase-stdin on a TTY", async () => {
+    const stdin = new Readable({ read() {} });
+    Object.defineProperty(stdin, "isTTY", {
+      configurable: true,
+      value: true,
+    });
+
+    await expect(
+      runWrap(
+        {
+          wrap: join(home, "unused-config.json"),
+          fortress,
+          passphraseFromStdin: true,
+          noOpen: true,
+          protectCommand: true,
+        },
+        {
+          ...wrapDeps(),
+          stdin,
+        },
+      ),
+    ).rejects.toThrow("process.exit(2)");
+    const captured = vi.mocked(console.error).mock.calls
+      .map((call) => call.join(" "))
+      .join("\n");
+    expect(captured).toContain("--passphrase-stdin requires piped input");
+  });
+
+  it("refuses protect --passphrase-stdin combined with --passphrase", async () => {
+    await expect(
+      runWrap(
+        {
+          wrap: join(home, "unused-config.json"),
+          fortress,
+          passphrase: "argv-value-not-printed",
+          passphraseFromStdin: true,
+          noOpen: true,
+          protectCommand: true,
+        },
+        {
+          ...wrapDeps(),
+          stdin: Readable.from(["stdin-value-not-printed\n"]),
+        },
+      ),
+    ).rejects.toThrow("process.exit(2)");
+    const captured = vi.mocked(console.error).mock.calls
+      .map((call) => call.join(" "))
+      .join("\n");
+    expect(captured).toContain("--passphrase-stdin cannot be combined with --passphrase");
+    expect(captured).not.toContain("argv-value-not-printed");
+    expect(captured).not.toContain("stdin-value-not-printed");
+  });
 
   it("export-passphrase returns the enrolled factor after init", async () => {
     await initFortress();

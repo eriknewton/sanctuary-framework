@@ -8,7 +8,6 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 
 import { loadConfig } from "../config.js";
@@ -59,6 +58,7 @@ import {
   hasFlag,
   shellQuoteSingleArg,
 } from "./argv.js";
+import { readPassphraseFromStdin } from "./passphrase-stdin.js";
 
 export interface MemoryFileCommandArgs {
   readonly argv: string[];
@@ -235,12 +235,6 @@ function refuseOwnerRefOrIdentityBeforeBootstrap(
   return false;
 }
 
-/**
- * Bound on the `--passphrase-stdin` read so a pipe that is opened and never
- * written does not hang the command forever. An empty read falls through to the
- * normal "no credential supplied" refusal.
- */
-const STDIN_READ_DEADLINE_MS = 30_000;
 export const PASSPHRASE_ARGV_WARNING =
   "Warning: --passphrase puts the fortress passphrase in this process's argv, " +
   "where any local user can read it from the process list. Use " +
@@ -1101,36 +1095,6 @@ function parseVaultArgs(
     passphrase,
     passphraseFromStdin: hasFlag([...argv], "--passphrase-stdin"),
   };
-}
-
-/**
- * Read one line from stdin as the fortress passphrase.
- *
- * Failure mode to watch for: a caller that passes `--passphrase-stdin` and then
- * never writes to the pipe. That looks like a stuck command rather than a
- * credential problem, so the read is deadline-bounded and an empty result falls
- * through to the normal refusal.
- */
-async function readPassphraseFromStdin(stdin: NodeJS.ReadableStream): Promise<string> {
-  return new Promise((resolvePassphrase) => {
-    const rl = createInterface({ input: stdin });
-    let settled = false;
-    const finish = (value: string): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      try {
-        rl.close();
-      } catch {
-        // Already closed; the value is what matters.
-      }
-      resolvePassphrase(value);
-    };
-    const deadline = setTimeout(() => finish(""), STDIN_READ_DEADLINE_MS);
-    rl.once("line", (line) => finish(line));
-    rl.once("close", () => finish(""));
-    rl.once("error", () => finish(""));
-  });
 }
 
 interface BootstrappedMemoryFileCommand {
