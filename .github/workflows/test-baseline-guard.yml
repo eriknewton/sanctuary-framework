@@ -221,6 +221,10 @@ jobs:
           # scripts/parse-vitest-summary.sh: the shared parser strips ANSI and
           # requires exactly one Vitest summary line.
           passing=$(VITEST_SUMMARY_ERROR_STYLE=github bash scripts/parse-vitest-summary.sh /tmp/vitest-output.log)
+          if ! [[ "$passing" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Parsed passing-test count is not a non-negative integer: '$passing'"
+            exit 1
+          fi
           echo "Baseline floor: $baseline"
           echo "Passing tests:  $passing"
           if (( passing < baseline )); then

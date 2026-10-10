@@ -22,6 +22,10 @@ strip_ansi() {
   LC_ALL=C sed $'s/\033\\[[0-?]*[ -/]*[@-~]//g'
 }
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if [[ "$#" != "1" ]]; then
   emit_error "Usage: scripts/parse-vitest-summary.sh <vitest-output-log>"
   exit 1
@@ -42,6 +46,8 @@ fi
 # exactly one Vitest summary-shaped line remains after ANSI stripping. Picking
 # the first or last matching line would make the baseline count ambiguous.
 SUMMARY_LINE_RE='^[[:space:]]*Tests[[:space:]]+[0-9]+ passed'
+SUMMARY_COUNT_RE='Tests[[:space:]]+[0-9]+ passed'
+EXPECTED_SUMMARY_COUNT=1
 summary_lines=$(printf '%s\n' "$stripped_output" | grep -E "$SUMMARY_LINE_RE" || true)
 if [[ -z "$summary_lines" ]]; then
   emit_error "Could not parse passing-test count from vitest output."
@@ -50,7 +56,7 @@ if [[ -z "$summary_lines" ]]; then
 fi
 
 summary_line_count=$(printf '%s\n' "$summary_lines" | wc -l | tr -d '[:space:]')
-if [[ "$summary_line_count" != "1" ]]; then
+if [[ "$summary_line_count" != "$EXPECTED_SUMMARY_COUNT" ]]; then
   emit_error "Could not parse passing-test count from vitest output."
   emit_error "Found $summary_line_count lines shaped like the vitest 'Tests <N> passed' summary; expected exactly one."
   emit_error "Test output that prints its own summary-shaped line makes the count ambiguous, so the baseline guard refuses to pick one:"
@@ -58,7 +64,16 @@ if [[ "$summary_line_count" != "1" ]]; then
   exit 1
 fi
 
-passing=$(printf '%s\n' "$summary_lines" | sed -E 's/^[[:space:]]*Tests[[:space:]]+([0-9]+) passed.*/\1/')
+summary_count_matches=$(printf '%s\n' "$summary_lines" | grep -oE "$SUMMARY_COUNT_RE" | wc -l | tr -d '[:space:]')
+if [[ "$summary_count_matches" != "$EXPECTED_SUMMARY_COUNT" ]]; then
+  emit_error "Could not parse passing-test count from vitest output."
+  emit_error "Found $summary_count_matches count-shaped matches inside the vitest summary line; expected exactly one."
+  emit_error "A single line with more than one 'Tests <N> passed' count is ambiguous, so the baseline guard refuses to pick one:"
+  printf '%s\n' "$summary_lines" >&2
+  exit 1
+fi
+
+passing=$(printf '%s\n' "$summary_lines" | grep -oE "$SUMMARY_COUNT_RE" | sed -E 's/^Tests[[:space:]]+([0-9]+) passed$/\1/')
 if [[ -z "$passing" ]]; then
   emit_error "Could not parse passing-test count from vitest output."
   emit_error "The summary line was found but no count could be read from it: $summary_lines"

@@ -404,6 +404,25 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     expect(stderr).not.toContain("All baseline-guard checks passed");
   });
 
+  it("(xiii) two summary counts on one physical line block the push instead of choosing the first count", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD:
+        "printf 'Test Files  3 passed (3)\\n      Tests  50 passed (50)      Tests  4 passed (4)\\n'",
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("count-shaped matches");
+    expect(stderr).toContain("expected exactly one");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {
     const { repoDir, mainSha } = buildRepo({ baselineMain: 10, baselineHead: 10 });
     track(repoDir);

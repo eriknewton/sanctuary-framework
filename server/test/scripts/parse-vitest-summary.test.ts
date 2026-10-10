@@ -86,6 +86,18 @@ describe("scripts/parse-vitest-summary.sh", () => {
     expect(result.stderr).toContain("4 passed");
   });
 
+  it("refuses two summary counts on one line with a named message", () => {
+    const result = runParser(
+      "Test Files  3 passed (3)\n      Tests  50 passed (50)      Tests  4 passed (4)\n",
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("count-shaped matches");
+    expect(result.stderr).toContain("expected exactly one");
+    expect(result.stderr).toContain("50 passed");
+    expect(result.stderr).toContain("4 passed");
+  });
+
   it("accepts an ANSI-wrapped summary count", () => {
     const result = runParser(
       "\u001b[2m Test Files \u001b[22m \u001b[1m\u001b[32m3 passed\u001b[39m\u001b[22m\u001b[90m (3)\u001b[39m\n" +
