@@ -41,7 +41,7 @@ describe("tsup source SHA resolution", () => {
     const result = spawnSync(process.execPath, ["--import", TSX_LOADER, "--eval", SCRIPT], {
       cwd,
       encoding: "utf8",
-      env: sourceTarballEnv({ SANCTUARY_SOURCE_SHA: sha }),
+      env: { ...sourceTarballEnv({ SANCTUARY_SOURCE_SHA: sha }), VITEST: process.env.VITEST },
     });
 
     expect(result.status).toBe(0);
@@ -55,7 +55,7 @@ describe("tsup source SHA resolution", () => {
     const result = spawnSync(process.execPath, ["--import", TSX_LOADER, "--eval", SCRIPT], {
       cwd,
       encoding: "utf8",
-      env: sourceTarballEnv(),
+      env: { ...sourceTarballEnv(), VITEST: process.env.VITEST },
     });
 
     expect(result.status).toBe(0);
