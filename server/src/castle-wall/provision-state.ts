@@ -176,8 +176,8 @@ export function castleWallLocalPlatformSubject(
 
 /**
  * The one operator-facing sentence for a vault that is not yet on the wall.
- * Shared so `init`, `wrap`, `castle-wall status`, and `doctor` cannot drift
- * into four different descriptions of the same state.
+ * Shared so init completion, `wrap`, and `castle-wall status` cannot drift into
+ * different descriptions of the same state.
  *
  * Deliberately free of trust-anchor vocabulary: it is read on a first run, by
  * someone who has not yet met the word "pin".

@@ -1637,9 +1637,8 @@ function readRequiredPathArg(
   return value;
 }
 
-export function printInitHelp(): void {
-  const localPlatformSubject = castleWallLocalPlatformSubject();
-  const notYetWalledSentence = castleWallNotYetWalledSentence();
+export function printInitHelp(host: NodeJS.Platform = platform()): void {
+  const localPlatformSubject = castleWallLocalPlatformSubject(host);
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
 sanctuary init. Create a fresh Sanctuary fortress at a chosen path.
@@ -1710,8 +1709,8 @@ What init does:
   7. Writes the default principal-policy.yaml, the approval-gate policy the
      runtime loads at startup and \`sanctuary doctor\` checks for.
   8. Creates this vault's own Castle Wall key pair, inside the fortress
-     directory, and records: ${notYetWalledSentence} Init never reads or
-     changes ${localPlatformSubject}'s Castle Wall settings:
+     directory, and records that the vault is not yet on the Castle Wall of
+     ${localPlatformSubject}. Init never reads or changes ${localPlatformSubject}'s Castle Wall settings:
      turning the wall on for a vault is a separate step you run when you
      mean to, and it is the installer's next action.
 

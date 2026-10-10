@@ -1476,7 +1476,33 @@ describe("sanctuary install agent contract", () => {
     // Re-pin is not a sudo/root step: the root signer helper writes the pin.
     expect(argv).not.toContain("sudo");
     expect(argv).toContain("SANCTUARY_STORAGE_PATH=/tmp/fortress");
+    expect(plan.next_action?.description ?? "").toBe(
+      "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.",
+    );
     expect((plan.next_action?.description ?? "").toLowerCase()).toContain("re-pin");
+  });
+
+  it("does not render macOS re-pin wording in Linux full-profile plans", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "linux",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "not-applicable",
+        bootService: "mismatch",
+        contentFilter: "not-applicable",
+        enforcement: "unavailable",
+        trustAnchor: "broken",
+      }),
+    });
+
+    const rendered = JSON.stringify(plan);
+    expect(plan.status).toBe("blocked");
+    expect(rendered).not.toContain("macOS restart it");
+    expect(rendered).not.toContain("private local Terminal");
   });
 
   it("names re-pin for a machine with no anchor yet, and for a vault that is not on the wall", () => {

@@ -121,6 +121,12 @@ const CASTLE_WALL_APP_IDENTIFIER = "ai.sanctuaryprotocol.macos";
 const CASTLE_WALL_LAUNCHER_IDENTIFIER =
   "ai.sanctuaryprotocol.macos.castle-wall.sanctuary-launcher";
 const CASTLE_WALL_HEADLESS_CONTRACT = "3";
+const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
+const HEX_CHARS_PER_BYTE = 2;
+const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
+// Must match SOURCE_SHA_HEX_PATTERN in server/tsup.config.ts and server/scripts/build-castle-wall-runtime-manifest.mjs.
+const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
+// Must match the define key in server/tsup.config.ts.
 const INSTALLER_SOURCE_SHA =
   typeof __SANCTUARY_SOURCE_SHA__ === "string" ? __SANCTUARY_SOURCE_SHA__ : null;
 const CASTLE_WALL_SIGNER_CLIENT =
@@ -665,7 +671,7 @@ async function probeCastleWallApp(): Promise<{
     if (
       contract.stdout.trim() !== CASTLE_WALL_HEADLESS_CONTRACT ||
       !/^[a-f0-9]{12}$/.test(sha) ||
-      !/^[a-f0-9]{40}$/.test(sourceSha.stdout.trim()) ||
+      !SOURCE_SHA_HEX_PATTERN.test(sourceSha.stdout.trim()) ||
       !sourceSha.stdout.trim().startsWith(sha) ||
       sourceSha.stdout.trim() !== INSTALLER_SOURCE_SHA ||
       cliVersion.stdout.trim() !== INSTALLER_VERSION ||
@@ -2102,12 +2108,16 @@ export function buildAgentInstallPlan(input: {
       plan.notes.push("The trust anchor needs to be installed or migrated, but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
       return plan;
     }
+    const restartClause = input.platform === "darwin"
+      ? "a mismatched anchor makes macOS restart it in a loop"
+      : "a mismatched anchor keeps the boot service from becoming stable";
+    const localShellName = input.platform === "darwin" ? "private local Terminal" : "private local shell";
     plan.status = "human_action";
     plan.next_action = {
       id: "repin_trust_anchor",
       actor: "human",
       description:
-        `This vault is not on ${localPlatformSubject}'s Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.`,
+        `This vault is not on ${localPlatformSubject}'s Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (${restartClause}). Run this exact 'castle-wall re-pin' command in a ${localShellName} to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.`,
       argv: [
         "/usr/bin/env",
         `SANCTUARY_STORAGE_PATH=${input.fortress}`,

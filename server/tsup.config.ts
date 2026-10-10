@@ -1,31 +1,48 @@
 import { defineConfig } from "tsup";
 import { execFileSync } from "node:child_process";
 
-const UNKNOWN_SOURCE_SHA = "unknown";
+// Must match SANCTUARY_SOURCE_SHA_ENV in server/test/scripts/tsup-config-source-sha.test.ts.
+const SANCTUARY_SOURCE_SHA_ENV = "SANCTUARY_SOURCE_SHA";
+const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
+const HEX_CHARS_PER_BYTE = 2;
+const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
+// Must match SOURCE_SHA_HEX_PATTERN in server/src/cli/install.ts and server/scripts/build-castle-wall-runtime-manifest.mjs.
+const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
+const GIT_REV_PARSE_TIMEOUT_MS = 5_000; // 5_000 ms = 5 seconds for one local metadata read.
+
+function requireSourceSha(value: string, source: string): string {
+  // INVARIANT: sealed-app verification compares against this value, so a placeholder would make every field check refuse.
+  if (!SOURCE_SHA_HEX_PATTERN.test(value)) {
+    throw new Error(
+      `${SANCTUARY_SOURCE_SHA_ENV} must be the exact ${SOURCE_SHA_HEX_CHARS}-hex source commit; ` +
+        `${source} was missing or malformed.`,
+    );
+  }
+  return value;
+}
 
 function resolveSourceSha(): string {
-  const override = process.env.SANCTUARY_SOURCE_SHA?.trim();
-  if (override) {
-    return override;
+  const override = process.env[SANCTUARY_SOURCE_SHA_ENV];
+  if (override !== undefined) {
+    return requireSourceSha(override.trim(), SANCTUARY_SOURCE_SHA_ENV);
   }
+  let gitSha: string;
   try {
-    return execFileSync(
+    gitSha = execFileSync(
       "/usr/bin/git",
       ["rev-parse", "HEAD"],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: GIT_REV_PARSE_TIMEOUT_MS },
     ).trim();
   } catch {
-    console.warn(
-      `Warning: SANCTUARY_SOURCE_SHA is not set and git metadata is unavailable; using ${UNKNOWN_SOURCE_SHA}.`,
+    throw new Error(
+      `${SANCTUARY_SOURCE_SHA_ENV} must be set to the exact ${SOURCE_SHA_HEX_CHARS}-hex source commit ` +
+        "when git metadata is unavailable.",
     );
-    return UNKNOWN_SOURCE_SHA;
   }
+  return requireSourceSha(gitSha, "git rev-parse HEAD");
 }
 
 const sourceSha = resolveSourceSha();
-if (sourceSha !== UNKNOWN_SOURCE_SHA && !/^[a-f0-9]{40}$/.test(sourceSha)) {
-  throw new Error("SANCTUARY_SOURCE_SHA must be the exact 40-hex source commit");
-}
 
 export default defineConfig({
   entry: {
@@ -46,6 +63,7 @@ export default defineConfig({
   splitting: false,
   treeshake: true,
   define: {
+    // Must match the injected global declared in server/src/cli/install.ts.
     __SANCTUARY_SOURCE_SHA__: JSON.stringify(sourceSha),
   },
   noExternal: ["@noble/curves", "@noble/hashes"],
