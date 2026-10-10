@@ -97,7 +97,7 @@ import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.
 // The vault-level wall claim written by wrap/init.ts. Wrap reads it and never
 // writes it.
 import {
-  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  castleWallNotYetWalledSentence,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
 import {
@@ -4067,7 +4067,7 @@ export async function runWrap(
       if (vaultProvision.state === "not-yet-walled") {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `\n  Sanctuary wrap: ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}`
+          `\n  Sanctuary wrap: ${castleWallNotYetWalledSentence(platform())}`
         );
       }
     } catch (err) {

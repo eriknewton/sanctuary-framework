@@ -30,8 +30,8 @@ import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-crea
 // never writes it: `walled` has no writer anywhere by design.
 import {
   CASTLE_WALL_NOT_YET_WALLED,
-  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
   CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE,
+  castleWallNotYetWalledSentence,
   castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
@@ -2088,7 +2088,7 @@ export async function runStatus(
   if (vaultProvision.state === "not-yet-walled") {
     write(
       out,
-      `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${CASTLE_WALL_NOT_YET_WALLED_SENTENCE})\n`,
+      `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${castleWallNotYetWalledSentence(platform)})\n`,
     );
   } else if (vaultProvision.state === "unreadable") {
     // A record that exists and does not parse is NOT-PROVEN, and `status` is the

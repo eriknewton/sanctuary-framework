@@ -92,8 +92,9 @@ import {
 // refuse every fortress that carries it).
 import {
   CASTLE_WALL_NOT_YET_WALLED,
-  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
   CASTLE_WALL_PROVISION_META_KEY,
+  castleWallLocalPlatformSubject,
+  castleWallNotYetWalledSentence,
 } from "../castle-wall/provision-state.js";
 import { stringToBytes } from "../core/encoding.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
@@ -502,6 +503,7 @@ export async function runInit(
   const provisionPin = deps.provisionPin ?? runProvisionPin;
   const fortressPath = resolveFortressPath(options);
   const host = platform();
+  const localPlatformSubject = castleWallLocalPlatformSubject(host);
   if (!kernelBackedCrossProcessLockPlatformSupported(host)) {
     throw new Error(
       `Sanctuary init requires process-owned custody locking; unsupported host platform ${host}. ` +
@@ -1368,7 +1370,7 @@ export async function runInit(
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  Sanctuary init: ${skipSource} is accepted but no longer does anything.\n` +
-        `  Creating a vault never changes this Mac's Castle Wall settings, with or\n` +
+        `  Creating a vault never changes ${localPlatformSubject}'s Castle Wall settings, with or\n` +
         `  without that option. You can stop passing it.\n`,
     );
   }
@@ -1444,7 +1446,7 @@ export async function runInit(
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  Sanctuary init: your vault is created.\n` +
-        `  ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}\n`,
+        `  ${castleWallNotYetWalledSentence(host)}\n`,
     );
   }
 
@@ -1636,6 +1638,8 @@ function readRequiredPathArg(
 }
 
 export function printInitHelp(): void {
+  const localPlatformSubject = castleWallLocalPlatformSubject();
+  const notYetWalledSentence = castleWallNotYetWalledSentence();
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
 sanctuary init. Create a fresh Sanctuary fortress at a chosen path.
@@ -1660,7 +1664,7 @@ Options:
                        file mode 0600). The key is NEVER written inside the
                        fortress it protects.
   --no-pin             Accepted, does nothing. Creating a vault never
-                       changes this Mac's Castle Wall settings, so there is
+                       changes ${localPlatformSubject}'s Castle Wall settings, so there is
                        nothing for this option to skip. It stays accepted so
                        saved commands keep working. Also settable via
                        SANCTUARY_INIT_NO_PIN=1.
@@ -1706,8 +1710,8 @@ What init does:
   7. Writes the default principal-policy.yaml, the approval-gate policy the
      runtime loads at startup and \`sanctuary doctor\` checks for.
   8. Creates this vault's own Castle Wall key pair, inside the fortress
-     directory, and records that the vault is not yet on the Castle Wall of
-     this Mac. Init never reads or changes this Mac's Castle Wall settings:
+     directory, and records: ${notYetWalledSentence} Init never reads or
+     changes ${localPlatformSubject}'s Castle Wall settings:
      turning the wall on for a vault is a separate step you run when you
      mean to, and it is the installer's next action.
 

@@ -1,12 +1,29 @@
 import { defineConfig } from "tsup";
 import { execFileSync } from "node:child_process";
 
-const sourceSha = process.env.SANCTUARY_SOURCE_SHA ?? execFileSync(
-  "/usr/bin/git",
-  ["rev-parse", "HEAD"],
-  { encoding: "utf8" },
-).trim();
-if (!/^[a-f0-9]{40}$/.test(sourceSha)) {
+const UNKNOWN_SOURCE_SHA = "unknown";
+
+function resolveSourceSha(): string {
+  const override = process.env.SANCTUARY_SOURCE_SHA?.trim();
+  if (override) {
+    return override;
+  }
+  try {
+    return execFileSync(
+      "/usr/bin/git",
+      ["rev-parse", "HEAD"],
+      { encoding: "utf8" },
+    ).trim();
+  } catch {
+    console.warn(
+      `Warning: SANCTUARY_SOURCE_SHA is not set and git metadata is unavailable; using ${UNKNOWN_SOURCE_SHA}.`,
+    );
+    return UNKNOWN_SOURCE_SHA;
+  }
+}
+
+const sourceSha = resolveSourceSha();
+if (sourceSha !== UNKNOWN_SOURCE_SHA && !/^[a-f0-9]{40}$/.test(sourceSha)) {
   throw new Error("SANCTUARY_SOURCE_SHA must be the exact 40-hex source commit");
 }
 

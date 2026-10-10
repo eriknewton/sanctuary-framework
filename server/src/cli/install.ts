@@ -55,6 +55,7 @@ import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall
 // The vault-level wall claim + its ONE derivation chokepoint. The planner
 // reads it; only `wrap/init.ts` writes it.
 import {
+  castleWallLocalPlatformSubject,
   deriveCastleWallProvision,
   readPersistedCastleWallProvision,
   type PersistedCastleWallProvisionObservation,
@@ -1848,6 +1849,7 @@ export function buildAgentInstallPlan(input: {
   observed: InstallProbeResult;
 }): AgentInstallPlan {
   const plan = basePlan(input.profile, input.harness, input.fortress, input.observed);
+  const localPlatformSubject = castleWallLocalPlatformSubject(input.platform);
   const sealedLauncherRuntime =
     input.platform === "darwin" &&
     input.observed.persistentCliPath === DEFAULT_CASTLE_WALL_LAUNCHER;
@@ -2105,7 +2107,7 @@ export function buildAgentInstallPlan(input: {
       id: "repin_trust_anchor",
       actor: "human",
       description:
-        "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.",
+        `This vault is not on ${localPlatformSubject}'s Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.`,
       argv: [
         "/usr/bin/env",
         `SANCTUARY_STORAGE_PATH=${input.fortress}`,
