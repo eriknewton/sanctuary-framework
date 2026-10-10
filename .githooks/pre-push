@@ -574,10 +574,36 @@ set +e
 if [[ -n "${SANCTUARY_PREPUSH_TEST_CMD:-}" ]]; then
   test_output=$(eval "$SANCTUARY_PREPUSH_TEST_CMD" 2>&1)
 else
-  test_output=$(cd server && npm test 2>&1 | node ../scripts/redact-test-output.mjs)
+  # NO_COLOR=1 asks vitest for an escape-free summary (vitest's color
+  # library lets NO_COLOR win over FORCE_COLOR); the strip below is the
+  # backstop for a runner that forces color anyway, so the gate never depends
+  # on this variable being honored.
+  test_output=$(cd server && NO_COLOR=1 npm test 2>&1 | node ../scripts/redact-test-output.mjs)
 fi
 test_exit=$?
 set -e
+
+# ── ANSI strip: every parse below reads escape-free text ─────────────
+# INVARIANT: every grep over vitest output in this hook (the transform
+# classifier, gate2b's "Test Files" parse via $GATE2B_LOG, and the
+# "Tests N passed" count) runs on this stripped copy, never on the raw
+# capture. A colored summary interleaves escapes between the label and the
+# number ("Tests ESC[22m ESC[1mESC[32m50 passed"), so a `[[:space:]]+[0-9]+`
+# pattern finds nothing; under `set -euo pipefail` that empty grep used to
+# kill the hook at the assignment, before its own error message, and git
+# printed only "failed to push some refs" (ledger L14a, build box job 81).
+# The sed removes CSI sequences: ESC, '[', parameter bytes 0x30-0x3F,
+# intermediate bytes 0x20-0x2F, one final byte 0x40-0x7E (ECMA-48 5.4).
+# LC_ALL=C keeps those byte ranges byte ranges under a UTF-8 locale.
+# FAILURE MODE: if this strip itself fails, the hook says so and blocks; it
+# never falls through to parsing the raw, possibly-colored capture.
+strip_ansi() {
+  LC_ALL=C sed $'s/\033\\[[0-?]*[ -/]*[@-~]//g'
+}
+if ! test_output=$(printf '%s\n' "$test_output" | strip_ansi); then
+  fail "Could not strip ANSI escape sequences from the vitest output - push blocked"
+  exit 1
+fi
 
 # ── Check: transform / collection failure classification ────────────
 #
@@ -689,7 +715,9 @@ fi
 # Recover actual_total (needed for the summary line below) from
 # gate2b-check.sh's own output instead of re-parsing test_output a second
 # time with a second copy of the same regex.
-actual_total=$(echo "$gate2b_output" | grep -oE "Files vitest loaded for the run:[[:space:]]+[0-9]+" | grep -oE "[0-9]+")
+# `|| true`: an empty match must reach the explicit refusal below, not end
+# the hook silently at this assignment under `set -euo pipefail`.
+actual_total=$(echo "$gate2b_output" | grep -oE "Files vitest loaded for the run:[[:space:]]+[0-9]+" | grep -oE "[0-9]+" || true)
 if [[ -z "$actual_total" ]]; then
   fail "Could not recover the test-file count from scripts/gate2b-check.sh output - internal error"
   exit 1
@@ -697,9 +725,15 @@ fi
 validate_counter "Test Files count" "$actual_total"
 
 # ── Check: passing count >= baseline (Rule (a)) ──────────────────────
-passing=$(echo "$test_output" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+# INVARIANT: a parse failure here is LOUD and blocks the push. The pipeline
+# ends in `|| true` so an empty match (or a SIGPIPE from `head -1` under
+# pipefail) leaves $passing empty and reaches the named refusal below; it
+# must never end the hook at this assignment, which exits non-zero with no
+# message and looks like a git transport failure from the outside.
+passing=$(echo "$test_output" | grep -oE "Tests[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1 || true)
 if [[ -z "$passing" ]]; then
-  fail "Could not parse passing-test count from vitest output"
+  fail "Could not parse passing-test count from vitest output - push blocked"
+  fail "Expected a vitest summary line matching 'Tests <N> passed' (after ANSI stripping); none was found."
   echo "$test_output" | tail -30 >&2
   exit 1
 fi
