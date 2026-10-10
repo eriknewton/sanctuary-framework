@@ -24,6 +24,8 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
+
 /**
  * Returns the inline client script body. The HTML shell wraps this in
  * `<script type="module">` tags.
@@ -32,8 +34,16 @@
  * patterns (em-dashes, UBAI strings, MLS dead-claims, raw chat-command
  * POST paths, verifier function imports) using simple regex checks.
  */
-export function getClientScript(): string {
-  return CLIENT_SCRIPT;
+const LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER =
+  "__SANCTUARY_LOCAL_CASTLE_WALL_SUBJECT__";
+
+export function getClientScript(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return CLIENT_SCRIPT.replaceAll(
+    LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER,
+    castleWallLocalPlatformSubject(platform),
+  );
 }
 
 // Must match DASHBOARD_MODE_NOT_SERVED_* in
@@ -3317,7 +3327,7 @@ function renderPostureScreen() {
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
   const vaultNotice =
     vaultProvision === "not_yet_walled"
-      ? '<p class="muted">This vault is not on this Mac\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+      ? '<p class="muted">This vault is not on __SANCTUARY_LOCAL_CASTLE_WALL_SUBJECT__\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
       : "";
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];

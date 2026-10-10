@@ -31,6 +31,7 @@ import type { ResolvedEnforcementAvailability } from "../castle-wall/runtime/enf
 // this consumer never re-implements it.
 import {
   CASTLE_WALL_NOT_YET_WALLED,
+  castleWallLocalPlatformSubject,
   type CastleWallProvisionState,
 } from "../castle-wall/provision-state.js";
 import type { ReputationEvidence } from "../shr/generator.js";
@@ -786,7 +787,8 @@ function computeOverall(
      * independently of `wallArmState`, which is a MACHINE fact.
      */
     vaultNotOnThisWall: boolean;
-  }
+  },
+  platform?: NodeJS.Platform,
 ): ProtectionSnapshot["overall"] {
   // Fail closed on a tamper-flagged or unreadable audit chain: the evidence the
   // overall light would be judged from is itself untrustworthy, so it can never
@@ -844,6 +846,7 @@ function computeOverall(
       headline: castleWallNotEnforcingHeadline(
         enforcement.wallArmState,
         enforcement.vaultNotOnThisWall,
+        platform,
       ),
     };
   }
@@ -858,13 +861,14 @@ function computeOverall(
 function castleWallNotEnforcingHeadline(
   arm: CastleWallArmState,
   vaultNotOnThisWall = false,
+  platform?: NodeJS.Platform,
 ): string {
   // The vault-level gap outranks the machine's arm-state in this headline: on a
   // host with a leftover armed wall the arm-state reads `armed`, and a headline
   // derived from it alone would say the wall is fine while the operator's vault
   // is the thing that is not on it.
   if (vaultNotOnThisWall) {
-    return "Layers configured, but this vault is not on this Mac's Castle Wall";
+    return `Layers configured, but this vault is not on ${castleWallLocalPlatformSubject(platform)}'s Castle Wall`;
   }
   switch (arm) {
     case "degraded":
@@ -1139,7 +1143,7 @@ export async function getProtectionSnapshot(
       wallArmState,
       auditIntegrityOk,
       vaultNotOnThisWall: vaultProvision === CASTLE_WALL_NOT_YET_WALLED,
-    }),
+    }, sources.platform),
     agent,
     layers: { l1, l2, l3, l4 },
     activity,

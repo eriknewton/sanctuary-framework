@@ -30,6 +30,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { platform as hostPlatform } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -166,6 +167,13 @@ export const CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE =
   "this vault's wall provisioning state is unreadable, so it is not read as " +
   "being on the wall";
 
+/** Platform-correct local machine wording for operator-facing Castle Wall text. */
+export function castleWallLocalPlatformSubject(
+  platform: NodeJS.Platform = hostPlatform(),
+): "this Mac" | "this machine" {
+  return platform === "darwin" ? "this Mac" : "this machine";
+}
+
 /**
  * The one operator-facing sentence for a vault that is not yet on the wall.
  * Shared so `init`, `wrap`, `castle-wall status`, and `doctor` cannot drift
@@ -174,7 +182,15 @@ export const CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE =
  * Deliberately free of trust-anchor vocabulary: it is read on a first run, by
  * someone who has not yet met the word "pin".
  */
+export function castleWallNotYetWalledSentence(
+  platform: NodeJS.Platform = hostPlatform(),
+): string {
+  const subject = castleWallLocalPlatformSubject(platform);
+  return `This vault is not yet on the Castle Wall of ${subject}. Turning the wall on ` +
+    "for this vault is the installer's next step; until then this vault's " +
+    "agents are not filtered by this vault's policy.";
+}
+
+/** Darwin-compatible sentence kept for existing imports and byte identity. */
 export const CASTLE_WALL_NOT_YET_WALLED_SENTENCE =
-  "This vault is not yet on the Castle Wall of this Mac. Turning the wall on " +
-  "for this vault is the installer's next step; until then this vault's " +
-  "agents are not filtered by this vault's policy.";
+  castleWallNotYetWalledSentence("darwin");
