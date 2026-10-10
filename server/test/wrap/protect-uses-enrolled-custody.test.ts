@@ -230,6 +230,24 @@ describe("protect uses the custody factor init enrolled", () => {
     );
   });
 
+  it("does not echo a stray positional value when reporting the parser refusal", () => {
+    const output = captureOperatorOutput();
+    const value = "operator-secret-shaped-value-not-printed";
+    let thrown: unknown;
+    try {
+      parseWrapArgs(["--passphrase-stdin", value]);
+    } catch (err) {
+      thrown = err;
+      console.error((err as Error).message);
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toContain("Unrecognized argument at position 2");
+    expect(message).not.toContain(value);
+    expect(output.text()).not.toContain(value);
+  });
+
   /** `sanctuary init` on the documented interactive path: enrolls an OS-keyring custody factor and no passphrase. */
   async function initFortress(): Promise<string> {
     const result = await runInit(

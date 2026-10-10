@@ -6755,14 +6755,15 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
 
-    // Reject unknown positional arguments
+    // Reject unknown positional arguments. Positional values can carry operator
+    // input, so the parser names only their argv position in operator output.
     if (!arg.startsWith("-")) {
       const suggestion = WRAP_HARNESS_FLAGS.find(
         (f) => f.replace(/^--/, "") === arg,
       );
       const hint = suggestion ? ` Did you mean ${suggestion}?` : "";
       throw new Error(
-        `Unrecognized argument '${arg}'.${hint} Run 'sanctuary wrap --help' for valid flags.`,
+        `Unrecognized argument at position ${String(i + 1)}.${hint} Run 'sanctuary wrap --help' for valid flags.`,
       );
     }
 
