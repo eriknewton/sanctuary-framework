@@ -326,6 +326,71 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     expect(stderr).toContain("TEST BASELINE REGRESSION");
   });
 
+  // Ledger L14a: vitest can color its summary with no TTY (observed under the
+  // build box's job runner, 2026-10-09). The Tests line below is the byte
+  // layout captured there (dim label, bold-green count, dim separator, yellow
+  // skipped, gray total), with only the numbers changed; the escapes sit
+  // between "Tests" and the number, so an unstripped parse finds nothing.
+  const COLORED_TEST_STUB =
+    "printf '\\033[2m Test Files \\033[22m \\033[1m\\033[32m3 passed\\033[39m\\033[22m\\033[90m (3)\\033[39m\\n" +
+    "\\033[2m      Tests \\033[22m \\033[1m\\033[32m50 passed\\033[39m\\033[22m\\033[2m | \\033[22m\\033[33m1 skipped\\033[39m\\033[90m (51)\\033[39m\\n'";
+
+  it("(x) parses an ANSI-colored vitest summary and allows the push (L14a)", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD: COLORED_TEST_STUB,
+    });
+
+    expect(stderr).toContain("50 tests passed (baseline: 50)");
+    expect(stderr).toContain("All baseline-guard checks passed");
+    expect(status).toBe(0);
+  });
+
+  it("(xi) an unparseable passing count blocks the push with a named message, never silently (L14a)", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 10,
+      baselineHead: 10,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD: "printf 'Test Files  3 passed (3)\\n'",
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("Could not parse passing-test count from vitest output");
+    expect(stderr).toContain("Tests <N> passed");
+  });
+
+  it("(xii) a second summary-shaped line in test output blocks the push instead of choosing the count (L14a)", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    // Test stdout printing a colored look-alike at the floor before vitest's
+    // real (lower) summary: after the ANSI strip both lines parse, so the
+    // hook must refuse the ambiguity rather than take either one.
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD:
+        "printf '\\033[2m      Tests \\033[22m \\033[1m\\033[32m50 passed\\033[39m\\033[22m\\n" +
+        "Test Files  3 passed (3)\\n      Tests  4 passed (4)\\n'",
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("expected exactly one");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {
     const { repoDir, mainSha } = buildRepo({ baselineMain: 10, baselineHead: 10 });
     track(repoDir);
