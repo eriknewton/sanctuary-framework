@@ -213,9 +213,23 @@ export function resolveActiveSessionIdentity(
   };
 }
 
+export interface OpaqueNamespacePersistence {
+  loadHandleForIdentity(identityId: string): Promise<string | null>;
+  claimHandleForIdentity(identityId: string, mint: () => string): Promise<string>;
+  findOwnerForHandle(handle: string): Promise<string | undefined>;
+}
+
+// Must match the at-rest entry in server/reorg-surface-manifest.md and the
+// master-rotation recipe in core/master-rotation.ts.
+export const MEMORY_HANDLE_REGISTRY_NAMESPACE = "_facade/memory_handles";
+export const MEMORY_HANDLE_REGISTRY_LOCK = ".memory-handles.lock";
+export const MEMORY_HANDLE_RECORD_VERSION = 1;
+
 export class OpaqueNamespaceRegistry {
   private handleToIdentity = new Map<string, string>();
   private identityToHandle = new Map<string, string>();
+
+  constructor(private readonly persistence?: OpaqueNamespacePersistence) {}
 
   issueMemoryHandle(identityId: string): string {
     const existing = this.identityToHandle.get(identityId);
@@ -226,12 +240,39 @@ export class OpaqueNamespaceRegistry {
     return handle;
   }
 
+  async issuePersistedMemoryHandle(identityId: string): Promise<string> {
+    const existing = this.identityToHandle.get(identityId);
+    if (existing) return existing;
+    if (!this.persistence) return this.issueMemoryHandle(identityId);
+    const loaded = await this.persistence.loadHandleForIdentity(identityId);
+    if (loaded) {
+      this.rememberOwner(identityId, loaded);
+      return loaded;
+    }
+    // DEBT(MEMORY-HANDLE-ORPHANS): handles returned before this registry
+    // existed have no durable owner record; an operator recovery would need a
+    // separate approved reconciliation tool that maps those old namespaces back
+    // to identities before this mint point can see them.
+    const handle = await this.persistence.claimHandleForIdentity(
+      identityId,
+      () => `mem_${randomBytes(16).toString("hex")}`
+    );
+    // The persistence callback returns only after the reserved StateStore record
+    // has landed; a returned-but-unpersisted handle would orphan future memory.
+    this.rememberOwner(identityId, handle);
+    return handle;
+  }
+
   isOpaqueMemoryHandle(namespace: string): boolean {
     return namespace.startsWith("mem_");
   }
 
-  getOwner(namespace: string): string | undefined {
-    return this.handleToIdentity.get(namespace);
+  async getOwner(namespace: string): Promise<string | undefined> {
+    const existing = this.handleToIdentity.get(namespace);
+    if (existing || !this.persistence) return existing;
+    const owner = await this.persistence.findOwnerForHandle(namespace);
+    if (owner) this.rememberOwner(owner, namespace);
+    return owner;
   }
 
   getHandleForIdentity(identityId: string): string | undefined {
@@ -244,6 +285,19 @@ export class OpaqueNamespaceRegistry {
     if (this.handleToIdentity.get(namespace) !== active.identity_id) {
       throw new SessionIdentityError();
     }
+  }
+
+  async assertOwnedPersisted(namespace: string, binding: SessionBinding | undefined): Promise<void> {
+    if (!this.isOpaqueMemoryHandle(namespace)) return;
+    const active = resolveActiveSessionIdentity(binding);
+    if ((await this.getOwner(namespace)) !== active.identity_id) {
+      throw new SessionIdentityError();
+    }
+  }
+
+  private rememberOwner(identityId: string, handle: string): void {
+    this.identityToHandle.set(identityId, handle);
+    this.handleToIdentity.set(handle, identityId);
   }
 }
 

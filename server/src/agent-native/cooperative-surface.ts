@@ -89,17 +89,17 @@ export function createAgentNativeCooperativeTools(
     return resolveActiveSessionIdentity(options.currentSessionBinding());
   }
 
-  function activeMemoryNamespace(): string {
-    return options.namespaceRegistry.issueMemoryHandle(active().identity_id);
+  async function activeMemoryNamespace(): Promise<string> {
+    return options.namespaceRegistry.issuePersistedMemoryHandle(active().identity_id);
   }
 
-  function facadeMemoryNamespace(args: Record<string, unknown>): string {
+  async function facadeMemoryNamespace(args: Record<string, unknown>): Promise<string> {
     const requested = (args.opts as Record<string, unknown> | undefined)?.namespace;
     if (requested === undefined) return activeMemoryNamespace();
     if (typeof requested !== "string" || !options.namespaceRegistry.isOpaqueMemoryHandle(requested)) {
       throw new Error(FIXED_DENIAL_MESSAGE);
     }
-    options.namespaceRegistry.assertOwned(requested, options.currentSessionBinding());
+    await options.namespaceRegistry.assertOwnedPersisted(requested, options.currentSessionBinding());
     return requested;
   }
 
@@ -286,8 +286,8 @@ export function createAgentNativeCooperativeTools(
     return toolResult(fixedDenial(auditRef, remediation, retryAfter));
   }
 
-  function rememberPrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace = facadeMemoryNamespace(args);
+  async function rememberPrimitiveArgs(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const namespace = await facadeMemoryNamespace(args);
     const opts = (args.opts as Record<string, unknown> | undefined) ?? {};
     const metadata: Record<string, unknown> = {};
     if (typeof opts.ttl === "number") metadata.ttl_seconds = opts.ttl;
@@ -301,13 +301,13 @@ export function createAgentNativeCooperativeTools(
     };
   }
 
-  function recallPrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace = facadeMemoryNamespace(args);
+  async function recallPrimitiveArgs(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const namespace = await facadeMemoryNamespace(args);
     return { namespace, key: args.key, verify_integrity: true };
   }
 
-  function deletePrimitiveArgs(args: Record<string, unknown>): Record<string, unknown> {
-    const namespace = facadeMemoryNamespace(args);
+  async function deletePrimitiveArgs(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const namespace = await facadeMemoryNamespace(args);
     return {
       namespace,
       key: args.key,
@@ -508,29 +508,29 @@ export function createAgentNativeCooperativeTools(
     };
   }
 
-  function compoundStepPrimitive(tool: CompoundExecutableToolName, stepArgs: Record<string, unknown>): {
+  async function compoundStepPrimitive(tool: CompoundExecutableToolName, stepArgs: Record<string, unknown>): Promise<{
     primitiveTool: "state_delete" | "state_write" | "state_read";
     primitive: Record<string, unknown>;
     riskTier: 1 | 3;
-  } {
+  }> {
     switch (tool) {
       case COOPERATIVE_TOOL_NAMES.forget:
         return {
           primitiveTool: "state_delete",
-          primitive: deletePrimitiveArgs(stepArgs),
+          primitive: await deletePrimitiveArgs(stepArgs),
           riskTier: 1,
         };
       case COOPERATIVE_TOOL_NAMES.remember:
         return {
           primitiveTool: "state_write",
-          primitive: rememberPrimitiveArgs(stepArgs),
+          primitive: await rememberPrimitiveArgs(stepArgs),
           riskTier: 3,
         };
       case COOPERATIVE_TOOL_NAMES.hide:
       case COOPERATIVE_TOOL_NAMES.recall:
         return {
           primitiveTool: "state_read",
-          primitive: recallPrimitiveArgs(stepArgs),
+          primitive: await recallPrimitiveArgs(stepArgs),
           riskTier: 3,
         };
     }
@@ -636,7 +636,7 @@ export function createAgentNativeCooperativeTools(
       },
       handler: async (args) => {
         try {
-          const primitiveArgs = rememberPrimitiveArgs(args);
+          const primitiveArgs = await rememberPrimitiveArgs(args);
           const result = await callPrimitive("state_write", primitiveArgs);
           if (result.denied || result.error) return deny("audit:sanctuary_remember", "try_lower_scope");
           const auditRef = await audit("sanctuary_remember", {
@@ -676,7 +676,7 @@ export function createAgentNativeCooperativeTools(
       },
       handler: async (args) => {
         try {
-          const primitiveArgs = recallPrimitiveArgs(args);
+          const primitiveArgs = await recallPrimitiveArgs(args);
           const marker = await loadHiddenMarker(
             primitiveArgs.namespace as string,
             primitiveArgs.key as string
@@ -729,7 +729,7 @@ export function createAgentNativeCooperativeTools(
       },
       handler: async (args) => {
         try {
-          const primitiveArgs = recallPrimitiveArgs(args);
+          const primitiveArgs = await recallPrimitiveArgs(args);
           const read = await callPrimitive("state_read", primitiveArgs);
           if (read.denied) {
             return deny("audit:sanctuary_hide");
@@ -772,7 +772,7 @@ export function createAgentNativeCooperativeTools(
       handler: async (args) => {
         if (!forgetModeIsSecure(args)) return deny("audit:sanctuary_forget");
         try {
-          const primitiveArgs = deletePrimitiveArgs(args);
+          const primitiveArgs = await deletePrimitiveArgs(args);
           const result = await callPrimitive("state_delete", primitiveArgs);
           if (result.denied || result.error) return deny("audit:sanctuary_forget");
           const auditRef = await applyForgetSideEffects(args, primitiveArgs);
@@ -842,7 +842,7 @@ export function createAgentNativeCooperativeTools(
           return toolResult({
             label: identity.label,
             active_identity_fingerprint: activeIdentity.requester_identity_fingerprint,
-            memory_namespace_handle: activeMemoryNamespace(),
+            memory_namespace_handle: await activeMemoryNamespace(),
             did: identity.did,
             audit_ref: auditRef,
           });
@@ -1082,7 +1082,7 @@ export function createAgentNativeCooperativeTools(
       handler: async (args) => {
         try {
           const steps = Array.isArray(args.steps) ? args.steps as Record<string, unknown>[] : [];
-          const planSteps = steps.map((step, index) => {
+          const planSteps = await Promise.all(steps.map(async (step, index) => {
             const tool = String(step.tool ?? "");
             const stepArgs = (step.args && typeof step.args === "object" && !Array.isArray(step.args))
               ? step.args as Record<string, unknown>
@@ -1093,7 +1093,7 @@ export function createAgentNativeCooperativeTools(
             if (tool === COOPERATIVE_TOOL_NAMES.forget && !forgetModeIsSecure(stepArgs)) {
               throw new Error(FIXED_DENIAL_MESSAGE);
             }
-            const { primitiveTool, primitive, riskTier } = compoundStepPrimitive(tool, stepArgs);
+            const { primitiveTool, primitive, riskTier } = await compoundStepPrimitive(tool, stepArgs);
             return {
               step_id: `step-${index + 1}`,
               tool,
@@ -1103,7 +1103,7 @@ export function createAgentNativeCooperativeTools(
               primitive,
               risk_tier: riskTier,
             };
-          });
+          }));
           const planHash = sha256(canonicalJson(planSteps.map((step) => ({
             step_id: step.step_id,
             primitive_tool: step.primitive_tool,
