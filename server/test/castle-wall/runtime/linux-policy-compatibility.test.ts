@@ -36,7 +36,7 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     // Narrow parser for the Rust `pub struct RuleScope { ... }` declaration:
     // this test is a full-field parity tripwire, not a general Rust parser.
     const declaration = rustSource.match(
-      /(?<attrs>(?:#\[[^\n]*\]\n)*)pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/
+      /(?<attrs>(?:^#\[[^\n]*\]\n)*)^pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/m
     )?.groups;
     expect(declaration).toBeDefined();
     // Comment lines are dropped so prose inside the struct can never read as a field or an attribute.
