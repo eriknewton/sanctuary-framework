@@ -26,7 +26,7 @@ import {
 } from "../castle-wall/provision/orchestrate.js";
 import { collectSystemResolvers } from "../castle-wall/runtime/system-resolvers.js";
 import { runAgentEgressProbesAsUid } from "../wrap/auto-provision.js";
-import { consumeFlagValue } from "./argv.js";
+import { consumeFlagValue, argvTokenForDisplay } from "./argv.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -114,7 +114,7 @@ function parseLivenessProbeArgs(argv: string[]): LivenessProbeOptions {
     } else if (arg === "--json") {
       opts.json = true;
     } else {
-      throw new Error(`Unknown liveness-probe option: ${arg}`);
+      throw new Error(`Unknown liveness-probe option: ${argvTokenForDisplay(arg)}`);
     }
   }
   return opts;

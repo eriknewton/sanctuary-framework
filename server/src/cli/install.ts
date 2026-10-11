@@ -75,6 +75,7 @@ import {
   installerRequiredSealedCliRuntimeEntries,
   sealedCliRuntimeManifestPath,
 } from "../../scripts/sealed-cli-runtime-entries.mjs";
+import { argvTokenForDisplay } from "./argv.js";
 
 declare const __SANCTUARY_SOURCE_SHA__: string;
 
@@ -560,7 +561,7 @@ function parseInstallArgs(argv: string[]): ParsedInstallArgs {
     } else if (arg.startsWith("--") && HARNESSES.has(arg.slice(2) as InstallHarness)) {
       parsed.harness = arg.slice(2) as InstallHarness;
     } else {
-      parsed.error = `Unknown install option: ${arg}`;
+      parsed.error = `Unknown install option: ${argvTokenForDisplay(arg)}`;
       break;
     }
   }

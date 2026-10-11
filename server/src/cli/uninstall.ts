@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 
 import { scrubProvisionedEgressRules, type ScrubProvisionedEgressResult } from "../castle-wall/provision/egress.js";
 import { resolveStoragePath } from "../paths.js";
-import { consumeFlagValue } from "./argv.js";
+import { consumeFlagValue, argvTokenForDisplay } from "./argv.js";
 import { CASTLE_WALL_BOOT_PLIST_PATH, runUninstallBoot } from "./castle-wall-boot.js";
 import {
   SYSEXT_REREGISTRATION_GUIDANCE,
@@ -107,8 +107,8 @@ function parseUninstallArgs(argv: string[]): ParsedUninstallArgs {
   for (const arg of remaining) {
     if (arg === "--help" || arg === "-h") parsed.help = true;
     else if (arg === "--remove-operator-data") parsed.removeOperatorData = true;
-    else if (arg.startsWith("-")) parsed.error = `Unknown uninstall option: ${arg}`;
-    else parsed.error = `Unexpected uninstall argument: ${arg}`;
+    else if (arg.startsWith("-")) parsed.error = `Unknown uninstall option: ${argvTokenForDisplay(arg)}`;
+    else parsed.error = `Unexpected uninstall argument: ${argvTokenForDisplay(arg)}`;
     if (parsed.error !== undefined) break;
   }
   if (parsed.harnessId.trim() === "") parsed.error = "--harness must not be empty";
