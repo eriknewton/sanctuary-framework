@@ -99,6 +99,7 @@ import {
   readCustodyEnvelope,
   writeCustodyEnvelope,
   recoverCustodyEnvelopeCommitIfPresent,
+  CustodyEnvelopeCommitJournalError,
   unwrapMaster,
   verifyEnvelopeMac,
   wrapMasterWithPassphrase,
@@ -112,6 +113,7 @@ import {
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
   CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
   STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
   CUSTODY_FLOOR_WRAPS,
   CUSTODY_WRITE_LOCK_NAMESPACE,
@@ -839,6 +841,9 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
  * `convertMeta`.
  */
 export function classifyMetaKey(key: string): MetaKeyClass | null {
+  if (key.startsWith(CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX)) {
+    return "rotation";
+  }
   switch (key) {
     case "key-params":
     case "recovery-key-hash":
@@ -2116,6 +2121,7 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   await fenced(ctx, () => recoverCustodyEnvelopeCommitIfPresent(ctx.storage, {
     envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
     sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+    master: ctx.newMaster,
   }));
   const staged = await readCustodyEnvelope(ctx.storage, {
     envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
@@ -2135,7 +2141,7 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
       ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
     );
     await fenced(ctx, () =>
-      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY),
+      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
     );
     ctx.failpoint("staged-deleted");
   } else {
@@ -2392,9 +2398,22 @@ async function rotateMasterLocked(
   // a pure-legacy fortress goes through `sanctuary wrap` migration first.
   // Custody-pair recovery runs under the rotation barrier and custody lock, so
   // the preflight sees the same complete pair a boot writer would settle.
-  await recoverCustodyEnvelopeCommitIfPresent(storage);
+  let liveCustodyPairRecoveryError: unknown;
+  try {
+    await recoverCustodyEnvelopeCommitIfPresent(storage);
+  } catch (error) {
+    if (
+      error instanceof CustodyEnvelopeCommitJournalError &&
+      error.kind === "unusable"
+    ) {
+      liveCustodyPairRecoveryError = error;
+    } else {
+      throw error;
+    }
+  }
   const oldEnvelope = await readCustodyEnvelope(storage);
   if (!oldEnvelope) {
+    if (liveCustodyPairRecoveryError !== undefined) throw liveCustodyPairRecoveryError;
     throw new RotationPreflightError(
       "this fortress does not have envelope-format custody yet; run " +
         "`sanctuary wrap` once (it migrates in place) and retry"
@@ -2406,6 +2425,9 @@ async function rotateMasterLocked(
   try {
     opts.__testObserveSecretBuffer?.("old-master", oldMaster);
     verifyEnvelopeMac(oldEnvelope, oldMaster);
+    if (liveCustodyPairRecoveryError !== undefined) {
+      await recoverCustodyEnvelopeCommitIfPresent(storage, { master: oldMaster });
+    }
 
     // Reconcile an interrupted PRE-journal recovery handoff before minting a
     // new rotation identity. The pending record is authenticated by the still-
@@ -2455,7 +2477,7 @@ async function rotateMasterLocked(
       lease.assertHeld();
       await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
       lease.assertHeld();
       log(
         `Reconciled interrupted pre-journal recovery handoff ${pendingRecovery.rotation_id}; ` +
@@ -2473,7 +2495,7 @@ async function rotateMasterLocked(
       lease.assertHeld();
       await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
       lease.assertHeld();
     }
 
@@ -2731,7 +2753,7 @@ async function rotateMasterLocked(
         storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
       );
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
       );
       throw new RotationPreflightError(
         "recovery-key capture was not completed; rotation requires a " +
@@ -2748,7 +2770,7 @@ async function rotateMasterLocked(
         storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
       );
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
       );
       throw new RotationPreflightError(
         `the rotated envelope would hold fewer than ${CUSTODY_FLOOR_WRAPS} verified ` +
@@ -2877,7 +2899,7 @@ async function rotateMasterLocked(
       await cleanup(() => fenced(ctx, () => storage.delete("_meta", PENDING_RECOVERY_KEY)));
       await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY)));
       await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY)));
-      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true)));
     }
     zeroizeWriterCache(ctx);
   }

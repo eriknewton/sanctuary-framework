@@ -100,6 +100,7 @@ import {
   writeCustodyEnvelope,
   writeCustodyEnvelopeBytes,
   recoverCustodyEnvelopeCommitIfPresent,
+  CustodyEnvelopeCommitJournalError,
   withCustodyWriteLock,
   CustodyUnlockError,
   CUSTODY_ENVELOPE_KEY,
@@ -1573,9 +1574,22 @@ async function runRecoveryKeyPath(
             delete: () => fortressFiles.delete("passphrase.enc"),
           },
         };
-        await recoverCustodyEnvelopeCommitIfPresent(storage);
+        let preUnlockJournalError: CustodyEnvelopeCommitJournalError | undefined;
+        try {
+          await recoverCustodyEnvelopeCommitIfPresent(storage);
+        } catch (error) {
+          if (
+            error instanceof CustodyEnvelopeCommitJournalError &&
+            error.kind === "unusable"
+          ) {
+            preUnlockJournalError = error;
+          } else {
+            throw error;
+          }
+        }
         let envelope = await readCustodyEnvelope(storage);
         if (!envelope) {
+          if (preUnlockJournalError !== undefined) throw preUnlockJournalError;
           ctx.err.write(
             "Refusing: this fortress has no envelope-format custody to rekey.\n" +
               "The recovery-key rekey path applies only to envelope custody. Nothing was changed.\n"
@@ -1595,6 +1609,12 @@ async function runRecoveryKeyPath(
         // Authenticate the envelope's wrap list under the recovered master
         // before trusting it (never honor an unauthenticated envelope).
         verifyEnvelopeMac(envelope, master);
+        if (preUnlockJournalError !== undefined) {
+          await recoverCustodyEnvelopeCommitIfPresent(storage, { master });
+          envelope = await readCustodyEnvelope(storage);
+          if (!envelope) throw preUnlockJournalError;
+          verifyEnvelopeMac(envelope, master);
+        }
         // Validate a pending journal before ANY secondary custody/keyring
         // mutation. A corrupt or foreign journal therefore preserves both the
         // current authenticated envelope and every stored-credential namespace.

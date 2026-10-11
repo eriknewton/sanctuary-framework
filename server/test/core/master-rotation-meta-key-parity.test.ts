@@ -61,6 +61,7 @@ import {
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
   CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
   STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
 } from "../../src/core/master-custody.js";
 import {
@@ -114,6 +115,10 @@ const ROTATION_RECOGNIZED_META_KEYS: readonly MetaKeyWriteSite[] = [
   {
     key: CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
     writer: "core/master-custody.ts (custodyEnvelopeCommitJournalKey default)",
+  },
+  {
+    key: `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}<unix-ms>`,
+    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalQuarantineKey)",
   },
   {
     key: STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
@@ -198,11 +203,6 @@ const ROTATION_DEFERRED_META_KEYS: readonly MetaKeyWriteSite[] = [
 const LEGACY_KEYS_WITHOUT_A_WRITER: ReadonlySet<string> = new Set([
   "key-params",
   "recovery-key-hash",
-]);
-
-const DYNAMIC_CUSTODY_PAIR_JOURNAL_KEYS: ReadonlySet<string> = new Set([
-  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
-  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
 ]);
 
 // ── Mechanical scan ──────────────────────────────────────────────────────────
@@ -333,6 +333,11 @@ function scanMetaWriteSites(files: Map<string, string>): ScanResult {
       }
     }
   }
+  if (corpus.includes("CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX")) {
+    keys.add("custody-envelope-commit-journal");
+    keys.add("custody-envelope-commit-journal.custody-envelope-next.custody-sentinel-next");
+    keys.add("custody-envelope-commit-journal.quarantine.<unix-ms>");
+  }
   return { keys, unresolved };
 }
 
@@ -362,7 +367,6 @@ describe("master rotation: `_meta` key classification is total over the tree's w
     const inventoryKeys = inventory
       .map((site) => site.key)
       .filter((key) => !LEGACY_KEYS_WITHOUT_A_WRITER.has(key))
-      .filter((key) => !DYNAMIC_CUSTODY_PAIR_JOURNAL_KEYS.has(key))
       .sort();
     const scanned = [...scan.keys].sort();
     expect(
@@ -405,6 +409,11 @@ describe("master rotation: `_meta` key classification is total over the tree's w
 
   it("an unnamed key classifies to null (the preflight's fail-closed default)", () => {
     expect(classifyMetaKey("mystery-record")).toBeNull();
+  });
+
+  it("custody-pair quarantine records classify as known non-blocking rotation metadata", () => {
+    expect(classifyMetaKey(`${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}1700000000000`))
+      .toBe("rotation");
   });
 
   it("the config-security baseline key/marker/purpose/domain are byte-identical in the writer and the rotation recipe, and each side pins the other", () => {
