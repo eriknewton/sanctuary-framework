@@ -13,7 +13,8 @@
 #     summary lines, several summary lines, several counts on one line, or a
 #     non-canonical count.
 #   - Source it: defines emit_error, strip_ansi, is_canonical_count,
-#     compare_counts and count_difference, and returns before parsing. The
+#     compare_counts, count_difference and read_canonical_floor, and returns
+#     before parsing. The
 #     pre-push hook compares counts only through compare_counts, so it has no
 #     digit ceiling and does no overflow-prone arithmetic on a count.
 
@@ -74,6 +75,39 @@ compare_counts() {
     fi
   done
   printf 'eq\n'
+}
+
+# read_canonical_floor: read the raw bytes of a .test-baseline file on stdin
+# and print the floor. The content must be exactly one canonical count,
+# optionally followed by ONE newline; nothing else.
+# INVARIANT: the raw bytes are validated as they are, never after stripping
+# whitespace: stripping first would turn "123 4567" or "123\n4567" into a valid
+# 7-digit floor nobody wrote. The bytes are checked as hex pairs from od, which
+# keeps NUL and CR bytes visible (a bash variable silently drops NUL).
+# Must match every .test-baseline read: the Rule (a) and Rule (b) floor reads in
+# .githooks/pre-push.
+# FAILURE MODE: anything else (empty, a space, an inner or second newline,
+# CRLF, a sign, a leading zero, any other byte) is refused with a named error
+# and status 1, printing nothing on stdout; a caller must test the status.
+# Hex patterns: 30-39 are the ASCII digits 0-9 and 0a is a line feed.
+FLOOR_HEX_RE='^(30|3[1-9](3[0-9])*)(0a)?$'
+read_canonical_floor() {
+  local hex count i
+  if ! hex=$(LC_ALL=C od -An -v -tx1 | tr -d ' \n'); then
+    emit_error "Could not read the .test-baseline bytes."
+    return 1
+  fi
+  if ! [[ "$hex" =~ $FLOOR_HEX_RE ]]; then
+    emit_error ".test-baseline must be exactly one canonical non-negative integer (digits only, no leading zero) with at most one trailing newline; spaces, inner newlines, CRLF and any other byte are refused."
+    return 1
+  fi
+  hex="${hex%0a}"
+  count=""
+  # Each pair is "3d" for digit d, so the digit is the pair's second character.
+  for (( i = 1; i < ${#hex}; i += 2 )); do
+    count="${count}${hex:i:1}"
+  done
+  printf '%s\n' "$count"
 }
 
 # 18 = one fewer than the 19 digits of 9223372036854775807 (2^63 - 1, bash's

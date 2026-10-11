@@ -480,6 +480,41 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     expect(stderr).toContain("PUSHED .test-baseline IS BELOW THE PREVIOUS FLOOR");
   });
 
+  // The floor file's raw bytes are validated, never whitespace-stripped first:
+  // stripping would join these into a valid-looking floor nobody wrote.
+  it.each([
+    ["(xvii) an embedded newline", "123\n4567"],
+    ["(xviii) an embedded space", "123 4567"],
+    ["(xix) CRLF", "50\r"],
+  ])("%s in the pushed .test-baseline blocks the push", (_label, rawFloor) => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: rawFloor,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("is not a single canonical integer");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
+  it("(xx) a CRLF previous floor is refused as unreadable, never normalized", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: "50\r",
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(".test-baseline is unreadable");
+  });
+
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {
     const { repoDir, mainSha } = buildRepo({ baselineMain: 10, baselineHead: 10 });
     track(repoDir);

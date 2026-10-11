@@ -473,14 +473,15 @@ local_sha="$head_sha"
 # Resolve the enforcement floor from the TIP OF WHAT IS BEING PUSHED
 # (`$local_sha:.test-baseline`), never the unstaged working tree. The floor
 # in effect for this push is that commit's own committed blob.
-baseline=$(git show "$local_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-if [[ -z "$baseline" ]]; then
+if ! git cat-file -e "$local_sha:.test-baseline" 2>/dev/null; then
   fail ".test-baseline is missing at the commit being pushed ($local_sha)"
   printf '[baseline-guard]   Create it with a single integer (the current passing count) and commit it.\n' >&2
   exit 1
 fi
-if ! is_canonical_count "$baseline"; then
-  fail "committed .test-baseline ($local_sha:.test-baseline) is not a single integer, got: '$baseline'"
+# The raw blob is validated by the shared read_canonical_floor, never after a
+# whitespace strip (which would join "123 4567" into one valid-looking floor).
+if ! baseline=$(git show "$local_sha:.test-baseline" | read_canonical_floor); then
+  fail "committed .test-baseline ($local_sha:.test-baseline) is not a single canonical integer - push blocked"
   exit 1
 fi
 
@@ -521,7 +522,7 @@ for _i in "${!non_delete_local_refs[@]}"; do
       fail "the remote tip $_remote_sha of $_ref is not available locally; run \`git fetch origin $(ref_branch_name "$_ref")\` and push again"
       exit 1
     fi
-    prev_floor=$(git show "$_remote_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+    prev_floor_rev="$_remote_sha"
     prev_floor_source="the remote tip $_remote_sha of $_ref"
   else
     # New ref (remote SHA is all zeros): there is no remote tip to read, so
@@ -541,11 +542,12 @@ for _i in "${!non_delete_local_refs[@]}"; do
       fi
       fetched_origin_main=1
     fi
-    prev_floor=$(git show FETCH_HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+    prev_floor_rev="FETCH_HEAD"
     prev_floor_source="freshly fetched main of remote '$push_remote_name'"
   fi
 
-  if [[ -z "$prev_floor" ]] || ! is_canonical_count "$prev_floor"; then
+  # Same raw-bytes rule as the pushed floor: read_canonical_floor, no strip.
+  if ! prev_floor=$(git show "$prev_floor_rev:.test-baseline" 2>/dev/null | read_canonical_floor); then
     fail "$prev_floor_source's .test-baseline is unreadable - push blocked"
     exit 1
   fi

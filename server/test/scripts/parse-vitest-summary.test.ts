@@ -52,14 +52,16 @@ function runParser(
  * consumers (.githooks/pre-push and the CI baseline guard) source.
  */
 function runHelper(
-  fn: "compare_counts" | "count_difference" | "is_canonical_count",
+  fn: "compare_counts" | "count_difference" | "is_canonical_count" | "read_canonical_floor",
   args: string[],
+  input = "",
 ): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(
     "bash",
     ["-c", 'source "$1"; shift; "$@"', "helper", SCRIPT_PATH, fn, ...args],
     {
       encoding: "utf8",
+      input,
       env: { ...process.env, VITEST: process.env.VITEST ?? "true" },
     },
   );
@@ -231,6 +233,40 @@ describe("scripts/parse-vitest-summary.sh count helpers (sourced by both consume
       expect(result.stdout).toBe("");
       expect(result.stderr).toContain("must be a canonical non-negative integer");
     }
+  });
+
+  it.each([
+    ["one count and a trailing newline", "17345\n", "17345"],
+    ["one count with no trailing newline", "17345", "17345"],
+    ["zero", "0\n", "0"],
+    ["a 20-digit count", `${WRAPS_TO_17345}\n`, WRAPS_TO_17345],
+  ])("read_canonical_floor accepts %s", (_label, raw, expected) => {
+    const result = runHelper("read_canonical_floor", [], raw);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(`${expected}\n`);
+    expect(result.stderr).toBe("");
+  });
+
+  it.each([
+    ["an embedded space", "123 4567\n"],
+    ["an embedded newline", "123\n4567\n"],
+    ["CRLF", "17345\r\n"],
+    ["a second trailing newline", "17345\n\n"],
+    ["a trailing space", "17345 \n"],
+    ["a leading space", " 17345\n"],
+    ["a tab", "17345\t\n"],
+    ["an embedded NUL byte", "173\u000045\n"],
+    ["a leading zero", "007\n"],
+    ["a sign", "+17345\n"],
+    ["an empty file", ""],
+    ["a lone newline", "\n"],
+  ])("read_canonical_floor refuses %s instead of normalizing it", (_label, raw) => {
+    const result = runHelper("read_canonical_floor", [], raw);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("at most one trailing newline");
   });
 
   it("count_difference states a short difference exactly and never prints a wrapped number", () => {
