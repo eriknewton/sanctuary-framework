@@ -143,6 +143,7 @@ import type {
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { CustodyUnlockError } from "../core/master-custody.js";
 import {
+  AgentGuidedRecoveryStagingRefusal,
   establishWrapCustody,
   type WrapCustodyCredential,
   type WrapCustodyResult,
@@ -663,6 +664,33 @@ export interface WrapOptions {
    * anything.
    */
   unprotectEgressGate?: boolean;
+}
+
+export class ExplicitLocalIntelligenceRefusal extends Error {
+  readonly exitCode = 1;
+
+  constructor(reason: string) {
+    super(
+      `Sanctuary protect refused: --provision-local-intelligence was explicitly requested, ` +
+        `but local intelligence could not be provisioned (${reason}). The harness remains ` +
+        `wrapped and local surfaces remain DEGRADED. Resolve the named issue and rerun, ` +
+        `or rerun with --no-provision-local-intelligence to accept wrap without local intelligence.`,
+    );
+    this.name = "ExplicitLocalIntelligenceRefusal";
+  }
+}
+
+export function isWrapCliRefusal(
+  err: unknown,
+): err is (ExplicitLocalIntelligenceRefusal | AgentGuidedRecoveryStagingRefusal) {
+  return err instanceof ExplicitLocalIntelligenceRefusal ||
+    err instanceof AgentGuidedRecoveryStagingRefusal;
+}
+
+export function wrapCliRefusalExitCode(
+  err: ExplicitLocalIntelligenceRefusal | AgentGuidedRecoveryStagingRefusal,
+): number {
+  return err instanceof ExplicitLocalIntelligenceRefusal ? err.exitCode : 1;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -2555,13 +2583,32 @@ async function maybeRunLocalIntelligenceForWrap(
     } else if (outcome.kind === "refused") {
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+      // An explicit positive request is part of the operator's desired end
+      // state; continuing with exit 0 would make scripts treat that refused
+      // state as a completed local-intelligence setup.
+      if (options.provisionLocalIntelligence === true) {
+        throw new ExplicitLocalIntelligenceRefusal(outcome.reason);
+      }
     }
   } catch (err) {
+    if (err instanceof ExplicitLocalIntelligenceRefusal) {
+      throw err;
+    }
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
     console.error(
       `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
         `the harness remains wrapped and local surfaces remain DEGRADED.`,
     );
+    // The explicit flag makes local intelligence a requested setup target, so a
+    // ceremony exception must be visible to automation as a refused target even
+    // though the cooperative wrap remains in place.
+    if (options.provisionLocalIntelligence === true) {
+      throw err instanceof ExplicitLocalIntelligenceRefusal
+        ? err
+        : new ExplicitLocalIntelligenceRefusal(
+          err instanceof Error ? err.message : String(err),
+        );
+    }
   }
 }
 
