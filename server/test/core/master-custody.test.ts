@@ -27,7 +27,7 @@ import {
   verifyRecoveryWrapByReentry,
   verifyEnvelopeMac,
   enforceCustodyFloor,
-  unlockExistingMasterReadOnly,
+  unlockExistingMasterReadOnly, liveCustodyPairAuthenticates,
   countVerifiedWraps,
   checkCastlePinCustody,
   CustodyUnlockError,
@@ -50,7 +50,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { encrypt, decrypt } from "../../src/core/encryption.js";
 import {
-  toBase64url,
+  toBase64url, fromBase64url,
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
@@ -903,6 +903,10 @@ describe("custody-pair commit schedule", () => {
   // 2 = the conventional JSON pretty-print width used only to produce a byte
   // string whose parsed envelope content is identical while its bytes differ.
   const JSON_PRETTY_PRINT_SPACES = 2;
+  const REPLAY_SENTINEL_WRITE_COUNT = 1;
+  // The retry hook targets the accepted publish: one replay sentinel write,
+  // then one publish sentinel write after the continue decision.
+  const ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT = REPLAY_SENTINEL_WRITE_COUNT + 1;
 
   async function leavePendingCustodyPair(args: {
     storage: MemoryStorage;
@@ -975,6 +979,12 @@ describe("custody-pair commit schedule", () => {
     journal.envelope_bytes = toBase64url(envelopeBytes);
     journal.envelope_sha256 = hashToString(envelopeBytes);
     await writeCommitJournal(storage, journal);
+  }
+
+  async function journalEnvelopeBytes(storage: MemoryStorage): Promise<Uint8Array> {
+    const journal = await readCommitJournal(storage);
+    expect(typeof journal.envelope_bytes).toBe("string");
+    return fromBase64url(journal.envelope_bytes as string);
   }
 
   async function replaceJournalSentinelBytes(
@@ -1561,10 +1571,14 @@ describe("custody-pair commit schedule", () => {
         .toEqual(requestedEnvelope);
       await replaceJournalEnvelopeBytes(storage, sameContentDifferentBytes);
     }
+    const recoveredEnvelopeBytes = await journalEnvelopeBytes(storage);
 
     await expectSnapshotChanged(
       writeCustodyEnvelopeBytes(storage, requestedBytes, opened.masterKey),
     );
+    const liveEnvelopeBytes = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    expect(liveEnvelopeBytes).not.toBeNull();
+    expect(bytesToString(liveEnvelopeBytes!)).toBe(bytesToString(recoveredEnvelopeBytes));
     opened.masterKey.fill(0);
   });
 
@@ -1598,10 +1612,14 @@ describe("custody-pair commit schedule", () => {
       CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
       stalePreparedPair,
     );
+    const recoveredEnvelopeBytes = await journalEnvelopeBytes(storage);
 
     await expectSnapshotChanged(
       writeCustodyEnvelopeBytes(storage, currentBytes, nextMaster),
     );
+    const liveEnvelopeBytes = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    expect(liveEnvelopeBytes).not.toBeNull();
+    expect(bytesToString(liveEnvelopeBytes!)).toBe(bytesToString(recoveredEnvelopeBytes));
     nextMaster.fill(0);
   });
 
@@ -1645,6 +1663,7 @@ describe("custody-pair commit schedule", () => {
       opened.masterKey,
     );
     expect(restored.created_at).toBe(priorEnvelope!.created_at);
+    expect(await liveCustodyPairAuthenticates(storage, opened.masterKey)).toBe(true);
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
       .toBeNull();
     opened.masterKey.fill(0);
@@ -1682,10 +1701,15 @@ describe("custody-pair commit schedule", () => {
     ).rejects.toThrow("injected first restore interruption");
 
     let retrySentinelWrites = 0;
+    let retryPublishJournalWritten = false;
     storage.write = async (namespace, key, value) => {
+      if (namespace === "_meta" && key === CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        retryPublishJournalWritten = true;
+      }
       if (namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
         retrySentinelWrites += 1;
-        if (retrySentinelWrites === 2) {
+        if (retrySentinelWrites === ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT) {
+          expect(retryPublishJournalWritten).toBe(true);
           throw new Error("injected restore retry interruption");
         }
       }
@@ -1695,9 +1719,14 @@ describe("custody-pair commit schedule", () => {
       writeCustodyEnvelopeBytes(storage, priorBytes, opened.masterKey),
     ).rejects.toThrow("injected restore retry interruption");
     storage.write = originalWrite;
-    expect(retrySentinelWrites).toBe(2);
+    expect(retrySentinelWrites).toBe(ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT);
+    expect(retryPublishJournalWritten).toBe(true);
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
       .not.toBeNull();
+    const liveEnvelopeBytesAfterInterruption = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    expect(liveEnvelopeBytesAfterInterruption).not.toBeNull();
+    expect(bytesToString(liveEnvelopeBytesAfterInterruption!)).toBe(bytesToString(priorBytes));
+    expect(await liveCustodyPairAuthenticates(storage, opened.masterKey)).toBe(true);
     await expect(
       unlockExistingMasterReadOnly(storage, {
         passphrase: "custody-restore-resume-passphrase",
@@ -1710,6 +1739,7 @@ describe("custody-pair commit schedule", () => {
       opened.masterKey,
     );
     expect(restored.created_at).toBe(priorEnvelope!.created_at);
+    expect(await liveCustodyPairAuthenticates(storage, opened.masterKey)).toBe(true);
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
       .toBeNull();
     opened.masterKey.fill(0);

@@ -1295,6 +1295,7 @@ interface CustodyPairRecoveryResult {
 
 async function recoveredCustodyPairAllowsPublish(
   storage: StorageBackend,
+  lease: CrossProcessLockLease,
   recovery: CustodyPairRecoveryResult,
   requested: {
     envelopeBytes: Uint8Array;
@@ -1303,25 +1304,42 @@ async function recoveredCustodyPairAllowsPublish(
     master: Uint8Array;
   },
 ): Promise<boolean> {
-  if (!recovery.changedPair) return true;
+  lease.assertHeld();
+  if (!recovery.changedPair) {
+    // The custody write lock is held from replay recovery through the publish
+    // below, so a continue decision cannot straddle another custody writer.
+    lease.assertHeld();
+    return true;
+  }
   const recoveredEnvelopeMatchesRequestedEnvelope =
     recovery.recoveredPair !== undefined &&
     constantTimeEqual(recovery.recoveredPair.envelopeBytes, requested.envelopeBytes);
   if (!recoveredEnvelopeMatchesRequestedEnvelope) return false;
   // Continuing and refusal table (AGENTS.md rule 13):
-  // - unchanged replay: continue because the publish sees the same pair it read;
+  // - no journal or a journal that vanished under the lock: recovery returns
+  //   `changedPair:false`; continue because this writer has no replay to judge;
+  // - unchanged replay: recovery returns `changedPair:false`; continue because
+  //   the publish sees the same pair it read;
+  // - unusable or mismatched-target journal with a target pair that
+  //   authenticates under this writer's master: recovery quarantines the
+  //   journal and returns `changedPair:false`; continue because recovery has
+  //   proven the live pair is already coherent for this writer;
+  // - unusable or mismatched-target journal without that proof: recovery
+  //   refuses before this predicate, preserving the operator recovery path;
   // - changed replay with exact requested envelope bytes and a sentinel that
   //   authenticates under this writer's master: continue because the replay
   //   immediately before this check may itself have rewritten disk, and this
-  //   writer's publish overwrites no one else's update;
+  //   writer's locked publish leaves the same envelope bytes on disk;
   // - changed replay with no recovered pair, different envelope bytes, same
-  //   parsed content in different bytes, a different target pair, or a pair
+  //   parsed content in different bytes, or a pair
   //   authenticating only under another master: refuse with the stale-snapshot
   //   message and preserve the caller's retry boundary.
-  return verifyCustodyPairAuthenticates(storage, requested.master, {
+  const recoveredPairAuthenticates = await verifyCustodyPairAuthenticates(storage, requested.master, {
     envelopeKey: requested.envelopeKey,
     sentinelKey: requested.sentinelKey,
   });
+  if (recoveredPairAuthenticates) lease.assertHeld();
+  return recoveredPairAuthenticates;
 }
 
 export type CustodyEnvelopeCommitConsistencyCheck = (
@@ -1679,7 +1697,7 @@ async function writeCustodyEnvelopeLocked(
         master,
       },
     );
-    if (!(await recoveredCustodyPairAllowsPublish(storage, recovery, {
+    if (!(await recoveredCustodyPairAllowsPublish(storage, lease, recovery, {
       envelopeBytes,
       envelopeKey,
       sentinelKey: sentinelTargetKey,
@@ -1748,7 +1766,7 @@ export async function writeCustodyEnvelopeBytes(
             master,
           },
         );
-        if (!(await recoveredCustodyPairAllowsPublish(storage, recovery, {
+        if (!(await recoveredCustodyPairAllowsPublish(storage, lease, recovery, {
           envelopeBytes,
           envelopeKey: CUSTODY_ENVELOPE_KEY,
           sentinelKey: CUSTODY_SENTINEL_KEY,

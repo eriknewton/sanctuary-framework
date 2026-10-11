@@ -2513,6 +2513,10 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
   });
 
   it("resume converges when its accepted live custody publish is interrupted", async () => {
+    const REPLAY_SENTINEL_WRITE_COUNT = 1;
+    // The resume hook targets the accepted publish: one replay sentinel write,
+    // then one publish sentinel write after the continue decision.
+    const ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT = REPLAY_SENTINEL_WRITE_COUNT + 1;
     const fortress = await buildFortress();
     const originalWrite = fortress.storage.write.bind(fortress.storage);
     let disclosedKey = "";
@@ -2545,10 +2549,15 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     expect(interruptedLiveCustodyPair).toBe(true);
 
     let resumeSentinelWrites = 0;
+    let resumePublishJournalWritten = false;
     fortress.storage.write = async (namespace, key, data) => {
+      if (namespace === "_meta" && key === CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        resumePublishJournalWritten = true;
+      }
       if (namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
         resumeSentinelWrites += 1;
-        if (resumeSentinelWrites === 2) {
+        if (resumeSentinelWrites === ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT) {
+          expect(resumePublishJournalWritten).toBe(true);
           throw new Error("injected resume live custody publish interruption");
         }
       }
@@ -2560,7 +2569,8 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
       passphrase: PASSPHRASE,
     })).rejects.toThrow("injected resume live custody publish interruption");
     fortress.storage.write = originalWrite;
-    expect(resumeSentinelWrites).toBe(2);
+    expect(resumeSentinelWrites).toBe(ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT);
+    expect(resumePublishJournalWritten).toBe(true);
     expect(await fortress.storage.read(
       "_meta",
       CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
