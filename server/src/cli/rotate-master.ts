@@ -53,7 +53,7 @@ import {
   type DisclosureIo,
   type RotationRecoveryFileMutation,
 } from "../wrap/recovery-key-disclosure.js";
-import { consumeFlagValue } from "./argv.js";
+import { consumeFlagValue, argvTokenForDisplay } from "./argv.js";
 
 export interface RotateMasterCliArgs {
   argv: string[];
@@ -97,7 +97,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       out.recoveryOut = readRequiredPathArg(storage.argv, i, "--recovery-out");
       i++;
     } else if (a && a.startsWith("--")) {
-      throw new Error(`Unknown flag: ${a}`);
+      throw new Error(`Unknown flag: ${argvTokenForDisplay(a)}`);
     }
   }
   return out;

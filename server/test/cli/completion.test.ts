@@ -61,7 +61,7 @@ describe("sanctuary completion", () => {
 
     const badErr = new Capture();
     expect(await runCompletionCommand({ argv: ["powershell"], err: badErr })).toBe(2);
-    expect(badErr.text()).toContain("Unknown shell: powershell");
+    expect(badErr.text()).toContain("Unknown shell: <argument not shown>");
   });
 
   it("uses injected command lists without stale hardcoding", async () => {

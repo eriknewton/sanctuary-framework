@@ -1176,10 +1176,78 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
       [hostAppPath, "--headless", "status"],
-      [hostAppPath, "--headless", "enable", "--no-ttl"],
+      [hostAppPath, "--headless", "enable"],
       [hostAppPath, "--headless", "status"],
     ]);
   });
+
+  // The dead-man TTL reaches the extension only through the arm lease sent to
+  // the daemon socket; the host app refuses --ttl/--no-ttl, so the CLI must
+  // never put either on the host-app argv, and the lease frame must still
+  // carry the operator's choice (ic-sweep-headless-ttl-flags-effective).
+  // 900 = 15 minutes x 60 seconds, the parse of "15m".
+  it.each([
+    { flag: "--ttl=15m", expectedTtlSeconds: 900 },
+    { flag: "--no-ttl", expectedTtlSeconds: null },
+  ])(
+    "enable $flag keeps the TTL off the host-app argv and sends it in the daemon lease",
+    async ({ flag, expectedTtlSeconds }) => {
+      const { fortressPath, hostAppPath, env } = await makeFixture();
+      const received: Array<{ method?: string; params?: Record<string, unknown> }> = [];
+      const socketPath = join(fortressPath, "castle.sock");
+      const server: Server = createServer((socket) => {
+        let buffer = Buffer.alloc(0);
+        socket.on("data", (chunk: Buffer) => {
+          buffer = Buffer.concat([buffer, chunk]);
+          const parsed = parseFrame(buffer);
+          if (parsed.kind !== "complete") return;
+          buffer = buffer.subarray(parsed.consumedBytes);
+          received.push(
+            JSON.parse(parsed.body) as { method?: string; params?: Record<string, unknown> },
+          );
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        // port-discipline: ignore - Unix domain socket path, not a TCP port.
+        server.listen(socketPath, resolve);
+      });
+      const { invoke, calls } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      try {
+        const code = await runEnable(["--fortress", fortressPath, "--force", flag], {
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+          env,
+          platform: "darwin",
+          hostAppCandidates: [hostAppPath],
+          hostAppInvoke: invoke,
+          sysextProbe: async () => "[activated enabled]",
+          egressAllowRuleCountProbe: async () => 1,
+          daemonProbe: async () => {
+            throw new Error("probe must not run under --force");
+          },
+        });
+
+        expect(code).toBe(0);
+        expect(calls).toEqual([
+          [hostAppPath, "--headless", "status"],
+          [hostAppPath, "--headless", "enable"],
+          [hostAppPath, "--headless", "status"],
+        ]);
+        await waitFor(() => received.length > 0);
+        const leaseFrames = received.filter((f) => f.method === "castle-wall.arm_lease");
+        expect(leaseFrames).toHaveLength(1);
+        expect(leaseFrames[0]!.params).toMatchObject({ type: "arm_lease", armed: true });
+        expect(leaseFrames[0]!.params!.ttl_seconds).toBe(expectedTtlSeconds);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+  );
 
   it("enable writes a wall_armed audit entry corroborating the arm", async () => {
     const { fortressPath, hostAppPath, env, recoveryKey } = await makeFixture();
@@ -2052,8 +2120,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[1]!.slice(-3)).toEqual([
+      "--headless",
       "enable",
-      "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[2]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);

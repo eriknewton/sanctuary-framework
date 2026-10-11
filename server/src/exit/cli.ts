@@ -40,7 +40,7 @@ import type {
 import { verifyExitBundle, InvalidExitBundleError, readManifest } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
-import { flagValue, flagValues, consumeFlagValue } from "../cli/argv.js";
+import { flagValue, flagValues, consumeFlagValue, argvTokenForDisplay } from "../cli/argv.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
 
@@ -1313,7 +1313,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       return result.verified ? 0 : 1;
     }
 
-    write(err, `Unknown exit command: ${command}\n`);
+    write(err, `Unknown exit command: ${argvTokenForDisplay(command)}\n`);
     return 2;
   } catch (error) {
     write(err, error instanceof Error ? `${error.message}\n` : `${String(error)}\n`);

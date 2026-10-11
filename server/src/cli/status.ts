@@ -20,6 +20,7 @@ import {
   type DashboardRequestContext,
 } from "./dashboard-request.js";
 import { openV1Session } from "./v1-session.js";
+import { argvTokenForDisplay } from "./argv.js";
 
 export interface StatusCommandArgs {
   argv: string[];
@@ -87,7 +88,7 @@ export async function runStatusCommand(args: StatusCommandArgs): Promise<number>
       // Reserved (catalog flag); full status is already the verbose view.
     } else {
       err.write(
-        `sanctuary status: unknown option ${arg}\nnext: run \`sanctuary status --help\`\n`,
+        `sanctuary status: unknown option ${argvTokenForDisplay(arg)}\nnext: run \`sanctuary status --help\`\n`,
       );
       return 1;
     }
