@@ -8,8 +8,10 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
+  constants as fsConstants,
   mkdir,
   mkdtemp,
+  open as openFile,
   readFile,
   readdir,
   rm,
@@ -72,9 +74,12 @@ const PRIMARY_IDENTITY_SETTLE_MS = 10;
 // Must match the memory archive artifact path written by runMemoryArchiveExportCommand.
 const MEMORY_ARCHIVE_ARTIFACT_PATH = "artifacts/sdw-memory-archive.json";
 const OVER_CAP_SENTINEL_BYTES = 1; // One byte over the artifact ceiling must be refused.
-// 250 ms is long enough for the descriptor reader to reject a FIFO, while a
-// blocking whole-file open still needs an explicit writer to release the test.
-const FIFO_REJECTION_DEADLINE_MS = 250;
+// A blocking FIFO read waits forever; the descriptor reader returns quickly,
+// so the old 250 ms probe can keep 20x headroom and still catch the regression.
+const FIFO_REJECTION_PROBE_MS = 250;
+const FIFO_REJECTION_HEADROOM_MULTIPLIER = 20;
+const FIFO_REJECTION_DEADLINE_MS =
+  FIFO_REJECTION_PROBE_MS * FIFO_REJECTION_HEADROOM_MULTIPLIER;
 // Five seconds bounds the fixture setup command that creates a FIFO node.
 const FIFO_SETUP_TIMEOUT_MS = 5_000;
 const cleanup: string[] = [];
@@ -267,6 +272,18 @@ function fortressId(path: string): string {
 
 function sinkPair(): { out: Sink; err: Sink } {
   return { out: new Sink(), err: new Sink() };
+}
+
+async function releaseFifoReaderIfWaiting(path: string): Promise<void> {
+  try {
+    const handle = await openFile(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_NONBLOCK,
+    );
+    await handle.close();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENXIO") throw error;
+  }
 }
 
 async function exportBundle(source: Fortress, ownerRef = "owner-a", json = false) {
@@ -564,6 +581,34 @@ describe("Exit V2 memory archive CLI", () => {
     expect(await treeSnapshot(destination.path)).toEqual(destinationBefore);
   }, 60_000);
 
+  it("refuses a symlinked archive artifacts directory before opening the destination fortress", async () => {
+    const source = await fortress("exit-v2-cli-symlink-dir-source", "owner-a", true);
+    const exported = await exportBundle(source);
+    const destination = await fortress("exit-v2-cli-symlink-dir-destination", "owner-a", false);
+    const destinationBefore = await treeSnapshot(destination.path);
+    const artifactPath = join(exported.bundle, MEMORY_ARCHIVE_ARTIFACT_PATH);
+    const originalArtifact = await readFile(artifactPath);
+    const outsideArtifacts = await tempDir("exit-v2-cli-artifacts-target");
+    await writeFile(join(outsideArtifacts, "sdw-memory-archive.json"), originalArtifact);
+    await rm(join(exported.bundle, "artifacts"), { recursive: true, force: true });
+    await symlink(outsideArtifacts, join(exported.bundle, "artifacts"));
+    const terminal = new TestTerminal();
+    terminal.hiddenValue = Buffer.from(secretText(exported.terminal), "ascii");
+    const { out, err } = sinkPair();
+    const code = await runMemoryArchiveImportCommand({
+      argv: ["--in", exported.bundle, "--owner-ref", "owner-a", "--fortress", destination.path],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      interaction: interactionWithApproval(terminal, new RecordingApprovalChannel()),
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain(artifactPath);
+    expect(err.text()).toContain("symbolic links are not permitted");
+    expect(terminal.hiddenReads).toBe(0);
+    expect(await treeSnapshot(destination.path)).toEqual(destinationBefore);
+  }, 60_000);
+
   it("refuses a FIFO archive artifact without waiting for a writer", async () => {
     const source = await fortress("exit-v2-cli-fifo-source", "owner-a", true);
     const exported = await exportBundle(source);
@@ -591,7 +636,7 @@ describe("Exit V2 memory archive CLI", () => {
       delay(FIFO_REJECTION_DEADLINE_MS).then(() => ({ timedOut: true })),
     ]);
     if ("timedOut" in raced) {
-      await writeFile(artifactPath, "");
+      await releaseFifoReaderIfWaiting(artifactPath);
       await run.catch(() => undefined);
     }
     expect(raced).toHaveProperty("code", 1);
@@ -960,6 +1005,12 @@ describe("Exit V2 memory archive CLI", () => {
     expect(source).not.toContain("readFile(manifestPath)");
     expect(source).not.toContain("readFile(artifactPath)");
     expect(source).toContain("readFileCustody(path, { maxBytes })");
+    const bundleFailureMapper = source.slice(
+      source.indexOf("function describeBundleReadFailure("),
+      source.indexOf("function resolveInteraction("),
+    );
+    expect(bundleFailureMapper).toContain("custody check failed");
+    expect(bundleFailureMapper).not.toContain("error.message");
   });
 });
 

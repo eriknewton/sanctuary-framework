@@ -77,9 +77,11 @@ const MAX_LOCAL_DIALOG_OUTPUT_BYTES = 4 * 1024;
 const ASCII_LINE_FEED = 10;
 const ASCII_CARRIAGE_RETURN = 13;
 const ASCII_SPACE = 32;
-const BYTES_PER_KIB = 1024; // 1024 bytes is the binary KiB unit used by the artifact cap.
+const BYTES_PER_KIB = 1024; // 1024 bytes is the binary KiB unit used by the local manifest cap.
 const BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB;
-const MAX_MANIFEST_MIB = 1; // 1 MiB covers the single-artifact signed manifest with operational headroom.
+// The writer emits one generated manifest measured around 1.1 KiB; 1 MiB is
+// more than 300x headroom for bounded identifiers, hashes, key, and signature.
+const MAX_MANIFEST_MIB = 1;
 const MAX_MANIFEST_BYTES = MAX_MANIFEST_MIB * BYTES_PER_MIB;
 // Must match the artifact path returned by exportExitV2SdwMemoryArchive.
 const ARTIFACT_PATH = "artifacts/sdw-memory-archive.json";
@@ -265,6 +267,8 @@ export async function runMemoryArchiveExportCommand(
     await mkdir(outputParent, { recursive: true, mode: 0o700 });
     stagedPath = await mkdtemp(join(outputParent, ".sanctuary-exit-v2-"));
     await mkdir(join(stagedPath, "artifacts"), { mode: 0o700 });
+    // No writer-side cap is needed: this writer produces the fixed one-artifact
+    // manifest measured above, while import's MAX_MANIFEST_BYTES refuses over 1 MiB.
     await writeFile(
       join(stagedPath, "manifest.json"),
       JSON.stringify(exported.manifest, null, 2) + "\n",
@@ -819,11 +823,22 @@ async function readBundle(inputPath: string): Promise<{
   artifactBytes: Uint8Array;
   artifactSha256: string;
 }> {
-  const manifestPath = join(inputPath, "manifest.json");
-  const artifactPath = join(inputPath, ARTIFACT_PATH);
+  const bundleRoot = resolve(inputPath);
+  const manifestPath = join(bundleRoot, "manifest.json");
+  const artifactPath = join(bundleRoot, ARTIFACT_PATH);
   const [manifestBytes, artifactBytes] = await Promise.all([
-    readArchiveBundleFile(manifestPath, MAX_MANIFEST_BYTES),
-    readArchiveBundleFile(artifactPath, MAX_ARTIFACT_BYTES),
+    readArchiveBundleFile(
+      bundleRoot,
+      "manifest.json",
+      manifestPath,
+      MAX_MANIFEST_BYTES,
+    ),
+    readArchiveBundleFile(
+      bundleRoot,
+      ARTIFACT_PATH,
+      artifactPath,
+      MAX_ARTIFACT_BYTES,
+    ),
   ]);
   const manifest = JSON.parse(
     new TextDecoder().decode(manifestBytes),
@@ -839,13 +854,46 @@ async function readBundle(inputPath: string): Promise<{
   };
 }
 
-async function readArchiveBundleFile(path: string, maxBytes: number): Promise<Uint8Array> {
-  // The shared custody reader opens and checks the descriptor before reading,
-  // so links, special files, and files over the declared cap fail before import.
+async function readArchiveBundleFile(
+  bundleRoot: string,
+  relativePath: string,
+  path: string,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  // The operator-supplied bundle root itself may be a symlink by choice; every
+  // component below it is checked with lstat before the descriptor reader opens
+  // the leaf, so a bundle cannot redirect its own artifact directory.
   try {
+    await assertNoSymlinkedBundleParents(bundleRoot, relativePath, path);
     return await readFileCustody(path, { maxBytes });
   } catch (error) {
+    if (error instanceof MemoryArchiveBundleFileError) throw error;
     throw describeBundleReadFailure(path, maxBytes, error);
+  }
+}
+
+async function assertNoSymlinkedBundleParents(
+  bundleRoot: string,
+  relativePath: string,
+  displayPath: string,
+): Promise<void> {
+  const components = relativePath
+    .split(/[\\/]+/)
+    .filter((component) => component.length > 0);
+  let current = bundleRoot;
+  for (const component of components.slice(0, -1)) {
+    current = join(current, component);
+    const stats = await lstat(current);
+    if (stats.isSymbolicLink()) {
+      throw new MemoryArchiveBundleFileError(
+        `bundle file ${displayPath}: symbolic links are not permitted`,
+      );
+    }
+    if (!stats.isDirectory()) {
+      throw new MemoryArchiveBundleFileError(
+        `bundle file ${displayPath}: not a regular file`,
+      );
+    }
   }
 }
 
@@ -871,7 +919,7 @@ function describeBundleReadFailure(
       );
     }
     return new MemoryArchiveBundleFileError(
-      `bundle file ${path}: ${error.message}`,
+      `bundle file ${path}: custody check failed`,
     );
   }
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
