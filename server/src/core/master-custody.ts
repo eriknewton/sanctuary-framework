@@ -1382,8 +1382,11 @@ async function pruneCustodyEnvelopeCommitJournalQuarantine(
     // parsed suffix. A non-numeric suffix becomes Number.MAX_SAFE_INTEGER and
     // sorts as newest, so the cap deletes numeric records first. A backward
     // wall-clock step can make the copy just written sort old enough to prune
-    // before the slot journal is deleted. Records created by boot recovery
-    // persist until the next recovery-key rekey or rotation.
+    // before the slot journal is deleted. Each slot keeps at most
+    // CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT records
+    // (every quarantine, including one made by boot recovery, prunes its slot
+    // to that cap); the retained records remain until a later quarantine
+    // prunes them or the next recovery-key rekey or rotation deletes them all.
     await storage.delete("_meta", entry.key, true);
   }
 }
