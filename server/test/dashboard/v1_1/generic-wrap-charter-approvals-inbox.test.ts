@@ -46,6 +46,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DashboardApprovalChannel } from "../../../src/principal-policy/dashboard.js";
 import {
+  buildConciergeContextProviders,
   buildV11Bindings,
   type V11Bindings,
 } from "../../../src/dashboard/v1_1/wiring.js";
@@ -57,6 +58,7 @@ import {
   HUB_INBOX_DEFAULT_LIMIT,
 } from "../../../src/hub/constants.js";
 import { charterApprovalItemId } from "../../../src/hub/charter-approval-bridge.js";
+import { InMemoryLocalAgentRegistry } from "../../../src/hub/agent-registry.js";
 import { ApprovalGate } from "../../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../src/principal-policy/baseline.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
@@ -449,6 +451,26 @@ describe("live Charter holds are projected under the caller's stated bound", () 
     const defaulted = await getJson(rig, `${HUB_API_PREFIX}/inbox`);
     expect(inboxItems(defaulted.body)).toHaveLength(HUB_INBOX_DEFAULT_LIMIT);
     expect(counting.calls.listLimits).toEqual([5, HUB_INBOX_DEFAULT_LIMIT]);
+  });
+
+  it("threads the same open inbox projection into concierge context", async () => {
+    const counting = countingBridge(1);
+    rig.bindings.hubService.setCharterApprovalBridge(counting.bridge);
+
+    const providers = buildConciergeContextProviders({
+      auditLog: rig.auditLog,
+      identityId: IDENTITY_ID,
+      registry: new InMemoryLocalAgentRegistry(),
+      resolveAuditAttribution: async () => ({}),
+      hubService: rig.bindings.hubService,
+    });
+
+    const context = await providers.openInbox();
+
+    expect(context).toContain(charterApprovalItemId("hold-0"));
+    expect(context).toContain("approval_pending");
+    expect(context).not.toBe("(no open inbox items)");
+    expect(counting.calls.listLimits).toEqual([5]);
   });
 
   it("resolves a card by key, never by scanning the queue", async () => {

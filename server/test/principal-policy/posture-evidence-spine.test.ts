@@ -134,6 +134,18 @@ describe("S3 evidence spine: the v1.1 dashboard", () => {
     expect(client).toContain('getElementById("sidebar-pills")');
   });
 
+  it("renders unwired sidebar status chips as unavailable rather than fixed status", () => {
+    expect(client).toContain(
+      'topbarPills: { deployment: "unavailable", mode: "unavailable", attestation: "unavailable" }',
+    );
+    expect(client).toContain("attestation: unavailable");
+    expect(client).toContain('data-pill="deployment">deployment: ');
+    expect(client).toContain('data-pill="mode">mode: ');
+    expect(client).not.toContain(
+      'topbarPills: { deployment: "local", mode: "solo", attestation: "pending" }',
+    );
+  });
+
   it("replaces the bare boot placeholder with an S3 empty state", () => {
     expect(html).toContain("Checking how safe you are.");
     expect(html).not.toContain("Loading dashboard.");

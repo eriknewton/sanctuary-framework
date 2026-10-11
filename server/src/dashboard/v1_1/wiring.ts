@@ -315,6 +315,8 @@ export interface V11Bindings {
   pii?: V11PiiRewriteBinding;
 }
 
+const CONCIERGE_OPEN_INBOX_LIMIT = 5;
+
 async function pruneExpiredDidWebKeysOnUnlock(
   inputs: BuildV11BindingsInputs,
 ): Promise<void> {
@@ -466,6 +468,7 @@ export function buildV11Bindings(
     });
   }
 
+  let hubServiceForConcierge: HubService | null = null;
   let operatorChatService: OperatorChatService | undefined;
   if (inputs.storage && inputs.masterKey) {
     const chatStore = new OperatorChatStore(inputs.storage, inputs.masterKey);
@@ -519,6 +522,12 @@ export function buildV11Bindings(
         identityId: inputs.identityId,
         registry,
         resolveAuditAttribution,
+        listOpenInboxItems: () =>
+          hubServiceForConcierge
+            ? hubServiceForConcierge.listInbox({
+                limit: CONCIERGE_OPEN_INBOX_LIMIT,
+              })
+            : [],
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
       // Rho-2.5: thread the live Tier B config so the concierge rewrite
@@ -798,6 +807,7 @@ export function buildV11Bindings(
     ...(operatorChatService ? { operatorChat: operatorChatService } : {}),
     ...(statelessConcierge ? { concierge: statelessConcierge } : {}),
   });
+  hubServiceForConcierge = hubService;
   return {
     hubService,
     identityId: inputs.identityId,
@@ -826,11 +836,13 @@ export function buildV11Bindings(
  * dashboard team iterate concierge prompts without touching the service
  * layer.
  */
-function buildConciergeContextProviders(args: {
+export function buildConciergeContextProviders(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
   resolveAuditAttribution: AuditAttributionOptionsResolver;
+  hubService?: HubService;
+  listOpenInboxItems?: () => ReturnType<HubService["listInbox"]>;
 }): ConciergeContextProviders {
   return {
     recentActivity: async () => {
@@ -864,10 +876,23 @@ function buildConciergeContextProviders(args: {
       return lines.join("\n");
     },
     openInbox: async () => {
-      // The inbox sources in v1.1.x wiring return empty arrays by
-      // default; the concierge surface degrades to an honest "(no
-      // open inbox items)" until the inbox aggregator is wired.
-      return "(no open inbox items)";
+      // The concierge reads the same bounded HubService projection as the
+      // operator inbox, so a live hold cannot disappear from chat context while
+      // still visible in the dashboard rail.
+      const items =
+        args.listOpenInboxItems?.() ??
+        args.hubService?.listInbox({ limit: CONCIERGE_OPEN_INBOX_LIMIT }) ??
+        [];
+      const openItems = items.filter((item) => item.resolved !== true);
+      if (openItems.length === 0) return "(no open inbox items)";
+      return openItems
+        .slice(0, CONCIERGE_OPEN_INBOX_LIMIT)
+        .map((item) => {
+          const tier =
+            item.kind === "approval_pending" ? `  tier=${item.tier}` : "";
+          return `${item.item_id}  kind=${item.kind}${tier}  created=${item.created_at}`;
+        })
+        .join("\n");
     },
   };
 }
