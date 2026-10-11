@@ -244,7 +244,7 @@ const state = {
   privacyEvents: [],
   handoffEvents: [],
   honeypot: { toolTraps: [], credentialTraps: [], loadError: null },
-  topbarPills: { deployment: "local", mode: "solo", attestation: "pending" },
+  topbarPills: { deployment: "unavailable", mode: "unavailable", attestation: "unavailable" },
   // Wave 1 (2026-06-30): which protected agent the operator is steering.
   // null means "All agents" (fortress-wide). Scopes the approvals queue +
   // ambient posture readout. The conversation spine is fortress-wide today
@@ -867,8 +867,12 @@ async function readPolicyView() {
 // outlined core; unverified shows the broken-seal mark. Observation
 // language only; Castle Layer 1 enforcement ships in WP-V1.x-CASTLE-WALL.
 function renderTopbarAttestationBadge(stateName) {
+  if (stateName === "unavailable") {
+    return '<span class="pill" data-pill="attestation">attestation: unavailable</span>';
+  }
   const valid = stateName === "verified" || stateName === "degraded" || stateName === "unverified" || stateName === "pending";
-  const cls = valid ? stateName : "pending";
+  if (!valid) return renderTopbarAttestationBadge("unavailable");
+  const cls = stateName;
   const ringDashed = cls === "pending" ? " dashed" : "";
   return '<span class="att-global ' + cls + '" data-pill="attestation" title="Fortress attestation">' +
     '<span class="seal">' +

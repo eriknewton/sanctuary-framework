@@ -69,9 +69,10 @@ form.
   present model against the signed manifest and arms.
 - **Interactive only, and the two headless cases differ.** A headless run that
   passes `--provision-local-intelligence` is refused before the host or the
-  manifest is touched, and the refusal is recorded. A headless run that never
-  asks for local intelligence is left alone: no ceremony, no refusal, and no
-  record written.
+  manifest is touched, the refusal is recorded, and `sanctuary protect` exits
+  non-zero after the cooperative wrap cleanup finishes. A headless run that
+  never asks for local intelligence is left alone: no ceremony, no refusal, and
+  no record written.
 - **ESM entry only.** The packaged manifest is located from the module's own
   file URL, which the CommonJS builds of the library do not carry; a CommonJS
   consumer gets a named refusal, and the `sanctuary` CLI is the provisioning

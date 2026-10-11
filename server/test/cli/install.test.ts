@@ -1,3 +1,4 @@
+// fail-before-exempt: this change pins existing planner behavior and changes no server/src file, so the new re-pin precedence enumeration and its source-scan pin pass on pre-change source by construction. Their witness is a mutation run: each recorded reordering of the re-pin arm or of a gate around it fails a named test.
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -9,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   AGENT_INSTALL_CONTRACT,
+  DEFAULT_CASTLE_WALL_APP,
   DEFAULT_CASTLE_WALL_LAUNCHER,
   buildAgentInstallPlan,
   createInstallOps,
@@ -1528,6 +1530,405 @@ describe("sanctuary install agent contract", () => {
     expect(notYetWalled.next_action?.id).toBe("repin_trust_anchor");
     expect(notYetWalled.status).not.toBe("complete");
   });
+
+  // Re-pin precedence pin for the full profile: the returns above the re-pin
+  // arm of buildAgentInstallPlan in server/src/cli/install.ts, in order.
+  //
+  // PROPERTY: on darwin a full-profile plan names `repin_trust_anchor` IF AND
+  // ONLY IF no return above the re-pin arm refuses first (every field holds a
+  // value in its `passing` list below) AND the anchor or the vault claim needs
+  // re-pin. Off darwin it never names it. The `passing` lists RECORD the
+  // planner's current pass-through values; they do not endorse them, and a
+  // planner change to any of them edits the matching `passing` list in the
+  // same change.
+  //
+  // SCOPE: this pins where re-pin sits relative to each refusal. It does not
+  // pin the relative order of two refusals above it, since only the re-pin id
+  // is asserted.
+  //
+  // COVERAGE is a covering design, not the full cross product (that is about
+  // forty million plans per platform). Every value of every observation the
+  // planner reads before the re-pin arm is exercised:
+  //   (a) one field at a time against an all-pass baseline, crossed with every
+  //       trust-anchor x vault-claim pair and every value of the three machine
+  //       facts the planner reads only after the re-pin arm;
+  //   (b) every pair of pre-re-pin fields at every value pair, crossed with
+  //       every trust-anchor x vault-claim pair.
+  // The all-pass baseline is the first case of (a). The next test pins the
+  // observed-field string comparisons, the harness and platform literals, and
+  // the build-sha pattern in that region to the planner source, and each value
+  // list is pinned to its declared union at compile time (CoversUnion), so a
+  // new observed value or a new string gate on those fields cannot sit outside
+  // the enumeration silently. The scan does not pin profile or null
+  // comparisons; a new gate of that shape needs its own case here.
+  type PrecedenceProbe = InstallProbeResult;
+  type PrecedenceHarness = Parameters<typeof buildAgentInstallPlan>[0]["harness"];
+  type CoversUnion<U, A extends readonly unknown[]> = [Exclude<U, A[number]>] extends [never] ? A : never;
+  const PRECEDENCE_OBSERVATIONS = ["present", "absent", "mismatch", "unknown", "not-applicable"] as const;
+  const PRECEDENCE_HARNESSES = ["openclaw", "hermes", "claude-code", "cursor", "cline", "mastra"] as const;
+  const PRECEDENCE_CUSTODY = ["present", "absent", "unknown"] as const;
+  const PRECEDENCE_SYSEXT = [
+    "[activated enabled]",
+    "[activated disabled]",
+    "[activated waiting for user]",
+    "not loaded",
+    "unknown",
+    "not-applicable",
+  ] as const;
+  const PRECEDENCE_TRUST_ANCHORS = ["consistent", "broken", "unprovisioned", "unknown", "not-applicable"] as const;
+  const PRECEDENCE_VAULT_CLAIMS = ["not-yet-walled", "walled", "unreadable", "unknown", "not-applicable"] as const;
+  const PRECEDENCE_CONTENT_FILTER = ["enabled", "disabled", "unknown", "not-applicable"] as const;
+  const PRECEDENCE_ENFORCEMENT = ["live", "unavailable", "undetermined", "not-applicable"] as const;
+  // Compile-time full-set pins: dropping a member of the declared union from a
+  // list above turns the matching line into a type error.
+  const precedenceUnionPins: [
+    CoversUnion<PrecedenceProbe["cooperativeWrap"], typeof PRECEDENCE_OBSERVATIONS>,
+    CoversUnion<PrecedenceProbe["persistentCli"], typeof PRECEDENCE_OBSERVATIONS>,
+    CoversUnion<PrecedenceProbe["castleWallApp"], typeof PRECEDENCE_OBSERVATIONS>,
+    CoversUnion<PrecedenceProbe["operatorTwin"], typeof PRECEDENCE_OBSERVATIONS>,
+    CoversUnion<PrecedenceProbe["bootService"], typeof PRECEDENCE_OBSERVATIONS>,
+    CoversUnion<PrecedenceHarness, typeof PRECEDENCE_HARNESSES>,
+    CoversUnion<PrecedenceProbe["existingCustody"], typeof PRECEDENCE_CUSTODY>,
+    CoversUnion<PrecedenceProbe["systemExtension"], typeof PRECEDENCE_SYSEXT>,
+    CoversUnion<PrecedenceProbe["trustAnchor"], typeof PRECEDENCE_TRUST_ANCHORS>,
+    CoversUnion<PrecedenceProbe["vaultProvision"], typeof PRECEDENCE_VAULT_CLAIMS>,
+    CoversUnion<PrecedenceProbe["contentFilter"], typeof PRECEDENCE_CONTENT_FILTER>,
+    CoversUnion<PrecedenceProbe["enforcement"], typeof PRECEDENCE_ENFORCEMENT>,
+  ] = [
+    PRECEDENCE_OBSERVATIONS,
+    PRECEDENCE_OBSERVATIONS,
+    PRECEDENCE_OBSERVATIONS,
+    PRECEDENCE_OBSERVATIONS,
+    PRECEDENCE_OBSERVATIONS,
+    PRECEDENCE_HARNESSES,
+    PRECEDENCE_CUSTODY,
+    PRECEDENCE_SYSEXT,
+    PRECEDENCE_TRUST_ANCHORS,
+    PRECEDENCE_VAULT_CLAIMS,
+    PRECEDENCE_CONTENT_FILTER,
+    PRECEDENCE_ENFORCEMENT,
+  ];
+  void precedenceUnionPins;
+
+  const PRECEDENCE_GLOBAL_CLI = "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js";
+  const PRECEDENCE_PATH_NODE = "/opt/homebrew/bin/node";
+  // The sealed-launcher gate compares persistentCliPath to the launcher path;
+  // nodePath travels with it, as the runtime resolver reports them together.
+  // The planner never compares nodePath itself, yet the re-pin argv runs it,
+  // so the argv check below holds only for these tied pairs; a sealed path
+  // with a different nodePath is outside this enumeration.
+  const PRECEDENCE_RUNTIMES = {
+    sealed: { persistentCliPath: DEFAULT_CASTLE_WALL_LAUNCHER, nodePath: DEFAULT_CASTLE_WALL_LAUNCHER },
+    global: { persistentCliPath: PRECEDENCE_GLOBAL_CLI, nodePath: PRECEDENCE_PATH_NODE },
+    missing: { persistentCliPath: null, nodePath: PRECEDENCE_PATH_NODE },
+  } as const;
+  // 12 = the short build-identity length the planner's app gate accepts; the
+  // two invalid spellings are the uppercase form and one character short.
+  const PRECEDENCE_VALID_BUILD_SHA = "a61a7322ca80";
+  // Must match CASTLE_WALL_SIGNER_CLIENT in server/src/cli/install.ts.
+  const PRECEDENCE_SIGNER_CLIENT = join(DEFAULT_CASTLE_WALL_APP, "Contents", "MacOS", "castle-wall-signer-client");
+  const PRECEDENCE_BUILD_SHAS = [PRECEDENCE_VALID_BUILD_SHA, null, "A61A7322CA80", "a61a7322ca8"] as const;
+
+  type PrecedenceCase = { harness: PrecedenceHarness; observed: PrecedenceProbe };
+  type PrecedenceDimension = {
+    field: string;
+    // Observation fields this dimension sets; pinned against the source scan.
+    observedFields: readonly (keyof PrecedenceProbe)[];
+    values: readonly (string | null)[];
+    // The values the planner lets through to the re-pin arm. This RECORDS the
+    // planner's CURRENT pre-re-pin behavior per field and is not a claim that
+    // each value is safe: e.g. cooperativeWrap `unknown` is refused only by
+    // the safety stop that runs after the re-pin arm, so it passes here.
+    passing: readonly (string | null)[];
+    apply: (target: PrecedenceCase, value: string | null) => void;
+  };
+  const observedDimension = (
+    field: keyof PrecedenceProbe,
+    values: readonly (string | null)[],
+    passing: readonly (string | null)[],
+  ): PrecedenceDimension => ({
+    field,
+    observedFields: [field],
+    values,
+    passing,
+    apply: (target, value) => {
+      (target.observed as unknown as Record<string, string | null>)[field] = value;
+    },
+  });
+  const PRE_REPIN_DIMENSIONS: readonly PrecedenceDimension[] = [
+    observedDimension("persistentCli", PRECEDENCE_OBSERVATIONS, ["present"]),
+    {
+      field: "runtime",
+      observedFields: ["persistentCliPath", "nodePath"],
+      values: Object.keys(PRECEDENCE_RUNTIMES),
+      passing: ["sealed"],
+      apply: (target, value) => {
+        Object.assign(target.observed, PRECEDENCE_RUNTIMES[value as keyof typeof PRECEDENCE_RUNTIMES]);
+      },
+    },
+    // Read only on the memory profile or with no CLI, so every value passes.
+    observedDimension("packageManagerPath", ["/opt/homebrew/bin/npm", null], ["/opt/homebrew/bin/npm", null]),
+    {
+      field: "harness",
+      observedFields: [],
+      values: PRECEDENCE_HARNESSES,
+      passing: ["hermes"],
+      apply: (target, value) => {
+        target.harness = value as PrecedenceHarness;
+      },
+    },
+    // Custody is refused only together with an absent wrap, which the wrap
+    // dimension already refuses on its own, so every value passes here.
+    observedDimension("existingCustody", PRECEDENCE_CUSTODY, PRECEDENCE_CUSTODY),
+    observedDimension("cooperativeWrap", PRECEDENCE_OBSERVATIONS, ["present", "mismatch", "unknown", "not-applicable"]),
+    observedDimension("castleWallApp", PRECEDENCE_OBSERVATIONS, ["present", "not-applicable"]),
+    observedDimension("castleWallBuildSha", PRECEDENCE_BUILD_SHAS, [PRECEDENCE_VALID_BUILD_SHA]),
+    observedDimension("systemExtension", PRECEDENCE_SYSEXT, ["[activated enabled]", "not-applicable"]),
+    observedDimension("operatorTwin", PRECEDENCE_OBSERVATIONS, ["absent"]),
+  ];
+  // Read only after the re-pin arm; re-pin must not depend on them.
+  const POST_REPIN_DIMENSIONS: readonly PrecedenceDimension[] = [
+    observedDimension("bootService", PRECEDENCE_OBSERVATIONS, PRECEDENCE_OBSERVATIONS),
+    observedDimension("contentFilter", PRECEDENCE_CONTENT_FILTER, PRECEDENCE_CONTENT_FILTER),
+    observedDimension("enforcement", PRECEDENCE_ENFORCEMENT, PRECEDENCE_ENFORCEMENT),
+  ];
+  const ANCHOR_OBSERVED_FIELDS: readonly (keyof PrecedenceProbe)[] = ["trustAnchor", "vaultProvision"];
+  const PRECEDENCE_BASELINE: Record<string, string | null> = {
+    persistentCli: "present",
+    runtime: "sealed",
+    packageManagerPath: "/opt/homebrew/bin/npm",
+    harness: "hermes",
+    existingCustody: "present",
+    cooperativeWrap: "present",
+    castleWallApp: "present",
+    castleWallBuildSha: PRECEDENCE_VALID_BUILD_SHA,
+    systemExtension: "[activated enabled]",
+    operatorTwin: "absent",
+    bootService: "present",
+    contentFilter: "enabled",
+    enforcement: "live",
+  };
+  const anchorNeedsRepin = (trustAnchor: string, vaultProvision: string): boolean =>
+    trustAnchor === "broken" ||
+    trustAnchor === "unprovisioned" ||
+    (vaultProvision === "not-yet-walled" && trustAnchor !== "consistent");
+
+  // Every assignment of the covering design, as field -> value overrides of
+  // the baseline. (a) single-field cases carry every post-re-pin combination;
+  // (b) pair cases keep the baseline post-re-pin facts.
+  function precedenceAssignments(): Record<string, string | null>[] {
+    const postCombos: Record<string, string | null>[] = [];
+    for (const boot of POST_REPIN_DIMENSIONS[0].values) {
+      for (const filter of POST_REPIN_DIMENSIONS[1].values) {
+        for (const enforcement of POST_REPIN_DIMENSIONS[2].values) {
+          postCombos.push({ bootService: boot, contentFilter: filter, enforcement });
+        }
+      }
+    }
+    const assignments: Record<string, string | null>[] = [];
+    for (const dimension of PRE_REPIN_DIMENSIONS) {
+      for (const value of dimension.values) {
+        for (const post of postCombos) assignments.push({ [dimension.field]: value, ...post });
+      }
+    }
+    for (let i = 0; i < PRE_REPIN_DIMENSIONS.length; i += 1) {
+      for (let j = i + 1; j < PRE_REPIN_DIMENSIONS.length; j += 1) {
+        for (const first of PRE_REPIN_DIMENSIONS[i].values) {
+          for (const second of PRE_REPIN_DIMENSIONS[j].values) {
+            assignments.push({ [PRE_REPIN_DIMENSIONS[i].field]: first, [PRE_REPIN_DIMENSIONS[j].field]: second });
+          }
+        }
+      }
+    }
+    return assignments;
+  }
+
+  function buildPrecedenceCase(assignment: Record<string, string | null>): {
+    target: PrecedenceCase;
+    gatesPass: boolean;
+  } {
+    const target: PrecedenceCase = { harness: "hermes", observed: fullObserved() };
+    let gatesPass = true;
+    for (const dimension of [...PRE_REPIN_DIMENSIONS, ...POST_REPIN_DIMENSIONS]) {
+      const value = dimension.field in assignment ? assignment[dimension.field] : PRECEDENCE_BASELINE[dimension.field];
+      dimension.apply(target, value);
+      if (!dimension.passing.includes(value)) gatesPass = false;
+    }
+    return { target, gatesPass };
+  }
+
+  // Operator-facing prose of a plan: every action description (including
+  // on_nonzero fallbacks) and every note, with absolute paths removed, since
+  // the app bundle path legitimately contains "MacOS".
+  function planProse(plan: AgentInstallPlan): string[] {
+    const actions = [plan.next_action, ...plan.operator_actions].filter(
+      (action): action is NonNullable<typeof action> => action !== null && action !== undefined,
+    );
+    return [
+      ...actions.flatMap((action) => [action.description, action.on_nonzero?.description ?? ""]),
+      ...plan.notes,
+    ].map((text) => text.replace(/\/[^\s;,]+/g, "<path>"));
+  }
+  // macOS-only operator wording. A non-darwin plan carrying any of these
+  // would be telling a Linux or Windows operator to act on a Mac.
+  const MACOS_ONLY_WORDING = [
+    "macOS",
+    "Mac",
+    "Terminal",
+    "Keychain",
+    "System Settings",
+    "Network Extension",
+    "Gatekeeper",
+  ] as const;
+
+  // (a) sum of pre-re-pin value counts x post-re-pin combinations, plus (b)
+  // the sum over field pairs of their value-count products, all times the
+  // trust-anchor x vault-claim pairs.
+  function expectedPrecedenceCaseCount(): number {
+    const sizes = PRE_REPIN_DIMENSIONS.map((dimension) => dimension.values.length);
+    const postCombos = POST_REPIN_DIMENSIONS.reduce((product, dimension) => product * dimension.values.length, 1);
+    const singles = sizes.reduce((sum, size) => sum + size, 0) * postCombos;
+    let pairs = 0;
+    for (let i = 0; i < sizes.length; i += 1) {
+      for (let j = i + 1; j < sizes.length; j += 1) pairs += sizes[i] * sizes[j];
+    }
+    return (singles + pairs) * PRECEDENCE_TRUST_ANCHORS.length * PRECEDENCE_VAULT_CLAIMS.length;
+  }
+
+  const DARWIN_REPIN_DESCRIPTION =
+    "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.";
+
+  function runPrecedenceEnumeration(platform: NodeJS.Platform): {
+    checked: number;
+    repinExpected: number;
+    failures: string[];
+    proseScanned: number;
+  } {
+    const failures: string[] = [];
+    let checked = 0;
+    let proseScanned = 0;
+    let repinExpected = 0;
+    for (const assignment of precedenceAssignments()) {
+      for (const trustAnchor of PRECEDENCE_TRUST_ANCHORS) {
+        for (const vaultProvision of PRECEDENCE_VAULT_CLAIMS) {
+          const { target, gatesPass } = buildPrecedenceCase(assignment);
+          target.observed.trustAnchor = trustAnchor;
+          target.observed.vaultProvision = vaultProvision;
+          const plan = buildAgentInstallPlan({
+            profile: "full",
+            harness: target.harness,
+            fortress: "/tmp/fortress",
+            platform,
+            observed: target.observed,
+          });
+          checked += 1;
+          const label = JSON.stringify({ platform, ...assignment, trustAnchor, vaultProvision });
+          const named = plan.next_action?.id === "repin_trust_anchor";
+          const expected =
+            platform === "darwin" && gatesPass && anchorNeedsRepin(trustAnchor, vaultProvision);
+          if (expected) repinExpected += 1;
+          if (named !== expected) {
+            failures.push(`${expected ? "missing" : "unexpected"} re-pin: ${label}`);
+            continue;
+          }
+          if (platform !== "darwin") {
+            for (const text of planProse(plan)) {
+              proseScanned += 1;
+              for (const banned of MACOS_ONLY_WORDING) {
+                if (text.includes(banned)) failures.push(`"${banned}" in ${platform} plan prose: ${label}`);
+              }
+            }
+          }
+          if (!named) continue;
+          const argv = plan.next_action?.argv;
+          const argvIsSealed =
+            Array.isArray(argv) &&
+            argv.length === 6 &&
+            argv[0] === "/usr/bin/env" &&
+            argv[1] === "SANCTUARY_STORAGE_PATH=/tmp/fortress" &&
+            argv[2] === `SANCTUARY_CASTLE_SIGNER_CLIENT=${PRECEDENCE_SIGNER_CLIENT}` &&
+            argv[3] === DEFAULT_CASTLE_WALL_LAUNCHER &&
+            argv[4] === "castle-wall" &&
+            argv[5] === "re-pin";
+          if (!argvIsSealed) failures.push(`re-pin argv is not the sealed launcher: ${JSON.stringify(argv)} ${label}`);
+          if (plan.status !== "human_action" || plan.next_action?.actor !== "human") {
+            failures.push(`re-pin is not a human action: ${label}`);
+          }
+          if (plan.next_action?.description !== DARWIN_REPIN_DESCRIPTION) {
+            failures.push(`re-pin description drifted: ${label}`);
+          }
+        }
+      }
+    }
+    return { checked, repinExpected, failures, proseScanned };
+  }
+
+  it("reads only the enumerated fields, and compares only enumerated values, before the re-pin arm", async () => {
+    const source = await readFile(new URL("../../src/cli/install.ts", import.meta.url), "utf8");
+    const start = source.indexOf("export function buildAgentInstallPlan(");
+    const end = source.indexOf("if (trustAnchorNeedsRepin) {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = source.slice(start, end);
+
+    const readFields = new Set([...region.matchAll(/input\.observed\.(\w+)/g)].map((match) => match[1]));
+    const enumeratedFields = new Set<string>([
+      ...PRE_REPIN_DIMENSIONS.flatMap((dimension) => dimension.observedFields),
+      ...ANCHOR_OBSERVED_FIELDS,
+    ]);
+    expect([...readFields].sort()).toEqual([...enumeratedFields].sort());
+
+    const valuesByField = new Map<string, readonly (string | null)[]>([
+      ...PRE_REPIN_DIMENSIONS.map((dimension) => [dimension.field, dimension.values] as const),
+      ["trustAnchor", PRECEDENCE_TRUST_ANCHORS],
+      ["vaultProvision", PRECEDENCE_VAULT_CLAIMS],
+    ]);
+    const comparedLiterals = [...region.matchAll(/input\.observed\.(\w+)\s*[!=]==\s*"([^"]*)"/g)];
+    expect(comparedLiterals.length).toBeGreaterThan(0);
+    for (const [, field, literal] of comparedLiterals) {
+      expect(valuesByField.get(field) ?? [], `${field} === "${literal}"`).toContain(literal);
+    }
+    for (const [, literal] of region.matchAll(/input\.harness\s*[!=]==\s*"([^"]*)"/g)) {
+      expect(PRECEDENCE_HARNESSES as readonly string[]).toContain(literal);
+    }
+    // The only platform the region distinguishes is darwin; every other
+    // platform takes the same branch, which the non-darwin cases exercise.
+    expect(new Set([...region.matchAll(/input\.platform\s*[!=]==\s*"([^"]*)"/g)].map((match) => match[1]))).toEqual(
+      new Set(["darwin"]),
+    );
+    // The build-identity gate's shape, which the invalid build-sha values probe.
+    expect(region).toContain("!/^[a-f0-9]{12}$/.test(input.observed.castleWallBuildSha)");
+  });
+
+  it("names re-pin on darwin if and only if no earlier full-profile return refuses and the anchor needs it (pass-through values recorded, not endorsed)", () => {
+    const { checked, repinExpected, failures } = runPrecedenceEnumeration("darwin");
+    expect({ failureCount: failures.length, firstFailures: failures.slice(0, 5) }).toEqual({
+      failureCount: 0,
+      firstFailures: [],
+    });
+    // Non-vacuity: the generator emitted exactly the covering design described
+    // above (109,575 plans today), and both sides of the IFF were exercised.
+    expect(checked).toBe(expectedPrecedenceCaseCount());
+    expect(repinExpected).toBeGreaterThan(0);
+    expect(checked - repinExpected).toBeGreaterThan(0);
+  });
+
+  it.each(["linux", "win32", "freebsd"] as const)(
+    "never names re-pin, and no action or note carries macOS-only wording, for a %s full-profile plan",
+    (platform) => {
+      // Today these plans carry notes but no actions, so the wording scan
+      // reads notes; it guards against a macOS action or note moving above
+      // the non-darwin stop.
+      const { checked, repinExpected, failures, proseScanned } = runPrecedenceEnumeration(platform);
+      expect({ failureCount: failures.length, firstFailures: failures.slice(0, 5) }).toEqual({
+        failureCount: 0,
+        firstFailures: [],
+      });
+      expect(repinExpected).toBe(0);
+      expect(checked).toBe(expectedPrecedenceCaseCount());
+      expect(proseScanned).toBeGreaterThanOrEqual(checked);
+    },
+  );
 
   it("stops naming re-pin once the anchor is consistent, so the operator is not sent round the same command", () => {
     // THE LOOP THIS CLOSES: `re-pin` is idempotent. On an anchor that already
