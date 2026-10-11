@@ -390,7 +390,112 @@ const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
  * lifetime is `encrypted_state`, and 24 MiB of serialized state is already
  * a very large single fortress).
  */
-const MAX_EXIT_ARTIFACT_READ_BYTES = 24 * 1024 * 1024;
+const BYTES_PER_MIB = 1024 * 1024;
+const EXIT_ARTIFACT_READ_CAP_MIB = 24;
+const MAX_EXIT_ARTIFACT_READ_BYTES =
+  EXIT_ARTIFACT_READ_CAP_MIB * BYTES_PER_MIB;
+
+type ExitArtifactReadFailureClass = Extract<
+  ExitBundleFailureClass,
+  | "archive_contains_symlink"
+  | "artifact_path_escapes_root"
+  | "artifact_size_mismatch"
+  | "artifact_missing"
+>;
+
+interface BoundedExitArtifactRead {
+  ok: true;
+  artifactPath: string;
+  bytes: Uint8Array;
+  fileSize: number;
+}
+
+interface FailedExitArtifactRead {
+  ok: false;
+  artifactPath: string;
+  failure_class: ExitArtifactReadFailureClass;
+}
+
+class ExitArtifactSizeRefusedError extends Error {
+  constructor() {
+    super("exit artifact size refused before full read");
+    this.name = "ExitArtifactSizeRefusedError";
+  }
+}
+
+function artifactSizeWithinReadBounds(
+  entry: ExitBundleArtifactEntry,
+  size: number
+): boolean {
+  return (
+    size === entry.size_bytes &&
+    size <= MAX_EXIT_ARTIFACT_READ_BYTES
+  );
+}
+
+async function readExitArtifactBytesBounded(
+  root: string,
+  entry: ExitBundleArtifactEntry
+): Promise<BoundedExitArtifactRead | FailedExitArtifactRead> {
+  const artifactPath = join(root, entry.path);
+  try {
+    const linkStat = await lstat(artifactPath);
+    if (linkStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "archive_contains_symlink",
+      };
+    }
+    // INVARIANT: every artifact reader checks the signed declared size and
+    // absolute cap before any full-content read; this shared helper is the
+    // single gate used by the hash pass and the later kind-specific loaders.
+    if (!artifactSizeWithinReadBounds(entry, linkStat.size)) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_size_mismatch",
+      };
+    }
+    const descends = await assertDescendant(root, artifactPath);
+    if (!descends) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_path_escapes_root",
+      };
+    }
+    const { data: raw, stats: fileStat } = await readFileCustodyWithStats(
+      artifactPath,
+      {
+        verifyPathIdentity: true,
+        onDescriptorVerified: ({ stats }) => {
+          // The descriptor stat is the last point before readFile(); enforce
+          // the same bound again so a changed same-path file still refuses
+          // before bytes are pulled into memory.
+          if (!artifactSizeWithinReadBounds(entry, stats.size)) {
+            throw new ExitArtifactSizeRefusedError();
+          }
+        },
+      },
+    );
+    return {
+      ok: true,
+      artifactPath,
+      bytes: new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
+      fileSize: fileStat.size,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      artifactPath,
+      failure_class:
+        err instanceof ExitArtifactSizeRefusedError
+          ? "artifact_size_mismatch"
+          : "artifact_missing",
+    };
+  }
+}
 
 /**
  * Cap on how many unlisted paths the `artifact_directory_unlisted_file`
@@ -899,15 +1004,17 @@ export async function loadExitArtifact<T = unknown>(
 ): Promise<LoadedExitArtifact<T> | null> {
   const entry = manifest.body.artifacts.find((artifact) => artifact.kind === kind);
   if (!entry) return null;
-  const artifactPath = join(bundleDir, entry.path);
-  const bytes = await readFileCustody(artifactPath, {
-    verifyPathIdentity: true,
-  });
+  const read = await readExitArtifactBytesBounded(bundleDir, entry);
+  if (!read.ok) {
+    throw new InvalidExitBundleError(
+      `Exit artifact ${kind} could not be loaded: ${read.failure_class}`
+    );
+  }
   return {
     entry,
-    path: artifactPath,
-    bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-    json: JSON.parse(Buffer.from(bytes).toString("utf8")) as T,
+    path: read.artifactPath,
+    bytes: read.bytes,
+    json: JSON.parse(Buffer.from(read.bytes).toString("utf8")) as T,
   };
 }
 
@@ -1016,39 +1123,22 @@ async function verifyIdentityBindingBeforeManifestKeyUse(
     };
   }
 
-  const artifactPath = join(root, entry.path);
-  let bytes: Uint8Array;
-  let fileSize: number;
-  try {
-    const linkStat = await lstat(artifactPath);
-    if (linkStat.isSymbolicLink()) {
-      return { failure_class: "archive_contains_symlink", warnings: [] };
-    }
-    const descends = await assertDescendant(root, artifactPath);
-    if (!descends) {
-      return { failure_class: "artifact_path_escapes_root", warnings: [] };
-    }
-    const { data: raw, stats } = await readFileCustodyWithStats(
-      artifactPath,
-      { verifyPathIdentity: true },
-    );
-    bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    fileSize = stats.size;
-  } catch {
-    return { failure_class: "artifact_missing", warnings: [] };
+  const read = await readExitArtifactBytesBounded(root, entry);
+  if (!read.ok) {
+    return { failure_class: read.failure_class, warnings: [] };
   }
 
-  const hashPassed = sha256Hex(bytes) === entry.hash;
+  const hashPassed = sha256Hex(read.bytes) === entry.hash;
   if (!hashPassed) {
     return { failure_class: "artifact_hash_mismatch", warnings: [] };
   }
-  if (fileSize !== entry.size_bytes) {
+  if (read.fileSize !== entry.size_bytes) {
     return { failure_class: "artifact_size_mismatch", warnings: [] };
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    parsed = JSON.parse(Buffer.from(read.bytes).toString("utf8"));
   } catch {
     return {
       failure_class: "identity_signature_invalid",
@@ -1750,72 +1840,9 @@ export async function verifyExitBundle(
   let sawEncryptedState = false;
 
   for (const artifact of body.artifacts) {
-    const artifactPath = join(root, artifact.path);
-    let bytes: Uint8Array;
-    let fileSize: number;
-    try {
-      const linkStat = await lstat(artifactPath);
-      if (linkStat.isSymbolicLink()) {
-        artifactFailure = "archive_contains_symlink";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      // Checked from the `lstat` already taken above - no extra syscall -
-      // and BEFORE the full-content read below. By this point in the
-      // function the manifest's signature and `artifacts_aggregate_hash`
-      // have ALREADY been verified (both run earlier in this function), so
-      // `artifact.size_bytes` is a value the exporting fortress genuinely
-      // signed; a REAL on-disk file that does not match it, or that
-      // exceeds the absolute per-artifact cap even when it does match, is
-      // never read in full - only hashed-and-refused after the fact. This
-      // closes that class for the common, realistic case (a stat lstat
-      // already returned, not a fresh syscall). RESIDUAL (private register
-      // EXIT-KS-01): it does not close a same-uid writer that grows this
-      // exact file, in place, in the narrow window between this check and
-      // `readFileCustodyWithStats`'s own internal path-identity recheck
-      // below - `verifyPathIdentity` catches a SWAPPED file (different
-      // inode) in that window but not a GROWN one (same inode); that
-      // residual requires a single fd-based bounded-read primitive shared
-      // with `readFileCustodyWithStats` and is tracked as a separate,
-      // unbuilt row rather than duplicated here (AGENTS.md rule 5 -
-      // custody checks live in ONE place, storage/custody-fs.ts).
-      if (
-        linkStat.size !== artifact.size_bytes ||
-        linkStat.size > MAX_EXIT_ARTIFACT_READ_BYTES
-      ) {
-        artifactFailure = "artifact_size_mismatch";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      const descends = await assertDescendant(root, artifactPath);
-      if (!descends) {
-        artifactFailure = "artifact_path_escapes_root";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      const { data: raw, stats: fileStat } = await readFileCustodyWithStats(
-        artifactPath,
-        { verifyPathIdentity: true },
-      );
-      fileSize = fileStat.size;
-      bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    } catch {
-      artifactFailure = "artifact_missing";
+    const read = await readExitArtifactBytesBounded(root, artifact);
+    if (!read.ok) {
+      artifactFailure = read.failure_class;
       artifactResults.push({
         path: artifact.path,
         kind: artifact.kind,
@@ -1825,8 +1852,9 @@ export async function verifyExitBundle(
       continue;
     }
 
+    const bytes = read.bytes;
     const hashPassed = sha256Hex(bytes) === artifact.hash;
-    const sizePassed = fileSize === artifact.size_bytes;
+    const sizePassed = read.fileSize === artifact.size_bytes;
     if (!hashPassed && !artifactFailure) artifactFailure = "artifact_hash_mismatch";
     if (!sizePassed && !artifactFailure) artifactFailure = "artifact_size_mismatch";
     artifactResults.push({

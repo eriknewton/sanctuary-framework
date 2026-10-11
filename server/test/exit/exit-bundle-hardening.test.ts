@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -11,11 +11,13 @@ import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import {
+  loadExitArtifact,
   exportExitBundle,
   importExitBundle,
   verifyExitBundle,
   ExitBundleImportError,
 } from "../../src/exit/index.js";
+import { InvalidExitBundleError } from "../../src/exit/verifier.js";
 import { EXIT_BUNDLE_DID_WEB_AUDIT_OPS } from "../../src/exit/bundle.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -108,6 +110,52 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact applies the per-artifact read cap before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-load-cap-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{");
+    const bytesPerMiB = 1024 * 1024;
+    // The verifier's documented cap is 24 MiB; +1 proves the refusal branch
+    // without forcing the fixture to allocate a dense artifact on disk.
+    const oversizedArtifactBytes = 24 * bytesPerMiB + 1;
+    await truncate(artifactPath, oversizedArtifactBytes);
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: oversizedArtifactBytes,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toBeInstanceOf(InvalidExitBundleError);
   });
 
   it("#54: refuses identity overwrite without forceRebind, allows it with forceRebind, records audit", async () => {
