@@ -138,7 +138,7 @@ describe("startTransparencyScheduler", () => {
     }
   });
 
-  it("stop gives up after the tick-work deadline and later storage admission is refused", async () => {
+  it("stop gives up after the named tick-work estimate", async () => {
     vi.useFakeTimers();
     try {
       let barrierHeld = true;

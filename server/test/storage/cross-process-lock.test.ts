@@ -56,6 +56,7 @@ const SHORT_SOCKET_TMP_PARENT =
 // Cross-file contract: must match BARRIER_SCAFFOLD_DIGEST_HEX_CHARS in
 // src/storage/cross-process-lock.ts, the filename width this test plants.
 const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
+const SECURE_SCAFFOLD_MODE = 0o600;
 
 function scaffoldDigest(seed: number): string {
   return seed.toString(16).padStart(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS, "0");
@@ -65,6 +66,21 @@ async function countReaperScaffolds(root: string): Promise<number> {
   return (await readdir(root)).filter(
     (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
   ).length;
+}
+
+async function writeSecureScaffold(path: string): Promise<void> {
+  await writeFile(path, "");
+  await chmod(path, SECURE_SCAFFOLD_MODE);
+}
+
+async function scaffoldModes(root: string): Promise<Map<string, number>> {
+  const modes = new Map<string, number>();
+  for (const name of await readdir(root)) {
+    if (!name.endsWith(".reaper") && !name.endsWith(".reader-reaper")) continue;
+    const stats = await lstat(join(root, name));
+    modes.set(name, stats.mode & 0o777);
+  }
+  return modes;
 }
 
 function reaperLockCommand(host: NodeJS.Platform): string {
@@ -219,7 +235,7 @@ describe("withCrossProcessLock", () => {
           `${freshDigest}.reader-reaper`,
         ];
         for (const scaffold of freshScaffolds) {
-          await writeFile(join(runtimeRoot, scaffold), "");
+          await writeSecureScaffold(join(runtimeRoot, scaffold));
         }
         const triggerFortress = await mkdtemp(join(base, "barrier-trigger-"));
         const triggerLease = await acquireMasterWriteBarrier(
@@ -261,8 +277,8 @@ describe("withCrossProcessLock", () => {
         const digest = "e".repeat(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
         const exclusiveScaffold = join(runtimeRoot, `${digest}.reaper`);
         const readerScaffold = join(runtimeRoot, `${digest}.reader-reaper`);
-        await writeFile(exclusiveScaffold, "");
-        await writeFile(readerScaffold, "");
+        await writeSecureScaffold(exclusiveScaffold);
+        await writeSecureScaffold(readerScaffold);
         await sleep(SCAFFOLD_STALE_SETTLE_MS);
         holder = trackChild(await spawnScaffoldLockHolder(exclusiveScaffold, host));
 
@@ -334,7 +350,7 @@ describe("withCrossProcessLock", () => {
         const liveLease = await acquireMasterWriteBarrier(
           liveStorage,
           "_meta",
-          "scaffold-sweep-test",
+          "scaffold-live-held-test",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
         );
         const liveBefore = (await readdir(runtimeRoot)).filter(
@@ -356,7 +372,7 @@ describe("withCrossProcessLock", () => {
         const reacquired = await acquireMasterWriteBarrier(
           new FilesystemStorage(join(nonActiveTrigger, "state")),
           "_meta",
-          "scaffold-sweep-test",
+          "scaffold-sweep-trigger-test",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
         );
         await reacquired.release();
@@ -389,12 +405,12 @@ describe("withCrossProcessLock", () => {
         }
         for (let index = 0; index < OVER_CEILING_SCAFFOLD_PAIR_COUNT; index += 1) {
           const digest = scaffoldDigest(index);
-          await writeFile(join(runtimeRoot, `${digest}.reaper`), "");
-          await writeFile(join(runtimeRoot, `${digest}.reader-reaper`), "");
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
         }
         for (let index = 0; index < OVER_CEILING_CUSTODY_REAPER_COUNT; index += 1) {
           const digest = scaffoldDigest(OVER_CEILING_SCAFFOLD_PAIR_COUNT + index);
-          await writeFile(join(runtimeRoot, `${digest}.reaper`), "");
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
         }
         await sleep(SCAFFOLD_STALE_SETTLE_MS);
 
@@ -403,7 +419,7 @@ describe("withCrossProcessLock", () => {
         const firstTriggerLease = await acquireMasterWriteBarrier(
           new FilesystemStorage(join(firstTriggerFortress, "state")),
           "_meta",
-          "scaffold-sweep-test",
+          "scaffold-sweep-trigger-a",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
         );
         await firstTriggerLease.release();
@@ -417,7 +433,7 @@ describe("withCrossProcessLock", () => {
         const secondTriggerLease = await acquireMasterWriteBarrier(
           new FilesystemStorage(join(secondTriggerFortress, "state")),
           "_meta",
-          "scaffold-sweep-test",
+          "scaffold-sweep-trigger-b",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
         );
         await secondTriggerLease.release();
@@ -427,6 +443,103 @@ describe("withCrossProcessLock", () => {
           UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2,
         );
       } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "sweeps complete scaffold pairs while leaving custody-only scaffolds inert",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const custodyDigest = scaffoldDigest(1);
+        const pairDigest = scaffoldDigest(2);
+        await writeSecureScaffold(join(runtimeRoot, `${custodyDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const triggerFortress = await mkdtemp(join(base, "barrier-complete-pair-"));
+        const triggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(triggerFortress, "state")),
+          "_meta",
+          "scaffold-complete-pair-trigger",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await triggerLease.release();
+
+        const names = await readdir(runtimeRoot);
+        expect(names).toContain(`${custodyDigest}.reaper`);
+        expect(names).not.toContain(`${custodyDigest}.reader-reaper`);
+        expect(names).not.toContain(`${pairDigest}.reaper`);
+        expect(names).not.toContain(`${pairDigest}.reader-reaper`);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "keeps scaffold modes secure under a restrictive process umask",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const previousUmask = process.umask(0o027);
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const custodyDigest = scaffoldDigest(10);
+        const pairDigest = scaffoldDigest(11);
+        await writeSecureScaffold(join(runtimeRoot, `${custodyDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const firstFortress = await mkdtemp(join(base, "barrier-umask-a-"));
+        const secondFortress = await mkdtemp(join(base, "barrier-umask-b-"));
+        const [firstLease, secondLease] = await Promise.all([
+          acquireMasterWriteBarrier(
+            new FilesystemStorage(join(firstFortress, "state")),
+            "_meta",
+            "scaffold-umask-a",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          ),
+          acquireMasterWriteBarrier(
+            new FilesystemStorage(join(secondFortress, "state")),
+            "_meta",
+            "scaffold-umask-b",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          ),
+        ]);
+        await firstLease.release();
+        await secondLease.release();
+
+        for (const mode of (await scaffoldModes(runtimeRoot)).values()) {
+          expect(mode).toBe(SECURE_SCAFFOLD_MODE);
+        }
+
+        const laterFortress = await mkdtemp(join(base, "barrier-umask-later-"));
+        const laterLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(laterFortress, "state")),
+          "_meta",
+          "scaffold-umask-later",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await expect(laterLease.release()).resolves.toBeUndefined();
+      } finally {
+        process.umask(previousUmask);
         if (previousRoot === undefined) {
           delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
         } else {

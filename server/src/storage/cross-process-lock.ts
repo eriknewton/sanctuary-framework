@@ -1201,15 +1201,35 @@ async function sweepUnusedBarrierScaffolds(
       if (hasLiveEntry) continue;
       const hasExclusiveScaffold = nameSet.has(`${digest}.reaper`);
       const hasReaderScaffold = nameSet.has(`${digest}.reader-reaper`);
-      if (!hasExclusiveScaffold) continue;
-      // INVARIANT (bounded runtime dir): every cleanup candidate, including a
-      // custody-only reaper scaffold, holds the exclusive and reader reaper
-      // authorities in one fixed order before unlinking names, then re-checks
-      // the no-socket and freshness conditions under those locks.
+      if (!hasExclusiveScaffold || !hasReaderScaffold) {
+        // DEBT(CUSTODY-SCAFFOLD-ACCUMULATION): a released custody digest can
+        // leave one uid-owned 0600 empty `.reaper` scaffold; without the
+        // reader-reaper sibling this barrier-pair sweep has no reader authority
+        // to lock, so cleanup is intentionally deferred.
+        continue;
+      }
+      const exclusiveScaffoldPath = join(runtimeDir, `${digest}.reaper`);
+      const readerScaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
+      const exclusiveSnapshot = await readSweepScaffoldSnapshot(exclusiveScaffoldPath)
+        .catch(() => null);
+      const readerSnapshot = await readSweepScaffoldSnapshot(readerScaffoldPath)
+        .catch(() => null);
+      if (exclusiveSnapshot === null || readerSnapshot === null) continue;
+      if (
+        now - exclusiveSnapshot.ctimeMs < UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS
+        || now - readerSnapshot.ctimeMs < UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS
+      ) {
+        continue;
+      }
+      // INVARIANT (bounded runtime dir): every cleanup candidate is a complete
+      // barrier pair; the parent validates stable secure inodes immediately
+      // before spawning, and the helper then locks both reaper authorities in a
+      // fixed order before unlinking.
       helperSpawns += 1;
       await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host, {
-        requireReaderScaffold: hasReaderScaffold,
-      });
+        exclusiveSnapshot,
+        readerSnapshot,
+      }).catch(() => 0);
     }
     completed = true;
   } finally {
@@ -1225,13 +1245,15 @@ async function sweepOneUnusedBarrierScaffold(
   runtimeDir: string,
   digest: string,
   host: NodeJS.Platform,
-  options: { requireReaderScaffold: boolean },
+  options: {
+    exclusiveSnapshot: SweepScaffoldSnapshot;
+    readerSnapshot: SweepScaffoldSnapshot;
+  },
 ): Promise<number> {
   const script = String.raw`
 const fs=require('node:fs'); const path=require('node:path');
-const [runtimeDir,digest,readerPrefix,minAgeRaw,requireReaderRaw]=process.argv.slice(1);
+const [runtimeDir,digest,readerPrefix,minAgeRaw]=process.argv.slice(1);
 const minAgeMs=Number(minAgeRaw); const now=Date.now();
-const requireReader=requireReaderRaw === '1';
 function hasSocket(){
   for (const name of fs.readdirSync(runtimeDir)) {
     if (name === digest + '.sock') return true;
@@ -1246,9 +1268,7 @@ function oldEnough(name){
 const names=[digest + '.reaper', digest + '.reader-reaper'];
 if (hasSocket()) process.exit(73);
 try { if (!oldEnough(names[0])) process.exit(73); } catch { process.exit(73); }
-if (requireReader) {
-  try { if (!oldEnough(names[1])) process.exit(73); } catch { process.exit(73); }
-}
+try { if (!oldEnough(names[1])) process.exit(73); } catch { process.exit(73); }
 if (hasSocket()) process.exit(73);
 let removed=0;
 for (const name of names) {
@@ -1259,6 +1279,18 @@ process.stdout.write(String(removed));
 `;
   const exclusiveScaffoldPath = join(runtimeDir, `${digest}.reaper`);
   const readerScaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
+  const currentExclusive = await readSweepScaffoldSnapshot(exclusiveScaffoldPath);
+  const currentReader = await readSweepScaffoldSnapshot(readerScaffoldPath);
+  if (
+    currentExclusive === null
+    || currentReader === null
+    || !sameSweepScaffoldSnapshot(currentExclusive, options.exclusiveSnapshot)
+    || !sameSweepScaffoldSnapshot(currentReader, options.readerSnapshot)
+    || Date.now() - currentExclusive.ctimeMs < UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS
+    || Date.now() - currentReader.ctimeMs < UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS
+  ) {
+    return 0;
+  }
   const command = kernelReaperCommand(host);
   const commandArgs = host === "darwin"
     ? [
@@ -1278,7 +1310,6 @@ process.stdout.write(String(removed));
         digest,
         digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
-        options.requireReaderScaffold ? "1" : "0",
       ]
     : [
         "-n",
@@ -1293,11 +1324,16 @@ process.stdout.write(String(removed));
         digest,
         digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
-        options.requireReaderScaffold ? "1" : "0",
       ];
   return await new Promise<number>((resolve, reject) => {
-    const child = spawn(command, commandArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
+    const child = spawn("/bin/sh", [
+      "-c",
+      "umask 077; exec \"$@\"",
+      "unused-scaffold-lock",
+      command,
+      ...commandArgs,
+    ], {
+      stdio: ["ignore", "pipe", "ignore"],
       detached: true,
     });
     const killSweepGroup = (): void => {
@@ -1314,7 +1350,6 @@ process.stdout.write(String(removed));
       }
     };
     let stdout = "";
-    let stderr = "";
     const timer = setTimeout(() => {
       killSweepGroup();
       reject(new CrossProcessLockError("unused-scaffold sweep exceeded its bounded deadline", "io"));
@@ -1323,14 +1358,11 @@ process.stdout.write(String(removed));
     child.stdout.on("data", (chunk) => {
       if (stdout.length < 16) stdout += String(chunk).slice(0, 16 - stdout.length);
     });
-    child.stderr.on("data", (chunk) => {
-      if (stderr.length < 512) stderr += String(chunk).slice(0, 512 - stderr.length);
-    });
     child.once("error", (error) => {
       clearTimeout(timer);
       reject(new CrossProcessLockError(`unused-scaffold sweep failed to start: ${errorMessage(error)}`, "capability"));
     });
-    child.once("exit", (code, signal) => {
+    child.once("exit", (code) => {
       clearTimeout(timer);
       if (code === 0) {
         resolve(Number(stdout.trim() || "0"));
@@ -1340,10 +1372,7 @@ process.stdout.write(String(removed));
         resolve(0);
         return;
       }
-      reject(new CrossProcessLockError(
-        `unused-scaffold sweep refused (${signal ?? code})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
-        "io",
-      ));
+      resolve(0);
     });
   });
 }
@@ -1433,6 +1462,35 @@ const BARRIER_REAPER_SCAFFOLD_PATTERN = new RegExp(
   `^[0-9a-f]{${BARRIER_SCAFFOLD_DIGEST_HEX_CHARS}}\\.(?:reader-)?reaper$`,
 );
 const lastUnusedBarrierSweepByDigest = new Map<string, number>();
+interface SweepScaffoldSnapshot {
+  dev: string;
+  ino: string;
+  ctimeMs: number;
+}
+
+async function readSweepScaffoldSnapshot(
+  path: string,
+): Promise<SweepScaffoldSnapshot | null> {
+  const stats = await lstat(path, { bigint: true }).catch((error) => {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (stats === null) return null;
+  if (!stats.isFile()) return null;
+  if (Number(stats.mode & 0o777n) !== 0o600) return null;
+  return {
+    dev: String(stats.dev),
+    ino: String(stats.ino),
+    ctimeMs: Number(stats.ctimeMs),
+  };
+}
+
+function sameSweepScaffoldSnapshot(
+  left: SweepScaffoldSnapshot,
+  right: SweepScaffoldSnapshot,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
 
 /**
  * Best-effort, bounded reap of DEAD reader sockets left in the shared runtime

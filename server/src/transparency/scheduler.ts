@@ -22,9 +22,12 @@ export const TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS = 5_000;
 export const TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS = 3_000;
 // 2_000 ms is the shutdown scheduling margin after all named tick work budgets.
 export const TRANSPARENCY_STOP_DRAIN_MARGIN_MS = 2_000;
-// Shutdown drains a tick through its bounded work budget, then releases the
-// daemon's master session; writes that begin after that release are refused by
-// the master-write barrier.
+// DEBT(TRANSPARENCY-DRAIN-STRADDLE): the local sign/append term is a named
+// estimate, not a code-enforced budget; chain verification and writes already
+// admitted before release can still straddle this drain deadline.
+// Shutdown drains to the named estimate, then releases the daemon's master
+// session; writes that begin after that release are refused by the
+// master-write barrier.
 export const TRANSPARENCY_STOP_DRAIN_DEADLINE_MS =
   TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS +
   REKOR_SUBMIT_TIMEOUT_MS +
@@ -116,7 +119,7 @@ export function startTransparencyScheduler(
       stopped = true;
       clearIntervalFn(timer);
       // Shutdown drains a tick that already entered its master-derived writes,
-      // but only to the named tick-work deadline; after that the daemon drops
+      // but only to the named estimate deadline; after that the daemon drops
       // its reader and writes that begin later fail closed through the storage
       // barrier.
       const current = inFlight;
