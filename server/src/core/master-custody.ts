@@ -191,8 +191,8 @@ const LIVE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT =
   "If they do not, restore that live custody pair from a trusted backup; if no backup exists, the state needs manual repair.";
 
 const STAGED_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT =
-  "Sanctuary will quarantine this staged custody record only after the staged custody pair authenticates, or after a rotation resume proves the staged pair was already promoted and removed. " +
-  "Retry with `sanctuary rotate-master --resume` when a rotation journal exists, or rerun `sanctuary rotate-master` to let preflight abort an abandoned staged pair.";
+  "Sanctuary will quarantine _meta/custody-envelope-commit-journal.custody-envelope-next.custody-sentinel-next only after the staged pair keys _meta/custody-envelope-next and _meta/custody-sentinel-next authenticate together, or after those staged pair keys are absent and the live custody pair authenticates. " +
+  "With no rotation journal, a plain `sanctuary rotate-master` clears abandoned staged pair keys; with a rotation journal, repair those named staged objects before resuming rotation.";
 
 /**
  * Single registry for every custody-pair journal slot. Every journal key,
@@ -1280,6 +1280,12 @@ interface CustodyPairRecoveryResult {
   quarantinedJournal: boolean;
 }
 
+export type CustodyEnvelopeCommitConsistencyCheck = (
+  storage: StorageBackend,
+  master: Uint8Array,
+  slot: CustodyEnvelopeCommitJournalSlot,
+) => Promise<boolean>;
+
 async function verifyCustodyPairAuthenticates(
   storage: StorageBackend,
   master: Uint8Array,
@@ -1298,6 +1304,16 @@ async function verifyCustodyPairAuthenticates(
   } catch {
     return false;
   }
+}
+
+export async function liveCustodyPairAuthenticates(
+  storage: StorageBackend,
+  master: Uint8Array,
+): Promise<boolean> {
+  return verifyCustodyPairAuthenticates(storage, master, {
+    envelopeKey: CUSTODY_ENVELOPE_KEY,
+    sentinelKey: CUSTODY_SENTINEL_KEY,
+  });
 }
 
 async function liveCustodyPairConsistent(
@@ -1362,15 +1378,21 @@ async function pruneCustodyEnvelopeCommitJournalQuarantine(
   const excess =
     entries.length - CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT;
   for (const entry of excess > 0 ? entries.slice(0, excess) : []) {
-    // Quarantines retain old custody wraps for operator inspection; the cap
-    // bounds that residual by securely deleting the oldest record per slot.
+    // DEBT(CUSTODY-QUARANTINE-RETENTION-ORDER): between custody mutations,
+    // quarantines retain old wraps for inspection; the cap bounds that residual
+    // by securely deleting the oldest record per slot.
     await storage.delete("_meta", entry.key, true);
   }
 }
 
 export async function recoverCustodyEnvelopeCommitIfPresent(
   storage: StorageBackend,
-  opts?: { envelopeKey?: string; sentinelKey?: string; master?: Uint8Array },
+  opts?: {
+    envelopeKey?: string;
+    sentinelKey?: string;
+    master?: Uint8Array;
+    consistencyCheck?: CustodyEnvelopeCommitConsistencyCheck;
+  },
 ): Promise<CustodyPairRecoveryResult> {
   const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
   const sentinelKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
@@ -1384,6 +1406,7 @@ export async function recoverCustodyEnvelopeCommitIfPresent(
         envelopeKey,
         sentinelKey,
         master: opts?.master,
+        consistencyCheck: opts?.consistencyCheck,
       }),
     { metadata: { owner: "recover-custody-envelope-commit" } },
   );
@@ -1405,7 +1428,12 @@ async function recoverCustodyEnvelopeCommitLocked(
   storage: StorageBackend,
   slot: CustodyEnvelopeCommitJournalSlot,
   lease: CrossProcessLockLease,
-  expected: { envelopeKey: string; sentinelKey: string; master?: Uint8Array },
+  expected: {
+    envelopeKey: string;
+    sentinelKey: string;
+    master?: Uint8Array;
+    consistencyCheck?: CustodyEnvelopeCommitConsistencyCheck;
+  },
 ): Promise<CustodyPairRecoveryResult> {
   if (slot !== custodyEnvelopeCommitJournalSlotForKey(slot.key)) {
     throw new CustodyEnvelopeCommitJournalError(
@@ -1423,6 +1451,17 @@ async function recoverCustodyEnvelopeCommitLocked(
   //   retry after unlock with a master or, if a master-rotation journal exists,
   //   refuse normal service and leave `sanctuary rotate-master --resume` to
   //   complete the rotation under the staged/live rotation master;
+  // - staged slot absent fallback: finalize/resume may accept both staged files
+  //   absent only when the live pair authenticates under the supplied new
+  //   master, proving the staged pair was already promoted;
+  // - preflight two-step retry: preflight first records an unusable staged
+  //   journal, then retries this slot with an override consistency check that
+  //   authenticates the live pair under the old master, quarantines only the
+  //   staged journal, and lets the writer clear the abandoned staged pair;
+  // - writers that observe a changed pair after replay raise
+  //   CustodySnapshotChangedError so the caller retries from disk truth;
+  // - boot refuses on a rotation journal before any slot recovery, because
+  //   normal service must not decide which master is authoritative mid-rotation;
   // - invalid slot journal whose slot consistency check passes: move it to
   //   `<slot-key>.quarantine.<unix-ms>`, prune that slot's oldest quarantine
   //   records above the bounded retention cap, securely clear the slot journal,
@@ -1439,7 +1478,11 @@ async function recoverCustodyEnvelopeCommitLocked(
       error instanceof CustodyEnvelopeCommitJournalError &&
       error.kind === "unusable" &&
       expected.master !== undefined &&
-      await slot.consistencyCheck(storage, expected.master, slot)
+      await (expected.consistencyCheck ?? slot.consistencyCheck)(
+        storage,
+        expected.master,
+        slot,
+      )
     ) {
       await quarantineCustodyEnvelopeCommitJournal(storage, slot, raw);
       lease.assertHeld();
@@ -1453,7 +1496,11 @@ async function recoverCustodyEnvelopeCommitLocked(
   ) {
     if (
       expected.master !== undefined &&
-      await slot.consistencyCheck(storage, expected.master, slot)
+      await (expected.consistencyCheck ?? slot.consistencyCheck)(
+        storage,
+        expected.master,
+        slot,
+      )
     ) {
       await quarantineCustodyEnvelopeCommitJournal(storage, slot, raw);
       lease.assertHeld();
@@ -1483,6 +1530,20 @@ async function recoverCustodyEnvelopeCommitLocked(
   await storage.delete("_meta", slot.key, true);
   lease.assertHeld();
   return { changedPair, quarantinedJournal: false };
+}
+
+export async function deleteCustodyEnvelopeCommitJournalQuarantines(
+  storage: StorageBackend,
+): Promise<void> {
+  for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
+    const prefix = custodyEnvelopeCommitJournalQuarantinePrefix(slot);
+    for (const entry of await storage.list("_meta", prefix)) {
+      // Quarantine records are inspection artifacts, not recovery material; any
+      // successful custody rekey securely drops both slots so retired wraps do
+      // not remain as an alternate credential path.
+      await storage.delete("_meta", entry.key, true);
+    }
+  }
 }
 
 async function state_PREPARED_completeCustodyPair(

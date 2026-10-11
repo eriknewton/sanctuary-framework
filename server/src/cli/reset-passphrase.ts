@@ -100,6 +100,7 @@ import {
   writeCustodyEnvelope,
   writeCustodyEnvelopeBytes,
   recoverCustodyEnvelopeCommitIfPresent,
+  deleteCustodyEnvelopeCommitJournalQuarantines,
   CustodyEnvelopeCommitJournalError,
   withCustodyWriteLock,
   CustodyUnlockError,
@@ -1666,6 +1667,8 @@ async function runRecoveryKeyPath(
           verifyEnvelopeMac(healedEnvelope, master);
           envelope = healedEnvelope;
         }
+
+        await deleteCustodyEnvelopeCommitJournalQuarantines(storage);
 
         const startedAt = new Date().toISOString();
         // The fresh passphrase is random and never surfaced to the operator; it
