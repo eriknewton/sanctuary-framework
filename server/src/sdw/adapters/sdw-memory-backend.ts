@@ -164,7 +164,6 @@ interface PreparedPassage {
   readonly documentClassifierOverride: ClassifierOverrideAuthorization | undefined;
   readonly chunkClassifierOverrides: readonly (ClassifierOverrideAuthorization | undefined)[];
   readonly provenanceRecord: SdwMemoryProvenanceRecord;
-  readonly provenanceMintOptions: MintPersistableOptions;
   readonly signerIdentityId: string;
   readonly signerDid: string;
   readonly signerPublicKey: Uint8Array;
@@ -188,10 +187,6 @@ function chunkMintOptions(
 ): MintPersistableOptions | undefined {
   const token = item.chunkClassifierOverrides[chunkIndex];
   return token === undefined ? undefined : { classifierOverride: token };
-}
-
-function provenanceMintOptions(item: PreparedPassage): MintPersistableOptions {
-  return item.provenanceMintOptions;
 }
 
 /** The prior state of one passage, captured so a failed batch can restore it. */
@@ -419,7 +414,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         for (const [index, chunkRecord] of chunkRecords.entries()) {
           await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(prepared, index));
         }
-        await this.corpus.putProvenance(prepared.provenanceRecord, taint, txn, provenanceMintOptions(prepared));
+        await this.corpus.putProvenance(prepared.provenanceRecord, taint, txn);
         await txn.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentProvenanceStatusKey(documentId));
         await this.corpus.putDocument(documentRecord, taint, txn, documentMintOptions(prepared));
       });
@@ -443,7 +438,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                 chunkMintOptions(prepared, index),
               );
             }
-            await this.corpus.putProvenance(prepared.provenanceRecord, taint, undefined, provenanceMintOptions(prepared));
+            await this.corpus.putProvenance(prepared.provenanceRecord, taint, undefined);
             await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
               documentProvenanceStatusKey(documentId), true);
             await this.corpus.putDocument(
@@ -487,7 +482,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       // from the gate putPassages re-runs on the same records (absent an
       // override, which this screen never applies).
       this.corpus.mintDocument(prepared.documentRecord, taint);
-      this.corpus.mintProvenance(prepared.provenanceRecord, taint, provenanceMintOptions(prepared));
+      this.corpus.mintProvenance(prepared.provenanceRecord, taint);
       for (const chunkRecord of prepared.chunkRecords) {
         this.corpus.mintChunk(chunkRecord, taint);
       }
@@ -548,7 +543,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             for (const [index, chunkRecord] of item.chunkRecords.entries()) {
               await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(item, index));
             }
-            await this.corpus.putProvenance(item.provenanceRecord, taint, txn, provenanceMintOptions(item));
+            await this.corpus.putProvenance(item.provenanceRecord, taint, txn);
             await txn.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
               documentProvenanceStatusKey(item.documentId));
             await this.corpus.putDocument(item.documentRecord, taint, txn, documentMintOptions(item));
@@ -576,7 +571,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                     chunkMintOptions(item, index),
                   );
                 }
-                await this.corpus.putProvenance(item.provenanceRecord, taint, undefined, provenanceMintOptions(item));
+                await this.corpus.putProvenance(item.provenanceRecord, taint, undefined);
                 await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
                   documentProvenanceStatusKey(item.documentId), true);
                 await this.corpus.putDocument(
@@ -654,7 +649,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             for (const [index, chunkRecord] of item.chunkRecords.entries()) {
               await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(item, index));
             }
-            await this.corpus.putProvenance(item.provenanceRecord, taint, txn, provenanceMintOptions(item));
+            await this.corpus.putProvenance(item.provenanceRecord, taint, txn);
             await txn.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
               documentProvenanceStatusKey(item.documentId));
             await this.corpus.putDocument(item.documentRecord, taint, txn, documentMintOptions(item));
@@ -687,7 +682,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                   chunkMintOptions(item, index),
                 );
               }
-              await this.corpus.putProvenance(item.provenanceRecord, taint, undefined, provenanceMintOptions(item));
+              await this.corpus.putProvenance(item.provenanceRecord, taint, undefined);
               await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
                 documentProvenanceStatusKey(item.documentId), true);
               await this.corpus.putDocument(
@@ -1152,20 +1147,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const provenanceRecord: SdwMemoryProvenanceRecord = {
       kind: "memory_provenance", version: 1, document_id: documentId, companion: verified.value,
     };
-    const provenanceOptions: MintPersistableOptions = {
-      verifiedProvenanceSignatures: [
-        {
-          path: "companion.origin.signature",
-          owner: verified.value.origin,
-          signature: verified.value.origin.signature,
-        },
-        {
-          path: "companion.admission.signature",
-          owner: verified.value.admission,
-          signature: verified.value.admission.signature,
-        },
-      ],
-    };
+    // The verifier above is the only writer to the provenance-signature
+    // registry: the subject is the returned origin/admission owner object,
+    // and the verified signature value cannot be replaced because the
+    // verifier freezes those owners before persistence reaches the write gate.
     // Re-scope the SAME verified passage-level authorization to each CHUNK's
     // own text (a chunk's content_hash is over its substring, not the whole
     // passage, so the document-level token above cannot itself authorize a
@@ -1189,7 +1174,6 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       documentClassifierOverride,
       chunkClassifierOverrides,
       provenanceRecord,
-      provenanceMintOptions: provenanceOptions,
       signerIdentityId: signer.identity_id,
       signerDid: signer.did,
       signerPublicKey: new Uint8Array(signer.public_key),

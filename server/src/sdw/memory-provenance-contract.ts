@@ -31,6 +31,27 @@ import { SubstrateError } from "../substrate/errors.js";
 import { parseStrictJson } from "../substrate/strict-json.js";
 import { isSdwIdentifier } from "./grammar.js";
 
+const BASE58BTC_ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const DID_KEY_PREFIX = "did:key:z";
+// 0xed 0x01 is the Ed25519 public-key multicodec prefix used by core/identity.ts.
+const ED25519_DID_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
+const ED25519_DID_MULTICODEC_BYTES =
+  ED25519_DID_MULTICODEC_PREFIX.byteLength + ED25519_PUBLIC_KEY_BYTES;
+
+const verifiedProvenanceSignatures = new WeakMap<object, string>();
+
+/**
+ * Registry populated only after `verifyMemoryProvenanceCompanion` has checked
+ * the owner object's Ed25519 signature bytes against the subject named in its
+ * signed body. The write gate consumes only this read predicate: a verified
+ * signature is classifier-skipped because it is verifier-produced signature
+ * material, not caller-authored credential text.
+ */
+export function isVerifiedProvenanceSignature(owner: object, signature: string): boolean {
+  return verifiedProvenanceSignatures.get(owner) === signature;
+}
+
 export const MEMORY_PROVENANCE_COMPANION_FORMAT =
   "SANCTUARY_SDW_MEMORY_PROVENANCE_V1" as const;
 export const MEMORY_ORIGIN_FORMAT =
@@ -1284,6 +1305,62 @@ function signerMatchesKey(
   );
 }
 
+export function publicKeyFromMemoryProvenanceDid(did: string): Uint8Array | undefined {
+  if (!did.startsWith(DID_KEY_PREFIX)) return undefined;
+  const encoded = did.slice(DID_KEY_PREFIX.length);
+  const canonical = decodeDidMulticodec(base58btcDecode(encoded));
+  if (canonical !== undefined) return canonical;
+  return decodeDidMulticodec(fromBase64urlStrictOrUndefined(encoded));
+}
+
+function decodeDidMulticodec(bytes: Uint8Array | undefined): Uint8Array | undefined {
+  if (
+    bytes === undefined ||
+    bytes.byteLength !== ED25519_DID_MULTICODEC_BYTES ||
+    bytes[0] !== ED25519_DID_MULTICODEC_PREFIX[0] ||
+    bytes[1] !== ED25519_DID_MULTICODEC_PREFIX[1]
+  ) {
+    return undefined;
+  }
+  return bytes.slice(ED25519_DID_MULTICODEC_PREFIX.byteLength);
+}
+
+function fromBase64urlStrictOrUndefined(value: string): Uint8Array | undefined {
+  try {
+    return fromBase64urlStrict(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function base58btcDecode(value: string): Uint8Array | undefined {
+  const base = BASE58BTC_ALPHABET.length;
+  const bytes: number[] = [0];
+  for (const char of value) {
+    const digit = BASE58BTC_ALPHABET.indexOf(char);
+    if (digit < 0) return undefined;
+    let carry = digit;
+    for (let index = 0; index < bytes.length; index += 1) {
+      const next = bytes[index]! * base + carry;
+      bytes[index] = next & 0xff; // 0xff keeps the low byte after base conversion carry propagation.
+      carry = next >> 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  let leadingZeroes = 0;
+  for (const char of value) {
+    if (char !== BASE58BTC_ALPHABET[0]) break;
+    leadingZeroes += 1;
+  }
+  return new Uint8Array([
+    ...new Array<number>(leadingZeroes).fill(0),
+    ...bytes.reverse(),
+  ]);
+}
+
 function validateSigningHandle(
   signer: MemoryProvenanceSigningHandle,
 ): MemoryProvenanceResult<MemoryProvenanceSigningHandle> {
@@ -1629,5 +1706,12 @@ export function verifyMemoryProvenanceCompanion(
       "Admission destination does not match the local passage",
     );
   }
+  Object.freeze(companion.origin.body);
+  Object.freeze(companion.admission.body);
+  Object.freeze(companion.origin);
+  Object.freeze(companion.admission);
+  Object.freeze(companion);
+  verifiedProvenanceSignatures.set(companion.origin, companion.origin.signature);
+  verifiedProvenanceSignatures.set(companion.admission, companion.admission.signature);
   return { ok: true, value: companion };
 }

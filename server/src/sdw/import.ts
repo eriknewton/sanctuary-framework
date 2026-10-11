@@ -45,6 +45,10 @@ import {
   type SdwExportManifestBody,
   type SdwStateExportBundle,
 } from "./export.js";
+import {
+  publicKeyFromMemoryProvenanceDid,
+  verifyMemoryProvenanceCompanion,
+} from "./memory-provenance-contract.js";
 
 /** Hard caps — a hostile bundle must not exhaust memory before verification. */
 const MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
@@ -311,12 +315,13 @@ export async function importSdwExportBundle(params: {
         bundleRecord.key,
         digest,
       );
+      const recordForMint = verifyImportProvenanceRecord(plaintextRecord, digest);
       // mintPersistable revalidates schema + namespace binding + classifier
       // and computes the TARGET AAD (target fortress id || namespace || key).
       let persistable: Persistable<SdwRecord>;
       try {
         persistable = mintPersistable(
-          { value: plaintextRecord, taint: "user_content" },
+          { value: recordForMint, taint: "user_content" },
           namespace,
           bundleRecord.key,
           params.targetFortressId,
@@ -381,6 +386,34 @@ function asSdwTransactional(
     return storage as StorageBackend & SdwTransactional;
   }
   return null;
+}
+
+function verifyImportProvenanceRecord(record: SdwRecord, digest: string): SdwRecord {
+  if (record.kind !== "memory_provenance") return record;
+  const verified = verifyMemoryProvenanceCompanion(record.companion, {
+    size: 2,
+    resolve: (_identityId, did) => publicKeyFromMemoryProvenanceDid(did),
+  }, {
+    origin: {
+      origin_fortress_id: record.companion.origin.body.origin_fortress_id,
+      owner_ref: record.companion.origin.body.owner_ref,
+      passage_id: record.companion.origin.body.passage_id,
+      content_hash: record.companion.origin.body.content_hash,
+      chunk_count: record.companion.origin.body.chunk_count,
+    },
+    destination: {
+      destination_fortress_id: record.companion.admission.body.destination_fortress_id,
+      destination_owner_ref: record.companion.admission.body.destination_owner_ref,
+      passage_id: record.companion.admission.body.passage_id,
+    },
+  });
+  if (!verified.ok) {
+    throw new SdwImportVerificationError("schema_invalid", digest);
+  }
+  // The import subject is the provenance record's own signed origin/admission
+  // owners, and the verifier above records those exact owner objects before
+  // the write gate sees them; caller copies from the bundle are never enough.
+  return { ...record, companion: verified.value };
 }
 
 function decryptBundleRecord(
