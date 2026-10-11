@@ -15,9 +15,10 @@
  *
  * Every one of those defects is the same defect: a per-verb credential chain.
  * So the chain lives here once, and `protect` (wrap/cli.ts),
- * `export-passphrase` (cli/export-passphrase.ts), and the install planner (cli/install.ts) all
- * call it. A new verb that needs the fortress credential calls this, or it
- * reintroduces the class.
+ * `export-passphrase` (cli/export-passphrase.ts), the install planner
+ * (cli/install.ts), MCP/dashboard boot, and Castle Wall's `provision-pin` /
+ * `re-pin` verbs all call it. A new verb that needs the fortress credential
+ * calls this, or it reintroduces the class.
  *
  * ── THE ORDER, AND WHY IT IS THIS ORDER ────────────────────────────────
  *

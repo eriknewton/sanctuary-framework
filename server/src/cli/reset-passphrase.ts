@@ -98,6 +98,10 @@ import {
   verifyEnvelopeMac,
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
+  writeCustodyEnvelopeBytes,
+  recoverCustodyEnvelopeCommitIfPresent,
+  deleteCustodyEnvelopeCommitJournalQuarantines,
+  CustodyEnvelopeCommitJournalError,
   withCustodyWriteLock,
   CustodyUnlockError,
   CUSTODY_ENVELOPE_KEY,
@@ -1455,7 +1459,7 @@ async function healInterruptedRekey(
   // ROLL BACK: restore the EXACT prior envelope bytes. The old credential /
   // recovery key still open it, and the orphaned new wrap is gone (no accretion).
   lease.assertHeld();
-  await storage.write("_meta", CUSTODY_ENVELOPE_KEY, authenticatedPrior.bytes);
+  await writeCustodyEnvelopeBytes(storage, authenticatedPrior.bytes, master);
   lease.assertHeld();
   await clearRekeyJournal(storage);
   lease.assertHeld();
@@ -1572,8 +1576,22 @@ async function runRecoveryKeyPath(
             delete: () => fortressFiles.delete("passphrase.enc"),
           },
         };
+        let preUnlockJournalError: CustodyEnvelopeCommitJournalError | undefined;
+        try {
+          await recoverCustodyEnvelopeCommitIfPresent(storage);
+        } catch (error) {
+          if (
+            error instanceof CustodyEnvelopeCommitJournalError &&
+            error.kind === "unusable"
+          ) {
+            preUnlockJournalError = error;
+          } else {
+            throw error;
+          }
+        }
         let envelope = await readCustodyEnvelope(storage);
         if (!envelope) {
+          if (preUnlockJournalError !== undefined) throw preUnlockJournalError;
           ctx.err.write(
             "Refusing: this fortress has no envelope-format custody to rekey.\n" +
               "The recovery-key rekey path applies only to envelope custody. Nothing was changed.\n"
@@ -1593,6 +1611,12 @@ async function runRecoveryKeyPath(
         // Authenticate the envelope's wrap list under the recovered master
         // before trusting it (never honor an unauthenticated envelope).
         verifyEnvelopeMac(envelope, master);
+        if (preUnlockJournalError !== undefined) {
+          await recoverCustodyEnvelopeCommitIfPresent(storage, { master });
+          envelope = await readCustodyEnvelope(storage);
+          if (!envelope) throw preUnlockJournalError;
+          verifyEnvelopeMac(envelope, master);
+        }
         // Validate a pending journal before ANY secondary custody/keyring
         // mutation. A corrupt or foreign journal therefore preserves both the
         // current authenticated envelope and every stored-credential namespace.
@@ -1644,6 +1668,8 @@ async function runRecoveryKeyPath(
           verifyEnvelopeMac(healedEnvelope, master);
           envelope = healedEnvelope;
         }
+
+        await deleteCustodyEnvelopeCommitJournalQuarantines(storage);
 
         const startedAt = new Date().toISOString();
         // The fresh passphrase is random and never surfaced to the operator; it
@@ -1708,7 +1734,7 @@ async function runRecoveryKeyPath(
           // wrap → no accretion). The stored credential was never touched, so the
           // fortress stays consistent.
           lease.assertHeld();
-          await storage.write("_meta", CUSTODY_ENVELOPE_KEY, priorRaw);
+          await writeCustodyEnvelopeBytes(storage, priorRaw, master);
           lease.assertHeld();
           await clearRekeyJournal(storage);
           lease.assertHeld();
@@ -1785,7 +1811,7 @@ async function runRecoveryKeyPath(
           } else {
             // Confirmed pre-commit: no stored credential opens the new wrap.
             lease.assertHeld();
-            await storage.write("_meta", CUSTODY_ENVELOPE_KEY, priorRaw);
+            await writeCustodyEnvelopeBytes(storage, priorRaw, master);
             lease.assertHeld();
             await clearRekeyJournal(storage);
             lease.assertHeld();

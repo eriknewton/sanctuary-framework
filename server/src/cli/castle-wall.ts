@@ -13,8 +13,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
+  acquireFortressMasterWriteBarrier,
   establishMaster,
-  unlockExistingMasterReadOnly,
   withCustodyWriteLock,
 } from "../core/master-custody.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -192,14 +192,20 @@ export interface CastleWallCommandContext {
   /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
   warn?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
-  /** INTERNAL: already-authenticated master owned and scrubbed by provision-pin. */
+  /**
+   * INTERNAL: owned already-authenticated master transferred to provision-pin.
+   * The callee scrubs it, so any caller that still needs its master after the
+   * handoff must pass a `.slice()` copy and retain ownership of the original.
+   */
   __resolvedProvisionMasterKey?: Uint8Array;
   /** TEST ONLY: pause after authoritative unlock while the custody lease is held. */
-  __testAfterProvisionMasterResolved?: () => void | Promise<void>;
+  __testAfterProvisionMasterResolved?: (masterKey: Uint8Array) => void | Promise<void>;
   /** TEST ONLY: shorten provision-pin custody lock contention. */
   __testProvisionLockTimeoutMs?: number;
   /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
   __testObserveStoredPassphrase?: typeof observeStoredPassphrase;
+  /** TEST ONLY: resolve provision-pin custody through a controlled in-memory seam. */
+  __testResolveProvisionCustodyCredential?: typeof resolveFortressCustodyCredential;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   /**
@@ -430,6 +436,10 @@ export interface CastleWallCommandContext {
    */
   auditProducerPublicKeyPath?: string;
 }
+
+type ProvisionPinAlreadyLockedContext = CastleWallCommandContext & {
+  __resolvedProvisionMasterKey: Uint8Array;
+};
 
 export interface CastleWallParsedArgs {
   fortress?: string;
@@ -893,6 +903,19 @@ async function resolveMasterKey(
   return result.masterKey;
 }
 
+function provisionCredentialFields(
+  credential: ResolvedCustodyCredential,
+): { passphrase: string } | { recoveryKey: string } | { keychainKey: Uint8Array } {
+  switch (credential.kind) {
+    case "passphrase":
+      return { passphrase: credential.passphrase };
+    case "recovery-key":
+      return { recoveryKey: credential.recoveryKey };
+    case "keychain-key":
+      return { keychainKey: credential.keychainKey };
+  }
+}
+
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
  * consent entry. This flag lets specific privileged CLI verbs (daemon
@@ -1122,11 +1145,12 @@ export async function runAuditStoreStatus(
  */
 export async function runProvisionPinAlreadyLocked(
   argv: string[] = [],
-  ctx: CastleWallCommandContext = {}
+  ctx: ProvisionPinAlreadyLockedContext,
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  const masterKey: Uint8Array | undefined = ctx.__resolvedProvisionMasterKey;
   // Honor the subcommand-level `--fortress <path>` flag, exactly like every
   // other castle-wall custody verb (re-pin, daemon, audit-*) and like the
   // federation/identity/transparency verbs. Before this, provision-pin
@@ -1138,10 +1162,10 @@ export async function runProvisionPinAlreadyLocked(
   // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, preserving prior behavior.
   const parsed = parseCastleWallArgs(argv);
-  if (writeCastleWallParseError(parsed, err)) return 2;
-  const storagePath = resolveFortressArg(parsed.fortress, env);
-  const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
-  const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
+  if (writeCastleWallParseError(parsed, err)) {
+    masterKey?.fill(0);
+    return 2;
+  }
   // INVARIANT (one anchor writer): provision-pin mints and publishes THIS
   // FORTRESS's local Castle key pair and nothing else. It does not read,
   // compare, or write the machine-wide enforcement anchor at
@@ -1154,12 +1178,15 @@ export async function runProvisionPinAlreadyLocked(
   // refused, failing every default init on that machine. The ONLY writer of the
   // machine-wide anchor is the helper's installPin(), reached only through the
   // confirmed `castle-wall re-pin` verb.
-
-  let masterKey: Uint8Array | undefined;
   let privateSeed: Uint8Array | undefined;
   try {
+    const storagePath = resolveFortressArg(parsed.fortress, env);
+    const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
+    const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
-    masterKey = ctx.__resolvedProvisionMasterKey ?? await resolveMasterKey(storagePath, env);
+    if (masterKey === undefined) {
+      throw new Error("provision-pin requires an already-authenticated master");
+    }
 
     // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
     // material. Enforced in the core verb - not the wrapping CLI - so
@@ -1254,12 +1281,31 @@ export async function runProvisionPin(
 ): Promise<number> {
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  const suppliedMasterKey = ctx.__resolvedProvisionMasterKey;
   const parsed = parseCastleWallArgs(argv);
-  if (writeCastleWallParseError(parsed, err)) return 2;
-  const storagePath = resolveFortressArg(parsed.fortress, env);
-  const storage = new FilesystemStorage(join(storagePath, "state"));
+  if (writeCastleWallParseError(parsed, err)) {
+    suppliedMasterKey?.fill(0);
+    return 2;
+  }
+  let preLockMasterWriteBarrier:
+    | Awaited<ReturnType<typeof acquireFortressMasterWriteBarrier>>
+    | undefined;
+  let result: number | undefined;
+  let failure: unknown;
+  let releaseContext: unknown;
   try {
-    return await withCustodyWriteLock(
+    const storagePath = resolveFortressArg(parsed.fortress, env);
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    if (suppliedMasterKey === undefined) {
+      // INVARIANT (lock order): provision-pin acquires the shared rotation
+      // barrier before the custody write lock, matching rotate-master's
+      // barrier -> custody-lock order and avoiding a custody-lock -> barrier
+      // inversion when rotation is already draining readers.
+      preLockMasterWriteBarrier = await acquireFortressMasterWriteBarrier(storage, {
+        degradeOnEnvironmentalLoss: "read-only",
+      });
+    }
+    result = await withCustodyWriteLock(
       storage,
       async (lease) => {
         lease.assertHeld();
@@ -1267,57 +1313,70 @@ export async function runProvisionPin(
         if (!lockedFortressPath) {
           throw new Error("provision-pin custody lock did not expose a stable fortress root");
         }
-        const lockedEnv: NodeJS.ProcessEnv = { ...env };
-        if (!lockedEnv.SANCTUARY_RECOVERY_KEY && !lockedEnv.SANCTUARY_PASSPHRASE) {
-          const observed = await (
-            ctx.__testObserveStoredPassphrase ?? observeStoredPassphrase
-          )({
-            storagePath,
-            readOnly: true,
-          });
-          if (observed.status === "found") {
-            lockedEnv.SANCTUARY_PASSPHRASE = observed.result.value;
-          } else if (observed.status === "fallback-unreadable") {
-            throw new Error(
-              `stored passphrase fallback is unreadable (${observed.reason}); ` +
-                "refusing to mint or replace custody during provision-pin",
-            );
-          } else if (observed.keyringUnreachable) {
-            throw new Error(
-              `stored passphrase is unavailable because the OS keyring is locked or unreachable` +
-                `${observed.keyringDetail ? ` (${observed.keyringDetail})` : ""}; ` +
-                "unlock it and retry provision-pin",
-            );
-          } else {
-            throw new Error(
-              "no stored passphrase exists for this fortress; provision-pin is " +
-                "read-only with respect to custody and will not mint one",
-            );
-          }
-        }
-        const masterKey = await unlockExistingMasterReadOnly(storage, {
-          ...(lockedEnv.SANCTUARY_RECOVERY_KEY
-            ? { recoveryKey: lockedEnv.SANCTUARY_RECOVERY_KEY }
-            : { passphrase: lockedEnv.SANCTUARY_PASSPHRASE! }),
-          storagePathHint: storagePath,
-        });
-        await ctx.__testAfterProvisionMasterResolved?.();
-        lease.assertHeld();
+        const masterWriteBarrier = preLockMasterWriteBarrier;
+        let resolvedCredential: ResolvedCustodyCredential | undefined;
+        let masterKey: Uint8Array | undefined;
+        let provisionFailure: unknown;
         try {
+          masterKey =
+            suppliedMasterKey ??
+            await (async () => {
+              const resolution = await (ctx.__testResolveProvisionCustodyCredential ??
+                resolveFortressCustodyCredential)({
+                storagePath,
+                env,
+                storage,
+                allowMint: false,
+                ...(ctx.__testObserveStoredPassphrase === undefined
+                  ? {}
+                  : { observePassphrase: ctx.__testObserveStoredPassphrase }),
+              });
+              if (resolution.status !== "resolved") {
+                throw custodyCredentialRefusal(resolution.report, storagePath);
+              }
+              resolvedCredential = resolution.credential;
+              // INVARIANT (one custody chain): provision-pin resolves through the
+              // shared fortress resolver used by sibling custody verbs, so source
+              // precedence and indeterminate states cannot drift per verb.
+              const established = await establishMaster({
+                storage,
+                ...provisionCredentialFields(resolution.credential),
+                storagePathHint: storagePath,
+                ...(masterWriteBarrier === undefined
+                  ? {}
+                  : { heldBarrier: masterWriteBarrier }),
+                barrierDegradeMode: "read-only",
+              });
+              return established.masterKey;
+            })();
+          await ctx.__testAfterProvisionMasterResolved?.(masterKey);
+          lease.assertHeld();
           const result = lease.stableFortressCapability
-            ? await lease.stableFortressCapability.provisionPin({
-                masterKey,
-                ...(ctx.globalPinnedPublicKeyPath
-                  ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
-                  : {}),
-              })
+            ? await (async () => {
+                const handoffMasterKey = masterKey!.slice();
+                try {
+                  return await lease.stableFortressCapability!.provisionPin({
+                    // INVARIANT (master ownership): the capability copies the
+                    // handoff for IPC; this caller scrubs the handoff copy and
+                    // keeps the established master until its own cleanup boundary.
+                    masterKey: handoffMasterKey,
+                    ...(ctx.globalPinnedPublicKeyPath
+                      ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
+                      : {}),
+                  });
+                } finally {
+                  handoffMasterKey.fill(0);
+                }
+              })()
             : await runProvisionPinAlreadyLocked([], {
                 ...ctx,
                 env: {
-                  ...lockedEnv,
                   SANCTUARY_STORAGE_PATH: lockedFortressPath,
                 },
-                __resolvedProvisionMasterKey: masterKey,
+                // INVARIANT (master ownership): runProvisionPinAlreadyLocked
+                // always scrubs the transferred buffer, so the outer command
+                // hands off a copy and scrubs the original exactly once here.
+                __resolvedProvisionMasterKey: masterKey.slice(),
               });
           lease.assertHeld();
           if (typeof result === "number") return result;
@@ -1325,8 +1384,36 @@ export async function runProvisionPin(
           if (result.stderr) write(err, result.stderr);
           for (const warning of result.warnings) console.warn(warning);
           return result.code;
+        } catch (error) {
+          provisionFailure = error;
+          throw error;
         } finally {
-          masterKey.fill(0);
+          masterKey?.fill(0);
+          if (resolvedCredential?.kind === "keychain-key") {
+            // The resolver transfers ownership of this buffer to the caller;
+            // provision-pin scrubs it at the same lifetime boundary as the
+            // derived master so custody key material is not left for GC.
+            resolvedCredential.keychainKey.fill(0);
+          }
+          const barrierToRelease = masterWriteBarrier;
+          if (barrierToRelease !== undefined) {
+            try {
+              await barrierToRelease.release();
+              if (barrierToRelease === preLockMasterWriteBarrier) {
+                preLockMasterWriteBarrier = undefined;
+              }
+            } catch (error) {
+              releaseContext = error;
+              if (provisionFailure === undefined) {
+                // A barrier release failure after a successful provision must
+                // fail the command, so this throw deliberately replaces the
+                // completed result; an earlier provision failure is never
+                // replaced (guarded above) and keeps this error as context.
+                // eslint-disable-next-line no-unsafe-finally
+                throw error;
+              }
+            }
+          }
         }
       },
       {
@@ -1337,9 +1424,46 @@ export async function runProvisionPin(
       },
     );
   } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    failure = error;
+  } finally {
+    suppliedMasterKey?.fill(0);
+  }
+  if (failure !== undefined && releaseContext !== undefined) {
+    failure = attachContextWithoutReplacingMessage(failure, releaseContext);
+  }
+  if (preLockMasterWriteBarrier !== undefined) {
+    try {
+      await preLockMasterWriteBarrier.release();
+      preLockMasterWriteBarrier = undefined;
+    } catch (releaseError) {
+      failure = failure === undefined
+        ? releaseError
+        : attachContextWithoutReplacingMessage(failure, releaseError);
+    }
+  }
+  if (failure !== undefined) {
+    write(err, `Error: ${failure instanceof Error ? failure.message : String(failure)}\n`);
     return 1;
   }
+  return result ?? 1;
+}
+
+function attachContextWithoutReplacingMessage(
+  primary: unknown,
+  context: unknown,
+): unknown {
+  if (primary instanceof Error) {
+    const writable = primary as Error & { cause?: unknown };
+    writable.cause = writable.cause === undefined
+      ? context
+      : new AggregateError(
+          [writable.cause, context],
+          "additional provision-pin cleanup context",
+          { cause: context },
+        );
+    return primary;
+  }
+  return new Error(String(primary), { cause: context });
 }
 
 async function readOptionalFile(
