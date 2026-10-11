@@ -54,6 +54,7 @@ import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { stripTrailingSlashes } from "../strings.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
+import { argvTokenForDisplay } from "./argv.js";
 
 export interface PolicyArgs {
   argv: string[];
@@ -102,7 +103,7 @@ export async function runPolicyCommand(args: PolicyArgs): Promise<number> {
       case "drafts":
         return await cmdDrafts(rest, { out, err, storagePath });
       default:
-        err.write(`Unknown subcommand: ${sub}\n`);
+        err.write(`Unknown subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -339,7 +340,7 @@ async function cmdDrafts(
   if (sub === "activate") {
     return await cmdDraftsActivate(rest, ctx);
   }
-  ctx.err.write(`Unknown drafts subcommand: ${sub}\n`);
+  ctx.err.write(`Unknown drafts subcommand: ${argvTokenForDisplay(sub)}\n`);
   return 2;
 }
 

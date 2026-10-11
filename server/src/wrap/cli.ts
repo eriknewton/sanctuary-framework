@@ -210,6 +210,7 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
+import { argvTokenForDisplay } from "../cli/argv.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -6770,7 +6771,7 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
     // Reject unknown flags
     if (!WRAP_BOOLEAN_FLAGS.has(arg) && !WRAP_VALUE_FLAGS.has(arg)) {
       throw new Error(
-        `Unrecognized flag '${arg}'. Run 'sanctuary wrap --help' for valid flags.`,
+        `Unrecognized flag '${argvTokenForDisplay(arg)}'. Run 'sanctuary wrap --help' for valid flags.`,
       );
     }
 

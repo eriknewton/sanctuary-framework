@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { OPERATOR_CLOUD_DISCLOSURE } from "../mesh/node-posture.js";
-import { flagValue } from "./argv.js";
+import { flagValue, argvTokenForDisplay } from "./argv.js";
 
 export interface DeployCommandArgs {
   argv: string[];
@@ -49,7 +49,7 @@ export async function runDeployCommand(args: DeployCommandArgs): Promise<number>
     return target ? 0 : 2;
   }
   if (target !== "operator-cloud") {
-    write(err, `Unknown deploy target: ${target}\n`);
+    write(err, `Unknown deploy target: ${argvTokenForDisplay(target)}\n`);
     printUsage(err);
     return 2;
   }
@@ -71,7 +71,7 @@ export async function runDeployCommand(args: DeployCommandArgs): Promise<number>
     return 0;
   }
   if (action !== "plan") {
-    write(err, `Unknown operator-cloud deploy command: ${action}\n`);
+    write(err, `Unknown operator-cloud deploy command: ${argvTokenForDisplay(action)}\n`);
     printOperatorCloudUsage(err);
     return 2;
   }
