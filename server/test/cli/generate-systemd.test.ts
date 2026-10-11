@@ -69,7 +69,7 @@ describe("sanctuary generate systemd", () => {
     const err = new Capture();
     const code = await runGenerateCommand({ argv: ["launchd"], err });
     expect(code).toBe(2);
-    expect(err.text()).toContain("Unknown generate command: launchd");
+    expect(err.text()).toContain("Unknown generate command: <argument not shown>");
   });
 
   it("prints systemd help without templating", async () => {

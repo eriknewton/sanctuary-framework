@@ -39,6 +39,7 @@ import type {
   DeploymentContext,
   AnnexIIIRiskClass,
 } from "./types.js";
+import { argvTokenForDisplay } from "../../cli/argv.js";
 
 // ── Arg parsing ──────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ function parseArgs(args: string[]): ComplianceCliOptions {
 
   if (args[0] !== "eu-ai-act") {
     throw new Error(
-      `Unknown compliance subcommand: "${args[0]}". Supported: "eu-ai-act", "nist-ai-rmf".`
+      `Unknown compliance subcommand: "${argvTokenForDisplay(args[0])}". Supported: "eu-ai-act", "nist-ai-rmf".`
     );
   }
 
@@ -144,7 +145,7 @@ function parseArgs(args: string[]): ComplianceCliOptions {
         opts.pdf = true;
         break;
       default:
-        throw new Error(`Unknown flag: "${flag}"`);
+        throw new Error(`Unknown flag: "${argvTokenForDisplay(flag)}"`);
     }
   }
 

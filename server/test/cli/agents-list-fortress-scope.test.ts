@@ -206,6 +206,6 @@ describe("sanctuary agents list --fortress", () => {
       probe: offlineProbe,
     });
     expect(unknownCode).toBe(2);
-    expect(unknownErr.text).toContain("unknown fortress flag --fortress-path");
+    expect(unknownErr.text).toContain("unknown fortress flag <argument not shown>");
   });
 });

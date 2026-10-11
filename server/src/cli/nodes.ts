@@ -4,7 +4,7 @@ import {
   DashboardRequestError,
   type DashboardRequestContext,
 } from "./dashboard-request.js";
-import { flagValue } from "./argv.js";
+import { flagValue, argvTokenForDisplay, caughtErrorForDisplay } from "./argv.js";
 
 interface NodesFlags {
   dashboardUrl?: string;
@@ -48,7 +48,7 @@ export async function runNodesCommand(args: {
     return 0;
   }
   if (sub !== "list") {
-    err.write(`sanctuary nodes: unknown subcommand "${sub}"\n\n${HELP}`);
+    err.write(`sanctuary nodes: unknown subcommand "${argvTokenForDisplay(sub)}"\n\n${HELP}`);
     return 1;
   }
 
@@ -83,7 +83,7 @@ export async function runNodesCommand(args: {
       err.write(`sanctuary nodes list: ${cause.message}\n`);
       return cause.kind === "auth" ? 3 : 2;
     }
-    err.write(`sanctuary nodes list: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary nodes list: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 }
