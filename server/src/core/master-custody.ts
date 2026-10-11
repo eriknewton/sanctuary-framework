@@ -162,9 +162,10 @@ export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
  * Its PRESENCE means a rotation is in flight: some fortress data may be under
  * the old master and some under the new. Every establishment path refuses to
- * proceed until the rotation is resumed to completion. The staging phase
- * writes no rotation journal, so booting half-keyed is exactly the split-state
- * lockout the custody work exists to kill.
+ * proceed until the rotation is resumed to completion, because booting
+ * half-keyed is exactly the split-state lockout the custody work exists to
+ * kill. The staging phase writes no rotation journal, so this refusal never
+ * fires during staging.
  */
 export const ROTATION_JOURNAL_KEY = "rotation-journal";
 
