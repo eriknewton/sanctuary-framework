@@ -3804,6 +3804,10 @@ export async function importExitBundle(
     );
   }
 
+  // RESIDUAL (private register EXIT-KS-01): this importer still consumes
+  // manifest/artifact bytes loaded after the verifier's earlier pass; the
+  // bounded reader limits each load, while exact byte reuse is tracked
+  // separately.
   const manifest = await readManifest(opts.bundleDir);
   const importWarnings: string[] = [];
 
@@ -3882,10 +3886,9 @@ export async function importExitBundle(
   // The SAME declared-size check `verifyExitBundle` runs (verifier.ts
   // `isKnownSignersArtifactSizeAcceptable`), before this artifact is
   // parsed - defense in depth, mirroring the resolution hard-fail
-  // immediately below. (`loadExitArtifact` below still reads the bytes off
-  // disk to hash them, same as every other artifact kind; this check's
-  // job is only to refuse before those bytes are ever handed to a JSON
-  // parser.)
+  // immediately below. The shared loader still reads the artifact bytes
+  // from disk; this table-specific check refuses oversized table semantics
+  // before those bytes are handed to a JSON parser.
   if (!isKnownSignersArtifactSizeAcceptable(manifest)) {
     throw new ExitBundleImportError(
       "KNOWN_SIGNERS_INVALID",
