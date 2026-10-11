@@ -438,7 +438,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                 chunkMintOptions(prepared, index),
               );
             }
-            await this.corpus.putProvenance(prepared.provenanceRecord, taint);
+            await this.corpus.putProvenance(prepared.provenanceRecord, taint, undefined);
             await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
               documentProvenanceStatusKey(documentId), true);
             await this.corpus.putDocument(
@@ -571,7 +571,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                     chunkMintOptions(item, index),
                   );
                 }
-                await this.corpus.putProvenance(item.provenanceRecord, taint);
+                await this.corpus.putProvenance(item.provenanceRecord, taint, undefined);
                 await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
                   documentProvenanceStatusKey(item.documentId), true);
                 await this.corpus.putDocument(
@@ -682,7 +682,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                   chunkMintOptions(item, index),
                 );
               }
-              await this.corpus.putProvenance(item.provenanceRecord, taint);
+              await this.corpus.putProvenance(item.provenanceRecord, taint, undefined);
               await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE,
                 documentProvenanceStatusKey(item.documentId), true);
               await this.corpus.putDocument(
@@ -1147,6 +1147,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const provenanceRecord: SdwMemoryProvenanceRecord = {
       kind: "memory_provenance", version: 1, document_id: documentId, companion: verified.value,
     };
+    // The verifier above is the only writer to the provenance-signature
+    // registry: the subject is the returned origin/admission owner object,
+    // and the verified signature value cannot be replaced because the
+    // verifier freezes those owners before persistence reaches the write gate.
     // Re-scope the SAME verified passage-level authorization to each CHUNK's
     // own text (a chunk's content_hash is over its substring, not the whole
     // passage, so the document-level token above cannot itself authorize a

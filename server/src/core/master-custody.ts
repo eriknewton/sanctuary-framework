@@ -162,9 +162,10 @@ export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
  * Its PRESENCE means a rotation is in flight: some fortress data may be under
  * the old master and some under the new. Every establishment path refuses to
- * proceed until the rotation is resumed to completion (or rolled back from
- * the staging phase) — booting half-keyed is exactly the split-state lockout
- * the custody work exists to kill.
+ * proceed until the rotation is resumed to completion, because booting
+ * half-keyed is exactly the split-state lockout the custody work exists to
+ * kill. The staging phase writes no rotation journal, so this refusal never
+ * fires during staging.
  */
 export const ROTATION_JOURNAL_KEY = "rotation-journal";
 
@@ -673,8 +674,8 @@ export class CustodyRotationInProgressError extends Error {
         "Some data may still be encrypted under the previous master. Refusing to\n" +
         "start until the rotation completes. Run:\n" +
         "  sanctuary rotate-master --resume\n" +
-        "to finish it (or `sanctuary rotate-master --abort` if it never left the\n" +
-        "staging phase). Both require the fortress passphrase."
+        "to continue the journaled rotation forward to completion. This requires\n" +
+        "the fortress passphrase (add --fortress <path> for a non-default fortress)."
     );
     this.name = "CustodyRotationInProgressError";
   }
@@ -1075,6 +1076,9 @@ export async function readCustodyEnvelope(
   return envelope;
 }
 
+// MUST MATCH TEST_CUSTODY_SENTINEL_PLAINTEXT in
+// server/test/core/master-custody.test.ts; the test mints a same-shape
+// sentinel under a different master to pin the writer-master check.
 const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
 
 /**
@@ -1283,6 +1287,10 @@ async function writeMetaDurable(
 interface CustodyPairRecoveryResult {
   changedPair: boolean;
   quarantinedJournal: boolean;
+  recoveredPair?: {
+    envelopeBytes: Uint8Array;
+    sentinelBytes: Uint8Array;
+  };
 }
 
 export type CustodyEnvelopeCommitConsistencyCheck = (
@@ -1472,7 +1480,11 @@ async function recoverCustodyEnvelopeCommitLocked(
   //   way, otherwise the stored unusable error is rethrown after the staged
   //   reads as the preflight staged REFUSE arm;
   // - writers that observe a changed pair after replay raise
-  //   CustodySnapshotChangedError so the caller retries from disk truth;
+  //   CustodySnapshotChangedError unless the replayed envelope is the exact
+  //   byte string this writer is publishing and the replayed pair
+  //   authenticates under this writer's master; that continuing arm is safe
+  //   because the locked publish below leaves the same envelope bytes on disk
+  //   and replaces the replayed sentinel with this writer's sentinel;
   // - boot refuses on a rotation journal before any slot recovery, because
   //   normal service must not decide which master is authoritative mid-rotation;
   // - invalid slot journal whose slot consistency check passes: move it to
@@ -1542,7 +1554,11 @@ async function recoverCustodyEnvelopeCommitLocked(
   await state_PREPARED_completeCustodyPair(storage, journal, lease);
   await storage.delete("_meta", slot.key, true);
   lease.assertHeld();
-  return { changedPair, quarantinedJournal: false };
+  return {
+    changedPair,
+    quarantinedJournal: false,
+    recoveredPair: { envelopeBytes, sentinelBytes },
+  };
 }
 
 export async function deleteCustodyEnvelopeCommitJournalQuarantines(
@@ -1597,22 +1613,6 @@ async function writeCustodyEnvelopeLocked(
   assertMaster(master);
   const pendingJournalSlot = custodyEnvelopeCommitJournalSlotForTargetPair(opts);
   const pendingJournalKey = pendingJournalSlot.key;
-  const pendingJournal = await storage.read("_meta", pendingJournalKey);
-  if (pendingJournal !== null) {
-    const recovery = await recoverCustodyEnvelopeCommitLocked(
-      storage,
-      pendingJournalSlot,
-      lease,
-      {
-        envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
-        sentinelKey: opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
-        master,
-      },
-    );
-    if (recovery.changedPair) {
-      throw new CustodySnapshotChangedError();
-    }
-  }
   const stamped: CustodyEnvelope = {
     v: envelope.v,
     install_mode: envelope.install_mode,
@@ -1636,6 +1636,35 @@ async function writeCustodyEnvelopeLocked(
   const journalKey = pendingJournalKey;
   const envelopeBytes = stringToBytes(JSON.stringify(stamped));
   const sentinelBytes = stringToBytes(JSON.stringify(sentinel));
+  const pendingJournal = await storage.read("_meta", pendingJournalKey);
+  if (pendingJournal !== null) {
+    const recovery = await recoverCustodyEnvelopeCommitLocked(
+      storage,
+      pendingJournalSlot,
+      lease,
+      {
+        envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
+        sentinelKey: opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
+        master,
+      },
+    );
+    const recoveredEnvelopeMatchesRequestedEnvelope =
+      recovery.recoveredPair !== undefined &&
+      constantTimeEqual(recovery.recoveredPair.envelopeBytes, envelopeBytes);
+    const recoveredPairAuthenticates =
+      recoveredEnvelopeMatchesRequestedEnvelope &&
+      await verifyCustodyPairAuthenticates(storage, master, {
+        envelopeKey,
+        sentinelKey: sentinelTargetKey,
+      });
+    // The custody write lock is held from this check through the publish below:
+    // continuing is safe only when disk already holds the exact envelope bytes
+    // this writer is publishing and the sentinel authenticates under this
+    // writer's master, so no other actor's custody update is overwritten.
+    if (recovery.changedPair && !recoveredPairAuthenticates) {
+      throw new CustodySnapshotChangedError();
+    }
+  }
   const journal = custodyEnvelopeCommitJournal(
     envelopeKey,
     sentinelTargetKey,
