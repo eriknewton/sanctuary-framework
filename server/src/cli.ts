@@ -183,7 +183,7 @@ async function main(): Promise<void> {
       // Known protect/wrap refusals are operator outcomes, not MCP boot
       // failures; printing only the curated sentence keeps remedies visible
       // without exposing an irrelevant module stack.
-      console.error(`\n  ${err.message}\n`);
+      process.stderr.write(`\n  ${err.message}\n`);
       return drainAndExit(wrapCliRefusalExitCode(err));
     }
     return;

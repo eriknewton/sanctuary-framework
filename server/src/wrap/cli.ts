@@ -693,6 +693,10 @@ export function wrapCliRefusalExitCode(
   return err instanceof ExplicitLocalIntelligenceRefusal ? err.exitCode : 1;
 }
 
+interface LocalIntelligenceWrapResult {
+  explicitRefusal?: ExplicitLocalIntelligenceRefusal;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -2557,7 +2561,7 @@ async function maybeRunLocalIntelligenceForWrap(
   identityId: string,
   options: WrapOptions,
   deps: RunWrapDeps,
-): Promise<void> {
+): Promise<LocalIntelligenceWrapResult> {
   try {
     const runner = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
     const outcome = await runner({
@@ -2586,30 +2590,29 @@ async function maybeRunLocalIntelligenceForWrap(
       // An explicit positive request is part of the operator's desired end
       // state; continuing with exit 0 would make scripts treat that refused
       // state as a completed local-intelligence setup.
-      if (options.provisionLocalIntelligence === true) {
-        throw new ExplicitLocalIntelligenceRefusal(outcome.reason);
+      if (
+        options.provisionLocalIntelligence === true &&
+        outcome.reason !== "declined"
+      ) {
+        return {
+          explicitRefusal: new ExplicitLocalIntelligenceRefusal(outcome.reason),
+        };
       }
     }
   } catch (err) {
-    if (err instanceof ExplicitLocalIntelligenceRefusal) {
-      throw err;
-    }
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
     console.error(
       `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
         `the harness remains wrapped and local surfaces remain DEGRADED.`,
     );
-    // The explicit flag makes local intelligence a requested setup target, so a
-    // ceremony exception must be visible to automation as a refused target even
-    // though the cooperative wrap remains in place.
+    // Unexpected ceremony failures are crashes, not operator refusals. Keeping
+    // the original error preserves the stack and avoids relabeling a defect as
+    // an actionable local-intelligence decline.
     if (options.provisionLocalIntelligence === true) {
-      throw err instanceof ExplicitLocalIntelligenceRefusal
-        ? err
-        : new ExplicitLocalIntelligenceRefusal(
-          err instanceof Error ? err.message : String(err),
-        );
+      throw err;
     }
   }
+  return {};
 }
 
 async function exitAfterDeferredAutoProvisionSignal(
@@ -5029,8 +5032,9 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
+    let ndLocalIntelligenceResult: LocalIntelligenceWrapResult = {};
     if (ndAuditStorage && ndAuditMasterKey && ndAuditLog) {
-      await maybeRunLocalIntelligenceForWrap(
+      ndLocalIntelligenceResult = await maybeRunLocalIntelligenceForWrap(
         ndAuditStorage,
         ndAuditMasterKey,
         ndAuditLog,
@@ -5090,6 +5094,9 @@ export async function runWrap(
         `  WARNING: the transient Castle Wall daemon could not be stopped before --no-dashboard exit ` +
           `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
       );
+    }
+    if (ndLocalIntelligenceResult.explicitRefusal) {
+      throw ndLocalIntelligenceResult.explicitRefusal;
     }
     return;
   }
@@ -5305,8 +5312,9 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
+  let wrapLocalIntelligenceResult: LocalIntelligenceWrapResult = {};
   if (wrapAuditStorage && wrapAuditMasterKey && wrapAuditLog) {
-    await maybeRunLocalIntelligenceForWrap(
+    wrapLocalIntelligenceResult = await maybeRunLocalIntelligenceForWrap(
       wrapAuditStorage,
       wrapAuditMasterKey,
       wrapAuditLog,
@@ -5417,6 +5425,18 @@ export async function runWrap(
     // terminal-final success surface, not only the mid-flow warning.
     pinnedVersionResolvability: pinResolvability,
   });
+  if (wrapLocalIntelligenceResult.explicitRefusal) {
+    try {
+      await stopTransientCastleWallDaemonForAutoProvision();
+    } catch (err) {
+      // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
+      console.error(
+        `  WARNING: the transient Castle Wall daemon could not be stopped before refusal exit ` +
+          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+      );
+    }
+    throw wrapLocalIntelligenceResult.explicitRefusal;
+  }
 }
 
 // ── Dashboard-fold PR-4: ensure-and-reuse the ONE main dashboard ─────
