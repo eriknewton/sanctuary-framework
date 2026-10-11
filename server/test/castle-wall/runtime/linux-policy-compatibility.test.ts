@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { CURATED_ALLOWLIST } from "../../../src/castle-wall/runtime/curated-allowlist.js";
@@ -22,6 +24,28 @@ function rule(overrides: Partial<AllowlistRule> = {}): AllowlistRule {
 }
 
 describe("Linux IP/CIDR policy compatibility preflight", () => {
+  // LINUX-SCOPE-UIDS-TS-RUST-PARITY-01
+  it("declares the Linux signable scope subset against the daemon modeled scope set", () => {
+    const rustSource = readFileSync(resolve("..", "castle-wall-daemon/src/policy.rs"), "utf8");
+    // Narrow parser for the Rust `pub struct RuleScope { ... }` declaration:
+    // this test is a full-field parity tripwire, not a general Rust parser.
+    const block = rustSource.match(/pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/)?.groups?.body;
+    expect(block).toBeDefined();
+    const rustScopeFields = [...block!.matchAll(/^\s*pub\s+([a-z_][a-z0-9_]*)\s*:/gm)]
+      .map((match) => match[1])
+      .sort();
+    expect(rustScopeFields).toEqual(["agent_ids", "template_ids"]);
+
+    const profile = LINUX_IP_CIDR_POLICY_PROFILE as typeof LINUX_IP_CIDR_POLICY_PROFILE & {
+      daemon_modeled_scope_axes?: readonly string[];
+      scope_axis_subset_reason?: string;
+    };
+    expect([...(profile.daemon_modeled_scope_axes ?? [])].sort()).toEqual(rustScopeFields);
+    expect(profile.supported_scope_axes).toEqual(["agent_ids"]);
+    expect(profile.scope_axis_subset_reason).toContain("template_ids");
+    expect(profile.scope_axis_subset_reason).toContain("template attestation");
+  });
+
   it("publishes an explicit, usable IP/CIDR profile and accepts both destination forms", () => {
     expect(LINUX_IP_CIDR_POLICY_PROFILE.id).toBe("linux-ip-cidr-v1");
     expect(inspectLinuxPolicyCompatibility([rule()])).toEqual([]);
@@ -85,6 +109,32 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
       name: "RuntimeLinuxActivationError",
       reason: "policy_incompatible",
     });
+    expect(sign).not.toHaveBeenCalled();
+    expect(storage.writeRule).not.toHaveBeenCalled();
+    expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
+  });
+
+  it("refuses macOS-only uid scopes before broker publication signing", async () => {
+    const sign = vi.fn(() => new Uint8Array(64));
+    const storage: ManifestStorage = {
+      writeRule: vi.fn(async () => undefined),
+      atomicRenameManifest: vi.fn(async () => undefined),
+      listRules: vi.fn(async () => []),
+      removeRule: vi.fn(async () => undefined),
+    };
+
+    await expect(
+      publishLinuxCompatiblePolicy(
+        {
+          fortressId: "deadbeef",
+          issuedAt: "2026-09-03T00:00:00Z",
+          generation: 1,
+          rules: [rule({ scope: { uids: [60123] } })],
+          signer: { signingKeyId: "sha256:" + "11".repeat(32), sign },
+        },
+        storage
+      )
+    ).rejects.toThrow(/scope\.uids.*macOS-only/);
     expect(sign).not.toHaveBeenCalled();
     expect(storage.writeRule).not.toHaveBeenCalled();
     expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
