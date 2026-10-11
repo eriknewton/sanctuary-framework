@@ -12,6 +12,11 @@
 export const TRANSPARENCY_INTERVAL_ENV = "SANCTUARY_TRANSPARENCY_INTERVAL";
 export const DEFAULT_TRANSPARENCY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 export const MIN_TRANSPARENCY_INTERVAL_MS = 60_000;
+// 30_000 ms = the 60_000 ms minimum checkpoint cadence divided by two; shutdown
+// drains an entered tick briefly, then releases the daemon's master session so
+// any late storage write is refused by the master-write barrier.
+export const TRANSPARENCY_STOP_DRAIN_DEADLINE_MS =
+  MIN_TRANSPARENCY_INTERVAL_MS / 2;
 
 /**
  * Parse the cadence config. Accepts "off"/"0" (disabled), plain
@@ -97,9 +102,23 @@ export function startTransparencyScheduler(
     async stop() {
       stopped = true;
       clearIntervalFn(timer);
-      // Shutdown must drain the tick that already entered its master-derived
-      // writes; the daemon releases its rotation reader only after this settles.
-      await inFlight;
+      // Shutdown drains a tick that already entered its master-derived writes,
+      // but only to the named deadline; after that the daemon drops its reader
+      // and late writes fail closed through the storage barrier.
+      const current = inFlight;
+      if (current === undefined) return;
+      let drainTimer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          current,
+          new Promise<void>((resolve) => {
+            drainTimer = setTimeout(resolve, TRANSPARENCY_STOP_DRAIN_DEADLINE_MS);
+            drainTimer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (drainTimer !== undefined) clearTimeout(drainTimer);
+      }
     },
   };
 }

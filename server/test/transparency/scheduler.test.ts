@@ -100,6 +100,7 @@ describe("startTransparencyScheduler", () => {
     try {
       let release: (() => void) | undefined;
       let completed = false;
+      let stopSettled = false;
       const scheduler = startTransparencyScheduler({
         intervalMs: 1_000,
         emit: () =>
@@ -113,11 +114,16 @@ describe("startTransparencyScheduler", () => {
       });
       await vi.advanceTimersByTimeAsync(1_000);
       const stopped = scheduler.stop();
+      void stopped.then(() => {
+        stopSettled = true;
+      });
       await vi.advanceTimersByTimeAsync(3_000);
       expect(completed).toBe(false);
+      expect(stopSettled).toBe(false);
       release!();
       await stopped;
       expect(completed).toBe(true);
+      expect(stopSettled).toBe(true);
     } finally {
       vi.useRealTimers();
     }

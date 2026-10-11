@@ -870,23 +870,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-async function resolveMasterKey(
-  storagePath: string,
-  env: NodeJS.ProcessEnv
-): Promise<Uint8Array> {
-  const result = await openResolvedMasterKeySession(storagePath, env);
-  try {
-    // INVARIANT (read-only resolver): this helper returns only key bytes, not a
-    // session handle, so its internal shared reader must be released before the
-    // caller continues in the same process.
-    await result.masterWriteBarrier?.release();
-    return result.masterKey;
-  } catch (error) {
-    result.masterKey.fill(0);
-    throw error;
-  }
-}
-
 interface ResolvedMasterKeySession {
   readonly storage: FilesystemStorage;
   readonly masterKey: Uint8Array;
@@ -1097,8 +1080,9 @@ export async function runAuditFindings(
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
     const findings = await auditLog.getIntegrityFindings();
 
@@ -1111,7 +1095,6 @@ export async function runAuditFindings(
     // returned `verified` / `empty` / `not_present` (never migrated). Run that
     // walk now and fold its verdict into the clean/unclean decision.
     const sealed = await verifySealedLegacyPrefix(storage, masterKey);
-    masterKey.fill(0);
 
     const sealedClean =
       sealed.status === "verified" ||
@@ -1170,6 +1153,7 @@ export async function runAuditFindings(
       write(err, `sealed legacy region: ${sealedNote}.\n`);
     }
     return 0;
+    });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
@@ -1198,10 +1182,12 @@ export async function runAuditStoreStatus(
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
-    const report = await verifyFortressAuditFullPicture({ storage, masterKey });
-    masterKey.fill(0);
+    const report = await withResolvedMasterKeySession(fortressPath, env, async (session) =>
+      verifyFortressAuditFullPicture({
+        storage: session.storage,
+        masterKey: session.masterKey,
+      }),
+    );
     write(out, JSON.stringify(report, null, 2) + "\n");
     return 0;
   } catch (error) {
@@ -2577,6 +2563,7 @@ export async function runDaemon(
     }
   };
   let transparencyScheduler: { stop(): Promise<void> } | undefined;
+  let daemon: { socketPath: string; stop: () => Promise<void> } | undefined;
   try {
   // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
   // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
@@ -2649,7 +2636,6 @@ export async function runDaemon(
     });
   }
 
-  let daemon: { socketPath: string; stop: () => Promise<void> };
   // Carried out of the activation block so the console claim below is derived
   // from the activation's own evidence rather than from the fact that a start
   // did not throw. `undefined` means the Linux path was not taken at all.
@@ -2773,8 +2759,13 @@ export async function runDaemon(
       return 1;
     }
   }
+  if (daemon === undefined) {
+    await releaseDaemonMasterSession();
+    return 1;
+  }
+  const runningDaemon = daemon;
 
-  write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
+  write(out, `Castle Wall daemon listening on ${runningDaemon.socketPath}\n`);
   if (linuxProducerSigned) {
     // ACTIVE is a claim about the KERNEL runtime, not about the process having
     // started. An indeterminate or unconfirmed activation prints DEGRADED here:
@@ -2947,7 +2938,7 @@ export async function runDaemon(
       write(err, "\nStopping Castle Wall daemon...\n");
       void (async () => {
         await transparencyScheduler?.stop().catch(() => undefined);
-        await daemon.stop().catch(() => undefined);
+        await runningDaemon.stop().catch(() => undefined);
         resolveWait();
       })();
     };
@@ -2957,8 +2948,10 @@ export async function runDaemon(
   return (await releaseDaemonMasterSession()) ? 0 : 1;
   } finally {
     // INVARIANT (daemon session ownership): any path after master unlock that
-    // returns or throws must drain checkpoint work before dropping the reader.
+    // returns or throws must stop daemon work and drain checkpoint work before
+    // dropping the reader.
     await transparencyScheduler?.stop().catch(() => undefined);
+    await daemon?.stop().catch(() => undefined);
     await releaseDaemonMasterSession();
   }
 }
@@ -3526,8 +3519,9 @@ export async function runAuditDump(
     : undefined;
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
       layer: "l1" as const,
@@ -3606,6 +3600,7 @@ export async function runAuditDump(
       write(out, JSON.stringify({ ...entry, _chain: "daemon" }) + "\n");
     }
     return 0;
+    });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
@@ -3788,8 +3783,9 @@ export async function runAuditVerify(
       },
     );
 
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
       layer: "l1" as const,
@@ -4006,6 +4002,7 @@ export async function runAuditVerify(
       }
     }
     return 0;
+    });
   } catch (error) {
     write(
       err,

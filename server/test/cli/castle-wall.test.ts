@@ -16,11 +16,14 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   AuditLog,
+  type AuditEntry,
   type PersistedAuditEnvelopeV2,
 } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import {
   CUSTODY_WRITE_LOCK_NAMESPACE,
   MASTER_ROTATION_BARRIER_NAME,
@@ -1054,6 +1057,34 @@ describe("castle-wall CLI verbs", () => {
     const lines = out.text().trim().split("\n");
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0]!).operation).toBe("egress_allowed");
+  });
+
+  it("audit-findings keeps its master session through compatibility anchor establishment", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const auditKey = derivePurposeKey(masterKey, "audit-log");
+    const entry: AuditEntry = {
+      timestamp: "2026-10-11T00:00:00.000Z",
+      layer: "l1",
+      operation: "castle_wall_compatibility_read",
+      identity_id: "unit",
+      result: "success",
+    };
+    const encrypted = encrypt(stringToBytes(JSON.stringify(entry)), auditKey);
+    await storage.write("_audit", "legacy-compatibility-entry", stringToBytes(JSON.stringify(encrypted)));
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runAuditFindings(["--fortress", fortressPath], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+    expect(code, err.text()).toBe(0);
+    expect(out.text()).toContain("No audit integrity findings");
   });
 
   /** Seed a fortress with flows decided by several distinct rules + default-deny. */

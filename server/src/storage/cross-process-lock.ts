@@ -97,9 +97,13 @@ const BARRIER_READER_PREFIX_HEX_CHARS = 24;
 // abuse of the 0700 dir, and scanning it unboundedly amplifies work. Above the
 // ceiling the barrier fails CLOSED with a remediation instead of scanning it.
 const MAX_BARRIER_READER_SOCKETS = 4_096;
-// 128 = one cleanup action per 32 entries under the shared fail-closed ceiling.
+// 128 = one helper spawn per 32 entries under the shared fail-closed ceiling.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT =
   MAX_BARRIER_READER_SOCKETS / 32;
+// The sweep is amortized by identity; the interval is derived from the
+// stale-reaper deadline so one admitting peer gets a full scaffold-freshness
+// window before the same identity may sweep again.
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_INTERVAL_MS = STALE_REAPER_TIMEOUT_MS;
 // A peer can create its scaffold pair before it binds the socket. A scaffold
 // younger than the stale-reaper deadline is treated as possibly in-admission.
 const UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS = STALE_REAPER_TIMEOUT_MS;
@@ -1080,6 +1084,8 @@ export async function acquireMasterWriteBarrier(
       server.unref();
       const controller = new AbortController();
       let released = false;
+      let closeFinished = false;
+      let closePromise: Promise<void> | undefined;
       const held = acquired;
       const lease: MasterWriteBarrierLease = {
         signal: controller.signal,
@@ -1098,11 +1104,27 @@ export async function acquireMasterWriteBarrier(
           lease.assertSessionHeld();
         },
         release: async () => {
-          if (released) return;
-          await releaseKernelLock(held, options.__testReleaseTimeoutMs);
-          released = true;
-          controller.abort();
-          unregisterMasterWriteBarrier(storage, lease);
+          if (!released) {
+            // INVARIANT (shared reader release): claim release, abort waiters,
+            // and unregister before closing the socket so any same-process
+            // master-derived write after release fails closed even while the
+            // kernel close is still draining.
+            released = true;
+            controller.abort();
+            unregisterMasterWriteBarrier(storage, lease);
+          }
+          if (closeFinished) return;
+          if (closePromise === undefined) {
+            closePromise = releaseKernelLock(held, options.__testReleaseTimeoutMs)
+              .then(() => {
+                closeFinished = true;
+              })
+              .catch((error) => {
+                closePromise = undefined;
+                throw error;
+              });
+          }
+          await closePromise;
         },
       };
       options.__testAfterSharedSocketAcquired?.(readerSocketPath);
@@ -1133,14 +1155,22 @@ async function sweepUnusedBarrierScaffolds(
   activeScaffoldDigest: string,
   host: NodeJS.Platform,
 ): Promise<void> {
+  const now = Date.now();
+  const lastSweep = lastUnusedBarrierSweepByDigest.get(activeScaffoldDigest) ?? 0;
+  if (now - lastSweep < UNUSED_BARRIER_SCAFFOLD_SWEEP_INTERVAL_MS) return;
+  if (lastUnusedBarrierSweepByDigest.size > MAX_BARRIER_READER_SOCKETS) {
+    // The throttle map is an in-process cache only; clearing it at the same
+    // ceiling as the runtime dir preserves a hard memory bound without changing
+    // any on-disk authority decision.
+    lastUnusedBarrierSweepByDigest.clear();
+  }
+  lastUnusedBarrierSweepByDigest.set(activeScaffoldDigest, now);
   const names = await readdir(runtimeDir);
   if (names.length > MAX_BARRIER_READER_SOCKETS) {
-    throw new CrossProcessLockError(
-      `master write barrier runtime dir holds ${names.length} entries ` +
-        `(> ${MAX_BARRIER_READER_SOCKETS}); refusing to scan an unbounded set. ` +
-        `No Sanctuary process should leave this many under ${runtimeDir}.`,
-      "capability",
-    );
+    // INVARIANT (sweep admission): above the shared ceiling, cleanup refuses to
+    // enumerate candidates or spawn helpers; acquire itself still proceeds so a
+    // cleanup fault cannot block a read unlock path.
+    return;
   }
   const nameSet = new Set(names);
   const scaffoldDigests = new Set<string>();
@@ -1164,20 +1194,20 @@ async function sweepUnusedBarrierScaffolds(
     }
   }
 
-  let removed = 0;
+  let helperSpawns = 0;
   for (const digest of scaffoldDigests) {
-    if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
+    if (helperSpawns >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
     if (digest === activeScaffoldDigest) continue;
     const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
     const hasLiveEntry =
       exclusiveSocketDigests.has(digest) || readerSocketDigests.has(readerDigest);
     if (hasLiveEntry) continue;
     if (!nameSet.has(`${digest}.reader-reaper`)) continue;
-    // INVARIANT (bounded runtime dir): scaffold cleanup re-checks the no-socket
-    // condition under the same reader-reaper authority used for stale reader
-    // removal, and skips fresh scaffolds that may belong to an admitting peer.
-    removed += await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host);
-    if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
+    // INVARIANT (bounded runtime dir): scaffold cleanup holds both sibling
+    // reaper authorities in one fixed order before unlinking either name, then
+    // re-checks the no-socket and freshness conditions under those locks.
+    helperSpawns += 1;
+    await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host);
   }
 }
 
@@ -1214,14 +1244,20 @@ for (const name of names) {
 }
 process.stdout.write(String(removed));
 `;
-  const scaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
+  const exclusiveScaffoldPath = join(runtimeDir, `${digest}.reaper`);
+  const readerScaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
   const command = kernelReaperCommand(host);
   const commandArgs = host === "darwin"
     ? [
         "-k",
         "-t",
         "0",
-        scaffoldPath,
+        exclusiveScaffoldPath,
+        command,
+        "-k",
+        "-t",
+        "0",
+        readerScaffoldPath,
         process.execPath,
         "-e",
         script,
@@ -1232,7 +1268,10 @@ process.stdout.write(String(removed));
       ]
     : [
         "-n",
-        scaffoldPath,
+        exclusiveScaffoldPath,
+        command,
+        "-n",
+        readerScaffoldPath,
         process.execPath,
         "-e",
         script,
@@ -1242,11 +1281,27 @@ process.stdout.write(String(removed));
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
       ];
   return await new Promise<number>((resolve, reject) => {
-    const child = spawn(command, commandArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, commandArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    const killSweepGroup = (): void => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }
+    };
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killSweepGroup();
       reject(new CrossProcessLockError("unused-scaffold sweep exceeded its bounded deadline", "io"));
     }, STALE_REAPER_TIMEOUT_MS);
     timer.unref?.();
@@ -1362,6 +1417,7 @@ const MAX_EVICTIONS_PER_SWEEP = 8;
 const BARRIER_REAPER_SCAFFOLD_PATTERN = new RegExp(
   `^[0-9a-f]{${BARRIER_SCAFFOLD_DIGEST_HEX_CHARS}}\\.(?:reader-)?reaper$`,
 );
+const lastUnusedBarrierSweepByDigest = new Map<string, number>();
 
 /**
  * Best-effort, bounded reap of DEAD reader sockets left in the shared runtime
