@@ -2090,18 +2090,18 @@ export function buildAgentInstallPlan(input: {
   // command, the anchor is consistent, the vault is still not on the wall, and
   // the next plan asks for the same command again.
   //
-  // DARWIN-ONLY BY CONSTRUCTION, and LAST among the gates: this arm is reached
-  // only after the non-darwin stop above and after every macOS full-profile
-  // gate (sealed launcher, Hermes harness, first custody, cooperative surface,
-  // signed app and build identity, system extension, operator twin). That is
-  // why the description below says "this Mac", "macOS" and "Terminal": no
-  // other platform can render it (the shipped probe also reports the anchor
-  // and vault claim `not-applicable` off darwin), so it needs no non-darwin
-  // wording branch. Hoisting this arm above any of those gates is a behavior
-  // change, not a wording change: for a non-sealed runtime the argv below
-  // would carry a global or PATH-resolved CLI that the sealed-launcher refusal
-  // exists to reject. Must match the gate ladder pinned by "keeps every darwin
-  // full-profile gate ahead of re-pin" in server/test/cli/install.test.ts.
+  // RE-PIN PRECEDENCE: on darwin this arm names re-pin if and only if every
+  // gate above it passes (CLI bootstrap, sealed launcher, Hermes harness,
+  // first custody, cooperative surface, signed app and build identity, system
+  // extension, operator twin) and the anchor or vault claim needs re-pin; the
+  // facts read only below it (boot service, content filter, enforcement) do
+  // not decide it, and the argv it builds runs the sealed launcher. Off darwin
+  // the full profile stops at the non-darwin return above, so re-pin and its
+  // macOS wording ("this Mac", "macOS", "Terminal") are darwin-only. Moving
+  // this arm above any of those gates, or below a check on the facts it
+  // ignores, changes behavior. Must match the covering-enumeration tests
+  // "names re-pin on darwin if and only if ..." and the non-darwin cases in
+  // server/test/cli/install.test.ts.
   const trustAnchorNeedsRepin =
     input.observed.trustAnchor === "broken" ||
     input.observed.trustAnchor === "unprovisioned" ||
