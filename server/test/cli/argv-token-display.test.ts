@@ -116,9 +116,22 @@ describe("argv token display formatter", () => {
   it("renders a caught value as its error class name only", () => {
     expect(caughtErrorForDisplay(new TypeError(`bad ${MARK}`))).toBe("TypeError");
     expect(caughtErrorForDisplay(new Error(MARK))).toBe("Error");
-    const renamed = new Error("x");
-    renamed.name = FLAG_SHAPED_MARK;
-    expect(caughtErrorForDisplay(renamed)).toBe("error");
+    for (const shape of [FLAG_SHAPED_MARK, `${MARK}Error`, "Error", "TypeError"]) {
+      const renamed = new Error("x");
+      renamed.name = shape;
+      expect(caughtErrorForDisplay(renamed), shape).toBe("Error");
+      const renamedType = new TypeError("x");
+      renamedType.name = shape;
+      expect(caughtErrorForDisplay(renamedType), shape).toBe("TypeError");
+    }
+    class CalleeError extends Error {
+      constructor() {
+        super(MARK);
+        this.name = `${MARK}Error`;
+      }
+    }
+    expect(caughtErrorForDisplay(new CalleeError())).toBe("Error");
+    expect(caughtErrorForDisplay({ name: `${MARK}Error`, message: MARK })).toBe("error");
     expect(caughtErrorForDisplay(MARK)).toBe("error");
     expect(caughtErrorForDisplay(undefined)).toBe("error");
   });
@@ -156,7 +169,10 @@ function walk(dir: string): string[] {
   return out;
 }
 
-/** Every CLI module: src/cli/**, src/cli.ts, any src/**\/cli.ts, the offline verifier. */
+/**
+ * Every CLI module: src/cli/**, src/cli.ts, any src/**\/cli.ts, the offline verifier.
+ * Must match the module list in the `argvTokenForDisplay` doc comment in src/cli/argv.ts.
+ */
 function cliSourceFiles(): string[] {
   return walk(SRC)
     .filter((p) => {

@@ -285,8 +285,9 @@ const SINGLE_LOWERCASE_SHORT_FLAG = /^-[a-z]$/;
  * Operator-facing rendering of an argv token that a parser or subcommand
  * dispatcher refused as unrecognized. The one shared formatter for every
  * such refusal in the CLI modules (server/src/cli/**, server/src/cli.ts,
- * and every server/src/**\/cli.ts), enforced as a full set by
- * test/cli/argv-token-display.test.ts.
+ * every server/src/**\/cli.ts, and server/src/transparency/offline-cli.ts),
+ * enforced as a full set by test/cli/argv-token-display.test.ts; this list
+ * must match the module filter in that test.
  *
  * An unrecognized token is never reproduced: the parser does not know what
  * it is, and a value the operator meant for another flag, or any value typed
@@ -309,15 +310,32 @@ export function argvTokenForDisplay(token: string | undefined): string {
   return ARGV_TOKEN_NOT_SHOWN;
 }
 
-/** Error class names that are safe to print: a constructor name, never message text. */
-const ERROR_CLASS_NAME = /^(?:[A-Z][A-Za-z0-9]*)?Error$/;
+/**
+ * Built-in error constructors whose names are safe to print, most specific
+ * first. The printed text is the literal paired with each constructor here,
+ * never a property read from the caught value: `name` and `message` are both
+ * writable by whoever threw, so neither can carry operator-safe text.
+ */
+const BUILT_IN_ERROR_CLASSES: ReadonlyArray<readonly [ErrorConstructor, string]> = [
+  [TypeError, "TypeError"],
+  [RangeError, "RangeError"],
+  [SyntaxError, "SyntaxError"],
+  [ReferenceError, "ReferenceError"],
+  [URIError, "URIError"],
+  [EvalError, "EvalError"],
+  [Error, "Error"],
+];
 
 /**
  * Operator-facing rendering of a caught value in an "unexpected error"
- * refusal. Prints only the error's class name; the message is never
- * printed, because a callee may have built it from an argv token.
+ * refusal. Prints only a fixed class label chosen by `instanceof` against the
+ * built-in error constructors; a custom subclass prints as "Error", and a
+ * non-error value prints as "error". Nothing is read from the caught value
+ * itself, because a callee may have built its message or name from an argv token.
  */
 export function caughtErrorForDisplay(cause: unknown): string {
-  const name = cause instanceof Error ? cause.name : undefined;
-  return name !== undefined && ERROR_CLASS_NAME.test(name) ? name : "error";
+  for (const [ctor, label] of BUILT_IN_ERROR_CLASSES) {
+    if (cause instanceof ctor) return label;
+  }
+  return "error";
 }
