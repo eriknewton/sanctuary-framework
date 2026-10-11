@@ -125,7 +125,7 @@ describe("castle-wall CLI verbs", () => {
       recoveryKey,
       storagePathHint: fortressPath,
     });
-    custody.masterKey.fill(0);
+    await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0);
     return { fortressPath, masterKey, recoveryKey };
   }
 
@@ -1264,7 +1264,7 @@ describe("castle-wall CLI verbs", () => {
 
       expect(code).toBe(1);
       expect(observe).toHaveBeenCalledOnce();
-      expect(err.text()).toMatch(/read-only.*will not mint/i);
+      expect(err.text()).toMatch(/Accepted credentials, in the order they are tried[\s\S]*Refusing to continue with a credential that does not verify/);
       await expect(stat(join(fortressPath, "castle-pinned-privkey.enc")))
         .rejects.toMatchObject({ code: "ENOENT" });
     });
@@ -1525,6 +1525,78 @@ describe("castle-wall audit-chain operator override", () => {
       operation: e.operation,
     }));
   }
+
+  it("provision-pin opens with the enrolled custody factor when no invocation credential is supplied", async () => {
+    const { verifyRecoveryWrapByReentry } = await import("../../src/core/master-custody.js");
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-enrolled-pin-"));
+    tempDirs.push(fortressPath);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const custodyKey = generateRandomKey();
+    const established = await establishMaster({
+      storage,
+      keychainKey: custodyKey,
+      firstRun: { installMode: "interactive", mintRecoveryKey: true },
+      storagePathHint: fortressPath,
+    });
+    await verifyRecoveryWrapByReentry(
+      storage,
+      established.envelope!,
+      established.mintedRecoveryKey!,
+    );
+    await established.masterWriteBarrier?.release();
+    established.masterKey.fill(0);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    let resolvedOptions: { storagePath?: string; allowMint?: boolean } | undefined;
+    const resolveProvisionCustody = vi.fn(async (options: { storagePath?: string; allowMint?: boolean }) => {
+      resolvedOptions = options;
+      return {
+        status: "resolved" as const,
+        credential: {
+          source: "enrolled-custody-key" as const,
+          kind: "keychain-key" as const,
+          keychainKey: custodyKey,
+          location: "test-custody-store",
+          displaySource: "test-custody-store",
+        },
+        report: {
+          found: ["enrolled-custody-key" as const],
+          rejected: [],
+          indeterminate: [],
+          details: {},
+          integrityIndeterminate: false,
+          envelopePresent: true,
+          noCustodyStateAtAll: false,
+          custodyKeyUnverifiable: false,
+          enrolledCustodyKeyItem: "found" as const,
+        },
+      };
+    });
+    const code = await runProvisionPin([], {
+      out,
+      err,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      globalPinnedPublicKeyPath: join(fortressPath, "test-global-pin.bin"),
+      __testObserveStoredPassphrase: vi.fn(async () => ({
+        status: "absent",
+        keyringUnreachable: false,
+      }) as const),
+      __testResolveProvisionCustodyCredential: resolveProvisionCustody,
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    expect(resolveProvisionCustody).toHaveBeenCalledOnce();
+    expect(resolvedOptions).toMatchObject({
+      storagePath: fortressPath,
+      allowMint: false,
+    });
+    const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+    expect(pub.length).toBe(32);
+    expect(out.text().trim()).toBe(createHash("sha256").update(pub).digest("hex").slice(0, 16));
+    custodyKey.fill(0);
+  });
 
   it("re-pin refuses on a broken chain without --accept-broken-chain (unchanged default)", async () => {
     const { fortressPath, masterKey, recoveryKey } = await makeFortress();

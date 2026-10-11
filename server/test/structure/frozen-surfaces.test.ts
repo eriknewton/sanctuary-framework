@@ -495,6 +495,28 @@ describe("credential help text and boot-order comments match the shipped behavio
     );
   });
 
+  it("fortress credential consumers name the shared resolver", () => {
+    const consumers = [
+      ["protect", "wrap/cli.ts", "resolveFortressCustodyCredential"],
+      ["export-passphrase", "cli/export-passphrase.ts", "resolveFortressCustodyCredential"],
+      ["install planner", "cli/install.ts", "resolveFortressCustodyCredential"],
+      ["MCP boot", "index.ts", "resolveHostLocalBootCredential"],
+      ["dashboard boot", "dashboard-standalone.ts", "resolveHostLocalBootCredential"],
+      ["castle-wall provision-pin", "cli/castle-wall.ts", "__testResolveProvisionCustodyCredential"],
+      ["castle-wall re-pin", "cli/castle-wall.ts", "__testResolveRePinCustodyCredential"],
+    ] as const;
+    for (const [label, file, token] of consumers) {
+      const source = read(file);
+      expect(
+        source,
+        `${label} must resolve fortress credentials through wrap/custody-credential.ts`,
+      ).toContain(token);
+    }
+    expect(read("wrap/custody-credential.ts")).toContain(
+      "MCP/dashboard boot, and Castle Wall's `provision-pin` /",
+    );
+  });
+
   it("the dashboard help states the host-local credential bound instead of promising a free start", () => {
     // `sanctuary dashboard` starts without a TYPED credential only when this
     // host already holds one (the enrolled OS-keyring custody factor or the

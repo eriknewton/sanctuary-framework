@@ -14,7 +14,6 @@ import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   establishMaster,
-  unlockExistingMasterReadOnly,
   withCustodyWriteLock,
 } from "../core/master-custody.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -200,6 +199,8 @@ export interface CastleWallCommandContext {
   __testProvisionLockTimeoutMs?: number;
   /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
   __testObserveStoredPassphrase?: typeof observeStoredPassphrase;
+  /** TEST ONLY: resolve provision-pin custody through a controlled in-memory seam. */
+  __testResolveProvisionCustodyCredential?: typeof resolveFortressCustodyCredential;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   /**
@@ -893,6 +894,19 @@ async function resolveMasterKey(
   return result.masterKey;
 }
 
+function provisionCredentialFields(
+  credential: ResolvedCustodyCredential,
+): { passphrase: string } | { recoveryKey: string } | { keychainKey: Uint8Array } {
+  switch (credential.kind) {
+    case "passphrase":
+      return { passphrase: credential.passphrase };
+    case "recovery-key":
+      return { recoveryKey: credential.recoveryKey };
+    case "keychain-key":
+      return { keychainKey: credential.keychainKey };
+  }
+}
+
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
  * consent entry. This flag lets specific privileged CLI verbs (daemon
@@ -1267,40 +1281,35 @@ export async function runProvisionPin(
         if (!lockedFortressPath) {
           throw new Error("provision-pin custody lock did not expose a stable fortress root");
         }
-        const lockedEnv: NodeJS.ProcessEnv = { ...env };
-        if (!lockedEnv.SANCTUARY_RECOVERY_KEY && !lockedEnv.SANCTUARY_PASSPHRASE) {
-          const observed = await (
-            ctx.__testObserveStoredPassphrase ?? observeStoredPassphrase
-          )({
-            storagePath,
-            readOnly: true,
-          });
-          if (observed.status === "found") {
-            lockedEnv.SANCTUARY_PASSPHRASE = observed.result.value;
-          } else if (observed.status === "fallback-unreadable") {
-            throw new Error(
-              `stored passphrase fallback is unreadable (${observed.reason}); ` +
-                "refusing to mint or replace custody during provision-pin",
-            );
-          } else if (observed.keyringUnreachable) {
-            throw new Error(
-              `stored passphrase is unavailable because the OS keyring is locked or unreachable` +
-                `${observed.keyringDetail ? ` (${observed.keyringDetail})` : ""}; ` +
-                "unlock it and retry provision-pin",
-            );
-          } else {
-            throw new Error(
-              "no stored passphrase exists for this fortress; provision-pin is " +
-                "read-only with respect to custody and will not mint one",
-            );
-          }
-        }
-        const masterKey = await unlockExistingMasterReadOnly(storage, {
-          ...(lockedEnv.SANCTUARY_RECOVERY_KEY
-            ? { recoveryKey: lockedEnv.SANCTUARY_RECOVERY_KEY }
-            : { passphrase: lockedEnv.SANCTUARY_PASSPHRASE! }),
-          storagePathHint: storagePath,
-        });
+        let masterWriteBarrier: { release(): Promise<void> } | undefined;
+        const masterKey =
+          ctx.__resolvedProvisionMasterKey ??
+          await (async () => {
+            const resolution = await (ctx.__testResolveProvisionCustodyCredential ??
+              resolveFortressCustodyCredential)({
+              storagePath,
+              env,
+              storage,
+              allowMint: false,
+              ...(ctx.__testObserveStoredPassphrase === undefined
+                ? {}
+                : { observePassphrase: ctx.__testObserveStoredPassphrase }),
+            });
+            if (resolution.status !== "resolved") {
+              throw custodyCredentialRefusal(resolution.report, storagePath);
+            }
+            // INVARIANT (one custody chain): provision-pin resolves through the
+            // shared fortress resolver used by sibling custody verbs, so source
+            // precedence and indeterminate states cannot drift per verb.
+            const established = await establishMaster({
+              storage,
+              ...provisionCredentialFields(resolution.credential),
+              storagePathHint: storagePath,
+              barrierDegradeMode: "read-only",
+            });
+            masterWriteBarrier = established.masterWriteBarrier;
+            return established.masterKey;
+          })();
         await ctx.__testAfterProvisionMasterResolved?.();
         lease.assertHeld();
         try {
@@ -1314,7 +1323,6 @@ export async function runProvisionPin(
             : await runProvisionPinAlreadyLocked([], {
                 ...ctx,
                 env: {
-                  ...lockedEnv,
                   SANCTUARY_STORAGE_PATH: lockedFortressPath,
                 },
                 __resolvedProvisionMasterKey: masterKey,
@@ -1327,6 +1335,7 @@ export async function runProvisionPin(
           return result.code;
         } finally {
           masterKey.fill(0);
+          await masterWriteBarrier?.release();
         }
       },
       {
