@@ -318,6 +318,8 @@ export interface V11Bindings {
 
 // Five lines keeps the context fold small enough for local models while still
 // showing the current operator bottleneck; the full rail remains the inbox UI.
+// Must match CONCIERGE_CONTEXT_PAGE_SIZE in
+// server/test/dashboard/v1_1/generic-wrap-charter-approvals-inbox.test.ts.
 const CONCIERGE_OPEN_INBOX_LIMIT = 5;
 
 async function pruneExpiredDidWebKeysOnUnlock(
@@ -880,9 +882,9 @@ export function buildConciergeContextProviders(args: {
       return lines.join("\n");
     },
     openInbox: async () => {
-      // The concierge reads the same open-only HubService projection as the
-      // operator inbox; a missing producer is unavailable, never a calm-empty
-      // context row.
+      // The concierge reads a bounded, open-only page of the same HubService
+      // inbox; a missing producer is unavailable, never a calm-empty context
+      // row.
       const items =
         args.listOpenInboxItems?.() ??
         args.hubService?.listInbox({
@@ -896,9 +898,11 @@ export function buildConciergeContextProviders(args: {
       const approvalCount = openItems.filter(
         (item) => item.kind === "approval_pending",
       ).length;
+      const pageIsFull = openItems.length === CONCIERGE_OPEN_INBOX_LIMIT;
+      const approvalPrefix = pageIsFull ? "at least " : "";
       const lines = approvalCount > 0
         ? [
-            `${approvalCount} approval${approvalCount === 1 ? "" : "s"} waiting`,
+            `${approvalPrefix}${approvalCount} approval${approvalCount === 1 ? "" : "s"} waiting`,
           ]
         : [];
       for (const item of openItems) {
@@ -907,7 +911,13 @@ export function buildConciergeContextProviders(args: {
           `${item.item_id}  kind=${item.kind}  created=${item.created_at}`,
         );
       }
-      lines.push(`(showing up to ${CONCIERGE_OPEN_INBOX_LIMIT} open items)`);
+      // A full bounded page proves only a lower bound for rows that were
+      // summarized from that page; the model should not receive it as a census.
+      if (pageIsFull) {
+        lines.push(
+          `(showing first ${CONCIERGE_OPEN_INBOX_LIMIT} open items; more may exist)`,
+        );
+      }
       return lines.join("\n");
     },
   };

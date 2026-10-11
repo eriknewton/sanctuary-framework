@@ -68,6 +68,10 @@ import { getFreePort } from "../../helpers/free-port.js";
 
 const IDENTITY_ID = "op-generic-wrap";
 const FORTRESS_ID = "fortress-generic-wrap";
+// Must match CONCIERGE_OPEN_INBOX_LIMIT in server/src/dashboard/v1_1/wiring.ts.
+const CONCIERGE_CONTEXT_PAGE_SIZE = 5;
+// More than one extra row proves the page is full without depending on order.
+const EXTRA_PENDING_APPROVALS_BEYOND_PAGE = 2;
 
 /**
  * The approval-channel timeout doubles as the test's own upper bound: a hold
@@ -567,6 +571,26 @@ describe("live Charter holds are projected under the caller's stated bound", () 
     const res = await postInboxAction(rig, approval.item_id, "deny");
     expect(res.status).toBe(200);
     await decision;
+  });
+
+  it("qualifies approval totals when the concierge page reaches its bound", async () => {
+    const counting = countingBridge(
+      CONCIERGE_CONTEXT_PAGE_SIZE + EXTRA_PENDING_APPROVALS_BEYOND_PAGE,
+    );
+    rig.bindings.hubService.setCharterApprovalBridge(counting.bridge);
+
+    const context = await assembledConciergeContext(rig.bindings);
+
+    expect(context).toContain(
+      `at least ${CONCIERGE_CONTEXT_PAGE_SIZE} approvals waiting`,
+    );
+    expect(context).not.toMatch(
+      new RegExp(`^${CONCIERGE_CONTEXT_PAGE_SIZE} approvals waiting$`, "m"),
+    );
+    expect(context).toContain(
+      `(showing first ${CONCIERGE_CONTEXT_PAGE_SIZE} open items; more may exist)`,
+    );
+    expect(counting.calls.listLimits).toEqual([CONCIERGE_CONTEXT_PAGE_SIZE]);
   });
 
   it("resolves a card by key, never by scanning the queue", async () => {

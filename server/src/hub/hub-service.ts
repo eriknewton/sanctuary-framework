@@ -270,8 +270,9 @@ export class HubService {
    *   what internal readers need: `getAgentStatusSnapshot` and
    *   `openAgentInspectPanel` filter this list by agent after it returns, so
    *   any default page size here would hide one agent's pending item behind
-   *   older items belonging to other agents. The only caller that renders a
-   *   page is `api-router.ts`, and it passes its own clamped `?limit=` down.
+   *   older items belonging to other agents. Page-rendering callers such as
+   *   `api-router.ts` and the concierge context provider pass their own clamp
+   *   down. `openOnly` filters resolved items before the page bound is applied.
    */
   listInbox(options?: { limit?: number; openOnly?: boolean }): HubInboxItem[] {
     // Infinity, not a large number: it makes "no bound was asked for" a
