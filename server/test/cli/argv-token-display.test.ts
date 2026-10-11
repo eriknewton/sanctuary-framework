@@ -14,11 +14,14 @@
  * CLI modules (src/cli/**, src/cli.ts, every src/**\/cli.ts, and the offline
  * transparency verifier); every interpolation of a credential-named
  * identifier in any string form in those modules (template, `+`
- * concatenation, `format(...)`); and the "unexpected error" lines in
+ * concatenation with at least one literal operand, `format(...)` with a
+ * literal format string); and the "unexpected error" lines in
  * cli/federation.ts and cli/nodes.ts. NOT covered: a generic catch block that
  * prints whatever message a callee threw (for example the exit verbs'
  * top-level catch, recorded in OUT_OF_SCOPE below), and string building the
- * census does not parse (`+=`, `.concat(...)`, `[...].join(...)`).
+ * census does not parse (`+=`, `.concat(...)`, `[...].join(...)`, a `+`
+ * chain with no literal operand, or `format(...)` whose format string is not a
+ * literal).
  *
  * Three layers, each over the full set:
  *   1. the formatter's own contract;
