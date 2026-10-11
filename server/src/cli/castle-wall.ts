@@ -30,8 +30,8 @@ import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-crea
 // never writes it: `walled` has no writer anywhere by design.
 import {
   CASTLE_WALL_NOT_YET_WALLED,
-  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
   CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE,
+  castleWallNotYetWalledSentence,
   castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
@@ -2088,7 +2088,7 @@ export async function runStatus(
   if (vaultProvision.state === "not-yet-walled") {
     write(
       out,
-      `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${CASTLE_WALL_NOT_YET_WALLED_SENTENCE})\n`,
+      `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${castleWallNotYetWalledSentence(platform)})\n`,
     );
   } else if (vaultProvision.state === "unreadable") {
     // A record that exists and does not parse is NOT-PROVEN, and `status` is the
@@ -5180,6 +5180,11 @@ function parseHeadlessReport(stdout: string): HeadlessReport | null {
  * reproduces the exact value validateHeadlessBuildIdentity compares against.
  */
 const CASTLE_WALL_SHORT_SHA_LENGTH = 12;
+const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
+const HEX_CHARS_PER_BYTE = 2;
+const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
+// Must match SOURCE_SHA_HEX_PATTERN in server/tsup.config.ts.
+const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
 
 /**
  * Substring that marks a path as living inside a macOS `.app` bundle. Detecting
@@ -5232,7 +5237,7 @@ function resolveSealedBundleBuildSha(
     };
     const sourceSha =
       typeof parsed.source_sha === "string" ? parsed.source_sha.trim() : "";
-    if (!/^[a-f0-9]{40}$/.test(sourceSha)) return null;
+    if (!SOURCE_SHA_HEX_PATTERN.test(sourceSha)) return null;
     return sourceSha.slice(0, CASTLE_WALL_SHORT_SHA_LENGTH);
   } catch {
     return null;
@@ -6127,11 +6132,13 @@ async function runArmDisarmInner(
       return 1;
     }
   }
+  // The dead-man TTL never rides on the host-app argv: it reaches the
+  // extension only through the signed arm lease sent to the daemon socket
+  // below, which is the one consumer that enforces it. The host app refuses
+  // --ttl/--no-ttl (must match unsupportedLeaseFlags in
+  // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift).
   const headlessArgs = ["--headless", action];
-  if (action === "enable") {
-    if (parsed.noTtl) headlessArgs.push("--no-ttl");
-    else headlessArgs.push(`--ttl=${parsed.ttlSeconds}`);
-  } else {
+  if (action !== "enable") {
     headlessArgs.push("--timeout=3");
   }
   let leaseRevoked = false;

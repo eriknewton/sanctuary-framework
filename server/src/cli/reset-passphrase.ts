@@ -121,6 +121,7 @@ import {
   consumeFlagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
@@ -444,7 +445,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (a === "--allow-machine-local-passphrase") {
       out.allowMachineLocalPassphrase = true;
     } else if (a && a.startsWith("--")) {
-      throw new Error(`Unknown flag: ${a}`);
+      throw new Error(`Unknown flag: ${argvTokenForDisplay(a)}`);
     }
   }
   return out;

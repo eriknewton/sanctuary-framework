@@ -50,7 +50,7 @@ import { FilesystemStorage } from "../../storage/filesystem.js";
 import { resolveCliMasterKey } from "../../core/master-custody.js";
 import { readStoredPassphrase } from "../../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../../dashboard/v1_1/wiring.js";
-import { consumeFlagValue, unknownFlagWithPrefix } from "../argv.js";
+import { consumeFlagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "../argv.js";
 
 export interface AgentsCommandArgs {
   argv: string[];
@@ -108,7 +108,7 @@ export async function runAgentsCommand(
 ): Promise<number> {
   const unknownFortressFlag = unknownFlagWithPrefix(args.argv, "--fortress");
   if (unknownFortressFlag) {
-    (args.err ?? process.stderr).write(`agents unknown fortress flag ${unknownFortressFlag}\n`);
+    (args.err ?? process.stderr).write(`agents unknown fortress flag ${argvTokenForDisplay(unknownFortressFlag)}\n`);
     return 2;
   }
   const fortress = consumeFlagValue(args.argv, "--fortress");
@@ -142,7 +142,7 @@ export async function runAgentsCommand(
       case "config":
         return await cmdConfig(rest, ctx);
       default:
-        ctx.err.write(`Unknown subcommand: ${sub}\n`);
+        ctx.err.write(`Unknown subcommand: ${argvTokenForDisplay(sub)}\n`);
         printAgentsHelp(ctx.err);
         return 2;
     }

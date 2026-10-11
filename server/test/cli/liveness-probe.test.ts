@@ -144,7 +144,7 @@ describe("sanctuary liveness-probe CLI", () => {
     });
 
     expect(code).toBe(2);
-    expect(err.text()).toContain("Unknown liveness-probe option: --unknown");
+    expect(err.text()).toContain("Unknown liveness-probe option: <argument not shown>");
     expect(out.text()).toBe("");
   });
 
