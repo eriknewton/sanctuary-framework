@@ -40,6 +40,11 @@ import {
 const NS = "_lock_test";
 const LOCK = ".unit.lock";
 const DISTINCT_BARRIER_FORTRESS_COUNT = 32;
+const OVER_CEILING_IGNORED_ENTRY_COUNT = 3_500;
+const OVER_CEILING_SCAFFOLD_PAIR_COUNT = 300;
+const OVER_CEILING_CUSTODY_REAPER_COUNT = 4;
+// 128 = MAX_BARRIER_READER_SOCKETS (4,096) / 32 in src/storage/cross-process-lock.ts.
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT = 128;
 // 2 = one `.reaper` plus one `.reader-reaper` pair for the most recent identity.
 const MAX_SCAFFOLDS_AFTER_SWEEP = 2;
 // 1_000 ms = one second, short enough for unit tests and long enough for a local socket bind.
@@ -51,6 +56,16 @@ const SHORT_SOCKET_TMP_PARENT =
 // Cross-file contract: must match BARRIER_SCAFFOLD_DIGEST_HEX_CHARS in
 // src/storage/cross-process-lock.ts, the filename width this test plants.
 const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
+
+function scaffoldDigest(seed: number): string {
+  return seed.toString(16).padStart(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS, "0");
+}
+
+async function countReaperScaffolds(root: string): Promise<number> {
+  return (await readdir(root)).filter(
+    (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
+  ).length;
+}
 
 function reaperLockCommand(host: NodeJS.Platform): string {
   if (host === "darwin") return "/usr/bin/lockf";
@@ -325,6 +340,7 @@ describe("withCrossProcessLock", () => {
         const liveBefore = (await readdir(runtimeRoot)).filter(
           (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
         );
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
 
         for (let index = 0; index < DISTINCT_BARRIER_FORTRESS_COUNT; index += 1) {
           const fortress = await mkdtemp(join(base, `barrier-other-${index}-`));
@@ -336,9 +352,9 @@ describe("withCrossProcessLock", () => {
           );
           await lease.release();
         }
-        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const nonActiveTrigger = await mkdtemp(join(base, "barrier-non-active-"));
         const reacquired = await acquireMasterWriteBarrier(
-          liveStorage,
+          new FilesystemStorage(join(nonActiveTrigger, "state")),
           "_meta",
           "scaffold-sweep-test",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
@@ -350,6 +366,66 @@ describe("withCrossProcessLock", () => {
           expect(after).toContain(scaffold);
         }
         await liveLease.release();
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "sweeps a bounded batch from an over-ceiling runtime directory",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        for (let index = 0; index < OVER_CEILING_IGNORED_ENTRY_COUNT; index += 1) {
+          await writeFile(join(runtimeRoot, `ignored-${index}`), "");
+        }
+        for (let index = 0; index < OVER_CEILING_SCAFFOLD_PAIR_COUNT; index += 1) {
+          const digest = scaffoldDigest(index);
+          await writeFile(join(runtimeRoot, `${digest}.reaper`), "");
+          await writeFile(join(runtimeRoot, `${digest}.reader-reaper`), "");
+        }
+        for (let index = 0; index < OVER_CEILING_CUSTODY_REAPER_COUNT; index += 1) {
+          const digest = scaffoldDigest(OVER_CEILING_SCAFFOLD_PAIR_COUNT + index);
+          await writeFile(join(runtimeRoot, `${digest}.reaper`), "");
+        }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const before = await countReaperScaffolds(runtimeRoot);
+        const firstTriggerFortress = await mkdtemp(join(base, "barrier-over-ceiling-a-"));
+        const firstTriggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(firstTriggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await firstTriggerLease.release();
+        const afterFirst = await countReaperScaffolds(runtimeRoot);
+        expect(afterFirst).toBeLessThan(before);
+        expect(before - afterFirst).toBeLessThanOrEqual(
+          UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2,
+        );
+
+        const secondTriggerFortress = await mkdtemp(join(base, "barrier-over-ceiling-b-"));
+        const secondTriggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(secondTriggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await secondTriggerLease.release();
+        const afterSecond = await countReaperScaffolds(runtimeRoot);
+        expect(afterSecond).toBeLessThan(afterFirst);
+        expect(afterFirst - afterSecond).toBeLessThanOrEqual(
+          UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2,
+        );
       } finally {
         if (previousRoot === undefined) {
           delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;

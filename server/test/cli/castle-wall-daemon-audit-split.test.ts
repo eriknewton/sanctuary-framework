@@ -53,10 +53,31 @@ class CaptureStream extends Writable {
 }
 
 const STOP_AFTER_CAPTURE = new Error("captured");
+const SIGNAL_LISTENER_POLL_MS = 10;
+// 20_000 ms leaves room for transform-heavy workers to reach the foreground
+// signal wait after custody unlock and dynamic daemon setup.
+const SIGNAL_LISTENER_WAIT_DEADLINE_MS = 20_000;
 type DaemonCapture = {
   input?: MacOSCastleWallDaemonInput;
   onStart?: (input: MacOSCastleWallDaemonInput) => Promise<void>;
 };
+
+async function waitForNewSignalListener(
+  signal: NodeJS.Signals,
+  before: readonly Function[],
+): Promise<Function> {
+  const started = Date.now();
+  for (;;) {
+    const listener = process.rawListeners(signal).find(
+      (candidate) => !before.includes(candidate),
+    );
+    if (listener !== undefined) return listener;
+    if (Date.now() - started > SIGNAL_LISTENER_WAIT_DEADLINE_MS) {
+      throw new Error(`timed out waiting for ${signal} listener`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, SIGNAL_LISTENER_POLL_MS));
+  }
+}
 
 describe("castle-wall daemon: F2 Option A audit-store split", () => {
   const tempDirs: string[] = [];
@@ -218,6 +239,53 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     await expect(
       readFile(join(fortressPath, "state", "_audit_migration", "boundary-v1.json")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("clean signal stop stops daemon work once", async () => {
+    const { fortressPath } = await makeLocalFortress();
+    let stopCalls = 0;
+    let daemonAuditLog: MacOSCastleWallDaemonInput["auditLog"] | undefined;
+    const signalListenersBefore = process.rawListeners("SIGTERM");
+    const ctx: CastleWallCommandContext = {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      platform: "darwin",
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_PASSPHRASE: PASSPHRASE,
+        SANCTUARY_CASTLE_LOCAL_SIGN: "1",
+        SANCTUARY_TRANSPARENCY_INTERVAL: "off",
+      },
+      fullDaemonStart: async (input) => {
+        daemonAuditLog = input.auditLog;
+        return {
+          socketPath: join(fortressPath, "castle-wall.sock"),
+          stop: async () => {
+            stopCalls += 1;
+            await input.auditLog.appendCritical({
+              layer: "l1",
+              operation: "filter_stopped",
+              identity_id: "daemon",
+              result: "success",
+            });
+            await input.auditLog.flush();
+          },
+        };
+      },
+      getuid: () => 501,
+    };
+
+    const running = runDaemon([], ctx);
+    const listener = await waitForNewSignalListener("SIGTERM", signalListenersBefore);
+    listener();
+
+    await expect(running).resolves.toBe(0);
+    expect(stopCalls).toBe(1);
+    const stoppedEntries = await daemonAuditLog!.query({
+      operation_type: "filter_stopped",
+      limit: 10,
+    });
+    expect(stoppedEntries.entries).toHaveLength(1);
   });
 });
 

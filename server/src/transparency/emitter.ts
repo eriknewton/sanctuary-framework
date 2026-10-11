@@ -50,6 +50,7 @@ import {
   type EnforcementCheckpointRecord,
 } from "./checkpoint.js";
 import { ED25519_SIGNATURE_BYTES } from "../core/crypto-suite-registry.js";
+import { TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS } from "./scheduler.js";
 
 export const TRANSPARENCY_CHECKPOINT_NAMESPACE = "_transparency_checkpoints";
 export const TRANSPARENCY_CHECKPOINT_KEY_PREFIX = "enforcement-checkpoint-";
@@ -61,7 +62,6 @@ const TRANSPARENCY_FLOOR_MAC_DOMAIN =
 const TRANSPARENCY_POLICY_RULES_DOMAIN =
   "sanctuary.transparency.policy-rules.v1";
 const TRANSPARENCY_EMIT_LOCK_FILE = ".transparency-emit.lock";
-const TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS = 5_000;
 const TRANSPARENCY_EMIT_LOCK_RETRY_MS = 100;
 
 /**

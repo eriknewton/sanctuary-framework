@@ -2564,6 +2564,16 @@ export async function runDaemon(
   };
   let transparencyScheduler: { stop(): Promise<void> } | undefined;
   let daemon: { socketPath: string; stop: () => Promise<void> } | undefined;
+  const stopTransparencySchedulerOnce = async (): Promise<void> => {
+    const current = transparencyScheduler;
+    transparencyScheduler = undefined;
+    await current?.stop().catch(() => undefined);
+  };
+  const stopDaemonOnce = async (): Promise<void> => {
+    const current = daemon;
+    daemon = undefined;
+    await current?.stop().catch(() => undefined);
+  };
   try {
   // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
   // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
@@ -2824,8 +2834,8 @@ export async function runDaemon(
       intervalMs = parseTransparencyInterval(env[TRANSPARENCY_INTERVAL_ENV]);
     } catch (error) {
       write(err, `${(error as Error).message}\n`);
-      await daemon.stop().catch(() => undefined);
-      await transparencyScheduler?.stop().catch(() => undefined);
+      await stopDaemonOnce();
+      await stopTransparencySchedulerOnce();
       await releaseDaemonMasterSession();
       return 1;
     }
@@ -2937,8 +2947,8 @@ export async function runDaemon(
       stopping = true;
       write(err, "\nStopping Castle Wall daemon...\n");
       void (async () => {
-        await transparencyScheduler?.stop().catch(() => undefined);
-        await runningDaemon.stop().catch(() => undefined);
+        await stopTransparencySchedulerOnce();
+        await stopDaemonOnce();
         resolveWait();
       })();
     };
@@ -2950,8 +2960,8 @@ export async function runDaemon(
     // INVARIANT (daemon session ownership): any path after master unlock that
     // returns or throws must stop daemon work and drain checkpoint work before
     // dropping the reader.
-    await transparencyScheduler?.stop().catch(() => undefined);
-    await daemon?.stop().catch(() => undefined);
+    await stopTransparencySchedulerOnce();
+    await stopDaemonOnce();
     await releaseDaemonMasterSession();
   }
 }

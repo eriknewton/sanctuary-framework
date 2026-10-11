@@ -74,23 +74,25 @@ export const CROSS_PROCESS_LOCK_RETRY_MS = 100;
 /** Maximum wait for the process-owned Unix-domain listener to close. */
 export const KERNEL_LOCK_RELEASE_TIMEOUT_MS = 2_000;
 const KERNEL_SOCKET_PATH_MAX_BYTES = 100;
+// 40 = the shared scaffold digest width used in `<digest>.reaper` paths below.
+const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
+// 24 = the reader socket digest prefix width used in `<digest>.reader-*.sock`.
+const BARRIER_READER_PREFIX_HEX_CHARS = 24;
 // Descriptive leaf for the per-uid custody lock ROOT directory. Cross-file
 // contract: must match the leaf the resolver composes in
 // {@link resolveCustodyLockRoot} and the test corpus in
 // test/storage/custody-lock-root-resolver.test.ts.
 const CUSTODY_LOCK_ROOT_LEAF = "sanctuary-custody-locks";
 // Longest entry composed under the lock root is a reaper scaffold:
-// `${digest.slice(0, 40)}.reaper`. The socket entry (`.sock`) is 2 bytes
-// shorter, so bounding the reaper bounds every entry. 47 = 40-hex digest slice
-// + ".reaper".length (7). Used only to reject a root whose composed entry paths
-// would overflow KERNEL_SOCKET_PATH_MAX_BYTES; it is not a wire/at-rest value.
-const CUSTODY_LOCK_MAX_ENTRY_BYTES = 40 + ".reaper".length;
+// `${digest.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS)}.reaper`. The socket
+// entry (`.sock`) is 2 bytes shorter, so bounding the reaper bounds every entry.
+// 47 = 40-hex digest slice + ".reaper".length (7). Used only to reject a root
+// whose composed entry paths would overflow KERNEL_SOCKET_PATH_MAX_BYTES; it is
+// not a wire/at-rest value.
+const CUSTODY_LOCK_MAX_ENTRY_BYTES =
+  BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".reaper".length;
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
-// 40 = the shared scaffold digest width used in `<digest>.reaper` paths below.
-const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
-// 24 = the reader socket digest prefix width used in `<digest>.reader-*.sock`.
-const BARRIER_READER_PREFIX_HEX_CHARS = 24;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
 // reader socket per live unlock plus a few fixed scaffolds. A real host has a
 // handful; anything past this ceiling means crashed-reader leakage or a same-uid
@@ -1164,50 +1166,58 @@ async function sweepUnusedBarrierScaffolds(
     // any on-disk authority decision.
     lastUnusedBarrierSweepByDigest.clear();
   }
-  lastUnusedBarrierSweepByDigest.set(activeScaffoldDigest, now);
-  const names = await readdir(runtimeDir);
-  if (names.length > MAX_BARRIER_READER_SOCKETS) {
-    // INVARIANT (sweep admission): above the shared ceiling, cleanup refuses to
-    // enumerate candidates or spawn helpers; acquire itself still proceeds so a
-    // cleanup fault cannot block a read unlock path.
-    return;
-  }
-  const nameSet = new Set(names);
-  const scaffoldDigests = new Set<string>();
-  const exclusiveSocketDigests = new Set<string>();
-  const readerSocketDigests = new Set<string>();
-  for (const name of names) {
-    if (BARRIER_REAPER_SCAFFOLD_PATTERN.test(name)) {
-      scaffoldDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
-      continue;
-    }
-    if (name.endsWith(".sock")) {
-      const readerMarker = ".reader-";
-      const readerMarkerAt = name.indexOf(readerMarker);
-      if (readerMarkerAt === BARRIER_READER_PREFIX_HEX_CHARS) {
-        readerSocketDigests.add(name.slice(0, BARRIER_READER_PREFIX_HEX_CHARS));
-      } else if (
-        name.length === BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".sock".length
-      ) {
-        exclusiveSocketDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
+  let completed = false;
+  try {
+    const names = await readdir(runtimeDir);
+    const nameSet = new Set(names);
+    const scaffoldDigests = new Set<string>();
+    const exclusiveSocketDigests = new Set<string>();
+    const readerSocketDigests = new Set<string>();
+    for (const name of names) {
+      if (BARRIER_REAPER_SCAFFOLD_PATTERN.test(name)) {
+        scaffoldDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
+        continue;
+      }
+      if (name.endsWith(".sock")) {
+        const readerMarker = ".reader-";
+        const readerMarkerAt = name.indexOf(readerMarker);
+        if (readerMarkerAt === BARRIER_READER_PREFIX_HEX_CHARS) {
+          readerSocketDigests.add(name.slice(0, BARRIER_READER_PREFIX_HEX_CHARS));
+        } else if (
+          name.length === BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".sock".length
+        ) {
+          exclusiveSocketDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
+        }
       }
     }
-  }
 
-  let helperSpawns = 0;
-  for (const digest of scaffoldDigests) {
-    if (helperSpawns >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
-    if (digest === activeScaffoldDigest) continue;
-    const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
-    const hasLiveEntry =
-      exclusiveSocketDigests.has(digest) || readerSocketDigests.has(readerDigest);
-    if (hasLiveEntry) continue;
-    if (!nameSet.has(`${digest}.reader-reaper`)) continue;
-    // INVARIANT (bounded runtime dir): scaffold cleanup holds both sibling
-    // reaper authorities in one fixed order before unlinking either name, then
-    // re-checks the no-socket and freshness conditions under those locks.
-    helperSpawns += 1;
-    await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host);
+    let helperSpawns = 0;
+    for (const digest of scaffoldDigests) {
+      if (helperSpawns >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) break;
+      if (digest === activeScaffoldDigest) continue;
+      const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
+      const hasLiveEntry =
+        exclusiveSocketDigests.has(digest) || readerSocketDigests.has(readerDigest);
+      if (hasLiveEntry) continue;
+      const hasExclusiveScaffold = nameSet.has(`${digest}.reaper`);
+      const hasReaderScaffold = nameSet.has(`${digest}.reader-reaper`);
+      if (!hasExclusiveScaffold) continue;
+      // INVARIANT (bounded runtime dir): every cleanup candidate, including a
+      // custody-only reaper scaffold, holds the exclusive and reader reaper
+      // authorities in one fixed order before unlinking names, then re-checks
+      // the no-socket and freshness conditions under those locks.
+      helperSpawns += 1;
+      await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host, {
+        requireReaderScaffold: hasReaderScaffold,
+      });
+    }
+    completed = true;
+  } finally {
+    if (completed) {
+      lastUnusedBarrierSweepByDigest.set(activeScaffoldDigest, now);
+    } else {
+      lastUnusedBarrierSweepByDigest.delete(activeScaffoldDigest);
+    }
   }
 }
 
@@ -1215,11 +1225,13 @@ async function sweepOneUnusedBarrierScaffold(
   runtimeDir: string,
   digest: string,
   host: NodeJS.Platform,
+  options: { requireReaderScaffold: boolean },
 ): Promise<number> {
   const script = String.raw`
 const fs=require('node:fs'); const path=require('node:path');
-const [runtimeDir,digest,readerPrefix,minAgeRaw]=process.argv.slice(1);
+const [runtimeDir,digest,readerPrefix,minAgeRaw,requireReaderRaw]=process.argv.slice(1);
 const minAgeMs=Number(minAgeRaw); const now=Date.now();
+const requireReader=requireReaderRaw === '1';
 function hasSocket(){
   for (const name of fs.readdirSync(runtimeDir)) {
     if (name === digest + '.sock') return true;
@@ -1231,10 +1243,11 @@ function oldEnough(name){
   const stat=fs.lstatSync(path.join(runtimeDir,name));
   return now - stat.ctimeMs >= minAgeMs;
 }
-if (hasSocket()) process.exit(73);
 const names=[digest + '.reaper', digest + '.reader-reaper'];
-for (const name of names) {
-  try { if (!oldEnough(name)) process.exit(73); } catch { process.exit(73); }
+if (hasSocket()) process.exit(73);
+try { if (!oldEnough(names[0])) process.exit(73); } catch { process.exit(73); }
+if (requireReader) {
+  try { if (!oldEnough(names[1])) process.exit(73); } catch { process.exit(73); }
 }
 if (hasSocket()) process.exit(73);
 let removed=0;
@@ -1265,6 +1278,7 @@ process.stdout.write(String(removed));
         digest,
         digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
+        options.requireReaderScaffold ? "1" : "0",
       ]
     : [
         "-n",
@@ -1279,6 +1293,7 @@ process.stdout.write(String(removed));
         digest,
         digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
+        options.requireReaderScaffold ? "1" : "0",
       ];
   return await new Promise<number>((resolve, reject) => {
     const child = spawn(command, commandArgs, {
@@ -1759,12 +1774,16 @@ async function acquireKernelLock(
   await assertLocalLockFilesystem(runtimeDir);
   const runtimeIdentity = await lstat(runtimeDir, { bigint: true });
   const digest = createHash("sha256").update(lockIdentity).digest("hex");
-  const socketPath = join(runtimeDir, `${digest.slice(0, 40)}.sock`);
+  const socketPath = join(
+    runtimeDir,
+    `${digest.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS)}.sock`,
+  );
   // The custody namespace may be reached through /proc/self/fd in the mutator,
   // but that descriptor is close-on-exec and has no meaning in the reaper child.
   // Keep reaper serialization in the stable uid-owned runtime directory instead,
   // keyed by the canonical lock-directory dev+ino digest used by the socket.
-  const reaperScaffoldName = `${digest.slice(0, 40)}.reaper`;
+  const reaperScaffoldName =
+    `${digest.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS)}.reaper`;
   await ensureInertLockScaffold(runtimeDir, reaperScaffoldName);
   const reaperScaffoldPath = join(runtimeDir, reaperScaffoldName);
   if (Buffer.byteLength(socketPath) > KERNEL_SOCKET_PATH_MAX_BYTES) {

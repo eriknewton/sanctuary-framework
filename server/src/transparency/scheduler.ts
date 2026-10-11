@@ -9,14 +9,27 @@
  * persists anything (the emitter is fail-closed).
  */
 
+import { REKOR_SUBMIT_TIMEOUT_MS } from "./rekor-client.js";
+
 export const TRANSPARENCY_INTERVAL_ENV = "SANCTUARY_TRANSPARENCY_INTERVAL";
 export const DEFAULT_TRANSPARENCY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 export const MIN_TRANSPARENCY_INTERVAL_MS = 60_000;
-// 30_000 ms = the 60_000 ms minimum checkpoint cadence divided by two; shutdown
-// drains an entered tick briefly, then releases the daemon's master session so
-// any late storage write is refused by the master-write barrier.
+// Must match the emission lock wait used by emitEnforcementCheckpoint in
+// ./emitter.ts; shutdown cannot be shorter than a real tick's admission wait.
+export const TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS = 5_000;
+// 3_000 ms budgets local signer/helper latency plus checkpoint/audit append work;
+// Rekor's HTTP submit carries its own named 30_000 ms timeout.
+export const TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS = 3_000;
+// 2_000 ms is the shutdown scheduling margin after all named tick work budgets.
+export const TRANSPARENCY_STOP_DRAIN_MARGIN_MS = 2_000;
+// Shutdown drains a tick through its bounded work budget, then releases the
+// daemon's master session; writes that begin after that release are refused by
+// the master-write barrier.
 export const TRANSPARENCY_STOP_DRAIN_DEADLINE_MS =
-  MIN_TRANSPARENCY_INTERVAL_MS / 2;
+  TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS +
+  REKOR_SUBMIT_TIMEOUT_MS +
+  TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS +
+  TRANSPARENCY_STOP_DRAIN_MARGIN_MS;
 
 /**
  * Parse the cadence config. Accepts "off"/"0" (disabled), plain
@@ -103,8 +116,9 @@ export function startTransparencyScheduler(
       stopped = true;
       clearIntervalFn(timer);
       // Shutdown drains a tick that already entered its master-derived writes,
-      // but only to the named deadline; after that the daemon drops its reader
-      // and late writes fail closed through the storage barrier.
+      // but only to the named tick-work deadline; after that the daemon drops
+      // its reader and writes that begin later fail closed through the storage
+      // barrier.
       const current = inFlight;
       if (current === undefined) return;
       let drainTimer: NodeJS.Timeout | undefined;

@@ -3,7 +3,16 @@ import {
   DEFAULT_TRANSPARENCY_INTERVAL_MS,
   parseTransparencyInterval,
   startTransparencyScheduler,
+  TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
 } from "../../src/transparency/scheduler.js";
+import { REKOR_SUBMIT_TIMEOUT_MS } from "../../src/transparency/rekor-client.js";
+
+const LOCAL_EMIT_LOCK_TIMEOUT_MS = 5_000;
+const LOCAL_SIGN_APPEND_AND_MARGIN_MS = 5_000;
+const EXPECTED_STOP_DRAIN_DEADLINE_MS =
+  LOCAL_EMIT_LOCK_TIMEOUT_MS +
+  REKOR_SUBMIT_TIMEOUT_MS +
+  LOCAL_SIGN_APPEND_AND_MARGIN_MS;
 
 describe("parseTransparencyInterval", () => {
   it("defaults to 6 hours when unset", () => {
@@ -124,6 +133,44 @@ describe("startTransparencyScheduler", () => {
       await stopped;
       expect(completed).toBe(true);
       expect(stopSettled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop gives up after the tick-work deadline and later storage admission is refused", async () => {
+    vi.useFakeTimers();
+    try {
+      let barrierHeld = true;
+      let stopSettled = false;
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: () => new Promise<void>(() => undefined),
+        onError: () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const stopped = scheduler.stop();
+      void stopped.then(() => {
+        stopSettled = true;
+      });
+      await vi.advanceTimersByTimeAsync(TRANSPARENCY_STOP_DRAIN_DEADLINE_MS - 1);
+      expect(stopSettled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await stopped;
+      expect(TRANSPARENCY_STOP_DRAIN_DEADLINE_MS).toBe(
+        EXPECTED_STOP_DRAIN_DEADLINE_MS,
+      );
+      expect(stopSettled).toBe(true);
+
+      barrierHeld = false;
+      const writeAfterRelease = async () => {
+        if (!barrierHeld) throw new Error("master write session was released");
+      };
+      await expect(writeAfterRelease()).rejects.toThrow(
+        "master write session was released",
+      );
     } finally {
       vi.useRealTimers();
     }
