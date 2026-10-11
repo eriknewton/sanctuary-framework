@@ -1075,6 +1075,9 @@ export async function readCustodyEnvelope(
   return envelope;
 }
 
+// MUST MATCH TEST_CUSTODY_SENTINEL_PLAINTEXT in
+// server/test/core/master-custody.test.ts; the test mints a same-shape
+// sentinel under a different master to pin the writer-master check.
 const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
 
 /**
@@ -1476,7 +1479,11 @@ async function recoverCustodyEnvelopeCommitLocked(
   //   way, otherwise the stored unusable error is rethrown after the staged
   //   reads as the preflight staged REFUSE arm;
   // - writers that observe a changed pair after replay raise
-  //   CustodySnapshotChangedError so the caller retries from disk truth;
+  //   CustodySnapshotChangedError unless the replayed envelope is the exact
+  //   byte string this writer is publishing and the replayed pair
+  //   authenticates under this writer's master; that continuing arm is safe
+  //   because the locked publish below leaves the same envelope bytes on disk
+  //   and replaces the replayed sentinel with this writer's sentinel;
   // - boot refuses on a rotation journal before any slot recovery, because
   //   normal service must not decide which master is authoritative mid-rotation;
   // - invalid slot journal whose slot consistency check passes: move it to
@@ -1649,9 +1656,10 @@ async function writeCustodyEnvelopeLocked(
         envelopeKey,
         sentinelKey: sentinelTargetKey,
       });
-    // A recovered prepared pair can continue only when it publishes the exact
-    // envelope this writer requested and the sentinel authenticates with it;
-    // any other change remains a stale snapshot.
+    // The custody write lock is held from this check through the publish below:
+    // continuing is safe only when disk already holds the exact envelope bytes
+    // this writer is publishing and the sentinel authenticates under this
+    // writer's master, so no other actor's custody update is overwritten.
     if (recovery.changedPair && !recoveredPairAuthenticates) {
       throw new CustodySnapshotChangedError();
     }
