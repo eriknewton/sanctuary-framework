@@ -6,6 +6,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { canonicalize } from "../mesh/canonical-json.js";
 import { castleWallSigningKeyId, verifyManifestSignature } from "../castle-wall/allowlist/parse.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { validateLinuxInstallAgentIdScopes } from "../castle-wall/allowlist/confined-agent-id.js";
 import { composeEffectiveRules } from "../castle-wall/allowlist/habeas-port.js";
 import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../castle-wall/allowlist/manifest.js";
@@ -26,6 +27,8 @@ export async function buildInstallBundle(input: BuildSignedManifestInput, public
   if (!/^[a-f0-9]{8,64}$/.test(input.fortressId)) throw new Error("invalid fortress id");
   if (!Number.isSafeInteger(input.generation) || (input.generation ?? 0) <= 0) throw new Error("positive safe integer generation required");
   for (const rule of input.rules) if (validateRule(rule).length !== 0) throw new Error("invalid policy rule");
+  // Operator-authored agent scopes must name the daemon's confined id before code-derived lanes are composed.
+  validateLinuxInstallAgentIdScopes(input.rules, origin.agent_uid);
   const bundle: PolicyBundle = { public_key_hex: Buffer.from(publicKey).toString("hex"), manifest_b64url: "", rules: [] };
   const rules = composeEffectiveRules({ operatorRules: input.rules, resolvers: [], createdAt: input.issuedAt });
   await publishLinuxCompatiblePolicy({ ...input, rules, agentOrigin: origin }, {
