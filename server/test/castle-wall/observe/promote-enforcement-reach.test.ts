@@ -1061,6 +1061,7 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       err,
       env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
       approvalChannel: new AutoApproveChannel(),
+      platform: "darwin",
     });
 
     expect(code).toBe(0);
@@ -1103,10 +1104,62 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       err: new Capture(),
       env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
       approvalChannel: new AutoApproveChannel(),
+      platform: "darwin",
     });
     expect(code).toBe(0);
     expect(out.text()).not.toContain("CANNOT reach");
     expect(await fortress.listStoredCandidates()).toBe(0);
+  });
+
+  it("FAIL-WITHOUT-FIX: Linux promote refuses unsupported rule shapes before policy state changes", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+      platform: "linux",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("cannot publish this ruleset on Linux");
+    expect(err.text()).toContain("match.host");
+    expect(await fortress.listStoredCandidates()).toBe(1);
+    await expect(readFile(join(fortress.fortressPath, "policy", "egress", "manifest.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("macOS promote continues to publish host-scoped rules through the existing path", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+      platform: "darwin",
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    expect(await fortress.listStoredCandidates()).toBe(0);
+    const verified = await readVerifiedManifest(
+      join(fortress.fortressPath, "policy", "egress"),
+      fortress.pinnedPublicKey,
+    );
+    expect(verified.status).toBe("ok");
+    if (verified.status !== "ok") throw new Error("unreachable");
+    expect(verified.rules.some((rule) => rule.match.host?.[0] === "api.newlyapproved.example")).toBe(true);
   });
 
   it("FAIL-WITHOUT-FIX (R5): duplicate --destination flags promote ONCE, cleanly, instead of crashing post-approval on a duplicate rule id", async () => {
@@ -1130,6 +1183,7 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
         err,
         env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
         approvalChannel: new AutoApproveChannel(),
+        platform: "darwin",
       },
     );
     expect(code).toBe(0);
