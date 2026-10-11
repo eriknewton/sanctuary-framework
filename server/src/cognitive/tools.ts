@@ -45,6 +45,7 @@ import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
+  MemoryHandleOwnershipConflictError,
   MEMORY_HANDLE_PATTERN,
   MEMORY_HANDLE_RECORD_VERSION,
   MEMORY_HANDLE_REGISTRY_LOCK,
@@ -1081,6 +1082,7 @@ export function createCognitiveTools(
       // namespace is bounded by the number of identities in the fortress, not
       // by attacker-supplied memory keys.
       const entries = await storage.list(MEMORY_HANDLE_REGISTRY_NAMESPACE);
+      let owner: string | undefined;
       for (const entry of entries) {
         const read = await stateStore.read(
           MEMORY_HANDLE_REGISTRY_NAMESPACE,
@@ -1092,10 +1094,15 @@ export function createCognitiveTools(
         // must agree before this scan can use it as ownership evidence.
         const persisted = parseMemoryHandleRecord(read.value, entry.key);
         if (persisted === handle) {
-          return entry.key;
+          // More than one verified principal naming the same handle is ambiguous
+          // ownership evidence, so refuse before any list order can decide.
+          if (owner !== undefined && owner !== entry.key) {
+            throw new MemoryHandleOwnershipConflictError();
+          }
+          owner = entry.key;
         }
       }
-      return undefined;
+      return owner;
     },
   });
   const internalSigning = createInternalIdentitySigningHelpers(

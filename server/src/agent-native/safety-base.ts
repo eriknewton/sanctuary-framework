@@ -338,14 +338,6 @@ export class OpaqueNamespaceRegistry {
     return this.identityToHandle.get(identityId);
   }
 
-  assertOwned(namespace: string, binding: SessionBinding | undefined): void {
-    if (!this.isOpaqueMemoryHandle(namespace)) return;
-    const active = resolveActiveSessionIdentity(binding);
-    if (this.handleToIdentity.get(namespace) !== active.identity_id) {
-      throw new SessionIdentityError();
-    }
-  }
-
   async assertOwnedPersisted(namespace: string, binding: SessionBinding | undefined): Promise<void> {
     if (!this.isOpaqueMemoryHandle(namespace)) return;
     const active = resolveActiveSessionIdentity(binding);

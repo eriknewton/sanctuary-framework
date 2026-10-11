@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateRandomKey } from "../../src/core/random.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -19,6 +20,9 @@ import {
   canonicalJson,
   fingerprintIdentityId,
   fixedDenial,
+  MemoryHandleOwnershipConflictError,
+  MEMORY_HANDLE_RECORD_VERSION,
+  MEMORY_HANDLE_REGISTRY_NAMESPACE,
   normalizedArgsHash,
   sha256,
   type SessionBinding,
@@ -36,7 +40,6 @@ import {
 import type { ApprovalResponse } from "../../src/principal-policy/types.js";
 import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
-const MEMORY_HANDLE_REGISTRY_NAMESPACE = "_facade/memory_handles";
 const cleanup: Array<() => Promise<unknown>> = [];
 
 afterEach(async () => {
@@ -197,6 +200,36 @@ function facadeWithPrimitives(
   }).tools;
 }
 
+async function writeMemoryHandleRecord(
+  stateStore: StateStore,
+  masterKey: Uint8Array,
+  identity: {
+    identity_id: string;
+    encrypted_private_key: Parameters<StateStore["write"]>[4];
+  },
+  handle: string
+): Promise<void> {
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  await stateStore.write(
+    MEMORY_HANDLE_REGISTRY_NAMESPACE,
+    identity.identity_id,
+    JSON.stringify({
+      v: MEMORY_HANDLE_RECORD_VERSION,
+      identity_id: identity.identity_id,
+      handle,
+    }),
+    identity.identity_id,
+    identity.encrypted_private_key,
+    identityEncKey,
+    {
+      provenance: {
+        origin_actor: "system",
+        origin_ref: identity.identity_id,
+      },
+    }
+  );
+}
+
 async function setupFilesystemSurface() {
   const path = await mkdtemp(join(tmpdir(), "memory-handle-"));
   cleanup.push(() => rm(path, { recursive: true, force: true }));
@@ -355,6 +388,67 @@ describe("agent-native Phase 2 cooperative surface", () => {
     });
     expect(result.denied).toBe(true);
     expect(result).not.toHaveProperty("namespace_handle");
+
+    storage.write = originalWrite;
+    const retry = await callTool(facadeTools, "sanctuary_remember", {
+      key: "timezone",
+      value: "America/Los_Angeles",
+    });
+    expect(retry.namespace_handle).toMatch(/^mem_[a-f0-9]{32}$/);
+  });
+
+  it("refuses duplicate verified memory handle records before trusting scan order", async () => {
+    const exerciseOrder = async (labels: readonly [string, string]) => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      let active: SessionBinding | undefined;
+      const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+        { currentSessionBinding: () => active }
+      );
+      await identityManager.load();
+      const firstCreated = await callTool(l1Tools, "identity_create", { label: labels[0] });
+      const secondCreated = await callTool(l1Tools, "identity_create", { label: labels[1] });
+      const byLabel = new Map([
+        [labels[0], identityManager.get(firstCreated.identity_id as string)!],
+        [labels[1], identityManager.get(secondCreated.identity_id as string)!],
+      ]);
+      const handle = "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+      for (const label of labels) {
+        await writeMemoryHandleRecord(stateStore, masterKey, byLabel.get(label)!, handle);
+      }
+
+      active = session(byLabel.get("agent-a")!.identity_id);
+      await expect(namespaceRegistry.getOwner(handle)).rejects.toBeInstanceOf(
+        MemoryHandleOwnershipConflictError
+      );
+
+      const { tools: facadeTools } = createAgentNativeCooperativeTools({
+        identityManager,
+        namespaceRegistry,
+        auditLog,
+        currentSessionBinding: () => active,
+        primitiveTools: l1Tools,
+        storage,
+        approvalProofStore: new ApprovalProofStore(),
+      });
+      const denied = await callTool(facadeTools, "sanctuary_recall", {
+        key: "timezone",
+        opts: { namespace: handle },
+      });
+      expect(denied.denied).toBe(true);
+      expect(denied).not.toHaveProperty("value");
+    };
+
+    await exerciseOrder(["agent-a", "agent-b"]);
+    await exerciseOrder(["agent-b", "agent-a"]);
   });
 
   it("converges first-use handle claims across fresh registries on one fortress", async () => {
