@@ -21,7 +21,12 @@ import {
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { establishMaster } from "../../src/core/master-custody.js";
+import {
+  CUSTODY_WRITE_LOCK_NAMESPACE,
+  MASTER_ROTATION_BARRIER_NAME,
+  establishMaster,
+  withCustodyWriteLock,
+} from "../../src/core/master-custody.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
@@ -45,6 +50,10 @@ import {
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
+import {
+  CrossProcessLockError,
+  withExclusiveMasterRotationBarrier,
+} from "../../src/storage/cross-process-lock.js";
 
 /**
  * Drives the Linux producer-signed activation's REPORTED completeness for the
@@ -84,6 +93,10 @@ vi.mock("../../src/castle-wall/runtime/index.js", async (importOriginal) => {
     },
   };
 });
+
+const ONE_EVENT_LOOP_TURN_MS = 50;
+const LOCK_ORDER_SETTLE_MS = 150;
+const SHORT_LOCK_TIMEOUT_MS = 250;
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -127,6 +140,27 @@ describe("castle-wall CLI verbs", () => {
     });
     await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0);
     return { fortressPath, masterKey, recoveryKey };
+  }
+
+  async function attemptProvisionCustodyLock(
+    storage: FilesystemStorage,
+    timeoutMs: number,
+  ): Promise<"ran" | "blocked"> {
+    try {
+      await withCustodyWriteLock(
+        storage,
+        async () => undefined,
+        { metadata: { owner: "provision-pin-order-probe" }, timeoutMs },
+      );
+      return "ran";
+    } catch (error) {
+      if (error instanceof CrossProcessLockError) return "blocked";
+      throw error;
+    }
+  }
+
+  async function waitForTurn(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ONE_EVENT_LOOP_TURN_MS));
   }
 
   /**
@@ -1078,10 +1112,16 @@ describe("castle-wall CLI verbs", () => {
     await runInit(
       { fortress: fortressPath, noConfirm: true },
       {
-        provisionPin: (argv, ctx) => runProvisionPinAlreadyLocked(argv, {
-          ...ctx,
-          globalPinnedPublicKeyPath: join(globalDir, "castle-pinned-pubkey.bin"),
-        }),
+        provisionPin: (argv, ctx) => {
+          if (ctx?.__resolvedProvisionMasterKey === undefined) {
+            throw new Error("test provision seam requires an established master");
+          }
+          return runProvisionPinAlreadyLocked(argv, {
+            ...ctx,
+            __resolvedProvisionMasterKey: ctx.__resolvedProvisionMasterKey,
+            globalPinnedPublicKeyPath: join(globalDir, "castle-pinned-pubkey.bin"),
+          });
+        },
       },
     );
 
@@ -1245,6 +1285,57 @@ describe("castle-wall CLI verbs", () => {
       expect(contenderError.text()).toContain("remained held");
       release();
       await expect(first).resolves.toBe(0);
+    });
+
+    it.runIf(process.platform === "darwin" || process.platform === "linux")(
+      "waits on the rotation barrier before taking the custody write lock",
+      async () => {
+        const { fortressPath, recoveryKey } = await makeFortress();
+        const storage = new FilesystemStorage(join(fortressPath, "state"));
+        let pin: Promise<number> | undefined;
+        await withExclusiveMasterRotationBarrier(
+          storage,
+          CUSTODY_WRITE_LOCK_NAMESPACE,
+          MASTER_ROTATION_BARRIER_NAME,
+          async () => {
+            pin = runProvisionPin([], {
+              out: new CaptureStream(),
+              err: new CaptureStream(),
+              env: {
+                SANCTUARY_STORAGE_PATH: fortressPath,
+                SANCTUARY_RECOVERY_KEY: recoveryKey,
+              },
+              globalPinnedPublicKeyPath: await makeGlobalPinDir(),
+            });
+            await new Promise((resolve) => setTimeout(resolve, LOCK_ORDER_SETTLE_MS));
+            expect(await attemptProvisionCustodyLock(storage, SHORT_LOCK_TIMEOUT_MS))
+              .toBe("ran");
+          },
+          { timeoutMs: SHORT_LOCK_TIMEOUT_MS },
+        );
+
+        expect(pin).toBeDefined();
+        await expect(pin!).resolves.toBe(0);
+      },
+    );
+
+    it("already-locked provision-pin requires the caller to transfer the master", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const err = new CaptureStream();
+      const code = await runProvisionPinAlreadyLocked([], {
+        out: new CaptureStream(),
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_RECOVERY_KEY: recoveryKey,
+        },
+        globalPinnedPublicKeyPath: await makeGlobalPinDir(),
+      } as never);
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("already-authenticated master");
+      await expect(stat(join(fortressPath, "castle-pinned-privkey.enc")))
+        .rejects.toMatchObject({ code: "ENOENT" });
     });
 
     it("never mints custody when no stored provision-pin credential exists", async () => {
@@ -1595,7 +1686,7 @@ describe("castle-wall audit-chain operator override", () => {
     const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
     expect(pub.length).toBe(32);
     expect(out.text().trim()).toBe(createHash("sha256").update(pub).digest("hex").slice(0, 16));
-    custodyKey.fill(0);
+    expect([...custodyKey]).toEqual(Array.from({ length: custodyKey.length }, () => 0));
   });
 
   it("re-pin refuses on a broken chain without --accept-broken-chain (unchanged default)", async () => {

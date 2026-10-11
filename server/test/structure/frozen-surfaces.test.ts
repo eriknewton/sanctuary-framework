@@ -435,6 +435,23 @@ describe("OS-keyring credential service families on a path that resolves through
 describe("credential help text and boot-order comments match the shipped behavior", () => {
   const read = (file: string): string =>
     readFileSync(join(SERVER_SRC, file), "utf-8");
+  const functionBody = (source: string, name: string): string => {
+    const declaration = `function ${name}(`;
+    const start = source.indexOf(declaration);
+    expect(start, `${name} must exist`).toBeGreaterThanOrEqual(0);
+    const signatureEnd = source.indexOf("):", start);
+    expect(signatureEnd, `${name} must have a typed signature`).toBeGreaterThanOrEqual(0);
+    const open = source.indexOf("{", signatureEnd);
+    expect(open, `${name} must have a body`).toBeGreaterThanOrEqual(0);
+    let depth = 0;
+    for (let i = open; i < source.length; i += 1) {
+      const char = source[i];
+      if (char === "{") depth += 1;
+      if (char === "}") depth -= 1;
+      if (depth === 0) return source.slice(open, i + 1);
+    }
+    throw new Error(`${name} body did not close`);
+  };
 
   it("no help text still promises that protect auto-generates a passphrase", () => {
     // The exact strings that were false: `protect` opens an existing fortress
@@ -495,15 +512,13 @@ describe("credential help text and boot-order comments match the shipped behavio
     );
   });
 
-  it("fortress credential consumers name the shared resolver", () => {
+  it("the listed fortress credential consumers name the shared resolver", () => {
     const consumers = [
       ["protect", "wrap/cli.ts", "resolveFortressCustodyCredential"],
       ["export-passphrase", "cli/export-passphrase.ts", "resolveFortressCustodyCredential"],
       ["install planner", "cli/install.ts", "resolveFortressCustodyCredential"],
       ["MCP boot", "index.ts", "resolveHostLocalBootCredential"],
       ["dashboard boot", "dashboard-standalone.ts", "resolveHostLocalBootCredential"],
-      ["castle-wall provision-pin", "cli/castle-wall.ts", "__testResolveProvisionCustodyCredential"],
-      ["castle-wall re-pin", "cli/castle-wall.ts", "__testResolveRePinCustodyCredential"],
     ] as const;
     for (const [label, file, token] of consumers) {
       const source = read(file);
@@ -515,6 +530,24 @@ describe("credential help text and boot-order comments match the shipped behavio
     expect(read("wrap/custody-credential.ts")).toContain(
       "MCP/dashboard boot, and Castle Wall's `provision-pin` /",
     );
+  });
+
+  it("Castle Wall pin verbs keep the resolver on their production bodies", () => {
+    const castleWall = read("cli/castle-wall.ts");
+    for (const [label, name] of [
+      ["castle-wall provision-pin", "runProvisionPin"],
+      ["castle-wall re-pin", "runRePin"],
+    ] as const) {
+      const body = functionBody(castleWall, name);
+      expect(
+        body,
+        `${label} must resolve fortress credentials through wrap/custody-credential.ts`,
+      ).toContain("resolveFortressCustodyCredential");
+      expect(body, `${label} must not call the legacy stored-passphrase observer`)
+        .not.toContain("observeStoredPassphrase(");
+      expect(body, `${label} must not read credential env vars directly`)
+        .not.toMatch(/SANCTUARY_(PASSPHRASE|RECOVERY_KEY)/);
+    }
   });
 
   it("the dashboard help states the host-local credential bound instead of promising a free start", () => {

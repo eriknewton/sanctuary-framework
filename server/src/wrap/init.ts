@@ -1400,6 +1400,7 @@ export async function runInit(
               SANCTUARY_STORAGE_PATH: lockedFortressPath,
               SANCTUARY_RECOVERY_KEY: recoveryKey,
             },
+            __resolvedProvisionMasterKey: masterKey,
           });
         }
         if (lease.stableFortressCapability) {

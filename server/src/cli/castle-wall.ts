@@ -13,6 +13,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
+  acquireFortressMasterWriteBarrier,
   establishMaster,
   withCustodyWriteLock,
 } from "../core/master-custody.js";
@@ -431,6 +432,10 @@ export interface CastleWallCommandContext {
    */
   auditProducerPublicKeyPath?: string;
 }
+
+type ProvisionPinAlreadyLockedContext = CastleWallCommandContext & {
+  __resolvedProvisionMasterKey: Uint8Array;
+};
 
 export interface CastleWallParsedArgs {
   fortress?: string;
@@ -1136,7 +1141,7 @@ export async function runAuditStoreStatus(
  */
 export async function runProvisionPinAlreadyLocked(
   argv: string[] = [],
-  ctx: CastleWallCommandContext = {}
+  ctx: ProvisionPinAlreadyLockedContext,
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
@@ -1173,7 +1178,10 @@ export async function runProvisionPinAlreadyLocked(
   let privateSeed: Uint8Array | undefined;
   try {
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
-    masterKey = ctx.__resolvedProvisionMasterKey ?? await resolveMasterKey(storagePath, env);
+    if (ctx.__resolvedProvisionMasterKey === undefined) {
+      throw new Error("provision-pin requires an already-authenticated master");
+    }
+    masterKey = ctx.__resolvedProvisionMasterKey;
 
     // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
     // material. Enforced in the core verb - not the wrapping CLI - so
@@ -1272,8 +1280,23 @@ export async function runProvisionPin(
   if (writeCastleWallParseError(parsed, err)) return 2;
   const storagePath = resolveFortressArg(parsed.fortress, env);
   const storage = new FilesystemStorage(join(storagePath, "state"));
+  const suppliedMasterKey = ctx.__resolvedProvisionMasterKey;
+  let preLockMasterWriteBarrier:
+    | Awaited<ReturnType<typeof acquireFortressMasterWriteBarrier>>
+    | undefined;
+  let result: number | undefined;
+  let failure: unknown;
   try {
-    return await withCustodyWriteLock(
+    if (suppliedMasterKey === undefined) {
+      // INVARIANT (lock order): provision-pin acquires the shared rotation
+      // barrier before the custody write lock, matching rotate-master's
+      // barrier -> custody-lock order and avoiding a custody-lock -> barrier
+      // inversion when rotation is already draining readers.
+      preLockMasterWriteBarrier = await acquireFortressMasterWriteBarrier(storage, {
+        degradeOnEnvironmentalLoss: "read-only",
+      });
+    }
+    result = await withCustodyWriteLock(
       storage,
       async (lease) => {
         lease.assertHeld();
@@ -1281,9 +1304,10 @@ export async function runProvisionPin(
         if (!lockedFortressPath) {
           throw new Error("provision-pin custody lock did not expose a stable fortress root");
         }
-        let masterWriteBarrier: { release(): Promise<void> } | undefined;
+        let masterWriteBarrier = preLockMasterWriteBarrier;
+        let resolvedCredential: ResolvedCustodyCredential | undefined;
         const masterKey =
-          ctx.__resolvedProvisionMasterKey ??
+          suppliedMasterKey ??
           await (async () => {
             const resolution = await (ctx.__testResolveProvisionCustodyCredential ??
               resolveFortressCustodyCredential)({
@@ -1298,6 +1322,7 @@ export async function runProvisionPin(
             if (resolution.status !== "resolved") {
               throw custodyCredentialRefusal(resolution.report, storagePath);
             }
+            resolvedCredential = resolution.credential;
             // INVARIANT (one custody chain): provision-pin resolves through the
             // shared fortress resolver used by sibling custody verbs, so source
             // precedence and indeterminate states cannot drift per verb.
@@ -1305,9 +1330,11 @@ export async function runProvisionPin(
               storage,
               ...provisionCredentialFields(resolution.credential),
               storagePathHint: storagePath,
+              ...(masterWriteBarrier === undefined
+                ? {}
+                : { heldBarrier: masterWriteBarrier }),
               barrierDegradeMode: "read-only",
             });
-            masterWriteBarrier = established.masterWriteBarrier;
             return established.masterKey;
           })();
         await ctx.__testAfterProvisionMasterResolved?.();
@@ -1335,7 +1362,19 @@ export async function runProvisionPin(
           return result.code;
         } finally {
           masterKey.fill(0);
-          await masterWriteBarrier?.release();
+          if (resolvedCredential?.kind === "keychain-key") {
+            // The resolver transfers ownership of this buffer to the caller;
+            // provision-pin scrubs it at the same lifetime boundary as the
+            // derived master so custody key material is not left for GC.
+            resolvedCredential.keychainKey.fill(0);
+          }
+          const barrierToRelease = masterWriteBarrier;
+          if (barrierToRelease !== undefined) {
+            if (barrierToRelease === preLockMasterWriteBarrier) {
+              preLockMasterWriteBarrier = undefined;
+            }
+            await barrierToRelease.release();
+          }
         }
       },
       {
@@ -1346,9 +1385,29 @@ export async function runProvisionPin(
       },
     );
   } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    failure = error;
+  } finally {
+    suppliedMasterKey?.fill(0);
+  }
+  if (preLockMasterWriteBarrier !== undefined) {
+    try {
+      await preLockMasterWriteBarrier.release();
+      preLockMasterWriteBarrier = undefined;
+    } catch (releaseError) {
+      failure = failure === undefined
+        ? releaseError
+        : new AggregateError(
+            [failure, releaseError],
+            "provision-pin failed and its master-write barrier did not release cleanly",
+            { cause: releaseError },
+          );
+    }
+  }
+  if (failure !== undefined) {
+    write(err, `Error: ${failure instanceof Error ? failure.message : String(failure)}\n`);
     return 1;
   }
+  return result ?? 1;
 }
 
 async function readOptionalFile(

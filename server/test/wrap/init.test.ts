@@ -1600,10 +1600,16 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     await runInit(
       { fortress: fortressPath, noConfirm: true },
       {
-        provisionPin: (argv, ctx) => runProvisionPinAlreadyLocked(argv, {
-          ...ctx,
-          globalPinnedPublicKeyPath: globalPinPath,
-        }),
+        provisionPin: (argv, ctx) => {
+          if (ctx?.__resolvedProvisionMasterKey === undefined) {
+            throw new Error("test provision seam requires an established master");
+          }
+          return runProvisionPinAlreadyLocked(argv, {
+            ...ctx,
+            __resolvedProvisionMasterKey: ctx.__resolvedProvisionMasterKey,
+            globalPinnedPublicKeyPath: globalPinPath,
+          });
+        },
       },
     );
 
