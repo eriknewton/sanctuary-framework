@@ -472,6 +472,7 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     const blockedNamespacePath = join(fortress.stateStoragePath, "agent-memory");
     const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-cli-refusal-"));
     cleanup.push(bundleDir);
+    const previousStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.SANCTUARY_STORAGE_PATH = fortress.storagePath;
 
     await chmod(blockedNamespacePath, 0o000);
@@ -494,6 +495,55 @@ describe("sanctuary exit export: state-namespace resolution", () => {
       expect(err.text).not.toContain(blockedNamespacePath);
       expect(err.text).not.toContain("EACCES");
       expect(err.text.toLowerCase()).not.toContain("permission denied");
+    } finally {
+      await chmod(blockedNamespacePath, 0o700);
+      if (previousStoragePath === undefined) {
+        delete process.env.SANCTUARY_STORAGE_PATH;
+      } else {
+        process.env.SANCTUARY_STORAGE_PATH = previousStoragePath;
+      }
+    }
+  });
+
+  it("refuses before the export audit entry when one namespace directory is unreadable", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      console.warn("skipping mode-000 namespace enumeration check while running as root");
+      return;
+    }
+    const fortress = await seededFortress();
+    const blockedNamespacePath = join(fortress.stateStoragePath, "agent-memory");
+    const parent = await mkdtemp(join(tmpdir(), "sanctuary-bundle-entry-refusal-parent-"));
+    cleanup.push(parent);
+    const bundleDir = join(parent, "bundle");
+
+    const beforeOps = await fortress.readAuditOperations();
+    await chmod(blockedNamespacePath, 0o000);
+    try {
+      await expect(
+        exportExitBundle({
+          unpartitionedLegacyExport: true,
+          bundleDir,
+          storage: fortress.storage,
+          masterKey: fortress.masterKey,
+          identityManager: fortress.identityManager,
+          auditLog: fortress.auditLog,
+          reputationStore: fortress.reputationStore,
+          policy: DEFAULT_POLICY,
+          config: defaultConfig(),
+          stateStoragePath: fortress.stateStoragePath,
+          keySource: "passphrase",
+        }),
+      ).rejects.toMatchObject({
+        name: "ExitNamespaceDiscoveryError",
+        code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
+      });
+      await expect(stat(bundleDir)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const afterOps = await fortress.readAuditOperations();
+      expect(afterOps.filter((op) => op === "exit_bundle_export")).toHaveLength(
+        beforeOps.filter((op) => op === "exit_bundle_export").length,
+      );
     } finally {
       await chmod(blockedNamespacePath, 0o700);
     }
@@ -653,23 +703,29 @@ describe("exportExitBundle: storage namespace enumeration failures refuse export
     const parent = await mkdtemp(join(tmpdir(), "sanctuary-bundle-bound-parent-"));
     const bundleDir = join(parent, "bundle");
     try {
-      await expect(
-        exportExitBundle({
-          unpartitionedLegacyExport: true,
-          bundleDir,
-          storage,
-          masterKey,
-          identityManager,
-          auditLog,
-          reputationStore,
-          policy: DEFAULT_POLICY,
-          config: defaultConfig(),
-          keySource: "recovery-key",
-        }),
-      ).rejects.toMatchObject({
+      const error = await exportExitBundle({
+        unpartitionedLegacyExport: true,
+        bundleDir,
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+        reputationStore,
+        policy: DEFAULT_POLICY,
+        config: defaultConfig(),
+        keySource: "recovery-key",
+      }).then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+      expect(error).toMatchObject({
         name: "ExitNamespaceDiscoveryError",
         code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
       });
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        NAMESPACE_DISCOVERY_LIMIT_REMEDIATION,
+      );
       await expect(stat(bundleDir)).rejects.toMatchObject({
         code: "ENOENT",
       });

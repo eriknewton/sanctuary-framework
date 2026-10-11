@@ -960,8 +960,10 @@ async function resolveExportStateNamespaces(
   try {
     // Must match StorageBackend.listNamespaces in storage/interface.ts: this is
     // the one namespace definition for full-fortress export. Continuing paths:
-    // empty-present roots and missing roots return []; unreadable roots,
-    // over-bound walks, and per-entry failures are typed refusals.
+    // empty-present roots and missing roots return []; any enumeration error
+    // other than an absent root (unreadable root, per-entry failure, mid-walk
+    // I/O error) and either bound constant (MAX_DISCOVERED_NAMESPACES,
+    // MAX_NAMESPACE_DISCOVERY_ENTRIES) are refusals rather than partial results.
     return await opts.storage.listNamespaces();
   } catch (error) {
     throw new ExitNamespaceDiscoveryError(error);

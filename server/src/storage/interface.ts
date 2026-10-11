@@ -118,9 +118,11 @@ export interface StorageBackend {
    * Must match resolveExportStateNamespaces in exit/bundle.ts: full-fortress
    * exit export consumes this exact enumeration rather than walking storage
    * with a second namespace definition.
-   * Continuing paths: empty-present roots and missing roots return [];
-   * refusing paths: unreadable roots, over-bound walks, and per-entry failures
-   * throw rather than returning a partial set.
+   * Continuing paths: empty-present roots and missing roots return []; any
+   * enumeration error other than an absent root (unreadable root, per-entry
+   * failure, mid-walk I/O error) and either bound constant
+   * (MAX_DISCOVERED_NAMESPACES, MAX_NAMESPACE_DISCOVERY_ENTRIES) are refusals
+   * rather than partial results.
    * These bounds must match the enforcement in filesystem.ts and memory.ts.
    */
   listNamespaces?(): Promise<string[]>;
