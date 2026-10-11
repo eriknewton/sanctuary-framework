@@ -1554,11 +1554,13 @@ describe("sanctuary install agent contract", () => {
   //       facts the planner reads only after the re-pin arm;
   //   (b) every pair of pre-re-pin fields at every value pair, crossed with
   //       every trust-anchor x vault-claim pair.
-  // The all-pass baseline is the first case of (a). The field list and every
-  // literal the planner compares in that region are pinned to the planner
-  // source by the next test, and each value list is pinned to its declared
-  // union at compile time (CoversUnion), so a new gate or a new value cannot
-  // sit outside the enumeration silently.
+  // The all-pass baseline is the first case of (a). The next test pins the
+  // observed-field string comparisons, the harness and platform literals, and
+  // the build-sha pattern in that region to the planner source, and each value
+  // list is pinned to its declared union at compile time (CoversUnion), so a
+  // new observed value or a new string gate on those fields cannot sit outside
+  // the enumeration silently. The scan does not pin profile or null
+  // comparisons; a new gate of that shape needs its own case here.
   type PrecedenceProbe = InstallProbeResult;
   type PrecedenceHarness = Parameters<typeof buildAgentInstallPlan>[0]["harness"];
   type CoversUnion<U, A extends readonly unknown[]> = [Exclude<U, A[number]>] extends [never] ? A : never;
