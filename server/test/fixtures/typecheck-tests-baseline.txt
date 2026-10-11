@@ -81,8 +81,8 @@ test/cognitive/memory-attest.test.ts(44,35): error TS2554: Expected 0 arguments,
 test/compliance/eu_ai_act/generator.test.ts(60,39): error TS2554: Expected 0 arguments, but got 1.
 test/compliance/eu_ai_act/generator.test.ts(70,7): error TS2345: Argument of type '"fixture-passphrase"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/composition/sidecar-trust-boundary.test.ts(41,7): error TS2741: Property 'signature_scheme' is missing in type '{ event_id: string; event_type: string; agent_id: string; counterparty_id: string; commitment_class: string; fortress_id: string; emitter_node: string; emitted_at: string; }' but required in type 'CommitmentEvent'.
-test/core/master-custody.test.ts(374,12): error TS18047: 'second.envelope' is possibly 'null'.
-test/core/master-custody.test.ts(783,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
+test/core/master-custody.test.ts(376,12): error TS18047: 'second.envelope' is possibly 'null'.
+test/core/master-custody.test.ts(785,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
 test/dashboard-slice2-park.test.ts(121,12): error TS18046: 'healthBody' is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(154,14): error TS2571: Object is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(172,12): error TS18046: 'body' is of type 'unknown'.
