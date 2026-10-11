@@ -189,6 +189,7 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
     // ("...the_five_known...") goes stale the first time a target is added and
     // then reads as a lie in the CI output while the assertion itself is correct.
     let expected: BTreeSet<String> = [
+        "confined_agent_id",
         "integration_dns_bypass",
         "integration_failure_modes",
         "integration_gf1_recovery",

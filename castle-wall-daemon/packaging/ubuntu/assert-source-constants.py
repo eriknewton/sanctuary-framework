@@ -58,7 +58,13 @@ from pathlib import Path
 # comment and its TD2n equality test changed. The test pins the 2700 ms nft
 # bound against WATCHDOG_HOOK_NFT_WAIT; the rule grammar, parser, receipt mint,
 # and net script remain unchanged.
-NFTABLES_SOURCE_SHA256 = "e38c212af0f0e15a791c25361d31355301016ef3336bdaf425060be286f44ea4"
+# Refreshed for confined agent-id scope parsing (2026-10-11): nftables.rs gained
+# CONFINED_AGENT_ID_FORM, parse_confined_agent_id, the cfg widening for
+# confined_agent_id, and doc wording distinguishing the confined id from the
+# audit evidence subject. The rule grammar, the owned-table parser and its enum
+# variants, the receipt mint and the net script are byte-unchanged. The guard
+# constants it mirrors are unchanged.
+NFTABLES_SOURCE_SHA256 = "8c61c5fdd8e4c82595851b78812676f393782e567946910ceae72a844f802f17"
 
 
 # The declared partition of the guard's path constants (every name in
