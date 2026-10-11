@@ -1593,6 +1593,31 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     expect(sawStorageRealPath).toBe(await realpath(fortressPath));
   });
 
+  it("default init transfers an owned master copy to provision-pin", async () => {
+    const fortressPath = join(tmp, "default-pin-owned-master-fortress");
+    let initMaster: Uint8Array | undefined;
+    let observedAfterCalleeScrub = false;
+
+    await runInit(
+      { fortress: fortressPath, noConfirm: true },
+      {
+        observeSecretBuffer: (label, buffer) => {
+          if (label === "master") initMaster = buffer;
+        },
+        provisionPin: async (_argv, ctx) => {
+          const handedMaster = ctx?.__resolvedProvisionMasterKey;
+          expect(handedMaster).toBeInstanceOf(Uint8Array);
+          expect(handedMaster).not.toBe(initMaster);
+          handedMaster!.fill(0);
+          observedAfterCalleeScrub = initMaster!.some((byte) => byte !== 0);
+          return 0;
+        },
+      },
+    );
+
+    expect(observedAfterCalleeScrub).toBe(true);
+  });
+
   it("default init with the REAL provisioning writes the per-fortress key and no machine-wide anchor", async () => {
     const fortressPath = join(tmp, "default-pin-real-fortress");
     const globalPinPath = join(tmp, "default-pin-real-global", "castle-pinned-pubkey.bin");

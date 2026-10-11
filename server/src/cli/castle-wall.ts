@@ -192,10 +192,14 @@ export interface CastleWallCommandContext {
   /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
   warn?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
-  /** INTERNAL: already-authenticated master owned and scrubbed by provision-pin. */
+  /**
+   * INTERNAL: owned already-authenticated master transferred to provision-pin.
+   * The callee scrubs it, so any caller that still needs its master after the
+   * handoff must pass a `.slice()` copy and retain ownership of the original.
+   */
   __resolvedProvisionMasterKey?: Uint8Array;
   /** TEST ONLY: pause after authoritative unlock while the custody lease is held. */
-  __testAfterProvisionMasterResolved?: () => void | Promise<void>;
+  __testAfterProvisionMasterResolved?: (masterKey: Uint8Array) => void | Promise<void>;
   /** TEST ONLY: shorten provision-pin custody lock contention. */
   __testProvisionLockTimeoutMs?: number;
   /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
@@ -1146,6 +1150,7 @@ export async function runProvisionPinAlreadyLocked(
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  let masterKey: Uint8Array | undefined = ctx.__resolvedProvisionMasterKey;
   // Honor the subcommand-level `--fortress <path>` flag, exactly like every
   // other castle-wall custody verb (re-pin, daemon, audit-*) and like the
   // federation/identity/transparency verbs. Before this, provision-pin
@@ -1157,7 +1162,10 @@ export async function runProvisionPinAlreadyLocked(
   // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
   // resolveStoragePath(env) when no flag is given, preserving prior behavior.
   const parsed = parseCastleWallArgs(argv);
-  if (writeCastleWallParseError(parsed, err)) return 2;
+  if (writeCastleWallParseError(parsed, err)) {
+    masterKey?.fill(0);
+    return 2;
+  }
   const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
@@ -1173,15 +1181,12 @@ export async function runProvisionPinAlreadyLocked(
   // refused, failing every default init on that machine. The ONLY writer of the
   // machine-wide anchor is the helper's installPin(), reached only through the
   // confirmed `castle-wall re-pin` verb.
-
-  let masterKey: Uint8Array | undefined;
   let privateSeed: Uint8Array | undefined;
   try {
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
-    if (ctx.__resolvedProvisionMasterKey === undefined) {
+    if (masterKey === undefined) {
       throw new Error("provision-pin requires an already-authenticated master");
     }
-    masterKey = ctx.__resolvedProvisionMasterKey;
 
     // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
     // material. Enforced in the core verb - not the wrapping CLI - so
@@ -1276,11 +1281,14 @@ export async function runProvisionPin(
 ): Promise<number> {
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
+  const suppliedMasterKey = ctx.__resolvedProvisionMasterKey;
   const parsed = parseCastleWallArgs(argv);
-  if (writeCastleWallParseError(parsed, err)) return 2;
+  if (writeCastleWallParseError(parsed, err)) {
+    suppliedMasterKey?.fill(0);
+    return 2;
+  }
   const storagePath = resolveFortressArg(parsed.fortress, env);
   const storage = new FilesystemStorage(join(storagePath, "state"));
-  const suppliedMasterKey = ctx.__resolvedProvisionMasterKey;
   let preLockMasterWriteBarrier:
     | Awaited<ReturnType<typeof acquireFortressMasterWriteBarrier>>
     | undefined;
@@ -1306,53 +1314,67 @@ export async function runProvisionPin(
         }
         let masterWriteBarrier = preLockMasterWriteBarrier;
         let resolvedCredential: ResolvedCustodyCredential | undefined;
-        const masterKey =
-          suppliedMasterKey ??
-          await (async () => {
-            const resolution = await (ctx.__testResolveProvisionCustodyCredential ??
-              resolveFortressCustodyCredential)({
-              storagePath,
-              env,
-              storage,
-              allowMint: false,
-              ...(ctx.__testObserveStoredPassphrase === undefined
-                ? {}
-                : { observePassphrase: ctx.__testObserveStoredPassphrase }),
-            });
-            if (resolution.status !== "resolved") {
-              throw custodyCredentialRefusal(resolution.report, storagePath);
-            }
-            resolvedCredential = resolution.credential;
-            // INVARIANT (one custody chain): provision-pin resolves through the
-            // shared fortress resolver used by sibling custody verbs, so source
-            // precedence and indeterminate states cannot drift per verb.
-            const established = await establishMaster({
-              storage,
-              ...provisionCredentialFields(resolution.credential),
-              storagePathHint: storagePath,
-              ...(masterWriteBarrier === undefined
-                ? {}
-                : { heldBarrier: masterWriteBarrier }),
-              barrierDegradeMode: "read-only",
-            });
-            return established.masterKey;
-          })();
-        await ctx.__testAfterProvisionMasterResolved?.();
-        lease.assertHeld();
+        let masterKey: Uint8Array | undefined;
         try {
+          masterKey =
+            suppliedMasterKey ??
+            await (async () => {
+              const resolution = await (ctx.__testResolveProvisionCustodyCredential ??
+                resolveFortressCustodyCredential)({
+                storagePath,
+                env,
+                storage,
+                allowMint: false,
+                ...(ctx.__testObserveStoredPassphrase === undefined
+                  ? {}
+                  : { observePassphrase: ctx.__testObserveStoredPassphrase }),
+              });
+              if (resolution.status !== "resolved") {
+                throw custodyCredentialRefusal(resolution.report, storagePath);
+              }
+              resolvedCredential = resolution.credential;
+              // INVARIANT (one custody chain): provision-pin resolves through the
+              // shared fortress resolver used by sibling custody verbs, so source
+              // precedence and indeterminate states cannot drift per verb.
+              const established = await establishMaster({
+                storage,
+                ...provisionCredentialFields(resolution.credential),
+                storagePathHint: storagePath,
+                ...(masterWriteBarrier === undefined
+                  ? {}
+                  : { heldBarrier: masterWriteBarrier }),
+                barrierDegradeMode: "read-only",
+              });
+              return established.masterKey;
+            })();
+          await ctx.__testAfterProvisionMasterResolved?.(masterKey);
+          lease.assertHeld();
           const result = lease.stableFortressCapability
-            ? await lease.stableFortressCapability.provisionPin({
-                masterKey,
-                ...(ctx.globalPinnedPublicKeyPath
-                  ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
-                  : {}),
-              })
+            ? await (async () => {
+                const handoffMasterKey = masterKey!.slice();
+                try {
+                  return await lease.stableFortressCapability!.provisionPin({
+                    // INVARIANT (master ownership): the capability copies the
+                    // handoff for IPC; this caller scrubs the handoff copy and
+                    // keeps the established master until its own cleanup boundary.
+                    masterKey: handoffMasterKey,
+                    ...(ctx.globalPinnedPublicKeyPath
+                      ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
+                      : {}),
+                  });
+                } finally {
+                  handoffMasterKey.fill(0);
+                }
+              })()
             : await runProvisionPinAlreadyLocked([], {
                 ...ctx,
                 env: {
                   SANCTUARY_STORAGE_PATH: lockedFortressPath,
                 },
-                __resolvedProvisionMasterKey: masterKey,
+                // INVARIANT (master ownership): runProvisionPinAlreadyLocked
+                // always scrubs the transferred buffer, so the outer command
+                // hands off a copy and scrubs the original exactly once here.
+                __resolvedProvisionMasterKey: masterKey.slice(),
               });
           lease.assertHeld();
           if (typeof result === "number") return result;
@@ -1361,7 +1383,7 @@ export async function runProvisionPin(
           for (const warning of result.warnings) console.warn(warning);
           return result.code;
         } finally {
-          masterKey.fill(0);
+          masterKey?.fill(0);
           if (resolvedCredential?.kind === "keychain-key") {
             // The resolver transfers ownership of this buffer to the caller;
             // provision-pin scrubs it at the same lifetime boundary as the
