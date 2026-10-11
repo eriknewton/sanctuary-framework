@@ -140,6 +140,11 @@ tempfile = "=3.10.1"
 # whole block mechanically: it refuses any `tests/*.rs` that can reach a
 # host-global object without a `required-features` entry here.
 [[test]]
+name = "confined_agent_id"
+path = "tests/confined_agent_id.rs"
+required-features = ["test-isolation"]
+
+[[test]]
 name = "integration_linux_runtime_activation"
 path = "tests/integration_linux_runtime_activation.rs"
 required-features = ["test-isolation"]

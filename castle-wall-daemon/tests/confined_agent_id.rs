@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+mod isolation;
+
 #[derive(Deserialize)]
 struct ConfinedAgentIdVectors {
     valid: Vec<String>,
@@ -8,6 +10,7 @@ struct ConfinedAgentIdVectors {
 
 #[test]
 fn confined_agent_id_form_matches_the_shared_vector_set() {
+    let _suite = isolation::guard();
     let vectors: ConfinedAgentIdVectors =
         serde_json::from_str(include_str!("../test-vectors/confined-agent-id-v1.json")).unwrap();
     let accepted: Vec<_> = vectors
