@@ -279,15 +279,38 @@ describe("scripts/parse-vitest-summary.sh count helpers (sourced by both consume
   });
 });
 
-describe("the pre-push hook compares counts only through the shared helper", () => {
+describe("baseline-guard consumers compare counts only through the shared helper", () => {
   const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const workflow = fs.readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "test-baseline-guard.yml"),
+    "utf8",
+  );
   const hook = fs.readFileSync(path.join(REPO_ROOT, ".githooks", "pre-push"), "utf8");
+
+  // Gate 2c's run block: from its step name to the next step.
+  const gate2cStart = workflow.indexOf("- name: Gate 2c");
+  const gate2cEnd = workflow.indexOf("\n      - name:", gate2cStart + 1);
+  const gate2c = workflow.slice(gate2cStart, gate2cEnd === -1 ? undefined : gate2cEnd);
 
   // Arithmetic comparison or subtraction on a whole count: the shape that
   // wraps silently past signed 64-bit range.
   const COUNT_ARITHMETIC = /\(\([^)]*\b(passing|baseline|prev_floor)\b[^)]*\)\)/;
 
-  it("compares the floors and the passing count only through compare_counts", () => {
+  it("Gate 2c sources the trusted helper copy and does no arithmetic on a count", () => {
+    expect(gate2cStart).toBeGreaterThan(-1);
+    expect(gate2c).toContain('git show "${BASE_SHA}:scripts/parse-vitest-summary.sh"');
+    expect(gate2c).toContain('source "$trusted_helper"');
+    expect(gate2c).toMatch(/compare_counts "\$passing" "\$baseline"/);
+    expect(gate2c).not.toMatch(COUNT_ARITHMETIC);
+  });
+
+  it("the workflow never sources or runs the checked-out helper directly", () => {
+    // On pull_request the checkout is the head under review; running its copy
+    // of the helper would let a head that edits the helper grade itself.
+    expect(workflow).not.toMatch(/(source|bash|\.)\s+\.?\/?scripts\/parse-vitest-summary\.sh/);
+  });
+
+  it("the pre-push hook compares the floors and the passing count only through compare_counts", () => {
     expect(hook).toContain("source scripts/parse-vitest-summary.sh");
     expect(hook).toMatch(/compare_counts "\$baseline" "\$prev_floor"/);
     expect(hook).toMatch(/compare_counts "\$passing" "\$baseline"/);
