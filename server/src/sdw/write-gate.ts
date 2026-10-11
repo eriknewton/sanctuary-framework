@@ -19,8 +19,10 @@ import {
   SDW_QUERY_HISTORY_NAMESPACE,
   SDW_VECTOR_MEMORY_NAMESPACE,
   SDW_WORKING_STATE_NAMESPACE,
+  SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS,
   type SdwNamespace,
   type SdwReplayAnchorData,
+  type SdwMemoryProvenanceSignaturePath,
   type SdwRecord,
 } from "./records.js";
 import { SdwValidationError, type SdwClassifierDetector } from "./errors.js";
@@ -51,6 +53,15 @@ const BASE64URL_32_BYTE_KEY_SHAPE = new RegExp(
   `^[A-Za-z0-9_-]{${BASE64URL_32_BYTE_KEY_CHARS}}$`,
 );
 const HEX_32_BYTE_KEY_SHAPE = new RegExp(`^[A-Fa-f0-9]{${HEX_32_BYTE_KEY_CHARS}}$`);
+const ED25519_SIGNATURE_BYTES = 64; // Ed25519 signatures are fixed 64-byte values.
+const BITS_PER_BYTE = 8;
+const BASE64URL_BITS_PER_CHAR = 6;
+const ED25519_SIGNATURE_BASE64URL_CHARS = Math.ceil(
+  (ED25519_SIGNATURE_BYTES * BITS_PER_BYTE) / BASE64URL_BITS_PER_CHAR,
+);
+const ED25519_SIGNATURE_BASE64URL_SHAPE = new RegExp(
+  `^[A-Za-z0-9_-]{${ED25519_SIGNATURE_BASE64URL_CHARS}}$`,
+);
 const RECOVERY_KEY_LABEL_PATTERN = String.raw`SANCTUARY_RECOVERY_KEY|recovery[_ -]?key`;
 const ED25519_PRIVATE_KEY_LABEL_PATTERN = String.raw`ed25519[_ -]?(?:private|secret)(?:[_ -]?key)?|(?:private|secret)(?:[_ -]?key)?[_ -]?ed25519`;
 const PRIVATE_KEY_MARKER_PROBES: readonly RegExp[] = [
@@ -220,18 +231,23 @@ function recordContentHashOf(record: SdwRecord): string | undefined {
 }
 
 /**
- * Every other SDW store (catalog, working-state, query-history, vector-memory,
- * replay-anchor) never passes `classifierOverride`, so their classify pass is
- * unaffected. It is not a general escape hatch: `classifyRecord` runs at TWO
- * independent chokepoints for a real write (here, in mintPersistable, and
- * again in prepareSdwBackendWrite below); an override must be threaded
- * through BOTH or the second pass still rejects, and each pass independently
- * verifies the token against the RECORD IT IS ABOUT TO CLASSIFY (never a
- * caller-supplied claim), so a caller cannot pair a genuine token with
- * unrelated content and have it verify.
+ * The classifier options are intentionally per-record and per-write-pass.
+ * `classifyRecord` runs at TWO independent chokepoints for a real write
+ * (here, in mintPersistable, and again in prepareSdwBackendWrite below); an
+ * option must be threaded through BOTH or the second pass still rejects. The
+ * content override verifies against the RECORD IT IS ABOUT TO CLASSIFY (never
+ * a caller-supplied claim), and provenance signature references must match the
+ * exact schema path, exact Ed25519 shape, and exact verified owner object.
  */
 export interface MintPersistableOptions {
   readonly classifierOverride?: ClassifierOverrideAuthorization;
+  readonly verifiedProvenanceSignatures?: readonly VerifiedProvenanceSignatureReference[];
+}
+
+export interface VerifiedProvenanceSignatureReference {
+  readonly path: SdwMemoryProvenanceSignaturePath;
+  readonly owner: object;
+  readonly signature: string;
 }
 
 export function mintPersistable<T extends SdwRecord>(
@@ -251,7 +267,7 @@ export function mintPersistable<T extends SdwRecord>(
   const authorized =
     recordHash !== undefined && isAuthorizedClassifierOverride(options?.classifierOverride, recordHash);
   if (!authorized) {
-    classifyRecord(input.value);
+    classifyRecord(input.value, options);
   }
   return {
     [PERSISTABLE_BRAND]: true,
@@ -316,7 +332,7 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
   const authorized =
     recordHash !== undefined && isAuthorizedClassifierOverride(options?.classifierOverride, recordHash);
   if (!authorized) {
-    classifyRecord(persistable.record);
+    classifyRecord(persistable.record, options);
   }
   const aad = sdwAad(fortressId, namespace, storageKey);
   const envelope = encrypt(
@@ -923,8 +939,8 @@ function assertOneOf<T extends string>(
   }
 }
 
-function classifyRecord(record: SdwRecord): void {
-  const text = canonicalClassifierText(record);
+function classifyRecord(record: SdwRecord, options?: MintPersistableOptions): void {
+  const text = canonicalClassifierText(record, options);
   if (text.length === 0) return;
   // This text scan is defense in depth only. The enforced persistence control for
   // source-known crown jewels is provenance taint plus persistable/raw-write
@@ -935,7 +951,7 @@ function classifyRecord(record: SdwRecord): void {
   // interleaves key-path tokens between values, which would wedge between a "PRIVATE"
   // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
   // values-only compact reassembles a marker fragmented across non-adjacent fields.
-  const views = collectClassifierTextViews(record);
+  const views = collectClassifierTextViews(record, options);
   // applyBareCredentialFallback defaults to false here:
   // every OTHER SDW record kind (query-history, document chunks, working
   // state, catalog) legitimately carries system-generated ids, content
@@ -1175,7 +1191,7 @@ function findEncodedEd25519Pkcs8PrivateKey(text: string): ClassifierHit | undefi
   return undefined;
 }
 
-function canonicalClassifierText(value: SdwRecord): string {
+function canonicalClassifierText(value: SdwRecord, options?: MintPersistableOptions): string {
   const out: string[] = [];
   const visit = (item: unknown, keyPath = ""): void => {
     if (keyPath !== "") out.push(keyPath);
@@ -1190,7 +1206,12 @@ function canonicalClassifierText(value: SdwRecord): string {
     if (item !== null && typeof item === "object") {
       const object = item as { readonly [key: string]: unknown };
       for (const key of Object.keys(object).sort()) {
-        visit(object[key], keyPath === "" ? key : `${keyPath}.${key}`);
+        const childPath = keyPath === "" ? key : `${keyPath}.${key}`;
+        const child = object[key];
+        if (isVerifiedProvenanceSignatureClassifierExclusion(value, childPath, child, object, options)) {
+          continue;
+        }
+        visit(child, childPath);
       }
     }
   };
@@ -1207,17 +1228,17 @@ interface ClassifierTextViews {
   readonly entropyContexts: readonly string[];
 }
 
-function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
+function collectClassifierTextViews(value: SdwRecord, options?: MintPersistableOptions): ClassifierTextViews {
   const stringValues: string[] = [];
   const entropyContexts: string[] = [];
-  const visit = (item: unknown): void => {
+  const visit = (item: unknown, keyPath = ""): void => {
     if (typeof item === "string") {
       stringValues.push(item);
       entropyContexts.push(item);
       return;
     }
     if (Array.isArray(item)) {
-      for (const child of item) visit(child);
+      item.forEach((child, index) => visit(child, `${keyPath}[${index}]`));
       return;
     }
     if (item !== null && typeof item === "object") {
@@ -1235,7 +1256,14 @@ function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
       if (typeof object.key === "string" && typeof object.value === "string") {
         entropyContexts.push(`${object.key}\n${object.value}`);
       }
-      for (const key of Object.keys(object).sort()) visit(object[key]);
+      for (const key of Object.keys(object).sort()) {
+        const childPath = keyPath === "" ? key : `${keyPath}.${key}`;
+        const child = object[key];
+        if (isVerifiedProvenanceSignatureClassifierExclusion(value, childPath, child, object, options)) {
+          continue;
+        }
+        visit(child, childPath);
+      }
     }
   };
   visit(value);
@@ -1245,6 +1273,33 @@ function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
     compactValues: stringValues.join("").replace(/[^A-Za-z0-9]+/g, ""),
     entropyContexts,
   };
+}
+
+function isVerifiedProvenanceSignatureClassifierExclusion(
+  record: SdwRecord,
+  keyPath: string,
+  value: unknown,
+  owner: object,
+  options: MintPersistableOptions | undefined,
+): boolean {
+  if (record.kind !== "memory_provenance" || typeof value !== "string") return false;
+  if (!isSdwMemoryProvenanceSignaturePath(keyPath)) return false;
+  if (!ED25519_SIGNATURE_BASE64URL_SHAPE.test(value)) return false;
+  // Must match SdwMemoryProvenanceRecord.companion in records.ts. A verified
+  // Ed25519 signature's bytes cannot be chosen without forging; the exclusion
+  // applies only to the exact signed object reference verified on this path, so
+  // caller-authored text and look-alike signature strings remain classified.
+  return options?.verifiedProvenanceSignatures?.some((signature) =>
+    signature.path === keyPath &&
+    signature.owner === owner &&
+    signature.signature === value
+  ) ?? false;
+}
+
+function isSdwMemoryProvenanceSignaturePath(
+  keyPath: string,
+): keyPath is SdwMemoryProvenanceSignaturePath {
+  return (SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS as readonly string[]).includes(keyPath);
 }
 
 // Whole-record by design (unchanged by Rung-1 F1, which scopes only the
