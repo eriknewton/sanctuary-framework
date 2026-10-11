@@ -52,8 +52,6 @@ enum HeadlessFilterCLI {
     struct Invocation: Equatable {
         let action: Action
         let timeoutSeconds: Double
-        let ttlSeconds: UInt32?
-        let noTTL: Bool
         /// When set, the JSON report is ALSO written here (in addition to
         /// stdout). `sanctuary castle-wall enable|disable` launches this binary
         /// through `open` on macOS Tahoe - the only way to reach NE preferences
@@ -64,15 +62,11 @@ enum HeadlessFilterCLI {
         init(
             action: Action,
             timeoutSeconds: Double,
-            reportFilePath: String? = nil,
-            ttlSeconds: UInt32? = nil,
-            noTTL: Bool = false
+            reportFilePath: String? = nil
         ) {
             self.action = action
             self.timeoutSeconds = timeoutSeconds
             self.reportFilePath = reportFilePath
-            self.ttlSeconds = ttlSeconds
-            self.noTTL = noTTL
         }
     }
 
@@ -80,6 +74,16 @@ enum HeadlessFilterCLI {
         case invocation(Invocation)
         case usageError(String)
     }
+
+    /// Dead-man lease flags this binary refuses. The lease TTL is owned by
+    /// `sanctuary castle-wall enable --ttl|--no-ttl`, which sends it to the
+    /// daemon socket; the daemon relays the signed arm lease to the filter
+    /// extension. This host-app path only toggles the NE preference and has
+    /// no lease consumer, so accepting these flags would let an operator
+    /// believe a TTL was applied when it was discarded. Must match the
+    /// headless argv built in runArmDisarmInner in server/src/cli/castle-wall.ts,
+    /// which never passes them.
+    static let unsupportedLeaseFlags: Set<String> = ["--ttl", "--no-ttl"]
 
     /// Exit codes consumed by `sanctuary castle-wall enable|disable`.
     enum ExitCode: Int32 {
@@ -177,8 +181,6 @@ enum HeadlessFilterCLI {
         var action: Action?
         var timeout = defaultTimeoutSeconds
         var reportFilePath: String?
-        var ttlSeconds: UInt32?
-        var noTTL = false
         for argument in arguments[(flagIndex + 1)...] {
             if argument.hasPrefix("--timeout=") {
                 guard let value = Double(argument.dropFirst("--timeout=".count)),
@@ -192,14 +194,17 @@ enum HeadlessFilterCLI {
                     return .usageError("invalid --report-file value: \(argument)")
                 }
                 reportFilePath = path
-            } else if argument.hasPrefix("--ttl=") {
-                guard let value = UInt32(argument.dropFirst("--ttl=".count)),
-                      value > 0 else {
-                    return .usageError("invalid --ttl value: \(argument)")
-                }
-                ttlSeconds = value
-            } else if argument == "--no-ttl" {
-                noTTL = true
+            } else if unsupportedLeaseFlags.contains(
+                String(argument.split(separator: "=", maxSplits: 1).first ?? "")
+            ) {
+                // Refuse loudly instead of folding into "unknown argument":
+                // a lease flag here is a caller that thinks this binary sets
+                // the dead-man TTL, and the message names where it lives.
+                return .usageError(
+                    "unsupported flag: \(argument) (the dead-man lease TTL is set by "
+                        + "'sanctuary castle-wall enable --ttl <duration>|--no-ttl', "
+                        + "not by the headless host app)"
+                )
             } else if action == nil, let parsed = Action(rawValue: argument) {
                 action = parsed
             } else {
@@ -216,9 +221,7 @@ enum HeadlessFilterCLI {
             Invocation(
                 action: action,
                 timeoutSeconds: timeout,
-                reportFilePath: reportFilePath,
-                ttlSeconds: ttlSeconds,
-                noTTL: noTTL
+                reportFilePath: reportFilePath
             )
         )
     }

@@ -31,20 +31,28 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertEqual(invocation.timeoutSeconds, 5.0)
     }
 
-    func testParseLeaseFlags() {
-        let ttl = HeadlessFilterCLI.parse(["app", "--headless", "enable", "--ttl=300"])
-        guard case let .invocation(ttlInvocation)? = ttl else {
-            return XCTFail("expected ttl invocation")
+    // The dead-man lease TTL is not a host-app concern: `sanctuary castle-wall
+    // enable --ttl|--no-ttl` sends it to the daemon, which relays the signed
+    // arm lease to the filter extension. The headless host app only toggles
+    // the NE preference, so it refuses lease flags rather than accepting a
+    // value it would silently discard (ic-sweep-headless-ttl-flags-effective).
+    func testParseRefusesLeaseTTLFlags() {
+        for flag in ["--ttl=300", "--ttl", "--ttl=0", "--no-ttl"] {
+            let result = HeadlessFilterCLI.parse(["app", "--headless", "enable", flag])
+            guard case let .usageError(message)? = result else {
+                XCTFail("expected usageError for \(flag), got \(String(describing: result))")
+                continue
+            }
+            XCTAssertTrue(
+                message.hasPrefix("unsupported flag: "),
+                "lease flag \(flag) must be refused as unsupported, got: \(message)"
+            )
+            XCTAssertTrue(message.contains(flag), "refusal must name \(flag): \(message)")
+            XCTAssertTrue(
+                message.contains("sanctuary castle-wall enable"),
+                "refusal must point at the CLI that owns the lease: \(message)"
+            )
         }
-        XCTAssertEqual(ttlInvocation.ttlSeconds, 300)
-        XCTAssertFalse(ttlInvocation.noTTL)
-
-        let durable = HeadlessFilterCLI.parse(["app", "--headless", "enable", "--no-ttl"])
-        guard case let .invocation(durableInvocation)? = durable else {
-            return XCTFail("expected durable invocation")
-        }
-        XCTAssertNil(durableInvocation.ttlSeconds)
-        XCTAssertTrue(durableInvocation.noTTL)
     }
 
     func testParseInvalidTimeoutIsUsageError() {

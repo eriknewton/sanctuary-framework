@@ -1176,7 +1176,39 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
       [hostAppPath, "--headless", "status"],
-      [hostAppPath, "--headless", "enable", "--no-ttl"],
+      [hostAppPath, "--headless", "enable"],
+      [hostAppPath, "--headless", "status"],
+    ]);
+  });
+
+  // The dead-man TTL reaches the extension only through the signed lease sent
+  // to the daemon; the host app refuses --ttl/--no-ttl, so the CLI must never
+  // put either on the host-app argv (ic-sweep-headless-ttl-flags-effective).
+  it("enable --ttl keeps the lease TTL off the host-app argv", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke, calls } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--force", "--ttl=15m"], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      daemonProbe: async () => {
+        throw new Error("probe must not run under --force");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(calls).toEqual([
+      [hostAppPath, "--headless", "status"],
+      [hostAppPath, "--headless", "enable"],
       [hostAppPath, "--headless", "status"],
     ]);
   });
@@ -2052,8 +2084,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[1]!.slice(-3)).toEqual([
+      "--headless",
       "enable",
-      "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[2]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
