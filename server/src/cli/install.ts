@@ -122,6 +122,7 @@ const CASTLE_WALL_LAUNCHER_IDENTIFIER =
 const CASTLE_WALL_HEADLESS_CONTRACT = "3";
 const INSTALLER_SOURCE_SHA =
   typeof __SANCTUARY_SOURCE_SHA__ === "string" ? __SANCTUARY_SOURCE_SHA__ : null;
+// Must match PRECEDENCE_SIGNER_CLIENT in server/test/cli/install.test.ts.
 const CASTLE_WALL_SIGNER_CLIENT =
   "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client";
 
@@ -2090,18 +2091,27 @@ export function buildAgentInstallPlan(input: {
   // command, the anchor is consistent, the vault is still not on the wall, and
   // the next plan asks for the same command again.
   //
-  // RE-PIN PRECEDENCE: on darwin this arm names re-pin if and only if every
-  // gate above it passes (CLI bootstrap, sealed launcher, Hermes harness,
-  // first custody, cooperative surface, signed app and build identity, system
-  // extension, operator twin) and the anchor or vault claim needs re-pin; the
-  // facts read only below it (boot service, content filter, enforcement) do
-  // not decide it, and the argv it builds runs the sealed launcher. Off darwin
-  // the full profile stops at the non-darwin return above, so re-pin and its
-  // macOS wording ("this Mac", "macOS", "Terminal") are darwin-only. Moving
-  // this arm above any of those gates, or below a check on the facts it
-  // ignores, changes behavior. Must match the covering-enumeration tests
-  // "names re-pin on darwin if and only if ..." and the non-darwin cases in
-  // server/test/cli/install.test.ts.
+  // RE-PIN PRECEDENCE (a description of what the planner does today, not a
+  // claim that every macOS gate has passed). On darwin this arm is reached,
+  // and names re-pin whenever the predicate below is true, unless one of the
+  // returns above refused first. Those returns refuse on: a persistent CLI
+  // that is not `present` or has no path; a non-sealed runtime; a harness
+  // other than Hermes; cooperativeWrap `absent` (with or without existing
+  // custody); castleWallApp `absent`, `unknown` or `mismatch`, or a build sha
+  // that is null or not 12 lowercase hex; systemExtension `not loaded`,
+  // `[activated waiting for user]`, `[activated disabled]` or `unknown`; and
+  // operatorTwin anything but `absent`. Every other value passes through to
+  // this arm, including cooperativeWrap `mismatch`, `unknown` and
+  // `not-applicable` (the unknown-observation stop is BELOW this arm),
+  // castleWallApp `not-applicable`, and systemExtension `not-applicable`.
+  // Boot service, content filter and enforcement are read only below and do
+  // not decide this arm. The re-pin argv carries no CLI-path argument on the
+  // sealed runtime and runs the observed nodePath. Off darwin the full profile
+  // stops at the non-darwin return above, so re-pin and its macOS wording
+  // ("this Mac", "macOS", "Terminal") are darwin-only. Must match the
+  // covering-enumeration tests "names re-pin on darwin if and only if ..."
+  // and the non-darwin cases in server/test/cli/install.test.ts, whose
+  // per-field `passing` lists record exactly these pass-through values.
   const trustAnchorNeedsRepin =
     input.observed.trustAnchor === "broken" ||
     input.observed.trustAnchor === "unprovisioned" ||

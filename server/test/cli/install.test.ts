@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   AGENT_INSTALL_CONTRACT,
+  DEFAULT_CASTLE_WALL_APP,
   DEFAULT_CASTLE_WALL_LAUNCHER,
   buildAgentInstallPlan,
   createInstallOps,
@@ -1535,8 +1536,18 @@ describe("sanctuary install agent contract", () => {
   // server/src/cli/install.ts.
   //
   // PROPERTY: on darwin a full-profile plan names `repin_trust_anchor` IF AND
-  // ONLY IF every gate the planner evaluates before the re-pin arm passes AND
-  // the anchor or the vault claim needs re-pin. Off darwin it never names it.
+  // ONLY IF no return above the re-pin arm refuses first (every field holds a
+  // value in its `passing` list below) AND the anchor or the vault claim needs
+  // re-pin. Off darwin it never names it. The `passing` lists RECORD the
+  // planner's current pass-through values; they do not endorse them. Several
+  // (cooperativeWrap mismatch/unknown/not-applicable, castleWallApp
+  // not-applicable, systemExtension not-applicable) are referred to a
+  // separate defect investigation, and closing any of them means editing the
+  // matching `passing` list in the same change.
+  //
+  // SCOPE: this pins where re-pin sits relative to each refusal. It does not
+  // pin the relative order of two refusals above it, since only the re-pin id
+  // is asserted.
   //
   // COVERAGE is a covering design, not the full cross product (that is about
   // forty million plans per platform). Every value of every observation the
@@ -1604,6 +1615,9 @@ describe("sanctuary install agent contract", () => {
   const PRECEDENCE_PATH_NODE = "/opt/homebrew/bin/node";
   // The sealed-launcher gate compares persistentCliPath to the launcher path;
   // nodePath travels with it, as the runtime resolver reports them together.
+  // The planner never compares nodePath itself, yet the re-pin argv runs it,
+  // so the argv check below holds only for these tied pairs; a sealed path
+  // with a different nodePath is outside this enumeration.
   const PRECEDENCE_RUNTIMES = {
     sealed: { persistentCliPath: DEFAULT_CASTLE_WALL_LAUNCHER, nodePath: DEFAULT_CASTLE_WALL_LAUNCHER },
     global: { persistentCliPath: PRECEDENCE_GLOBAL_CLI, nodePath: PRECEDENCE_PATH_NODE },
@@ -1612,6 +1626,8 @@ describe("sanctuary install agent contract", () => {
   // 12 = the short build-identity length the planner's app gate accepts; the
   // two invalid spellings are the uppercase form and one character short.
   const PRECEDENCE_VALID_BUILD_SHA = "a61a7322ca80";
+  // Must match CASTLE_WALL_SIGNER_CLIENT in server/src/cli/install.ts.
+  const PRECEDENCE_SIGNER_CLIENT = join(DEFAULT_CASTLE_WALL_APP, "Contents", "MacOS", "castle-wall-signer-client");
   const PRECEDENCE_BUILD_SHAS = [PRECEDENCE_VALID_BUILD_SHA, null, "A61A7322CA80", "a61a7322ca8"] as const;
 
   type PrecedenceCase = { harness: PrecedenceHarness; observed: PrecedenceProbe };
@@ -1620,10 +1636,10 @@ describe("sanctuary install agent contract", () => {
     // Observation fields this dimension sets; pinned against the source scan.
     observedFields: readonly (keyof PrecedenceProbe)[];
     values: readonly (string | null)[];
-    // The values the planner lets through to the re-pin arm. This is the
-    // planner's CURRENT pre-re-pin behavior, stated independently per field:
-    // e.g. cooperativeWrap `unknown` is refused only by the safety stop that
-    // runs after the re-pin arm, so it passes here.
+    // The values the planner lets through to the re-pin arm. This RECORDS the
+    // planner's CURRENT pre-re-pin behavior per field and is not a claim that
+    // each value is safe: e.g. cooperativeWrap `unknown` is refused only by
+    // the safety stop that runs after the re-pin arm, so it passes here.
     passing: readonly (string | null)[];
     apply: (target: PrecedenceCase, value: string | null) => void;
   };
@@ -1742,12 +1758,29 @@ describe("sanctuary install agent contract", () => {
     return { target, gatesPass };
   }
 
-  function actionDescriptions(plan: AgentInstallPlan): string[] {
+  // Operator-facing prose of a plan: every action description (including
+  // on_nonzero fallbacks) and every note, with absolute paths removed, since
+  // the app bundle path legitimately contains "MacOS".
+  function planProse(plan: AgentInstallPlan): string[] {
     const actions = [plan.next_action, ...plan.operator_actions].filter(
       (action): action is NonNullable<typeof action> => action !== null && action !== undefined,
     );
-    return actions.flatMap((action) => [action.description, action.on_nonzero?.description ?? ""]);
+    return [
+      ...actions.flatMap((action) => [action.description, action.on_nonzero?.description ?? ""]),
+      ...plan.notes,
+    ].map((text) => text.replace(/\/[^\s;,]+/g, "<path>"));
   }
+  // macOS-only operator wording. A non-darwin plan carrying any of these
+  // would be telling a Linux or Windows operator to act on a Mac.
+  const MACOS_ONLY_WORDING = [
+    "macOS",
+    "Mac",
+    "Terminal",
+    "Keychain",
+    "System Settings",
+    "Network Extension",
+    "Gatekeeper",
+  ] as const;
 
   // (a) sum of pre-re-pin value counts x post-re-pin combinations, plus (b)
   // the sum over field pairs of their value-count products, all times the
@@ -1770,9 +1803,11 @@ describe("sanctuary install agent contract", () => {
     checked: number;
     repinExpected: number;
     failures: string[];
+    proseScanned: number;
   } {
     const failures: string[] = [];
     let checked = 0;
+    let proseScanned = 0;
     let repinExpected = 0;
     for (const assignment of precedenceAssignments()) {
       for (const trustAnchor of PRECEDENCE_TRUST_ANCHORS) {
@@ -1798,9 +1833,10 @@ describe("sanctuary install agent contract", () => {
             continue;
           }
           if (platform !== "darwin") {
-            for (const description of actionDescriptions(plan)) {
-              for (const banned of ["macOS", "Mac", "Terminal", "Keychain"]) {
-                if (description.includes(banned)) failures.push(`"${banned}" in a ${platform} action: ${label}`);
+            for (const text of planProse(plan)) {
+              proseScanned += 1;
+              for (const banned of MACOS_ONLY_WORDING) {
+                if (text.includes(banned)) failures.push(`"${banned}" in ${platform} plan prose: ${label}`);
               }
             }
           }
@@ -1811,7 +1847,7 @@ describe("sanctuary install agent contract", () => {
             argv.length === 6 &&
             argv[0] === "/usr/bin/env" &&
             argv[1] === "SANCTUARY_STORAGE_PATH=/tmp/fortress" &&
-            argv[2].startsWith("SANCTUARY_CASTLE_SIGNER_CLIENT=/") &&
+            argv[2] === `SANCTUARY_CASTLE_SIGNER_CLIENT=${PRECEDENCE_SIGNER_CLIENT}` &&
             argv[3] === DEFAULT_CASTLE_WALL_LAUNCHER &&
             argv[4] === "castle-wall" &&
             argv[5] === "re-pin";
@@ -1825,7 +1861,7 @@ describe("sanctuary install agent contract", () => {
         }
       }
     }
-    return { checked, repinExpected, failures };
+    return { checked, repinExpected, failures, proseScanned };
   }
 
   it("reads only the enumerated fields, and compares only enumerated values, before the re-pin arm", async () => {
@@ -1879,15 +1915,19 @@ describe("sanctuary install agent contract", () => {
   });
 
   it.each(["linux", "win32", "freebsd"] as const)(
-    "never names re-pin, and no action says macOS, Mac, Terminal or Keychain, for a %s full-profile plan",
+    "never names re-pin, and no action or note carries macOS-only wording, for a %s full-profile plan",
     (platform) => {
-      const { checked, repinExpected, failures } = runPrecedenceEnumeration(platform);
+      // Today these plans carry notes but no actions, so the wording scan
+      // reads notes; it guards against a macOS action or note moving above
+      // the non-darwin stop.
+      const { checked, repinExpected, failures, proseScanned } = runPrecedenceEnumeration(platform);
       expect({ failureCount: failures.length, firstFailures: failures.slice(0, 5) }).toEqual({
         failureCount: 0,
         firstFailures: [],
       });
       expect(repinExpected).toBe(0);
       expect(checked).toBe(expectedPrecedenceCaseCount());
+      expect(proseScanned).toBeGreaterThanOrEqual(checked);
     },
   );
 
