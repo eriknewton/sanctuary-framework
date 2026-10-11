@@ -37,9 +37,9 @@ import {
   CustodySnapshotChangedError,
   OrphanedFortressStateError,
   CustodyFloorError,
-  CUSTODY_ENVELOPE_KEY,
-  CUSTODY_SENTINEL_KEY,
-  type CustodyEnvelope,
+  CUSTODY_ENVELOPE_KEY, CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  CUSTODY_SENTINEL_KEY, CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT, type CustodyEnvelope,
 } from "../../src/core/master-custody.js";
 
 import {
@@ -894,13 +894,6 @@ describe("checkCastlePinCustody", () => {
 });
 
 describe("custody-pair commit schedule", () => {
-  // Must match CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY in ../../src/core/master-custody.ts;
-  // kept local so existing typecheck diagnostic line pins stay fixed.
-  const CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
-    "custody-envelope-commit-journal";
-  const CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX =
-    "custody-envelope-commit-journal.quarantine.";
-
   async function leavePendingCustodyPair(args: {
     storage: MemoryStorage;
     passphrase: string;
@@ -1092,7 +1085,9 @@ describe("custody-pair commit schedule", () => {
       .toBeNull();
     const quarantined = await quarantineKeys(storage);
     expect(quarantined).toHaveLength(1);
-    expect(quarantined[0]).toMatch(/^custody-envelope-commit-journal\.quarantine\.\d+$/);
+    const escapedPrefix = CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(quarantined[0]).toMatch(new RegExp(`^${escapedPrefix}\\d+$`));
   });
 
   it("refuses a custody-pair journal that appears during read-only unlock", async () => {
@@ -1199,6 +1194,31 @@ describe("custody-pair commit schedule", () => {
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
       .toBeNull();
     expect(await quarantineKeys(storage)).toHaveLength(1);
+  });
+
+  it("bounds custody-pair quarantine retention per slot", async () => {
+    const storage = await seedConsistentPair("custody-quarantine-retention-passphrase");
+    for (
+      let i = 0;
+      i < CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT + 2;
+      i++
+    ) {
+      await leavePendingCustodyPair({
+        storage,
+        passphrase: "custody-quarantine-retention-passphrase",
+        failTarget: CUSTODY_SENTINEL_KEY,
+      });
+      await storage.write("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, stringToBytes("{"));
+      const opened = await establishMaster({
+        storage,
+        passphrase: "custody-quarantine-retention-passphrase",
+      });
+      opened.masterKey.fill(0);
+    }
+
+    expect(await quarantineKeys(storage)).toHaveLength(
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT,
+    );
   });
 
   it("refuses an unreadable custody-pair journal beside a custody pair that does not authenticate", async () => {

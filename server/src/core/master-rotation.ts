@@ -112,8 +112,8 @@ import {
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
-  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
-  CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS,
+  custodyEnvelopeCommitJournalQuarantinePrefix,
   STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
   CUSTODY_FLOOR_WRAPS,
   CUSTODY_WRITE_LOCK_NAMESPACE,
@@ -841,7 +841,13 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
  * `convertMeta`.
  */
 export function classifyMetaKey(key: string): MetaKeyClass | null {
-  if (key.startsWith(CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX)) {
+  if (
+    CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.some(
+      (slot) =>
+        key === slot.key ||
+        key.startsWith(custodyEnvelopeCommitJournalQuarantinePrefix(slot)),
+    )
+  ) {
     return "rotation";
   }
   switch (key) {
@@ -855,8 +861,6 @@ export function classifyMetaKey(key: string): MetaKeyClass | null {
     case PENDING_RECOVERY_KEY:
     case STAGED_CUSTODY_ENVELOPE_KEY:
     case STAGED_CUSTODY_SENTINEL_KEY:
-    case CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY:
-    case STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY:
       return "rotation";
     case STATE_META_PUBLIC_KEYS_KEY: // public keys only
     case AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY: // literal "1"
@@ -2435,13 +2439,48 @@ async function rotateMasterLocked(
     // envelope bytes. External cleanup is delegated to the platform adapter,
     // which must verify the candidate and delete only its recorded inode/item.
     const pendingRecovery = await readPendingRecovery(storage, oldMaster);
-    await recoverCustodyEnvelopeCommitIfPresent(storage, {
+    let stagedCustodyPairRecoveryError: unknown;
+    try {
+      await recoverCustodyEnvelopeCommitIfPresent(storage, {
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+        master: oldMaster,
+      });
+    } catch (error) {
+      if (
+        error instanceof CustodyEnvelopeCommitJournalError &&
+        error.kind === "unusable"
+      ) {
+        stagedCustodyPairRecoveryError = error;
+      } else {
+        throw error;
+      }
+    }
+    let abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
       envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
-      sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
     });
-    const abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
-      envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
-    });
+    if (stagedCustodyPairRecoveryError !== undefined && abandonedStagedEnvelope) {
+      const stagedMaster = await unwrapMaster(abandonedStagedEnvelope, {
+        passphrase: opts.passphrase,
+      });
+      try {
+        verifyEnvelopeMac(abandonedStagedEnvelope, stagedMaster);
+        await recoverCustodyEnvelopeCommitIfPresent(storage, {
+          envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+          sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+          master: stagedMaster,
+        });
+        stagedCustodyPairRecoveryError = undefined;
+        abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
+          envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        });
+      } finally {
+        stagedMaster.fill(0);
+      }
+    }
+    if (stagedCustodyPairRecoveryError !== undefined) {
+      throw stagedCustodyPairRecoveryError;
+    }
     if (pendingRecovery) {
       if (!abandonedStagedEnvelope) {
         throw new RotationPreflightError(

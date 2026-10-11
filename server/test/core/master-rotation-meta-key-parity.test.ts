@@ -60,9 +60,8 @@ import {
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
-  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
-  CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX,
-  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS,
+  custodyEnvelopeCommitJournalQuarantinePrefix,
 } from "../../src/core/master-custody.js";
 import {
   EPOCH_WITNESS_META_KEY,
@@ -112,18 +111,16 @@ const ROTATION_RECOGNIZED_META_KEYS: readonly MetaKeyWriteSite[] = [
   { key: PENDING_RECOVERY_KEY, writer: "core/master-rotation.ts" },
   { key: STAGED_CUSTODY_ENVELOPE_KEY, writer: "core/master-rotation.ts" },
   { key: STAGED_CUSTODY_SENTINEL_KEY, writer: "core/master-rotation.ts" },
-  {
-    key: CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
-    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalKey default)",
-  },
-  {
-    key: `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}<unix-ms>`,
-    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalQuarantineKey)",
-  },
-  {
-    key: STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
-    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalKey staged)",
-  },
+  ...CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.flatMap((slot) => [
+    {
+      key: slot.key,
+      writer: "core/master-custody.ts (CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS)",
+    },
+    {
+      key: `${custodyEnvelopeCommitJournalQuarantinePrefix(slot)}<unix-ms>`,
+      writer: "core/master-custody.ts (custodyEnvelopeCommitJournalQuarantinePrefix)",
+    },
+  ]),
   // State-store metadata.
   { key: STATE_ENVELOPE_PUBLIC_KEYS_KEY, writer: "cognitive/state-store.ts" },
   { key: STATE_ENVELOPE_VERSION_ANCHORS_KEY, writer: "cognitive/state-store.ts" },
@@ -333,10 +330,11 @@ function scanMetaWriteSites(files: Map<string, string>): ScanResult {
       }
     }
   }
-  if (corpus.includes("CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX")) {
-    keys.add("custody-envelope-commit-journal");
-    keys.add("custody-envelope-commit-journal.custody-envelope-next.custody-sentinel-next");
-    keys.add("custody-envelope-commit-journal.quarantine.<unix-ms>");
+  if (corpus.includes("CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS")) {
+    for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
+      keys.add(slot.key);
+      keys.add(`${custodyEnvelopeCommitJournalQuarantinePrefix(slot)}<unix-ms>`);
+    }
   }
   return { keys, unresolved };
 }
@@ -412,8 +410,28 @@ describe("master rotation: `_meta` key classification is total over the tree's w
   });
 
   it("custody-pair quarantine records classify as known non-blocking rotation metadata", () => {
-    expect(classifyMetaKey(`${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}1700000000000`))
-      .toBe("rotation");
+    for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
+      expect(classifyMetaKey(`${custodyEnvelopeCommitJournalQuarantinePrefix(slot)}1700000000000`))
+        .toBe("rotation");
+    }
+  });
+
+  it("custody-pair journal key literals in source are exactly the exported slot registry", () => {
+    const sourceLiterals = new Set<string>();
+    const registryKeys = CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.map((slot) => slot.key);
+    const journalPrefix = registryKeys.find((key) => !key.includes(".")) ?? registryKeys[0]!;
+    const literalPattern = /(?:"([^"]+)"|'([^']+)'|`([^`$]+)`)/g;
+    for (const src of files.values()) {
+      literalPattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = literalPattern.exec(src)) !== null) {
+        const literal = match[1] ?? match[2] ?? match[3]!;
+        if (literal === journalPrefix || literal.startsWith(`${journalPrefix}.`)) {
+          sourceLiterals.add(literal);
+        }
+      }
+    }
+    expect([...sourceLiterals].sort()).toEqual([...registryKeys].sort());
   });
 
   it("the config-security baseline key/marker/purpose/domain are byte-identical in the writer and the rotation recipe, and each side pins the other", () => {

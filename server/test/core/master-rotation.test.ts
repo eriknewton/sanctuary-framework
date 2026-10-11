@@ -23,6 +23,7 @@ import {
   establishMaster,
   readCustodyEnvelope,
   writeCustodyEnvelope,
+  wrapMasterWithPassphrase,
   countVerifiedWraps,
   envelopeEpochOf,
   readEnvelopeEpoch,
@@ -639,6 +640,104 @@ describe("master rotation — happy path", () => {
       .toBeNull();
     expect(await fortress.storage.read("_meta", STAGED_CUSTODY_SENTINEL_KEY))
       .toBeNull();
+  });
+
+  it("quarantines a torn abandoned staged cleanup record and starts a fresh rotation", async () => {
+    const fortress = await buildFortress();
+    const stagedMaster = generateRandomKey();
+    const originalDelete = fortress.storage.delete.bind(fortress.storage);
+    let armed = true;
+    fortress.storage.delete = async (namespace, key, secureOverwrite) => {
+      if (armed && namespace === "_meta" && key === STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        armed = false;
+        await originalDelete(namespace, key, secureOverwrite);
+        await fortress.storage.write("_meta", key, stringToBytes("{"));
+        throw new Error("injected staged cleanup schedule");
+      }
+      return originalDelete(namespace, key, secureOverwrite);
+    };
+    await expect(writeCustodyEnvelope(
+      fortress.storage,
+      {
+        v: 1,
+        install_mode: "interactive",
+        wraps: [
+          await wrapMasterWithPassphrase(stagedMaster, PASSPHRASE, {
+            verified: true,
+          }),
+        ],
+        created_at: new Date().toISOString(),
+      },
+      stagedMaster,
+      {
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+      },
+    )).rejects.toThrow(/injected staged cleanup schedule/);
+    fortress.storage.delete = originalDelete;
+    stagedMaster.fill(0);
+
+    await rotateMaster(rotateOpts(fortress));
+
+    expect(await fortress.storage.read(
+      "_meta",
+      STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY))
+      .toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_SENTINEL_KEY))
+      .toBeNull();
+    expect(await fortress.storage.list(
+      "_meta",
+      `${STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY}.quarantine.`,
+    )).toHaveLength(1);
+  });
+
+  it("refuses a torn staged cleanup record beside a mixed staged pair with the staged recovery step", async () => {
+    const fortress = await buildFortress();
+    const stagedMaster = generateRandomKey();
+    const originalDelete = fortress.storage.delete.bind(fortress.storage);
+    let armed = true;
+    fortress.storage.delete = async (namespace, key, secureOverwrite) => {
+      if (armed && namespace === "_meta" && key === STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        armed = false;
+        await originalDelete(namespace, key, secureOverwrite);
+        await fortress.storage.write("_meta", key, stringToBytes("{"));
+        throw new Error("injected staged cleanup schedule");
+      }
+      return originalDelete(namespace, key, secureOverwrite);
+    };
+    await expect(writeCustodyEnvelope(
+      fortress.storage,
+      {
+        v: 1,
+        install_mode: "interactive",
+        wraps: [
+          await wrapMasterWithPassphrase(stagedMaster, PASSPHRASE, {
+            verified: true,
+          }),
+        ],
+        created_at: new Date().toISOString(),
+      },
+      stagedMaster,
+      {
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+      },
+    )).rejects.toThrow(/injected staged cleanup schedule/);
+    fortress.storage.delete = originalDelete;
+    stagedMaster.fill(0);
+    await fortress.storage.write(
+      "_meta",
+      STAGED_CUSTODY_SENTINEL_KEY,
+      stringToBytes('{"v":1,"alg":"aes-256-gcm","iv":"bad","ct":"bad"}'),
+    );
+
+    const message = await rotateMaster(rotateOpts(fortress)).catch((error: unknown) =>
+      error instanceof Error ? error.message : String(error)
+    );
+    expect(message).toMatch(/staged custody pair[\s\S]*sanctuary rotate-master/i);
+    expect(message).not.toMatch(/restore _meta\/custody-envelope/i);
   });
 });
 
@@ -2268,6 +2367,49 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
       passphrase: PASSPHRASE,
     });
     await verifyRotated(fortress);
+  });
+
+  it("resumes after a torn staged cleanup record in finalize", async () => {
+    const fortress = await buildFortress();
+    const originalDelete = fortress.storage.delete.bind(fortress.storage);
+    let armed = false;
+    fortress.storage.delete = async (namespace, key, secureOverwrite) => {
+      if (armed && namespace === "_meta" && key === STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        armed = false;
+        await originalDelete(namespace, key, secureOverwrite);
+        await fortress.storage.write("_meta", key, stringToBytes("{"));
+        throw new Error("injected staged cleanup schedule");
+      }
+      return originalDelete(namespace, key, secureOverwrite);
+    };
+
+    await expect(rotateMaster(rotateOpts(fortress, {
+      failpoint: (point) => {
+        if (point === "journal-finalizing-written") armed = true;
+      },
+    }))).rejects.toThrow(/injected staged cleanup schedule/);
+    fortress.storage.delete = originalDelete;
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)).toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_SENTINEL_KEY)).toBeNull();
+    await expect(
+      establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE })
+    ).rejects.toThrow(CustodyRotationInProgressError);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    });
+    await verifyRotated(fortress);
+    expect(await fortress.storage.read(
+      "_meta",
+      STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).toBeNull();
+    expect(await fortress.storage.list(
+      "_meta",
+      `${STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY}.quarantine.`,
+    )).toHaveLength(1);
   });
 
   it("resume fails closed on a wrong passphrase", async () => {

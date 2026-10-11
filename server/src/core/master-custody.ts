@@ -155,6 +155,8 @@ const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
 
 /** `_meta` key holding the envelope. */
 export const CUSTODY_ENVELOPE_KEY = "custody-envelope";
+/** Plaintext + purpose label for the custody sentinel (see write below). */
+export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
 
 /**
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
@@ -169,16 +171,66 @@ export const ROTATION_JOURNAL_KEY = "rotation-journal";
 /** `_meta` keys staged by an in-flight rotation (promoted at finalize). */
 export const STAGED_CUSTODY_ENVELOPE_KEY = "custody-envelope-next";
 export const STAGED_CUSTODY_SENTINEL_KEY = "custody-sentinel-next";
-// Must match the local test constant in server/test/core/master-custody.test.ts;
-// the test keeps it local so existing typecheck diagnostic line pins stay fixed.
+
+export interface CustodyEnvelopeCommitJournalSlot {
+  readonly key: string;
+  readonly targetPair: {
+    readonly envelopeKey: string;
+    readonly sentinelKey: string;
+  };
+  readonly recoveryHint: string;
+  readonly consistencyCheck: (
+    storage: StorageBackend,
+    master: Uint8Array,
+    slot: CustodyEnvelopeCommitJournalSlot,
+  ) => Promise<boolean>;
+}
+
+const LIVE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT =
+  "Sanctuary will quarantine this live custody record only after _meta/custody-envelope and _meta/custody-sentinel authenticate together. " +
+  "If they do not, restore that live custody pair from a trusted backup; if no backup exists, the state needs manual repair.";
+
+const STAGED_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT =
+  "Sanctuary will quarantine this staged custody record only after the staged custody pair authenticates, or after a rotation resume proves the staged pair was already promoted and removed. " +
+  "Retry with `sanctuary rotate-master --resume` when a rotation journal exists, or rerun `sanctuary rotate-master` to let preflight abort an abandoned staged pair.";
+
+/**
+ * Single registry for every custody-pair journal slot. Every journal key,
+ * quarantine prefix, recovery lookup, secure-delete, and rotation classifier
+ * derives from this list; the meta-key parity test fails if source names a
+ * custody-pair journal key outside the registry.
+ */
+export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS: readonly CustodyEnvelopeCommitJournalSlot[] =
+  Object.freeze([
+    Object.freeze({
+      key: "custody-envelope-commit-journal",
+      targetPair: Object.freeze({
+        envelopeKey: CUSTODY_ENVELOPE_KEY,
+        sentinelKey: CUSTODY_SENTINEL_KEY,
+      }),
+      recoveryHint: LIVE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+      consistencyCheck: liveCustodyPairConsistent,
+    }),
+    Object.freeze({
+      key: "custody-envelope-commit-journal.custody-envelope-next.custody-sentinel-next",
+      targetPair: Object.freeze({
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+      }),
+      recoveryHint: STAGED_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+      consistencyCheck: stagedCustodyPairConsistent,
+    }),
+  ]);
+
 export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
-  "custody-envelope-commit-journal";
-export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX =
-  "custody-envelope-commit-journal.quarantine.";
-const CUSTODY_ENVELOPE_COMMIT_JOURNAL_PREFIX =
-  "custody-envelope-commit-journal";
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS[0]!.key;
 export const STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
-  `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_PREFIX}.${STAGED_CUSTODY_ENVELOPE_KEY}.${STAGED_CUSTODY_SENTINEL_KEY}`;
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS[1]!.key;
+export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX =
+  `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY}.quarantine.`;
+// 2 = the newest quarantine plus one prior retry, enough to compare a repeated
+// custody cleanup interruption without retaining an unbounded set of old wraps.
+export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT = 2;
 const CUSTODY_ENVELOPE_COMMIT_JOURNAL_VERSION = 1;
 const CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED =
   "custody_pair_prepared";
@@ -1018,8 +1070,6 @@ export async function readCustodyEnvelope(
   return envelope;
 }
 
-/** Plaintext + purpose label for the custody sentinel (see write below). */
-export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
 const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
 
 /**
@@ -1063,23 +1113,56 @@ interface CustodyEnvelopeCommitJournal {
   created_at: string;
 }
 
-const UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT =
-  "Sanctuary will quarantine this record only after the on-disk custody envelope and sentinel authenticate together. " +
-  "If they do not, restore _meta/custody-envelope and _meta/custody-sentinel from a trusted backup; if no backup exists, the state needs manual repair.";
-
 export function custodyEnvelopeCommitJournalKey(opts?: {
   envelopeKey?: string;
   sentinelKey?: string;
 }): string {
+  return custodyEnvelopeCommitJournalSlotForTargetPair(opts).key;
+}
+
+export function custodyEnvelopeCommitJournalQuarantinePrefix(
+  slot: CustodyEnvelopeCommitJournalSlot,
+): string {
+  return `${slot.key}.quarantine.`;
+}
+
+function custodyEnvelopeCommitJournalSlotForTargetPair(opts?: {
+  envelopeKey?: string;
+  sentinelKey?: string;
+}): CustodyEnvelopeCommitJournalSlot {
   const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
   const sentinelKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
-  if (
-    envelopeKey === CUSTODY_ENVELOPE_KEY &&
-    sentinelKey === CUSTODY_SENTINEL_KEY
-  ) {
-    return CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY;
-  }
-  return `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_PREFIX}.${envelopeKey}.${sentinelKey}`;
+  const slot = CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.find(
+    (candidate) =>
+      candidate.targetPair.envelopeKey === envelopeKey &&
+      candidate.targetPair.sentinelKey === sentinelKey,
+  );
+  if (slot !== undefined) return slot;
+  throw new CustodyEnvelopeCommitJournalError(
+    `The prepared custody record slot for _meta/${envelopeKey} and _meta/${sentinelKey} is not registered, so Sanctuary refused to invent a recovery key.`,
+    {
+      kind: "unusable",
+      recoveryHint:
+        "Use one of the registered custody-pair journal slots or add the slot to CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS with its consistency check.",
+    },
+  );
+}
+
+function custodyEnvelopeCommitJournalSlotForKey(
+  journalKey: string,
+): CustodyEnvelopeCommitJournalSlot {
+  const slot = CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.find(
+    (candidate) => candidate.key === journalKey,
+  );
+  if (slot !== undefined) return slot;
+  throw new CustodyEnvelopeCommitJournalError(
+    `The prepared custody record key _meta/${journalKey} is not registered, so Sanctuary refused to guess its target pair.`,
+    {
+      kind: "unusable",
+      recoveryHint:
+        "Add the custody-pair journal slot to CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS before writing that record.",
+    },
+  );
 }
 
 function custodyEnvelopeCommitJournal(
@@ -1103,6 +1186,7 @@ function custodyEnvelopeCommitJournal(
 
 function parseCustodyEnvelopeCommitJournal(
   raw: Uint8Array,
+  slot: CustodyEnvelopeCommitJournalSlot,
 ): CustodyEnvelopeCommitJournal {
   // The prepared-pair journal is unauthenticated by design: its checksums catch
   // torn local writes, while the envelope MAC and custody sentinel checks after
@@ -1116,7 +1200,7 @@ function parseCustodyEnvelopeCommitJournal(
       "The prepared custody record is not readable JSON, so Sanctuary kept it in place rather than guessing.",
       {
         kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+        recoveryHint: slot.recoveryHint,
       },
     );
   }
@@ -1138,17 +1222,18 @@ function parseCustodyEnvelopeCommitJournal(
       "The prepared custody record has an unsupported shape, so Sanctuary kept it in place rather than guessing.",
       {
         kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+        recoveryHint: slot.recoveryHint,
       },
     );
   }
   const typed = journal as CustodyEnvelopeCommitJournal;
-  decodeAndVerifyCustodyEnvelopeCommitJournalBytes(typed);
+  decodeAndVerifyCustodyEnvelopeCommitJournalBytes(typed, slot.recoveryHint);
   return typed;
 }
 
 function decodeAndVerifyCustodyEnvelopeCommitJournalBytes(
   journal: CustodyEnvelopeCommitJournal,
+  recoveryHint = LIVE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
 ): { envelopeBytes: Uint8Array; sentinelBytes: Uint8Array } {
   let envelopeBytes: Uint8Array;
   let sentinelBytes: Uint8Array;
@@ -1160,7 +1245,7 @@ function decodeAndVerifyCustodyEnvelopeCommitJournalBytes(
       "The prepared custody record contains unreadable target bytes, so Sanctuary kept it in place rather than applying a partial pair.",
       {
         kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+        recoveryHint,
       },
     );
   }
@@ -1172,7 +1257,7 @@ function decodeAndVerifyCustodyEnvelopeCommitJournalBytes(
       "The prepared custody record checksum does not match its target bytes, so Sanctuary kept it in place rather than applying a partial pair.",
       {
         kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+        recoveryHint,
       },
     );
   }
@@ -1215,28 +1300,72 @@ async function verifyCustodyPairAuthenticates(
   }
 }
 
+async function liveCustodyPairConsistent(
+  storage: StorageBackend,
+  master: Uint8Array,
+  slot: CustodyEnvelopeCommitJournalSlot,
+): Promise<boolean> {
+  return verifyCustodyPairAuthenticates(storage, master, slot.targetPair);
+}
+
+async function stagedCustodyPairConsistent(
+  storage: StorageBackend,
+  master: Uint8Array,
+  slot: CustodyEnvelopeCommitJournalSlot,
+): Promise<boolean> {
+  if (await verifyCustodyPairAuthenticates(storage, master, slot.targetPair)) {
+    return true;
+  }
+  const [stagedEnvelope, stagedSentinel] = await Promise.all([
+    storage.read("_meta", slot.targetPair.envelopeKey),
+    storage.read("_meta", slot.targetPair.sentinelKey),
+  ]);
+  if (stagedEnvelope !== null || stagedSentinel !== null) return false;
+  return verifyCustodyPairAuthenticates(storage, master, {
+    envelopeKey: CUSTODY_ENVELOPE_KEY,
+    sentinelKey: CUSTODY_SENTINEL_KEY,
+  });
+}
+
 async function quarantineCustodyEnvelopeCommitJournal(
   storage: StorageBackend,
-  journalKey: string,
+  slot: CustodyEnvelopeCommitJournalSlot,
   raw: Uint8Array,
 ): Promise<void> {
-  if (journalKey !== CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
-    throw new CustodyEnvelopeCommitJournalError(
-      "The prepared custody record is not readable for this staged slot, so Sanctuary kept it in place rather than guessing.",
-      {
-        kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
-      },
-    );
-  }
   let suffix = Date.now();
-  let quarantineKey = `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}${suffix}`;
+  const quarantinePrefix = custodyEnvelopeCommitJournalQuarantinePrefix(slot);
+  let quarantineKey = `${quarantinePrefix}${suffix}`;
   while (await storage.exists("_meta", quarantineKey)) {
     suffix += 1;
-    quarantineKey = `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_PREFIX}${suffix}`;
+    quarantineKey = `${quarantinePrefix}${suffix}`;
   }
   await writeMetaDurable(storage, quarantineKey, raw);
-  await storage.delete("_meta", journalKey, true);
+  await pruneCustodyEnvelopeCommitJournalQuarantine(storage, slot);
+  await storage.delete("_meta", slot.key, true);
+}
+
+async function pruneCustodyEnvelopeCommitJournalQuarantine(
+  storage: StorageBackend,
+  slot: CustodyEnvelopeCommitJournalSlot,
+): Promise<void> {
+  const prefix = custodyEnvelopeCommitJournalQuarantinePrefix(slot);
+  const entries = (await storage.list("_meta", prefix))
+    .map((entry) => {
+      const suffix = entry.key.slice(prefix.length);
+      const timestamp = Number.parseInt(suffix, 10);
+      return {
+        key: entry.key,
+        timestamp: Number.isSafeInteger(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) => a.timestamp - b.timestamp || a.key.localeCompare(b.key));
+  const excess =
+    entries.length - CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT;
+  for (const entry of excess > 0 ? entries.slice(0, excess) : []) {
+    // Quarantines retain old custody wraps for operator inspection; the cap
+    // bounds that residual by securely deleting the oldest record per slot.
+    await storage.delete("_meta", entry.key, true);
+  }
 }
 
 export async function recoverCustodyEnvelopeCommitIfPresent(
@@ -1245,13 +1374,13 @@ export async function recoverCustodyEnvelopeCommitIfPresent(
 ): Promise<CustodyPairRecoveryResult> {
   const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
   const sentinelKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
-  const journalKey = custodyEnvelopeCommitJournalKey(opts);
-  const raw = await storage.read("_meta", journalKey);
+  const slot = custodyEnvelopeCommitJournalSlotForTargetPair(opts);
+  const raw = await storage.read("_meta", slot.key);
   if (raw === null) return { changedPair: false, quarantinedJournal: false };
   return await withCustodyWriteLock(
     storage,
     (lease) =>
-      recoverCustodyEnvelopeCommitLocked(storage, journalKey, lease, {
+      recoverCustodyEnvelopeCommitLocked(storage, slot, lease, {
         envelopeKey,
         sentinelKey,
         master: opts?.master,
@@ -1264,8 +1393,8 @@ async function assertNoCustodyEnvelopeCommitJournalForReadOnly(
   storage: StorageBackend,
   opts?: { envelopeKey?: string; sentinelKey?: string },
 ): Promise<void> {
-  const journalKey = custodyEnvelopeCommitJournalKey(opts);
-  const raw = await storage.read("_meta", journalKey);
+  const slot = custodyEnvelopeCommitJournalSlotForTargetPair(opts);
+  const raw = await storage.read("_meta", slot.key);
   if (raw === null) return;
   throw new CustodyEnvelopeCommitJournalError(
     "This read-only path found a pending custody pair and will not take the custody write lock or rewrite custody files.",
@@ -1274,32 +1403,45 @@ async function assertNoCustodyEnvelopeCommitJournalForReadOnly(
 
 async function recoverCustodyEnvelopeCommitLocked(
   storage: StorageBackend,
-  journalKey: string,
+  slot: CustodyEnvelopeCommitJournalSlot,
   lease: CrossProcessLockLease,
   expected: { envelopeKey: string; sentinelKey: string; master?: Uint8Array },
 ): Promise<CustodyPairRecoveryResult> {
+  if (slot !== custodyEnvelopeCommitJournalSlotForKey(slot.key)) {
+    throw new CustodyEnvelopeCommitJournalError(
+      `The prepared custody record key _meta/${slot.key} is not registered for recovery.`,
+      { kind: "unusable", recoveryHint: slot.recoveryHint },
+    );
+  }
   lease.assertHeld();
   // Continuing-path table (AGENTS.md rule 13):
-  // - no locked journal: continue, another writer already settled it;
-  // - valid matching journal: replay both targets, clear the live journal, and
-  //   report whether the pair changed so stale callers refuse;
-  // - unreadable/decode/checksum/key-slot failure with an authentic current
-  //   envelope+sentinel pair: move the record to a quarantine key and continue;
-  // - the same failure without an authentic current pair: refuse and leave the
-  //   live journal in place for operator repair.
-  const raw = await storage.read("_meta", journalKey);
+  // - no locked slot journal: continue, another writer already settled it;
+  // - valid matching slot journal: replay that slot's target pair, securely
+  //   clear the slot journal, and report whether the pair changed so stale
+  //   callers refuse;
+  // - invalid slot journal without a master: refuse; boot/read paths either
+  //   retry after unlock with a master or, if a master-rotation journal exists,
+  //   refuse normal service and leave `sanctuary rotate-master --resume` to
+  //   complete the rotation under the staged/live rotation master;
+  // - invalid slot journal whose slot consistency check passes: move it to
+  //   `<slot-key>.quarantine.<unix-ms>`, prune that slot's oldest quarantine
+  //   records above the bounded retention cap, securely clear the slot journal,
+  //   and continue;
+  // - invalid slot journal whose target pair is mixed: refuse with that slot's
+  //   recovery step and preserve the journal for the operator path.
+  const raw = await storage.read("_meta", slot.key);
   if (raw === null) return { changedPair: false, quarantinedJournal: false };
   let journal: CustodyEnvelopeCommitJournal;
   try {
-    journal = parseCustodyEnvelopeCommitJournal(raw);
+    journal = parseCustodyEnvelopeCommitJournal(raw, slot);
   } catch (error) {
     if (
       error instanceof CustodyEnvelopeCommitJournalError &&
       error.kind === "unusable" &&
       expected.master !== undefined &&
-      await verifyCustodyPairAuthenticates(storage, expected.master, expected)
+      await slot.consistencyCheck(storage, expected.master, slot)
     ) {
-      await quarantineCustodyEnvelopeCommitJournal(storage, journalKey, raw);
+      await quarantineCustodyEnvelopeCommitJournal(storage, slot, raw);
       lease.assertHeld();
       return { changedPair: false, quarantinedJournal: true };
     }
@@ -1311,9 +1453,9 @@ async function recoverCustodyEnvelopeCommitLocked(
   ) {
     if (
       expected.master !== undefined &&
-      await verifyCustodyPairAuthenticates(storage, expected.master, expected)
+      await slot.consistencyCheck(storage, expected.master, slot)
     ) {
-      await quarantineCustodyEnvelopeCommitJournal(storage, journalKey, raw);
+      await quarantineCustodyEnvelopeCommitJournal(storage, slot, raw);
       lease.assertHeld();
       return { changedPair: false, quarantinedJournal: true };
     }
@@ -1324,7 +1466,7 @@ async function recoverCustodyEnvelopeCommitLocked(
       "The prepared custody record is bound to different target keys than its slot, so Sanctuary kept it in place rather than guessing.",
       {
         kind: "unusable",
-        recoveryHint: UNUSABLE_CUSTODY_PAIR_JOURNAL_RECOVERY_HINT,
+        recoveryHint: slot.recoveryHint,
       },
     );
   }
@@ -1338,7 +1480,7 @@ async function recoverCustodyEnvelopeCommitLocked(
     !constantTimeEqual(beforeEnvelope, envelopeBytes) ||
     !constantTimeEqual(beforeSentinel, sentinelBytes);
   await state_PREPARED_completeCustodyPair(storage, journal, lease);
-  await storage.delete("_meta", journalKey, true);
+  await storage.delete("_meta", slot.key, true);
   lease.assertHeld();
   return { changedPair, quarantinedJournal: false };
 }
@@ -1349,8 +1491,9 @@ async function state_PREPARED_completeCustodyPair(
   lease: CrossProcessLockLease,
 ): Promise<void> {
   lease.assertHeld();
-  // The prepared record is the recovery authority: both target bytes replay
-  // from one journal, so an interrupted pair cannot mix generations.
+  // The prepared record supplies atomic pairing, not trust: both target bytes
+  // replay from one journal, and callers authenticate the resulting pair before
+  // using or quarantining it.
   const { envelopeBytes, sentinelBytes } =
     decodeAndVerifyCustodyEnvelopeCommitJournalBytes(journal);
   await writeMetaDurable(
@@ -1376,12 +1519,13 @@ async function writeCustodyEnvelopeLocked(
 ): Promise<CustodyEnvelope> {
   lease.assertHeld();
   assertMaster(master);
-  const pendingJournalKey = custodyEnvelopeCommitJournalKey(opts);
+  const pendingJournalSlot = custodyEnvelopeCommitJournalSlotForTargetPair(opts);
+  const pendingJournalKey = pendingJournalSlot.key;
   const pendingJournal = await storage.read("_meta", pendingJournalKey);
   if (pendingJournal !== null) {
     const recovery = await recoverCustodyEnvelopeCommitLocked(
       storage,
-      pendingJournalKey,
+      pendingJournalSlot,
       lease,
       {
         envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
@@ -1462,12 +1606,13 @@ export async function writeCustodyEnvelopeBytes(
         );
       }
       verifyEnvelopeMac(parsed, master);
-      const pendingJournalKey = custodyEnvelopeCommitJournalKey();
+      const pendingJournalSlot = custodyEnvelopeCommitJournalSlotForTargetPair();
+      const pendingJournalKey = pendingJournalSlot.key;
       const pendingJournal = await storage.read("_meta", pendingJournalKey);
       if (pendingJournal !== null) {
         const recovery = await recoverCustodyEnvelopeCommitLocked(
           storage,
-          pendingJournalKey,
+          pendingJournalSlot,
           lease,
           {
             envelopeKey: CUSTODY_ENVELOPE_KEY,
