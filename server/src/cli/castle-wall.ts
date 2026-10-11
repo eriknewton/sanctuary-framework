@@ -202,6 +202,15 @@ export interface CastleWallCommandContext {
   __testAfterProvisionMasterResolved?: (masterKey: Uint8Array) => void | Promise<void>;
   /** TEST ONLY: shorten provision-pin custody lock contention. */
   __testProvisionLockTimeoutMs?: number;
+  /**
+   * TEST ONLY: observe provision-pin's pre-lock rotation barrier. Limited to the
+   * wait bound and the contention observer; degradeOnEnvironmentalLoss stays
+   * pinned to "read-only" by runProvisionPin.
+   */
+  __testProvisionMasterWriteBarrierOptions?: Pick<
+    NonNullable<Parameters<typeof acquireFortressMasterWriteBarrier>[1]>,
+    "timeoutMs" | "__testAfterSharedBarrierContention"
+  >;
   /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
   __testObserveStoredPassphrase?: typeof observeStoredPassphrase;
   /** TEST ONLY: resolve provision-pin custody through a controlled in-memory seam. */
@@ -865,6 +874,29 @@ async function resolveMasterKey(
   storagePath: string,
   env: NodeJS.ProcessEnv
 ): Promise<Uint8Array> {
+  const result = await openResolvedMasterKeySession(storagePath, env);
+  try {
+    // INVARIANT (read-only resolver): this helper returns only key bytes, not a
+    // session handle, so its internal shared reader must be released before the
+    // caller continues in the same process.
+    await result.masterWriteBarrier?.release();
+    return result.masterKey;
+  } catch (error) {
+    result.masterKey.fill(0);
+    throw error;
+  }
+}
+
+interface ResolvedMasterKeySession {
+  readonly storage: FilesystemStorage;
+  readonly masterKey: Uint8Array;
+  readonly masterWriteBarrier?: { release(): Promise<void> };
+}
+
+async function openResolvedMasterKeySession(
+  storagePath: string,
+  env: NodeJS.ProcessEnv,
+): Promise<ResolvedMasterKeySession> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
 
   // Unified custody path (master-custody.ts): envelope-first, legacy markers
@@ -886,11 +918,13 @@ async function resolveMasterKey(
       storagePathHint: storagePath,
       barrierDegradeMode: "read-only",
     });
-    // INVARIANT (read-only resolver): this helper returns only key bytes, not a
-    // session handle, so its internal shared reader must be released before the
-    // caller continues in the same process.
-    await result.masterWriteBarrier?.release();
-    return result.masterKey;
+    return {
+      storage,
+      masterKey: result.masterKey,
+      ...(result.masterWriteBarrier !== undefined
+        ? { masterWriteBarrier: result.masterWriteBarrier }
+        : {}),
+    };
   }
 
   const passphrase =
@@ -904,11 +938,42 @@ async function resolveMasterKey(
     storagePathHint: storagePath,
     barrierDegradeMode: "read-only",
   });
-  // INVARIANT (read-only resolver): this helper returns only key bytes, not a
-  // session handle, so its internal shared reader must be released before the
-  // caller continues in the same process.
-  await result.masterWriteBarrier?.release();
-  return result.masterKey;
+  return {
+    storage,
+    masterKey: result.masterKey,
+    ...(result.masterWriteBarrier !== undefined
+      ? { masterWriteBarrier: result.masterWriteBarrier }
+      : {}),
+  };
+}
+
+async function withResolvedMasterKeySession<T>(
+  storagePath: string,
+  env: NodeJS.ProcessEnv,
+  operation: (session: ResolvedMasterKeySession) => Promise<T>,
+): Promise<T> {
+  const session = await openResolvedMasterKeySession(storagePath, env);
+  let operationError: unknown;
+  try {
+    return await operation(session);
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    // DEBT(BARRIER-READER-CALLERS): shared lease-scoped resolver for remaining
+    // CLI master-key callers that perform master-derived writes after unlock.
+    session.masterKey.fill(0);
+    try {
+      await session.masterWriteBarrier?.release();
+    } catch (releaseError) {
+      if (operationError === undefined) throw releaseError;
+      throw new AggregateError(
+        [operationError, releaseError],
+        "master-key operation failed and its shared rotation reader did not release cleanly",
+        { cause: releaseError },
+      );
+    }
+  }
 }
 
 function provisionCredentialFields(
@@ -1310,6 +1375,7 @@ export async function runProvisionPin(
       // barrier -> custody-lock order and avoiding a custody-lock -> barrier
       // inversion when rotation is already draining readers.
       preLockMasterWriteBarrier = await acquireFortressMasterWriteBarrier(storage, {
+        ...ctx.__testProvisionMasterWriteBarrierOptions,
         degradeOnEnvironmentalLoss: "read-only",
       });
     }
@@ -2510,6 +2576,8 @@ export async function runDaemon(
       return false;
     }
   };
+  let transparencyScheduler: { stop(): Promise<void> } | undefined;
+  try {
   // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
   // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
   // primitives), while every OTHER caller of this same binary runs as the
@@ -2754,7 +2822,6 @@ export async function runDaemon(
   // misconfigured cadence refuses to start the daemon (no silent fallback);
   // a failed emission tick is loud on stderr but never crashes enforcement
   // and never persists a partial checkpoint (the emitter is fail-closed).
-  let transparencyScheduler: { stop(): void } | undefined;
   {
     const {
       parseTransparencyInterval,
@@ -2767,6 +2834,7 @@ export async function runDaemon(
     } catch (error) {
       write(err, `${(error as Error).message}\n`);
       await daemon.stop().catch(() => undefined);
+      await transparencyScheduler?.stop().catch(() => undefined);
       await releaseDaemonMasterSession();
       return 1;
     }
@@ -2877,16 +2945,22 @@ export async function runDaemon(
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall daemon...\n");
-      transparencyScheduler?.stop();
-      void daemon
-        .stop()
-        .catch(() => undefined)
-        .finally(() => resolveWait());
+      void (async () => {
+        await transparencyScheduler?.stop().catch(() => undefined);
+        await daemon.stop().catch(() => undefined);
+        resolveWait();
+      })();
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
   return (await releaseDaemonMasterSession()) ? 0 : 1;
+  } finally {
+    // INVARIANT (daemon session ownership): any path after master unlock that
+    // returns or throws must drain checkpoint work before dropping the reader.
+    await transparencyScheduler?.stop().catch(() => undefined);
+    await releaseDaemonMasterSession();
+  }
 }
 
 /**
@@ -5512,20 +5586,23 @@ export async function appendCastleWallCliAuditBestEffort(
   fortressPath: string,
   env: NodeJS.ProcessEnv,
   err: Writable,
+  hooks: {
+    __testBeforeAuditAppend?: (session: ResolvedMasterKeySession) => void | Promise<void>;
+  } = {},
 ): Promise<void> {
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
-    const auditLog = new AuditLog(storage, masterKey);
-    await auditLog.append(
-      "l1",
-      operation,
-      fortressIdFromStoragePath(fortressPath),
-      details,
-      "success",
-    );
-    await auditLog.flush();
-    masterKey.fill(0);
+    await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+      const auditLog = new AuditLog(session.storage, session.masterKey);
+      await hooks.__testBeforeAuditAppend?.(session);
+      await auditLog.append(
+        "l1",
+        operation,
+        fortressIdFromStoragePath(fortressPath),
+        details,
+        "success",
+      );
+      await auditLog.flush();
+    });
   } catch (error) {
     write(
       err,

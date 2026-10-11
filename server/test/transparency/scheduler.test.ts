@@ -62,10 +62,10 @@ describe("startTransparencyScheduler", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       expect(maxInFlight).toBe(1);
       release!();
-      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
       expect(maxInFlight).toBe(1);
       expect(completed).toBe(1);
-      scheduler.stop();
+      await scheduler.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -87,9 +87,37 @@ describe("startTransparencyScheduler", () => {
       await vi.advanceTimersByTimeAsync(3_000);
       expect(attempts).toBe(3);
       expect(errors).toHaveLength(3);
-      scheduler.stop();
+      await scheduler.stop();
       await vi.advanceTimersByTimeAsync(3_000);
       expect(attempts).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop waits for the current emission to settle", async () => {
+    vi.useFakeTimers();
+    try {
+      let release: (() => void) | undefined;
+      let completed = false;
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: () =>
+          new Promise<void>((resolve) => {
+            release = () => {
+              completed = true;
+              resolve();
+            };
+          }),
+        onError: () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const stopped = scheduler.stop();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(completed).toBe(false);
+      release!();
+      await stopped;
+      expect(completed).toBe(true);
     } finally {
       vi.useRealTimers();
     }

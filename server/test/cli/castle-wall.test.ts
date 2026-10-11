@@ -32,6 +32,7 @@ import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encodi
 import {
   formatEnforcementAvailabilityStatus,
   parseCastleWallArgs,
+  appendCastleWallCliAuditBestEffort,
   runDaemon,
   runProvisionPin,
   runProvisionPinAlreadyLocked,
@@ -96,15 +97,28 @@ vi.mock("../../src/castle-wall/runtime/index.js", async (importOriginal) => {
 });
 
 const ONE_EVENT_LOOP_TURN_MS = 50;
-const LOCK_ORDER_SETTLE_MS = 150;
-const SHORT_LOCK_TIMEOUT_MS = 250;
+const PRIOR_LOCK_ORDER_TIMEOUT_MS = 250;
+// 4x the original 250ms probe keeps the negative check quick while leaving
+// headroom for a loaded CI worker to schedule the contender.
+const LOADED_LOCK_ORDER_HEADROOM = 4;
+const LOCK_ORDER_PROBE_TIMEOUT_MS =
+  PRIOR_LOCK_ORDER_TIMEOUT_MS * LOADED_LOCK_ORDER_HEADROOM;
+// Ten probe windows gives the started pin path room to reach the barrier under
+// transform-heavy loaded runs; failure names the missing observation directly.
+const BARRIER_CONTENTION_DEADLINE_MULTIPLIER = 10;
+const BARRIER_CONTENTION_DEADLINE_MS =
+  LOCK_ORDER_PROBE_TIMEOUT_MS * BARRIER_CONTENTION_DEADLINE_MULTIPLIER;
+const SHORT_SOCKET_TMP_PARENT =
+  process.platform === "darwin" ? "/private/tmp" : tmpdir();
 
 let previousCustodyLockRoot: string | undefined;
 let castleWallTestLockRoot: string | undefined;
 
 beforeAll(async () => {
   previousCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
-  castleWallTestLockRoot = await mkdtemp(join(tmpdir(), "sanctuary-cw-locks-"));
+  // macOS `sun_path` is 104 bytes including the terminator; the resolver's
+  // reviewed 100-byte cap leaves room only when the test root is short.
+  castleWallTestLockRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "cwlk-"));
   process.env.SANCTUARY_CUSTODY_LOCK_ROOT = castleWallTestLockRoot;
 });
 
@@ -201,6 +215,74 @@ describe("castle-wall CLI verbs", () => {
 
   async function waitForTurn(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ONE_EVENT_LOOP_TURN_MS));
+  }
+
+  it("holds the resolved master reader through a CLI audit append", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const err = new CaptureStream();
+    let observedLiveReader = false;
+
+    await appendCastleWallCliAuditBestEffort(
+      "castle_wall_test_append",
+      { source: "unit" },
+      fortressPath,
+      { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      err,
+      {
+        __testBeforeAuditAppend: async () => {
+          const sockets = await __testListMasterBarrierReaderSockets(
+            new FilesystemStorage(join(fortressPath, "state")),
+            CUSTODY_WRITE_LOCK_NAMESPACE,
+            MASTER_ROTATION_BARRIER_NAME,
+          );
+          observedLiveReader = sockets.length > 0;
+        },
+      },
+    );
+
+    expect(err.text()).toBe("");
+    expect(observedLiveReader).toBe(true);
+    await assertNoMasterBarrierReadersForTempDirs([fortressPath]);
+  });
+
+  async function waitForProvisionPinBarrierContention(
+    signal: Promise<void>,
+    pin: Promise<number>,
+    timeoutMs: number,
+  ): Promise<void> {
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        signal,
+        pin.then(
+          (code) => {
+            throw new Error(
+              `provision-pin resolved with ${code} before the rotation barrier contention signal`,
+            );
+          },
+          (error) => {
+            throw new Error(
+              `provision-pin rejected before the rotation barrier contention signal: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          },
+        ),
+        new Promise<void>((_, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `provision-pin did not report rotation barrier contention within ${timeoutMs}ms`,
+                ),
+              ),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   }
 
   /**
@@ -1333,6 +1415,10 @@ describe("castle-wall CLI verbs", () => {
         const { fortressPath, recoveryKey } = await makeFortress();
         const storage = new FilesystemStorage(join(fortressPath, "state"));
         let pin: Promise<number> | undefined;
+        let observedBarrierContention!: () => void;
+        const barrierContention = new Promise<void>((resolve) => {
+          observedBarrierContention = resolve;
+        });
         await withExclusiveMasterRotationBarrier(
           storage,
           CUSTODY_WRITE_LOCK_NAMESPACE,
@@ -1346,12 +1432,20 @@ describe("castle-wall CLI verbs", () => {
                 SANCTUARY_RECOVERY_KEY: recoveryKey,
               },
               globalPinnedPublicKeyPath: await makeGlobalPinDir(),
+              __testProvisionMasterWriteBarrierOptions: {
+                timeoutMs: BARRIER_CONTENTION_DEADLINE_MS,
+                __testAfterSharedBarrierContention: observedBarrierContention,
+              },
             });
-            await new Promise((resolve) => setTimeout(resolve, LOCK_ORDER_SETTLE_MS));
-            expect(await attemptProvisionCustodyLock(storage, SHORT_LOCK_TIMEOUT_MS))
+            await waitForProvisionPinBarrierContention(
+              barrierContention,
+              pin,
+              BARRIER_CONTENTION_DEADLINE_MS,
+            );
+            expect(await attemptProvisionCustodyLock(storage, LOCK_ORDER_PROBE_TIMEOUT_MS))
               .toBe("ran");
           },
-          { timeoutMs: SHORT_LOCK_TIMEOUT_MS },
+          { timeoutMs: BARRIER_CONTENTION_DEADLINE_MS },
         );
 
         expect(pin).toBeDefined();

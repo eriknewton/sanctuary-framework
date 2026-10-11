@@ -29,6 +29,7 @@ import {
   readEnvelopeEpoch,
   CustodyUnlockError,
   CustodyRotationInProgressError,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
@@ -2456,6 +2457,59 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
       passphrase: PASSPHRASE,
     });
     await verifyRotated(fortress);
+  });
+
+  it("resumes through a recovered live custody pair commit in finalize", async () => {
+    const fortress = await buildFortress();
+    const originalWrite = fortress.storage.write.bind(fortress.storage);
+    let disclosedKey = "";
+    let armLiveCustodyPairInterruption = false;
+    let interruptedLiveCustodyPair = false;
+    fortress.storage.write = async (namespace, key, data) => {
+      if (
+        armLiveCustodyPairInterruption &&
+        !interruptedLiveCustodyPair &&
+        namespace === "_meta" &&
+        key === CUSTODY_SENTINEL_KEY
+      ) {
+        interruptedLiveCustodyPair = true;
+        throw new Error("injected live custody pair interruption");
+      }
+      return originalWrite(namespace, key, data);
+    };
+
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        disclosedKey = rk;
+        return verify(rk);
+      },
+      failpoint: (point) => {
+        if (point === "journal-finalizing-written") {
+          armLiveCustodyPairInterruption = true;
+        }
+      },
+    }))).rejects.toThrow("injected live custody pair interruption");
+    fortress.storage.write = originalWrite;
+    expect(interruptedLiveCustodyPair).toBe(true);
+    expect(await fortress.storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).not.toBeNull();
+
+    await expect(
+      establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE })
+    ).rejects.toThrow(CustodyRotationInProgressError);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    });
+    expect(await fortress.storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).toBeNull();
+    await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
   });
 
   it("resumes after a torn staged cleanup record in finalize", async () => {

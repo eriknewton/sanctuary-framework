@@ -91,13 +91,18 @@ const STALE_REAPER_TIMEOUT_MS = 2_000;
 const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
 // 24 = the reader socket digest prefix width used in `<digest>.reader-*.sock`.
 const BARRIER_READER_PREFIX_HEX_CHARS = 24;
-const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT = 128;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
 // reader socket per live unlock plus a few fixed scaffolds. A real host has a
 // handful; anything past this ceiling means crashed-reader leakage or a same-uid
 // abuse of the 0700 dir, and scanning it unboundedly amplifies work. Above the
 // ceiling the barrier fails CLOSED with a remediation instead of scanning it.
 const MAX_BARRIER_READER_SOCKETS = 4_096;
+// 128 = one cleanup action per 32 entries under the shared fail-closed ceiling.
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT =
+  MAX_BARRIER_READER_SOCKETS / 32;
+// A peer can create its scaffold pair before it binds the socket. A scaffold
+// younger than the stale-reaper deadline is treated as possibly in-admission.
+const UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS = STALE_REAPER_TIMEOUT_MS;
 // Reaping a stale socket spawns a serialized helper process, so bound how many
 // we launch per drain pass; the rest are handled on the next pass within the
 // same overall timeout. This caps the N-reaps-per-pass amplification.
@@ -384,6 +389,14 @@ export interface MasterWriteBarrierOptions {
   retryMs?: number;
   /** TEST ONLY: observe the shared reader socket after it is fully admitted. */
   __testAfterSharedSocketAcquired?: (path: string) => void;
+  /**
+   * TEST ONLY: observe a shared acquirer waiting behind an exclusive gate, so a
+   * lock-order test can prove the wait happened instead of sleeping. It is
+   * observation only: it runs before the timeout check, so it must settle
+   * promptly and must not throw. When unset, the acquire loop does no extra
+   * await.
+   */
+  __testAfterSharedBarrierContention?: () => void | Promise<void>;
   /**
    * TEST ONLY: observe the exclusive gate after it is live.
    * Must match the async hook shape in CrossProcessLockOptions in this file,
@@ -784,6 +797,9 @@ async function resolveMasterBarrierCoordinates(
     dev: String(runtimeStats.dev),
     ino: String(runtimeStats.ino),
   };
+  // Residual identity bound: a reused directory identity can make rotation wait
+  // on another live process's readers until that process exits; it never lets a
+  // rotation proceed before every visible reader is drained.
   const lockIdentity = `${directoryIdentity.dev}:${directoryIdentity.ino}:${barrierName}`;
   const digest = createHash("sha256").update(lockIdentity).digest("hex");
   const scaffoldDigest = digest.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
@@ -793,7 +809,7 @@ async function resolveMasterBarrierCoordinates(
   const readerReaperScaffoldName = `${scaffoldDigest}.reader-reaper`;
   await ensureInertLockScaffold(runtimeDir, exclusiveReaperScaffoldName);
   await ensureInertLockScaffold(runtimeDir, readerReaperScaffoldName);
-  await sweepUnusedBarrierScaffolds(runtimeDir, scaffoldDigest).catch(() => undefined);
+  await sweepUnusedBarrierScaffolds(runtimeDir, scaffoldDigest, host).catch(() => undefined);
   return {
     host,
     lockIdentity,
@@ -1000,9 +1016,11 @@ export async function acquireMasterWriteBarrier(
   if (coordinates === null) return inertMasterWriteBarrierLease();
   const timeoutMs = options.timeoutMs ?? CROSS_PROCESS_LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS;
+  const afterContention = options.__testAfterSharedBarrierContention;
   const started = Date.now();
   for (;;) {
     if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
+      if (afterContention !== undefined) await afterContention();
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `master rotation barrier remained exclusive for ${timeoutMs}ms`,
@@ -1049,6 +1067,7 @@ export async function acquireMasterWriteBarrier(
       if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
         await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);
         acquired = undefined;
+        if (afterContention !== undefined) await afterContention();
         if (Date.now() - started >= timeoutMs) {
           throw new CrossProcessLockError(
             `master rotation barrier remained exclusive for ${timeoutMs}ms`,
@@ -1080,10 +1099,10 @@ export async function acquireMasterWriteBarrier(
         },
         release: async () => {
           if (released) return;
+          await releaseKernelLock(held, options.__testReleaseTimeoutMs);
           released = true;
           controller.abort();
           unregisterMasterWriteBarrier(storage, lease);
-          await releaseKernelLock(held, options.__testReleaseTimeoutMs);
         },
       };
       options.__testAfterSharedSocketAcquired?.(readerSocketPath);
@@ -1112,8 +1131,17 @@ export async function acquireMasterWriteBarrier(
 async function sweepUnusedBarrierScaffolds(
   runtimeDir: string,
   activeScaffoldDigest: string,
+  host: NodeJS.Platform,
 ): Promise<void> {
   const names = await readdir(runtimeDir);
+  if (names.length > MAX_BARRIER_READER_SOCKETS) {
+    throw new CrossProcessLockError(
+      `master write barrier runtime dir holds ${names.length} entries ` +
+        `(> ${MAX_BARRIER_READER_SOCKETS}); refusing to scan an unbounded set. ` +
+        `No Sanctuary process should leave this many under ${runtimeDir}.`,
+      "capability",
+    );
+  }
   const nameSet = new Set(names);
   const scaffoldDigests = new Set<string>();
   const exclusiveSocketDigests = new Set<string>();
@@ -1144,18 +1172,110 @@ async function sweepUnusedBarrierScaffolds(
     const hasLiveEntry =
       exclusiveSocketDigests.has(digest) || readerSocketDigests.has(readerDigest);
     if (hasLiveEntry) continue;
-    for (const suffix of [".reaper", ".reader-reaper"] as const) {
-      const scaffoldName = `${digest}${suffix}`;
-      if (!nameSet.has(scaffoldName)) continue;
-      // INVARIANT (bounded runtime dir): inert scaffolds have no socket owner;
-      // removing them only after the identity has no socket leaves live readers
-      // and rotators coordinated while preventing one scaffold pair per old
-      // fortress from accumulating forever.
-      await rm(join(runtimeDir, scaffoldName), { force: true });
-      removed += 1;
-      if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
-    }
+    if (!nameSet.has(`${digest}.reader-reaper`)) continue;
+    // INVARIANT (bounded runtime dir): scaffold cleanup re-checks the no-socket
+    // condition under the same reader-reaper authority used for stale reader
+    // removal, and skips fresh scaffolds that may belong to an admitting peer.
+    removed += await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host);
+    if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
   }
+}
+
+async function sweepOneUnusedBarrierScaffold(
+  runtimeDir: string,
+  digest: string,
+  host: NodeJS.Platform,
+): Promise<number> {
+  const script = String.raw`
+const fs=require('node:fs'); const path=require('node:path');
+const [runtimeDir,digest,readerPrefix,minAgeRaw]=process.argv.slice(1);
+const minAgeMs=Number(minAgeRaw); const now=Date.now();
+function hasSocket(){
+  for (const name of fs.readdirSync(runtimeDir)) {
+    if (name === digest + '.sock') return true;
+    if (name.startsWith(readerPrefix + '.reader-') && name.endsWith('.sock')) return true;
+  }
+  return false;
+}
+function oldEnough(name){
+  const stat=fs.lstatSync(path.join(runtimeDir,name));
+  return now - stat.ctimeMs >= minAgeMs;
+}
+if (hasSocket()) process.exit(73);
+const names=[digest + '.reaper', digest + '.reader-reaper'];
+for (const name of names) {
+  try { if (!oldEnough(name)) process.exit(73); } catch { process.exit(73); }
+}
+if (hasSocket()) process.exit(73);
+let removed=0;
+for (const name of names) {
+  try { fs.unlinkSync(path.join(runtimeDir,name)); removed++; }
+  catch (error) { if (!error || error.code !== 'ENOENT') process.exit(74); }
+}
+process.stdout.write(String(removed));
+`;
+  const scaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
+  const command = kernelReaperCommand(host);
+  const commandArgs = host === "darwin"
+    ? [
+        "-k",
+        "-t",
+        "0",
+        scaffoldPath,
+        process.execPath,
+        "-e",
+        script,
+        runtimeDir,
+        digest,
+        digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
+        String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
+      ]
+    : [
+        "-n",
+        scaffoldPath,
+        process.execPath,
+        "-e",
+        script,
+        runtimeDir,
+        digest,
+        digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS),
+        String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
+      ];
+  return await new Promise<number>((resolve, reject) => {
+    const child = spawn(command, commandArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new CrossProcessLockError("unused-scaffold sweep exceeded its bounded deadline", "io"));
+    }, STALE_REAPER_TIMEOUT_MS);
+    timer.unref?.();
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < 16) stdout += String(chunk).slice(0, 16 - stdout.length);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 512) stderr += String(chunk).slice(0, 512 - stderr.length);
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(new CrossProcessLockError(`unused-scaffold sweep failed to start: ${errorMessage(error)}`, "capability"));
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(Number(stdout.trim() || "0"));
+        return;
+      }
+      if (code === 73) {
+        resolve(0);
+        return;
+      }
+      reject(new CrossProcessLockError(
+        `unused-scaffold sweep refused (${signal ?? code})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+        "io",
+      ));
+    });
+  });
 }
 
 async function waitForMasterBarrierReaders(

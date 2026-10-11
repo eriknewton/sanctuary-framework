@@ -44,6 +44,13 @@ const DISTINCT_BARRIER_FORTRESS_COUNT = 32;
 const MAX_SCAFFOLDS_AFTER_SWEEP = 2;
 // 1_000 ms = one second, short enough for unit tests and long enough for a local socket bind.
 const SHORT_KERNEL_TEST_TIMEOUT_MS = 1_000;
+// 2_100 ms is just past the production 2_000 ms stale-reaper deadline.
+const SCAFFOLD_STALE_SETTLE_MS = 2_100;
+const SHORT_SOCKET_TMP_PARENT =
+  process.platform === "darwin" ? "/private/tmp" : tmpdir();
+// Cross-file contract: must match BARRIER_SCAFFOLD_DIGEST_HEX_CHARS in
+// src/storage/cross-process-lock.ts, the filename width this test plants.
+const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -139,7 +146,9 @@ describe("withCrossProcessLock", () => {
     "bounds unused master-barrier scaffolds across distinct fortresses",
     async () => {
       const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
-      const runtimeRoot = join(base, "runtime-locks");
+      // macOS `sun_path` is 104 bytes including the terminator; the resolver's
+      // reviewed 100-byte cap leaves room only when the test root is short.
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
       process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
       try {
         for (let index = 0; index < DISTINCT_BARRIER_FORTRESS_COUNT; index += 1) {
@@ -152,16 +161,39 @@ describe("withCrossProcessLock", () => {
           );
           await lease.release();
         }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const freshDigest = "f".repeat(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
+        const freshScaffolds = [
+          `${freshDigest}.reaper`,
+          `${freshDigest}.reader-reaper`,
+        ];
+        for (const scaffold of freshScaffolds) {
+          await writeFile(join(runtimeRoot, scaffold), "");
+        }
+        const triggerFortress = await mkdtemp(join(base, "barrier-trigger-"));
+        const triggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(triggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await triggerLease.release();
         const scaffolds = (await readdir(runtimeRoot)).filter(
           (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
         );
-        expect(scaffolds.length).toBeLessThanOrEqual(MAX_SCAFFOLDS_AFTER_SWEEP);
+        for (const scaffold of freshScaffolds) {
+          expect(scaffolds).toContain(scaffold);
+        }
+        expect(scaffolds.length).toBeLessThanOrEqual(
+          MAX_SCAFFOLDS_AFTER_SWEEP + freshScaffolds.length,
+        );
       } finally {
         if (previousRoot === undefined) {
           delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
         } else {
           process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
         }
+        await rm(runtimeRoot, { recursive: true, force: true });
       }
     },
   );

@@ -63,7 +63,7 @@ export interface TransparencySchedulerOptions {
 }
 
 export interface TransparencySchedulerHandle {
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 export function startTransparencyScheduler(
@@ -71,13 +71,13 @@ export function startTransparencyScheduler(
 ): TransparencySchedulerHandle {
   const setIntervalFn = options.setIntervalFn ?? setInterval;
   const clearIntervalFn = options.clearIntervalFn ?? clearInterval;
-  let inFlight = false;
+  let inFlight: Promise<void> | undefined;
   let stopped = false;
   const timer = setIntervalFn(() => {
-    if (inFlight || stopped) return; // never overlap emissions
-    inFlight = true;
-    void options
+    if (inFlight !== undefined || stopped) return; // never overlap emissions
+    inFlight = options
       .emit()
+      .then(() => undefined)
       .catch((err) => {
         try {
           options.onError(err);
@@ -86,7 +86,7 @@ export function startTransparencyScheduler(
         }
       })
       .finally(() => {
-        inFlight = false;
+        inFlight = undefined;
       });
   }, options.intervalMs);
   // Never keep the host process alive solely for checkpointing.
@@ -94,9 +94,12 @@ export function startTransparencyScheduler(
     (timer as NodeJS.Timeout).unref();
   }
   return {
-    stop() {
+    async stop() {
       stopped = true;
       clearIntervalFn(timer);
+      // Shutdown must drain the tick that already entered its master-derived
+      // writes; the daemon releases its rotation reader only after this settles.
+      await inFlight;
     },
   };
 }
