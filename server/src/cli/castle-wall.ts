@@ -1150,7 +1150,7 @@ export async function runProvisionPinAlreadyLocked(
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
-  let masterKey: Uint8Array | undefined = ctx.__resolvedProvisionMasterKey;
+  const masterKey: Uint8Array | undefined = ctx.__resolvedProvisionMasterKey;
   // Honor the subcommand-level `--fortress <path>` flag, exactly like every
   // other castle-wall custody verb (re-pin, daemon, audit-*) and like the
   // federation/identity/transparency verbs. Before this, provision-pin
@@ -1313,7 +1313,7 @@ export async function runProvisionPin(
         if (!lockedFortressPath) {
           throw new Error("provision-pin custody lock did not expose a stable fortress root");
         }
-        let masterWriteBarrier = preLockMasterWriteBarrier;
+        const masterWriteBarrier = preLockMasterWriteBarrier;
         let resolvedCredential: ResolvedCustodyCredential | undefined;
         let masterKey: Uint8Array | undefined;
         let provisionFailure: unknown;
