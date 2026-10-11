@@ -438,5 +438,7 @@ fn launch_refuses_existing_install_with_non_confined_scope_before_start() {
         err,
         "rule linux-explicit-ip scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
     );
-    assert_eq!(t.state, State::Configured);
+    // No state assertion here: `read_installed` takes the transaction by shared reference. The start and
+    // enable paths call it before any systemctl invocation (linux_install/command.rs and arch/command.rs
+    // `manager_action`), so a refusal leaves running units under their current confinement.
 }

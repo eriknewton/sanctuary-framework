@@ -39,7 +39,10 @@ export function parseConfinedAgentId(id: string): number | null {
   return confinedAgentIdForUid(uid) === id ? uid : null;
 }
 
-/** Refuse Linux install scopes that do not name the single uid this profile admits. */
+/**
+ * Refuse Linux uid-mode policy scopes that do not name the single confined agent uid. Called by
+ * the Linux installer and by the broker publisher (`publishLinuxCompatiblePolicy`) before signing.
+ */
 export function validateLinuxInstallAgentIdScopes(
   rules: readonly AllowlistRule[],
   admittedUid: number,
@@ -54,7 +57,9 @@ export function validateLinuxInstallAgentIdScopes(
           `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
       }
-      // The install profile rejects gate_uid earlier, so the admitted confined-id set is the agent uid singleton.
+      // The Linux daemon binds and queues only the agent uid (nftables.rs `binding_set_rule`), so a scope naming
+      // any other uid, including a gate uid, can never match; the admitted confined-id set is the agent uid
+      // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
         throw new Error(
           `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected admitted uid ${admittedUid}`,
