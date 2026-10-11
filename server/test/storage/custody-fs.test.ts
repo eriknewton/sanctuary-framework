@@ -69,6 +69,15 @@ describe("custody-fs descriptor-first file API", () => {
     });
   });
 
+  it("reads exactly maxBytes without consuming a sentinel byte", async () => {
+    const path = join(dir, "exact-bound.txt");
+    await writeFile(path, "abcd", { mode: 0o600 });
+
+    await expect(
+      readFileCustodyWithStats(path, { maxBytes: 4, encoding: "utf8" }),
+    ).resolves.toMatchObject({ data: "abcd" });
+  });
+
   it("rejects wrong mode and wrong uid without reading bytes", async () => {
     const path = join(dir, "token.bin");
     await writeFile(path, "token", { mode: 0o600 });

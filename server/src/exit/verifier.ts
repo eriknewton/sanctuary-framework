@@ -15,7 +15,7 @@
 export class InvalidExitBundleError extends Error {
   constructor(
     message: string,
-    public readonly failure_class?: string,
+    public readonly failure_class?: ExitBundleFailureClass,
   ) {
     super(message);
     this.name = "InvalidExitBundleError";
@@ -382,7 +382,7 @@ async function assertDescendant(root: string, candidate: string): Promise<boolea
 const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
 
 /**
- * Absolute per-artifact read cap - the artifact-hash loop below refuses to
+ * Absolute per-artifact read cap - the shared descriptor reader refuses to
  * read ANY exit artifact whose on-disk size exceeds this, regardless of
  * what the manifest declares. 24 MiB matches the existing precedent for a
  * related exit-archive format's per-artifact cap
@@ -408,6 +408,7 @@ type ExitArtifactReadFailureClass = Extract<
   | "artifact_path_escapes_root"
   | "artifact_size_mismatch"
   | "artifact_missing"
+  | "artifact_read_rejected"
 >;
 
 interface BoundedExitArtifactRead {
@@ -450,7 +451,7 @@ async function readExitArtifactBytesBounded(
       return {
         ok: false,
         artifactPath,
-        failure_class: "artifact_missing",
+        failure_class: "artifact_read_rejected",
       };
     }
     // INVARIANT (private register EXIT-KS-01): the manifest-declared size is
@@ -494,12 +495,26 @@ async function readExitArtifactBytesBounded(
     return {
       ok: false,
       artifactPath,
-      failure_class:
-        isCustodyFsError(err) && err.code === "read_size_rejected"
-          ? "artifact_size_mismatch"
-          : "artifact_missing",
+      failure_class: mapBundleReadFailureClass(err),
     };
   }
+}
+
+function mapBundleReadFailureClass(err: unknown): ExitArtifactReadFailureClass {
+  if (isCustodyFsError(err)) {
+    switch (err.code) {
+      case "read_size_rejected":
+        return "artifact_size_mismatch";
+      case "symlink_rejected":
+        return "archive_contains_symlink";
+      default:
+        return "artifact_read_rejected";
+    }
+  }
+  if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    return "artifact_missing";
+  }
+  return "artifact_read_rejected";
 }
 
 /**
@@ -1006,10 +1021,7 @@ async function readManifestBytesBounded(bundleDir: string): Promise<Uint8Array> 
     });
     return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
   } catch (err) {
-    const failureClass =
-      isCustodyFsError(err) && err.code === "read_size_rejected"
-        ? "artifact_size_mismatch"
-        : "artifact_missing";
+    const failureClass = mapBundleReadFailureClass(err);
     throw new InvalidExitBundleError(
       `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: ${EXIT_MANIFEST_FILE_NAME} could not be loaded: ${failureClass}`,
       failureClass,
@@ -1017,16 +1029,25 @@ async function readManifestBytesBounded(bundleDir: string): Promise<Uint8Array> 
   }
 }
 
-export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
+async function readManifestWithBytes(
+  bundleDir: string
+): Promise<{ manifest: ExitBundleManifest; bytes: Uint8Array }> {
   const bytes = await readManifestBytesBounded(bundleDir);
   try {
-    return JSON.parse(Buffer.from(bytes).toString("utf8")) as ExitBundleManifest;
+    return {
+      manifest: JSON.parse(Buffer.from(bytes).toString("utf8")) as ExitBundleManifest,
+      bytes,
+    };
   } catch {
     throw new InvalidExitBundleError(
       `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: ${EXIT_MANIFEST_FILE_NAME} is malformed.`,
       "other",
     );
   }
+}
+
+export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
+  return (await readManifestWithBytes(bundleDir)).manifest;
 }
 
 export async function loadExitArtifact<T = unknown>(
@@ -1702,8 +1723,9 @@ export async function verifyExitBundle(
   let manifest: ExitBundleManifest;
   let manifestBytes: Uint8Array;
   try {
-    manifestBytes = await readManifestBytesBounded(root);
-    manifest = JSON.parse(Buffer.from(manifestBytes).toString("utf8")) as ExitBundleManifest;
+    const manifestRead = await readManifestWithBytes(root);
+    manifest = manifestRead.manifest;
+    manifestBytes = manifestRead.bytes;
   } catch (err) {
     if (err instanceof InvalidExitBundleError) throw err;
     throw new InvalidExitBundleError(
@@ -2134,7 +2156,7 @@ export async function verifyExitBundle(
   } catch (err) {
     const failureClass =
       err instanceof InvalidExitBundleError && err.failure_class !== undefined
-        ? (err.failure_class as ExitBundleFailureClass)
+        ? err.failure_class
         : "other";
     return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
   }
@@ -2180,7 +2202,7 @@ export async function verifyExitBundle(
   } catch (err) {
     const failureClass =
       err instanceof InvalidExitBundleError && err.failure_class !== undefined
-        ? (err.failure_class as ExitBundleFailureClass)
+        ? err.failure_class
         : "other";
     return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
   }
@@ -2326,6 +2348,7 @@ export async function verifyExitBundle(
     archive_contains_symlink: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_path_escapes_root: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_missing: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_read_rejected: false, // early-returned by the shared bundle-file reader above
     artifact_hash_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_size_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
     private_material_present: false, // early-returned by the per-artifact symlink/hash/size loop above

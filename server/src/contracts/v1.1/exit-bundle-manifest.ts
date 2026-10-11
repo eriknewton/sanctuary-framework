@@ -282,6 +282,7 @@ export interface ExitBundleVerifierResult {
     | "manifest_signature_scheme_invalid"
     | "artifact_hash_mismatch"
     | "artifact_missing"
+    | "artifact_read_rejected"
     | "artifact_size_mismatch"
     | "aggregate_hash_mismatch"
     | "artifact_path_unsafe"

@@ -109,6 +109,8 @@ const FAILURE_CLASS_EXPLANATIONS: Record<
     "At least one artifact's contents do not match the hash recorded in the signed manifest. The file was altered, or the bundle is corrupted.",
   artifact_missing:
     "At least one artifact the manifest lists could not be found in the bundle directory. The download or copy is incomplete.",
+  artifact_read_rejected:
+    "At least one artifact the manifest lists is present but cannot be read as a regular bundle file. Refusing this bundle.",
   artifact_size_mismatch:
     "At least one artifact's size does not match what the signed manifest recorded. The file was truncated, altered, or the bundle is corrupted.",
   aggregate_hash_mismatch:

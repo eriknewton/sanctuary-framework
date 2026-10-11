@@ -1,13 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { constants as fsConstants } from "node:fs";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   mkdir,
   mkdtemp,
-  open,
   readFile,
   rm,
+  symlink,
   truncate,
   writeFile,
 } from "node:fs/promises";
@@ -41,6 +40,7 @@ import {
   canonicalize,
   canonicalizeToBytes,
 } from "../../src/mesh/canonical-json.js";
+import type { ExitBundleVerifierResult } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { hash as sha256 } from "../../src/core/hashing.js";
 import {
@@ -49,8 +49,9 @@ import {
 } from "../../src/reputation/reputation-store.js";
 
 const execFileAsync = promisify(execFile);
-const NAMED_PIPE_WRITER_RETRIES = 20;
-const NAMED_PIPE_WRITER_DELAY_MS = 10;
+const NON_REGULAR_READ_SETTLE_TIMEOUT_MS = 250; // Quarter-second witness: local regular-file classification must settle before the no-hang guard fires.
+type ExitBundleFailureClass =
+  NonNullable<ExitBundleVerifierResult["failure_class"]>;
 
 interface ToolDef {
   name: string;
@@ -127,22 +128,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function writeNamedPipeIfReaderAppears(path: string): Promise<void> {
-  for (let attempt = 0; attempt < NAMED_PIPE_WRITER_RETRIES; attempt += 1) {
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK);
-      await handle.writeFile("{}");
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENXIO") throw err;
-      await delay(NAMED_PIPE_WRITER_DELAY_MS);
-    } finally {
-      await handle?.close().catch(() => undefined);
-    }
-  }
-}
-
 describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
   const tempDirs: string[] = [];
 
@@ -150,6 +135,11 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: InvalidExitBundleError carries the shared failure_class contract", () => {
+    expectTypeOf(new InvalidExitBundleError("typed", "other").failure_class)
+      .toEqualTypeOf<ExitBundleFailureClass | undefined>();
   });
 
   it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact applies the per-artifact read cap before parsing", async () => {
@@ -206,9 +196,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
     await mkdir(join(bundleDir, "artifacts"));
     await execFileAsync("mkfifo", [artifactPath]);
-    const writer = writeNamedPipeIfReaderAppears(artifactPath);
 
-    await expect(
+    const settled = await Promise.race([
       loadExitArtifact(
         bundleDir,
         {
@@ -238,12 +227,58 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
           signature: "",
         },
         "audit_receipts"
+      ).catch((err: unknown) => err),
+      delay(NON_REGULAR_READ_SETTLE_TIMEOUT_MS).then(() => "timed_out" as const),
+    ]);
+
+    expect(settled).toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_read_rejected",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact classifies a larger artifact with an in-range declaration", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-size-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{}");
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 1,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
       )
     ).rejects.toMatchObject({
       name: "InvalidExitBundleError",
-      failure_class: "artifact_missing",
+      failure_class: "artifact_size_mismatch",
     });
-    await writer;
   });
 
   it("defect.exit-verifier-per-artifact-read-cap: readManifest applies the manifest read cap before parsing", async () => {
@@ -256,6 +291,30 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     await expect(readManifest(bundleDir)).rejects.toMatchObject({
       name: "InvalidExitBundleError",
       failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: readManifest preserves the symlink failure class", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-link-"));
+    tempDirs.push(bundleDir);
+    const manifestTarget = join(bundleDir, "manifest-target.json");
+    await writeFile(manifestTarget, "{}");
+    await symlink(manifestTarget, join(bundleDir, "manifest.json"));
+
+    await expect(readManifest(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "archive_contains_symlink",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: verifyExitBundle shares readManifest malformed-manifest classification", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-json-"));
+    tempDirs.push(bundleDir);
+    await writeFile(join(bundleDir, "manifest.json"), "{");
+
+    await expect(verifyExitBundle(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "other",
     });
   });
 
