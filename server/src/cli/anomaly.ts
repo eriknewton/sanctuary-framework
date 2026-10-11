@@ -49,7 +49,7 @@ import { ClassifierStateStore } from "../anomaly-detection/classifier-state-stor
 import { ANOMALY_SENTINEL_ID_PREFIX } from "../anomaly-detection/types.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
-import { flagValue } from "./argv.js";
+import { flagValue, subcommandTokenForDisplay } from "./argv.js";
 
 export interface AnomalyArgs {
   argv: string[];
@@ -91,7 +91,7 @@ export async function runAnomalyCommand(
       case "classifier-state":
         return await cmdClassifierState(rest, { out, err, args });
       default:
-        err.write(`Unknown subcommand: ${sub}\n`);
+        err.write(`Unknown subcommand: ${subcommandTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -163,7 +163,7 @@ function cmdDetectors(
 ): number {
   const sub = argv[0];
   if (sub !== undefined && sub !== "list") {
-    ctx.out.write(`Unknown detectors subcommand: ${sub}\n`);
+    ctx.out.write(`Unknown detectors subcommand: ${subcommandTokenForDisplay(sub)}\n`);
     return 2;
   }
   if (ANOMALY_CATALOG.length === 0) {

@@ -6,6 +6,7 @@
 
 import { Writable } from "node:stream";
 import { TOP_LEVEL_SUBCOMMANDS } from "./subcommands.js";
+import { subcommandTokenForDisplay } from "./argv.js";
 
 export interface CompletionCommandArgs {
   argv: string[];
@@ -33,7 +34,7 @@ export async function runCompletionCommand(
   }
 
   if (shell !== "bash" && shell !== "zsh" && shell !== "fish") {
-    write(err, `Unknown shell: ${shell}\n`);
+    write(err, `Unknown shell: ${subcommandTokenForDisplay(shell)}\n`);
     printUsage(err);
     return 2;
   }

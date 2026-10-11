@@ -28,6 +28,7 @@ import {
   verifyAnchorEvidence,
   type AnchorCoverage,
 } from "./anchor-verify.js";
+import { argvTokenForDisplay } from "../cli/argv.js";
 
 export const STANDALONE_EXIT_PARTIAL = 10;
 
@@ -278,7 +279,7 @@ function parseFlags(
         `${arg} performs network I/O; this standalone artifact is offline-only. Use "sanctuary verify-transparency --fetch-anchors", or verify the receipt-embedded proofs offline with --check-anchors alone`
       );
     }
-    throw new Error(`unknown option: ${arg}`);
+    throw new Error(`unknown option: ${argvTokenForDisplay(arg)}`);
   }
   return { values, flags };
 }

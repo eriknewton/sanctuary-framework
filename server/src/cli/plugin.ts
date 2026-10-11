@@ -35,6 +35,7 @@ import {
   type BundledPluginSpec,
   type LoadedBundledPlugin,
 } from "../substrate/reference-plugin/index.js";
+import { subcommandTokenForDisplay } from "./argv.js";
 
 const PLUGIN_HELP = `sanctuary plugin - bundled plugin inspection (read-only + liveness)
 
@@ -212,6 +213,6 @@ export async function runPluginCommand(args: {
   if (sub === "status") return runStatus(out, err, args.argv[1]);
   if (sub === "test") return runTest(out, err, args.argv[1]);
 
-  err.write(`sanctuary plugin: unknown subcommand "${sub}"\n\n${PLUGIN_HELP}`);
+  err.write(`sanctuary plugin: unknown subcommand "${subcommandTokenForDisplay(sub)}"\n\n${PLUGIN_HELP}`);
   return 1;
 }

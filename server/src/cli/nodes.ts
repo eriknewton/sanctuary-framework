@@ -4,7 +4,7 @@ import {
   DashboardRequestError,
   type DashboardRequestContext,
 } from "./dashboard-request.js";
-import { flagValue } from "./argv.js";
+import { flagValue, subcommandTokenForDisplay } from "./argv.js";
 
 interface NodesFlags {
   dashboardUrl?: string;
@@ -48,7 +48,7 @@ export async function runNodesCommand(args: {
     return 0;
   }
   if (sub !== "list") {
-    err.write(`sanctuary nodes: unknown subcommand "${sub}"\n\n${HELP}`);
+    err.write(`sanctuary nodes: unknown subcommand "${subcommandTokenForDisplay(sub)}"\n\n${HELP}`);
     return 1;
   }
 

@@ -85,6 +85,7 @@ import {
   type AuditReadData,
 } from "./generate.js";
 import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
+import { argvTokenForDisplay, subcommandTokenForDisplay } from "../cli/argv.js";
 
 /**
  * D10-DISC-1 (dry-bar round 10): the ONE place a caught read error becomes a
@@ -1138,7 +1139,7 @@ function parseArgs(args: string[]): EvidencePackCliOptions {
   }
   if (args[0] !== "generate") {
     throw new Error(
-      `Unknown evidence-pack subcommand: "${args[0]}". Supported: "generate".`
+      `Unknown evidence-pack subcommand: "${subcommandTokenForDisplay(args[0])}". Supported: "generate".`
     );
   }
 
@@ -1165,7 +1166,7 @@ function parseArgs(args: string[]): EvidencePackCliOptions {
         i++;
         break;
       default:
-        throw new Error(`Unknown flag: "${flag}"`);
+        throw new Error(`Unknown flag: "${argvTokenForDisplay(flag)}"`);
     }
   }
 

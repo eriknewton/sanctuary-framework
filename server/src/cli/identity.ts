@@ -28,6 +28,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  subcommandTokenForDisplay,
 } from "./argv.js";
 
 export interface IdentityCommandArgs {
@@ -105,7 +106,7 @@ export async function runIdentityCommand(
     return await cmdCreate(argv.slice(1), out, err, env);
   }
 
-  write(err, `Unknown identity command: ${command}\n`);
+  write(err, `Unknown identity command: ${subcommandTokenForDisplay(command)}\n`);
   write(err, `Run "sanctuary identity --help" for usage.\n`);
   return 2;
 }

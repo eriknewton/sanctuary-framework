@@ -25,6 +25,8 @@ import {
   flagValue,
   flagValues,
   unknownFlagWithPrefix,
+  argvTokenForDisplay,
+  subcommandTokenForDisplay,
 } from "./argv.js";
 import {
   toBase64url,
@@ -254,7 +256,7 @@ function parsedFederationFortressPath(argv: string[]): {
   fortressPath?: string;
 } {
   const unknown = unknownFlagWithPrefix(argv, "--fortress", ["--fortress-url"]);
-  if (unknown) return { parseError: `unknown fortress flag ${unknown}` };
+  if (unknown) return { parseError: `unknown fortress flag ${argvTokenForDisplay(unknown)}` };
   const parsed = consumeFlagValue(argv, "--fortress");
   if (parsed.error) return { parseError: parsed.error };
   return parsed.value === undefined ? {} : { fortressPath: parsed.value };
@@ -3477,7 +3479,7 @@ export async function runFederationCommand(args: {
     return runFederationDowngradeLog({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
-    `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,
+    `sanctuary federation: unknown subcommand "${subcommandTokenForDisplay(sub)}"\n\n${FEDERATION_HELP}`,
   );
   return 1;
 }

@@ -36,6 +36,8 @@ import {
   consumeFlagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
+  subcommandTokenForDisplay,
 } from "./argv.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
@@ -130,7 +132,7 @@ export async function runTransparencyCommand(
   if (sub === "anchor") {
     return runAnchorCommand(rest, out, err, args.env ?? process.env, args.fetchFn);
   }
-  write(err, `Unknown transparency command: ${sub}\n`);
+  write(err, `Unknown transparency command: ${subcommandTokenForDisplay(sub)}\n`);
   printUsage(err);
   return 2;
 }
@@ -161,7 +163,7 @@ async function runAnchorCommand(
     return 0;
   }
   if (!["enable", "disable", "status", "now", "export"].includes(verb)) {
-    write(err, `Unknown anchor command: ${verb}\n`);
+    write(err, `Unknown anchor command: ${subcommandTokenForDisplay(verb)}\n`);
     printAnchorUsage(err);
     return 2;
   }
@@ -1274,7 +1276,7 @@ function parseFlags(
       flags[arg] = true;
       continue;
     }
-    throw new Error(`unknown option: ${arg}`);
+    throw new Error(`unknown option: ${argvTokenForDisplay(arg)}`);
   }
   return { values, flags };
 }

@@ -56,6 +56,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  subcommandTokenForDisplay,
 } from "./argv.js";
 
 export interface DidWebCommandArgs {
@@ -162,7 +163,7 @@ export async function runDidWebCommand(
   if (command === "register-hosted") {
     return await cmdRegisterHosted(argv.slice(1), out, err, env);
   }
-  write(err, `Unknown did-web command: ${command}\n`);
+  write(err, `Unknown did-web command: ${subcommandTokenForDisplay(command)}\n`);
   write(err, `Run "sanctuary did-web --help" for usage.\n`);
   return 2;
 }
