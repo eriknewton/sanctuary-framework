@@ -1,4 +1,4 @@
-// fail-before-exempt: this change pins existing planner behavior and changes no server/src code path (the only source edit is an invariant comment), so the new re-pin precedence enumeration and its source-scan pin pass on pre-change source by construction. Their witness is a mutation run: each recorded reordering of the re-pin arm or of a gate around it fails a named test.
+// fail-before-exempt: this change pins existing planner behavior and changes no server/src file, so the new re-pin precedence enumeration and its source-scan pin pass on pre-change source by construction. Their witness is a mutation run: each recorded reordering of the re-pin arm or of a gate around it fails a named test.
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
