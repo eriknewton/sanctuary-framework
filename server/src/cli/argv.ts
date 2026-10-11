@@ -278,55 +278,38 @@ export function shellQuoteSingleArg(value: string): string {
  */
 export const ARGV_TOKEN_NOT_SHOWN = "<argument not shown>";
 
-/**
- * Shape of a flag name a refusal may print: a `--` long flag made of
- * lowercase ASCII letters and digits in hyphen-separated words, or a
- * single-letter `-x` short flag. Every flag this CLI defines has one of
- * these shapes; a dash-leading token outside them (mixed case, symbols,
- * a multi-character single-dash run) is treated as operator data, not as
- * a flag name.
- */
-const DISPLAYABLE_FLAG_NAME = /^(?:--[a-z0-9]+(?:-[a-z0-9]+)*|-[A-Za-z])$/;
+/** A single lowercase short flag, `-x`: one letter carries no operator data. */
+const SINGLE_LOWERCASE_SHORT_FLAG = /^-[a-z]$/;
 
 /**
- * Shape of a subcommand word a dispatcher's refusal may print: lowercase
- * ASCII letters and digits in hyphen-separated words, the shape of every
- * verb this CLI defines.
- */
-const DISPLAYABLE_COMMAND_WORD = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
-
-/**
- * Operator-facing rendering of an argv token that a parser refused as an
- * unrecognized flag, option, or argument. The one shared formatter for
- * every such refusal in the CLI (server/src/cli/**, server/src/cli.ts,
- * server/src/wrap/cli.ts), enforced as a full set by
+ * Operator-facing rendering of an argv token that a parser or subcommand
+ * dispatcher refused as unrecognized. The one shared formatter for every
+ * such refusal in the CLI modules (server/src/cli/**, server/src/cli.ts,
+ * and every server/src/**\/cli.ts), enforced as a full set by
  * test/cli/argv-token-display.test.ts.
  *
- * A refusal names the flag only: for a dash-leading token it prints the
- * text before the first `=` and only when that text has a flag-name shape,
- * because the text after `=` is the value the operator bound to the flag
- * and a dash-leading token may itself be a value that followed a boolean
- * flag. A token that does not start with `-` is a positional value, and a
- * positional value is never printed. Bound: a dash-leading value that is
- * itself shaped exactly like a long flag name is indistinguishable from a
- * mistyped flag and is printed as one.
+ * An unrecognized token is never reproduced: the parser does not know what
+ * it is, and a value the operator meant for another flag, or any value typed
+ * in the wrong slot, can have any shape, including the shape of a
+ * long flag or of a verb. The only token printed is a single lowercase
+ * short flag. A refusal that wants to help may name a member of its own
+ * known flag or verb set instead; that text comes from the parser, not from
+ * argv.
  */
-export function argvTokenForDisplay(token: string): string {
-  if (!token.startsWith("-")) return ARGV_TOKEN_NOT_SHOWN;
-  const name = token.split("=", 1)[0]!;
-  return DISPLAYABLE_FLAG_NAME.test(name) ? name : ARGV_TOKEN_NOT_SHOWN;
+export function argvTokenForDisplay(token: string | undefined): string {
+  if (token !== undefined && SINGLE_LOWERCASE_SHORT_FLAG.test(token)) return token;
+  return ARGV_TOKEN_NOT_SHOWN;
 }
 
+/** Error class names that are safe to print: a constructor name, never message text. */
+const ERROR_CLASS_NAME = /^(?:[A-Z][A-Za-z0-9]*)?Error$/;
+
 /**
- * Subcommand-dispatcher counterpart of `argvTokenForDisplay`: the token
- * sits where a verb belongs, so a token shaped like a verb is printed to
- * help the operator spot a typo, and every other token (including any
- * dash-leading token, rendered by `argvTokenForDisplay`) follows the same
- * flag-name-only rule. Bound: a value typed in the verb position that is
- * itself shaped exactly like a verb word is printed as one.
+ * Operator-facing rendering of a caught value in an "unexpected error"
+ * refusal. Prints only the error's class name; the message is never
+ * printed, because a callee may have built it from an argv token.
  */
-export function subcommandTokenForDisplay(token: string | undefined): string {
-  if (token === undefined) return ARGV_TOKEN_NOT_SHOWN;
-  if (token.startsWith("-")) return argvTokenForDisplay(token);
-  return DISPLAYABLE_COMMAND_WORD.test(token) ? token : ARGV_TOKEN_NOT_SHOWN;
+export function caughtErrorForDisplay(cause: unknown): string {
+  const name = cause instanceof Error ? cause.name : undefined;
+  return name !== undefined && ERROR_CLASS_NAME.test(name) ? name : "error";
 }

@@ -58,7 +58,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
-  subcommandTokenForDisplay,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 export interface CheckpointCommandArgs {
@@ -253,7 +253,7 @@ export async function runCheckpointCommand(
       }
       return cmdRestore(rest, out, err, env);
     default:
-      write(err, `Unknown checkpoint command: ${subcommandTokenForDisplay(command)}\n`);
+      write(err, `Unknown checkpoint command: ${argvTokenForDisplay(command)}\n`);
       printUsage(err);
       return 2;
   }

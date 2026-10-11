@@ -43,7 +43,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
-  subcommandTokenForDisplay,
+  argvTokenForDisplay,
 } from "./argv.js";
 import {
   FILE_GRANT_DEFAULTS,
@@ -214,7 +214,7 @@ export async function runFileGrantCommand(
       }
       return cmdRevoke(rest, out, err, env);
     default:
-      write(err, `Unknown file-grant command: ${subcommandTokenForDisplay(command)}\n`);
+      write(err, `Unknown file-grant command: ${argvTokenForDisplay(command)}\n`);
       printUsage(err);
       return 2;
   }

@@ -45,7 +45,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
-  subcommandTokenForDisplay,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 export interface DistressCommandArgs {
@@ -145,7 +145,7 @@ export async function runDistressCommand(
     return await cmdSend(rest, out, err, env);
   }
 
-  write(err, `Unknown distress command: ${subcommandTokenForDisplay(command)}\n`);
+  write(err, `Unknown distress command: ${argvTokenForDisplay(command)}\n`);
   write(err, `Run "sanctuary distress --help" for usage.\n`);
   return 2;
 }

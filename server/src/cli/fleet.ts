@@ -65,7 +65,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
-  subcommandTokenForDisplay,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 function write(stream: Writable, text: string): void {
@@ -617,7 +617,7 @@ async function runAttestCommand(
       write(out, ATTEST_USAGE);
       return verb === undefined ? 1 : 0;
     default:
-      write(err, `fleet attest: unknown verb '${subcommandTokenForDisplay(verb)}'\n\n${ATTEST_USAGE}`);
+      write(err, `fleet attest: unknown verb '${argvTokenForDisplay(verb)}'\n\n${ATTEST_USAGE}`);
       return 1;
   }
 }
@@ -654,7 +654,7 @@ export async function runFleetCommand(args: {
     write(out, USAGE);
     return group === undefined ? 1 : 0;
   }
-  write(err, `fleet: unknown verb '${subcommandTokenForDisplay(group)}'\n\n${USAGE}`);
+  write(err, `fleet: unknown verb '${argvTokenForDisplay(group)}'\n\n${USAGE}`);
   return 1;
 }
 

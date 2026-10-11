@@ -23,7 +23,7 @@ import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
-import { subcommandTokenForDisplay } from "./cli/argv.js";
+import { argvTokenForDisplay } from "./cli/argv.js";
 export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 
 const require = createRequire(import.meta.url);
@@ -1455,7 +1455,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
       return runSignerHelperStatus(args.slice(2));
     }
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(`Unknown signer-helper subcommand: ${subcommandTokenForDisplay(sub)}. Try: sanctuary castle-wall signer-helper status`);
+    console.error(`Unknown signer-helper subcommand: ${argvTokenForDisplay(sub)}. Try: sanctuary castle-wall signer-helper status`);
     return 2;
   }
 
@@ -1624,7 +1624,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
-    `Unknown subcommand: ${subcommandTokenForDisplay(command)}. Try: sanctuary castle-wall --help`
+    `Unknown subcommand: ${argvTokenForDisplay(command)}. Try: sanctuary castle-wall --help`
   );
   return 2;
 }

@@ -70,7 +70,7 @@ import {
   surrogateHelperDaemonPlistPath,
   surrogateUnlockSocketPath,
 } from "../egress-gate/surrogate-helper-daemon.js";
-import { flagValue, subcommandTokenForDisplay } from "./argv.js";
+import { flagValue, argvTokenForDisplay } from "./argv.js";
 import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 
 export interface SecretsArgs {
@@ -175,7 +175,7 @@ export async function runSecretsCommand(args: SecretsArgs): Promise<number> {
       case "surrogate":
         return await cmdSurrogate(rest, { out, err, stdin, args });
       default:
-        err.write(`Unknown subcommand: ${subcommandTokenForDisplay(sub)}\n`);
+        err.write(`Unknown subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -587,7 +587,7 @@ async function cmdSurrogate(
     case "events":
       return await cmdSurrogateEvents(rest, ctx);
     default:
-      ctx.err.write(`Unknown surrogate subcommand: ${subcommandTokenForDisplay(sub)}\n`);
+      ctx.err.write(`Unknown surrogate subcommand: ${argvTokenForDisplay(sub)}\n`);
       printSurrogateUsage(ctx.err);
       return 2;
   }

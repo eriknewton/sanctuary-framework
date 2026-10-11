@@ -1,99 +1,130 @@
 /**
- * CLI refusals name the flag, never its value.
+ * CLI refusals never reproduce an unrecognized argv token.
  *
  * Every operator-facing refusal for an unrecognized flag, option, argument,
- * or subcommand renders the offending argv token through the one shared
- * formatter in src/cli/argv.ts (`argvTokenForDisplay` /
- * `subcommandTokenForDisplay`). A refusal may print a flag name (the text
- * before `=`) or a verb-shaped subcommand word; it never prints the value
- * bound with `=`, a dash-leading token that is not shaped like a flag name,
- * or a positional value.
+ * or subcommand renders the offending token through the one shared
+ * formatter in src/cli/argv.ts (`argvTokenForDisplay`), and every
+ * "unexpected error" refusal renders a caught value through
+ * `caughtErrorForDisplay`. An unrecognized token prints as
+ * `<argument not shown>` whatever its shape, because a value typed in the
+ * wrong slot can look exactly like a long flag or a verb. The only token
+ * printed is a single lowercase short flag.
  *
  * Three layers, each over the full set:
  *   1. the formatter's own contract;
- *   2. a source census over every CLI module: each refusal template that
- *      interpolates must route the token through the formatter, or appear on
- *      an explicit allowlist with a reason (and every allowlist entry must
- *      still exist, so the list cannot rot);
+ *   2. a source census over every CLI module, parsed with the TypeScript
+ *      compiler: every refusal-shaped template literal, `+` concatenation,
+ *      and `format(...)` call must interpolate only a whole formatter call or
+ *      an allowlisted non-token (every allowlist entry must still exist, and
+ *      the formatter-site count is exact, so neither list can rot);
  *   3. a behavioral table that drives every reachable refusal path with a
- *      `--flag=VALUE` token and a dash-leading value token, and asserts the
- *      value appears nowhere in what the operator sees (stdout, stderr,
- *      injected streams, console, and any thrown message the top-level
- *      printer would render).
+ *      `--flag=VALUE` token, a dash-leading value, a value shaped like a long
+ *      flag, and (in positional slots) a value shaped like a verb, asserts
+ *      that a refusal was produced, and asserts no value appears in what the
+ *      operator sees (stdout, stderr, injected streams, console, and every
+ *      thrown message, string throw, and `cause` the top-level printer could
+ *      render).
  */
 
 import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { Writable } from "node:stream";
+import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   ARGV_TOKEN_NOT_SHOWN,
   argvTokenForDisplay,
-  subcommandTokenForDisplay,
+  caughtErrorForDisplay,
+  consumeFlagValue,
+  consumeFlagValues,
 } from "../../src/cli/argv.js";
 import { CLI_SUBPROCESS_TEST_TIMEOUT_MS, runCli } from "./helpers/run-cli";
 
 // Must match ARGV_TOKEN_NOT_SHOWN in src/cli/argv.ts.
 const EXPECTED_NOT_SHOWN = "<argument not shown>";
 
-// The marker carries an uppercase run and digits so no token built from it
-// has a flag-name or verb-word shape; a display rule that printed it would be
-// printing operator data.
+// Value markers. MARK has no flag or verb shape; the other two are the shapes
+// a real value can take: a hyphenated multi-word value typed after `--`, and a
+// lowercase hex string (24 = 12 bytes, hex-encoded) in a verb slot.
 const MARK = "Zq9VALUEmark";
+const FLAG_SHAPED_MARK = "correct-horse-battery-staple";
+const HEX_MARK = "deadbeef0123456789abcdef";
+const MARKERS = [MARK, FLAG_SHAPED_MARK, HEX_MARK];
+
 const FLAG_WITH_VALUE = `--zz-not-a-flag=${MARK}`;
 const DASH_VALUE = `-${MARK}`;
-const POSITIONAL_VALUE = MARK;
 const DOUBLE_DASH_VALUE = `--${MARK}`;
+const FLAG_SHAPED_VALUE = `--${FLAG_SHAPED_MARK}`;
+const POSITIONAL_VALUE = MARK;
+const VERB_SHAPED_VALUE = HEX_MARK;
 const FORTRESS_FLAG_WITH_VALUE = `--fortress-zz=${MARK}`;
 const FORTRESS_DASH_VALUE = `--fortress${MARK}`;
+const FORTRESS_FLAG_SHAPED_VALUE = `--fortress-${FLAG_SHAPED_MARK}`;
 
 describe("argv token display formatter", () => {
   it("pins the placeholder text", () => {
     expect(ARGV_TOKEN_NOT_SHOWN).toBe(EXPECTED_NOT_SHOWN);
   });
 
-  it("names a long flag and drops the value bound with =", () => {
-    expect(argvTokenForDisplay("--name")).toBe("--name");
-    expect(argvTokenForDisplay(`--output-file=${MARK}`)).toBe("--output-file");
-    expect(argvTokenForDisplay("--a1-b2=x=y")).toBe("--a1-b2");
+  it("prints only a single lowercase short flag", () => {
     expect(argvTokenForDisplay("-h")).toBe("-h");
+    expect(argvTokenForDisplay("-x")).toBe("-x");
   });
 
-  it("does not print a dash-leading token that is not flag-shaped", () => {
+  it("never prints any other token, whatever its shape", () => {
     for (const token of [
-      DASH_VALUE,
-      `--${MARK}`,
-      `--${MARK}=x`,
-      "-abc",
-      "--",
+      undefined,
+      "",
       "-",
-      "--a b",
-      "--a_b",
-      "--a--b",
-      "--a-",
-      "---a",
+      "--",
+      "-A",
+      "-ab",
+      "--name",
+      `--output-file=${MARK}`,
+      FLAG_WITH_VALUE,
+      DASH_VALUE,
+      DOUBLE_DASH_VALUE,
+      FLAG_SHAPED_VALUE,
+      `${FLAG_SHAPED_VALUE}=x`,
+      POSITIONAL_VALUE,
+      VERB_SHAPED_VALUE,
+      FLAG_SHAPED_MARK,
+      "frobnicate",
+      "operator-cloud",
+      "claude-code",
+      "has space",
     ]) {
-      expect(argvTokenForDisplay(token), token).toBe(EXPECTED_NOT_SHOWN);
+      expect(argvTokenForDisplay(token), String(token)).toBe(EXPECTED_NOT_SHOWN);
     }
   });
 
-  it("never prints a positional value", () => {
-    expect(argvTokenForDisplay(POSITIONAL_VALUE)).toBe(EXPECTED_NOT_SHOWN);
-    expect(argvTokenForDisplay("claude-code")).toBe(EXPECTED_NOT_SHOWN);
-    expect(argvTokenForDisplay("")).toBe(EXPECTED_NOT_SHOWN);
+  it("renders a caught value as its error class name only", () => {
+    expect(caughtErrorForDisplay(new TypeError(`bad ${MARK}`))).toBe("TypeError");
+    expect(caughtErrorForDisplay(new Error(MARK))).toBe("Error");
+    const renamed = new Error("x");
+    renamed.name = FLAG_SHAPED_MARK;
+    expect(caughtErrorForDisplay(renamed)).toBe("error");
+    expect(caughtErrorForDisplay(MARK)).toBe("error");
+    expect(caughtErrorForDisplay(undefined)).toBe("error");
   });
 
-  it("subcommand form prints verb-shaped words and follows the flag rule otherwise", () => {
-    expect(subcommandTokenForDisplay("frobnicate")).toBe("frobnicate");
-    expect(subcommandTokenForDisplay("operator-cloud")).toBe("operator-cloud");
-    expect(subcommandTokenForDisplay("v2")).toBe("v2");
-    expect(subcommandTokenForDisplay(undefined)).toBe(EXPECTED_NOT_SHOWN);
-    expect(subcommandTokenForDisplay(POSITIONAL_VALUE)).toBe(EXPECTED_NOT_SHOWN);
-    expect(subcommandTokenForDisplay("has space")).toBe(EXPECTED_NOT_SHOWN);
-    expect(subcommandTokenForDisplay(FLAG_WITH_VALUE)).toBe("--zz-not-a-flag");
-    expect(subcommandTokenForDisplay(DASH_VALUE)).toBe(EXPECTED_NOT_SHOWN);
+  it("consumeFlagValue and consumeFlagValues refusals name the flag, never the next token", () => {
+    const cases: string[][] = [
+      ["--fortress", DASH_VALUE],
+      ["--fortress", FLAG_SHAPED_VALUE],
+      ["--fortress", "a", "--fortress", MARK],
+      ["--fortress="],
+    ];
+    for (const argv of cases) {
+      const single = consumeFlagValue(argv, "--fortress");
+      expect(single.error, argv.join(" ")).toBeDefined();
+      const multi = consumeFlagValues(argv, "--fortress");
+      for (const text of [single.error ?? "", multi.error ?? ""]) {
+        for (const m of MARKERS) expect(text).not.toContain(m);
+      }
+    }
   });
 });
 
@@ -114,12 +145,11 @@ function walk(dir: string): string[] {
 
 /** Every CLI module: src/cli/**, src/cli.ts, any src/**\/cli.ts, the offline verifier. */
 function cliSourceFiles(): string[] {
-  const all = walk(SRC);
-  return all
+  return walk(SRC)
     .filter((p) => {
       const rel = relative(SRC, p);
       return (
-        rel.startsWith(`cli/`) ||
+        rel.startsWith("cli/") ||
         rel === "cli.ts" ||
         rel.endsWith("/cli.ts") ||
         rel === "transparency/offline-cli.ts"
@@ -129,13 +159,15 @@ function cliSourceFiles(): string[] {
 }
 
 const REFUSAL_KEYWORD = /\b(unknown|unrecognized|unexpected)\b/i;
-const FORMATTER_CALL = /^(argvTokenForDisplay|subcommandTokenForDisplay)\(/;
-const FORMATTER_MAP = 'unknown.map(argvTokenForDisplay).join(" ")';
+/** Interpolations named like credential material are checked in every template, keyword or not. */
+const CREDENTIAL_NAMED = /passphrase|recovery_?key|recoveryKey/i;
+const FORMATTERS = new Set(["argvTokenForDisplay", "caughtErrorForDisplay"]);
+const FORMATTER_MAP = "unknown.map(argvTokenForDisplay).join(\" \")";
 
 /**
- * Interpolations in a refusal-shaped template that are not an argv token, or
- * are a value the operator supplied as a named lookup key for that verb.
- * Keyed `<path relative to src>|<expression>`. Full-set: every entry must be
+ * Interpolations in a refusal-shaped string that are not an argv token, or
+ * are a lookup key the verb resolves against its own known set. Keyed
+ * `<path relative to src>|<expression>`. Full-set: every entry must be
  * matched by the census, so a removed site removes its entry.
  */
 const ALLOWLIST: Record<string, string> = {
@@ -144,7 +176,6 @@ const ALLOWLIST: Record<string, string> = {
   "cli/anomaly.ts|classifierId": "classifier lookup key named for this verb",
   "cli/castle-wall.ts|reason": "probe outcome reason, not argv",
   "cli/castle-wall.ts|report.state": "host app report field, not argv",
-  "cli/federation.ts|String(cause)": "caught error text, not argv",
   "cli/federation.ts|verb": "fixed verb string chosen by the code",
   "cli/federation.ts|FEDERATION_HELP": "fixed help text",
   "cli/fleet.ts|ATTEST_USAGE": "fixed usage text",
@@ -155,56 +186,149 @@ const ALLOWLIST: Record<string, string> = {
   'cli/license.ts|ALL_ENTITLEMENT_FEATURE_FLAGS.join(", ")': "fixed feature list",
   "cli/license.ts|USAGE": "fixed usage text",
   "cli/nodes.ts|HELP": "fixed help text",
-  "cli/nodes.ts|String(cause)": "caught error text, not argv",
   "cli/plugin.ts|PLUGIN_HELP": "fixed help text",
-  "cli/secrets.ts|f.secret": "binding name from the stored surrogate policy",
+  "cli/secrets.ts|f.secret":
+    "binding name already matched against the helper's served-name set before this line; values never enter this record",
   "cli/sentinel.ts|sentinelId": "sentinel lookup key named for this verb",
   'evidence-pack/cli.ts|unexpected.sort().join(", ")': "file names found on disk, not argv",
   "honeypot/cli.ts|trapId": "trap lookup key named for this verb",
   "templates/cli.ts|templateName": "template lookup key named for this verb",
+  "cli/agents/cli.ts|passphraseLabel(tenant)": "fixed status label for where a tenant's credential lives",
+  "cli/castle-wall.ts|error instanceof Error ? error.message : String(error)":
+    "status line for a host-app probe the CLI spawns itself; no argv reaches it",
+  "cli/reset-passphrase.ts|availability.recoveryKey.reason": "fixed availability reason text",
+  "cli/rotate-master.ts|opts.recoveryKey":
+    "the newly minted recovery key, shown once to the operator on this terminal by design; not argv",
+  "cli/secrets.ts|SURROGATE_BOUND_PORT": "numeric constant",
+  "cli/secrets.ts|f.reason": "fixed failure reason class",
+  "cli/secrets.ts|describeUnlockSettleCommands(f.agentUid)": "fixed command text built from a numeric uid",
+  "wrap/cli.ts|passphraseLocation": "where the credential is stored, never the value",
   "wrap/cli.ts|String(i + 1)": "argv position, not the token",
   "wrap/cli.ts|hint": "fixed known-flag suggestion",
 };
 
-describe("source census: refusal templates route argv tokens through the formatter", () => {
-  it("every interpolation is the formatter or an allowlisted non-token", () => {
-    const template = /`((?:[^`\\]|\\.)*)`/g;
-    const violations: string[] = [];
-    const seen = new Set<string>();
-    let formatterSites = 0;
-    for (const file of cliSourceFiles()) {
-      const rel = relative(SRC, file);
-      const lines = readFileSync(file, "utf8").split("\n");
-      lines.forEach((line, idx) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-        for (const m of line.matchAll(template)) {
-          const body = m[1]!;
-          if (!body.includes("${")) continue;
-          const staticText = body.replace(/\$\{[^}]*\}/g, "");
-          if (!REFUSAL_KEYWORD.test(staticText)) continue;
-          for (const e of body.matchAll(/\$\{([^}]*)\}/g)) {
-            const expr = e[1]!;
-            if (FORMATTER_CALL.test(expr) || expr === FORMATTER_MAP) {
-              formatterSites += 1;
-              continue;
-            }
-            const key = `${rel}|${expr}`;
-            if (key in ALLOWLIST) {
-              seen.add(key);
-              continue;
-            }
-            violations.push(`${rel}:${String(idx + 1)} interpolates \${${expr}}`);
-          }
+interface CensusResult {
+  violations: string[];
+  allowlisted: Set<string>;
+  formatterSites: string[];
+}
+
+function runCensus(): CensusResult {
+  const result: CensusResult = { violations: [], allowlisted: new Set(), formatterSites: [] };
+  for (const file of cliSourceFiles()) {
+    const rel = relative(SRC, file);
+    const sf = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+    const checked = new Set<ts.Node>();
+    const where = (n: ts.Node): string =>
+      `${rel}:${String(sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1)}`;
+
+    const checkExpr = (expr: ts.Expression): void => {
+      if (checked.has(expr)) return;
+      checked.add(expr);
+      const text = expr.getText(sf);
+      // The WHOLE interpolation must be the formatter call; a formatter call
+      // inside a larger expression (`f(x) + x`) does not count.
+      const isFormatterCall =
+        ts.isCallExpression(expr) &&
+        ts.isIdentifier(expr.expression) &&
+        FORMATTERS.has(expr.expression.text);
+      if (isFormatterCall || text === FORMATTER_MAP) {
+        result.formatterSites.push(`${where(expr)} ${text}`);
+        return;
+      }
+      if (ts.isStringLiteralLike(expr) || ts.isNumericLiteral(expr)) return;
+      const key = `${rel}|${text}`;
+      if (key in ALLOWLIST) {
+        result.allowlisted.add(key);
+        return;
+      }
+      result.violations.push(`${where(expr)} interpolates ${text}`);
+    };
+
+    const staticText = (n: ts.Node): string | undefined => {
+      if (ts.isStringLiteralLike(n)) return n.text;
+      if (ts.isTemplateExpression(n)) {
+        return n.head.text + n.templateSpans.map((sp) => sp.literal.text).join("");
+      }
+      return undefined;
+    };
+
+    const flattenPlus = (n: ts.Expression): ts.Expression[] => {
+      const e = ts.isParenthesizedExpression(n) ? n.expression : n;
+      if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+        return [...flattenPlus(e.left), ...flattenPlus(e.right)];
+      }
+      return [e];
+    };
+
+    const checkParts = (parts: ts.Expression[]): void => {
+      for (const part of parts) {
+        if (ts.isTemplateExpression(part)) {
+          for (const sp of part.templateSpans) checkExpr(sp.expression);
+        } else if (staticText(part) === undefined) {
+          checkExpr(part);
         }
-      });
-    }
-    expect(violations).toEqual([]);
-    expect([...seen].sort()).toEqual(Object.keys(ALLOWLIST).sort());
-    // 67 = refusal-template interpolations routed through the formatter when
-    // this census was written (44 subcommand-position sites, 23 flag or
-    // argument sites); a drop means a site stopped using it.
-    expect(formatterSites).toBeGreaterThanOrEqual(67);
+      }
+    };
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isTemplateExpression(node)) {
+        const refusal = REFUSAL_KEYWORD.test(staticText(node)!);
+        for (const sp of node.templateSpans) {
+          if (refusal || CREDENTIAL_NAMED.test(sp.expression.getText(sf))) checkExpr(sp.expression);
+        }
+      } else if (
+        ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.PlusToken &&
+        !(
+          ts.isBinaryExpression(node.parent) &&
+          node.parent.operatorToken.kind === ts.SyntaxKind.PlusToken
+        )
+      ) {
+        const parts = flattenPlus(node);
+        const text = parts.map((p) => staticText(p) ?? "").join("");
+        if (parts.some((p) => staticText(p) !== undefined) && REFUSAL_KEYWORD.test(text)) {
+          checkParts(parts);
+        }
+      } else if (ts.isCallExpression(node)) {
+        const callee = node.expression.getText(sf);
+        const first = node.arguments[0];
+        if (
+          /(^|\.)format$/.test(callee) &&
+          first !== undefined &&
+          REFUSAL_KEYWORD.test(staticText(first) ?? "")
+        ) {
+          checkParts([...node.arguments.slice(1)]);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return result;
+}
+
+// 78 = interpolations routed through a formatter when this census was
+// written: 67 unrecognized-token refusals (argvTokenForDisplay, one of them
+// the config-reset `unknown.map(...)` form) plus 11 caught-error refusals
+// (caughtErrorForDisplay). Exact, so a removed or added site is a decision.
+const EXPECTED_FORMATTER_SITES = 78;
+
+describe("source census: refusal strings route argv tokens through the formatter", () => {
+  const census = runCensus();
+
+  it("every interpolation in a refusal string is a whole formatter call or allowlisted", () => {
+    expect(census.violations).toEqual([]);
+  });
+
+  it("every allowlist entry is still in use", () => {
+    expect([...census.allowlisted].sort()).toEqual(Object.keys(ALLOWLIST).sort());
+  });
+
+  it("the formatter-site count is exact", () => {
+    expect(census.formatterSites.length, census.formatterSites.join("\n")).toBe(
+      EXPECTED_FORMATTER_SITES,
+    );
   });
 });
 
@@ -231,17 +355,27 @@ interface Io {
 
 let tempHome = "";
 
+/** Every printable layer of a thrown value: message, string throw, and the cause chain. */
+function thrownText(e: unknown, depth = 0): string {
+  // 8 = a cause chain deeper than any this CLI builds; the cap only stops a cycle.
+  if (depth > 8 || e === undefined || e === null) return "";
+  if (e instanceof Error) {
+    return `${e.name}: ${e.message}\n${String(e.stack ?? "")}\n${thrownText(e.cause, depth + 1)}`;
+  }
+  return `${String(e)}\n`;
+}
+
 /**
  * Runs one refusal path and returns everything an operator would see:
- * injected streams, console, raw process stdout/stderr, and the message of
- * any thrown error (the top-level printer renders it).
+ * injected streams, console, raw process stdout/stderr, and every layer of
+ * any thrown value (the top-level printer renders it).
  */
 async function seen(run: (io: Io) => Promise<unknown> | unknown): Promise<string> {
   const out = sink();
   const err = sink();
   let captured = "";
   const collect = (...args: unknown[]): void => {
-    captured += args.map(String).join(" ") + "\n";
+    captured += args.map((a) => (a instanceof Error ? thrownText(a) : String(a))).join(" ") + "\n";
   };
   const spies = [
     vi.spyOn(console, "error").mockImplementation(collect),
@@ -267,11 +401,16 @@ async function seen(run: (io: Io) => Promise<unknown> | unknown): Promise<string
   try {
     await run({ out: out.stream, err: err.stream, env });
   } catch (e) {
-    if (!(e instanceof ExitSignal)) captured += `${(e as Error).message}\n`;
+    if (!(e instanceof ExitSignal)) captured += thrownText(e);
   } finally {
     for (const s of spies) s.mockRestore();
   }
   return `${out.text()}${err.text()}${captured}`;
+}
+
+function expectRefusalWithoutValue(text: string, witness: string = EXPECTED_NOT_SHOWN): void {
+  expect(text, "the path must produce a refusal").toContain(witness);
+  for (const m of MARKERS) expect(text).not.toContain(m);
 }
 
 type Runner = (argv: string[], io: Io) => Promise<unknown> | unknown;
@@ -339,6 +478,8 @@ const runners: Record<string, Runner> = {
       out: io.out,
       err: io.err,
       env: io.env,
+      // The verb refuses every other platform before it parses argv.
+      platform: "darwin",
     }),
   wrap: async (a) => (await load<any>("../../src/wrap/cli.js")).parseWrapArgs(a),
   offlineVerifier: async (a, io) =>
@@ -483,11 +624,12 @@ const FORTRESS_CASES: Array<[string, keyof typeof runners]> = [
 ];
 
 /** Positional-value refusals in argument parsers. */
-const POSITIONAL_CASES: Array<[string, keyof typeof runners, string[]]> = [
+/** [case name, runner, argv prefix, refusal witness when not the placeholder]. */
+const POSITIONAL_CASES: Array<[string, keyof typeof runners, string[], string?]> = [
   ["uninstall argument", "uninstall", []],
   ["sdw-owner argument", "sdwOwner", ["status"]],
   ["castle-wall repair-custody argument", "repairCustody", []],
-  ["wrap argument", "wrap", []],
+  ["wrap argument", "wrap", [], "Unrecognized argument at position"],
   ["evidence-pack generate argument", "evidencePack", ["generate"]],
 ];
 
@@ -511,59 +653,69 @@ describe("behavioral table: no refusal path prints an argv value", () => {
     else process.env.HOME = savedHome;
   });
 
+  const label = (token: string): string =>
+    token === FLAG_WITH_VALUE || token === FORTRESS_FLAG_WITH_VALUE
+      ? "--flag=value"
+      : token === FLAG_SHAPED_VALUE || token === FORTRESS_FLAG_SHAPED_VALUE
+        ? "flag-shaped value"
+        : token === VERB_SHAPED_VALUE
+          ? "verb-shaped value"
+          : token === POSITIONAL_VALUE
+            ? "positional value"
+            : "dash-leading value";
+
   for (const [name, runner, prefix, dashValue] of CASES) {
-    for (const token of [FLAG_WITH_VALUE, dashValue ?? DASH_VALUE]) {
-      it(`${name}: ${token === FLAG_WITH_VALUE ? "--flag=value" : "dash-leading value"}`, async () => {
+    for (const token of [FLAG_WITH_VALUE, dashValue ?? DASH_VALUE, FLAG_SHAPED_VALUE]) {
+      it(`${name}: ${label(token)}`, async () => {
         const text = await seen((io) => runners[runner]!([...prefix, token], io));
-        expect(text).not.toContain(MARK);
+        expectRefusalWithoutValue(text);
       });
     }
   }
 
-  // A non-verb-shaped token in a subcommand position is a value, not a typo.
+  // Any token in a subcommand position that is not a known verb is a value.
   for (const [name, runner, prefix] of CASES.filter(([n]) => SUBCOMMAND_POSITION.test(n))) {
-    it(`${name}: positional value`, async () => {
-      const text = await seen((io) => runners[runner]!([...prefix, POSITIONAL_VALUE], io));
-      expect(text).not.toContain(MARK);
-    });
+    for (const token of [POSITIONAL_VALUE, VERB_SHAPED_VALUE]) {
+      it(`${name}: ${label(token)}`, async () => {
+        const text = await seen((io) => runners[runner]!([...prefix, token], io));
+        expectRefusalWithoutValue(text);
+      });
+    }
   }
 
   for (const [name, runner] of FORTRESS_CASES) {
-    for (const token of [FORTRESS_FLAG_WITH_VALUE, FORTRESS_DASH_VALUE]) {
-      it(`${name}: ${token === FORTRESS_FLAG_WITH_VALUE ? "--flag=value" : "dash-leading value"}`, async () => {
+    for (const token of [FORTRESS_FLAG_WITH_VALUE, FORTRESS_DASH_VALUE, FORTRESS_FLAG_SHAPED_VALUE]) {
+      it(`${name}: ${label(token)}`, async () => {
         const text = await seen((io) => runners[runner]!([token], io));
-        expect(text).not.toContain(MARK);
+        expectRefusalWithoutValue(text);
       });
     }
   }
 
-  for (const [name, runner, prefix] of POSITIONAL_CASES) {
-    it(`${name}: positional value`, async () => {
-      const text = await seen((io) => runners[runner]!([...prefix, POSITIONAL_VALUE], io));
-      expect(text).not.toContain(MARK);
-    });
+  for (const [name, runner, prefix, witness] of POSITIONAL_CASES) {
+    for (const token of [POSITIONAL_VALUE, VERB_SHAPED_VALUE]) {
+      it(`${name}: ${label(token)}`, async () => {
+        const text = await seen((io) => runners[runner]!([...prefix, token], io));
+        expectRefusalWithoutValue(text, witness);
+      });
+    }
   }
-
-  it("a refusal still names the flag the operator typed", async () => {
-    const text = await seen((io) => runners.rotateMaster!([FLAG_WITH_VALUE], io));
-    expect(text).toContain("--zz-not-a-flag");
-    const wrap = await seen((io) => runners.wrap!([FLAG_WITH_VALUE], io));
-    expect(wrap).toContain("Unrecognized flag '--zz-not-a-flag'");
-  });
 });
 
-/**
- * The castle-wall dispatchers live in src/cli.ts, which runs `main()` on
- * import, so they are driven through the built CLI.
- */
 describe("behavioral table: castle-wall dispatchers in the built CLI", () => {
   for (const prefix of [["castle-wall"], ["castle-wall", "signer-helper"]]) {
-    for (const token of [FLAG_WITH_VALUE, DASH_VALUE, POSITIONAL_VALUE]) {
+    for (const token of [
+      FLAG_WITH_VALUE,
+      DASH_VALUE,
+      FLAG_SHAPED_VALUE,
+      POSITIONAL_VALUE,
+      VERB_SHAPED_VALUE,
+    ]) {
       it(
-        `${prefix.join(" ")}: ${token}`.replace(MARK, "<value>"),
+        `${prefix.join(" ")}: ${MARKERS.reduce((t, m) => t.replace(m, "<value>"), token)}`,
         async () => {
           const { output } = await runCli(...prefix, token);
-          expect(output).not.toContain(MARK);
+          expectRefusalWithoutValue(output);
         },
         CLI_SUBPROCESS_TEST_TIMEOUT_MS,
       );

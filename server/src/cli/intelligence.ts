@@ -46,7 +46,6 @@ import {
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
   argvTokenForDisplay,
-  subcommandTokenForDisplay,
 } from "./argv.js";
 
 /**
@@ -389,7 +388,7 @@ export async function runIntelligenceCommand(
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.error(`Unknown intelligence subcommand: ${subcommandTokenForDisplay(subcommand)}`);
+  console.error(`Unknown intelligence subcommand: ${argvTokenForDisplay(subcommand)}`);
   printHelp();
   return 2;
 }

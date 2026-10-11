@@ -21,7 +21,7 @@ import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { subcommandTokenForDisplay } from "../cli/argv.js";
+import { argvTokenForDisplay } from "../cli/argv.js";
 
 export interface TemplateCommandArgs {
   argv: string[];
@@ -63,7 +63,7 @@ export async function runTemplateCommand(args: TemplateCommandArgs): Promise<num
         args.storagePath,
       );
     default:
-      err.write(`Unknown template subcommand: ${subcommandTokenForDisplay(sub)}\n`);
+      err.write(`Unknown template subcommand: ${argvTokenForDisplay(sub)}\n`);
       printTemplateHelp(err);
       return 1;
   }

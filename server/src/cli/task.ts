@@ -6,7 +6,7 @@ import {
   type TaskStatus,
 } from "../operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { consumeFlagValue, flagValue, unknownFlagWithPrefix, argvTokenForDisplay, subcommandTokenForDisplay } from "./argv.js";
+import { consumeFlagValue, flagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "./argv.js";
 
 export interface TaskCliArgs {
   argv: string[];
@@ -48,7 +48,7 @@ export async function runTaskCommand(args: TaskCliArgs): Promise<number> {
       case "cancel":
         return await cancel(rest, out, err, ctx);
       default:
-        err.write(`Unknown task subcommand: ${subcommandTokenForDisplay(sub)}\n`);
+        err.write(`Unknown task subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }

@@ -19,7 +19,7 @@ import {
   type ConciergeStatus,
 } from "../concierge/index.js";
 import { SubstrateSelector } from "../intelligence/index.js";
-import { consumeFlagValue, unknownFlagWithPrefix, argvTokenForDisplay, subcommandTokenForDisplay } from "./argv.js";
+import { consumeFlagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "./argv.js";
 import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
 export interface ConciergeCliArgs {
@@ -53,7 +53,7 @@ export async function runConciergeCommand(args: ConciergeCliArgs): Promise<numbe
     }
     if (sub === "ask") return ask(rest, out, err, env, ctx, args.localServiceFactory);
     if (sub === "status") return status(rest, out, err, env, ctx, args.localServiceFactory);
-    err.write(`Unknown concierge subcommand: ${subcommandTokenForDisplay(sub)}\n`);
+    err.write(`Unknown concierge subcommand: ${argvTokenForDisplay(sub)}\n`);
     printUsage(err);
     return 2;
   } catch (cause) {

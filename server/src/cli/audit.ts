@@ -20,7 +20,6 @@ import {
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
   argvTokenForDisplay,
-  subcommandTokenForDisplay,
 } from "./argv.js";
 
 export interface AuditCommandArgs {
@@ -67,7 +66,7 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
   }
 
   if (sub !== "search") {
-    write(err, `Unknown audit command: ${subcommandTokenForDisplay(sub)}\n`);
+    write(err, `Unknown audit command: ${argvTokenForDisplay(sub)}\n`);
     printUsage(err);
     return 2;
   }
