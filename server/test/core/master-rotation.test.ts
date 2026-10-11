@@ -12,13 +12,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import {
   establishMaster,
   readCustodyEnvelope,
@@ -831,6 +832,42 @@ describe("master rotation — happy path", () => {
         "_meta",
         custodyEnvelopeCommitJournalQuarantinePrefix(slot),
       )).toHaveLength(0);
+    }
+  });
+});
+
+describe("master rotation — storage namespace discovery", () => {
+  it("refuses before rotation when stored names cannot be addressed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-rotate-name-"));
+    try {
+      const storage = new FilesystemStorage(dir);
+      const est = await establishMaster({
+        storage,
+        passphrase: PASSPHRASE,
+        firstRun: { installMode: "interactive", mintRecoveryKey: true },
+      });
+      await est.masterWriteBarrier?.release();
+      await mkdir(join(dir, "ns-!4E2D"), { recursive: true, mode: 0o700 });
+      await writeFile(join(dir, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
+
+      await expect(
+        rotateMaster({
+          storage,
+          fortressId: FORTRESS_ID,
+          passphrase: PASSPHRASE,
+          approve: async () => true,
+          captureRecoveryKey: async (recoveryKey, verify) => verify(recoveryKey),
+        }),
+      ).rejects.toThrow(/stored name this version cannot address/);
+
+      const stillOld = await establishMaster({
+        storage,
+        recoveryKey: est.mintedRecoveryKey!,
+      });
+      expect(toBase64url(stillOld.masterKey)).toBe(toBase64url(est.masterKey));
+      await stillOld.masterWriteBarrier?.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

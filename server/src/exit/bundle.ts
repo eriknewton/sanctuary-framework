@@ -18,6 +18,7 @@ import {
   isNamespaceDiscoveryLimitError,
   NAMESPACE_DISCOVERY_LIMIT_REMEDIATION,
 } from "../storage/interface.js";
+import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
 import type {
   CrossProcessLockLease,
   CrossProcessLockOptions,
@@ -936,12 +937,16 @@ export class ExitNamespaceDiscoveryError extends Error {
   readonly code = "EXIT_NAMESPACE_DISCOVERY_FAILED";
 
   constructor(cause: unknown) {
+    const storageNameMessage =
+      isFilesystemStorageNameError(cause) && cause instanceof Error
+        ? ` ${cause.message}`
+        : "";
     super(
       "exit-bundle: namespace discovery failed; export refused before writing " +
         "bundle artifacts." +
         (isNamespaceDiscoveryLimitError(cause)
           ? ` ${NAMESPACE_DISCOVERY_LIMIT_REMEDIATION}`
-          : ""),
+          : storageNameMessage),
       { cause },
     );
     this.name = "ExitNamespaceDiscoveryError";

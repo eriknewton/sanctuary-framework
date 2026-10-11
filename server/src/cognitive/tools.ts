@@ -7,6 +7,7 @@
 
 import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
 import { withRequiredCrossProcessLock } from "../storage/cross-process-lock.js";
+import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
@@ -1138,6 +1139,14 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
+  async function denyStorageNameAccess(operation: string, namespace: string) {
+    await recordCriticalAudit(auditLog, "l1", operation, "system", {
+      namespace,
+      denial_class: "namespace_unavailable",
+    }, "failure");
+    return toolResult(fixedDenial(`audit:${operation}`));
+  }
+
   async function assertOpaqueNamespaceOwned(namespace: string): Promise<void> {
     await namespaceRegistry.assertOwnedPersisted(namespace, options?.currentSessionBinding?.());
   }
@@ -1619,6 +1628,9 @@ export function createCognitiveTools(
               message: err.message,
             });
           }
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_write", args.namespace as string);
+          }
           throw err;
         }
 
@@ -1685,6 +1697,9 @@ export function createCognitiveTools(
               namespace: args.namespace,
               key: args.key,
             });
+          }
+          if (isFilesystemStorageNameError(error)) {
+            return denyStorageNameAccess("state_read", args.namespace as string);
           }
           throw error;
         }
@@ -1864,13 +1879,21 @@ export function createCognitiveTools(
           return denyNamespaceAccess("state_list", args.namespace as string);
         }
 
-        const result = await stateStore.list(
-          args.namespace as string,
-          args.prefix as string | undefined,
-          args.tags as string[] | undefined,
-          (args.limit as number) ?? 100,
-          (args.offset as number) ?? 0
-        );
+        let result;
+        try {
+          result = await stateStore.list(
+            args.namespace as string,
+            args.prefix as string | undefined,
+            args.tags as string[] | undefined,
+            (args.limit as number) ?? 100,
+            (args.offset as number) ?? 0
+          );
+        } catch (error) {
+          if (isFilesystemStorageNameError(error)) {
+            return denyStorageNameAccess("state_list", args.namespace as string);
+          }
+          throw error;
+        }
         return toolResult(result);
       },
     },
@@ -1937,6 +1960,9 @@ export function createCognitiveTools(
               error: "exit_import_pending_recovery",
               message: err.message,
             });
+          }
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_delete", args.namespace as string);
           }
           throw err;
         }
@@ -2050,7 +2076,18 @@ export function createCognitiveTools(
         // namespaces and de-duplicates; a namespace the gate-time set never
         // included cannot reappear here because `namespaces` is exactly the
         // approved binding, not a re-derived live set.
-        const result = await stateStore.exportNamespaces(namespaces);
+        let result;
+        try {
+          result = await stateStore.exportNamespaces(namespaces);
+        } catch (error) {
+          if (isFilesystemStorageNameError(error)) {
+            return denyStorageNameAccess(
+              "state_export",
+              typeof args.namespace === "string" ? args.namespace : "state_export",
+            );
+          }
+          throw error;
+        }
 
         await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,
@@ -2134,6 +2171,9 @@ export function createCognitiveTools(
               error: "exit_import_pending_recovery",
               message: err.message,
             });
+          }
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_import", "state_import");
           }
           throw err;
         }

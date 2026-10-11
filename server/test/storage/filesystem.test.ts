@@ -18,14 +18,45 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
+import {
+  ApprovalProofStore,
+  fingerprintIdentityId,
+  type SessionBinding,
+} from "../../src/agent-native/safety-base.js";
 import {
   DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
   FilesystemStorage,
 } from "../../src/storage/filesystem.js";
+import type { ToolDefinition } from "../../src/router.js";
+
+// NAMESPACE-ENCODER-NON-BIJECTIVE-01
 
 it("keeps the directory-capability readiness bound load-tolerant and finite", () => {
   expect(DIRECTORY_CAPABILITY_READY_TIMEOUT_MS).toBe(15_000);
 });
+
+async function callTool(
+  tools: ToolDefinition[],
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const tool = tools.find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`missing tool: ${name}`);
+  const result = await tool.handler(args);
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+function session(identityId: string): SessionBinding {
+  return {
+    identity_id: identityId,
+    requester_identity_fingerprint: fingerprintIdentityId(identityId),
+  };
+}
 
 describe("FilesystemStorage", () => {
   let basePath: string;
@@ -113,6 +144,117 @@ describe("FilesystemStorage", () => {
       await storage.write("_audit", "k", new Uint8Array([7]));
       const entries = await readdir(basePath);
       expect(entries).toContain("_audit");
+    });
+
+    it("refuses storage names that do not round-trip before creating files", async () => {
+      await expect(
+        storage.write("plain", "key-\u4E2D", new Uint8Array([1])),
+      ).rejects.toThrow(/stored name this version cannot address/);
+      await expect(storage.read("plain", "key-\u4E2D")).rejects.toThrow(
+        /stored name this version cannot address/,
+      );
+      await expect(storage.delete("plain", "key-\u4E2D", false)).rejects.toThrow(
+        /stored name this version cannot address/,
+      );
+      await expect(storage.exists("plain", "key-\u4E2D")).rejects.toThrow(
+        /stored name this version cannot address/,
+      );
+      await expect(
+        storage.write("ns-\u4E2D", "plain", new Uint8Array([1])),
+      ).rejects.toThrow(/stored name this version cannot address/);
+      expect(await readdir(basePath)).toEqual([]);
+    });
+
+    it("keeps ASCII and Latin-1 storage names addressable", async () => {
+      await storage.write("cafe-\u00F1", "key-\u00F1", new Uint8Array([7]));
+      expect(await storage.read("cafe-\u00F1", "key-\u00F1")).toEqual(
+        new Uint8Array([7]),
+      );
+      expect((await storage.list("cafe-\u00F1")).map((entry) => entry.key)).toEqual([
+        "key-\u00F1",
+      ]);
+      expect(await storage.listNamespaces()).toContain("cafe-\u00F1");
+    });
+
+    it("refuses raw stored names that cannot be re-addressed", async () => {
+      await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });
+      await writeFile(join(basePath, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(basePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+
+      await expect(storage.listNamespaces()).rejects.toThrow(
+        /stored name this version cannot address/,
+      );
+      await expect(storage.list("plain")).rejects.toThrow(
+        /stored name this version cannot address/,
+      );
+    });
+
+    it("returns generic agent denials for storage names that do not round-trip", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const identity = await callTool(tools, "identity_create", {
+        label: "roundtrip-agent",
+      });
+
+      const result = await callTool(tools, "state_write", {
+        namespace: "plain",
+        key: "key-\u4E2D",
+        value: "blocked",
+        identity_id: identity.identity_id,
+      });
+      expect(result.denied).toBe(true);
+      expect(JSON.stringify(result)).not.toContain("round-trip");
+      expect(JSON.stringify(result)).not.toContain("stored name");
+    });
+
+    it("returns generic cooperative denials for keys that do not round-trip", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      let active: SessionBinding | undefined;
+      const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+        { currentSessionBinding: () => active },
+      );
+      await identityManager.load();
+      const identity = await callTool(l1Tools, "identity_create", {
+        label: "cooperative-roundtrip-agent",
+      });
+      active = session(identity.identity_id as string);
+      const { tools: facadeTools } = createAgentNativeCooperativeTools({
+        identityManager,
+        namespaceRegistry,
+        auditLog,
+        currentSessionBinding: () => active,
+        primitiveTools: l1Tools,
+        storage,
+        approvalProofStore: new ApprovalProofStore(),
+      });
+
+      const result = await callTool(facadeTools, "sanctuary_remember", {
+        key: "key-\u4E2D",
+        value: "blocked",
+      });
+      expect(result.denied).toBe(true);
+      expect(JSON.stringify(result)).not.toContain("round-trip");
+      expect(JSON.stringify(result)).not.toContain("stored name");
     });
   });
 

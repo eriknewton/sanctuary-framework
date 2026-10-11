@@ -42,7 +42,7 @@
 // change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -299,6 +299,58 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     expect(out.text).toContain("BUNDLE RE-KEY KEY");
     expect(out.text).not.toContain("NO STATE EXPORTED");
     expect(err.text).not.toContain("NO STATE was exported");
+  });
+
+  it("refuses discovery when a stored namespace cannot be addressed", async () => {
+    const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-exit-name-"));
+    cleanup.push(storagePath);
+    const stateStoragePath = join(storagePath, "state");
+    await mkdir(stateStoragePath, { recursive: true, mode: 0o700 });
+    await mkdir(join(stateStoragePath, "ns-!4E2D"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(
+      join(stateStoragePath, "ns-!4E2D", "plain.enc"),
+      new Uint8Array([1]),
+    );
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-refuse-"));
+    cleanup.push(bundleDir);
+    const storage = new FilesystemStorage(stateStoragePath);
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+    );
+    await identityManager.load();
+    const { reputationStore } = createL4Tools(
+      storage,
+      masterKey,
+      identityManager,
+      auditLog,
+    );
+    await callTool(tools as ToolLike[], "identity_create", { label: "agent" });
+
+    await expect(
+      exportExitBundle({
+        unpartitionedLegacyExport: true,
+        bundleDir,
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+        reputationStore,
+        policy: DEFAULT_POLICY,
+        config: defaultConfig(),
+        stateStoragePath,
+        keySource: "recovery-key",
+      }),
+    ).rejects.toThrow(/stored name this version cannot address/);
   });
 
   it("still restricts the export to the namespaces --state-namespace names", async () => {
