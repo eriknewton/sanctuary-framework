@@ -1531,19 +1531,16 @@ describe("sanctuary install agent contract", () => {
     expect(notYetWalled.status).not.toBe("complete");
   });
 
-  // Re-pin precedence pin for the full profile. Must match the "RE-PIN
-  // PRECEDENCE" comment at the re-pin arm of buildAgentInstallPlan in
-  // server/src/cli/install.ts.
+  // Re-pin precedence pin for the full profile: the returns above the re-pin
+  // arm of buildAgentInstallPlan in server/src/cli/install.ts, in order.
   //
   // PROPERTY: on darwin a full-profile plan names `repin_trust_anchor` IF AND
   // ONLY IF no return above the re-pin arm refuses first (every field holds a
   // value in its `passing` list below) AND the anchor or the vault claim needs
   // re-pin. Off darwin it never names it. The `passing` lists RECORD the
-  // planner's current pass-through values; they do not endorse them. Several
-  // (cooperativeWrap mismatch/unknown/not-applicable, castleWallApp
-  // not-applicable, systemExtension not-applicable) are referred to a
-  // separate defect investigation, and closing any of them means editing the
-  // matching `passing` list in the same change.
+  // planner's current pass-through values; they do not endorse them, and a
+  // planner change to any of them edits the matching `passing` list in the
+  // same change.
   //
   // SCOPE: this pins where re-pin sits relative to each refusal. It does not
   // pin the relative order of two refusals above it, since only the re-pin id
