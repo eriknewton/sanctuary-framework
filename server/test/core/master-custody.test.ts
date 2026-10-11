@@ -987,6 +987,12 @@ describe("custody-pair commit schedule", () => {
     return fromBase64url(journal.envelope_bytes as string);
   }
 
+  async function journalSentinelBytes(storage: MemoryStorage): Promise<Uint8Array> {
+    const journal = await readCommitJournal(storage);
+    expect(typeof journal.sentinel_bytes).toBe("string");
+    return fromBase64url(journal.sentinel_bytes as string);
+  }
+
   async function replaceJournalSentinelBytes(
     storage: MemoryStorage,
     sentinelBytes: Uint8Array,
@@ -1572,6 +1578,7 @@ describe("custody-pair commit schedule", () => {
       await replaceJournalEnvelopeBytes(storage, sameContentDifferentBytes);
     }
     const recoveredEnvelopeBytes = await journalEnvelopeBytes(storage);
+    const recoveredSentinelBytes = await journalSentinelBytes(storage);
 
     await expectSnapshotChanged(
       writeCustodyEnvelopeBytes(storage, requestedBytes, opened.masterKey),
@@ -1579,6 +1586,9 @@ describe("custody-pair commit schedule", () => {
     const liveEnvelopeBytes = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
     expect(liveEnvelopeBytes).not.toBeNull();
     expect(bytesToString(liveEnvelopeBytes!)).toBe(bytesToString(recoveredEnvelopeBytes));
+    const liveSentinelBytes = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    expect(liveSentinelBytes).not.toBeNull();
+    expect(bytesToString(liveSentinelBytes!)).toBe(bytesToString(recoveredSentinelBytes));
     opened.masterKey.fill(0);
   });
 
@@ -1613,6 +1623,7 @@ describe("custody-pair commit schedule", () => {
       stalePreparedPair,
     );
     const recoveredEnvelopeBytes = await journalEnvelopeBytes(storage);
+    const recoveredSentinelBytes = await journalSentinelBytes(storage);
 
     await expectSnapshotChanged(
       writeCustodyEnvelopeBytes(storage, currentBytes, nextMaster),
@@ -1620,6 +1631,9 @@ describe("custody-pair commit schedule", () => {
     const liveEnvelopeBytes = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
     expect(liveEnvelopeBytes).not.toBeNull();
     expect(bytesToString(liveEnvelopeBytes!)).toBe(bytesToString(recoveredEnvelopeBytes));
+    const liveSentinelBytes = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    expect(liveSentinelBytes).not.toBeNull();
+    expect(bytesToString(liveSentinelBytes!)).toBe(bytesToString(recoveredSentinelBytes));
     nextMaster.fill(0);
   });
 
