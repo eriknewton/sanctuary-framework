@@ -627,8 +627,8 @@ impl DecisionEngine {
         // the returned borrow alive across that read would not compile, and
         // releasing the guard first would open the window this whole design
         // closes.
-        let outcome = guard
-            .reload_with_authorization(|loaded| {
+        let outcome = match gate {
+            IdentityGate::Frozen => guard.reload_with_authorization(|loaded| {
                 if shutdown.load(Ordering::SeqCst) {
                     return Err(ControlAuditError::Cancelled);
                 }
@@ -649,8 +649,25 @@ impl DecisionEngine {
                 self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
                 summary = Some(candidate);
                 Ok(())
-            })
-            .map(|_| ());
+            }),
+            IdentityGate::BootFreeze => guard.reload_active_at_boot_with_authorization(|loaded| {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Err(ControlAuditError::Cancelled);
+                }
+                let candidate = ManifestReloadSummary {
+                    signature_b64url: loaded.manifest_signature_b64url.clone(),
+                    rule_count: loaded.rule_count,
+                };
+                let detail = format!(
+                    "context={context} signature={} rules={}",
+                    candidate.signature_b64url, candidate.rule_count
+                );
+                self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
+                summary = Some(candidate);
+                Ok(())
+            }),
+        }
+        .map(|_| ());
         let result = match outcome {
             // Safety: the Ok arm means the authorization callback ran to completion,
             // and its last statement assigns `summary`. Any early return inside the
