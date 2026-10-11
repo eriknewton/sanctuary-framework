@@ -20,6 +20,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+// Marker strings must match the suite-list-begin/end comments in
+// ../.github/workflows/castle-wall-linux.yml.
+const WORKFLOW_SUITE_LIST_BEGIN: &str = "# suite-list-begin:";
+const WORKFLOW_SUITE_LIST_END: &str = "# suite-list-end:";
+const WORKFLOW_LIST_EXTRA_TARGET: &str = "test_isolation_gate";
+
 /// Source substrings that prove a target can reach a host-global object: the
 /// nftables table (shared kernel object), or `daemon::boot`, whose Linux path
 /// calls `activate_kernel_runtime` and installs that table, takes the host
@@ -41,6 +47,13 @@ fn host_global_markers() -> Vec<String> {
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn repo_root() -> PathBuf {
+    crate_root()
+        .parent()
+        .expect("crate root has repository parent")
+        .to_path_buf()
 }
 
 /// Test targets Cargo.toml declares with `required-features = ["test-isolation"]`.
@@ -78,6 +91,71 @@ fn gated_targets() -> BTreeSet<String> {
         }
     }
     gated
+}
+
+/// The Linux CI "did it run" loop names every gated target plus this guard
+/// target. Parsed from anchored comments so the workflow and Cargo.toml lists
+/// cannot drift independently.
+fn workflow_suite_targets() -> BTreeSet<String> {
+    let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
+    let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
+    let mut suites = BTreeSet::new();
+    let mut in_suite_list = false;
+    let mut saw_begin = false;
+    let mut saw_end = false;
+
+    for raw_line in workflow.lines() {
+        let line = raw_line.trim();
+        if line.contains(WORKFLOW_SUITE_LIST_BEGIN) {
+            assert!(
+                !in_suite_list,
+                "nested Linux workflow suite-list-begin marker"
+            );
+            in_suite_list = true;
+            saw_begin = true;
+            continue;
+        }
+        if line.contains(WORKFLOW_SUITE_LIST_END) {
+            assert!(
+                in_suite_list,
+                "Linux workflow suite-list-end marker without a begin marker"
+            );
+            in_suite_list = false;
+            saw_end = true;
+            continue;
+        }
+        if !in_suite_list {
+            continue;
+        }
+
+        let command_part = line
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .replace('\\', " ");
+        for token in command_part.split_whitespace() {
+            let token = token.trim_matches(';');
+            if matches!(token, "for" | "suite" | "in" | "do") {
+                continue;
+            }
+            suites.insert(token.to_string());
+        }
+    }
+
+    assert!(
+        saw_begin,
+        "Linux workflow suite-list-begin marker is missing"
+    );
+    assert!(saw_end, "Linux workflow suite-list-end marker is missing");
+    assert!(
+        !in_suite_list,
+        "Linux workflow suite list marker block is unterminated"
+    );
+    assert!(
+        !suites.is_empty(),
+        "Linux workflow suite list marker block contains no suite names"
+    );
+    suites
 }
 
 /// Every `tests/*.rs` file, which is exactly the set cargo auto-discovers as
@@ -207,5 +285,24 @@ fn the_gated_set_is_exactly_the_known_host_touching_targets() {
          (update this list). REMOVING one means a suite that touches the host \
          nftables table, ownership lock or journal is now reachable from a plain \
          `cargo test`."
+    );
+}
+
+/// The workflow loop is the CI-side witness that every gated test binary
+/// actually appeared in the `cargo test --features test-isolation` run. It must
+/// stay equal to Cargo.toml's gated set, plus this ungated self-check target.
+#[test]
+fn linux_workflow_suite_ran_loop_matches_the_gated_target_set() {
+    let mut expected = gated_targets();
+    assert!(
+        expected.insert(WORKFLOW_LIST_EXTRA_TARGET.to_string()),
+        "the workflow's one documented extra target must not also be gated"
+    );
+    assert_eq!(
+        workflow_suite_targets(),
+        expected,
+        "the Linux workflow suite-ran loop must equal the Cargo.toml \
+         `test-isolation` gated target set, plus `test_isolation_gate` as the \
+         one documented extra self-check target"
     );
 }
