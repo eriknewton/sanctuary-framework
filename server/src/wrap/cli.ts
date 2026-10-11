@@ -690,11 +690,15 @@ export function isWrapCliRefusal(
 export function wrapCliRefusalExitCode(
   err: ExplicitLocalIntelligenceRefusal | AgentGuidedRecoveryStagingRefusal,
 ): number {
+  if (typeof process.exitCode === "number" && process.exitCode !== 0) {
+    return process.exitCode;
+  }
   return err instanceof ExplicitLocalIntelligenceRefusal ? err.exitCode : 1;
 }
 
 interface LocalIntelligenceWrapResult {
   explicitRefusal?: ExplicitLocalIntelligenceRefusal;
+  unexpectedError?: unknown;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -2552,7 +2556,9 @@ async function maybeRunAutoProvisionForWrap(
 
 /**
  * Run the same additive P1 ceremony used by `sanctuary init`. Any refusal is
- * loud but cannot undo or fail the cooperative wrap that already completed.
+ * loud but cannot undo the cooperative wrap that already completed; explicit
+ * failures are carried back to the caller so cleanup and terminal reporting
+ * finish before the caller chooses the final exit.
  */
 async function maybeRunLocalIntelligenceForWrap(
   storage: FilesystemStorage,
@@ -2609,10 +2615,38 @@ async function maybeRunLocalIntelligenceForWrap(
     // the original error preserves the stack and avoids relabeling a defect as
     // an actionable local-intelligence decline.
     if (options.provisionLocalIntelligence === true) {
-      throw err;
+      return { unexpectedError: err };
     }
   }
   return {};
+}
+
+async function flushBeforeDeferredLocalIntelligenceExit(
+  auditLog: AuditLog | undefined,
+  result: LocalIntelligenceWrapResult,
+): Promise<void> {
+  if (!auditLog || (!result.explicitRefusal && result.unexpectedError === undefined)) {
+    return;
+  }
+  try {
+    await auditLog.flush();
+  } catch (err) {
+    if (result.unexpectedError === undefined) throw err;
+    // The setup error remains the crash cause; replacing it with a late flush
+    // error would hide the original stack the operator and tests need.
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `  WARNING: audit log flush before local-intelligence crash exit failed ` +
+        `(${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
+}
+
+function throwDeferredLocalIntelligenceExit(
+  result: LocalIntelligenceWrapResult,
+): never {
+  if (result.explicitRefusal) throw result.explicitRefusal;
+  throw result.unexpectedError;
 }
 
 async function exitAfterDeferredAutoProvisionSignal(
@@ -5095,8 +5129,15 @@ export async function runWrap(
           `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
       );
     }
-    if (ndLocalIntelligenceResult.explicitRefusal) {
-      throw ndLocalIntelligenceResult.explicitRefusal;
+    if (
+      ndLocalIntelligenceResult.explicitRefusal ||
+      ndLocalIntelligenceResult.unexpectedError !== undefined
+    ) {
+      await flushBeforeDeferredLocalIntelligenceExit(
+        ndAuditLog,
+        ndLocalIntelligenceResult,
+      );
+      throwDeferredLocalIntelligenceExit(ndLocalIntelligenceResult);
     }
     return;
   }
@@ -5379,7 +5420,12 @@ export async function runWrap(
   // boot path is now the single production writer/clearer of runtime.json,
   // so the race is resolved by construction (asserted in
   // test/wrap/protect-ensure-dashboard.test.ts).
-  const dashboardUrl = ensuredDashboard?.url;
+  const deferredLocalIntelligenceExit =
+    wrapLocalIntelligenceResult.explicitRefusal !== undefined ||
+    wrapLocalIntelligenceResult.unexpectedError !== undefined;
+  const dashboardUrl = deferredLocalIntelligenceExit
+    ? undefined
+    : ensuredDashboard?.url;
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -5425,7 +5471,7 @@ export async function runWrap(
     // terminal-final success surface, not only the mid-flow warning.
     pinnedVersionResolvability: pinResolvability,
   });
-  if (wrapLocalIntelligenceResult.explicitRefusal) {
+  if (deferredLocalIntelligenceExit) {
     try {
       await stopTransientCastleWallDaemonForAutoProvision();
     } catch (err) {
@@ -5435,7 +5481,11 @@ export async function runWrap(
           `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
       );
     }
-    throw wrapLocalIntelligenceResult.explicitRefusal;
+    await flushBeforeDeferredLocalIntelligenceExit(
+      wrapAuditLog,
+      wrapLocalIntelligenceResult,
+    );
+    throwDeferredLocalIntelligenceExit(wrapLocalIntelligenceResult);
   }
 }
 

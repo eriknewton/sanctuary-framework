@@ -11,7 +11,27 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
+const castleWallMocks = vi.hoisted(() => {
+  const stop = vi.fn(async () => undefined);
+  return {
+    stop,
+    startMacOSCastleWallDaemon: vi.fn(async () => ({ stop })),
+  };
+});
+
+vi.mock("../../src/castle-wall/runtime/index.js", () => ({
+  startMacOSCastleWallDaemon: castleWallMocks.startMacOSCastleWallDaemon,
+  isLinuxProducerSignedActivationRequested: () => false,
+}));
+
+import { AuditLog } from "../../src/operational/audit-log.js";
+import {
+  __resetProcessShutdownStateForTest,
+  ExplicitLocalIntelligenceRefusal,
+  runWrap,
+  wrapCliRefusalExitCode,
+  type RunWrapDeps,
+} from "../../src/wrap/cli.js";
 import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import {
   agreeingHermesParity,
@@ -21,6 +41,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+const AGENT_GUIDED_NOT_ARMED_EXIT_CODE = 2;
 
 describe("runWrap explicit local-intelligence continuation", () => {
   let tmpHome: string;
@@ -39,6 +60,11 @@ describe("runWrap explicit local-intelligence continuation", () => {
     process.exitCode = undefined;
     process.env.HOME = tmpHome;
     process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+    castleWallMocks.stop.mockClear();
+    castleWallMocks.startMacOSCastleWallDaemon.mockClear();
+    castleWallMocks.startMacOSCastleWallDaemon.mockResolvedValue({
+      stop: castleWallMocks.stop,
+    });
     installHermesParityHook(agreeingHermesParity);
     const hermesDir = join(tmpHome, ".hermes");
     await mkdir(hermesDir, { recursive: true });
@@ -47,7 +73,9 @@ describe("runWrap explicit local-intelligence continuation", () => {
   });
 
   afterEach(async () => {
+    __resetProcessShutdownStateForTest();
     stderrSpy.mockRestore();
+    vi.restoreAllMocks();
     clearHermesParityHook();
     process.exitCode = originalExitCode;
     if (originalHome === undefined) delete process.env.HOME;
@@ -102,6 +130,89 @@ describe("runWrap explicit local-intelligence continuation", () => {
     expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
   });
 
+  it("flushes the no-dashboard audit log after provisioning before surfacing an explicit refusal", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const order: string[] = [];
+    const originalFlush = AuditLog.prototype.flush;
+    vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (
+      this: AuditLog,
+    ): Promise<void> {
+      order.push("flush");
+      return originalFlush.apply(this);
+    });
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      order.push("auto-provision");
+      return {
+        ran: true,
+        outcome: {
+          kind: "skipped-non-tty-cooperative-only",
+          reason: "test non-interactive provisioning skip",
+        },
+      };
+    });
+
+    await expect(
+      runWrap(
+        {
+          hermes: true,
+          noOpen: true,
+          noDashboard: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          runAutoProvisionForWrap,
+          runLocalIntelligenceSetup: async () => ({ kind: "refused", reason: "non_tty" }),
+        }),
+      ),
+    ).rejects.toThrow("--provision-local-intelligence was explicitly requested");
+
+    expect(order.lastIndexOf("flush")).toBeGreaterThan(order.indexOf("auto-provision"));
+  });
+
+  it("finishes no-dashboard continuation before surfacing an unexpected explicit setup error", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const localError = new TypeError("synthetic local-intelligence failure");
+    const order: string[] = [];
+    const originalFlush = AuditLog.prototype.flush;
+    vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (
+      this: AuditLog,
+    ): Promise<void> {
+      order.push("flush");
+      return originalFlush.apply(this);
+    });
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      order.push("auto-provision");
+      return {
+        ran: true,
+        outcome: {
+          kind: "skipped-non-tty-cooperative-only",
+          reason: "test non-interactive provisioning skip",
+        },
+      };
+    });
+
+    await expect(
+      runWrap(
+        {
+          hermes: true,
+          noOpen: true,
+          noDashboard: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          runAutoProvisionForWrap,
+          runLocalIntelligenceSetup: async () => {
+            throw localError;
+          },
+        }),
+      ),
+    ).rejects.toBe(localError);
+
+    expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+    expect(order.lastIndexOf("flush")).toBeGreaterThan(order.indexOf("auto-provision"));
+    expect(castleWallMocks.stop).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps an interactive declined local-intelligence prompt on the normal dashboard path", async () => {
     Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
@@ -147,5 +258,39 @@ describe("runWrap explicit local-intelligence continuation", () => {
         }),
       ),
     ).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it("does not open or announce an owned dashboard before surfacing an explicit refusal", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const openBrowser = vi.fn(async () => {});
+
+    await expect(
+      runWrap(
+        {
+          hermes: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          openBrowser,
+          runAutoProvisionForWrap: async () => ({ ran: true }),
+          runLocalIntelligenceSetup: async () => ({ kind: "refused", reason: "pull_failed" }),
+          startOwnedDashboard: async () => ({ url: "http://127.0.0.1:3501", port: 3501 }),
+          probeDashboardHealth: async () => false,
+        }),
+      ),
+    ).rejects.toThrow("--provision-local-intelligence was explicitly requested");
+
+    expect(openBrowser).not.toHaveBeenCalled();
+    expect(stderrSpy.mock.calls.flat().join("\n")).not.toContain(
+      "Sovereignty Dashboard running at",
+    );
+  });
+
+  it("preserves an existing specific refusal exit code", () => {
+    process.exitCode = AGENT_GUIDED_NOT_ARMED_EXIT_CODE;
+
+    expect(
+      wrapCliRefusalExitCode(new ExplicitLocalIntelligenceRefusal("non_tty")),
+    ).toBe(AGENT_GUIDED_NOT_ARMED_EXIT_CODE);
   });
 });
