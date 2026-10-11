@@ -12,6 +12,10 @@ import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateLinuxInstallAgentIdScopes } from "../allowlist/confined-agent-id.js";
 import {
+  formatBoundedDiagnosticList,
+  formatBoundedDiagnosticValue,
+} from "../allowlist/bounded-diagnostic-text.js";
+import {
   publishSignedManifest,
   type BuildSignedManifestInput,
   type ManifestStorage,
@@ -124,9 +128,12 @@ export function inspectLinuxPolicyCompatibility(
 export function assertLinuxPolicyCompatibility(rules: readonly AllowlistRule[]): void {
   const issues = inspectLinuxPolicyCompatibility(rules);
   if (issues.length === 0) return;
-  const summary = issues
-    .map((issue) => `${issue.ruleId}:${issue.axis} (${issue.reason})`)
-    .join("; ");
+  const summary = formatBoundedDiagnosticList(
+    issues,
+    (issue) =>
+      // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+      `${formatBoundedDiagnosticValue(issue.ruleId)}:${formatBoundedDiagnosticValue(issue.axis)} (${issue.reason})`,
+  );
   throw new RuntimeLinuxActivationError(
     `Castle Wall Linux policy is incompatible with ${LINUX_IP_CIDR_POLICY_PROFILE.id}: ${summary}`,
     "policy_incompatible"

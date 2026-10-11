@@ -6,10 +6,16 @@ import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js
 import { CURATED_ALLOWLIST } from "../../../src/castle-wall/runtime/curated-allowlist.js";
 import {
   LINUX_IP_CIDR_POLICY_PROFILE,
+  assertLinuxPolicyCompatibility,
   inspectLinuxPolicyCompatibility,
   publishLinuxCompatiblePolicy,
 } from "../../../src/castle-wall/runtime/linux-policy-compatibility.js";
 import type { ManifestStorage } from "../../../src/castle-wall/runtime/manifest-publisher.js";
+
+const TEST_DIAGNOSTIC_TEXT_CAP = 8 * 8;
+const TEST_MAX_LISTED_OFFENDERS = 8;
+const TEST_LONG_TEXT_LENGTH = TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP;
+const TEST_OFFENDER_COUNT = 10 ** 3;
 
 function rule(overrides: Partial<AllowlistRule> = {}): AllowlistRule {
   return {
@@ -31,7 +37,10 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     // this test is a full-field parity tripwire, not a general Rust parser.
     const block = rustSource.match(/pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/)?.groups?.body;
     expect(block).toBeDefined();
-    const rustScopeFields = [...block!.matchAll(/^\s*pub\s+([a-z_][a-z0-9_]*)\s*:/gm)]
+    expect(block).not.toMatch(/#\s*\[\s*serde\s*\([^)]*\brename\s*=/);
+    const rustScopeFields = [
+      ...block!.matchAll(/^\s*pub(?:\s*\([^)]*\))?\s+([a-z_][a-z0-9_]*)\s*:/gm),
+    ]
       .map((match) => match[1])
       .sort();
     expect(rustScopeFields).toEqual(["agent_ids", "template_ids"]);
@@ -44,6 +53,15 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(profile.supported_scope_axes).toEqual(["agent_ids"]);
     expect(profile.scope_axis_subset_reason).toContain("template_ids");
     expect(profile.scope_axis_subset_reason).toContain("template attestation");
+  });
+
+  it("refuses empty scope.uids because the daemon refuses unknown scope fields", () => {
+    expect(inspectLinuxPolicyCompatibility([rule({ scope: { uids: [] } })])).toEqual([
+      expect.objectContaining({
+        axis: "scope.uids",
+        reason: expect.stringContaining("not modeled by the Linux daemon"),
+      }),
+    ]);
   });
 
   it("publishes an explicit, usable IP/CIDR profile and accepts both destination forms", () => {
@@ -114,6 +132,34 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
   });
 
+  it("keeps Linux compatibility refusal diagnostics within the display budget", () => {
+    const longRuleId = "rule-" + "r".repeat(TEST_LONG_TEXT_LENGTH);
+    const longAxis = "axis-" + "a".repeat(TEST_LONG_TEXT_LENGTH);
+    const issues = Array.from({ length: TEST_OFFENDER_COUNT }, (_, index) =>
+      rule({
+        id: index === 0 ? longRuleId : `extra-${index}`,
+        scope:
+          index === 0
+            ? ({ [longAxis]: [] } as AllowlistRule["scope"])
+            : ({ [`axis-${index}`]: [] } as AllowlistRule["scope"]),
+      })
+    );
+
+    let message = "";
+    try {
+      assertLinuxPolicyCompatibility(issues);
+    } catch (error) {
+      message = String((error as Error).message);
+    }
+
+    expect(message).toContain(`original length ${longRuleId.length}`);
+    expect(message).toContain(`original length ${`scope.${longAxis}`.length}`);
+    expect(message).toContain(`and ${TEST_OFFENDER_COUNT - TEST_MAX_LISTED_OFFENDERS} more`);
+    expect(message).not.toContain(longRuleId);
+    expect(message).not.toContain(`scope.${longAxis}`);
+    expect(message.length).toBeLessThan(TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP);
+  });
+
   it("refuses macOS-only uid scopes before broker publication signing", async () => {
     const sign = vi.fn(() => new Uint8Array(64));
     const storage: ManifestStorage = {
@@ -169,6 +215,46 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(sign).not.toHaveBeenCalled();
     expect(storage.writeRule).not.toHaveBeenCalled();
     expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
+  });
+
+  it("keeps confined-agent refusal diagnostics within the display budget", async () => {
+    const longRuleId = "rule-" + "r".repeat(TEST_LONG_TEXT_LENGTH);
+    const longAgentId = "agent-" + "a".repeat(TEST_LONG_TEXT_LENGTH);
+    const sign = vi.fn(() => new Uint8Array(64));
+    const storage: ManifestStorage = {
+      writeRule: vi.fn(async () => undefined),
+      atomicRenameManifest: vi.fn(async () => undefined),
+      listRules: vi.fn(async () => []),
+      removeRule: vi.fn(async () => undefined),
+    };
+
+    let message = "";
+    try {
+      await publishLinuxCompatiblePolicy(
+        {
+          fortressId: "deadbeef",
+          issuedAt: "2026-09-03T00:00:00Z",
+          generation: 1,
+          rules: [rule({ id: longRuleId, scope: { agent_ids: [longAgentId] } })],
+          agentOrigin: {
+            mode: "uid",
+            agent_uid: 60123,
+            system_uid_allow_ceiling: 1000,
+          },
+          signer: { signingKeyId: "sha256:" + "11".repeat(32), sign },
+        },
+        storage
+      );
+    } catch (error) {
+      message = String((error as Error).message);
+    }
+
+    expect(message).toContain(`original length ${longRuleId.length}`);
+    expect(message).toContain(`original length ${JSON.stringify(longAgentId).length}`);
+    expect(message).not.toContain(longRuleId);
+    expect(message).not.toContain(longAgentId);
+    expect(message.length).toBeLessThan(TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP);
+    expect(sign).not.toHaveBeenCalled();
   });
 
   it("refuses a broker publication scope naming the gate uid before signing", async () => {
