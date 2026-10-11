@@ -41,9 +41,12 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(declaration).toBeDefined();
     // Comment lines are dropped so prose inside the struct can never read as a field or an attribute.
     const block = declaration!.body.replace(/^\s*\/\/.*$/gm, "");
-    // Any serde option that changes accepted wire names makes field identifiers stop matching the
+    // The serde options that rename, alias or merge fields make field identifiers stop matching the
     // JSON keys the daemon admits, so the tripwire refuses them rather than modelling each form.
+    // This is a narrow tripwire on single-line attributes, not a serde model; the daemon itself
+    // still fails closed on any key it does not model because of `deny_unknown_fields`.
     const wireNameOption = /#\s*\[\s*serde\s*\([^\]]*\b(?:rename|rename_all|alias|flatten)\b/;
+    expect(declaration!.attrs).toMatch(/#\s*\[\s*serde\s*\([^\]]*\bdeny_unknown_fields\b/);
     expect(declaration!.attrs).not.toMatch(wireNameOption);
     expect(block).not.toMatch(wireNameOption);
     // Every field counts, public or not: serde deserializes private fields too.
