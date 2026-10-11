@@ -71,7 +71,7 @@ async function startOnFreePort(
     ...options,
     port: EPHEMERAL_PORT,
   });
-  return { dashboard, port: dashboardBoundPort(dashboard) };
+  return await dashboardWithBoundPort(dashboard);
 }
 
 describe("Slice 2: park-not-exit (server lifecycle)", () => {
@@ -457,6 +457,64 @@ function dashboardBoundPort(dashboard: DashboardApprovalChannel): number {
   }
   return address.port;
 }
+
+async function dashboardWithBoundPort(
+  dashboard: DashboardApprovalChannel,
+): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
+  try {
+    return { dashboard, port: dashboardBoundPort(dashboard) };
+  } catch (err) {
+    // The helper owns a started listener until the port read-back succeeds;
+    // a failed read-back must close it so later tests can bind cleanly.
+    await dashboard.stop().catch(() => {});
+    throw err;
+  }
+}
+
+describe("Slice 2: park test helper lifecycle", () => {
+  it("closes the dashboard listener if the ephemeral port read-back throws", async () => {
+    const { Server } = await import("node:net");
+    const originalAddress = Server.prototype.address;
+    const originalHome = process.env.HOME;
+    const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    const originalToken = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    const originalVitest = process.env.VITEST;
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-slice2-park-readback-"));
+    const storagePath = join(root, "tenant");
+    const readBackError = new Error("forced dashboard port read-back failure");
+    let startedServer: import("node:net").Server | null = null;
+
+    try {
+      process.env.VITEST = "true";
+      process.env.HOME = root;
+      process.env.SANCTUARY_STORAGE_PATH = storagePath;
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "park-readback-stop";
+      await seedWrappedFortress(storagePath);
+
+      Server.prototype.address = function patchedAddress(this: import("node:net").Server) {
+        startedServer = this;
+        throw readBackError;
+      };
+
+      await expect(
+        startOnFreePort({ host: "127.0.0.1", allowPark: true }),
+      ).rejects.toThrow(readBackError.message);
+    } finally {
+      Server.prototype.address = originalAddress;
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+      if (originalToken === undefined) delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+      else process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = originalToken;
+      if (originalVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = originalVitest;
+    }
+
+    expect((startedServer as import("node:net").Server | null)?.listening).toBe(false);
+  });
+});
 
 describe("Slice 2: user-domain LaunchAgent plist", () => {
   const validArgs = [
