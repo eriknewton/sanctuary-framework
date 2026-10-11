@@ -11,6 +11,8 @@
 //!
 //! This target is deliberately NOT gated, so a plain `cargo test` runs it. It
 //! reads files and spawns nothing, so it is safe on every host.
+//! The same file also owns the Linux CI witness-loop parity check, so the
+//! feature-gated binaries are proven to have appeared in the CI log.
 //!
 //! Failure mode this catches, stated as the operator sees it: none. A missing
 //! gate is silent on macOS and destroys an operator's live enforcement table on
@@ -20,10 +22,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-// Marker strings must match the suite-list-begin/end comments in
-// ../.github/workflows/castle-wall-linux.yml.
+// Marker strings must match the suite-list-begin/end comments in the repo-root
+// path .github/workflows/castle-wall-linux.yml.
 const WORKFLOW_SUITE_LIST_BEGIN: &str = "# suite-list-begin:";
 const WORKFLOW_SUITE_LIST_END: &str = "# suite-list-end:";
+const WORKFLOW_SUITE_RAN_GREP: &str = r#"grep -q "Running tests/$suite.rs""#;
 const WORKFLOW_LIST_EXTRA_TARGET: &str = "test_isolation_gate";
 
 /// Source substrings that prove a target can reach a host-global object: the
@@ -99,46 +102,140 @@ fn gated_targets() -> BTreeSet<String> {
 fn workflow_suite_targets() -> BTreeSet<String> {
     let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
     let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
+    workflow_suite_targets_from_str(&workflow)
+}
+
+fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum WorkflowSuiteLoopState {
+        Outside,
+        InList,
+        InBody,
+    }
+
+    fn parse_suite_list_lines(lines: &[String]) -> BTreeSet<String> {
+        assert!(
+            !lines.is_empty(),
+            "Linux workflow suite list marker block contains no suite names"
+        );
+        assert!(
+            lines
+                .first()
+                .expect("suite list lines already known non-empty")
+                .starts_with("for suite in"),
+            "Linux workflow suite list must start with `for suite in`"
+        );
+
+        let mut suites = BTreeSet::new();
+        let Some((last_line, earlier_lines)) = lines.split_last() else {
+            unreachable!("empty suite list was rejected before split_last")
+        };
+
+        for line in earlier_lines {
+            assert!(
+                !line.contains('#'),
+                "Linux workflow suite list must not contain comments"
+            );
+            assert!(
+                line.ends_with('\\'),
+                "every non-final Linux workflow suite list line must end with a backslash"
+            );
+        }
+        assert!(
+            !last_line.contains('#'),
+            "Linux workflow suite list must not contain comments"
+        );
+        assert!(
+            last_line.ends_with("; do"),
+            "final Linux workflow suite list line must end with `; do`"
+        );
+
+        for (index, line) in lines.iter().enumerate() {
+            let mut command_part = line.as_str();
+            if index == 0 {
+                command_part = command_part
+                    .strip_prefix("for suite in")
+                    .expect("first suite list line was checked above");
+            }
+            if index + 1 == lines.len() {
+                command_part = command_part
+                    .strip_suffix("; do")
+                    .expect("final suite list line was checked above");
+            } else {
+                command_part = command_part
+                    .strip_suffix('\\')
+                    .expect("non-final suite list line was checked above");
+            }
+            for token in command_part.split_whitespace() {
+                suites.insert(token.to_string());
+            }
+        }
+        suites
+    }
+
     let mut suites = BTreeSet::new();
-    let mut in_suite_list = false;
+    let mut suite_list_lines = Vec::new();
+    let mut state = WorkflowSuiteLoopState::Outside;
     let mut saw_begin = false;
     let mut saw_end = false;
+    let mut saw_body_grep = false;
+    let mut saw_body_exit = false;
+    let mut saw_loop_done = false;
 
     for raw_line in workflow.lines() {
         let line = raw_line.trim();
         if line.contains(WORKFLOW_SUITE_LIST_BEGIN) {
             assert!(
-                !in_suite_list,
-                "nested Linux workflow suite-list-begin marker"
+                !saw_begin,
+                "more than one Linux workflow suite-list-begin marker"
             );
-            in_suite_list = true;
+            assert!(
+                state == WorkflowSuiteLoopState::Outside,
+                "Linux workflow suite-list-begin marker must start a loop list"
+            );
+            state = WorkflowSuiteLoopState::InList;
             saw_begin = true;
             continue;
         }
         if line.contains(WORKFLOW_SUITE_LIST_END) {
             assert!(
-                in_suite_list,
+                !saw_end,
+                "more than one Linux workflow suite-list-end marker"
+            );
+            assert!(
+                state == WorkflowSuiteLoopState::InList,
                 "Linux workflow suite-list-end marker without a begin marker"
             );
-            in_suite_list = false;
+            suites = parse_suite_list_lines(&suite_list_lines);
+            state = WorkflowSuiteLoopState::InBody;
             saw_end = true;
             continue;
         }
-        if !in_suite_list {
-            continue;
-        }
 
-        let command_part = line
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .replace('\\', " ");
-        for token in command_part.split_whitespace() {
-            let token = token.trim_matches(';');
-            if matches!(token, "for" | "suite" | "in" | "do") {
+        match state {
+            WorkflowSuiteLoopState::Outside => continue,
+            WorkflowSuiteLoopState::InList => {
+                suite_list_lines.push(line.to_string());
+            }
+            WorkflowSuiteLoopState::InBody => {
+                if line == "done" {
+                    assert!(
+                        saw_body_grep && saw_body_exit,
+                        "Linux workflow suite-ran loop body must fail the step when a suite is absent"
+                    );
+                    saw_loop_done = true;
+                    state = WorkflowSuiteLoopState::Outside;
+                    continue;
+                }
+                if line.starts_with(WORKFLOW_SUITE_RAN_GREP) && line.contains("|| {") {
+                    saw_body_grep = true;
+                    continue;
+                }
+                if saw_body_grep && line == "exit 1" {
+                    saw_body_exit = true;
+                }
                 continue;
             }
-            suites.insert(token.to_string());
         }
     }
 
@@ -148,14 +245,107 @@ fn workflow_suite_targets() -> BTreeSet<String> {
     );
     assert!(saw_end, "Linux workflow suite-list-end marker is missing");
     assert!(
-        !in_suite_list,
+        state != WorkflowSuiteLoopState::InList,
         "Linux workflow suite list marker block is unterminated"
+    );
+    assert!(
+        saw_loop_done,
+        "Linux workflow suite-ran loop must close after the marker block"
     );
     assert!(
         !suites.is_empty(),
         "Linux workflow suite list marker block contains no suite names"
     );
     suites
+}
+
+#[test]
+fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
+    let cases = [
+        (
+            "second marker pair",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+          # suite-list-begin:
+          for suite in integration_kernel_binding; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+"#,
+        ),
+        (
+            "header separated from body check",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation integration_kernel_binding; do
+          # suite-list-end:
+            true
+          done
+          for suite in integration_linux_runtime_activation; do
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+"#,
+        ),
+        (
+            "body without witness check",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            true
+          done
+"#,
+        ),
+        (
+            "comment inside suite list",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation \
+          # integration_kernel_binding
+                       integration_dns_bypass; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+"#,
+        ),
+        (
+            "missing continuation backslash",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation
+                       integration_kernel_binding; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+"#,
+        ),
+    ];
+
+    let mut accepted = Vec::new();
+    for (name, workflow) in cases {
+        if std::panic::catch_unwind(|| workflow_suite_targets_from_str(workflow)).is_ok() {
+            accepted.push(name);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "workflow suite-loop parser accepted invalid fixture shapes: {:?}",
+        accepted
+    );
 }
 
 /// Every `tests/*.rs` file, which is exactly the set cargo auto-discovers as

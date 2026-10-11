@@ -202,8 +202,8 @@ jobs:
           # Question 2 is not implied by question 1: a `required-features` target
           # that is not selected is silently absent from the run, and cargo still
           # exits 0 having tested nothing on that path. Keep this list equal to the
-          # gated set in castle-wall-daemon/Cargo.toml; `tests/test_isolation_gate.rs`
-          # pins that set from the other side.
+          # gated set in castle-wall-daemon/Cargo.toml plus test_isolation_gate;
+          # linux_workflow_suite_ran_loop_matches_the_gated_target_set enforces it.
           # The guard greps PLAIN text. Cargo colours its "Running" banner when
           # CARGO_TERM_COLOR is set (the job env sets it), which puts an escape
           # sequence between "Running" and the path and makes every grep below
