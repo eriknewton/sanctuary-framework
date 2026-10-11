@@ -21,7 +21,12 @@ import {
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { establishMaster } from "../../src/core/master-custody.js";
+import {
+  CUSTODY_WRITE_LOCK_NAMESPACE,
+  MASTER_ROTATION_BARRIER_NAME,
+  establishMaster,
+  withCustodyWriteLock,
+} from "../../src/core/master-custody.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
@@ -45,6 +50,10 @@ import {
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
+import {
+  CrossProcessLockError,
+  withExclusiveMasterRotationBarrier,
+} from "../../src/storage/cross-process-lock.js";
 
 /**
  * Drives the Linux producer-signed activation's REPORTED completeness for the
@@ -84,6 +93,10 @@ vi.mock("../../src/castle-wall/runtime/index.js", async (importOriginal) => {
     },
   };
 });
+
+const ONE_EVENT_LOOP_TURN_MS = 50;
+const LOCK_ORDER_SETTLE_MS = 150;
+const SHORT_LOCK_TIMEOUT_MS = 250;
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -125,8 +138,29 @@ describe("castle-wall CLI verbs", () => {
       recoveryKey,
       storagePathHint: fortressPath,
     });
-    custody.masterKey.fill(0);
+    await custody.masterWriteBarrier?.release(); custody.masterKey.fill(0);
     return { fortressPath, masterKey, recoveryKey };
+  }
+
+  async function attemptProvisionCustodyLock(
+    storage: FilesystemStorage,
+    timeoutMs: number,
+  ): Promise<"ran" | "blocked"> {
+    try {
+      await withCustodyWriteLock(
+        storage,
+        async () => undefined,
+        { metadata: { owner: "provision-pin-order-probe" }, timeoutMs },
+      );
+      return "ran";
+    } catch (error) {
+      if (error instanceof CrossProcessLockError) return "blocked";
+      throw error;
+    }
+  }
+
+  async function waitForTurn(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ONE_EVENT_LOOP_TURN_MS));
   }
 
   /**
@@ -1078,10 +1112,16 @@ describe("castle-wall CLI verbs", () => {
     await runInit(
       { fortress: fortressPath, noConfirm: true },
       {
-        provisionPin: (argv, ctx) => runProvisionPinAlreadyLocked(argv, {
-          ...ctx,
-          globalPinnedPublicKeyPath: join(globalDir, "castle-pinned-pubkey.bin"),
-        }),
+        provisionPin: (argv, ctx) => {
+          if (ctx?.__resolvedProvisionMasterKey === undefined) {
+            throw new Error("test provision seam requires an established master");
+          }
+          return runProvisionPinAlreadyLocked(argv, {
+            ...ctx,
+            __resolvedProvisionMasterKey: ctx.__resolvedProvisionMasterKey,
+            globalPinnedPublicKeyPath: join(globalDir, "castle-pinned-pubkey.bin"),
+          });
+        },
       },
     );
 
@@ -1247,6 +1287,57 @@ describe("castle-wall CLI verbs", () => {
       await expect(first).resolves.toBe(0);
     });
 
+    it.runIf(process.platform === "darwin" || process.platform === "linux")(
+      "waits on the rotation barrier before taking the custody write lock",
+      async () => {
+        const { fortressPath, recoveryKey } = await makeFortress();
+        const storage = new FilesystemStorage(join(fortressPath, "state"));
+        let pin: Promise<number> | undefined;
+        await withExclusiveMasterRotationBarrier(
+          storage,
+          CUSTODY_WRITE_LOCK_NAMESPACE,
+          MASTER_ROTATION_BARRIER_NAME,
+          async () => {
+            pin = runProvisionPin([], {
+              out: new CaptureStream(),
+              err: new CaptureStream(),
+              env: {
+                SANCTUARY_STORAGE_PATH: fortressPath,
+                SANCTUARY_RECOVERY_KEY: recoveryKey,
+              },
+              globalPinnedPublicKeyPath: await makeGlobalPinDir(),
+            });
+            await new Promise((resolve) => setTimeout(resolve, LOCK_ORDER_SETTLE_MS));
+            expect(await attemptProvisionCustodyLock(storage, SHORT_LOCK_TIMEOUT_MS))
+              .toBe("ran");
+          },
+          { timeoutMs: SHORT_LOCK_TIMEOUT_MS },
+        );
+
+        expect(pin).toBeDefined();
+        await expect(pin!).resolves.toBe(0);
+      },
+    );
+
+    it("already-locked provision-pin requires the caller to transfer the master", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const err = new CaptureStream();
+      const code = await runProvisionPinAlreadyLocked([], {
+        out: new CaptureStream(),
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_RECOVERY_KEY: recoveryKey,
+        },
+        globalPinnedPublicKeyPath: await makeGlobalPinDir(),
+      } as never);
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("already-authenticated master");
+      await expect(stat(join(fortressPath, "castle-pinned-privkey.enc")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    });
+
     it("never mints custody when no stored provision-pin credential exists", async () => {
       const { fortressPath } = await makeFortress();
       const err = new CaptureStream();
@@ -1264,7 +1355,7 @@ describe("castle-wall CLI verbs", () => {
 
       expect(code).toBe(1);
       expect(observe).toHaveBeenCalledOnce();
-      expect(err.text()).toMatch(/read-only.*will not mint/i);
+      expect(err.text()).toMatch(/Accepted credentials, in the order they are tried[\s\S]*Refusing to continue with a credential that does not verify/);
       await expect(stat(join(fortressPath, "castle-pinned-privkey.enc")))
         .rejects.toMatchObject({ code: "ENOENT" });
     });
@@ -1525,6 +1616,208 @@ describe("castle-wall audit-chain operator override", () => {
       operation: e.operation,
     }));
   }
+
+  it("scrubs transferred masters on provision-pin argument refusal", async () => {
+    for (const run of [
+      (master: Uint8Array) => runProvisionPin(["--fortress"], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        __resolvedProvisionMasterKey: master,
+      }),
+      (master: Uint8Array) => runProvisionPinAlreadyLocked(["--fortress"], {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        __resolvedProvisionMasterKey: master,
+      }),
+    ]) {
+      const master = generateRandomKey();
+      expect(await run(master)).toBe(2);
+      expect(master).toEqual(new Uint8Array(master.length));
+    }
+  });
+
+  it("scrubs transferred masters when relative fortress resolution cannot continue", async () => {
+    const originalCwd = process.cwd();
+    const removedCwd = await mkdtemp(join(tmpdir(), "sanctuary-cw-removed-cwd-"));
+    try {
+      process.chdir(removedCwd);
+      await rm(removedCwd, { recursive: true, force: true });
+
+      for (const run of [
+        (master: Uint8Array) => runProvisionPin(["--fortress", "relative-fortress"], {
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+          __resolvedProvisionMasterKey: master,
+        }),
+        (master: Uint8Array) => runProvisionPinAlreadyLocked(["--fortress", "relative-fortress"], {
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+          __resolvedProvisionMasterKey: master,
+        }),
+      ]) {
+        const master = generateRandomKey();
+        let thrown: unknown;
+        let code: number | undefined;
+        try {
+          code = await run(master);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(master).toEqual(new Uint8Array(master.length));
+        expect(thrown).toBeUndefined();
+        expect(code).toBe(1);
+      }
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it("scrubs the resolved custody key when provision-pin establishment refuses", async () => {
+    const { fortressPath } = await makeFortress();
+    const custodyKey = generateRandomKey();
+
+    const code = await runProvisionPin([], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      __testResolveProvisionCustodyCredential: async () => ({
+        status: "resolved" as const,
+        credential: {
+          source: "enrolled-custody-key" as const,
+          kind: "keychain-key" as const,
+          keychainKey: custodyKey,
+          location: "test-custody-store",
+          displaySource: "test-custody-store",
+        },
+        report: {
+          found: ["enrolled-custody-key" as const],
+          rejected: [],
+          indeterminate: [],
+          details: {},
+          integrityIndeterminate: false,
+          envelopePresent: true,
+          noCustodyStateAtAll: false,
+          custodyKeyUnverifiable: false,
+          enrolledCustodyKeyItem: "found" as const,
+        },
+      }),
+    });
+
+    expect(code).toBe(1);
+    expect(custodyKey).toEqual(new Uint8Array(custodyKey.length));
+  });
+
+  it("scrubs the established provision-pin master when the holder is gone", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    let establishedMaster: Uint8Array | undefined;
+
+    const code = await runProvisionPin([], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      __testResolveProvisionCustodyCredential: async () => ({
+        status: "resolved" as const,
+        credential: {
+          source: "env-recovery-key" as const,
+          kind: "recovery-key" as const,
+          recoveryKey,
+          location: "SANCTUARY_RECOVERY_KEY",
+          displaySource: "SANCTUARY_RECOVERY_KEY",
+        },
+        report: {
+          found: ["env-recovery-key" as const],
+          rejected: [],
+          indeterminate: [],
+          details: {},
+          integrityIndeterminate: false,
+          envelopePresent: true,
+          noCustodyStateAtAll: false,
+          custodyKeyUnverifiable: false,
+          enrolledCustodyKeyItem: "not-found" as const,
+        },
+      }),
+      __testAfterProvisionMasterResolved: (masterKey: Uint8Array) => {
+        establishedMaster = masterKey;
+        throw new Error("test holder stopped before pin publication");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(establishedMaster).toBeDefined();
+    expect(establishedMaster).toEqual(new Uint8Array(establishedMaster!.length));
+  });
+
+  it("provision-pin opens with the enrolled custody factor when no invocation credential is supplied", async () => {
+    const { verifyRecoveryWrapByReentry } = await import("../../src/core/master-custody.js");
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-enrolled-pin-"));
+    tempDirs.push(fortressPath);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const custodyKey = generateRandomKey();
+    const established = await establishMaster({
+      storage,
+      keychainKey: custodyKey,
+      firstRun: { installMode: "interactive", mintRecoveryKey: true },
+      storagePathHint: fortressPath,
+    });
+    await verifyRecoveryWrapByReentry(
+      storage,
+      established.envelope!,
+      established.mintedRecoveryKey!,
+    );
+    await established.masterWriteBarrier?.release();
+    established.masterKey.fill(0);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    let resolvedOptions: { storagePath?: string; allowMint?: boolean } | undefined;
+    const resolveProvisionCustody = vi.fn(async (options: { storagePath?: string; allowMint?: boolean }) => {
+      resolvedOptions = options;
+      return {
+        status: "resolved" as const,
+        credential: {
+          source: "enrolled-custody-key" as const,
+          kind: "keychain-key" as const,
+          keychainKey: custodyKey,
+          location: "test-custody-store",
+          displaySource: "test-custody-store",
+        },
+        report: {
+          found: ["enrolled-custody-key" as const],
+          rejected: [],
+          indeterminate: [],
+          details: {},
+          integrityIndeterminate: false,
+          envelopePresent: true,
+          noCustodyStateAtAll: false,
+          custodyKeyUnverifiable: false,
+          enrolledCustodyKeyItem: "found" as const,
+        },
+      };
+    });
+    const code = await runProvisionPin([], {
+      out,
+      err,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      globalPinnedPublicKeyPath: join(fortressPath, "test-global-pin.bin"),
+      __testObserveStoredPassphrase: vi.fn(async () => ({
+        status: "absent",
+        keyringUnreachable: false,
+      }) as const),
+      __testResolveProvisionCustodyCredential: resolveProvisionCustody,
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    expect(resolveProvisionCustody).toHaveBeenCalledOnce();
+    expect(resolvedOptions).toMatchObject({
+      storagePath: fortressPath,
+      allowMint: false,
+    });
+    const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+    expect(pub.length).toBe(32);
+    expect(out.text().trim()).toBe(createHash("sha256").update(pub).digest("hex").slice(0, 16));
+    expect([...custodyKey]).toEqual(Array.from({ length: custodyKey.length }, () => 0));
+  });
 
   it("re-pin refuses on a broken chain without --accept-broken-chain (unchanged default)", async () => {
     const { fortressPath, masterKey, recoveryKey } = await makeFortress();

@@ -18,7 +18,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const castleWallMocks = vi.hoisted(() => ({
-  runProvisionPin: vi.fn(async () => 0),
+  runProvisionPin: vi.fn(
+    async (
+      _argv: string[],
+      _ctx: { __resolvedProvisionMasterKey?: Uint8Array; env?: NodeJS.ProcessEnv },
+    ) => 0,
+  ),
   startMacOSCastleWallDaemon: vi.fn(async () => ({
     stop: async () => {},
   })),
@@ -324,15 +329,11 @@ describe("fresh-install onboarding smoke", () => {
     expect(openedUrls).toEqual([`http://127.0.0.1:${assignedPort}`]);
     expect(v11BindingsSet).toBe(false);
     expect(loopbackAutoAuth).toBeUndefined();
-    expect(castleWallMocks.runProvisionPin).toHaveBeenCalledWith(
-      [],
-      expect.objectContaining({
-        env: expect.objectContaining({
-          SANCTUARY_STORAGE_PATH: fortressPath,
-          SANCTUARY_PASSPHRASE: WRAP_PASSPHRASE,
-        }),
-      }),
-    );
+    expect(castleWallMocks.runProvisionPin).toHaveBeenCalledOnce();
+    const pinCtx = castleWallMocks.runProvisionPin.mock.calls[0]?.[1];
+    expect(pinCtx?.__resolvedProvisionMasterKey).toBeInstanceOf(Uint8Array);
+    expect(pinCtx?.env).toMatchObject({ SANCTUARY_STORAGE_PATH: fortressPath });
+    expect(pinCtx?.env).not.toHaveProperty("SANCTUARY_PASSPHRASE");
     expect(castleWallMocks.startMacOSCastleWallDaemon).toHaveBeenCalledWith(
       expect.objectContaining({ fortressPath }),
     );
