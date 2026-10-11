@@ -37,20 +37,25 @@ final class HeadlessFilterCLITests: XCTestCase {
     // the NE preference, so it refuses lease flags rather than accepting a
     // value it would silently discard (ic-sweep-headless-ttl-flags-effective).
     func testParseRefusesLeaseTTLFlags() {
-        for flag in ["--ttl=300", "--ttl", "--ttl=0", "--no-ttl"] {
-            let result = HeadlessFilterCLI.parse(["app", "--headless", "enable", flag])
-            guard case let .usageError(message)? = result else {
-                XCTFail("expected usageError for \(flag), got \(String(describing: result))")
-                continue
-            }
-            XCTAssertTrue(
-                message.hasPrefix("unsupported flag: "),
-                "lease flag \(flag) must be refused as unsupported, got: \(message)"
-            )
-            XCTAssertTrue(message.contains(flag), "refusal must name \(flag): \(message)")
-            XCTAssertTrue(
-                message.contains("sanctuary castle-wall enable"),
-                "refusal must point at the CLI that owns the lease: \(message)"
+        // Each case: (argv after the action, the token the refusal must name).
+        // The two-token form is refused on `--ttl` itself, before `300` is
+        // ever read as a second positional.
+        let cases: [([String], String)] = [
+            (["--ttl=300"], "--ttl=300"),
+            (["--ttl"], "--ttl"),
+            (["--ttl=0"], "--ttl=0"),
+            (["--no-ttl"], "--no-ttl"),
+            (["--ttl", "300"], "--ttl"),
+        ]
+        for (trailing, refusedToken) in cases {
+            let result = HeadlessFilterCLI.parse(["app", "--headless", "enable"] + trailing)
+            let expected = "unsupported flag: \(refusedToken) (the dead-man lease TTL is set by "
+                + "'sanctuary castle-wall enable --ttl <duration>|--no-ttl', "
+                + "not by the headless host app)"
+            XCTAssertEqual(
+                result,
+                .usageError(expected),
+                "lease argv \(trailing) must be refused with the full unsupported-flag message"
             )
         }
     }
