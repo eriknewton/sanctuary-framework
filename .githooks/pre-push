@@ -167,8 +167,11 @@ fail() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$RED" "$1" "$NC" 
 ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC" >&2; }
 
 # ── Counter validation (fail CLOSED) ────────────────────────────────
-# The vitest-derived counters (`actual_total`, `passing`) are extracted from
-# vitest's text output with `grep -oE "[0-9]+"`. The capture is *shaped* like a
+# The vitest-derived Test Files counter (`actual_total`) is extracted from
+# vitest's text output with `grep -oE "[0-9]+"`. (The passing count no longer
+# goes through this function: it is compared only through the shared
+# compare_counts, which has no digit ceiling and no arithmetic overflow; see
+# "Shared count helpers" below.) The capture is *shaped* like a
 # non-negative integer, but two pathological inputs are still possible and both
 # would corrupt the arithmetic guards downstream:
 #
@@ -286,6 +289,20 @@ fi
 # Resolve repo root (allows hook to run from any subdirectory).
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
+
+# ── Shared count helpers ─────────────────────────────────────────────
+# INVARIANT: every count this hook compares (the pushed floor, the previous
+# floor, the parsed passing count) goes through compare_counts from
+# scripts/parse-vitest-summary.sh, never through (( )). Bash arithmetic is
+# signed 64-bit and wraps silently, so a long enough count could compare equal
+# to the floor; the shared string comparison has no overflow and no digit
+# ceiling. Must match the Gate 2c comparison in
+# .github/workflows/test-baseline-guard.yml, which sources the same helpers.
+# Sourcing only defines functions (the script returns before it parses).
+# FAILURE MODE: a missing or unreadable script fails the hook closed here
+# under `set -e`, before any floor is read.
+source scripts/parse-vitest-summary.sh
+VITEST_SUMMARY_ERROR_PREFIX="[baseline-guard] "
 
 # ── Collect every non-delete ref update ──────────────────────────────
 # Every ref on stdin is collected here (not just the first). A deletion
@@ -461,7 +478,7 @@ if [[ -z "$baseline" ]]; then
   printf '[baseline-guard]   Create it with a single integer (the current passing count) and commit it.\n' >&2
   exit 1
 fi
-if ! [[ "$baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+if ! is_canonical_count "$baseline"; then
   fail "committed .test-baseline ($local_sha:.test-baseline) is not a single integer, got: '$baseline'"
   exit 1
 fi
@@ -527,12 +544,22 @@ for _i in "${!non_delete_local_refs[@]}"; do
     prev_floor_source="freshly fetched main of remote '$push_remote_name'"
   fi
 
-  if [[ -z "$prev_floor" ]] || ! [[ "$prev_floor" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  if [[ -z "$prev_floor" ]] || ! is_canonical_count "$prev_floor"; then
     fail "$prev_floor_source's .test-baseline is unreadable - push blocked"
     exit 1
   fi
 
-  if (( baseline < prev_floor )); then
+  if ! floor_relation=$(compare_counts "$baseline" "$prev_floor"); then
+    fail "could not compare the pushed .test-baseline with the previous floor - push blocked"
+    exit 1
+  fi
+  # Continuing paths: only "eq" and "gt" reach the next ref; anything other
+  # than the three named relations is refused rather than read as a pass.
+  case "$floor_relation" in
+    lt|eq|gt) ;;
+    *) fail "unknown floor comparison result '$floor_relation' - push blocked"; exit 1 ;;
+  esac
+  if [[ "$floor_relation" == "lt" ]]; then
     fail "PUSHED .test-baseline IS BELOW THE PREVIOUS FLOOR - push blocked"
     printf '[baseline-guard]   Previous floor (%s): %s\n' "$prev_floor_source" "$prev_floor" >&2
     printf '[baseline-guard]   Pushed .test-baseline:                     %s\n' "$baseline" >&2
@@ -593,7 +620,7 @@ set -e
 # capture.
 # FAILURE MODE: if the shared strip itself fails, the hook says so and blocks;
 # it never falls through to parsing the raw, possibly-colored capture.
-source scripts/parse-vitest-summary.sh
+# (The script was sourced once, right after the cd to the repo root above.)
 if ! test_output=$(printf '%s\n' "$test_output" | strip_ansi); then
   fail "Could not strip ANSI escape sequences from the vitest output - push blocked"
   exit 1
@@ -722,8 +749,11 @@ validate_counter "Test Files count" "$actual_total"
 # INVARIANT: the passing count parser is shared with
 # .github/workflows/test-baseline-guard.yml through
 # scripts/parse-vitest-summary.sh, whose header must match this caller pin.
-# The script strips ANSI and requires exactly one summary-shaped line, so the
+# The script strips ANSI, requires exactly one summary-shaped line holding
+# exactly one count, and prints only a canonical count of any length, so the
 # local hook and CI read the same count instead of keeping separate regexes.
+# The count is then compared only through the shared compare_counts (no digit
+# ceiling, no (( )) on the count), matching Gate 2c in the workflow.
 set +e
 passing=$(
   VITEST_SUMMARY_ERROR_PREFIX="[baseline-guard] " \
@@ -734,13 +764,22 @@ set -e
 if (( parse_passing_status != 0 )); then
   exit 1
 fi
-validate_counter "passing-test count" "$passing"
+if ! passing_relation=$(compare_counts "$passing" "$baseline"); then
+  fail "could not compare the passing-test count with the committed floor - push blocked"
+  exit 1
+fi
+# Continuing paths: "eq" passes, "gt" passes with the macOS carve-out warning
+# below; anything other than the three named relations is refused.
+case "$passing_relation" in
+  lt|eq|gt) ;;
+  *) fail "unknown passing-count comparison result '$passing_relation' - push blocked"; exit 1 ;;
+esac
 
-if (( passing < baseline )); then
+if [[ "$passing_relation" == "lt" ]]; then
   fail "TEST BASELINE REGRESSION - push blocked"
   printf '[baseline-guard]   Committed floor (%s:.test-baseline): %s\n' "$local_sha" "$baseline" >&2
   printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
-  printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
+  printf '[baseline-guard]   Regression: %s tests\n' "$(count_difference "$baseline" "$passing")" >&2
   printf '\n' >&2
   fail "Fix the regression, or bump .test-baseline in an explicitly-scoped"
   fail "commit explaining why, then push again."
@@ -758,8 +797,8 @@ fi
 # fails outright on `passing > baseline` with no carve-out, so a real
 # unaccounted new test is still caught before merge even though this local
 # hook let the push through.
-if (( passing > baseline )); then
-  warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
+if [[ "$passing_relation" == "gt" ]]; then
+  warn "Passing count ($passing) exceeds the committed floor ($baseline) by $(count_difference "$passing" "$baseline")."
   warn "This is expected on macOS when platform-gated suites that skip on Linux run"
   warn "locally; it can also mean a new test was added without bumping .test-baseline."
   warn "This local hook does not distinguish the two - if you added tests, bump"

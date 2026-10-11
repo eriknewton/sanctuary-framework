@@ -52,8 +52,13 @@ jobs:
             exit 1
           fi
           baseline=$(tr -d '[:space:]' < .test-baseline)
-          if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
-            echo "::error::.test-baseline must contain a single integer, got: '$baseline'"
+          # Must match is_canonical_count in scripts/parse-vitest-summary.sh
+          # (sourced here, so the floor's shape rule has one source): digits
+          # only, no leading zero, any length. A leading zero is refused
+          # because bash arithmetic elsewhere would read it as octal.
+          source scripts/parse-vitest-summary.sh
+          if ! is_canonical_count "$baseline"; then
+            echo "::error::.test-baseline must contain a single canonical non-negative integer (digits only, no leading zero), got: '$baseline'"
             exit 1
           fi
           echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
@@ -218,17 +223,26 @@ jobs:
         run: |
           baseline="${{ steps.baseline.outputs.baseline }}"
           # Must match the caller pin in .githooks/pre-push and the header in
-          # scripts/parse-vitest-summary.sh: the shared parser strips ANSI and
-          # requires exactly one Vitest summary line.
+          # scripts/parse-vitest-summary.sh: the shared parser strips ANSI,
+          # requires exactly one Vitest summary line holding exactly one count,
+          # and prints only a canonical count of any length.
           passing=$(VITEST_SUMMARY_ERROR_STYLE=github bash scripts/parse-vitest-summary.sh /tmp/vitest-output.log)
-          if ! [[ "$passing" =~ ^(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Parsed passing-test count is not a non-negative integer: '$passing'"
+          # INVARIANT: the counts are compared only through compare_counts
+          # from the same script (must match the hook's "Shared count
+          # helpers" block in .githooks/pre-push), never with (( )): bash
+          # arithmetic is signed 64-bit and wraps silently, so a long enough
+          # count could compare equal to the floor and print success. The
+          # string comparison has no digit ceiling and no overflow; a
+          # non-canonical or empty operand is refused with a named error.
+          source scripts/parse-vitest-summary.sh
+          if ! relation=$(VITEST_SUMMARY_ERROR_STYLE=github compare_counts "$passing" "$baseline"); then
+            echo "::error::Could not compare the passing-test count '$passing' with the baseline floor '$baseline'."
             exit 1
           fi
           echo "Baseline floor: $baseline"
           echo "Passing tests:  $passing"
-          if (( passing < baseline )); then
-            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
+          if [[ "$relation" == "lt" ]]; then
+            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $(count_difference "$baseline" "$passing") tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
             exit 1
           fi
           # Fail-above (mirror of the pre-commit hook): a passing count
@@ -237,8 +251,12 @@ jobs:
           # under the gap - the extra passing tests mask the loss until
           # the floor is finally bumped. The fix is mechanical: set
           # .test-baseline to the new count in this PR.
-          if (( passing > baseline )); then
-            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $((passing - baseline)) new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+          if [[ "$relation" == "gt" ]]; then
+            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $(count_difference "$passing" "$baseline") new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+            exit 1
+          fi
+          if [[ "$relation" != "eq" ]]; then
+            echo "::error::compare_counts returned an unknown relation '$relation'; refusing to pass."
             exit 1
           fi
           echo "✓ Baseline guard passed."
