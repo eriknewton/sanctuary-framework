@@ -77,7 +77,7 @@ describe("runCortexExportCommand: arg-parse (no fortress touched)", () => {
       env: {},
     });
     expect(code).toBe(2);
-    expect(err.text()).toMatch(/Unknown cortex-export command: frobnicate/);
+    expect(err.text()).toMatch(/Unknown cortex-export command: <argument not shown>/);
   });
 });
 

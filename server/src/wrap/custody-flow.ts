@@ -253,6 +253,16 @@ function valueAfterLabel(content: string, label: string): string | null {
   return index >= 0 ? lines[index + 1]?.trim() ?? null : null;
 }
 
+export class AgentGuidedRecoveryStagingRefusal extends Error {
+  constructor(readonly filePath: string) {
+    super(
+      `Sanctuary protect refused: recovery staging file is not an authenticated interrupted handoff: ${filePath}\n` +
+        "Move the file aside after confirming it is not the interrupted handoff you meant to resume, then rerun. Sanctuary did not overwrite or delete it.",
+    );
+    this.name = "AgentGuidedRecoveryStagingRefusal";
+  }
+}
+
 async function resumeAuthenticatedAgentRecoveryFile(input: {
   filePath: string;
   envelope: CustodyEnvelope;
@@ -281,9 +291,7 @@ async function resumeAuthenticatedAgentRecoveryFile(input: {
   const recoveryKey = valueAfterLabel(content, "Recovery key:");
   const receipt = valueAfterLabel(content, "Recovery staging receipt:");
   if (!recoveryKey || !receipt || !RECOVERY_KEY_VALUE.test(recoveryKey)) {
-    throw new Error(
-      `Existing agent-guided recovery file is not an authenticated interrupted handoff: ${input.filePath}`,
-    );
+    throw new AgentGuidedRecoveryStagingRefusal(input.filePath);
   }
   const expected = stagedRecoveryReceipt(
     input.envelope,
@@ -298,9 +306,7 @@ async function resumeAuthenticatedAgentRecoveryFile(input: {
     receiptMatches = false;
   }
   if (!receiptMatches) {
-    throw new Error(
-      `Existing agent-guided recovery file is not an authenticated interrupted handoff: ${input.filePath}`,
-    );
+    throw new AgentGuidedRecoveryStagingRefusal(input.filePath);
   }
   const prepared = prepareRecoveryWrapWithKey(
     input.envelope,

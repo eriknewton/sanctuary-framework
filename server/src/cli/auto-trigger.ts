@@ -43,7 +43,7 @@ import {
   NotifyOperatorAction,
 } from "../auto-trigger/action-dispatcher.js";
 import { CalibrationSuggester } from "../auto-trigger/calibration-suggester.js";
-import { flagValue } from "./argv.js";
+import { flagValue, argvTokenForDisplay } from "./argv.js";
 import {
   AutoTriggerError,
   type AutoTriggerRuleType,
@@ -80,7 +80,7 @@ export async function runAutoTriggerCommand(
       case "cancel":
         return await cmdCancel(rest, { out, err });
       default:
-        err.write(`Unknown subcommand: ${sub}\n`);
+        err.write(`Unknown subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -206,7 +206,7 @@ async function cmdRecommendations(
       return 0;
     }
     default:
-      ctx.err.write(`Unknown recommendations subcommand: ${sub}\n`);
+      ctx.err.write(`Unknown recommendations subcommand: ${argvTokenForDisplay(sub)}\n`);
       return 2;
   }
 }
@@ -236,7 +236,7 @@ async function cmdRules(
     case "set-threshold":
       return await cmdRulesSetThreshold(argv.slice(1), ctx);
     default:
-      ctx.err.write(`Unknown rules subcommand: ${sub}\n`);
+      ctx.err.write(`Unknown rules subcommand: ${argvTokenForDisplay(sub)}\n`);
       return 2;
   }
 }

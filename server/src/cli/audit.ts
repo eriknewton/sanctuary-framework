@@ -19,6 +19,7 @@ import {
   consumeFlagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 export interface AuditCommandArgs {
@@ -65,7 +66,7 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
   }
 
   if (sub !== "search") {
-    write(err, `Unknown audit command: ${sub}\n`);
+    write(err, `Unknown audit command: ${argvTokenForDisplay(sub)}\n`);
     printUsage(err);
     return 2;
   }
@@ -237,7 +238,7 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
     } else if (arg.startsWith("--passphrase=")) {
       passphrase = arg.slice("--passphrase=".length);
     } else {
-      throw new Error(`unknown option: ${arg}`);
+      throw new Error(`unknown option: ${argvTokenForDisplay(arg)}`);
     }
   }
   return { types, since, until, actor, requestId, limit, json, fortress, passphrase };

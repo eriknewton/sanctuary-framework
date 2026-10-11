@@ -45,6 +45,7 @@ import {
   consumeFlagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 /**
@@ -387,7 +388,7 @@ export async function runIntelligenceCommand(
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.error(`Unknown intelligence subcommand: ${subcommand}`);
+  console.error(`Unknown intelligence subcommand: ${argvTokenForDisplay(subcommand)}`);
   printHelp();
   return 2;
 }
@@ -785,7 +786,7 @@ export async function runIntelligenceConfigReset(
   }
   const unknown = resolved.argv.filter((arg) => arg.startsWith("-"));
   if (unknown.length > 0) {
-    print(`Unknown option(s) for config-reset: ${unknown.join(" ")}`);
+    print(`Unknown option(s) for config-reset: ${unknown.map(argvTokenForDisplay).join(" ")}`);
     printIntelligenceConfigResetHelp(print);
     return CONFIG_RESET_EXIT.USAGE;
   }

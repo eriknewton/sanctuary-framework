@@ -26,6 +26,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { NIST_CROSSWALK_V1, coverageStats } from "./crosswalk.js";
 import { renderNistCrosswalk } from "./generator.js";
+import { argvTokenForDisplay } from "../../cli/argv.js";
 
 interface NistCliOptions {
   help: boolean;
@@ -47,7 +48,7 @@ function parseArgs(args: string[]): NistCliOptions {
         i++;
         break;
       default:
-        throw new Error(`Unknown flag: "${flag}"`);
+        throw new Error(`Unknown flag: "${argvTokenForDisplay(flag)}"`);
     }
   }
   return opts;

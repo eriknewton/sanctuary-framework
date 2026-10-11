@@ -40,6 +40,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 export interface Erc8004CommandArgs {
@@ -115,7 +116,7 @@ export async function runErc8004Command(
   if (command === "status") {
     return await cmdStatus(argv.slice(1), out, err);
   }
-  write(err, `Unknown erc8004 command: ${command}\n`);
+  write(err, `Unknown erc8004 command: ${argvTokenForDisplay(command)}\n`);
   write(err, `Run "sanctuary erc8004 --help" for usage.\n`);
   return 2;
 }

@@ -55,7 +55,7 @@ import {
   type FortressCustodyFsOps,
   type FortressWalkResult,
 } from "../castle-wall/provision/fortress-custody.js";
-import { consumeFlagValue } from "./argv.js";
+import { consumeFlagValue, argvTokenForDisplay } from "./argv.js";
 import { appendCastleWallCliAuditBestEffort } from "./castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
 
@@ -223,7 +223,7 @@ export async function runRepairCustody(
   if (parsed.unknown !== undefined) {
     write(
       err,
-      `Unknown argument: ${parsed.unknown}. Usage: sudo sanctuary castle-wall repair-custody [--fortress <path>] [--rollback <manifest>]\n`,
+      `Unknown argument: ${argvTokenForDisplay(parsed.unknown)}. Usage: sudo sanctuary castle-wall repair-custody [--fortress <path>] [--rollback <manifest>]\n`,
     );
     return REPAIR_CUSTODY_EXIT_REFUSED;
   }
