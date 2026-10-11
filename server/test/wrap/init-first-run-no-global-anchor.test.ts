@@ -33,6 +33,8 @@ import { runInit, resolveNoPin, type InitOptions, type RunInitDeps } from "../..
 import { runProvisionPinAlreadyLocked } from "../../src/cli/castle-wall.js";
 import {
   CASTLE_WALL_NOT_YET_WALLED,
+  castleWallLocalPlatformSubject,
+  castleWallNotYetWalledSentence,
   castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../../src/castle-wall/provision-state.js";
@@ -155,9 +157,23 @@ describe("sanctuary init: a machine that already carries a Castle Wall anchor", 
     // And in words an operator on their first run can act on, with no
     // trust-anchor vocabulary.
     expect(output).toContain("your vault is created");
-    expect(output).toContain("not yet on the Castle Wall of this Mac");
+    expect(output).toContain(
+      `not yet on the Castle Wall of ${castleWallLocalPlatformSubject(process.platform)}`,
+    );
     expect(output).not.toContain("trust anchor");
     expect(output).not.toContain("provision-pin");
+  });
+
+  it("uses this machine in not-yet-walled text on Linux while keeping the darwin bytes", () => {
+    expect(castleWallNotYetWalledSentence("linux")).toContain(
+      "This vault is not yet on the Castle Wall of this machine.",
+    );
+    expect(castleWallNotYetWalledSentence("linux")).not.toContain("this Mac");
+    expect(castleWallNotYetWalledSentence("darwin")).toBe(
+      "This vault is not yet on the Castle Wall of this Mac. Turning the wall on " +
+        "for this vault is the installer's next step; until then this vault's " +
+        "agents are not filtered by this vault's policy.",
+    );
   });
 
   it("accepts --no-pin and SANCTUARY_INIT_NO_PIN, and changes nothing either way", async () => {
