@@ -1022,6 +1022,14 @@ async function readManifestBytesBounded(bundleDir: string): Promise<Uint8Array> 
     return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
   } catch (err) {
     const failureClass = mapBundleReadFailureClass(err);
+    if (failureClass === "artifact_missing") {
+      // Operators rely on the exact missing-manifest wording, while callers
+      // still need the typed class introduced by the shared read chokepoint.
+      throw new InvalidExitBundleError(
+        `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: manifest.json missing at ${manifestPath}`,
+        failureClass,
+      );
+    }
     throw new InvalidExitBundleError(
       `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: ${EXIT_MANIFEST_FILE_NAME} could not be loaded: ${failureClass}`,
       failureClass,
