@@ -116,6 +116,7 @@ import {
   flagValues,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
@@ -525,7 +526,7 @@ export async function runObserveCommand(
     case "discard":
       return runObserveDiscard(rest, ctx);
     default:
-      write(err, `Unknown observe command: ${command}\n`);
+      write(err, `Unknown observe command: ${argvTokenForDisplay(command)}\n`);
       printUsage(err);
       return 2;
   }

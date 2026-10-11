@@ -68,6 +68,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 export interface CortexExportCommandArgs {
@@ -331,7 +332,7 @@ export async function runCortexExportCommand(args: CortexExportCommandArgs): Pro
     return await cmdRun(rest, out, err, env);
   }
 
-  write(err, `Unknown cortex-export command: ${command}\n`);
+  write(err, `Unknown cortex-export command: ${argvTokenForDisplay(command)}\n`);
   write(err, `Run "sanctuary cortex-export --help" for usage.\n`);
   return 2;
 }

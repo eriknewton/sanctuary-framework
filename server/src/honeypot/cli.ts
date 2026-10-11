@@ -66,7 +66,7 @@ import {
   hashOfEnglishDraft,
 } from "./honeypot-compiler.js";
 import { TrapRegistry } from "./trap-registry.js";
-import { flagValue } from "../cli/argv.js";
+import { flagValue, argvTokenForDisplay } from "../cli/argv.js";
 
 export interface HoneypotCliDeps {
   registry: TrapRegistry;
@@ -356,7 +356,7 @@ export async function runHoneypotCli(
     return 0;
   }
 
-  write(err, `Unknown subcommand: ${command}\n`);
+  write(err, `Unknown subcommand: ${argvTokenForDisplay(command)}\n`);
   return 2;
 }
 

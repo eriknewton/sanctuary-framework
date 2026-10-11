@@ -270,3 +270,75 @@ export function hasFlag(argv: string[], name: string): boolean {
 export function shellQuoteSingleArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
+
+/**
+ * Placeholder an operator-facing CLI refusal prints in place of an argv
+ * token it will not reproduce. Must match `ARGV_TOKEN_NOT_SHOWN` as pinned
+ * in test/cli/argv-token-display.test.ts.
+ */
+// Must match the "unknown option" refusal literal in
+// src/transparency/offline-cli.ts, which cannot import this module
+// (standalone verifier subset).
+export const ARGV_TOKEN_NOT_SHOWN = "<argument not shown>";
+
+/** A single lowercase short flag, `-x`: one letter carries no operator data. */
+const SINGLE_LOWERCASE_SHORT_FLAG = /^-[a-z]$/;
+
+/**
+ * Operator-facing rendering of an argv token that a parser or subcommand
+ * dispatcher refused as unrecognized. The one shared formatter for every
+ * such refusal in the CLI modules (server/src/cli/**, server/src/cli.ts,
+ * every server/src/**\/cli.ts, and server/src/transparency/offline-cli.ts),
+ * enforced as a full set by test/cli/argv-token-display.test.ts; this list
+ * must match the module filter in that test.
+ *
+ * An unrecognized token is never reproduced: the parser does not know what
+ * it is, and a value the operator meant for another flag, or any value typed
+ * in the wrong slot, can have any shape, including the shape of a
+ * long flag or of a verb. The only token printed is a single lowercase
+ * short flag. A refusal that wants to help may name a member of its own
+ * known flag or verb set instead; that text comes from the parser, not from
+ * argv.
+ *
+ * Scope of the guard in test/cli/argv-token-display.test.ts: refusals of
+ * unrecognized or unexpected tokens in the CLI modules, credential-named
+ * interpolations in literal-anchored string forms there (a template, a `+`
+ * chain with a literal operand, `format(...)` with a literal format string), and the "unexpected error" lines
+ * that use `caughtErrorForDisplay`. It does not cover a generic catch block
+ * that prints a callee's error message (such as the exit verbs' top-level
+ * catch); that text is the callee's, not a refusal of a token.
+ */
+export function argvTokenForDisplay(token: string | undefined): string {
+  if (token !== undefined && SINGLE_LOWERCASE_SHORT_FLAG.test(token)) return token;
+  return ARGV_TOKEN_NOT_SHOWN;
+}
+
+/**
+ * Built-in error constructors whose names are safe to print, most specific
+ * first. The printed text is the literal paired with each constructor here,
+ * never a property read from the caught value: `name` and `message` are both
+ * writable by whoever threw, so neither can carry operator-safe text.
+ */
+const BUILT_IN_ERROR_CLASSES: ReadonlyArray<readonly [ErrorConstructor, string]> = [
+  [TypeError, "TypeError"],
+  [RangeError, "RangeError"],
+  [SyntaxError, "SyntaxError"],
+  [ReferenceError, "ReferenceError"],
+  [URIError, "URIError"],
+  [EvalError, "EvalError"],
+  [Error, "Error"],
+];
+
+/**
+ * Operator-facing rendering of a caught value in an "unexpected error"
+ * refusal. Prints only a fixed class label chosen by `instanceof` against the
+ * built-in error constructors; a custom subclass prints as "Error", and a
+ * non-error value prints as "error". Nothing is read from the caught value
+ * itself, because a callee may have built its message or name from an argv token.
+ */
+export function caughtErrorForDisplay(cause: unknown): string {
+  for (const [ctor, label] of BUILT_IN_ERROR_CLASSES) {
+    if (cause instanceof ctor) return label;
+  }
+  return "error";
+}
