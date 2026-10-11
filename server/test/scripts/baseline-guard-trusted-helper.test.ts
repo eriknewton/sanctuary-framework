@@ -59,7 +59,14 @@ function gitEnv(): NodeJS.ProcessEnv {
 }
 
 function git(args: string[], cwd: string): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", env: gitEnv() }).trim();
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...gitEnv(),
+      VITEST: process.env.VITEST ?? "true",
+    },
+  }).trim();
 }
 
 /** A head-side helper that grades every count as equal to the floor. */
