@@ -273,7 +273,10 @@ async function main(): Promise<void> {
   if (owner && (!Number.isSafeInteger(owner.uid) || !Number.isSafeInteger(owner.gid))) {
     throw new Error("invalid directory-capability owner identity");
   }
-  const storage = new FilesystemStorage(".", owner ? { owner } : {});
+  const storage = new FilesystemStorage(".", {
+    ...(owner ? { owner } : {}),
+    allowDirectoryCapabilityRootNamespace: true,
+  });
   process.on("message", (raw: Request) => {
     void (async () => {
       try {

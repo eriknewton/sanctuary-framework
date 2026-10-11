@@ -74,8 +74,13 @@ import {
   cleanupFreshInitRecoveryResidue,
   restoreFreshFortressLockScaffold,
 } from "./fresh-fortress.js";
-
-const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
+import {
+  decodeStoragePathComponent,
+  encodeStoragePathComponent,
+  resolveEncodedStorageNamespacePath,
+  resolveStorageNamespacePath,
+  storageNamespacePathComponent,
+} from "./namespace-component.js";
 
 // Starting the source worker requires loading tsx; on a saturated host that
 // handshake can legitimately exceed two seconds even though the child is
@@ -84,17 +89,8 @@ const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 // shorter per-operation deadline used after admission.
 export const DIRECTORY_CAPABILITY_READY_TIMEOUT_MS = 15_000;
 
-function bijectiveEncode(name: string): string {
-  return name.replace(SAFE_CHARS, (ch) =>
-    "!" + ch.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase()
-  );
-}
-
-function bijectiveDecode(encoded: string): string {
-  return encoded.replace(/!([0-9A-Fa-f]{2})/g, (_match, hex) =>
-    String.fromCharCode(parseInt(hex, 16))
-  );
-}
+const bijectiveEncode = encodeStoragePathComponent;
+const bijectiveDecode = decodeStoragePathComponent;
 
 // Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
@@ -106,7 +102,7 @@ function legacyKeySanitize(name: string): string {
 }
 
 function encodedNamespacePath(basePath: string, namespace: string): string {
-  return join(basePath, bijectiveEncode(namespace));
+  return resolveStorageNamespacePath(basePath, namespace);
 }
 
 function stableFortressFilePath(root: string, value: string): string {
@@ -405,10 +401,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * parent or chown failure fails the write.
    */
   private owner: { uid: number; gid: number } | undefined;
+  private readonly allowDirectoryCapabilityRootNamespace: boolean;
 
-  constructor(basePath: string, options: { owner?: { uid: number; gid: number } } = {}) {
+  constructor(
+    basePath: string,
+    options: {
+      owner?: { uid: number; gid: number };
+      allowDirectoryCapabilityRootNamespace?: boolean;
+    } = {}
+  ) {
     this.basePath = basePath;
     this.owner = options.owner;
+    this.allowDirectoryCapabilityRootNamespace =
+      options.allowDirectoryCapabilityRootNamespace === true;
   }
 
   private activeBasePath(): string {
@@ -439,8 +444,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   private activeNamespacePath(namespace: string): string {
+    if (this.allowDirectoryCapabilityRootNamespace && namespace === ".") {
+      return this.activeBasePath();
+    }
     const bound = this.boundBasePath.getStore();
     if (bound?.lockedNamespace === namespace && bound.namespaceBasePath) {
+      storageNamespacePathComponent(namespace);
       return bound.namespaceBasePath;
     }
     return encodedNamespacePath(this.activeBasePath(), namespace);
@@ -484,6 +493,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // below onward, Linux paths are descriptor-relative and Darwin storage I/O
     // is delegated to a child whose cwd is that exact inode. A rename or
     // replacement of the lexical fortress root cannot redirect a mutation.
+    const namespaceComponent = storageNamespacePathComponent(namespace);
     await mkdir(this.basePath, { recursive: true, mode: 0o700 });
     await mkdir(encodedNamespacePath(this.basePath, namespace), {
       recursive: true,
@@ -526,7 +536,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           ? stat(join(descriptorParent, basename(this.basePath)))
           : lstat(this.basePath),
         host === "linux"
-          ? lstat(join(descriptorRoot, bijectiveEncode(namespace)))
+          ? lstat(join(descriptorRoot, namespaceComponent))
           : lstat(encodedNamespacePath(this.basePath, namespace)),
       ]);
       if (
@@ -1199,7 +1209,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     };
     for await (const dir of root) {
       chargeEntry();
-      const path = join(this.activeBasePath(), dir.name);
+      const path = resolveEncodedStorageNamespacePath(this.activeBasePath(), dir.name);
       if (!(await stat(path)).isDirectory()) continue;
       let hasEntries = false;
       // Propagate subdirectory failures too: skipping an unreadable namespace
@@ -1219,7 +1229,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       // pre-#41 sanitized directory names still surface — as their raw names
       // — and the rotation walker's unknown-namespace abort catches them
       // (fail closed) instead of silently skipping a namespace.
-      namespaces.push(bijectiveDecode(dir.name));
+      const namespace = bijectiveDecode(dir.name);
+      storageNamespacePathComponent(namespace);
+      namespaces.push(namespace);
     }
     return namespaces.sort();
   }
@@ -1232,7 +1244,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     try {
       const namespaces = await readdir(this.activeBasePath());
       for (const ns of namespaces) {
-        const nsPath = join(this.activeBasePath(), ns);
+        const nsPath = resolveEncodedStorageNamespacePath(this.activeBasePath(), ns);
         const nsStat = await stat(nsPath);
         if (!nsStat.isDirectory()) continue;
 
@@ -1243,8 +1255,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           total += fileStat.size;
         }
       }
-    } catch {
-      // If base path doesn't exist yet, total is 0
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // If base path doesn't exist yet, total is 0
+        return 0;
+      }
+      throw error;
     }
 
     return total;

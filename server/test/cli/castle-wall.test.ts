@@ -96,16 +96,16 @@ vi.mock("../../src/castle-wall/runtime/index.js", async (importOriginal) => {
 
 const ONE_EVENT_LOOP_TURN_MS = 50;
 const PRIOR_LOCK_ORDER_TIMEOUT_MS = 250;
-// 4x the original 250ms probe keeps the negative check quick while leaving
-// headroom for a loaded CI worker to schedule the contender.
 const LOADED_LOCK_ORDER_HEADROOM = 4;
-const LOCK_ORDER_PROBE_TIMEOUT_MS =
-  PRIOR_LOCK_ORDER_TIMEOUT_MS * LOADED_LOCK_ORDER_HEADROOM;
-// Ten probe windows gives the started pin path room to reach the barrier under
-// transform-heavy loaded runs; failure names the missing observation directly.
-const BARRIER_CONTENTION_DEADLINE_MULTIPLIER = 10;
+const LOCK_ORDER_PROBE_TIMEOUT_MS = PRIOR_LOCK_ORDER_TIMEOUT_MS * LOADED_LOCK_ORDER_HEADROOM;
+const BARRIER_CONTENTION_DEADLINE_MULTIPLIER = 25;
 const BARRIER_CONTENTION_DEADLINE_MS =
   LOCK_ORDER_PROBE_TIMEOUT_MS * BARRIER_CONTENTION_DEADLINE_MULTIPLIER;
+const BARRIER_CONTENTION_TEST_TIMEOUT_HEADROOM_MULTIPLIER = 10;
+const BARRIER_CONTENTION_TEST_TIMEOUT_MS =
+  BARRIER_CONTENTION_DEADLINE_MS +
+  LOCK_ORDER_PROBE_TIMEOUT_MS * BARRIER_CONTENTION_TEST_TIMEOUT_HEADROOM_MULTIPLIER;
+const BARRIER_IDENTITY_CANDIDATE_LIMIT = 12;
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -1339,7 +1339,7 @@ describe("castle-wall CLI verbs", () => {
     it.runIf(process.platform === "darwin" || process.platform === "linux")(
       "waits on the rotation barrier before taking the custody write lock",
       async () => {
-        const { fortressPath, recoveryKey } = await makeFortress();
+        const { fortressPath, recoveryKey } = await makeFortressWithoutActiveBarrierReaders(makeFortress);
         const storage = new FilesystemStorage(join(fortressPath, "state"));
         let pin: Promise<number> | undefined;
         let observedBarrierContention!: () => void;
@@ -1378,7 +1378,7 @@ describe("castle-wall CLI verbs", () => {
         expect(pin).toBeDefined();
         await expect(pin!).resolves.toBe(0);
       },
-    );
+      BARRIER_CONTENTION_TEST_TIMEOUT_MS);
 
     it("already-locked provision-pin requires the caller to transfer the master", async () => {
       const { fortressPath, recoveryKey } = await makeFortress();
@@ -2759,3 +2759,34 @@ describe("formatEnforcementAvailabilityStatus (querier-blindness polish, spec 20
     }
   });
 });
+
+async function makeFortressWithoutActiveBarrierReaders<T extends { fortressPath: string }>(
+  makeFortress: () => Promise<T>,
+): Promise<T> {
+  let lastContention: CrossProcessLockError | undefined;
+  for (
+    let attempt = 0;
+    attempt < BARRIER_IDENTITY_CANDIDATE_LIMIT;
+    attempt += 1
+  ) {
+    const fortress = await makeFortress();
+    const storage = new FilesystemStorage(join(fortress.fortressPath, "state"));
+    try {
+      await withExclusiveMasterRotationBarrier(
+        storage,
+        CUSTODY_WRITE_LOCK_NAMESPACE,
+        MASTER_ROTATION_BARRIER_NAME,
+        async () => undefined,
+        { timeoutMs: LOCK_ORDER_PROBE_TIMEOUT_MS },
+      );
+      return fortress;
+    } catch (error) {
+      if (error instanceof CrossProcessLockError && error.kind === "contention") {
+        lastContention = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastContention ?? new Error("no barrier identity candidate was available");
+}

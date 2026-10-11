@@ -17,6 +17,7 @@ import type {
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "./interface.js";
+import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
 export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
@@ -32,6 +33,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     operation: (lease: CrossProcessLockLease) => Promise<T>,
     _options: CrossProcessLockOptions = {},
   ): Promise<T> {
+    assertStorageNamespacePathComponent(namespace);
     const identity = `${namespace.length}:${namespace}${lockFileName}`;
     const predecessor = this.namespaceLockTails.get(identity) ?? Promise.resolve();
     let release!: () => void;
@@ -51,6 +53,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   }
 
   private storageKey(namespace: string, key: string): string {
+    assertStorageNamespacePathComponent(namespace);
     return `${namespace}/${key}`;
   }
 
@@ -139,6 +142,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
   }
 
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+    assertStorageNamespacePathComponent(namespace);
     const entries: StorageEntryMeta[] = [];
     const nsPrefix = `${namespace}/`;
 

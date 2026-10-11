@@ -682,10 +682,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
     //      stateStore.read worked).
     //   2. No staged-import or rekey-temp namespace exists on the
     //      destination storage.
-    const namespaces = await destination.storage.list("");
-    const namespaceNames = new Set(
-      namespaces.map((m) => m.namespace).filter(Boolean),
-    );
+    const namespaceNames = new Set(await destination.storage.listNamespaces());
     for (const namespace of namespaceNames) {
       // Reject any namespace that suggests un-rekeyed source state.
       expect(namespace).not.toMatch(/_staging$|_rekey_temp$|_source_keys$/);
