@@ -295,6 +295,13 @@ const SINGLE_LOWERCASE_SHORT_FLAG = /^-[a-z]$/;
  * short flag. A refusal that wants to help may name a member of its own
  * known flag or verb set instead; that text comes from the parser, not from
  * argv.
+ *
+ * Scope of the guard in test/cli/argv-token-display.test.ts: refusals of
+ * unrecognized or unexpected tokens in the CLI modules, credential-named
+ * interpolations in any string form there, and the "unexpected error" lines
+ * that use `caughtErrorForDisplay`. It does not cover a generic catch block
+ * that prints a callee's error message (such as the exit verbs' top-level
+ * catch); that text is the callee's, not a refusal of a token.
  */
 export function argvTokenForDisplay(token: string | undefined): string {
   if (token !== undefined && SINGLE_LOWERCASE_SHORT_FLAG.test(token)) return token;

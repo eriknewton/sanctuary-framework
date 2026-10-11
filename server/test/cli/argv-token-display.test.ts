@@ -10,6 +10,16 @@
  * wrong slot can look exactly like a long flag or a verb. The only token
  * printed is a single lowercase short flag.
  *
+ * Scope. Covered: every refusal of an unrecognized or unexpected token in the
+ * CLI modules (src/cli/**, src/cli.ts, every src/**\/cli.ts, and the offline
+ * transparency verifier); every interpolation of a credential-named
+ * identifier in any string form in those modules (template, `+`
+ * concatenation, `format(...)`); and the "unexpected error" lines in
+ * cli/federation.ts and cli/nodes.ts. NOT covered: a generic catch block that
+ * prints whatever message a callee threw (for example the exit verbs'
+ * top-level catch, recorded in OUT_OF_SCOPE below), and string building the
+ * census does not parse (`+=`, `.concat(...)`, `[...].join(...)`).
+ *
  * Three layers, each over the full set:
  *   1. the formatter's own contract;
  *   2. a source census over every CLI module, parsed with the TypeScript
@@ -159,152 +169,228 @@ function cliSourceFiles(): string[] {
 }
 
 const REFUSAL_KEYWORD = /\b(unknown|unrecognized|unexpected)\b/i;
-/** Interpolations named like credential material are checked in every template, keyword or not. */
-const CREDENTIAL_NAMED = /passphrase|recovery_?key|recoveryKey/i;
+/**
+ * Interpolations named like credential or key material are checked in every
+ * string form (template, `+` concatenation, `format(...)`), refusal keyword or
+ * not: a value a credential-named variable holds must never reach a message
+ * without a formatter or an allowlist reason.
+ */
+const CREDENTIAL_NAMED =
+  /passphrase|password|passwd|recovery_?key|private_?key|secret|token|mnemonic|seed_?phrase|api_?key|bearer|key_?material/i;
 const FORMATTERS = new Set(["argvTokenForDisplay", "caughtErrorForDisplay"]);
 const FORMATTER_MAP = "unknown.map(argvTokenForDisplay).join(\" \")";
 
+interface AllowEntry {
+  reason: string;
+  /** When set, the census must find exactly this many uses, so one entry cannot silently cover a second site. */
+  count?: number;
+}
+
 /**
- * Interpolations in a refusal-shaped string that are not an argv token, or
- * are a lookup key the verb resolves against its own known set. Keyed
+ * Interpolations the census accepts without a formatter: not an argv token,
+ * or a lookup key the verb resolves against its own known set. Keyed
  * `<path relative to src>|<expression>`. Full-set: every entry must be
  * matched by the census, so a removed site removes its entry.
  */
-const ALLOWLIST: Record<string, string> = {
-  "cli/agents/cli.ts|positional": "tenant lookup key named for `agents show`",
-  "cli/anomaly.ts|detectorId": "detector lookup key named for this verb",
-  "cli/anomaly.ts|classifierId": "classifier lookup key named for this verb",
-  "cli/castle-wall.ts|reason": "probe outcome reason, not argv",
-  "cli/castle-wall.ts|report.state": "host app report field, not argv",
-  "cli/federation.ts|verb": "fixed verb string chosen by the code",
-  "cli/federation.ts|FEDERATION_HELP": "fixed help text",
-  "cli/fleet.ts|ATTEST_USAGE": "fixed usage text",
-  "cli/fleet.ts|USAGE": "fixed usage text",
-  "cli/license.ts|flags.plan": "value of --plan, checked against a fixed plan list",
-  'cli/license.ts|PLAN_NAMES.join(", ")': "fixed plan list",
-  "cli/license.ts|f": "feature name checked against a fixed feature list",
-  'cli/license.ts|ALL_ENTITLEMENT_FEATURE_FLAGS.join(", ")': "fixed feature list",
-  "cli/license.ts|USAGE": "fixed usage text",
-  "cli/nodes.ts|HELP": "fixed help text",
-  "cli/plugin.ts|PLUGIN_HELP": "fixed help text",
-  "cli/secrets.ts|f.secret":
-    "binding name already matched against the helper's served-name set before this line; values never enter this record",
-  "cli/sentinel.ts|sentinelId": "sentinel lookup key named for this verb",
-  'evidence-pack/cli.ts|unexpected.sort().join(", ")': "file names found on disk, not argv",
-  "honeypot/cli.ts|trapId": "trap lookup key named for this verb",
-  "templates/cli.ts|templateName": "template lookup key named for this verb",
-  "cli/agents/cli.ts|passphraseLabel(tenant)": "fixed status label for where a tenant's credential lives",
-  "cli/castle-wall.ts|error instanceof Error ? error.message : String(error)":
-    "status line for a host-app probe the CLI spawns itself; no argv reaches it",
-  "cli/reset-passphrase.ts|availability.recoveryKey.reason": "fixed availability reason text",
-  "cli/rotate-master.ts|opts.recoveryKey":
-    "the newly minted recovery key, shown once to the operator on this terminal by design; not argv",
-  "cli/secrets.ts|SURROGATE_BOUND_PORT": "numeric constant",
-  "cli/secrets.ts|f.reason": "fixed failure reason class",
-  "cli/secrets.ts|describeUnlockSettleCommands(f.agentUid)": "fixed command text built from a numeric uid",
-  "wrap/cli.ts|passphraseLocation": "where the credential is stored, never the value",
-  "wrap/cli.ts|String(i + 1)": "argv position, not the token",
-  "wrap/cli.ts|hint": "fixed known-flag suggestion",
+const ALLOWLIST: Record<string, AllowEntry> = {
+  "cli/agents/cli.ts|positional": { reason: "tenant lookup key named for `agents show`" },
+  "cli/anomaly.ts|detectorId": { reason: "detector lookup key named for this verb" },
+  "cli/anomaly.ts|classifierId": { reason: "classifier lookup key named for this verb" },
+  "cli/castle-wall.ts|reason": { reason: "probe outcome reason, not argv" },
+  "cli/castle-wall.ts|report.state": { reason: "host app report field, not argv" },
+  "cli/federation.ts|verb": { reason: "fixed verb string chosen by the code" },
+  "cli/federation.ts|FEDERATION_HELP": { reason: "fixed help text" },
+  "cli/fleet.ts|ATTEST_USAGE": { reason: "fixed usage text" },
+  "cli/fleet.ts|USAGE": { reason: "fixed usage text" },
+  "cli/license.ts|flags.plan": { reason: "value of --plan, checked against a fixed plan list" },
+  'cli/license.ts|PLAN_NAMES.join(", ")': { reason: "fixed plan list" },
+  "cli/license.ts|f": { reason: "feature name checked against a fixed feature list" },
+  'cli/license.ts|ALL_ENTITLEMENT_FEATURE_FLAGS.join(", ")': { reason: "fixed feature list" },
+  "cli/license.ts|USAGE": { reason: "fixed usage text" },
+  "cli/nodes.ts|HELP": { reason: "fixed help text" },
+  "cli/plugin.ts|PLUGIN_HELP": { reason: "fixed help text" },
+  "cli/secrets.ts|f.secret": {
+    reason:
+      "binding name already matched against the helper's served-name set before this line; values never enter this record",
+  },
+  "cli/sentinel.ts|sentinelId": { reason: "sentinel lookup key named for this verb" },
+  'evidence-pack/cli.ts|unexpected.sort().join(", ")': { reason: "file names found on disk, not argv" },
+  "honeypot/cli.ts|trapId": { reason: "trap lookup key named for this verb" },
+  "templates/cli.ts|templateName": { reason: "template lookup key named for this verb" },
+  "cli/agents/cli.ts|passphraseLabel(tenant)": {
+    reason: "fixed status label for where a tenant's credential lives",
+  },
+  "cli/castle-wall.ts|error instanceof Error ? error.message : String(error)": {
+    reason:
+      "content-filter status line for a host-app probe the CLI spawns itself with no operator arguments; a status read, not a refusal of argv",
+    count: 1,
+  },
+  "cli/reset-passphrase.ts|availability.recoveryKey.reason": { reason: "fixed availability reason text" },
+  "cli/rotate-master.ts|opts.recoveryKey": {
+    reason:
+      "the newly minted recovery key, shown once to the operator on this terminal by design; not argv. Exactly one use: a second use of this expression is a new decision",
+    count: 1,
+  },
+  "cli/secrets.ts|SURROGATE_BOUND_PORT": { reason: "numeric constant" },
+  "cli/secrets.ts|f.reason": { reason: "fixed failure reason class" },
+  "cli/secrets.ts|describeUnlockSettleCommands(f.agentUid)": {
+    reason: "fixed command text built from a numeric uid",
+  },
+  "wrap/cli.ts|passphraseLocation": { reason: "where the credential is stored, never the value" },
+  // Credential-named interpolations that are not refusal text. Each is pinned
+  // to its current use count so a new use is a new decision.
+  "cli/auto-trigger.ts|token": { reason: "Authorization request header, never printed", count: 1 },
+  "cli/concierge.ts|token": { reason: "Authorization request header, never printed", count: 1 },
+  "cli/dashboard-request.ts|token": { reason: "Authorization request header, never printed", count: 1 },
+  "cli/policy.ts|token": { reason: "Authorization request header, never printed", count: 2 },
+  "cli/castle-wall-boot.ts|bootTokenPath": { reason: "file path of the boot token, not its bytes", count: 4 },
+  "cli/castle-wall-observe.ts|tokenRead.length": { reason: "byte length, not content", count: 1 },
+  "cli/castle-wall-observe.ts|tokenRead.mode.toString(8)": { reason: "file mode, not content", count: 1 },
+  "cli/castle-wall.ts|tokenRead.length": { reason: "byte length, not content", count: 1 },
+  "cli/castle-wall.ts|tokenRead.mode.toString(8)": { reason: "file mode, not content", count: 1 },
+  "cli/castle-wall.ts|BOOT_TOKEN_LENGTH": { reason: "numeric constant", count: 1 },
+  "cli/castle-wall.ts|ED25519_PRIVATE_KEY_BYTES": { reason: "numeric constant", count: 1 },
+  "cli/federation.ts|JSON.stringify( { joined: true, persisted, node_id: bootstrapToken.intended_node_id, node_pubkey: toBase64url(assembled.nodePublicKey), certificate: response.certificate, issuing_principal_cert: response.issuing_principal_cert ?? null, }, null, 2, )":
+    { reason: "join result: node id from the bootstrap record, public key, certificates", count: 1 },
+  "cli/federation.ts|JSON.stringify({ bootstrap_token: response.bootstrap_token }, null, 2)": {
+    reason: "the bootstrap token is the intended output of `federation authorize`, handed to the joiner",
+    count: 1,
+  },
+  "cli/federation.ts|secretB64": {
+    reason: "the intended output of `federation reveal-master-secret`, printed only after the disclosure is audited",
+    count: 1,
+  },
+  "cli/secrets.ts|secret": {
+    reason: "secret binding NAME (the operator's label for a stored value); values are never held in this variable",
+    count: 22,
+  },
+  "cli/secrets.ts|b.secret": { reason: "binding NAME from the policy file", count: 2 },
+  "exit/cli.ts|report.declared_rekey_material": {
+    reason: "inspection state enum describing what the bundle declares, not key bytes",
+    count: 1,
+  },
+  "wrap/cli.ts|String(i + 1)": { reason: "argv position, not the token" },
+  "wrap/cli.ts|hint": { reason: "fixed known-flag suggestion" },
+};
+
+/**
+ * Message sites this guard deliberately does NOT cover, recorded so the
+ * scope stays truthful: a generic catch block that prints a callee's error
+ * message is callee error text, not a refusal of an unrecognized token.
+ * Keyed `<path relative to src>|<exact source text>`; each must still exist.
+ */
+const OUT_OF_SCOPE: Record<string, string> = {
+  "exit/cli.ts|write(err, error instanceof Error ? `${error.message}\\n` : `${String(error)}\\n`);":
+    "the exit verbs' top-level catch prints whatever message a callee threw; tracked separately",
 };
 
 interface CensusResult {
   violations: string[];
-  allowlisted: Set<string>;
+  allowlisted: Map<string, number>;
   formatterSites: string[];
 }
 
-function runCensus(): CensusResult {
-  const result: CensusResult = { violations: [], allowlisted: new Set(), formatterSites: [] };
-  for (const file of cliSourceFiles()) {
-    const rel = relative(SRC, file);
-    const sf = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
-    const checked = new Set<ts.Node>();
-    const where = (n: ts.Node): string =>
-      `${rel}:${String(sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1)}`;
+/** Census over one parsed module; `rel` is its path relative to src. */
+function censusModule(rel: string, source: string, result: CensusResult): void {
+  const sf = ts.createSourceFile(rel, source, ts.ScriptTarget.Latest, true);
+  const checked = new Set<ts.Node>();
+  const where = (n: ts.Node): string =>
+    `${rel}:${String(sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1)}`;
 
-    const checkExpr = (expr: ts.Expression): void => {
-      if (checked.has(expr)) return;
-      checked.add(expr);
-      const text = expr.getText(sf);
-      // The WHOLE interpolation must be the formatter call; a formatter call
-      // inside a larger expression (`f(x) + x`) does not count.
-      const isFormatterCall =
-        ts.isCallExpression(expr) &&
-        ts.isIdentifier(expr.expression) &&
-        FORMATTERS.has(expr.expression.text);
-      if (isFormatterCall || text === FORMATTER_MAP) {
-        result.formatterSites.push(`${where(expr)} ${text}`);
-        return;
-      }
-      if (ts.isStringLiteralLike(expr) || ts.isNumericLiteral(expr)) return;
-      const key = `${rel}|${text}`;
-      if (key in ALLOWLIST) {
-        result.allowlisted.add(key);
-        return;
-      }
-      result.violations.push(`${where(expr)} interpolates ${text}`);
+  const checkExpr = (expr: ts.Expression): void => {
+    if (checked.has(expr)) return;
+    checked.add(expr);
+    // Whitespace-collapsed so a multi-line expression has a one-line allowlist key.
+    const text = expr.getText(sf).replace(/\s+/g, " ");
+    // The WHOLE interpolation must be the formatter call; a formatter call
+    // inside a larger expression (`f(x) + x`) does not count.
+    const isFormatterCall =
+      ts.isCallExpression(expr) && ts.isIdentifier(expr.expression) && FORMATTERS.has(expr.expression.text);
+    if (isFormatterCall || text === FORMATTER_MAP) {
+      result.formatterSites.push(`${where(expr)} ${text}`);
+      return;
+    }
+    if (ts.isStringLiteralLike(expr) || ts.isNumericLiteral(expr)) return;
+    const key = `${rel}|${text}`;
+    if (key in ALLOWLIST) {
+      result.allowlisted.set(key, (result.allowlisted.get(key) ?? 0) + 1);
+      return;
+    }
+    result.violations.push(`${where(expr)} interpolates ${text}`);
+  };
+
+  const staticText = (n: ts.Node): string | undefined => {
+    if (ts.isStringLiteralLike(n)) return n.text;
+    if (ts.isTemplateExpression(n)) {
+      return n.head.text + n.templateSpans.map((sp) => sp.literal.text).join("");
+    }
+    return undefined;
+  };
+
+  const flattenPlus = (n: ts.Expression): ts.Expression[] => {
+    const e = ts.isParenthesizedExpression(n) ? n.expression : n;
+    if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      return [...flattenPlus(e.left), ...flattenPlus(e.right)];
+    }
+    return [e];
+  };
+
+  /** True when an identifier inside the expression (not a string literal in it) is credential-named. */
+  const credentialNamed = (expr: ts.Node): boolean => {
+    let hit = false;
+    const walkIds = (n: ts.Node): void => {
+      if (hit) return;
+      if (ts.isIdentifier(n) && CREDENTIAL_NAMED.test(n.text)) hit = true;
+      else ts.forEachChild(n, walkIds);
     };
+    walkIds(expr);
+    return hit;
+  };
 
-    const staticText = (n: ts.Node): string | undefined => {
-      if (ts.isStringLiteralLike(n)) return n.text;
-      if (ts.isTemplateExpression(n)) {
-        return n.head.text + n.templateSpans.map((sp) => sp.literal.text).join("");
-      }
-      return undefined;
-    };
-
-    const flattenPlus = (n: ts.Expression): ts.Expression[] => {
-      const e = ts.isParenthesizedExpression(n) ? n.expression : n;
-      if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-        return [...flattenPlus(e.left), ...flattenPlus(e.right)];
-      }
-      return [e];
-    };
-
-    const checkParts = (parts: ts.Expression[]): void => {
-      for (const part of parts) {
-        if (ts.isTemplateExpression(part)) {
-          for (const sp of part.templateSpans) checkExpr(sp.expression);
-        } else if (staticText(part) === undefined) {
-          checkExpr(part);
+  /** Checks every dynamic part when `all`, else only credential-named parts. */
+  const checkParts = (parts: ts.Expression[], all: boolean): void => {
+    for (const part of parts) {
+      if (ts.isTemplateExpression(part)) {
+        for (const sp of part.templateSpans) {
+          if (all || credentialNamed(sp.expression)) checkExpr(sp.expression);
         }
+      } else if (staticText(part) === undefined) {
+        if (all || credentialNamed(part)) checkExpr(part);
       }
-    };
+    }
+  };
 
-    const visit = (node: ts.Node): void => {
-      if (ts.isTemplateExpression(node)) {
-        const refusal = REFUSAL_KEYWORD.test(staticText(node)!);
-        for (const sp of node.templateSpans) {
-          if (refusal || CREDENTIAL_NAMED.test(sp.expression.getText(sf))) checkExpr(sp.expression);
-        }
-      } else if (
-        ts.isBinaryExpression(node) &&
-        node.operatorToken.kind === ts.SyntaxKind.PlusToken &&
-        !(
-          ts.isBinaryExpression(node.parent) &&
-          node.parent.operatorToken.kind === ts.SyntaxKind.PlusToken
-        )
-      ) {
-        const parts = flattenPlus(node);
+  const visit = (node: ts.Node): void => {
+    if (ts.isTemplateExpression(node)) {
+      checkParts(
+        node.templateSpans.map((sp) => sp.expression),
+        REFUSAL_KEYWORD.test(staticText(node)!),
+      );
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.PlusToken &&
+      !(ts.isBinaryExpression(node.parent) && node.parent.operatorToken.kind === ts.SyntaxKind.PlusToken)
+    ) {
+      const parts = flattenPlus(node);
+      if (parts.some((p) => staticText(p) !== undefined)) {
         const text = parts.map((p) => staticText(p) ?? "").join("");
-        if (parts.some((p) => staticText(p) !== undefined) && REFUSAL_KEYWORD.test(text)) {
-          checkParts(parts);
-        }
-      } else if (ts.isCallExpression(node)) {
-        const callee = node.expression.getText(sf);
-        const first = node.arguments[0];
-        if (
-          /(^|\.)format$/.test(callee) &&
-          first !== undefined &&
-          REFUSAL_KEYWORD.test(staticText(first) ?? "")
-        ) {
-          checkParts([...node.arguments.slice(1)]);
-        }
+        checkParts(parts, REFUSAL_KEYWORD.test(text));
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
-  }
+    } else if (ts.isCallExpression(node)) {
+      const callee = node.expression.getText(sf);
+      const first = node.arguments[0];
+      if (/(^|\.)format$/.test(callee) && first !== undefined && staticText(first) !== undefined) {
+        checkParts([...node.arguments.slice(1)], REFUSAL_KEYWORD.test(staticText(first)!));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+}
+
+function runCensus(): CensusResult {
+  const result: CensusResult = { violations: [], allowlisted: new Map(), formatterSites: [] };
+  for (const file of cliSourceFiles()) censusModule(relative(SRC, file), readFileSync(file, "utf8"), result);
   return result;
 }
 
@@ -321,14 +407,50 @@ describe("source census: refusal strings route argv tokens through the formatter
     expect(census.violations).toEqual([]);
   });
 
-  it("every allowlist entry is still in use", () => {
-    expect([...census.allowlisted].sort()).toEqual(Object.keys(ALLOWLIST).sort());
+  it("every allowlist entry is still in use, with its pinned use count where one is set", () => {
+    expect([...census.allowlisted.keys()].sort()).toEqual(Object.keys(ALLOWLIST).sort());
+    for (const [key, entry] of Object.entries(ALLOWLIST)) {
+      if (entry.count !== undefined) expect(census.allowlisted.get(key), key).toBe(entry.count);
+    }
   });
 
   it("the formatter-site count is exact", () => {
     expect(census.formatterSites.length, census.formatterSites.join("\n")).toBe(
       EXPECTED_FORMATTER_SITES,
     );
+  });
+
+  it("every recorded out-of-scope site still exists, so the stated scope stays accurate", () => {
+    for (const key of Object.keys(OUT_OF_SCOPE)) {
+      const sep = key.indexOf("|");
+      const source = readFileSync(join(SRC, key.slice(0, sep)), "utf8");
+      expect(source.includes(key.slice(sep + 1)), key).toBe(true);
+    }
+  });
+
+  it("catches planted credential-named and refusal interpolations in every string form", () => {
+    const planted = [
+      'export const a = (passphrase: string) => "invalid passphrase: " + passphrase;',
+      'import { format } from "node:util";\nexport const b = (recoveryKey: string) => format("invalid recovery key: %s", recoveryKey);',
+      "export const c = (token: string) => `invalid token: ${token}`;",
+      'export const d = (arg: string) => "Unknown option: " + arg;',
+      "export const e = (arg: string) => `Unknown option:\n  ${arg}`;",
+      "export const f = (arg: string) => `Unknown option: ${argvTokenForDisplay(arg) + arg}`;",
+      'import util from "node:util";\nexport const g = (arg: string) => util.format("Unknown option: %s", arg);',
+    ];
+    for (const source of planted) {
+      const probe: CensusResult = { violations: [], allowlisted: new Map(), formatterSites: [] };
+      censusModule("planted/cli.ts", source, probe);
+      expect(probe.violations.length, source).toBeGreaterThan(0);
+    }
+    const clean: CensusResult = { violations: [], allowlisted: new Map(), formatterSites: [] };
+    censusModule(
+      "planted/cli.ts",
+      "export const h = (arg: string) => `Unknown option: ${argvTokenForDisplay(arg)}`;",
+      clean,
+    );
+    expect(clean.violations).toEqual([]);
+    expect(clean.formatterSites.length).toBe(1);
   });
 });
 
