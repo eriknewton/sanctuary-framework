@@ -573,7 +573,12 @@ export class SdwMemoryProvenanceMigration {
       admitted_at: journal.observation_time,
     }, signer);
     if (!companion.ok) throw new SdwValidationError("auth_failed", "Legacy memory admission signing failed");
-    return { documentId, outcome: "migrated", provenance: companion.value, clearStatus: status !== null };
+    const verified = verifyMemoryProvenanceCompanion(companion.value, {
+      size: 1,
+      resolve: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
+    }, expectedBinding(this.fortressId, this.ownerRef, documentId, document));
+    if (!verified.ok) throw new SdwValidationError("auth_failed", "Legacy memory provenance self-verification failed");
+    return { documentId, outcome: "migrated", provenance: verified.value, clearStatus: status !== null };
   }
 
   private quarantineAction(
@@ -615,6 +620,9 @@ export class SdwMemoryProvenanceMigration {
     try {
       for (const action of actions) {
         if (action.provenance !== undefined) {
+          // The migrated record subject is this document's legacy passage, and
+          // the verifier has registered these exact origin/admission owner
+          // objects before the classifier gate handles their signature bytes.
           await this.corpus.putProvenance({
             kind: "memory_provenance",
             version: 1,
