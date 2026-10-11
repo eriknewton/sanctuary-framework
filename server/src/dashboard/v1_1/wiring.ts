@@ -62,6 +62,7 @@ import {
   publicAgentIdForVerifiedAttribution,
 } from "../../hub/agent-attribution.js";
 import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
+import type { HubInboxItem } from "../../contracts/v1.1/hub-events.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
@@ -315,6 +316,8 @@ export interface V11Bindings {
   pii?: V11PiiRewriteBinding;
 }
 
+// Five lines keeps the context fold small enough for local models while still
+// showing the current operator bottleneck; the full rail remains the inbox UI.
 const CONCIERGE_OPEN_INBOX_LIMIT = 5;
 
 async function pruneExpiredDidWebKeysOnUnlock(
@@ -526,8 +529,9 @@ export function buildV11Bindings(
           hubServiceForConcierge
             ? hubServiceForConcierge.listInbox({
                 limit: CONCIERGE_OPEN_INBOX_LIMIT,
+                openOnly: true,
               })
-            : [],
+            : null,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
       // Rho-2.5: thread the live Tier B config so the concierge rewrite
@@ -842,7 +846,7 @@ export function buildConciergeContextProviders(args: {
   registry: InMemoryLocalAgentRegistry;
   resolveAuditAttribution: AuditAttributionOptionsResolver;
   hubService?: HubService;
-  listOpenInboxItems?: () => ReturnType<HubService["listInbox"]>;
+  listOpenInboxItems?: () => HubInboxItem[] | null;
 }): ConciergeContextProviders {
   return {
     recentActivity: async () => {
@@ -876,23 +880,35 @@ export function buildConciergeContextProviders(args: {
       return lines.join("\n");
     },
     openInbox: async () => {
-      // The concierge reads the same bounded HubService projection as the
-      // operator inbox, so a live hold cannot disappear from chat context while
-      // still visible in the dashboard rail.
+      // The concierge reads the same open-only HubService projection as the
+      // operator inbox; a missing producer is unavailable, never a calm-empty
+      // context row.
       const items =
         args.listOpenInboxItems?.() ??
-        args.hubService?.listInbox({ limit: CONCIERGE_OPEN_INBOX_LIMIT }) ??
-        [];
-      const openItems = items.filter((item) => item.resolved !== true);
+        args.hubService?.listInbox({
+          limit: CONCIERGE_OPEN_INBOX_LIMIT,
+          openOnly: true,
+        }) ??
+        null;
+      if (items === null) return "(open inbox unavailable)";
+      const openItems = items;
       if (openItems.length === 0) return "(no open inbox items)";
-      return openItems
-        .slice(0, CONCIERGE_OPEN_INBOX_LIMIT)
-        .map((item) => {
-          const tier =
-            item.kind === "approval_pending" ? `  tier=${item.tier}` : "";
-          return `${item.item_id}  kind=${item.kind}${tier}  created=${item.created_at}`;
-        })
-        .join("\n");
+      const approvalCount = openItems.filter(
+        (item) => item.kind === "approval_pending",
+      ).length;
+      const lines = approvalCount > 0
+        ? [
+            `${approvalCount} approval${approvalCount === 1 ? "" : "s"} waiting`,
+          ]
+        : [];
+      for (const item of openItems) {
+        if (item.kind === "approval_pending") continue;
+        lines.push(
+          `${item.item_id}  kind=${item.kind}  created=${item.created_at}`,
+        );
+      }
+      lines.push(`(showing up to ${CONCIERGE_OPEN_INBOX_LIMIT} open items)`);
+      return lines.join("\n");
     },
   };
 }

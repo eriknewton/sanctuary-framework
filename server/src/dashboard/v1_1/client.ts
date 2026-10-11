@@ -861,7 +861,8 @@ function renderTopbarAttestationBadge(stateName) {
     return '<span class="pill" data-pill="attestation">attestation: unavailable</span>';
   }
   const valid = stateName === "verified" || stateName === "degraded" || stateName === "unverified" || stateName === "pending";
-  const cls = valid ? stateName : "pending";
+  if (!valid) return renderTopbarAttestationBadge("unavailable");
+  const cls = stateName;
   const ringDashed = cls === "pending" ? " dashed" : "";
   return '<span class="att-global ' + cls + '" data-pill="attestation" title="Fortress attestation">' +
     '<span class="seal">' +

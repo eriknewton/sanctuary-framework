@@ -62,6 +62,7 @@ import { InMemoryLocalAgentRegistry } from "../../../src/hub/agent-registry.js";
 import { ApprovalGate } from "../../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../src/principal-policy/baseline.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
+import type { HubInboxItem } from "../../../src/contracts/v1.1/hub-events.js";
 import type { ApprovalResponse } from "../../../src/principal-policy/types.js";
 import { getFreePort } from "../../helpers/free-port.js";
 
@@ -133,6 +134,8 @@ async function startRig(): Promise<Rig> {
       identityId: IDENTITY_ID,
       fortressId: FORTRESS_ID,
       auditLog,
+      storage,
+      masterKey,
       storagePath,
       warnProducerKeyUnavailable: () => {},
     });
@@ -213,6 +216,63 @@ function unresolvedApprovals(body: unknown): InboxItemShape[] {
   return inboxItems(body).filter(
     (i) => i.kind === "approval_pending" && !i.resolved,
   );
+}
+
+function blockedEgressItem(
+  itemId: string,
+  createdAt: string,
+  resolved: boolean,
+): HubInboxItem {
+  return {
+    version: "1.1",
+    item_id: itemId,
+    kind: "blocked_egress",
+    created_at: createdAt,
+    identity_id: IDENTITY_ID,
+    display_template_id: "blocked_egress.destination",
+    display_template_args: [{ kind: "destination_category", value: "custom" }],
+    resolved,
+    destination_category: "custom",
+    block_reason_class: "egress_policy_deny",
+  };
+}
+
+async function markStoreItemsResolved(
+  service: V11Bindings["hubService"],
+  itemIds: string[],
+): Promise<void> {
+  const store = hubInboxStore(service);
+  for (const itemId of itemIds) {
+    await store.resolve(itemId, "dismiss", new Date().toISOString());
+  }
+}
+
+function hubInboxStore(service: V11Bindings["hubService"]): {
+  upsertFromSource: (item: HubInboxItem) => void;
+  resolve: (
+    itemId: string,
+    decision: "approve" | "deny" | "dismiss",
+    nowIso: string,
+  ) => Promise<HubInboxItem>;
+} {
+  return (service as unknown as { inboxStore: {
+    upsertFromSource: (item: HubInboxItem) => void;
+    resolve: (
+      itemId: string,
+      decision: "approve" | "deny" | "dismiss",
+      nowIso: string,
+    ) => Promise<HubInboxItem>;
+  } }).inboxStore;
+}
+
+async function assembledConciergeContext(
+  bindings: V11Bindings,
+): Promise<string> {
+  const service = bindings.operatorChatService as unknown as {
+    assembleConciergeContext: () => Promise<string>;
+  };
+  expect(service).toBeTruthy();
+  return service.assembleConciergeContext();
 }
 
 /**
@@ -467,10 +527,46 @@ describe("live Charter holds are projected under the caller's stated bound", () 
 
     const context = await providers.openInbox();
 
-    expect(context).toContain(charterApprovalItemId("hold-0"));
-    expect(context).toContain("approval_pending");
+    expect(context).toContain("1 approval waiting");
+    expect(context).not.toContain(charterApprovalItemId("hold-0"));
+    expect(context).not.toContain("tier=");
     expect(context).not.toBe("(no open inbox items)");
     expect(counting.calls.listLimits).toEqual([5]);
+  });
+
+  it("filters resolved inbox entries before applying the concierge context bound", async () => {
+    const store = hubInboxStore(rig.bindings.hubService);
+    const resolvedIds = Array.from({ length: 5 }, (_, index) => `resolved-${index}`);
+    for (const [index, id] of resolvedIds.entries()) {
+      store.upsertFromSource(
+        blockedEgressItem(id, `2026-10-10T00:0${index}:00.000Z`, false),
+      );
+    }
+    await markStoreItemsResolved(rig.bindings.hubService, resolvedIds);
+    store.upsertFromSource(
+      blockedEgressItem("open-after-resolved", "2026-10-10T00:06:00.000Z", false),
+    );
+
+    const context = await assembledConciergeContext(rig.bindings);
+
+    expect(context).toContain("blocked_egress");
+    expect(context).toContain("open-after-resolved");
+    expect(context).not.toContain("(no open inbox items)");
+  });
+
+  it("keeps approval context count-only for concierge history readers", async () => {
+    const decision = raiseMemoryInsertHold(rig, "release182_context_1");
+    const [approval] = await waitForUnresolvedApprovals(rig, 1);
+
+    const context = await assembledConciergeContext(rig.bindings);
+
+    expect(context).toContain("1 approval waiting");
+    expect(context).not.toContain(approval.item_id);
+    expect(context).not.toContain("tier=");
+
+    const res = await postInboxAction(rig, approval.item_id, "deny");
+    expect(res.status).toBe(200);
+    await decision;
   });
 
   it("resolves a card by key, never by scanning the queue", async () => {

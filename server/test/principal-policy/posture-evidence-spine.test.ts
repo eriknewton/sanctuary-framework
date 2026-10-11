@@ -135,6 +135,16 @@ describe("S3 evidence spine: the v1.1 dashboard", () => {
   });
 
   it("renders unwired sidebar status chips as unavailable rather than fixed status", () => {
+    const pillsMatch = html.match(/<div class="pills" id="sidebar-pills">[\s\S]*?<\/div>/);
+    expect(pillsMatch).toBeTruthy();
+    const serverPills = pillsMatch![0];
+
+    expect(serverPills).toContain("deployment: unavailable");
+    expect(serverPills).toContain("mode: unavailable");
+    expect(serverPills).toContain("attestation: unavailable");
+    expect(serverPills).not.toContain("deployment: local");
+    expect(serverPills).not.toContain("mode: solo");
+    expect(serverPills).not.toContain("att-global pending");
     expect(client).toContain(
       'topbarPills: { deployment: "unavailable", mode: "unavailable", attestation: "unavailable" }',
     );
@@ -143,6 +153,12 @@ describe("S3 evidence spine: the v1.1 dashboard", () => {
     expect(client).toContain('data-pill="mode">mode: ');
     expect(client).not.toContain(
       'topbarPills: { deployment: "local", mode: "solo", attestation: "pending" }',
+    );
+  });
+
+  it("keeps unexpected attestation chip values in the unavailable state", () => {
+    expect(client).toContain(
+      'if (!valid) return renderTopbarAttestationBadge("unavailable");',
     );
   });
 
