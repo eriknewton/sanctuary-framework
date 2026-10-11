@@ -33,8 +33,14 @@ try {
     "late-writer",
     stringToBytes(JSON.stringify(payload)),
   );
+  const releaseToken = once(process.stdin, "data") as Promise<[Buffer]>;
   process.stdout.write("WROTE\n");
+  const [releaseChunk] = await releaseToken;
+  if (releaseChunk.toString("utf8").trim() !== "RELEASE") {
+    throw new Error("unexpected writer fixture release command");
+  }
 } finally {
   await custody.masterWriteBarrier?.release();
   custody.masterKey.fill(0);
 }
+process.stdout.write("RELEASED\n");

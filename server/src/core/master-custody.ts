@@ -204,8 +204,13 @@ export async function withCustodyWriteLock<T>(
     timeoutMs?: number;
     /** Test only: observe a deliberately non-owning helper process. */
     __testAfterKernelHolderAcquired?: (pid: number) => void;
-    /** Test only: observe the process-owned lock socket for loss fencing. */
-    __testAfterKernelSocketAcquired?: (path: string) => void;
+    /**
+     * Test only: observe the process-owned lock socket for loss fencing.
+     * Must match the async hook shape in CrossProcessLockOptions and
+     * MasterWriteBarrierOptions in storage/cross-process-lock.ts, and
+     * RotateMasterOptions in core/master-rotation.ts.
+     */
+    __testAfterKernelSocketAcquired?: (path: string) => void | Promise<void>;
   } = {},
 ): Promise<T> {
   const identity = custodyLockIdentity(storage);
