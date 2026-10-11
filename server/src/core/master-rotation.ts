@@ -98,6 +98,10 @@ import {
 import {
   readCustodyEnvelope,
   writeCustodyEnvelope,
+  recoverCustodyEnvelopeCommitIfPresent,
+  deleteCustodyEnvelopeCommitJournalQuarantines,
+  liveCustodyPairAuthenticates,
+  CustodyEnvelopeCommitJournalError,
   unwrapMaster,
   verifyEnvelopeMac,
   wrapMasterWithPassphrase,
@@ -110,6 +114,9 @@ import {
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS,
+  custodyEnvelopeCommitJournalQuarantinePrefix,
+  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
   CUSTODY_FLOOR_WRAPS,
   CUSTODY_WRITE_LOCK_NAMESPACE,
   MASTER_ROTATION_BARRIER_NAME,
@@ -836,6 +843,15 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
  * `convertMeta`.
  */
 export function classifyMetaKey(key: string): MetaKeyClass | null {
+  if (
+    CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS.some(
+      (slot) =>
+        key === slot.key ||
+        key.startsWith(custodyEnvelopeCommitJournalQuarantinePrefix(slot)),
+    )
+  ) {
+    return "rotation";
+  }
   switch (key) {
     case "key-params":
     case "recovery-key-hash":
@@ -2113,6 +2129,11 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   // Promote the staged envelope (idempotent: if the staged copy is gone, a
   // prior resume already promoted it), stamping the advanced epoch into it so
   // the on-disk custody epoch matches the witness.
+  await fenced(ctx, () => recoverCustodyEnvelopeCommitIfPresent(ctx.storage, {
+    envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+    sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+    master: ctx.newMaster,
+  }));
   const staged = await readCustodyEnvelope(ctx.storage, {
     envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
   });
@@ -2125,10 +2146,13 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
     ));
     ctx.failpoint("envelope-promoted");
     await fenced(ctx, () =>
-      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true),
     );
     await fenced(ctx, () =>
-      ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+      ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true),
+    );
+    await fenced(ctx, () =>
+      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
     );
     ctx.failpoint("staged-deleted");
   } else {
@@ -2261,6 +2285,7 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   ctx.failpoint("rotation-audited");
 
   await fenced(ctx, () => ctx.storage.delete("_meta", PENDING_RECOVERY_KEY));
+  await fenced(ctx, () => deleteCustodyEnvelopeCommitJournalQuarantines(ctx.storage));
   await fenced(ctx, () => ctx.storage.delete("_meta", ROTATION_JOURNAL_KEY));
 }
 
@@ -2383,8 +2408,24 @@ async function rotateMasterLocked(
 
   // Unlock the OLD master. Envelope-format custody is required: rotation of
   // a pure-legacy fortress goes through `sanctuary wrap` migration first.
+  // Custody-pair recovery runs under the rotation barrier and custody lock, so
+  // the preflight sees the same complete pair a boot writer would settle.
+  let liveCustodyPairRecoveryError: unknown;
+  try {
+    await recoverCustodyEnvelopeCommitIfPresent(storage);
+  } catch (error) {
+    if (
+      error instanceof CustodyEnvelopeCommitJournalError &&
+      error.kind === "unusable"
+    ) {
+      liveCustodyPairRecoveryError = error;
+    } else {
+      throw error;
+    }
+  }
   const oldEnvelope = await readCustodyEnvelope(storage);
   if (!oldEnvelope) {
+    if (liveCustodyPairRecoveryError !== undefined) throw liveCustodyPairRecoveryError;
     throw new RotationPreflightError(
       "this fortress does not have envelope-format custody yet; run " +
         "`sanctuary wrap` once (it migrates in place) and retry"
@@ -2396,6 +2437,9 @@ async function rotateMasterLocked(
   try {
     opts.__testObserveSecretBuffer?.("old-master", oldMaster);
     verifyEnvelopeMac(oldEnvelope, oldMaster);
+    if (liveCustodyPairRecoveryError !== undefined) {
+      await recoverCustodyEnvelopeCommitIfPresent(storage, { master: oldMaster });
+    }
 
     // Reconcile an interrupted PRE-journal recovery handoff before minting a
     // new rotation identity. The pending record is authenticated by the still-
@@ -2403,9 +2447,37 @@ async function rotateMasterLocked(
     // envelope bytes. External cleanup is delegated to the platform adapter,
     // which must verify the candidate and delete only its recorded inode/item.
     const pendingRecovery = await readPendingRecovery(storage, oldMaster);
+    let stagedCustodyPairRecoveryError: unknown;
+    try {
+      await recoverCustodyEnvelopeCommitIfPresent(storage, {
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+        master: oldMaster,
+        // Preflight is about to discard any abandoned staged pair. The live
+        // pair under oldMaster is the only authority needed to quarantine a
+        // torn staged journal, so a later passphrase rekey cannot strand this
+        // rotation on a retired staged credential.
+        consistencyCheck: (candidateStorage, candidateMaster) =>
+          liveCustodyPairAuthenticates(candidateStorage, candidateMaster),
+      });
+    } catch (error) {
+      if (
+        error instanceof CustodyEnvelopeCommitJournalError &&
+        error.kind === "unusable"
+      ) {
+        stagedCustodyPairRecoveryError = error;
+      } else {
+        throw error;
+      }
+    }
     const abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
       envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
     });
+    const abandonedStagedSentinel =
+      await storage.read("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+    if (stagedCustodyPairRecoveryError !== undefined) {
+      throw stagedCustodyPairRecoveryError;
+    }
     if (pendingRecovery) {
       if (!abandonedStagedEnvelope) {
         throw new RotationPreflightError(
@@ -2437,15 +2509,17 @@ async function rotateMasterLocked(
       lease.assertHeld();
       await storage.delete("_meta", PENDING_RECOVERY_KEY);
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true);
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true);
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
       lease.assertHeld();
       log(
         `Reconciled interrupted pre-journal recovery handoff ${pendingRecovery.rotation_id}; ` +
           "its new recovery key never became active.",
       );
-    } else if (abandonedStagedEnvelope) {
+    } else if (abandonedStagedEnvelope || abandonedStagedSentinel) {
       // Compatibility cleanup for v4 and for a crash after staging but before
       // the first pending-record write: no external handoff was authorized.
       log(
@@ -2453,11 +2527,14 @@ async function rotateMasterLocked(
           "before recovery escrow was authorized; its recovery key is inactive.",
       );
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true);
       lease.assertHeld();
-      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true);
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
       lease.assertHeld();
     }
+    await deleteCustodyEnvelopeCommitJournalQuarantines(storage);
 
   const newMaster = generateRandomKey();
   try {
@@ -2707,10 +2784,13 @@ async function rotateMasterLocked(
     if (typeof captureResult !== "boolean") recoveryCapture = captureResult;
     if (!captured) {
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true),
       );
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true),
+      );
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
       );
       throw new RotationPreflightError(
         "recovery-key capture was not completed; rotation requires a " +
@@ -2721,10 +2801,13 @@ async function rotateMasterLocked(
     // Two-factor floor on the ROTATED fortress, enforced before conversion.
     if (countVerifiedWraps(stagedEnvelope) < CUSTODY_FLOOR_WRAPS) {
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true),
       );
       await fenced(ctx, () =>
-        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true),
+      );
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true),
       );
       throw new RotationPreflightError(
         `the rotated envelope would hold fewer than ${CUSTODY_FLOOR_WRAPS} verified ` +
@@ -2851,8 +2934,9 @@ async function rotateMasterLocked(
       };
       await cleanup(async () => recoveryCapture?.rollback());
       await cleanup(() => fenced(ctx, () => storage.delete("_meta", PENDING_RECOVERY_KEY)));
-      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY)));
-      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY, true)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY, true)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true)));
     }
     zeroizeWriterCache(ctx);
   }
