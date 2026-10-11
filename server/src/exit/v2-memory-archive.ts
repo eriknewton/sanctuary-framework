@@ -96,7 +96,12 @@ const C0_CONTROL_CODE_POINT_MAX = 31;
 const DELETE_CONTROL_CODE_POINT = 127;
 // Base64 expands the 16 MiB plaintext ceiling by 4/3; 24 MiB leaves bounded
 // room for canonical JSON fields and per-file metadata.
-const MAX_ARTIFACT_BYTES = 24 * 1024 * 1024;
+const EXIT_V2_MEMORY_ARCHIVE_BYTES_PER_KIB = 1024; // 1024 bytes is the binary KiB unit used by archive ceilings.
+const EXIT_V2_MEMORY_ARCHIVE_BYTES_PER_MIB =
+  EXIT_V2_MEMORY_ARCHIVE_BYTES_PER_KIB * EXIT_V2_MEMORY_ARCHIVE_BYTES_PER_KIB;
+const EXIT_V2_MEMORY_ARCHIVE_ARTIFACT_MIB = 24; // 24 MiB is the signed memory archive artifact ceiling.
+export const MAX_ARTIFACT_BYTES =
+  EXIT_V2_MEMORY_ARCHIVE_ARTIFACT_MIB * EXIT_V2_MEMORY_ARCHIVE_BYTES_PER_MIB;
 const MAX_OWNER_SCOPE_PAGES = 10_000;
 const OWNER_SCOPE_PAGE_SIZE = 500;
 const SHA256_HEX = /^[a-f0-9]{64}$/;

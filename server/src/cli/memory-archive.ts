@@ -15,7 +15,6 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   rename,
   rm,
   writeFile,
@@ -33,6 +32,7 @@ import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   exportExitV2SdwMemoryArchive,
   importExitV2SdwMemoryArchive,
+  MAX_ARTIFACT_BYTES,
   planExitV2SdwMemoryAdmission,
   verifyExitV2SdwMemoryArchive,
 } from "../exit/v2-memory-archive.js";
@@ -57,6 +57,10 @@ import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration
 import { MemoryProvenanceBadSignerStore } from "../sdw/memory-provenance-bad-signers.js";
 import { MemoryProvenanceSignerPruner } from "../sdw/memory-provenance-signer-prune.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import {
+  isCustodyFsError,
+  readFileCustody,
+} from "../storage/custody-fs.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { KnownSignersStore } from "../reputation/known-signers-store.js";
 import { getSanctuaryVersion } from "../version.js";
@@ -73,13 +77,12 @@ const MAX_LOCAL_DIALOG_OUTPUT_BYTES = 4 * 1024;
 const ASCII_LINE_FEED = 10;
 const ASCII_CARRIAGE_RETURN = 13;
 const ASCII_SPACE = 32;
-const MAX_MANIFEST_BYTES = 1024 * 1024;
+const BYTES_PER_KIB = 1024; // 1024 bytes is the binary KiB unit used by the artifact cap.
+const BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB;
+const MAX_MANIFEST_MIB = 1; // 1 MiB covers the single-artifact signed manifest with operational headroom.
+const MAX_MANIFEST_BYTES = MAX_MANIFEST_MIB * BYTES_PER_MIB;
 // Must match the artifact path returned by exportExitV2SdwMemoryArchive.
 const ARTIFACT_PATH = "artifacts/sdw-memory-archive.json";
-// 24 MiB must match MAX_ARTIFACT_BYTES in exit/v2-memory-archive.ts.
-const MAX_ARTIFACT_BYTES = 24 * 1024 * 1024;
-// One sentinel byte proves the opened file did not grow beyond its declared bound.
-const BOUND_EXCESS_SENTINEL_BYTES = 1;
 const ARCHIVE_ID = /^[a-f0-9]{32}$/;
 const SAFE_OWNER_REF = /^[A-Za-z0-9:._-]{1,256}$/;
 const BASE64URL_ALPHABET = Buffer.from(
@@ -174,6 +177,13 @@ interface Bootstrapped {
     readonly did: string;
     sign(bytes: Uint8Array): Uint8Array;
   };
+}
+
+class MemoryArchiveBundleFileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryArchiveBundleFileError";
+  }
 }
 
 function write(stream: Writable, text: string): void {
@@ -497,7 +507,7 @@ export async function runMemoryArchiveImportCommand(
         : `memory_archive_import: imported ${receipt.destination_archive_id}\n`,
     );
     return 0;
-  } catch {
+  } catch (error) {
     // Pre-commit failures are genuinely authentication/validation failures
     // (bad recovery material, a malformed bundle, a denied approval). A
     // post-commit failure is a different situation entirely: the destination
@@ -511,7 +521,9 @@ export async function runMemoryArchiveImportCommand(
       err,
       committed
         ? "memory_archive_import failed after the archive was imported; a post-import step (audit logging or receipt output) failed. Re-running memory_archive_import with the same bundle is safe.\n"
-        : "memory_archive_import failed: archive authentication or validation failed\n",
+        : error instanceof MemoryArchiveBundleFileError
+          ? `memory_archive_import failed: ${error.message}\n`
+          : "memory_archive_import failed: archive authentication or validation failed\n",
     );
     return 1;
   } finally {
@@ -810,8 +822,8 @@ async function readBundle(inputPath: string): Promise<{
   const manifestPath = join(inputPath, "manifest.json");
   const artifactPath = join(inputPath, ARTIFACT_PATH);
   const [manifestBytes, artifactBytes] = await Promise.all([
-    readBoundedRegularFile(manifestPath, MAX_MANIFEST_BYTES),
-    readBoundedRegularFile(artifactPath, MAX_ARTIFACT_BYTES),
+    readArchiveBundleFile(manifestPath, MAX_MANIFEST_BYTES),
+    readArchiveBundleFile(artifactPath, MAX_ARTIFACT_BYTES),
   ]);
   const manifest = JSON.parse(
     new TextDecoder().decode(manifestBytes),
@@ -827,37 +839,47 @@ async function readBundle(inputPath: string): Promise<{
   };
 }
 
-async function readBoundedRegularFile(path: string, maxBytes: number): Promise<Uint8Array> {
-  // The descriptor is opened once and is the object both bounded and read, so
-  // replacing the path cannot swap in a larger allocation after validation.
-  const handle = await open(path, "r");
+async function readArchiveBundleFile(path: string, maxBytes: number): Promise<Uint8Array> {
+  // The shared custody reader opens and checks the descriptor before reading,
+  // so links, special files, and files over the declared cap fail before import.
   try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size > maxBytes) {
-      throw new Error("invalid bundle bounds");
-    }
-    const bounded = new Uint8Array(maxBytes + BOUND_EXCESS_SENTINEL_BYTES);
-    let offset = 0;
-    while (offset < bounded.byteLength) {
-      const { bytesRead } = await handle.read(
-        bounded,
-        offset,
-        bounded.byteLength - offset,
-        offset,
-      );
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    if (offset > maxBytes) {
-      bounded.fill(0);
-      throw new Error("invalid bundle bounds");
-    }
-    const exact = bounded.slice(0, offset);
-    bounded.fill(0);
-    return exact;
-  } finally {
-    await handle.close();
+    return await readFileCustody(path, { maxBytes });
+  } catch (error) {
+    throw describeBundleReadFailure(path, maxBytes, error);
   }
+}
+
+function describeBundleReadFailure(
+  path: string,
+  maxBytes: number,
+  error: unknown,
+): MemoryArchiveBundleFileError {
+  if (isCustodyFsError(error)) {
+    if (error.code === "read_size_rejected") {
+      return new MemoryArchiveBundleFileError(
+        `bundle file ${path} exceeds ${String(maxBytes)} bytes`,
+      );
+    }
+    if (error.code === "symlink_rejected") {
+      return new MemoryArchiveBundleFileError(
+        `bundle file ${path}: symbolic links are not permitted`,
+      );
+    }
+    if (error.code === "not_regular_file") {
+      return new MemoryArchiveBundleFileError(
+        `bundle file ${path}: not a regular file`,
+      );
+    }
+    return new MemoryArchiveBundleFileError(
+      `bundle file ${path}: ${error.message}`,
+    );
+  }
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return new MemoryArchiveBundleFileError(
+    code === undefined
+      ? `bundle file ${path} could not be read`
+      : `bundle file ${path} could not be read (${code})`,
+  );
 }
 
 function resolveInteraction(
