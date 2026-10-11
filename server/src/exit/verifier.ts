@@ -2117,8 +2117,12 @@ export async function verifyExitBundle(
       manifest,
       "known_signers"
     );
-  } catch {
-    return fail(root, manifest, "known_signers_invalid", warnings, unsupportedArtifacts);
+  } catch (err) {
+    const failureClass =
+      err instanceof InvalidExitBundleError && err.failure_class !== undefined
+        ? err.failure_class
+        : "known_signers_invalid";
+    return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
   }
   if (knownSignersArtifact) {
     if (

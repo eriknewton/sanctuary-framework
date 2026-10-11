@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -47,6 +47,7 @@ import {
   reputationBundleSigningBytes,
   type ReputationBundle,
 } from "../../src/reputation/reputation-store.js";
+import * as custodyFs from "../../src/storage/custody-fs.js";
 
 const execFileAsync = promisify(execFile);
 const NON_REGULAR_READ_SETTLE_TIMEOUT_MS = 250; // Quarter-second witness: local regular-file classification must settle before the no-hang guard fires.
@@ -135,6 +136,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
+    vi.restoreAllMocks();
   });
 
   it("defect.exit-verifier-per-artifact-read-cap: InvalidExitBundleError carries the shared failure_class contract", () => {
@@ -357,6 +359,40 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
         "audit_receipts"
       )
     ).rejects.toBeInstanceOf(InvalidExitBundleError);
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: known_signers reload preserves the shared read failure class", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "ks-reload-class" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-ks-read-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const originalReadFileCustodyWithStats = custodyFs.readFileCustodyWithStats;
+    const knownSignersPathSuffix = join("artifacts", "known_signers.json");
+    let knownSignersReads = 0;
+    vi.spyOn(custodyFs, "readFileCustodyWithStats").mockImplementation(
+      (async (
+        path: string,
+        options: custodyFs.ReadFileCustodyOptions = {}
+      ) => {
+        if (path.endsWith(knownSignersPathSuffix)) {
+          knownSignersReads += 1;
+          if (knownSignersReads === 2) {
+            throw new custodyFs.CustodyFsError(
+              "not_regular_file",
+              "known_signers reload fixture rejected the artifact read"
+            );
+          }
+        }
+        return originalReadFileCustodyWithStats(path, options);
+      }) as typeof custodyFs.readFileCustodyWithStats
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(knownSignersReads).toBe(2);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("artifact_read_rejected");
   });
 
   it("#54: refuses identity overwrite without forceRebind, allows it with forceRebind, records audit", async () => {
