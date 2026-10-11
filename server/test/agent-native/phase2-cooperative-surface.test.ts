@@ -1,6 +1,6 @@
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -12,6 +12,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { toolResult, type ToolDefinition } from "../../src/router.js";
+import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import {
   ApprovalProofStore,
   classifyApprovalRequest,
@@ -28,7 +29,12 @@ import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "../../src/cast
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
-import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import {
+  DEFAULT_POLICY,
+  writeDefaultPrincipalPolicyFile,
+} from "../../src/principal-policy/loader.js";
+import type { ApprovalResponse } from "../../src/principal-policy/types.js";
+import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
 const MEMORY_HANDLE_REGISTRY_NAMESPACE = "_facade/memory_handles";
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -57,6 +63,25 @@ async function callTool(
     return fixedDenial(`audit:gate:${name}`) as unknown as Record<string, unknown>;
   }
   const result = await tool.handler(args);
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+async function callServerTool(
+  app: SanctuaryServer,
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<Record<string, unknown>> {
+  const handler = (
+    app.server as unknown as { _requestHandlers: Map<string, Function> }
+  )._requestHandlers.get("tools/call");
+  if (!handler) throw new Error("tools/call handler not registered");
+  const result = await handler(
+    {
+      method: "tools/call" as const,
+      params: { name, arguments: args },
+    },
+    {}
+  );
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }
 
@@ -359,6 +384,65 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(recalledRight.value).toBe("two");
   });
 
+  it("keeps cooperative memory reachable after the real server composition restarts", async () => {
+    const home = await createTempHome("memory-handle-composition");
+    cleanup.push(home.cleanup);
+    await mkdir(home.defaultFortressPath, { recursive: true, mode: 0o700 });
+    const { policyPath } = await writeDefaultPrincipalPolicyFile(home.defaultFortressPath);
+    const policy = await readFile(policyPath, "utf8");
+    await writeFile(policyPath, policy.replace("type: stderr", "type: callback"), {
+      mode: 0o600,
+    });
+    const originalSessionIdentity = process.env.SANCTUARY_SESSION_IDENTITY_ID;
+    const approve = async (): Promise<ApprovalResponse> => ({
+      decision: "approve" as const,
+      decided_at: new Date().toISOString(),
+      decided_by: "human" as const,
+    });
+    let first: SanctuaryServer | undefined;
+    let second: SanctuaryServer | undefined;
+    try {
+      first = await createSanctuaryServer({
+        passphrase: TEST_PASSPHRASE,
+        approvalCallback: approve,
+      });
+      const identity = await callServerTool(first, "identity_create", {
+        label: "agent-a",
+      });
+      process.env.SANCTUARY_SESSION_IDENTITY_ID = identity.identity_id as string;
+      const remembered = await callServerTool(first, "sanctuary_remember", {
+        key: "timezone",
+        value: "America/Los_Angeles",
+      });
+      const handle = remembered.namespace_handle as string;
+      expect(handle).toMatch(/^mem_[a-f0-9]{32}$/);
+      await first.cleanup();
+      first = undefined;
+
+      second = await createSanctuaryServer({
+        passphrase: TEST_PASSPHRASE,
+        approvalCallback: approve,
+      });
+      const recalled = await callServerTool(second, "sanctuary_recall", {
+        key: "timezone",
+      });
+      expect(recalled).toMatchObject({
+        value: "America/Los_Angeles",
+        verified: true,
+      });
+      const who = await callServerTool(second, "sanctuary_who_am_i");
+      expect(who.memory_namespace_handle).toBe(handle);
+    } finally {
+      if (first) await first.cleanup();
+      if (second) await second.cleanup();
+      if (originalSessionIdentity === undefined) {
+        delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
+      } else {
+        process.env.SANCTUARY_SESSION_IDENTITY_ID = originalSessionIdentity;
+      }
+    }
+  }, 60_000);
+
   it("refuses cross-namespace convenience verb access below the facade", async () => {
     const env = await setup();
     const second = await callTool(env.l1Tools, "identity_create", { label: "agent-b" });
@@ -569,7 +653,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     const who = await callTool(env.facadeTools, "sanctuary_who_am_i");
     expect(who.label).toBe("agent-a");
     expect(who.active_identity_fingerprint).toMatch(/^sha256:/);
-    expect(who.memory_namespace_handle).toMatch(/^mem_/);
+    expect(who.memory_namespace_handle).toBeNull();
     expect(who.did).toMatch(/^did:key:/);
     expect(JSON.stringify(who)).not.toContain("private");
     expect(JSON.stringify(who)).not.toContain("topology");

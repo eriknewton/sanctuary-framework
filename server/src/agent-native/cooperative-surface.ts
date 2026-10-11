@@ -842,7 +842,8 @@ export function createAgentNativeCooperativeTools(
           return toolResult({
             label: identity.label,
             active_identity_fingerprint: activeIdentity.requester_identity_fingerprint,
-            memory_namespace_handle: await activeMemoryNamespace(),
+            memory_namespace_handle:
+              await options.namespaceRegistry.lookupPersistedMemoryHandle(identity.identity_id) ?? null,
             did: identity.did,
             audit_ref: auditRef,
           });

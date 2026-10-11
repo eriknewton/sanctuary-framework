@@ -45,6 +45,7 @@ import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
+  MEMORY_HANDLE_PATTERN,
   MEMORY_HANDLE_RECORD_VERSION,
   MEMORY_HANDLE_REGISTRY_LOCK,
   MEMORY_HANDLE_REGISTRY_NAMESPACE,
@@ -1010,7 +1011,6 @@ export function createCognitiveTools(
 } {
   const identityMgr = new IdentityManager(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-  const MEMORY_HANDLE_PATTERN = /^mem_[a-f0-9]{32}$/;
   const parseMemoryHandleRecord = (
     value: string,
     expectedIdentityId?: string
@@ -1067,7 +1067,13 @@ export function createCognitiveTools(
           );
           return handle;
         },
-        { metadata: { operation: "memory_handle_registry_claim" } }
+        {
+          // Memory-handle first use shares custody's process-owned lock shape:
+          // a crashed claimant must leave no inert file that blocks all later
+          // first-use claims for this fortress.
+          kernelBacked: true,
+          metadata: { operation: "memory_handle_registry_claim" },
+        }
       ),
     findOwnerForHandle: async (handle) => {
       if (!MEMORY_HANDLE_PATTERN.test(handle)) return undefined;
@@ -1082,10 +1088,11 @@ export function createCognitiveTools(
           true
         );
         if (!read) continue;
-        const parsed = JSON.parse(read.value) as Record<string, unknown>;
-        const persisted = parseMemoryHandleRecord(read.value);
-        if (persisted === handle && typeof parsed.identity_id === "string") {
-          return parsed.identity_id;
+        // The storage key is the principal being trusted; the signed record body
+        // must agree before this scan can use it as ownership evidence.
+        const persisted = parseMemoryHandleRecord(read.value, entry.key);
+        if (persisted === handle) {
+          return entry.key;
         }
       }
       return undefined;

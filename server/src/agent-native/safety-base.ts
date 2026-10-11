@@ -219,31 +219,80 @@ export interface OpaqueNamespacePersistence {
   findOwnerForHandle(handle: string): Promise<string | undefined>;
 }
 
+interface TestOnlyOpaqueNamespaceStore {
+  readonly kind: "test-only-in-memory";
+}
+
 // Must match the at-rest entry in server/reorg-surface-manifest.md and the
 // master-rotation recipe in core/master-rotation.ts.
 export const MEMORY_HANDLE_REGISTRY_NAMESPACE = "_facade/memory_handles";
 export const MEMORY_HANDLE_REGISTRY_LOCK = ".memory-handles.lock";
 export const MEMORY_HANDLE_RECORD_VERSION = 1;
+export const MEMORY_HANDLE_RANDOM_BYTES = 16;
+export const MEMORY_HANDLE_HEX_LENGTH = MEMORY_HANDLE_RANDOM_BYTES * 2;
+export const MEMORY_HANDLE_PATTERN = new RegExp(
+  `^mem_[a-f0-9]{${MEMORY_HANDLE_HEX_LENGTH}}$`
+);
+
+export class MemoryHandleOwnershipConflictError extends Error {
+  constructor(message = "memory handle ownership conflict") {
+    super(message);
+    this.name = "MemoryHandleOwnershipConflictError";
+  }
+}
 
 export class OpaqueNamespaceRegistry {
   private handleToIdentity = new Map<string, string>();
   private identityToHandle = new Map<string, string>();
+  private readonly persistence?: OpaqueNamespacePersistence;
+  private readonly testOnlyInMemory: boolean;
+  private inFlightClaims = new Map<string, Promise<string>>();
 
-  constructor(private readonly persistence?: OpaqueNamespacePersistence) {}
+  constructor(persistence: OpaqueNamespacePersistence | TestOnlyOpaqueNamespaceStore) {
+    if ((persistence as TestOnlyOpaqueNamespaceStore).kind === "test-only-in-memory") {
+      this.testOnlyInMemory = true;
+    } else {
+      this.persistence = persistence as OpaqueNamespacePersistence;
+      this.testOnlyInMemory = false;
+    }
+  }
+
+  static testOnlyInMemory(): OpaqueNamespaceRegistry {
+    return new OpaqueNamespaceRegistry({ kind: "test-only-in-memory" });
+  }
 
   issueMemoryHandle(identityId: string): string {
+    if (!this.testOnlyInMemory) {
+      throw new Error("test-only memory handles are unavailable on a persisted registry");
+    }
     const existing = this.identityToHandle.get(identityId);
     if (existing) return existing;
-    const handle = `mem_${randomBytes(16).toString("hex")}`;
-    this.identityToHandle.set(identityId, handle);
-    this.handleToIdentity.set(handle, identityId);
+    const handle = this.mintMemoryHandle();
+    this.rememberOwner(identityId, handle);
     return handle;
   }
 
   async issuePersistedMemoryHandle(identityId: string): Promise<string> {
     const existing = this.identityToHandle.get(identityId);
     if (existing) return existing;
-    if (!this.persistence) return this.issueMemoryHandle(identityId);
+    if (!this.persistence) {
+      throw new Error("persistent memory handle registry is required");
+    }
+    const inFlight = this.inFlightClaims.get(identityId);
+    if (inFlight) return inFlight;
+    const claim = this.issuePersistedMemoryHandleUncached(identityId);
+    this.inFlightClaims.set(identityId, claim);
+    try {
+      return await claim;
+    } finally {
+      this.inFlightClaims.delete(identityId);
+    }
+  }
+
+  private async issuePersistedMemoryHandleUncached(identityId: string): Promise<string> {
+    if (!this.persistence) {
+      throw new Error("persistent memory handle registry is required");
+    }
     const loaded = await this.persistence.loadHandleForIdentity(identityId);
     if (loaded) {
       this.rememberOwner(identityId, loaded);
@@ -255,12 +304,22 @@ export class OpaqueNamespaceRegistry {
     // to identities before this mint point can see them.
     const handle = await this.persistence.claimHandleForIdentity(
       identityId,
-      () => `mem_${randomBytes(16).toString("hex")}`
+      () => this.mintMemoryHandle()
     );
     // The persistence callback returns only after the reserved StateStore record
     // has landed; a returned-but-unpersisted handle would orphan future memory.
     this.rememberOwner(identityId, handle);
     return handle;
+  }
+
+  async lookupPersistedMemoryHandle(identityId: string): Promise<string | undefined> {
+    const existing = this.identityToHandle.get(identityId);
+    if (existing) return existing;
+    if (!this.persistence) return undefined;
+    const loaded = await this.persistence.loadHandleForIdentity(identityId);
+    if (!loaded) return undefined;
+    this.rememberOwner(identityId, loaded);
+    return loaded;
   }
 
   isOpaqueMemoryHandle(namespace: string): boolean {
@@ -296,8 +355,20 @@ export class OpaqueNamespaceRegistry {
   }
 
   private rememberOwner(identityId: string, handle: string): void {
+    const existingHandle = this.identityToHandle.get(identityId);
+    if (existingHandle !== undefined && existingHandle !== handle) {
+      throw new MemoryHandleOwnershipConflictError();
+    }
+    const existingIdentity = this.handleToIdentity.get(handle);
+    if (existingIdentity !== undefined && existingIdentity !== identityId) {
+      throw new MemoryHandleOwnershipConflictError();
+    }
     this.identityToHandle.set(identityId, handle);
     this.handleToIdentity.set(handle, identityId);
+  }
+
+  private mintMemoryHandle(): string {
+    return `mem_${randomBytes(MEMORY_HANDLE_RANDOM_BYTES).toString("hex")}`;
   }
 }
 

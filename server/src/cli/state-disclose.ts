@@ -554,13 +554,23 @@ export async function runStateDiscloseUnattributedCommand(
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      // A FRESH, EMPTY REGISTRY AND NO SESSION BINDING, on purpose. An opaque
+      // A fail-closed registry AND NO SESSION BINDING, on purpose. An opaque
       // `mem_*` handle is issued to a live agent session inside a running MCP
       // server; this process is the operator's own out-of-band presence and
       // holds no such session, so it owns no handle and every `mem_*` namespace
       // refuses here. Fail-closed, and the same code path the MCP tool takes
       // rather than a CLI-shaped approximation of it.
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: new OpaqueNamespaceRegistry({
+        loadHandleForIdentity: async () => {
+          throw new Error("operator CLI cannot claim agent memory handles");
+        },
+        claimHandleForIdentity: async () => {
+          throw new Error("operator CLI cannot claim agent memory handles");
+        },
+        findOwnerForHandle: async () => {
+          throw new Error("operator CLI cannot resolve agent memory handles");
+        },
+      }),
       namespace,
       key,
       identityId: primary.identity_id,
