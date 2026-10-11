@@ -1283,6 +1283,10 @@ async function writeMetaDurable(
 interface CustodyPairRecoveryResult {
   changedPair: boolean;
   quarantinedJournal: boolean;
+  recoveredPair?: {
+    envelopeBytes: Uint8Array;
+    sentinelBytes: Uint8Array;
+  };
 }
 
 export type CustodyEnvelopeCommitConsistencyCheck = (
@@ -1542,7 +1546,11 @@ async function recoverCustodyEnvelopeCommitLocked(
   await state_PREPARED_completeCustodyPair(storage, journal, lease);
   await storage.delete("_meta", slot.key, true);
   lease.assertHeld();
-  return { changedPair, quarantinedJournal: false };
+  return {
+    changedPair,
+    quarantinedJournal: false,
+    recoveredPair: { envelopeBytes, sentinelBytes },
+  };
 }
 
 export async function deleteCustodyEnvelopeCommitJournalQuarantines(
@@ -1597,22 +1605,6 @@ async function writeCustodyEnvelopeLocked(
   assertMaster(master);
   const pendingJournalSlot = custodyEnvelopeCommitJournalSlotForTargetPair(opts);
   const pendingJournalKey = pendingJournalSlot.key;
-  const pendingJournal = await storage.read("_meta", pendingJournalKey);
-  if (pendingJournal !== null) {
-    const recovery = await recoverCustodyEnvelopeCommitLocked(
-      storage,
-      pendingJournalSlot,
-      lease,
-      {
-        envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
-        sentinelKey: opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
-        master,
-      },
-    );
-    if (recovery.changedPair) {
-      throw new CustodySnapshotChangedError();
-    }
-  }
   const stamped: CustodyEnvelope = {
     v: envelope.v,
     install_mode: envelope.install_mode,
@@ -1636,6 +1628,34 @@ async function writeCustodyEnvelopeLocked(
   const journalKey = pendingJournalKey;
   const envelopeBytes = stringToBytes(JSON.stringify(stamped));
   const sentinelBytes = stringToBytes(JSON.stringify(sentinel));
+  const pendingJournal = await storage.read("_meta", pendingJournalKey);
+  if (pendingJournal !== null) {
+    const recovery = await recoverCustodyEnvelopeCommitLocked(
+      storage,
+      pendingJournalSlot,
+      lease,
+      {
+        envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
+        sentinelKey: opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
+        master,
+      },
+    );
+    const recoveredEnvelopeMatchesRequestedEnvelope =
+      recovery.recoveredPair !== undefined &&
+      constantTimeEqual(recovery.recoveredPair.envelopeBytes, envelopeBytes);
+    const recoveredPairAuthenticates =
+      recoveredEnvelopeMatchesRequestedEnvelope &&
+      await verifyCustodyPairAuthenticates(storage, master, {
+        envelopeKey,
+        sentinelKey: sentinelTargetKey,
+      });
+    // A recovered prepared pair can continue only when it publishes the exact
+    // envelope this writer requested and the sentinel authenticates with it;
+    // any other change remains a stale snapshot.
+    if (recovery.changedPair && !recoveredPairAuthenticates) {
+      throw new CustodySnapshotChangedError();
+    }
+  }
   const journal = custodyEnvelopeCommitJournal(
     envelopeKey,
     sentinelTargetKey,
