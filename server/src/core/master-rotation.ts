@@ -1149,8 +1149,13 @@ export interface RotateMasterOptions {
   log?: (line: string) => void;
   /** Test only: observe the real kernel holder and kill it to prove fencing. */
   __testAfterKernelHolderAcquired?: (pid: number) => void;
-  /** Test only: observe the process-owned lock socket for loss fencing. */
-  __testAfterKernelSocketAcquired?: (path: string) => void;
+  /**
+   * Test only: observe the process-owned lock socket for loss fencing.
+   * Must match the async hook shape in CrossProcessLockOptions and
+   * MasterWriteBarrierOptions in storage/cross-process-lock.ts, and
+   * withCustodyWriteLock in core/master-custody.ts.
+   */
+  __testAfterKernelSocketAcquired?: (path: string) => void | Promise<void>;
   /** Test only: pause after durable Castle-pin publish but before the lease fence. */
   __testAfterCastlePinPublished?: () => void | Promise<void>;
   /** Test only: storage-only fixtures may inject an isolated file capability. */
