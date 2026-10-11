@@ -34,6 +34,7 @@ import {
   consumeFlagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  argvTokenForDisplay,
 } from "./argv.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -117,7 +118,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--recovery-key-prompt") out.recoveryKeyPrompt = true;
     else if (a && a.startsWith("--")) {
-      throw new Error(`Unknown flag: ${a}`);
+      throw new Error(`Unknown flag: ${argvTokenForDisplay(a)}`);
     }
   }
   return out;

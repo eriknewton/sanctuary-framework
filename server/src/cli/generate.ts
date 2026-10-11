@@ -24,7 +24,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, sep } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { flagValue } from "./argv.js";
+import { flagValue, argvTokenForDisplay } from "./argv.js";
 
 export interface GenerateCommandArgs {
   argv: string[];
@@ -62,7 +62,7 @@ export async function runGenerateCommand(
     return sub ? 0 : 2;
   }
   if (sub !== "systemd") {
-    write(err, `Unknown generate command: ${sub}\n`);
+    write(err, `Unknown generate command: ${argvTokenForDisplay(sub)}\n`);
     printUsage(err);
     return 2;
   }

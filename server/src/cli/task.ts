@@ -6,7 +6,7 @@ import {
   type TaskStatus,
 } from "../operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { consumeFlagValue, flagValue, unknownFlagWithPrefix } from "./argv.js";
+import { consumeFlagValue, flagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "./argv.js";
 
 export interface TaskCliArgs {
   argv: string[];
@@ -48,7 +48,7 @@ export async function runTaskCommand(args: TaskCliArgs): Promise<number> {
       case "cancel":
         return await cancel(rest, out, err, ctx);
       default:
-        err.write(`Unknown task subcommand: ${sub}\n`);
+        err.write(`Unknown task subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -228,7 +228,7 @@ async function resolveContext(
 ): Promise<TaskCliContext | null> {
   const unknownFortressFlag = unknownFlagWithPrefix(argv, "--fortress");
   if (unknownFortressFlag) {
-    err.write(`task unknown fortress flag ${unknownFortressFlag}\n`);
+    err.write(`task unknown fortress flag ${argvTokenForDisplay(unknownFortressFlag)}\n`);
     return null;
   }
   const parsed = consumeFlagValue(argv, "--fortress");

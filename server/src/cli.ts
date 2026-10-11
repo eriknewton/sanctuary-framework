@@ -23,6 +23,7 @@ import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
+import { argvTokenForDisplay } from "./cli/argv.js";
 export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 
 const require = createRequire(import.meta.url);
@@ -140,7 +141,12 @@ async function main(): Promise<void> {
       );
       process.exit(2);
     }
-    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
+    const {
+      isWrapCliRefusal,
+      parseWrapArgs,
+      runWrap,
+      wrapCliRefusalExitCode,
+    } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     if (args[0] === "protect") opts.protectCommand = true;
     // Dashboard-fold PR-4 (ratified decision 1): inject the ONE main
@@ -149,29 +155,38 @@ async function main(): Promise<void> {
     // The closure lives HERE because wrap/cli must not import
     // dashboard-standalone itself (that edge would introduce a new import
     // cycle; see test/structure/import-cycle-baseline.test.ts).
-    await runWrap(opts, {
-      startOwnedDashboard: async ({ storagePath, port, passphrase }) => {
-        const { startStandaloneDashboard } = await import(
-          "./dashboard-standalone.js"
-        );
-        await startStandaloneDashboard({
-          storagePath,
-          port,
-          ...(passphrase !== undefined ? { passphrase } : {}),
-          // Fix round 1, F1 (ratified decision 2): a protect-started
-          // dashboard must never sit tokenless-open on the folded read
-          // routes. When no source configures dashboard.auth_token, the
-          // boot mints one (and prints it as "Operator token:"); a
-          // configured token always wins. Loopback auto-auth after unlock
-          // keeps the browser UX.
-          mintAuthTokenIfAbsent: true,
-        });
-        // The standalone boot binds exactly the requested loopback port (no
-        // silent walk) and writes the tenant's runtime.json itself — the
-        // single production writer.
-        return { url: `http://127.0.0.1:${port}`, port };
-      },
-    });
+    try {
+      await runWrap(opts, {
+        startOwnedDashboard: async ({ storagePath, port, passphrase }) => {
+          const { startStandaloneDashboard } = await import(
+            "./dashboard-standalone.js"
+          );
+          await startStandaloneDashboard({
+            storagePath,
+            port,
+            ...(passphrase !== undefined ? { passphrase } : {}),
+            // Fix round 1, F1 (ratified decision 2): a protect-started
+            // dashboard must never sit tokenless-open on the folded read
+            // routes. When no source configures dashboard.auth_token, the
+            // boot mints one (and prints it as "Operator token:"); a
+            // configured token always wins. Loopback auto-auth after unlock
+            // keeps the browser UX.
+            mintAuthTokenIfAbsent: true,
+          });
+          // The standalone boot binds exactly the requested loopback port (no
+          // silent walk) and writes the tenant's runtime.json itself — the
+          // single production writer.
+          return { url: `http://127.0.0.1:${port}`, port };
+        },
+      });
+    } catch (err) {
+      if (!isWrapCliRefusal(err)) throw err;
+      // Known protect/wrap refusals are operator outcomes, not MCP boot
+      // failures; printing only the curated sentence keeps remedies visible
+      // without exposing an irrelevant module stack.
+      process.stderr.write(`\n  ${err.message}\n`);
+      return drainAndExit(wrapCliRefusalExitCode(err));
+    }
     return;
   }
 
@@ -1454,7 +1469,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
       return runSignerHelperStatus(args.slice(2));
     }
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(`Unknown signer-helper subcommand: ${sub}. Try: sanctuary castle-wall signer-helper status`);
+    console.error(`Unknown signer-helper subcommand: ${argvTokenForDisplay(sub)}. Try: sanctuary castle-wall signer-helper status`);
     return 2;
   }
 
@@ -1623,7 +1638,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
-    `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
+    `Unknown subcommand: ${argvTokenForDisplay(command)}. Try: sanctuary castle-wall --help`
   );
   return 2;
 }
