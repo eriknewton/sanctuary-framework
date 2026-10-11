@@ -1293,6 +1293,37 @@ interface CustodyPairRecoveryResult {
   };
 }
 
+async function recoveredCustodyPairAllowsPublish(
+  storage: StorageBackend,
+  recovery: CustodyPairRecoveryResult,
+  requested: {
+    envelopeBytes: Uint8Array;
+    envelopeKey: string;
+    sentinelKey: string;
+    master: Uint8Array;
+  },
+): Promise<boolean> {
+  if (!recovery.changedPair) return true;
+  const recoveredEnvelopeMatchesRequestedEnvelope =
+    recovery.recoveredPair !== undefined &&
+    constantTimeEqual(recovery.recoveredPair.envelopeBytes, requested.envelopeBytes);
+  if (!recoveredEnvelopeMatchesRequestedEnvelope) return false;
+  // Continuing and refusal table (AGENTS.md rule 13):
+  // - unchanged replay: continue because the publish sees the same pair it read;
+  // - changed replay with exact requested envelope bytes and a sentinel that
+  //   authenticates under this writer's master: continue because the replay
+  //   immediately before this check may itself have rewritten disk, and this
+  //   writer's publish overwrites no one else's update;
+  // - changed replay with no recovered pair, different envelope bytes, same
+  //   parsed content in different bytes, a different target pair, or a pair
+  //   authenticating only under another master: refuse with the stale-snapshot
+  //   message and preserve the caller's retry boundary.
+  return verifyCustodyPairAuthenticates(storage, requested.master, {
+    envelopeKey: requested.envelopeKey,
+    sentinelKey: requested.sentinelKey,
+  });
+}
+
 export type CustodyEnvelopeCommitConsistencyCheck = (
   storage: StorageBackend,
   master: Uint8Array,
@@ -1648,20 +1679,12 @@ async function writeCustodyEnvelopeLocked(
         master,
       },
     );
-    const recoveredEnvelopeMatchesRequestedEnvelope =
-      recovery.recoveredPair !== undefined &&
-      constantTimeEqual(recovery.recoveredPair.envelopeBytes, envelopeBytes);
-    const recoveredPairAuthenticates =
-      recoveredEnvelopeMatchesRequestedEnvelope &&
-      await verifyCustodyPairAuthenticates(storage, master, {
-        envelopeKey,
-        sentinelKey: sentinelTargetKey,
-      });
-    // The custody write lock is held from this check through the publish below:
-    // continuing is safe only when disk already holds the exact envelope bytes
-    // this writer is publishing and the sentinel authenticates under this
-    // writer's master, so no other actor's custody update is overwritten.
-    if (recovery.changedPair && !recoveredPairAuthenticates) {
+    if (!(await recoveredCustodyPairAllowsPublish(storage, recovery, {
+      envelopeBytes,
+      envelopeKey,
+      sentinelKey: sentinelTargetKey,
+      master,
+    }))) {
       throw new CustodySnapshotChangedError();
     }
   }
@@ -1725,7 +1748,12 @@ export async function writeCustodyEnvelopeBytes(
             master,
           },
         );
-        if (recovery.changedPair) {
+        if (!(await recoveredCustodyPairAllowsPublish(storage, recovery, {
+          envelopeBytes,
+          envelopeKey: CUSTODY_ENVELOPE_KEY,
+          sentinelKey: CUSTODY_SENTINEL_KEY,
+          master,
+        }))) {
           throw new CustodySnapshotChangedError();
         }
       }

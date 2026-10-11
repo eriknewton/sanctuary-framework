@@ -1510,4 +1510,208 @@ describe("custody-pair commit schedule", () => {
     );
     nextMaster.fill(0);
   });
+
+  it.each([
+    "sentinel authenticates under another master",
+    "envelope bytes came from a concurrent writer",
+    "same parsed envelope content has different bytes",
+  ])("raw restore refuses when the recovered %s", async (scenario) => {
+    const storage = await seedConsistentPair(`custody-restore-${scenario}`);
+    const opened = await establishMaster({
+      storage,
+      passphrase: `custody-restore-${scenario}`,
+    });
+    const requestedEnvelope = await readCustodyEnvelope(storage);
+    expect(requestedEnvelope).not.toBeNull();
+    const requestedBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
+
+    if (scenario === "sentinel authenticates under another master") {
+      await leavePendingCustodyPair({
+        storage,
+        passphrase: `custody-restore-${scenario}`,
+        failTarget: CUSTODY_SENTINEL_KEY,
+        envelope: requestedEnvelope!,
+      });
+      const otherMaster = generateRandomKey();
+      await replaceJournalSentinelBytes(storage, sentinelBytesForMaster(otherMaster));
+      otherMaster.fill(0);
+    } else if (scenario === "envelope bytes came from a concurrent writer") {
+      await leavePendingCustodyPair({
+        storage,
+        passphrase: `custody-restore-${scenario}`,
+        failTarget: CUSTODY_ENVELOPE_KEY,
+        envelope: {
+          ...requestedEnvelope!,
+          created_at: "2034-01-01T00:00:00.000Z",
+        },
+      });
+    } else {
+      await leavePendingCustodyPair({
+        storage,
+        passphrase: `custody-restore-${scenario}`,
+        failTarget: CUSTODY_SENTINEL_KEY,
+        envelope: requestedEnvelope!,
+      });
+      const sameContentDifferentBytes = stringToBytes(
+        JSON.stringify(requestedEnvelope, null, JSON_PRETTY_PRINT_SPACES),
+      );
+      expect(bytesToString(sameContentDifferentBytes))
+        .not.toBe(bytesToString(requestedBytes));
+      expect(JSON.parse(bytesToString(sameContentDifferentBytes)))
+        .toEqual(requestedEnvelope);
+      await replaceJournalEnvelopeBytes(storage, sameContentDifferentBytes);
+    }
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelopeBytes(storage, requestedBytes, opened.masterKey),
+    );
+    opened.masterKey.fill(0);
+  });
+
+  it("raw restore refuses a stale prepared live pair from an earlier master", async () => {
+    const storage = await seedConsistentPair("custody-restore-earlier-master-passphrase");
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-restore-earlier-master-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+    });
+    const stalePreparedPair = (await storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    ))!;
+    await storage.delete("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
+
+    const nextMaster = generateRandomKey();
+    await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: "headless",
+        wraps: [await wrapMasterWithPassphrase(nextMaster, "custody-restore-next-master")],
+        created_at: "2035-01-01T00:00:00.000Z",
+      },
+      nextMaster,
+    );
+    const currentBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      stalePreparedPair,
+    );
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelopeBytes(storage, currentBytes, nextMaster),
+    );
+    nextMaster.fill(0);
+  });
+
+  it("accepts an interrupted restore when the replayed pair matches the requested bytes", async () => {
+    const storage = await seedConsistentPair("custody-restore-retry-passphrase");
+    const opened = await establishMaster({
+      storage,
+      passphrase: "custody-restore-retry-passphrase",
+    });
+    const priorBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
+    const priorEnvelope = await readCustodyEnvelope(storage);
+    expect(priorEnvelope).not.toBeNull();
+    await writeCustodyEnvelope(
+      storage,
+      {
+        ...priorEnvelope!,
+        created_at: "2033-01-01T00:00:00.000Z",
+      },
+      opened.masterKey,
+    );
+
+    const originalWrite = storage.write.bind(storage);
+    let interrupted = false;
+    storage.write = async (namespace, key, value) => {
+      if (!interrupted && namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
+        interrupted = true;
+        throw new Error("injected restore interruption");
+      }
+      return originalWrite(namespace, key, value);
+    };
+    await expect(
+      writeCustodyEnvelopeBytes(storage, priorBytes, opened.masterKey),
+    ).rejects.toThrow("injected restore interruption");
+    storage.write = originalWrite;
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .not.toBeNull();
+
+    const restored = await writeCustodyEnvelopeBytes(
+      storage,
+      priorBytes,
+      opened.masterKey,
+    );
+    expect(restored.created_at).toBe(priorEnvelope!.created_at);
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .toBeNull();
+    opened.masterKey.fill(0);
+  });
+
+  it("raw restore converges when the retry publish is interrupted after the accepted replay", async () => {
+    const storage = await seedConsistentPair("custody-restore-resume-passphrase");
+    const opened = await establishMaster({
+      storage,
+      passphrase: "custody-restore-resume-passphrase",
+    });
+    const priorBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
+    const priorEnvelope = await readCustodyEnvelope(storage);
+    expect(priorEnvelope).not.toBeNull();
+    await writeCustodyEnvelope(
+      storage,
+      {
+        ...priorEnvelope!,
+        created_at: "2036-01-01T00:00:00.000Z",
+      },
+      opened.masterKey,
+    );
+
+    const originalWrite = storage.write.bind(storage);
+    let firstInterrupted = false;
+    storage.write = async (namespace, key, value) => {
+      if (!firstInterrupted && namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
+        firstInterrupted = true;
+        throw new Error("injected first restore interruption");
+      }
+      return originalWrite(namespace, key, value);
+    };
+    await expect(
+      writeCustodyEnvelopeBytes(storage, priorBytes, opened.masterKey),
+    ).rejects.toThrow("injected first restore interruption");
+
+    let retrySentinelWrites = 0;
+    storage.write = async (namespace, key, value) => {
+      if (namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
+        retrySentinelWrites += 1;
+        if (retrySentinelWrites === 2) {
+          throw new Error("injected restore retry interruption");
+        }
+      }
+      return originalWrite(namespace, key, value);
+    };
+    await expect(
+      writeCustodyEnvelopeBytes(storage, priorBytes, opened.masterKey),
+    ).rejects.toThrow("injected restore retry interruption");
+    storage.write = originalWrite;
+    expect(retrySentinelWrites).toBe(2);
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .not.toBeNull();
+    await expect(
+      unlockExistingMasterReadOnly(storage, {
+        passphrase: "custody-restore-resume-passphrase",
+      }),
+    ).rejects.toThrow(/pending custody pair journal/);
+
+    const restored = await writeCustodyEnvelopeBytes(
+      storage,
+      priorBytes,
+      opened.masterKey,
+    );
+    expect(restored.created_at).toBe(priorEnvelope!.created_at);
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .toBeNull();
+    opened.masterKey.fill(0);
+  });
 });
