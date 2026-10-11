@@ -46,6 +46,7 @@ import {
   type SdwStateExportBundle,
 } from "./export.js";
 import {
+  parseMemoryProvenanceCompanionValue,
   publicKeyFromMemoryProvenanceDid,
   verifyMemoryProvenanceCompanion,
 } from "./memory-provenance-contract.js";
@@ -247,7 +248,8 @@ export interface SdwImportResult {
  * Execute the ratified import flow (steps 2–8) AFTER Tier-1 approval.
  *
  * Phase 1 (no writes): re-verify the signed manifest on the exact bytes, then
- * decrypt and validate EVERY record in memory. Any failure aborts the whole
+ * decrypt and validate EVERY record in memory, including strict self-
+ * verification for memory-provenance companions. Any failure aborts the whole
  * import before a single write (fail closed; constraint #5 — no partial,
  * degraded import).
  *
@@ -390,21 +392,26 @@ function asSdwTransactional(
 
 function verifyImportProvenanceRecord(record: SdwRecord, digest: string): SdwRecord {
   if (record.kind !== "memory_provenance") return record;
-  const verified = verifyMemoryProvenanceCompanion(record.companion, {
+  const parsed = parseMemoryProvenanceCompanionValue(record.companion);
+  if (!parsed.ok) {
+    throw new SdwImportVerificationError("schema_invalid", digest);
+  }
+  const companion = parsed.value;
+  const verified = verifyMemoryProvenanceCompanion(companion, {
     size: 2,
     resolve: (_identityId, did) => publicKeyFromMemoryProvenanceDid(did),
   }, {
     origin: {
-      origin_fortress_id: record.companion.origin.body.origin_fortress_id,
-      owner_ref: record.companion.origin.body.owner_ref,
-      passage_id: record.companion.origin.body.passage_id,
-      content_hash: record.companion.origin.body.content_hash,
-      chunk_count: record.companion.origin.body.chunk_count,
+      origin_fortress_id: companion.origin.body.origin_fortress_id,
+      owner_ref: companion.origin.body.owner_ref,
+      passage_id: companion.origin.body.passage_id,
+      content_hash: companion.origin.body.content_hash,
+      chunk_count: companion.origin.body.chunk_count,
     },
     destination: {
-      destination_fortress_id: record.companion.admission.body.destination_fortress_id,
-      destination_owner_ref: record.companion.admission.body.destination_owner_ref,
-      passage_id: record.companion.admission.body.passage_id,
+      destination_fortress_id: companion.admission.body.destination_fortress_id,
+      destination_owner_ref: companion.admission.body.destination_owner_ref,
+      passage_id: companion.admission.body.passage_id,
     },
   });
   if (!verified.ok) {

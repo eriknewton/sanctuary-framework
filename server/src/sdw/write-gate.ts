@@ -1282,7 +1282,9 @@ function isVerifiedProvenanceSignatureClassifierExclusion(
   // is the exact origin/admission owner object, the evidence source is the
   // signature string on that object, and memory-provenance-contract.ts is the
   // verifier; classifier exclusion means only that verifier-produced Ed25519
-  // signature material is not treated as caller-authored credential text.
+  // signature material is not treated as caller-authored credential text. The
+  // verifier must keep using core/identity.ts `verify`'s strict Ed25519 point
+  // profile before any owner can enter the registry this predicate reads.
   return isVerifiedProvenanceSignature(owner, value);
 }
 

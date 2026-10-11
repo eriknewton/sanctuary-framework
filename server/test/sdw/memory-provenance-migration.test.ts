@@ -39,17 +39,19 @@ function fixture(options: {
   readonly pageSize?: number;
   readonly candidateCap?: number;
   readonly fault?: ConstructorParameters<typeof SdwMemoryProvenanceMigration>[0]["__fault"];
-  readonly storage?: MemoryStorage;
+  readonly storage?: StorageBackend;
+  readonly now?: string;
 } = {}) {
   const storage = options.storage ?? new MemoryStorage();
   const deps = testMemoryProvenanceDependencies(MASTER_KEY);
+  const now = options.now ?? NOW;
   const migration = new SdwMemoryProvenanceMigration({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS,
     ownerRef: OWNER,
     ...deps,
-    now: () => NOW,
+    now: () => now,
     pageSize: options.pageSize,
     candidateCap: options.candidateCap,
     __fault: options.fault,
@@ -59,7 +61,7 @@ function fixture(options: {
     masterKey: MASTER_KEY,
     fortressId: FORTRESS,
     ownerRef: OWNER,
-    now: () => NOW,
+    now: () => now,
     resolveMemoryIntegrityState: () => migration.getState(),
   });
   return { storage, migration, adapter };
@@ -212,6 +214,57 @@ describe("Memory Integrity C3 provenance migration", () => {
     const markerRaw = await subject.storage.read(SDW_META_NAMESPACE, SDW_MEMORY_PROVENANCE_COMPLETION_KEY);
     expect(Buffer.from(markerRaw!).toString("utf8")).not.toContain(SDW_MEMORY_PROVENANCE_MIGRATION_ID);
     await expect(subject.adapter.getPassage("p1")).resolves.toMatchObject({ provenance_status: "verified" });
+  });
+
+  it("migrates token-prefix-shaped legacy provenance through the verified write path", async () => {
+    // Grounded by the deterministic test signing key; the timestamp below is
+    // the first fixture second whose origin signature starts with the
+    // classifier detector prefix, so an unregistered companion is refused.
+    const subject = fixture({ now: "2026-08-24T09:01:25.000Z" });
+    await makeUnsigned(subject, "p1");
+
+    await expect(subject.migration.migratePage()).resolves.toMatchObject({ state: "state_COMPLETE" });
+
+    const provenance = await subject.adapter.getPassageProvenance("p1");
+    if (provenance.status !== "verified") throw new Error("expected verified migration provenance");
+    expect(provenance.companion.origin.signature.startsWith("sk-")).toBe(true);
+    expect(provenance.companion.admission.body.admission_channel).toBe("legacy_migration");
+  });
+
+  it("writes token-prefix-shaped local provenance through each adapter write path", async () => {
+    // Grounded by the deterministic test signing key; passage-token-150610 is
+    // the first local-write fixture whose admission signature starts with the
+    // classifier detector prefix, so an unregistered companion is refused.
+    const inputWithTokenSignature = input("passage-token-150610", "ordinary passage text");
+    const nonTransactional = fixture();
+
+    expect(nonTransactional.adapter.screenPassage(inputWithTokenSignature, "user_content"))
+      .toEqual({ ok: true });
+    await expect(nonTransactional.adapter.insertPassage(
+      inputWithTokenSignature,
+      "user_content",
+    )).resolves.toMatchObject({ passage_id: "passage-token-150610", provenance_status: "verified" });
+    const inserted = await nonTransactional.adapter.getPassageProvenance("passage-token-150610");
+    if (inserted.status !== "verified") throw new Error("expected verified inserted provenance");
+    expect(inserted.companion.admission.signature.startsWith("sk-")).toBe(true);
+
+    const txPut = fixture({ storage: new TransactionalMemoryStorage() });
+    await expect(txPut.adapter.putPassages(
+      [inputWithTokenSignature],
+      "user_content",
+    )).resolves.toHaveLength(1);
+    const put = await txPut.adapter.getPassageProvenance("passage-token-150610");
+    if (put.status !== "verified") throw new Error("expected verified put provenance");
+    expect(put.companion.admission.signature.startsWith("sk-")).toBe(true);
+
+    const txIfAbsent = fixture({ storage: new TransactionalMemoryStorage() });
+    await expect(txIfAbsent.adapter.putPassagesIfAbsent(
+      [inputWithTokenSignature],
+      "user_content",
+    )).resolves.toHaveLength(1);
+    const absent = await txIfAbsent.adapter.getPassageProvenance("passage-token-150610");
+    if (absent.status !== "verified") throw new Error("expected verified conditional provenance");
+    expect(absent.companion.admission.signature.startsWith("sk-")).toBe(true);
   });
 
   it("preserves every pre-existing replay-anchor component while adding one completion counter", async () => {

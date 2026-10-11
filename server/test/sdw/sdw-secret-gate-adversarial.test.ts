@@ -304,9 +304,9 @@ describe("SDW secret-persistence adversarial fixtures", () => {
       },
     };
 
-    expect(() => corpus.mintProvenance(record, "system_generated")).toThrow(SdwValidationError);
-    expect(() => corpus.mintProvenance(clonedOriginRecord, "system_generated")).toThrow(SdwValidationError);
-    expect(() => corpus.mintProvenance(changedSignatureRecord, "system_generated")).toThrow(SdwValidationError);
+    expectSdwThrow(() => corpus.mintProvenance(record, "system_generated"), "classifier_reject");
+    expectSdwThrow(() => corpus.mintProvenance(clonedOriginRecord, "system_generated"), "classifier_reject");
+    expectSdwThrow(() => corpus.mintProvenance(changedSignatureRecord, "system_generated"), "classifier_reject");
     expect(
       isVerifiedProvenanceSignature(
         verifiedRecord.companion.admission,
@@ -324,9 +324,9 @@ describe("SDW secret-persistence adversarial fixtures", () => {
       fortressId: FORTRESS_ID,
     });
 
-    expect(() =>
+    expectSdwThrow(() =>
       corpus.mintProvenance(provenanceRecordWithSignature("prov-signature-token-shaped"), "system_generated"),
-    ).toThrow(SdwValidationError);
+    "classifier_reject");
   });
 
   it("rejects token-shaped non-signature fields on the same provenance record", () => {
@@ -339,9 +339,9 @@ describe("SDW secret-persistence adversarial fixtures", () => {
     const record = productSignedProvenanceRecord(identifierTokenShapedSignature());
     const verifiedRecord = verifyProvenanceRecord(record);
 
-    expect(() =>
+    expectSdwThrow(() =>
       corpus.mintProvenance(verifiedRecord, "system_generated"),
-    ).toThrow(SdwValidationError);
+    "classifier_reject");
   });
 
   it("pins the provenance classifier signature paths to the companion schema", () => {

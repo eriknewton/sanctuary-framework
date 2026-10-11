@@ -34,7 +34,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createIdentity, publicKeyToDid, verify } from "../../src/core/identity.js";
-import { fromBase64url, bytesToString, toBase64url } from "../../src/core/encoding.js";
+import { fromBase64url, bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import type { ToolDefinition } from "../../src/router.js";
 import {
   ApprovalProofStore,
@@ -53,7 +53,7 @@ import {
   type SdwTransactional,
 } from "../../src/sdw/lmdb-backend.js";
 import { assertSdwRawWriteAuthorized, prepareSdwBackendWrite } from "../../src/sdw/write-gate.js";
-import { stateKey } from "../../src/sdw/grammar.js";
+import { documentProvenanceKey, sdwAad, stateKey } from "../../src/sdw/grammar.js";
 import {
   SDW_DOCUMENT_CORPUS_NAMESPACE,
   SDW_QUERY_HISTORY_NAMESPACE,
@@ -246,7 +246,7 @@ function documentRecord(documentId: string): SdwDocumentRecord {
   };
 }
 
-function verifiedProductSignedProvenanceRecord(documentId: string): SdwMemoryProvenanceRecord {
+function verifiedProductSignedProvenanceRecord(documentId: string, passageId = "passage-token-481664"): SdwMemoryProvenanceRecord {
   const originSigner = provenanceSigner("origin-signer", new Uint8Array(32).fill(1));
   const admissionSigner = provenanceSigner("admission-signer", new Uint8Array(32).fill(2));
   const contentHash = toBase64url(new Uint8Array(32).fill(3));
@@ -256,7 +256,7 @@ function verifiedProductSignedProvenanceRecord(documentId: string): SdwMemoryPro
       owner_ref: "owner-destination",
       // Ground against the seeds above until the origin signature begins with
       // the detector prefix; 481664 is below two expected 64^3-prefix trials.
-      passage_id: "passage-token-481664",
+      passage_id: passageId,
       content_hash: contentHash,
       chunk_count: 2,
       recorded_at: "2026-08-24T12:34:56.789-06:00",
@@ -272,7 +272,7 @@ function verifiedProductSignedProvenanceRecord(documentId: string): SdwMemoryPro
     {
       destination_fortress_id: "fortress-destination",
       destination_owner_ref: "owner-destination",
-      passage_id: "passage-token-481664",
+      passage_id: passageId,
       admission_channel: "local_write",
       origin_trust_tier: "local_attested",
       verification_basis: "local_primary_identity",
@@ -1396,6 +1396,126 @@ describe("SDW D2 approval-proof replay defenses", () => {
     });
     const expired = await callThroughGate(harness.exportTool, args, gate, expiredProof.approval_ref);
     expect(expired.kind).toBe("denied_gate");
+  });
+});
+
+async function rawSdwEnvelopeBytes(
+  record: unknown,
+  masterKey: Uint8Array,
+  fortressId: string,
+  key: string,
+): Promise<Uint8Array> {
+  const { encrypt } = await import("../../src/core/encryption.js");
+  const { derivePurposeKey } = await import("../../src/core/key-derivation.js");
+  const { sdwHkdfInfoForNamespace } = await import("../../src/sdw/export.js");
+  const namespace = SDW_DOCUMENT_CORPUS_NAMESPACE;
+  const envelope = encrypt(
+    stringToBytes(JSON.stringify(record)),
+    derivePurposeKey(masterKey, sdwHkdfInfoForNamespace(namespace)),
+    sdwAad(fortressId, namespace, key),
+  );
+  return stringToBytes(JSON.stringify(envelope));
+}
+
+async function provenanceBundleForPlaintext(record: Record<string, unknown>): Promise<{
+  readonly source: Fortress;
+  readonly signing: Signing;
+  readonly bundle: SdwStateExportBundle;
+}> {
+  const source = makeFortress(SOURCE_FORTRESS);
+  const signing = makeSigning();
+  const documentId = record.document_id as string;
+  const key = documentProvenanceKey(documentId);
+  source.vault.rawSetForTest(
+    SDW_DOCUMENT_CORPUS_NAMESPACE,
+    key,
+    await rawSdwEnvelopeBytes(record, source.masterKey, SOURCE_FORTRESS, key),
+  );
+  const inventory = enumerateSdwExportInventory(source.vault, [SDW_DOCUMENT_CORPUS_NAMESPACE]);
+  const { bundle } = buildSignedSdwExportBundle({
+    inventory,
+    source: source.vault,
+    fortressId: SOURCE_FORTRESS,
+    exportAuditEventId: "audit-import-provenance",
+    signingKey: signing.signingKey,
+    now: NOW,
+  });
+  return { source, signing, bundle };
+}
+
+function mutableProvenanceRecord(
+  documentId: string,
+  passageId = "passage-token-481664",
+): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(verifiedProductSignedProvenanceRecord(documentId, passageId))) as Record<string, unknown>;
+}
+
+describe("SDW D2 memory-provenance import refusal", () => {
+  it("refuses malformed imported memory-provenance records through the typed import path", async () => {
+    const valid = mutableProvenanceRecord("prov-import-shape-valid");
+    const malformed = [
+      { record: { ...valid, document_id: "prov-import-null", companion: null } },
+      { record: { ...valid, document_id: "prov-import-missing", companion: {} } },
+      {
+        record: {
+          ...valid,
+          document_id: "prov-import-signature-type",
+          companion: {
+            ...(valid.companion as Record<string, unknown>),
+            origin: {
+              ...((valid.companion as Record<string, unknown>).origin as Record<string, unknown>),
+              signature: 7,
+            },
+          },
+        },
+      },
+      {
+        record: {
+          ...valid,
+          document_id: "prov-import-nested",
+          companion: { value: valid.companion },
+        },
+      },
+    ] as const;
+
+    for (const { record } of malformed) {
+      const { signing, source, bundle } = await provenanceBundleForPlaintext(record);
+      const target = makeFortress(TARGET_FORTRESS);
+      await expect(
+        importSdwExportBundle({
+          bundle,
+          storage: target.vault as StorageBackend,
+          resolvePublicKey: signing.resolvePublicKey,
+          sourceMasterKey: source.masterKey,
+          targetMasterKey: target.masterKey,
+          targetFortressId: TARGET_FORTRESS,
+        }),
+      ).rejects.toMatchObject({ category: "schema_invalid" });
+      expect(target.vault.countForTest()).toBe(0);
+    }
+  });
+
+  it("refuses a memory-provenance import when signature verification fails", async () => {
+    const record = mutableProvenanceRecord("prov-import-signature-refusal", "passage-ordinary");
+    const companion = record.companion as Record<string, unknown>;
+    const origin = companion.origin as { signature: string };
+    expect(origin.signature.startsWith("sk-")).toBe(false);
+    origin.signature = `${origin.signature.slice(0, -1)}${origin.signature.endsWith("A") ? "B" : "A"}`;
+
+    const { signing, source, bundle } = await provenanceBundleForPlaintext(record);
+    const target = makeFortress(TARGET_FORTRESS);
+
+    await expect(
+      importSdwExportBundle({
+        bundle,
+        storage: target.vault as StorageBackend,
+        resolvePublicKey: signing.resolvePublicKey,
+        sourceMasterKey: source.masterKey,
+        targetMasterKey: target.masterKey,
+        targetFortressId: TARGET_FORTRESS,
+      }),
+    ).rejects.toMatchObject({ category: "schema_invalid" });
+    expect(target.vault.countForTest()).toBe(0);
   });
 });
 

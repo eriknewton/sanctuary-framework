@@ -43,10 +43,10 @@ const verifiedProvenanceSignatures = new WeakMap<object, string>();
 
 /**
  * Registry populated only after `verifyMemoryProvenanceCompanion` has checked
- * the owner object's Ed25519 signature bytes against the subject named in its
- * signed body. The write gate consumes only this read predicate: a verified
- * signature is classifier-skipped because it is verifier-produced signature
- * material, not caller-authored credential text.
+ * that the owner object's signature is genuine strict-profile Ed25519 output
+ * under the DID named in its own signed body. The write gate consumes only
+ * this read predicate: it is a classifier-skip for verifier-produced signature
+ * bytes, not a trust signal about signer authority or destination safety.
  */
 export function isVerifiedProvenanceSignature(owner: object, signature: string): boolean {
   return verifiedProvenanceSignatures.get(owner) === signature;
@@ -1633,6 +1633,9 @@ export function verifyMemoryProvenanceCompanion(
   }
   const originSignature = fromBase64urlStrict(companion.origin.signature);
   if (
+    // Must match core/identity.ts `verify` strict Ed25519 profile; the
+    // classifier exclusion relies on rejecting non-canonical A/R encodings
+    // before any signature bytes are registered.
     !verifyIdentitySignature(
       memoryOriginSigningBytes(companion.origin.body),
       originSignature,
@@ -1682,6 +1685,8 @@ export function verifyMemoryProvenanceCompanion(
   }
   const admissionSignature = fromBase64urlStrict(companion.admission.signature);
   if (
+    // Must match core/identity.ts `verify` strict Ed25519 profile; relaxing it
+    // would change what "verifier-produced signature material" means below.
     !verifyIdentitySignature(
       memoryAdmissionSigningBytes(companion.admission.body),
       admissionSignature,
