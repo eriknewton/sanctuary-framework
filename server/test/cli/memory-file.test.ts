@@ -61,24 +61,6 @@ const APPROVE_DIALOG = () => ({
 // test's own `env` already sets one; a test that specifically exercises the
 // missing-identity refusal lives in memory-file-owner-pin.test.ts.
 const TEST_AGENT_ID = "claude_code:memory-file-cli-test";
-// 30 s = 6x the production 5 s barrier window; this file is not testing
-// barrier admission timing, so shared-runner load should not decide CLI cases.
-const TEST_MASTER_WRITE_BARRIER_TIMEOUT_MS = 30_000;
-const TEST_MASTER_WRITE_BARRIER_OPTIONS = {
-  timeoutMs: TEST_MASTER_WRITE_BARRIER_TIMEOUT_MS,
-};
-// 120 s = 24x the production 5 s Darwin capability operation bound; this file
-// exercises memory CLI behavior, not worker startup or per-operation deadlines.
-const TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS = 120_000;
-// 360 s = 3x the widened operation bound; setup performs several serialized
-// custody writes, so the hook budget covers total setup, not one operation.
-const TEST_HOOK_TIMEOUT_MS = 360_000;
-
-function memoryFileStorage(statePath: string): FilesystemStorage {
-  return new FilesystemStorage(statePath, {
-    __testDirectoryCapabilityTimeoutMs: TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
-  });
-}
 
 // memory_ingest is Tier-1 (S4): it now passes the human ApprovalGate like the
 // other memory verbs, so default the local-operator dialog to APPROVE unless a
@@ -88,10 +70,6 @@ const runMemoryIngestCommand: typeof runMemoryIngestCommandProduction = (args) =
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
-    __testMasterWriteBarrierOptions:
-      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
-    __testDirectoryCapabilityTimeoutMs:
-      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 // STEP1-F2: memory_emit/transcode/transcode_restore now apply the same
 // owner-pin precheck as memory_ingest (STEP1-F1), so they need the same
@@ -102,30 +80,18 @@ const runMemoryEmitCommand: typeof runMemoryEmitCommandProduction = (args) =>
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
-    __testMasterWriteBarrierOptions:
-      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
-    __testDirectoryCapabilityTimeoutMs:
-      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 const runMemoryTranscodeCommand: typeof runMemoryTranscodeCommandProduction = (args) =>
   runMemoryTranscodeCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
-    __testMasterWriteBarrierOptions:
-      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
-    __testDirectoryCapabilityTimeoutMs:
-      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 const runMemoryTranscodeRestoreCommand: typeof runMemoryTranscodeRestoreCommandProduction = (args) =>
   runMemoryTranscodeRestoreCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
-    __testMasterWriteBarrierOptions:
-      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
-    __testDirectoryCapabilityTimeoutMs:
-      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 
 function makeSink(): { stream: Writable; text: () => string } {
@@ -137,6 +103,14 @@ function makeSink(): { stream: Writable; text: () => string } {
     },
   });
   return { stream, text: () => chunks.join("") };
+}
+
+function commandExitMessage(
+  code: number,
+  err: { text: () => string },
+  out: { text: () => string },
+): string {
+  return `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`;
 }
 
 const cleanupTasks: Array<() => Promise<void>> = [];
@@ -341,7 +315,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     // Bootstrap a real passphrase-mode fortress so the CLI's unbootstrapped
     // resolveCliMasterKey unlocks an existing custody envelope. Failure mode if
     // this is skipped: the command fails on unlock, which looks like a CLI bug.
-    const storage = memoryFileStorage(join(fortress, "state"));
+    const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -354,18 +328,18 @@ describe("memory file CLI: fortress-backed round trip", () => {
       "passphrase",
     );
     await identities.save(storedIdentity);
-  }, TEST_HOOK_TIMEOUT_MS);
+  });
 
   afterEach(async () => {
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
-  }, TEST_HOOK_TIMEOUT_MS);
+  });
 
   async function auditEntries(): Promise<
     Array<{ operation: string; details: Record<string, unknown> }>
   > {
-    const storage = memoryFileStorage(join(fortress, "state"));
+    const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       storagePathHint: fortress,
@@ -916,7 +890,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     }, 60_000);
 
     async function fortressAdapterForCheckOnly(): Promise<SdwMemoryBackendAdapter> {
-      const storage = memoryFileStorage(join(fortress, "state"));
+      const storage = new FilesystemStorage(join(fortress, "state"));
       const masterKey = await resolveCliMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
@@ -946,7 +920,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       // the pin already exists). That isolates this test to its intended
       // target: a commit-phase corpus-write failure, not the unrelated
       // owner-pin machinery (covered by memory-file-owner-pin.test.ts).
-      const storage = memoryFileStorage(join(fortress, "state"));
+      const storage = new FilesystemStorage(join(fortress, "state"));
       const masterKey = await resolveCliMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
@@ -1177,17 +1151,17 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
 
   beforeEach(() => {
     prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
-  }, TEST_HOOK_TIMEOUT_MS);
+  });
   afterEach(async () => {
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
-  }, TEST_HOOK_TIMEOUT_MS);
+  });
 
   async function seedFortressWithStoredCustody(prefix: string): Promise<string> {
     const fortress = join(await tempDir(prefix), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
-    const storage = memoryFileStorage(join(fortress, "state"));
+    const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1216,55 +1190,68 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
 
     // 1) ingest via stored custody
     const ingest = makeSink();
+    const ingestErr = makeSink();
+    const ingestCode = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: ingest.stream,
+      err: ingestErr.stream,
+      env: {}, // no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY
+    });
     expect(
-      await runMemoryIngestCommand({
-        argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
-        out: ingest.stream,
-        err: makeSink().stream,
-        env: {}, // no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY
-      }),
+      ingestCode,
+      commandExitMessage(ingestCode, ingestErr, ingest),
     ).toBe(0);
     expect(ingest.text()).not.toContain("could not unlock the fortress");
     expect(ingest.text()).not.toContain(PASSPHRASE);
 
     // 2) transcode via stored custody
     const transcode = makeSink();
+    const transcodeErr = makeSink();
+    const transcodeCode = await runMemoryTranscodeCommand({
+      argv: [
+        "--from-harness", "claude-code",
+        "--to-harness", "codex",
+        "--mode", "reversible",
+        "--dir", projection,
+        "--fortress", fortress,
+      ],
+      out: transcode.stream,
+      err: transcodeErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryTranscodeCommand({
-        argv: [
-          "--from-harness", "claude-code",
-          "--to-harness", "codex",
-          "--mode", "reversible",
-          "--dir", projection,
-          "--fortress", fortress,
-        ],
-        out: transcode.stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      transcodeCode,
+      commandExitMessage(transcodeCode, transcodeErr, transcode),
     ).toBe(0);
     const archiveId = /archive_id ([a-f0-9]+)/.exec(transcode.text())?.[1];
     expect(archiveId).toMatch(/^[a-f0-9]+$/);
 
     // 3) transcode-restore via stored custody
+    const restoreOut = makeSink();
+    const restoreErr = makeSink();
+    const restoreCode = await runMemoryTranscodeRestoreCommand({
+      argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
+      out: restoreOut.stream,
+      err: restoreErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryTranscodeRestoreCommand({
-        argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
-        out: makeSink().stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      restoreCode,
+      commandExitMessage(restoreCode, restoreErr, restoreOut),
     ).toBe(0);
 
     // 4) emit via stored custody
     const emit = makeSink();
+    const emitErr = makeSink();
+    const emitCode = await runMemoryEmitCommand({
+      argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
+      out: emit.stream,
+      err: emitErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryEmitCommand({
-        argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
-        out: emit.stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      emitCode,
+      commandExitMessage(emitCode, emitErr, emit),
     ).toBe(0);
     expect(emit.text()).toContain("emitted 3 Claude Code memory files");
     expect(emit.text()).not.toContain(PASSPHRASE);
@@ -1274,7 +1261,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = join(await tempDir("memfile-f6-nocred"), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
     // Bootstrap custody but store NO credential in the keyring.
-    const storage = memoryFileStorage(join(fortress, "state"));
+    const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1297,7 +1284,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
   it("mismatch: a stored credential that does not open the fortress is refused", async () => {
     const fortress = join(await tempDir("memfile-f6-mismatch"), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
-    const storage = memoryFileStorage(join(fortress, "state"));
+    const storage = new FilesystemStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1320,21 +1307,25 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = await seedFortressWithStoredCustody("memfile-f4-ok");
     const source = await copyFixtureSet("basic", "memfile-f4-ok-source");
     const captured: Uint8Array[] = [];
+    const out = makeSink();
+    const err = makeSink();
     const code = await runMemoryIngestCommand({
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
-      out: makeSink().stream,
-      err: makeSink().stream,
+      out: out.stream,
+      err: err.stream,
       env: {},
       observeMasterKey: (buf) => captured.push(buf),
     });
-    expect(code).toBe(0);
+    expect(code, commandExitMessage(code, err, out)).toBe(0);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
-  }, 60_000);
+  });
 
   it("F4: the owned master is zeroed even when the verb body errors after unlock", async () => {
     const fortress = await seedFortressWithStoredCustody("memfile-f4-err");
     const captured: Uint8Array[] = [];
+    const out = makeSink();
+    const err = makeSink();
     // A nonexistent source dir fails AFTER bootstrap (post-unlock), driving the
     // verb through its catch + finally; the master must still be zeroed.
     const code = await runMemoryIngestCommand({
@@ -1343,12 +1334,12 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
         "--dir", join(await tempDir("memfile-f4-err-missing"), "does-not-exist"),
         "--fortress", fortress,
       ],
-      out: makeSink().stream,
-      err: makeSink().stream,
+      out: out.stream,
+      err: err.stream,
       env: {},
       observeMasterKey: (buf) => captured.push(buf),
     });
-    expect(code).toBe(1);
+    expect(code, commandExitMessage(code, err, out)).toBe(1);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
   });

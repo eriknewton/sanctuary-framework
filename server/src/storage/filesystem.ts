@@ -273,13 +273,9 @@ class DarwinDirectoryCapabilityClient {
     const client = new DarwinDirectoryCapabilityClient(child, operationTimeoutMs);
     try {
       await new Promise<void>((resolve, reject) => {
-        const readyTimeoutMs = Math.max(
-          DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
-          operationTimeoutMs,
-        );
         const timeout = setTimeout(
           () => reject(new Error("directory-capability worker readiness timed out")),
-          readyTimeoutMs,
+          DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
         );
         const onMessage = (raw: CapabilityResponse): void => {
           if (!raw.ready) return;
@@ -409,16 +405,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * parent or chown failure fails the write.
    */
   private owner: { uid: number; gid: number } | undefined;
-  private readonly directoryCapabilityTimeoutMs: number | undefined;
 
-  constructor(basePath: string, options: {
-    owner?: { uid: number; gid: number };
-    /** Test only: widen or shorten the Darwin directory-capability operation bound. */
-    __testDirectoryCapabilityTimeoutMs?: number;
-  } = {}) {
+  constructor(basePath: string, options: { owner?: { uid: number; gid: number } } = {}) {
     this.basePath = basePath;
     this.owner = options.owner;
-    this.directoryCapabilityTimeoutMs = options.__testDirectoryCapabilityTimeoutMs;
   }
 
   private activeBasePath(): string {
@@ -561,26 +551,21 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
       const heldParent = await parentHandle.stat();
       if (host === "darwin") {
-        rootClient = await DarwinDirectoryCapabilityClient.start(
-          this.basePath,
-          {
-            dev: String(heldRoot.dev),
-            ino: String(heldRoot.ino),
-          },
-          this.owner,
-          options.__testDirectoryCapabilityTimeoutMs ?? this.directoryCapabilityTimeoutMs,
-        );
+        rootClient = await DarwinDirectoryCapabilityClient.start(this.basePath, {
+          dev: String(heldRoot.dev),
+          ino: String(heldRoot.ino),
+        }, this.owner, options.__testDirectoryCapabilityTimeoutMs);
         parentClient = await DarwinDirectoryCapabilityClient.start(
           dirname(this.basePath),
           { dev: String(heldParent.dev), ino: String(heldParent.ino) },
           this.owner,
-          options.__testDirectoryCapabilityTimeoutMs ?? this.directoryCapabilityTimeoutMs,
+          options.__testDirectoryCapabilityTimeoutMs,
         );
         namespaceClient = await DarwinDirectoryCapabilityClient.start(
           encodedNamespacePath(this.basePath, namespace),
           { dev: String(heldNamespace.dev), ino: String(heldNamespace.ino) },
           this.owner,
-          options.__testDirectoryCapabilityTimeoutMs ?? this.directoryCapabilityTimeoutMs,
+          options.__testDirectoryCapabilityTimeoutMs,
         );
         options.__testAfterDirectoryCapabilityAcquired?.(
           rootClient.pid,
