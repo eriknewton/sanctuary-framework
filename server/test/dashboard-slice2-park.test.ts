@@ -35,12 +35,11 @@ import { establishMaster } from "../src/core/master-custody.js";
 import { IdentityManager } from "../src/cognitive/tools.js";
 import { createIdentity } from "../src/core/identity.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
-import {
-  bindWithRetry,
-  randomTestPort,
-} from "./util/port-collision-retry.js";
 
 const PASSPHRASE = "slice2-park-correct-horse-battery";
+const EPHEMERAL_PORT = 0;
+const SINGLE_OWNER_TIMEOUT_SECONDS = 2;
+
 
 /**
  * Seed a wrapped fortress with a REAL custody envelope (production
@@ -67,11 +66,12 @@ async function seedWrappedFortress(storagePath: string): Promise<void> {
 async function startOnFreePort(
   options: Omit<Parameters<typeof startStandaloneDashboard>[0], "port"> = {},
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
-  return bindWithRetry(async () => {
-    const port = randomTestPort();
-    const dashboard = await startStandaloneDashboard({ distressPort: 0, ...options, port });
-    return { dashboard, port };
+  const dashboard = await startStandaloneDashboard({
+    distressPort: EPHEMERAL_PORT,
+    ...options,
+    port: EPHEMERAL_PORT,
   });
+  return await dashboardWithBoundPort(dashboard);
 }
 
 describe("Slice 2: park-not-exit (server lifecycle)", () => {
@@ -441,6 +441,81 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
   });
 });
 
+type DashboardHttpServerAccess = {
+  httpServer:
+    | {
+        address(): import("node:net").AddressInfo | string | null;
+      }
+    | null;
+};
+
+function dashboardBoundPort(dashboard: DashboardApprovalChannel): number {
+  const server = (dashboard as unknown as DashboardHttpServerAccess).httpServer;
+  const address = server?.address();
+  if (!address || typeof address === "string" || address.port <= EPHEMERAL_PORT) {
+    throw new Error("dashboard test expected a bound TCP listener address");
+  }
+  return address.port;
+}
+
+async function dashboardWithBoundPort(
+  dashboard: DashboardApprovalChannel,
+): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
+  try {
+    return { dashboard, port: dashboardBoundPort(dashboard) };
+  } catch (err) {
+    // The helper owns a started listener until the port read-back succeeds;
+    // a failed read-back must close it so later tests can bind cleanly.
+    await dashboard.stop().catch(() => {});
+    throw err;
+  }
+}
+
+describe("Slice 2: park test helper lifecycle", () => {
+  it("closes the dashboard listener if the ephemeral port read-back throws", async () => {
+    const { Server } = await import("node:net");
+    const originalAddress = Server.prototype.address;
+    const originalHome = process.env.HOME;
+    const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    const originalToken = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    const originalVitest = process.env.VITEST;
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-slice2-park-readback-"));
+    const storagePath = join(root, "tenant");
+    const readBackError = new Error("forced dashboard port read-back failure");
+    let startedServer: import("node:net").Server | null = null;
+
+    try {
+      process.env.VITEST = "true";
+      process.env.HOME = root;
+      process.env.SANCTUARY_STORAGE_PATH = storagePath;
+      process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "park-readback-stop";
+      await seedWrappedFortress(storagePath);
+
+      Server.prototype.address = function patchedAddress(this: import("node:net").Server) {
+        startedServer = this;
+        throw readBackError;
+      };
+
+      await expect(
+        startOnFreePort({ host: "127.0.0.1", allowPark: true }),
+      ).rejects.toThrow(readBackError.message);
+    } finally {
+      Server.prototype.address = originalAddress;
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+      if (originalToken === undefined) delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+      else process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = originalToken;
+      if (originalVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = originalVitest;
+    }
+
+    expect((startedServer as import("node:net").Server | null)?.listening).toBe(false);
+  });
+});
+
 describe("Slice 2: user-domain LaunchAgent plist", () => {
   const validArgs = [
     "/usr/local/bin/node",
@@ -528,21 +603,21 @@ describe("Slice 2: user-domain LaunchAgent plist", () => {
 
 describe("Slice 2: single-owner / EADDRINUSE clean-exit (channel level)", () => {
   it("a second start() on the same port with exitCleanOnAddrInUse RESOLVES cleanly and flags addrInUse (no throw, no churn)", async () => {
-    const port = randomTestPort();
     const owner = new DashboardApprovalChannel({
-      port,
+      port: EPHEMERAL_PORT,
       host: "127.0.0.1",
-      timeout_seconds: 2,
+      timeout_seconds: SINGLE_OWNER_TIMEOUT_SECONDS,
       auto_deny: true,
     });
-    const second = new DashboardApprovalChannel({
-      port,
-      host: "127.0.0.1",
-      timeout_seconds: 2,
-      auto_deny: true,
-    });
+    let second: DashboardApprovalChannel | null = null;
     try {
       await owner.start();
+      second = new DashboardApprovalChannel({
+        port: dashboardBoundPort(owner),
+        host: "127.0.0.1",
+        timeout_seconds: SINGLE_OWNER_TIMEOUT_SECONDS,
+        auto_deny: true,
+      });
       // The supervised single-owner path: second start must NOT throw; it
       // resolves and flags addrInUse so the boot path can exit 0 (KeepAlive
       // sees a successful run, never a crash -> no restart churn).
@@ -553,31 +628,31 @@ describe("Slice 2: single-owner / EADDRINUSE clean-exit (channel level)", () => 
       // At most one listener survives: the owner.
       expect(owner.addrInUse()).toBe(false);
     } finally {
-      await second.stop().catch(() => {});
+      await second?.stop().catch(() => {});
       await owner.stop().catch(() => {});
     }
   });
 
   it("WITHOUT exitCleanOnAddrInUse, a second start() on the same port still THROWS (interactive path)", async () => {
-    const port = randomTestPort();
     const owner = new DashboardApprovalChannel({
-      port,
+      port: EPHEMERAL_PORT,
       host: "127.0.0.1",
-      timeout_seconds: 2,
+      timeout_seconds: SINGLE_OWNER_TIMEOUT_SECONDS,
       auto_deny: true,
     });
-    const second = new DashboardApprovalChannel({
-      port,
-      host: "127.0.0.1",
-      timeout_seconds: 2,
-      auto_deny: true,
-    });
+    let second: DashboardApprovalChannel | null = null;
     try {
       await owner.start();
+      second = new DashboardApprovalChannel({
+        port: dashboardBoundPort(owner),
+        host: "127.0.0.1",
+        timeout_seconds: SINGLE_OWNER_TIMEOUT_SECONDS,
+        auto_deny: true,
+      });
       await expect(second.start()).rejects.toThrow();
       expect(second.addrInUse()).toBe(false);
     } finally {
-      await second.stop().catch(() => {});
+      await second?.stop().catch(() => {});
       await owner.stop().catch(() => {});
     }
   });
