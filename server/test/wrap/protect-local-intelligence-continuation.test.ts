@@ -327,6 +327,73 @@ describe("runWrap explicit local-intelligence continuation", () => {
     ).rejects.toBeInstanceOf(TypeError);
   });
 
+  it("treats a non-Error explicit setup throw as a failed protect run", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const notThrown = Symbol("not-thrown");
+    let caught: unknown = notThrown;
+
+    try {
+      await runWrap(
+        {
+          hermes: true,
+          noOpen: true,
+          noDashboard: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          runAutoProvisionForWrap: async () => ({
+            ran: true,
+            outcome: {
+              kind: "skipped-non-tty-cooperative-only",
+              reason: "test non-interactive provisioning skip",
+            },
+          }),
+          runLocalIntelligenceSetup: async () => {
+            throw undefined;
+          },
+        }),
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeUndefined();
+    expect(castleWallMocks.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns only that transient daemon stop confirmation failed before deferred exit", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    castleWallMocks.stop.mockRejectedValueOnce(new Error("synthetic stop failure"));
+
+    await expect(
+      runWrap(
+        {
+          hermes: true,
+          noOpen: true,
+          noDashboard: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          runAutoProvisionForWrap: async () => ({
+            ran: true,
+            outcome: {
+              kind: "skipped-non-tty-cooperative-only",
+              reason: "test non-interactive provisioning skip",
+            },
+          }),
+          runLocalIntelligenceSetup: async () => ({ kind: "refused", reason: "non_tty" }),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(ExplicitLocalIntelligenceRefusal);
+
+    const stderr = stderrSpy.mock.calls.flat().join("\n");
+    expect(stderr).toContain(
+      "could not confirm the transient Castle Wall daemon stopped before --no-dashboard exit",
+    );
+    expect(stderr).toContain("Check whether a transient daemon is still holding the fortress socket");
+    expect(stderr).not.toContain("Stop the holding process");
+  });
+
   it("does not open or announce an owned dashboard before surfacing an explicit refusal", async () => {
     Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
     const openBrowser = vi.fn(async () => {});

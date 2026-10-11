@@ -699,7 +699,7 @@ export function wrapCliRefusalExitCode(
 
 interface LocalIntelligenceWrapResult {
   explicitRefusal?: ExplicitLocalIntelligenceRefusal;
-  unexpectedError?: unknown;
+  unexpectedError?: { value: unknown };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -2616,7 +2616,9 @@ async function maybeRunLocalIntelligenceForWrap(
     // the original error preserves the stack and avoids relabeling a defect as
     // an actionable local-intelligence decline.
     if (options.provisionLocalIntelligence === true) {
-      return { unexpectedError: err };
+      // Preserve even `throw undefined`; absence is represented by the
+      // optional wrapper, not by the thrown value itself.
+      return { unexpectedError: { value: err } };
     }
   }
   return {};
@@ -2656,7 +2658,7 @@ function throwDeferredLocalIntelligenceExit(
   result: LocalIntelligenceWrapResult,
 ): never {
   if (result.explicitRefusal) throw result.explicitRefusal;
-  throw result.unexpectedError;
+  throw result.unexpectedError?.value;
 }
 
 async function exitAfterDeferredAutoProvisionSignal(
@@ -5135,8 +5137,8 @@ export async function runWrap(
     } catch (err) {
       // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
       console.error(
-        `  WARNING: the transient Castle Wall daemon could not be stopped before --no-dashboard exit ` +
-          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+        `  WARNING: could not confirm the transient Castle Wall daemon stopped before --no-dashboard exit ` +
+          `(${(err as Error).message}). Check whether a transient daemon is still holding the fortress socket before retrying the sudo protect command.`,
       );
     }
     if (
@@ -5490,8 +5492,8 @@ export async function runWrap(
     } catch (err) {
       // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
       console.error(
-        `  WARNING: the transient Castle Wall daemon could not be stopped before refusal exit ` +
-          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+        `  WARNING: could not confirm the transient Castle Wall daemon stopped before refusal exit ` +
+          `(${(err as Error).message}). Check whether a transient daemon is still holding the fortress socket before retrying the sudo protect command.`,
       );
     }
     await flushBeforeDeferredLocalIntelligenceExit(
