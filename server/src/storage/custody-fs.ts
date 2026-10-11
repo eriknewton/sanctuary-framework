@@ -258,6 +258,13 @@ async function verifyParentCustody(
 }
 
 async function openReadHandle(path: string) {
+  // Read only, never through a link, never blocking: O_NOFOLLOW refuses a
+  // symlink at open time and O_NONBLOCK keeps a FIFO from stalling the open
+  // before the regular-file check on this descriptor refuses it. No O_CREAT,
+  // no mode: this call creates nothing. CodeQL reads the numeric flag word as
+  // a possible write and reports js/insecure-temporary-file when a caller's
+  // path came from the OS temp dir (test fixtures do); that is the same false
+  // positive already dismissed on claude-code-file-adapter.ts.
   try {
     return await open(path, fsConstants.O_RDONLY | O_NOFOLLOW | fsConstants.O_NONBLOCK);
   } catch (err) {
