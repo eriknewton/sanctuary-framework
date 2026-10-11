@@ -1405,6 +1405,11 @@ export async function runProvisionPin(
             } catch (error) {
               releaseContext = error;
               if (provisionFailure === undefined) {
+                // A barrier release failure after a successful provision must
+                // fail the command, so this throw deliberately replaces the
+                // completed result; an earlier provision failure is never
+                // replaced (guarded above) and keeps this error as context.
+                // eslint-disable-next-line no-unsafe-finally
                 throw error;
               }
             }
