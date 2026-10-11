@@ -28,7 +28,11 @@ import {
   verifyAnchorEvidence,
   type AnchorCoverage,
 } from "./anchor-verify.js";
-import { argvTokenForDisplay } from "../cli/argv.js";
+// The standalone verifier subset may import only itself, @noble and node:
+// builtins (test/structure/key-length-constants.test.ts), so it cannot import
+// the shared CLI formatter; it prints the same fixed text for every
+// unrecognized option instead. The "<argument not shown>" literal below must
+// match ARGV_TOKEN_NOT_SHOWN in src/cli/argv.ts.
 
 export const STANDALONE_EXIT_PARTIAL = 10;
 
@@ -279,7 +283,7 @@ function parseFlags(
         `${arg} performs network I/O; this standalone artifact is offline-only. Use "sanctuary verify-transparency --fetch-anchors", or verify the receipt-embedded proofs offline with --check-anchors alone`
       );
     }
-    throw new Error(`unknown option: ${argvTokenForDisplay(arg)}`);
+    throw new Error("unknown option: <argument not shown>");
   }
   return { values, flags };
 }

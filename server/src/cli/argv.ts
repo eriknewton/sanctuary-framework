@@ -276,6 +276,9 @@ export function shellQuoteSingleArg(value: string): string {
  * token it will not reproduce. Must match `ARGV_TOKEN_NOT_SHOWN` as pinned
  * in test/cli/argv-token-display.test.ts.
  */
+// Must match the "unknown option" refusal literal in
+// src/transparency/offline-cli.ts, which cannot import this module
+// (standalone verifier subset).
 export const ARGV_TOKEN_NOT_SHOWN = "<argument not shown>";
 
 /** A single lowercase short flag, `-x`: one letter carries no operator data. */

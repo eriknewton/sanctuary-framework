@@ -1,5 +1,5 @@
 /**
- * CLI refusals never reproduce an unrecognized argv token.
+ * CLI refusals never print an unrecognized argv token.
  *
  * Every operator-facing refusal for an unrecognized flag, option, argument,
  * or subcommand renders the offending token through the one shared
@@ -413,11 +413,13 @@ function runCensus(): CensusResult {
   return result;
 }
 
-// 78 = interpolations routed through a formatter when this census was
-// written: 67 unrecognized-token refusals (argvTokenForDisplay, one of them
+// 77 = interpolations routed through a formatter when this census was
+// written: 66 unrecognized-token refusals (argvTokenForDisplay, one of them
 // the config-reset `unknown.map(...)` form) plus 11 caught-error refusals
-// (caughtErrorForDisplay). Exact, so a removed or added site is a decision.
-const EXPECTED_FORMATTER_SITES = 78;
+// (caughtErrorForDisplay). The standalone offline verifier prints a fixed
+// literal instead, since it may not import src/cli/argv.ts. Exact, so a
+// removed or added site is a decision.
+const EXPECTED_FORMATTER_SITES = 77;
 
 describe("source census: refusal strings route argv tokens through the formatter", () => {
   const census = runCensus();
