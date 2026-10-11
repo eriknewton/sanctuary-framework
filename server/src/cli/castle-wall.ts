@@ -202,6 +202,10 @@ export interface CastleWallCommandContext {
   __testAfterProvisionMasterResolved?: (masterKey: Uint8Array) => void | Promise<void>;
   /** TEST ONLY: shorten provision-pin custody lock contention. */
   __testProvisionLockTimeoutMs?: number;
+  /** TEST ONLY: observe/control provision-pin's pre-lock rotation barrier. */
+  __testProvisionMasterWriteBarrierOptions?: Parameters<
+    typeof acquireFortressMasterWriteBarrier
+  >[1];
   /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
   __testObserveStoredPassphrase?: typeof observeStoredPassphrase;
   /** TEST ONLY: resolve provision-pin custody through a controlled in-memory seam. */
@@ -1302,6 +1306,7 @@ export async function runProvisionPin(
       // barrier -> custody-lock order and avoiding a custody-lock -> barrier
       // inversion when rotation is already draining readers.
       preLockMasterWriteBarrier = await acquireFortressMasterWriteBarrier(storage, {
+        ...ctx.__testProvisionMasterWriteBarrierOptions,
         degradeOnEnvironmentalLoss: "read-only",
       });
     }

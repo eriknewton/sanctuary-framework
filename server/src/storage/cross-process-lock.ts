@@ -379,6 +379,8 @@ export interface MasterWriteBarrierOptions {
   retryMs?: number;
   /** TEST ONLY: observe the shared reader socket after it is fully admitted. */
   __testAfterSharedSocketAcquired?: (path: string) => void;
+  /** TEST ONLY: observe a shared acquirer waiting behind an exclusive gate. */
+  __testAfterSharedBarrierContention?: () => void | Promise<void>;
   /**
    * TEST ONLY: observe the exclusive gate after it is live.
    * Must match the async hook shape in CrossProcessLockOptions in this file,
@@ -995,6 +997,7 @@ export async function acquireMasterWriteBarrier(
   const started = Date.now();
   for (;;) {
     if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
+      await options.__testAfterSharedBarrierContention?.();
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `master rotation barrier remained exclusive for ${timeoutMs}ms`,
@@ -1041,6 +1044,7 @@ export async function acquireMasterWriteBarrier(
       if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
         await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);
         acquired = undefined;
+        await options.__testAfterSharedBarrierContention?.();
         if (Date.now() - started >= timeoutMs) {
           throw new CrossProcessLockError(
             `master rotation barrier remained exclusive for ${timeoutMs}ms`,
