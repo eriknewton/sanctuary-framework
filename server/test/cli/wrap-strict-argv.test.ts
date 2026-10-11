@@ -8,7 +8,7 @@ import { parseWrapArgs } from "../../src/wrap/cli.js";
 describe("sanctuary wrap strict argv parsing (Finding EEE)", () => {
   it("rejects unknown positional argument with suggestion", () => {
     expect(() => parseWrapArgs(["claude-code"])).toThrow(
-      /Unrecognized argument 'claude-code'.*Did you mean --claude-code/,
+      /Unrecognized argument at position 1\..*Did you mean --claude-code/,
     );
   });
 
