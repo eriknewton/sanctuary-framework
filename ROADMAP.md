@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-10. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-11. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -251,6 +251,12 @@ Operator protection is shipped and proven; agent-side protections are roadmap, b
 #### Credential surrogacy, slices 1b and 2
 
 Slice 1a (October 2026, above) binds a secret to one wrapped agent and keeps the agent's environment to a placeholder. Slice 1b teaches the per-agent egress gate to swap the placeholder for the real value on requests to the operator-bound destination only, to refuse and audit a placeholder headed anywhere else, and to scrub the value from responses on the way back; it works for HTTP clients that send through the gate in forward mode. Slice 2 adds TLS termination for tool code with hardcoded `https://`, excluding pinned and mutual-TLS hosts. The assurance-matrix row stays `partial` until the macOS drill: a secret bound, an agent instructed by injected content to send it to a second allowed host, the refusal observed at the gate, the value observed only toward the bound host, and the agent's environment and memory holding only the placeholder, repeated after reboot. Linux inherits the Linux bound above. *Why it matters: an agent that never holds a credential cannot leak it, whatever a prompt injection tells it to do.*
+
+#### Credential surrogacy: secrets from the password manager you already use
+
+Today an operator adds a secret to credential surrogacy by typing it into a Sanctuary command, and unlocks the per-agent helper with a typed command. This item removes both steps. The operator connects an existing password manager once (1Password first, then Bitwarden and Proton Pass, each through its own supported command-line or SDK interface) and binds a vault item to a wrapped agent and destination; Sanctuary fetches the value at bind time and the agent still sees only the placeholder. On macOS, unlocking the helper becomes a Touch ID prompt instead of a typed command, so each release of a credential is approved by the operator's fingerprint. Password managers that offer no supported programmatic interface are out of scope for this item. **Why it matters:** an operator should not have to re-enter credentials they already keep in a password manager, and every agent harness, not only a browser, gets the same placeholder protection and a per-use approval.
+
+*Status: planned. Sequenced after the credential-surrogacy macOS drill above passes, and behind the current Linux priority. Two small slices (vault import, then Touch ID unlock); no new capability claim until each is drilled.*
 
 #### Content arriving through tools, screened at the boundary
 
