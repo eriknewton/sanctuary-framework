@@ -222,9 +222,10 @@ describe("the browser surfaces render the vault claim beside the machine wall", 
   });
 
   it("gives the v1.1 console its own vault line", () => {
-    const script = getClientScript();
+    const script = getClientScript("darwin");
     expect(script).toContain("home.castle_wall.castle_wall_provision");
     expect(script).toContain("not on this Mac");
+    expect(getClientScript("linux")).toContain("not on this machine");
   });
 });
 
