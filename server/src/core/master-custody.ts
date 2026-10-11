@@ -673,8 +673,8 @@ export class CustodyRotationInProgressError extends Error {
         "Some data may still be encrypted under the previous master. Refusing to\n" +
         "start until the rotation completes. Run:\n" +
         "  sanctuary rotate-master --resume\n" +
-        "to finish it (or `sanctuary rotate-master --abort` if it never left the\n" +
-        "staging phase). Both require the fortress passphrase."
+        "to continue the journaled rotation forward to completion. This requires\n" +
+        "the fortress passphrase."
     );
     this.name = "CustodyRotationInProgressError";
   }
