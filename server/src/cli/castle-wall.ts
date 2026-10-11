@@ -6132,11 +6132,13 @@ async function runArmDisarmInner(
       return 1;
     }
   }
+  // The dead-man TTL never rides on the host-app argv: it reaches the
+  // extension only through the signed arm lease sent to the daemon socket
+  // below, which is the one consumer that enforces it. The host app refuses
+  // --ttl/--no-ttl (must match unsupportedLeaseFlags in
+  // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift).
   const headlessArgs = ["--headless", action];
-  if (action === "enable") {
-    if (parsed.noTtl) headlessArgs.push("--no-ttl");
-    else headlessArgs.push(`--ttl=${parsed.ttlSeconds}`);
-  } else {
+  if (action !== "enable") {
     headlessArgs.push("--timeout=3");
   }
   let leaseRevoked = false;

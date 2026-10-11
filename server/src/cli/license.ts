@@ -75,6 +75,7 @@ import {
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
   hasFlag,
+  argvTokenForDisplay,
 } from "./argv.js";
 
 /**
@@ -778,7 +779,7 @@ export async function runLicenseCommand(args: {
       write(out, USAGE);
       return verb === undefined ? 1 : 0;
     default:
-      write(err, `license: unknown verb '${verb}'\n\n${USAGE}`);
+      write(err, `license: unknown verb '${argvTokenForDisplay(verb)}'\n\n${USAGE}`);
       return 1;
   }
 }

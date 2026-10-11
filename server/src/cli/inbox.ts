@@ -1,7 +1,7 @@
 import { readTenantRuntime } from "./agents/runtime.js";
 import { dashboardRequest } from "./dashboard-request.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
-import { consumeFlagValue, flagValue, unknownFlagWithPrefix } from "./argv.js";
+import { consumeFlagValue, flagValue, unknownFlagWithPrefix, argvTokenForDisplay } from "./argv.js";
 
 export interface InboxCliArgs {
   argv: string[];
@@ -44,7 +44,7 @@ export async function runInboxCommand(args: InboxCliArgs): Promise<number> {
       case "approvals":
         return await approvals(rest, out, err, ctx);
       default:
-        err.write(`Unknown inbox subcommand: ${sub}\n`);
+        err.write(`Unknown inbox subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }
@@ -200,7 +200,7 @@ async function approvals(
       printApprovalsUsage(out);
       return 0;
     default:
-      err.write(`Unknown inbox approvals subcommand: ${sub}\n`);
+      err.write(`Unknown inbox approvals subcommand: ${argvTokenForDisplay(sub)}\n`);
       printApprovalsUsage(err);
       return 2;
   }
@@ -326,7 +326,7 @@ async function resolveContext(
 ): Promise<InboxCliContext | null> {
   const unknownFortressFlag = unknownFlagWithPrefix(argv, "--fortress");
   if (unknownFortressFlag) {
-    err.write(`inbox unknown fortress flag ${unknownFortressFlag}\n`);
+    err.write(`inbox unknown fortress flag ${argvTokenForDisplay(unknownFortressFlag)}\n`);
     return null;
   }
   const parsed = consumeFlagValue(argv, "--fortress");
