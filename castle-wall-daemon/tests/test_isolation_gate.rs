@@ -106,9 +106,12 @@ fn gated_targets() -> BTreeSet<String> {
 
 /// The Linux CI "did it run" loop names every gated target plus this guard
 /// target. Parsed from anchored comments so the workflow and Cargo.toml lists
-/// cannot drift independently. Remaining bound: a line parser cannot evaluate
-/// context around the whole loop (`if false`, a subshell `|| true`, or an
-/// uncalled function), and YAML-parse validation is separate workflow work.
+/// cannot drift independently. Remaining bound: this pins workflow TEXT between
+/// the markers, not which YAML node runs it. Commands before the begin marker,
+/// wrappers around the whole loop (`if false`, a subshell `|| true`, an
+/// uncalled function), step-level `if:` or `continue-on-error:`, and relocating
+/// the marked block into another scalar are out of reach, as is YAML-parse
+/// validity (separate workflow work).
 fn workflow_suite_targets() -> BTreeSet<String> {
     let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
     let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
@@ -193,7 +196,9 @@ fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
 
     for raw_line in workflow.lines() {
         let line = raw_line.trim();
-        if line.contains(WORKFLOW_SUITE_LIST_BEGIN) {
+        // A marker counts only when the trimmed line starts with it: after trim, a line
+        // starting with `#` is all comment to bash, so no command can ride on a marker line.
+        if line.starts_with(WORKFLOW_SUITE_LIST_BEGIN) {
             assert!(
                 !saw_begin,
                 "more than one Linux workflow suite-list-begin marker"
@@ -206,7 +211,7 @@ fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
             saw_begin = true;
             continue;
         }
-        if line.contains(WORKFLOW_SUITE_LIST_END) {
+        if line.starts_with(WORKFLOW_SUITE_LIST_END) {
             assert!(
                 !saw_end,
                 "more than one Linux workflow suite-list-end marker"
@@ -417,6 +422,20 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
           done
 "#,
             "Linux workflow suite-ran loop body must match the pinned fail-closed body",
+        ),
+        (
+            "command on the end marker line",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          continue # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              echo "FAIL: $suite did not run; the test-isolation feature is required for it"
+              exit 1
+            }
+          done
+"#,
+            "Linux workflow suite-list-end marker is missing",
         ),
     ];
 
