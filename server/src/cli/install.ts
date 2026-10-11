@@ -2092,7 +2092,9 @@ export function buildAgentInstallPlan(input: {
   // the next plan asks for the same command again.
   //
   // RE-PIN PRECEDENCE (a description of what the planner does today, not a
-  // claim that every macOS gate has passed). On darwin this arm is reached,
+  // claim that every macOS gate has passed). It covers the FULL profile only:
+  // a memory-profile plan always returns in the memory branch above and never
+  // reaches this arm. On darwin, for the full profile, this arm is reached,
   // and names re-pin whenever the predicate below is true, unless one of the
   // returns above refused first. Those returns refuse on: a persistent CLI
   // that is not `present` or has no path; a non-sealed runtime; a harness

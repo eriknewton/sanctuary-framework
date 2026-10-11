@@ -1901,7 +1901,7 @@ describe("sanctuary install agent contract", () => {
     expect(region).toContain("!/^[a-f0-9]{12}$/.test(input.observed.castleWallBuildSha)");
   });
 
-  it("names re-pin on darwin if and only if every earlier full-profile gate passes and the anchor needs it", () => {
+  it("names re-pin on darwin if and only if no earlier full-profile return refuses and the anchor needs it (pass-through values recorded, not endorsed)", () => {
     const { checked, repinExpected, failures } = runPrecedenceEnumeration("darwin");
     expect({ failureCount: failures.length, firstFailures: failures.slice(0, 5) }).toEqual({
       failureCount: 0,
