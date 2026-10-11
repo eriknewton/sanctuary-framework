@@ -13,6 +13,8 @@ import { Readable, Writable } from "node:stream";
 
 import {
   captureRotatedRecoveryKey,
+  parseArgs,
+  rotateMasterAcceptedLongFlags,
   runRotateMasterCommand,
 } from "../../src/cli/rotate-master.js";
 import { RECOVERY_KEY_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
@@ -272,6 +274,14 @@ describe("rotate-master --recovery-out", () => {
       expect(code).toBe(1);
       expect(err.writes.join("")).toContain(`${flag} requires a value`);
       expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
+    }
+  });
+
+  it("keeps the accepted-flag set executable by the parser", () => {
+    for (const flag of rotateMasterAcceptedLongFlags()) {
+      expect(() => parseArgs([flag, "/tmp/sanctuary-rotate-master-test"])).not.toThrow(
+        /Unknown flag/,
+      );
     }
   });
 });

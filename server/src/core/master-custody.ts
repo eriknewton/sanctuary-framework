@@ -162,9 +162,9 @@ export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
  * Its PRESENCE means a rotation is in flight: some fortress data may be under
  * the old master and some under the new. Every establishment path refuses to
- * proceed until the rotation is resumed to completion (or rolled back from
- * the staging phase) — booting half-keyed is exactly the split-state lockout
- * the custody work exists to kill.
+ * proceed until the rotation is resumed to completion. The staging phase
+ * writes no rotation journal, so booting half-keyed is exactly the split-state
+ * lockout the custody work exists to kill.
  */
 export const ROTATION_JOURNAL_KEY = "rotation-journal";
 
@@ -674,7 +674,7 @@ export class CustodyRotationInProgressError extends Error {
         "start until the rotation completes. Run:\n" +
         "  sanctuary rotate-master --resume\n" +
         "to continue the journaled rotation forward to completion. This requires\n" +
-        "the fortress passphrase."
+        "the fortress passphrase (add --fortress <path> for a non-default fortress)."
     );
     this.name = "CustodyRotationInProgressError";
   }
