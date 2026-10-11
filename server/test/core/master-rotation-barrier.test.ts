@@ -190,6 +190,10 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
     ]);
     expect(stdout).toContain("WROTE\n");
     expect(eventOrder).toContain("writer-final-write");
+    // Bounded-time witness: proving the drain WAITS for the live reader needs a time bound, and this
+    // probe is it. A drain that does not wait is caught when it reaches __testAfterExclusiveDrain within
+    // DRAIN_BLOCK_PROBE_MS; one that also stalls past that window can pass a single run. The release
+    // handshake below removes the old close-window race; it does not remove this bound.
     await sleep(DRAIN_BLOCK_PROBE_MS);
     expect(exclusiveDrainHookFired).toBe(false);
     expect(writer.exitCode).toBeNull();
