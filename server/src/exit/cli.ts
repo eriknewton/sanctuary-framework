@@ -6,7 +6,7 @@
  */
 
 import { createReadStream, openSync } from "node:fs";
-import { access, readFile as fsReadFile, mkdir, stat } from "node:fs/promises";
+import { access, mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -37,7 +37,7 @@ import type {
   ExitBundleDidWebBinding,
   ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
-import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
+import { verifyExitBundle, InvalidExitBundleError, readManifest } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 import { flagValue, flagValues, consumeFlagValue } from "../cli/argv.js";
@@ -1103,8 +1103,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       }
       const manifestPath = join(bundleRoot, "manifest.json");
       try {
-        const raw = await fsReadFile(manifestPath, "utf8");
-        JSON.parse(raw);
+        await readManifest(bundleRoot);
       } catch {
         write(
           err,

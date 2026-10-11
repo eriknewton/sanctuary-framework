@@ -7,6 +7,7 @@ import { isBenignDirectoryFsyncError } from "./directory-fsync.js";
 export type CustodyFsErrorCode =
   | "symlink_rejected"
   | "not_regular_file"
+  | "read_size_rejected"
   | "path_identity_changed"
   | "mode_rejected"
   | "uid_rejected"
@@ -82,6 +83,12 @@ export interface ReadFileCustodyBaseOptions {
     path: string;
     stats: Stats;
   }) => void | Promise<void>;
+  /**
+   * Hard ceiling for bytes read from the already-open descriptor. The reader
+   * pulls at most maxBytes+1 bytes so same-inode growth after fstat is refused
+   * by the descriptor read itself, not by a stale path stat.
+   */
+  maxBytes?: number;
 }
 
 export interface ReadFileCustodyBufferOptions extends ReadFileCustodyBaseOptions {
@@ -252,7 +259,7 @@ async function verifyParentCustody(
 
 async function openReadHandle(path: string) {
   try {
-    return await open(path, fsConstants.O_RDONLY | O_NOFOLLOW);
+    return await open(path, fsConstants.O_RDONLY | O_NOFOLLOW | fsConstants.O_NONBLOCK);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ELOOP") {
       throw new CustodyFsError(
@@ -263,6 +270,46 @@ async function openReadHandle(path: string) {
     }
     throw err;
   }
+}
+
+const READ_BOUND_SENTINEL_BYTES = 1;
+const READ_BOUND_CHUNK_BYTES = 64 * 1024; // 64 KiB keeps allocation bounded while streaming descriptor reads.
+
+async function readDescriptorBytesBounded(
+  handle: Awaited<ReturnType<typeof open>>,
+  path: string,
+  maxBytes: number,
+): Promise<Buffer> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new CustodyFsError(
+      "read_size_rejected",
+      `File custody check failed for ${path}: invalid read size bound.`,
+    );
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const remainingWithSentinel =
+      maxBytes + READ_BOUND_SENTINEL_BYTES - total;
+    const nextLength = Math.min(READ_BOUND_CHUNK_BYTES, remainingWithSentinel);
+    const buffer = Buffer.allocUnsafe(nextLength);
+    const { bytesRead } = await handle.read(buffer, 0, nextLength, null);
+    if (bytesRead === 0) {
+      return Buffer.concat(chunks, total);
+    }
+    total += bytesRead;
+    if (total > maxBytes) {
+      throw new CustodyFsError(
+        "read_size_rejected",
+        `File custody check failed for ${path}: file exceeds read size bound.`,
+      );
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+  }
+  throw new CustodyFsError(
+    "read_size_rejected",
+    `File custody check failed for ${path}: file exceeds read size bound.`,
+  );
 }
 
 export async function readFileCustody(
@@ -321,6 +368,12 @@ export async function readFileCustodyWithStats(
     if (modeRejected(fileMode(stats), options.mode)) {
       throwModeRejected("mode_rejected", path, fileMode(stats));
     }
+    if (options.maxBytes !== undefined && stats.size > options.maxBytes) {
+      throw new CustodyFsError(
+        "read_size_rejected",
+        `File custody check failed for ${path}: file exceeds read size bound.`,
+      );
+    }
     await verifyParentCustody(path, options.parent);
     await options.onDescriptorVerified?.({ path, stats });
     if (options.verifyPathIdentity === true) {
@@ -332,10 +385,12 @@ export async function readFileCustodyWithStats(
         );
       }
     }
+    const bytes =
+      options.maxBytes === undefined
+        ? await handle.readFile()
+        : await readDescriptorBytesBounded(handle, path, options.maxBytes);
     return {
-      data: options.encoding
-        ? await handle.readFile({ encoding: options.encoding })
-        : await handle.readFile(),
+      data: options.encoding ? bytes.toString(options.encoding) : bytes,
       stats,
     };
   } finally {

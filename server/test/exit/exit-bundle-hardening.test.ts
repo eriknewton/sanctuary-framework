@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rm,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -14,10 +25,15 @@ import {
   loadExitArtifact,
   exportExitBundle,
   importExitBundle,
+  readManifest,
   verifyExitBundle,
   ExitBundleImportError,
 } from "../../src/exit/index.js";
-import { InvalidExitBundleError } from "../../src/exit/verifier.js";
+import {
+  InvalidExitBundleError,
+  MAX_EXIT_ARTIFACT_READ_BYTES,
+  MAX_EXIT_MANIFEST_READ_BYTES,
+} from "../../src/exit/verifier.js";
 import { EXIT_BUNDLE_DID_WEB_AUDIT_OPS } from "../../src/exit/bundle.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -31,6 +47,10 @@ import {
   reputationBundleSigningBytes,
   type ReputationBundle,
 } from "../../src/reputation/reputation-store.js";
+
+const execFileAsync = promisify(execFile);
+const NAMED_PIPE_WRITER_RETRIES = 20;
+const NAMED_PIPE_WRITER_DELAY_MS = 10;
 
 interface ToolDef {
   name: string;
@@ -103,6 +123,26 @@ async function exportFromSource(
   });
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function writeNamedPipeIfReaderAppears(path: string): Promise<void> {
+  for (let attempt = 0; attempt < NAMED_PIPE_WRITER_RETRIES; attempt += 1) {
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK);
+      await handle.writeFile("{}");
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENXIO") throw err;
+      await delay(NAMED_PIPE_WRITER_DELAY_MS);
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+}
+
 describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
   const tempDirs: string[] = [];
 
@@ -118,10 +158,9 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
     await mkdir(join(bundleDir, "artifacts"));
     await writeFile(artifactPath, "{");
-    const bytesPerMiB = 1024 * 1024;
     // The verifier's documented cap is 24 MiB; +1 proves the refusal branch
     // without forcing the fixture to allocate a dense artifact on disk.
-    const oversizedArtifactBytes = 24 * bytesPerMiB + 1;
+    const oversizedArtifactBytes = MAX_EXIT_ARTIFACT_READ_BYTES + 1;
     await truncate(artifactPath, oversizedArtifactBytes);
 
     await expect(
@@ -144,6 +183,109 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
                 hash_alg: "sha256",
                 hash: "0".repeat(64),
                 size_bytes: oversizedArtifactBytes,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact refuses non-regular artifacts before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-regular-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await execFileAsync("mkfifo", [artifactPath]);
+    const writer = writeNamedPipeIfReaderAppears(artifactPath);
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 0,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_missing",
+    });
+    await writer;
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: readManifest applies the manifest read cap before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-cap-"));
+    tempDirs.push(bundleDir);
+    const manifestPath = join(bundleDir, "manifest.json");
+    await writeFile(manifestPath, "{");
+    await truncate(manifestPath, MAX_EXIT_MANIFEST_READ_BYTES + 1);
+
+    await expect(readManifest(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact wraps malformed artifact JSON", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-artifact-json-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{");
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 1,
               },
             ],
             artifacts_aggregate_hash: "0".repeat(64),

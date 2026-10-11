@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   chmod,
+  appendFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -16,6 +17,7 @@ import { lstat, open } from "node:fs/promises";
 import {
   CustodyFsError,
   readFileCustody,
+  readFileCustodyWithStats,
   writeFileCustody,
 } from "../../src/storage/custody-fs.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -48,6 +50,22 @@ describe("custody-fs descriptor-first file API", () => {
 
     await expect(readFileCustody(path)).rejects.toMatchObject({
       code: "not_regular_file",
+    });
+  });
+
+  it("bounds descriptor reads after the descriptor custody check", async () => {
+    const path = join(dir, "bounded.txt");
+    await writeFile(path, "abc", { mode: 0o600 });
+
+    await expect(
+      readFileCustodyWithStats(path, {
+        maxBytes: 3,
+        onDescriptorVerified: async () => {
+          await appendFile(path, "d");
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "read_size_rejected",
     });
   });
 
