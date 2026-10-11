@@ -188,8 +188,16 @@ export interface SdwMemoryProvenanceRecord {
   readonly kind: "memory_provenance";
   readonly version: 1;
   readonly document_id: string;
+  // Must match SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS below; the SDW write gate
+  // uses that shared path set as the only classifier exclusion surface.
   readonly companion: import("./memory-provenance-contract.js").MemoryProvenanceCompanion;
 }
+
+export const SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS = [
+  "companion.origin.signature",
+  "companion.admission.signature",
+] as const;
+export type SdwMemoryProvenanceSignaturePath = typeof SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS[number];
 
 export interface SdwMemoryProvenanceStatusRecord {
   readonly kind: "memory_provenance_status";
