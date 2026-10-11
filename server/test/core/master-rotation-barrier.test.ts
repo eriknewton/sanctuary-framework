@@ -1,3 +1,4 @@
+// fail-before-exempt: race-condition test fix whose old form was intermittently green.
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -68,9 +69,19 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     children.push(writer);
+    const eventOrder: Array<"writer-final-write" | "conversion"> = [];
+    let releaseExclusiveDrain: () => void = () => {};
     let stdout = "";
     let stderr = "";
-    writer.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    let sawWriterFinalWrite = false;
+    writer.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      if (!sawWriterFinalWrite && stdout.includes("WROTE\n")) {
+        sawWriterFinalWrite = true;
+        eventOrder.push("writer-final-write");
+        releaseExclusiveDrain();
+      }
+    });
     writer.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
     await new Promise<void>((resolve, reject) => {
       writer.once("error", reject);
@@ -84,6 +95,12 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
     let exclusiveBound!: () => void;
     const exclusiveIsBound = new Promise<void>((resolve) => { exclusiveBound = resolve; });
     let allowExclusiveDrain!: () => void;
+    let exclusiveDrainReleased = false;
+    releaseExclusiveDrain = (): void => {
+      if (exclusiveDrainReleased) return;
+      exclusiveDrainReleased = true;
+      allowExclusiveDrain();
+    };
     const exclusiveDrainMayStart = new Promise<void>((resolve) => {
       allowExclusiveDrain = resolve;
     });
@@ -94,6 +111,11 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
       passphrase,
       approve: async () => true,
       captureRecoveryKey: async (key, verify) => verify(key),
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          eventOrder.push("conversion");
+        }
+      },
       __testMasterRotationBarrierOptions: {
         timeoutMs: 10_000,
         retryMs: 10,
@@ -102,7 +124,10 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
           await exclusiveDrainMayStart;
         },
       },
-    });
+    }).then(
+      (value) => ({ status: "fulfilled", value } as const),
+      (error) => ({ status: "rejected", error } as const),
+    );
     await exclusiveIsBound;
 
     // The writer was admitted before the exclusive gate. Its last write is
@@ -110,11 +135,16 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
     const writerExit = new Promise<number | null>((resolve, reject) => {
       writer.once("error", reject);
       writer.once("close", resolve);
-    }).finally(() => allowExclusiveDrain());
+    }).finally(() => releaseExclusiveDrain());
     writer.stdin.end("WRITE\n");
     expect(await writerExit, stderr).toBe(0);
     expect(stdout).toContain("WROTE\n");
-    await rotation;
+    expect(eventOrder).toContain("writer-final-write");
+    const rotationOutcome = await rotation;
+    if (rotationOutcome.status === "rejected") {
+      throw rotationOutcome.error;
+    }
+    expect(eventOrder).toEqual(["writer-final-write", "conversion"]);
 
     const final = await establishMaster({ storage, passphrase });
     try {

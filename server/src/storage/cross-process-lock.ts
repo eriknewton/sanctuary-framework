@@ -1522,9 +1522,9 @@ async function acquireKernelLock(
       if (!server.listening) {
         throw new Error("listener stopped before custody callback admission");
       }
-      // The awaited hook is test-only scheduling control; production never
-      // passes it, so production lock timing cannot be delayed here.
-      await options.__testAfterKernelSocketAcquired?.(socketPath);
+      // The hook is test-only scheduling control; no hook means no await and no yield.
+      const hook = options.__testAfterKernelSocketAcquired;
+      if (hook !== undefined) await hook(socketPath);
       let testHelper: ChildProcessWithoutNullStreams | undefined;
       if (options.__testAfterKernelHolderAcquired) {
         testHelper = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
