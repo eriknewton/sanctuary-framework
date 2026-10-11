@@ -14,19 +14,49 @@ use castle_wall_daemon::{
     },
 };
 use ed25519_dalek::{Signer, SigningKey};
+use serde::Deserialize;
 
-fn fixture(generation: u64, origin: bool) -> (Vec<u8>, String) {
+#[derive(Deserialize)]
+struct ConfinedAgentIdVectors {
+    valid: Vec<String>,
+    invalid: Vec<String>,
+}
+
+fn rule_body(scope: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "id": "linux-explicit-ip",
+        "schema_version": 1,
+        "created_at": "2026-10-01T00:00:00Z",
+        "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+        "scope": scope,
+        "disposition": "allow"
+    }))
+    .unwrap()
+}
+
+fn fixture_with_body(generation: u64, origin: bool, body: Vec<u8>) -> (Vec<u8>, String) {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
-    let filename = castle_wall_daemon::manifest::rule_identity::encode_rule_filename(
+    let body = body.as_slice();
+    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    let filename =
+        castle_wall_daemon::manifest::rule_identity::encode_rule_filename("linux-explicit-ip")
+            .unwrap();
+    let habeas_filename = castle_wall_daemon::manifest::rule_identity::encode_rule_filename(
         castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_ID,
     )
     .unwrap();
-    let entry = castle_wall_daemon::manifest::verify::ManifestRuleEntry {
-        rule_id: castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_ID.into(),
-        file: filename.clone(),
-        sha256: sha256(body),
-    };
+    let entries = vec![
+        castle_wall_daemon::manifest::verify::ManifestRuleEntry {
+            rule_id: "linux-explicit-ip".into(),
+            file: filename.clone(),
+            sha256: sha256(body),
+        },
+        castle_wall_daemon::manifest::verify::ManifestRuleEntry {
+            rule_id: castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_ID.into(),
+            file: habeas_filename.clone(),
+            sha256: sha256(habeas_body),
+        },
+    ];
     let manifest = AllowlistManifest {
         schema_version: 1,
         fortress_id: "0123456789abcdef".into(),
@@ -42,7 +72,7 @@ fn fixture(generation: u64, origin: bool) -> (Vec<u8>, String) {
             agent_runtime_port_range: None,
         }),
         operator_baseline: None,
-        rules: vec![entry],
+        rules: entries,
     };
     let signature =
         key.sign(&canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap());
@@ -57,15 +87,24 @@ fn fixture(generation: u64, origin: bool) -> (Vec<u8>, String) {
     let bundle = PolicyBundle {
         public_key_hex: hex::encode(key.verifying_key().to_bytes()),
         manifest_b64url: URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed).unwrap()),
-        rules: vec![BundleRule {
-            file: filename,
-            body_b64url: URL_SAFE_NO_PAD.encode(body),
-        }],
+        rules: vec![
+            BundleRule {
+                file: filename,
+                body_b64url: URL_SAFE_NO_PAD.encode(body),
+            },
+            BundleRule {
+                file: habeas_filename,
+                body_b64url: URL_SAFE_NO_PAD.encode(habeas_body),
+            },
+        ],
     };
     (
         serde_json::to_vec(&bundle).unwrap(),
         sha256(&key.verifying_key().to_bytes()),
     )
+}
+fn fixture(generation: u64, origin: bool) -> (Vec<u8>, String) {
+    fixture_with_body(generation, origin, rule_body(serde_json::json!({})))
 }
 fn identity() -> IdentityConstraints<'static> {
     IdentityConstraints {
@@ -77,6 +116,49 @@ fn identity() -> IdentityConstraints<'static> {
         system_uid_allow_ceiling: 1000,
     }
 }
+
+#[test]
+fn confined_agent_id_form_matches_the_shared_vector_set() {
+    let vectors: ConfinedAgentIdVectors =
+        serde_json::from_str(include_str!("../test-vectors/confined-agent-id-v1.json")).unwrap();
+    let accepted: Vec<_> = vectors
+        .valid
+        .iter()
+        .map(|id| {
+            (
+                id.as_str(),
+                castle_wall_daemon::nftables::parse_confined_agent_id(id).is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        accepted,
+        vectors
+            .valid
+            .iter()
+            .map(|id| (id.as_str(), true))
+            .collect::<Vec<_>>()
+    );
+    let refused: Vec<_> = vectors
+        .invalid
+        .iter()
+        .map(|id| {
+            (
+                id.as_str(),
+                castle_wall_daemon::nftables::parse_confined_agent_id(id).is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vectors
+            .invalid
+            .iter()
+            .map(|id| (id.as_str(), false))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn explicit_origin_and_independent_pin_are_mandatory() {
     let (bytes, pin) = fixture(10, true);
@@ -93,6 +175,55 @@ fn explicit_origin_and_independent_pin_are_mandatory() {
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     value["manifest_b64url"] = serde_json::json!(URL_SAFE_NO_PAD.encode(b"{}"));
     assert!(admit_bundle(&serde_json::to_vec(&value).unwrap(), &pin, &identity()).is_err());
+}
+
+#[test]
+fn policy_install_refuses_agent_scope_ids_outside_the_confined_uid_form() {
+    let malformed = [
+        ("protection-subject", "0123456789abcdef/uid-60123"),
+        ("empty", ""),
+        ("missing-digits", "uid-"),
+        ("leading-zero", "uid-01"),
+    ];
+    for (label, agent_id) in malformed {
+        let (bytes, pin) = fixture_with_body(
+            10,
+            true,
+            rule_body(serde_json::json!({ "agent_ids": [agent_id] })),
+        );
+        let err = match admit_bundle(&bytes, &pin, &identity()) {
+            Ok(_) => panic!("{label}: malformed scope was admitted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains(agent_id) && err.contains("expected uid-<decimal uid>"),
+            "{label}: {err}"
+        );
+    }
+}
+
+#[test]
+fn policy_install_accepts_only_the_admitted_confined_uid_scope() {
+    let (bytes, pin) = fixture_with_body(
+        10,
+        true,
+        rule_body(serde_json::json!({ "agent_ids": ["uid-60123"] })),
+    );
+    assert!(admit_bundle(&bytes, &pin, &identity()).is_ok());
+
+    let (bytes, pin) = fixture_with_body(
+        10,
+        true,
+        rule_body(serde_json::json!({ "agent_ids": ["uid-60124"] })),
+    );
+    let err = match admit_bundle(&bytes, &pin, &identity()) {
+        Ok(_) => panic!("non-admitted scope was admitted"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("uid-60124") && err.contains("admitted uid 60123"),
+        "{err}"
+    );
 }
 #[test]
 fn high_water_is_strict_even_for_an_identical_completed_request() {
@@ -227,9 +358,15 @@ fn launch_revalidates_installed_rules_pin_marker_and_committed_floor() {
     .unwrap();
     root.write(&format!("{dir}/pinned.key"), &admitted.key, 0o600)
         .unwrap();
-    let (name, body) = admitted.loaded.rule_files.iter().next().unwrap();
+    for (name, body) in &admitted.loaded.rule_files {
+        root.write(&format!("{dir}/rules/{name}"), body, 0o600)
+            .unwrap();
+    }
+    let name =
+        castle_wall_daemon::manifest::rule_identity::encode_rule_filename("linux-explicit-ip")
+            .unwrap();
+    let body = admitted.loaded.rule_files.get(&name).unwrap();
     let rule = format!("{dir}/rules/{name}");
-    root.write(&rule, body, 0o600).unwrap();
     let marker = ConfiguredV1 {
         version: 1,
         agent_uid: t.agent_uid,

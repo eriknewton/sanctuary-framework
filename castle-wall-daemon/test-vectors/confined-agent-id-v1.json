@@ -1,0 +1,20 @@
+{
+  "valid": [
+    "uid-0",
+    "uid-1",
+    "uid-60123",
+    "uid-4294967295"
+  ],
+  "invalid": [
+    "",
+    "uid-",
+    "uid-01",
+    "uid-001",
+    "uid--1",
+    "uid-1.0",
+    "uid-4294967296",
+    "0123456789abcdef/uid-60123",
+    "agent-a",
+    "sanctuary:habeas-distress-emitter"
+  ]
+}

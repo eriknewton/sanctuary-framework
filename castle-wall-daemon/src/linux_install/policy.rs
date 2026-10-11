@@ -43,6 +43,73 @@ pub struct Admitted {
     pub loaded: LoadedManifest,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum InstallPolicyAdmissionError {
+    #[error("rule {rule_id} scope.agent_ids entry {agent_id:?}: expected {expected_form}")]
+    MalformedAgentScope {
+        rule_id: String,
+        agent_id: String,
+        expected_form: &'static str,
+    },
+    #[error(
+        "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected admitted uid {admitted_uid}"
+    )]
+    AgentScopeOutsideAdmission {
+        rule_id: String,
+        agent_id: String,
+        admitted_uid: u32,
+    },
+}
+
+fn validate_install_agent_id_scopes(
+    rules: &[crate::policy::AllowlistRule],
+    admitted_uid: u32,
+) -> std::result::Result<(), InstallPolicyAdmissionError> {
+    for rule in rules {
+        // The reserved distress lane is code-derived and shape-checked here; operator-authored agent scopes use confined ids.
+        if crate::habeas::is_derived_habeas_rule(rule) {
+            continue;
+        }
+        for agent_id in &rule.scope.agent_ids {
+            let Some(uid) = crate::nftables::parse_confined_agent_id(agent_id) else {
+                return Err(InstallPolicyAdmissionError::MalformedAgentScope {
+                    rule_id: rule.id.clone(),
+                    agent_id: agent_id.clone(),
+                    expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
+                });
+            };
+            // The install profile rejects gate_uid above, so its admitted confined-id set is the agent uid singleton.
+            if uid != admitted_uid {
+                return Err(InstallPolicyAdmissionError::AgentScopeOutsideAdmission {
+                    rule_id: rule.id.clone(),
+                    agent_id: agent_id.clone(),
+                    admitted_uid,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_loaded_install_agent_id_scopes(
+    loaded: &LoadedManifest,
+    admitted_uid: u32,
+) -> std::result::Result<(), InstallPolicyAdmissionError> {
+    let mut rules = Vec::new();
+    for entry in &loaded.signed.manifest.rules {
+        let Some(bytes) = loaded.rule_files.get(&entry.file) else {
+            continue;
+        };
+        let Ok(rule) = serde_json::from_slice::<crate::policy::AllowlistRule>(bytes) else {
+            continue;
+        };
+        if rule.id == entry.rule_id {
+            rules.push(rule);
+        }
+    }
+    validate_install_agent_id_scopes(&rules, admitted_uid)
+}
+
 pub fn admit_bundle(
     bytes: &[u8],
     pin: &str,
@@ -115,6 +182,7 @@ pub fn admit_bundle(
         signed,
         rule_files,
     };
+    validate_loaded_install_agent_id_scopes(&loaded, identity.agent_uid)?;
     PolicySnapshot::from_loaded_manifest(&loaded)?;
     Ok(Admitted {
         key,
