@@ -443,6 +443,16 @@ describe("protect uses the custody factor init enrolled", () => {
       },
       wrapDeps(),
     );
+    expect(castleWallMocks.runProvisionPin).toHaveBeenCalledOnce();
+    const [pinArgv, pinCtx] = castleWallMocks.runProvisionPin.mock.calls[0]! as unknown as [
+      unknown[],
+      { env?: NodeJS.ProcessEnv; __resolvedProvisionMasterKey?: Uint8Array },
+    ];
+    expect(JSON.stringify(pinArgv)).not.toContain(recoveryKey);
+    expect(JSON.stringify(pinCtx?.env ?? {})).not.toContain(recoveryKey);
+    expect(pinCtx?.env?.SANCTUARY_RECOVERY_KEY).toBeUndefined();
+    expect(pinCtx?.env?.SANCTUARY_PASSPHRASE).toBeUndefined();
+    expect(pinCtx?.__resolvedProvisionMasterKey).toBeInstanceOf(Uint8Array);
     expect(await readStoredPassphrase({ storagePath: fortress })).toBeNull();
   }, 120_000);
 

@@ -62,6 +62,7 @@ import {
   publicAgentIdForVerifiedAttribution,
 } from "../../hub/agent-attribution.js";
 import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
+import type { HubInboxItem } from "../../contracts/v1.1/hub-events.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
@@ -315,6 +316,12 @@ export interface V11Bindings {
   pii?: V11PiiRewriteBinding;
 }
 
+// Five lines keeps the context fold small enough for local models while still
+// showing the current operator bottleneck; the full rail remains the inbox UI.
+// Must match CONCIERGE_CONTEXT_PAGE_SIZE in
+// server/test/dashboard/v1_1/generic-wrap-charter-approvals-inbox.test.ts.
+const CONCIERGE_OPEN_INBOX_LIMIT = 5;
+
 async function pruneExpiredDidWebKeysOnUnlock(
   inputs: BuildV11BindingsInputs,
 ): Promise<void> {
@@ -466,6 +473,7 @@ export function buildV11Bindings(
     });
   }
 
+  let hubServiceForConcierge: HubService | null = null;
   let operatorChatService: OperatorChatService | undefined;
   if (inputs.storage && inputs.masterKey) {
     const chatStore = new OperatorChatStore(inputs.storage, inputs.masterKey);
@@ -519,6 +527,13 @@ export function buildV11Bindings(
         identityId: inputs.identityId,
         registry,
         resolveAuditAttribution,
+        listOpenInboxItems: () =>
+          hubServiceForConcierge
+            ? hubServiceForConcierge.listInbox({
+                limit: CONCIERGE_OPEN_INBOX_LIMIT,
+                openOnly: true,
+              })
+            : null,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
       // Rho-2.5: thread the live Tier B config so the concierge rewrite
@@ -798,6 +813,7 @@ export function buildV11Bindings(
     ...(operatorChatService ? { operatorChat: operatorChatService } : {}),
     ...(statelessConcierge ? { concierge: statelessConcierge } : {}),
   });
+  hubServiceForConcierge = hubService;
   return {
     hubService,
     identityId: inputs.identityId,
@@ -826,11 +842,13 @@ export function buildV11Bindings(
  * dashboard team iterate concierge prompts without touching the service
  * layer.
  */
-function buildConciergeContextProviders(args: {
+export function buildConciergeContextProviders(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
   resolveAuditAttribution: AuditAttributionOptionsResolver;
+  hubService?: HubService;
+  listOpenInboxItems?: () => HubInboxItem[] | null;
 }): ConciergeContextProviders {
   return {
     recentActivity: async () => {
@@ -864,10 +882,43 @@ function buildConciergeContextProviders(args: {
       return lines.join("\n");
     },
     openInbox: async () => {
-      // The inbox sources in v1.1.x wiring return empty arrays by
-      // default; the concierge surface degrades to an honest "(no
-      // open inbox items)" until the inbox aggregator is wired.
-      return "(no open inbox items)";
+      // The concierge reads a bounded, open-only page of the same HubService
+      // inbox; a missing producer is unavailable, never a calm-empty context
+      // row.
+      const items =
+        args.listOpenInboxItems?.() ??
+        args.hubService?.listInbox({
+          limit: CONCIERGE_OPEN_INBOX_LIMIT,
+          openOnly: true,
+        }) ??
+        null;
+      if (items === null) return "(open inbox unavailable)";
+      const openItems = items;
+      if (openItems.length === 0) return "(no open inbox items)";
+      const approvalCount = openItems.filter(
+        (item) => item.kind === "approval_pending",
+      ).length;
+      const pageIsFull = openItems.length === CONCIERGE_OPEN_INBOX_LIMIT;
+      const approvalPrefix = pageIsFull ? "at least " : "";
+      const lines = approvalCount > 0
+        ? [
+            `${approvalPrefix}${approvalCount} approval${approvalCount === 1 ? "" : "s"} waiting`,
+          ]
+        : [];
+      for (const item of openItems) {
+        if (item.kind === "approval_pending") continue;
+        lines.push(
+          `${item.item_id}  kind=${item.kind}  created=${item.created_at}`,
+        );
+      }
+      // A full bounded page proves only a lower bound for rows that were
+      // summarized from that page; the model should not receive it as a census.
+      if (pageIsFull) {
+        lines.push(
+          `(showing first ${CONCIERGE_OPEN_INBOX_LIMIT} open items; more may exist)`,
+        );
+      }
+      return lines.join("\n");
     },
   };
 }

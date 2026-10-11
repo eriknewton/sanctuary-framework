@@ -105,6 +105,14 @@ function makeSink(): { stream: Writable; text: () => string } {
   return { stream, text: () => chunks.join("") };
 }
 
+function commandExitMessage(
+  code: number,
+  err: { text: () => string },
+  out: { text: () => string },
+): string {
+  return `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`;
+}
+
 const cleanupTasks: Array<() => Promise<void>> = [];
 
 async function tempDir(prefix: string): Promise<string> {
@@ -1182,55 +1190,68 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
 
     // 1) ingest via stored custody
     const ingest = makeSink();
+    const ingestErr = makeSink();
+    const ingestCode = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: ingest.stream,
+      err: ingestErr.stream,
+      env: {}, // no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY
+    });
     expect(
-      await runMemoryIngestCommand({
-        argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
-        out: ingest.stream,
-        err: makeSink().stream,
-        env: {}, // no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY
-      }),
+      ingestCode,
+      commandExitMessage(ingestCode, ingestErr, ingest),
     ).toBe(0);
     expect(ingest.text()).not.toContain("could not unlock the fortress");
     expect(ingest.text()).not.toContain(PASSPHRASE);
 
     // 2) transcode via stored custody
     const transcode = makeSink();
+    const transcodeErr = makeSink();
+    const transcodeCode = await runMemoryTranscodeCommand({
+      argv: [
+        "--from-harness", "claude-code",
+        "--to-harness", "codex",
+        "--mode", "reversible",
+        "--dir", projection,
+        "--fortress", fortress,
+      ],
+      out: transcode.stream,
+      err: transcodeErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryTranscodeCommand({
-        argv: [
-          "--from-harness", "claude-code",
-          "--to-harness", "codex",
-          "--mode", "reversible",
-          "--dir", projection,
-          "--fortress", fortress,
-        ],
-        out: transcode.stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      transcodeCode,
+      commandExitMessage(transcodeCode, transcodeErr, transcode),
     ).toBe(0);
     const archiveId = /archive_id ([a-f0-9]+)/.exec(transcode.text())?.[1];
     expect(archiveId).toMatch(/^[a-f0-9]+$/);
 
     // 3) transcode-restore via stored custody
+    const restoreOut = makeSink();
+    const restoreErr = makeSink();
+    const restoreCode = await runMemoryTranscodeRestoreCommand({
+      argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
+      out: restoreOut.stream,
+      err: restoreErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryTranscodeRestoreCommand({
-        argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
-        out: makeSink().stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      restoreCode,
+      commandExitMessage(restoreCode, restoreErr, restoreOut),
     ).toBe(0);
 
     // 4) emit via stored custody
     const emit = makeSink();
+    const emitErr = makeSink();
+    const emitCode = await runMemoryEmitCommand({
+      argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
+      out: emit.stream,
+      err: emitErr.stream,
+      env: {},
+    });
     expect(
-      await runMemoryEmitCommand({
-        argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
-        out: emit.stream,
-        err: makeSink().stream,
-        env: {},
-      }),
+      emitCode,
+      commandExitMessage(emitCode, emitErr, emit),
     ).toBe(0);
     expect(emit.text()).toContain("emitted 3 Claude Code memory files");
     expect(emit.text()).not.toContain(PASSPHRASE);
@@ -1286,14 +1307,16 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = await seedFortressWithStoredCustody("memfile-f4-ok");
     const source = await copyFixtureSet("basic", "memfile-f4-ok-source");
     const captured: Uint8Array[] = [];
+    const out = makeSink();
+    const err = makeSink();
     const code = await runMemoryIngestCommand({
       argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
-      out: makeSink().stream,
-      err: makeSink().stream,
+      out: out.stream,
+      err: err.stream,
       env: {},
       observeMasterKey: (buf) => captured.push(buf),
     });
-    expect(code).toBe(0);
+    expect(code, commandExitMessage(code, err, out)).toBe(0);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
   });
@@ -1301,6 +1324,8 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
   it("F4: the owned master is zeroed even when the verb body errors after unlock", async () => {
     const fortress = await seedFortressWithStoredCustody("memfile-f4-err");
     const captured: Uint8Array[] = [];
+    const out = makeSink();
+    const err = makeSink();
     // A nonexistent source dir fails AFTER bootstrap (post-unlock), driving the
     // verb through its catch + finally; the master must still be zeroed.
     const code = await runMemoryIngestCommand({
@@ -1309,12 +1334,12 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
         "--dir", join(await tempDir("memfile-f4-err-missing"), "does-not-exist"),
         "--fortress", fortress,
       ],
-      out: makeSink().stream,
-      err: makeSink().stream,
+      out: out.stream,
+      err: err.stream,
       env: {},
       observeMasterKey: (buf) => captured.push(buf),
     });
-    expect(code).toBe(1);
+    expect(code, commandExitMessage(code, err, out)).toBe(1);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
   });
