@@ -11,8 +11,9 @@
 //!
 //! This target is deliberately NOT gated, so a plain `cargo test` runs it. It
 //! reads files and spawns nothing, so it is safe on every host.
-//! The same file also owns the Linux CI witness-loop parity check, so the
-//! feature-gated binaries are proven to have appeared in the CI log.
+//! The same file also owns the Linux CI witness-loop parity check, so the CI
+//! step that witnesses the feature-gated binaries cannot silently lose one from
+//! its list.
 //!
 //! Failure mode this catches, stated as the operator sees it: none. A missing
 //! gate is silent on macOS and destroys an operator's live enforcement table on
@@ -26,8 +27,15 @@ use std::path::{Path, PathBuf};
 // path .github/workflows/castle-wall-linux.yml.
 const WORKFLOW_SUITE_LIST_BEGIN: &str = "# suite-list-begin:";
 const WORKFLOW_SUITE_LIST_END: &str = "# suite-list-end:";
-const WORKFLOW_SUITE_RAN_GREP: &str = r#"grep -q "Running tests/$suite.rs""#;
 const WORKFLOW_LIST_EXTRA_TARGET: &str = "test_isolation_gate";
+// Must match the grep/echo/exit/brace lines immediately below suite-list-end in
+// .github/workflows/castle-wall-linux.yml; this array is the single body pin.
+const WORKFLOW_SUITE_RAN_LOOP_BODY: &[&str] = &[
+    r#"grep -q "Running tests/$suite.rs" cargo-test.plain.log || {"#,
+    r#"echo "FAIL: $suite did not run; the test-isolation feature is required for it""#,
+    "exit 1",
+    "}",
+];
 
 /// Source substrings that prove a target can reach a host-global object: the
 /// nftables table (shared kernel object), or `daemon::boot`, whose Linux path
@@ -98,7 +106,9 @@ fn gated_targets() -> BTreeSet<String> {
 
 /// The Linux CI "did it run" loop names every gated target plus this guard
 /// target. Parsed from anchored comments so the workflow and Cargo.toml lists
-/// cannot drift independently.
+/// cannot drift independently. Remaining bound: a line parser cannot evaluate
+/// context around the whole loop (`if false`, a subshell `|| true`, or an
+/// uncalled function), and YAML-parse validation is separate workflow work.
 fn workflow_suite_targets() -> BTreeSet<String> {
     let workflow_path = repo_root().join(".github/workflows/castle-wall-linux.yml");
     let workflow = std::fs::read_to_string(workflow_path).expect("read Linux workflow");
@@ -178,8 +188,7 @@ fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
     let mut state = WorkflowSuiteLoopState::Outside;
     let mut saw_begin = false;
     let mut saw_end = false;
-    let mut saw_body_grep = false;
-    let mut saw_body_exit = false;
+    let mut body_line_index = 0usize;
     let mut saw_loop_done = false;
 
     for raw_line in workflow.lines() {
@@ -208,6 +217,7 @@ fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
             );
             suites = parse_suite_list_lines(&suite_list_lines);
             state = WorkflowSuiteLoopState::InBody;
+            body_line_index = 0usize;
             saw_end = true;
             continue;
         }
@@ -218,22 +228,20 @@ fn workflow_suite_targets_from_str(workflow: &str) -> BTreeSet<String> {
                 suite_list_lines.push(line.to_string());
             }
             WorkflowSuiteLoopState::InBody => {
-                if line == "done" {
+                if body_line_index < WORKFLOW_SUITE_RAN_LOOP_BODY.len() {
                     assert!(
-                        saw_body_grep && saw_body_exit,
-                        "Linux workflow suite-ran loop body must fail the step when a suite is absent"
+                        line == WORKFLOW_SUITE_RAN_LOOP_BODY[body_line_index],
+                        "Linux workflow suite-ran loop body must match the pinned fail-closed body"
                     );
-                    saw_loop_done = true;
-                    state = WorkflowSuiteLoopState::Outside;
+                    body_line_index += 1;
                     continue;
                 }
-                if line.starts_with(WORKFLOW_SUITE_RAN_GREP) && line.contains("|| {") {
-                    saw_body_grep = true;
-                    continue;
-                }
-                if saw_body_grep && line == "exit 1" {
-                    saw_body_exit = true;
-                }
+                assert!(
+                    line == "done",
+                    "Linux workflow suite-ran loop body must be followed immediately by `done`"
+                );
+                saw_loop_done = true;
+                state = WorkflowSuiteLoopState::Outside;
                 continue;
             }
         }
@@ -269,6 +277,7 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
           for suite in integration_linux_runtime_activation; do
           # suite-list-end:
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              echo "FAIL: $suite did not run; the test-isolation feature is required for it"
               exit 1
             }
           done
@@ -276,10 +285,12 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
           for suite in integration_kernel_binding; do
           # suite-list-end:
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              echo "FAIL: $suite did not run; the test-isolation feature is required for it"
               exit 1
             }
           done
 "#,
+            "more than one Linux workflow suite-list-begin marker",
         ),
         (
             "header separated from body check",
@@ -295,6 +306,7 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
             }
           done
 "#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
         ),
         (
             "body without witness check",
@@ -305,6 +317,7 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
             true
           done
 "#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
         ),
         (
             "comment inside suite list",
@@ -319,6 +332,7 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
             }
           done
 "#,
+            "Linux workflow suite list must not contain comments",
         ),
         (
             "missing continuation backslash",
@@ -332,20 +346,115 @@ fn workflow_suite_loop_shape_rejects_neutral_negative_fixtures() {
             }
           done
 "#,
+            "every non-final Linux workflow suite list line must end with a backslash",
+        ),
+        (
+            "continue before witness check",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            continue
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              exit 1
+            }
+          done
+"#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
+        ),
+        (
+            "neutralized witness check",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || true || {
+              exit 1
+            }
+          done
+"#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
+        ),
+        (
+            "inner suite shadow loop",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation integration_kernel_binding; do
+          # suite-list-end:
+            for suite in test_isolation_gate; do
+              grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+                exit 1
+              }
+            done
+          done
+"#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
+        ),
+        (
+            "early successful exit after witness group",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
+              echo "FAIL: $suite did not run; the test-isolation feature is required for it"
+              exit 1
+            }
+            exit 0
+          done
+"#,
+            "Linux workflow suite-ran loop body must be followed immediately by `done`",
+        ),
+        (
+            "witness check reads inline text",
+            r#"
+          # suite-list-begin:
+          for suite in integration_linux_runtime_activation; do
+          # suite-list-end:
+            grep -q "Running tests/$suite.rs" <<< "Running tests/$suite.rs" || {
+              exit 1
+            }
+          done
+"#,
+            "Linux workflow suite-ran loop body must match the pinned fail-closed body",
         ),
     ];
 
     let mut accepted = Vec::new();
-    for (name, workflow) in cases {
-        if std::panic::catch_unwind(|| workflow_suite_targets_from_str(workflow)).is_ok() {
-            accepted.push(name);
+    let mut wrong_panic = Vec::new();
+    for (name, workflow, expected_message) in cases {
+        match std::panic::catch_unwind(|| workflow_suite_targets_from_str(workflow)) {
+            Ok(_) => {
+                accepted.push(name);
+            }
+            Err(payload) => {
+                let message = panic_message(payload);
+                if !message.contains(expected_message) {
+                    wrong_panic.push(format!("{name}: {message:?}"));
+                }
+            }
         }
     }
+    assert!(
+        wrong_panic.is_empty(),
+        "workflow suite-loop parser rejected invalid fixture shapes for the wrong reason: {:?}",
+        wrong_panic
+    );
     assert!(
         accepted.is_empty(),
         "workflow suite-loop parser accepted invalid fixture shapes: {:?}",
         accepted
     );
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "<non-string panic>".to_string()
+    }
 }
 
 /// Every `tests/*.rs` file, which is exactly the set cargo auto-discovers as
