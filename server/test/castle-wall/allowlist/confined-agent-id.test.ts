@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  HABEAS_DISTRESS_PORT,
+  HABEAS_LOCAL_RULE_ID,
+  isGenuineDerivedHabeasRule,
+} from "../../../src/castle-wall/allowlist/habeas-port.js";
 import {
   parseConfinedAgentId,
   validateLinuxInstallAgentIdScopes,
@@ -9,7 +15,15 @@ import {
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 
 const vectors = JSON.parse(
-  readFileSync("../castle-wall-daemon/test-vectors/confined-agent-id-v1.json", "utf8"),
+  readFileSync(
+    fileURLToPath(
+      new URL(
+        "../../../../castle-wall-daemon/test-vectors/confined-agent-id-v1.json",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  ),
 ) as { valid: string[]; invalid: string[] };
 
 function rule(agentIds: string[]): AllowlistRule {
@@ -36,7 +50,7 @@ describe("confined agent id form", () => {
   it("refuses malformed install scopes before signing", () => {
     for (const agentId of ["0123456789abcdef/uid-60123", "", "uid-", "uid-01"]) {
       expect(() => validateLinuxInstallAgentIdScopes([rule([agentId])], 60123)).toThrow(
-        `scope.agent_ids entry ${JSON.stringify(agentId)}: expected uid-<decimal uid>`,
+        `scope.agent_ids entry ${JSON.stringify(agentId)}: expected uid-<decimal uid>; re-sign with the uid-<uid> form`,
       );
     }
   });
@@ -46,5 +60,20 @@ describe("confined agent id form", () => {
     expect(() => validateLinuxInstallAgentIdScopes([rule(["uid-60124"])], 60123)).toThrow(
       `scope.agent_ids entry "uid-60124": expected admitted uid 60123`,
     );
+  });
+
+  it("checks operator-authored rules that resemble the derived distress lane", () => {
+    const derivedShapeWithOperatorScope: AllowlistRule = {
+      id: HABEAS_LOCAL_RULE_ID,
+      schema_version: 1,
+      created_at: "2026-10-01T00:00:00Z",
+      match: { ip: ["127.0.0.1", "::1"], port: [HABEAS_DISTRESS_PORT], protocol: "tcp" },
+      scope: { agent_ids: ["uid-60124"] },
+      disposition: "allow",
+    };
+    expect(isGenuineDerivedHabeasRule(derivedShapeWithOperatorScope)).toBe(false);
+    expect(() =>
+      validateLinuxInstallAgentIdScopes([derivedShapeWithOperatorScope], 60123),
+    ).toThrow(`scope.agent_ids entry "uid-60124": expected admitted uid 60123`);
   });
 });

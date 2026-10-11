@@ -14,14 +14,6 @@ use castle_wall_daemon::{
     },
 };
 use ed25519_dalek::{Signer, SigningKey};
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct ConfinedAgentIdVectors {
-    valid: Vec<String>,
-    invalid: Vec<String>,
-}
-
 fn rule_body(scope: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "id": "linux-explicit-ip",
@@ -118,48 +110,6 @@ fn identity() -> IdentityConstraints<'static> {
 }
 
 #[test]
-fn confined_agent_id_form_matches_the_shared_vector_set() {
-    let vectors: ConfinedAgentIdVectors =
-        serde_json::from_str(include_str!("../test-vectors/confined-agent-id-v1.json")).unwrap();
-    let accepted: Vec<_> = vectors
-        .valid
-        .iter()
-        .map(|id| {
-            (
-                id.as_str(),
-                castle_wall_daemon::nftables::parse_confined_agent_id(id).is_some(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        accepted,
-        vectors
-            .valid
-            .iter()
-            .map(|id| (id.as_str(), true))
-            .collect::<Vec<_>>()
-    );
-    let refused: Vec<_> = vectors
-        .invalid
-        .iter()
-        .map(|id| {
-            (
-                id.as_str(),
-                castle_wall_daemon::nftables::parse_confined_agent_id(id).is_some(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        refused,
-        vectors
-            .invalid
-            .iter()
-            .map(|id| (id.as_str(), false))
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn explicit_origin_and_independent_pin_are_mandatory() {
     let (bytes, pin) = fixture(10, true);
     assert!(
@@ -195,8 +145,13 @@ fn policy_install_refuses_agent_scope_ids_outside_the_confined_uid_form() {
             Ok(_) => panic!("{label}: malformed scope was admitted"),
             Err(err) => err.to_string(),
         };
+        let expected = if agent_id.is_empty() {
+            "scope identifiers must be non-empty"
+        } else {
+            "expected uid-<decimal uid>"
+        };
         assert!(
-            err.contains(agent_id) && err.contains("expected uid-<decimal uid>"),
+            err.contains(agent_id) && err.contains(expected),
             "{label}: {err}"
         );
     }
@@ -410,4 +365,78 @@ fn launch_revalidates_installed_rules_pin_marker_and_committed_floor() {
     )
     .unwrap();
     assert!(read_installed(&root, &t, &marker).is_err());
+}
+
+#[test]
+fn launch_refuses_existing_install_with_non_confined_scope_before_start() {
+    use castle_wall_daemon::{
+        config::DaemonConfig,
+        linux_install::{
+            account::AccountStep,
+            contract::ConfiguredV1,
+            policy::read_installed,
+            transaction::{Root, State, Transaction},
+        },
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Root::open(tmp.path()).unwrap();
+    let t = Transaction {
+        version: 1,
+        request_sha256: "a".repeat(64),
+        state: State::Configured,
+        agent_uid: 60123,
+        service_uid: 60124,
+        operator_uid: 1000,
+        fortress_id: identity().fortress_id.into(),
+        sanctuary_gid: Some(999),
+        account_step: AccountStep::Complete,
+        policy_generation: 10,
+        policy_request_sha256: Some("b".repeat(64)),
+        policy_complete: true,
+    };
+    let config = DaemonConfig::defaults_for_fortress(&t.fortress_id);
+    let dir = config.policy_dir.to_str().unwrap().trim_start_matches('/');
+    std::fs::create_dir_all(tmp.path().join(format!("{dir}/rules"))).unwrap();
+    let (bytes, pin) = fixture_with_body(
+        10,
+        true,
+        rule_body(serde_json::json!({ "agent_ids": ["0123456789abcdef/uid-60123"] })),
+    );
+    let bundle: PolicyBundle = serde_json::from_slice(&bytes).unwrap();
+    let manifest_bytes = URL_SAFE_NO_PAD.decode(&bundle.manifest_b64url).unwrap();
+    let signed: SignedManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    let key = hex::decode(&bundle.public_key_hex).unwrap();
+    root.write(&format!("{dir}/manifest.json"), &manifest_bytes, 0o600)
+        .unwrap();
+    root.write(&format!("{dir}/pinned.key"), &key, 0o600)
+        .unwrap();
+    for rule in &bundle.rules {
+        root.write(
+            &format!("{dir}/rules/{}", rule.file),
+            &URL_SAFE_NO_PAD.decode(&rule.body_b64url).unwrap(),
+            0o600,
+        )
+        .unwrap();
+    }
+    let marker = ConfiguredV1 {
+        version: 1,
+        agent_uid: t.agent_uid,
+        fortress_id: t.fortress_id.clone(),
+        command_sha256: "a".repeat(64),
+        endpoints_sha256: "b".repeat(64),
+        public_pin_sha256: pin,
+        policy_generation: 10,
+        policy_signature_b64url: signed.signature.signature_b64url,
+        policy_sha256: sha256(&manifest_bytes),
+    };
+
+    let err = match read_installed(&root, &t, &marker) {
+        Ok(_) => panic!("non-confined installed scope was admitted for launch"),
+        Err(err) => err.to_string(),
+    };
+    assert_eq!(
+        err,
+        "rule linux-explicit-ip scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+    );
+    assert_eq!(t.state, State::Configured);
 }

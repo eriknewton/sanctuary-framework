@@ -89,4 +89,35 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(storage.writeRule).not.toHaveBeenCalled();
     expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
   });
+
+  it("refuses uid-mode broker publication scopes outside the confined id form before signing", async () => {
+    const sign = vi.fn(() => new Uint8Array(64));
+    const storage: ManifestStorage = {
+      writeRule: vi.fn(async () => undefined),
+      atomicRenameManifest: vi.fn(async () => undefined),
+      listRules: vi.fn(async () => []),
+      removeRule: vi.fn(async () => undefined),
+    };
+
+    await expect(
+      publishLinuxCompatiblePolicy(
+        {
+          fortressId: "deadbeef",
+          issuedAt: "2026-09-03T00:00:00Z",
+          generation: 1,
+          rules: [rule({ scope: { agent_ids: ["deadbeef/uid-60123"] } })],
+          agentOrigin: {
+            mode: "uid",
+            agent_uid: 60123,
+            system_uid_allow_ceiling: 1000,
+          },
+          signer: { signingKeyId: "sha256:" + "11".repeat(32), sign },
+        },
+        storage
+      )
+    ).rejects.toThrow("expected uid-<decimal uid>; re-sign with the uid-<uid> form");
+    expect(sign).not.toHaveBeenCalled();
+    expect(storage.writeRule).not.toHaveBeenCalled();
+    expect(storage.atomicRenameManifest).not.toHaveBeenCalled();
+  });
 });

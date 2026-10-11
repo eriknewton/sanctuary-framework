@@ -3810,6 +3810,8 @@ fn parse_owned_table_inventory_phases(
 /// fail to verify after a restart. The confined id is `uid-<U>`, while the
 /// protection-subject id used in audit evidence is `<fortress>/uid-<U>`.
 pub const CONFINED_AGENT_ID_PREFIX: &str = "uid-";
+// Must match `CONFINED_AGENT_ID_PREFIX` in
+// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
 // Must match `CONFINED_AGENT_ID_FORM` in
 // `server/src/castle-wall/allowlist/confined-agent-id.ts`.
 pub const CONFINED_AGENT_ID_FORM: &str = "uid-<decimal uid>";
@@ -3820,12 +3822,15 @@ pub const CONFINED_AGENT_ID_FORM: &str = "uid-<decimal uid>";
 /// the daemon installs: a test that spelled the id itself would be a
 /// hand-mirrored copy of this derivation, and the first change here would leave
 /// it silently installing a second chain for the same uid.
-#[cfg(any(target_os = "linux", test))]
 pub fn confined_agent_id(agent_uid: u32) -> String {
     format!("{CONFINED_AGENT_ID_PREFIX}{agent_uid}")
 }
 
 /// Parse the canonical confined id form used by Linux policy scopes.
+///
+/// Must match `parseConfinedAgentId` in
+/// `server/src/castle-wall/allowlist/confined-agent-id.ts` and the shared
+/// vector file at `castle-wall-daemon/test-vectors/confined-agent-id-v1.json`.
 pub fn parse_confined_agent_id(agent_id: &str) -> Option<u32> {
     let raw_uid = agent_id.strip_prefix(CONFINED_AGENT_ID_PREFIX)?;
     if raw_uid.is_empty() {
