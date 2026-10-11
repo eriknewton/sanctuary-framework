@@ -7,12 +7,16 @@
  * material and the destination has a signing identity.
  */
 
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type {
   FilesystemStorageCapabilities,
   NamespaceLockStorageCapabilities,
   StorageBackend,
+} from "../storage/interface.js";
+import {
+  isNamespaceDiscoveryLimitError,
+  NAMESPACE_DISCOVERY_LIMIT_REMEDIATION,
 } from "../storage/interface.js";
 import type {
   CrossProcessLockLease,
@@ -401,8 +405,8 @@ export interface ExportExitBundleOptions {
   stateStoragePath?: string;
   /**
    * Restrict the encrypted-state export to these namespaces. OMIT the option
-   * to export every namespace discovered under `stateStoragePath`; that is the
-   * behavior an operator-driven full-fortress export wants.
+   * to export every namespace discovered by `storage.listNamespaces()`; that
+   * is the behavior an operator-driven full-fortress export wants.
    *
    * Supplying an EMPTY array throws. It is never "export zero state": an empty
    * array is what a repeated-flag parser produces when the operator passed no
@@ -922,23 +926,39 @@ function mintSourceCustody(masterKey: Uint8Array): {
   };
 }
 
-async function discoverFilesystemStateNamespaces(
-  stateStoragePath?: string
+export class ExitNamespaceDiscoveryError extends Error {
+  readonly code = "EXIT_NAMESPACE_DISCOVERY_FAILED";
+
+  constructor(cause: unknown) {
+    super(
+      "exit-bundle: namespace discovery failed; export refused before writing " +
+        "bundle artifacts." +
+        (isNamespaceDiscoveryLimitError(cause)
+          ? ` ${NAMESPACE_DISCOVERY_LIMIT_REMEDIATION}`
+          : ""),
+      { cause },
+    );
+    this.name = "ExitNamespaceDiscoveryError";
+  }
+}
+
+async function resolveExportStateNamespaces(
+  opts: ExportExitBundleOptions,
 ): Promise<string[]> {
-  if (!stateStoragePath) return [];
+  if (opts.stateNamespaces !== undefined) return [...opts.stateNamespaces];
+  if (typeof opts.storage.listNamespaces !== "function") {
+    throw new ExitNamespaceDiscoveryError(
+      new Error("storage backend cannot enumerate namespaces"),
+    );
+  }
   try {
-    const names = await readdir(stateStoragePath);
-    const namespaces: string[] = [];
-    for (const name of names) {
-      const full = join(stateStoragePath, name);
-      const entryStat = await stat(full);
-      if (!entryStat.isDirectory()) continue;
-      if (name.startsWith("_")) continue;
-      namespaces.push(name);
-    }
-    return namespaces.sort();
-  } catch {
-    return [];
+    // Must match StorageBackend.listNamespaces in storage/interface.ts: this is
+    // the one namespace definition for full-fortress export. Continuing paths:
+    // empty-but-present and missing storage roots return []; unreadable roots,
+    // over-budget walks, and per-entry metadata failures are typed refusals.
+    return await opts.storage.listNamespaces();
+  } catch (error) {
+    throw new ExitNamespaceDiscoveryError(error);
   }
 }
 
@@ -987,16 +1007,14 @@ function assertExportOptionsShape(opts: ExportExitBundleOptions): void {
 async function exportEncryptedState(
   opts: ExportExitBundleOptions,
   exportedAt: string,
+  stateNamespaces: readonly string[],
 ): Promise<{
   bundle: ExitEncryptedStateBundle;
   rekeyKey?: string;
   partition?: PartitionResult;
 }> {
   assertExportOptionsShape(opts);
-  const namespaceSet = new Set(
-    opts.stateNamespaces ??
-      (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
-  );
+  const namespaceSet = new Set(stateNamespaces);
   const collected: ExitEncryptedStateBundle["entries"] = [];
   for (const namespace of [...namespaceSet].sort()) {
     // F6: never export internal `_`-prefixed namespaces - the rekey/import path
@@ -1437,6 +1455,10 @@ export async function exportExitBundle(
   // side does not re-fetch the published document; it embeds the
   // pointer the operator declared.
   const didWebBinding = validateExportDidWeb(opts.didWeb);
+  // INVARIANT: full-fortress namespace discovery completes before any bundle
+  // directory or audit entry is written. An enumeration fault cannot be turned
+  // into an incomplete export or a partial artifact tree.
+  const stateNamespaces = await resolveExportStateNamespaces(opts);
   const bundleDir = resolve(opts.bundleDir);
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
   await mkdir(join(bundleDir, ARTIFACT_DIR), { recursive: true, mode: 0o700 });
@@ -1474,7 +1496,11 @@ export async function exportExitBundle(
       "public_identity"
     )
   );
-  const encryptedStateExport = await exportEncryptedState(opts, exportedAt);
+  const encryptedStateExport = await exportEncryptedState(
+    opts,
+    exportedAt,
+    stateNamespaces,
+  );
   // A zero-entry export is a legitimate outcome for a fresh fortress, but it
   // must never READ as a successful state export: the bundle still carries a
   // valid signed manifest and an `encrypted_state.json`, so an operator running
@@ -3514,8 +3540,9 @@ async function rekeyState(
   for (const item of encryptedState.entries) {
     // F6: reject ALL underscore-prefixed (internal) namespaces on import.
     // Export only ever emits non-`_` namespaces (see
-    // discoverFilesystemStateNamespaces / exportEncryptedState), so any
-    // `_`-namespace in a bundle is crafted. RESERVED-NS-DIVERGE-01:
+    // resolveExportStateNamespaces / exportEncryptedState), so an
+    // `_`-namespace in a bundle is not an export-produced state entry.
+    // RESERVED-NS-DIVERGE-01:
     // `isReservedNamespace` applies the blanket underscore rule itself, so
     // it can't miss a newer internal `_`-namespace the curated list lags.
     if (isReservedNamespace(item.namespace)) {

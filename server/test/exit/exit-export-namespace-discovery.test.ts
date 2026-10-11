@@ -38,7 +38,7 @@
 // change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -49,14 +49,15 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { stringToBytes } from "../../src/core/encoding.js";
-import { StateStore } from "../../src/cognitive/state-store.js";
+import { StateStore, isReservedNamespace } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { createL4Tools } from "../../src/reputation/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
-import { exportExitBundle } from "../../src/exit/index.js";
+import { exportExitBundle, importExitBundle } from "../../src/exit/index.js";
 import type { ExitEncryptedStateBundle } from "../../src/exit/bundle.js";
+import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 
 // ── Test scaffolding ─────────────────────────────────────────────────
 
@@ -106,6 +107,13 @@ async function callTool(
  */
 async function bootstrapFortress(): Promise<{
   storagePath: string;
+  stateStoragePath: string;
+  storage: FilesystemStorage;
+  masterKey: Uint8Array;
+  stateStore: StateStore;
+  identityManager: Awaited<ReturnType<typeof createL1Tools>>["identityManager"];
+  auditLog: AuditLog;
+  reputationStore: ReturnType<typeof createL4Tools>["reputationStore"];
   identityId: string;
   tools: ToolLike[];
   /**
@@ -137,6 +145,12 @@ async function bootstrapFortress(): Promise<{
     auditLog,
   );
   await identityManager.load();
+  const { reputationStore } = createL4Tools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog,
+  );
   const created = await callTool(tools as ToolLike[], "identity_create", {
     label: "fortress-default",
   });
@@ -144,6 +158,13 @@ async function bootstrapFortress(): Promise<{
 
   return {
     storagePath,
+    stateStoragePath,
+    storage,
+    masterKey,
+    stateStore,
+    identityManager,
+    auditLog,
+    reputationStore,
     identityId: created.identity_id as string,
     tools: tools as ToolLike[],
     readAuditOperations: async () => {
@@ -162,6 +183,47 @@ async function readEncryptedState(
     "utf8",
   );
   return JSON.parse(raw) as ExitEncryptedStateBundle;
+}
+
+async function buildMemoryDestination(): Promise<{
+  storage: MemoryStorage;
+  masterKey: Uint8Array;
+  stateStore: StateStore;
+  identityManager: Awaited<ReturnType<typeof createL1Tools>>["identityManager"];
+  auditLog: AuditLog;
+  reputationStore: ReturnType<typeof createL4Tools>["reputationStore"];
+  identityId: string;
+}> {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const auditLog = new AuditLog(storage, masterKey);
+  const stateStore = new StateStore(storage, masterKey);
+  const { tools, identityManager } = createL1Tools(
+    stateStore,
+    storage,
+    masterKey,
+    "recovery-key",
+    auditLog,
+  );
+  await identityManager.load();
+  const { reputationStore } = createL4Tools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog,
+  );
+  const created = await callTool(tools as ToolLike[], "identity_create", {
+    label: "destination-default",
+  });
+  return {
+    storage,
+    masterKey,
+    stateStore,
+    identityManager,
+    auditLog,
+    reputationStore,
+    identityId: created.identity_id as string,
+  };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -351,6 +413,197 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     expect(seededOps).toContain("exit_bundle_export");
     expect(seededOps).not.toContain("exit_bundle_export_no_state");
   });
+
+  it("refuses a full-state export when namespace enumeration cannot read the state root", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      console.warn("skipping mode-000 namespace enumeration check while running as root");
+      return;
+    }
+    const fortress = await seededFortress();
+    const stateStoragePath = fortress.stateStoragePath;
+    const parent = await mkdtemp(join(tmpdir(), "sanctuary-bundle-unreadable-parent-"));
+    cleanup.push(parent);
+    const bundleDir = join(parent, "bundle");
+
+    await chmod(stateStoragePath, 0o000);
+    try {
+      await expect(
+        exportExitBundle({
+          unpartitionedLegacyExport: true,
+          bundleDir,
+          storage: fortress.storage,
+          masterKey: fortress.masterKey,
+          identityManager: fortress.identityManager,
+          auditLog: fortress.auditLog,
+          reputationStore: fortress.reputationStore,
+          policy: DEFAULT_POLICY,
+          config: defaultConfig(),
+          stateStoragePath,
+          keySource: "passphrase",
+        }),
+      ).rejects.toMatchObject({
+        name: "ExitNamespaceDiscoveryError",
+        code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
+      });
+      await expect(readFile(join(bundleDir, "manifest.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await chmod(stateStoragePath, 0o700);
+    }
+  });
+
+  it("exports the same namespace set that the storage layer enumerates", async () => {
+    const fortress = await bootstrapFortress();
+    cleanup.push(fortress.storagePath);
+    const namespaces = ["agent-memory", "project notes"] as const;
+    for (const namespace of namespaces) {
+      await callTool(fortress.tools, "state_write", {
+        namespace,
+        key: "note",
+        value: `${namespace} travels under its logical name`,
+        identity_id: fortress.identityId,
+      });
+    }
+    const exportableNamespaces = (await fortress.storage.listNamespaces()).filter(
+      (namespace) => !isReservedNamespace(namespace),
+    );
+    expect(exportableNamespaces).toEqual([...namespaces].sort());
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-listns-"));
+    cleanup.push(bundleDir);
+    await exportExitBundle({
+      unpartitionedLegacyExport: true,
+      bundleDir,
+      storage: fortress.storage,
+      masterKey: fortress.masterKey,
+      identityManager: fortress.identityManager,
+      auditLog: fortress.auditLog,
+      reputationStore: fortress.reputationStore,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateStoragePath: fortress.stateStoragePath,
+      keySource: "passphrase",
+      mintStateRekeyKey: true,
+    });
+
+    const state = await readEncryptedState(bundleDir);
+    expect(state.namespaces).toEqual(exportableNamespaces);
+  });
+
+  it("round-trips an encoded filesystem namespace under its logical name", async () => {
+    const namespace = "project notes";
+    const fortress = await bootstrapFortress();
+    cleanup.push(fortress.storagePath);
+    await callTool(fortress.tools, "state_write", {
+      namespace,
+      key: "handoff",
+      value: "encoded namespace keeps its logical name",
+      identity_id: fortress.identityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-encoded-ns-"));
+    cleanup.push(bundleDir);
+    const exported = await exportExitBundle({
+      unpartitionedLegacyExport: true,
+      bundleDir,
+      storage: fortress.storage,
+      masterKey: fortress.masterKey,
+      identityManager: fortress.identityManager,
+      auditLog: fortress.auditLog,
+      reputationStore: fortress.reputationStore,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateStoragePath: fortress.stateStoragePath,
+      keySource: "passphrase",
+      mintStateRekeyKey: true,
+    });
+
+    const destination = await buildMemoryDestination();
+    const result = await importExitBundle({
+      bundleDir,
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+      forceRebind: true,
+      sourceRecoveryKey: exported.state_rekey_key!,
+      destinationSignerIdentityId: destination.identityId,
+    });
+
+    expect(result.state.status).toBe("rekeyed");
+    expect(result.state.imported_keys).toBe(1);
+    expect(await destination.storage.listNamespaces()).toContain(namespace);
+    const read = await destination.stateStore.read(namespace, "handoff");
+    expect(read?.value).toBe("encoded namespace keeps its logical name");
+  });
+});
+
+describe("exportExitBundle: storage namespace enumeration failures refuse export", () => {
+  class RefusingNamespaceStorage extends MemoryStorage {
+    override async listNamespaces(): Promise<string[]> {
+      throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
+    }
+  }
+
+  it("refuses when the storage layer reports its namespace bound", async () => {
+    const storage = new RefusingNamespaceStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+    );
+    await identityManager.load();
+    const { reputationStore } = createL4Tools(
+      storage,
+      masterKey,
+      identityManager,
+      auditLog,
+    );
+    const created = await callTool(tools as ToolLike[], "identity_create", {
+      label: "agent",
+    });
+    await callTool(tools as ToolLike[], "state_write", {
+      namespace: "agent-memory",
+      key: "handoff",
+      value: "bounded enumeration refuses the full export",
+      identity_id: created.identity_id as string,
+    });
+
+    const parent = await mkdtemp(join(tmpdir(), "sanctuary-bundle-bound-parent-"));
+    const bundleDir = join(parent, "bundle");
+    try {
+      await expect(
+        exportExitBundle({
+          unpartitionedLegacyExport: true,
+          bundleDir,
+          storage,
+          masterKey,
+          identityManager,
+          auditLog,
+          reputationStore,
+          policy: DEFAULT_POLICY,
+          config: defaultConfig(),
+          keySource: "recovery-key",
+        }),
+      ).rejects.toMatchObject({
+        name: "ExitNamespaceDiscoveryError",
+        code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
+      });
+      await expect(readFile(join(bundleDir, "manifest.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("exportExitBundle: empty stateNamespaces is rejected, not honored", () => {
@@ -414,11 +667,10 @@ describe("exportExitBundle: an uncurated underscore namespace is excluded even w
     // namespace the curated list has never heard of must still be excluded
     // from the export.
     //
-    // Discovery (no --state-namespace) already filters `_`-prefixed
-    // directories before they reach exportEncryptedState (see
-    // `discoverFilesystemStateNamespaces`), so the only way to reach the
-    // in-loop `isReservedNamespace` check with such a namespace is to name it
-    // explicitly, the same way `--state-namespace` lets an operator do.
+    // Discovery (no --state-namespace) goes through StorageBackend.listNamespaces
+    // and the in-loop `isReservedNamespace` check, so the direct way to reach
+    // that check with such a namespace is to name it explicitly, the same way
+    // `--state-namespace` lets an operator do.
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
