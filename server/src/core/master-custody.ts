@@ -135,6 +135,7 @@ export interface CustodyEnvelope {
 export async function readEnvelopeEpoch(
   storage: StorageBackend
 ): Promise<number> {
+  await recoverCustodyEnvelopeCommitIfPresent(storage);
   const envelope = await readCustodyEnvelope(storage);
   return envelopeEpochOf(envelope);
 }
@@ -168,6 +169,15 @@ export const ROTATION_JOURNAL_KEY = "rotation-journal";
 /** `_meta` keys staged by an in-flight rotation (promoted at finalize). */
 export const STAGED_CUSTODY_ENVELOPE_KEY = "custody-envelope-next";
 export const STAGED_CUSTODY_SENTINEL_KEY = "custody-sentinel-next";
+// Must match the local test constant in server/test/core/master-custody.test.ts;
+// the test keeps it local so existing typecheck diagnostic line pins stay fixed.
+export const CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
+  "custody-envelope-commit-journal";
+const CUSTODY_ENVELOPE_COMMIT_JOURNAL_PREFIX =
+  "custody-envelope-commit-journal";
+const CUSTODY_ENVELOPE_COMMIT_JOURNAL_VERSION = 1;
+const CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED =
+  "custody_pair_prepared";
 
 /** One kernel-backed lock domain for every custody/master mutation. */
 export const CUSTODY_WRITE_LOCK_NAMESPACE = "_meta";
@@ -1007,6 +1017,157 @@ export async function writeCustodyEnvelope(
   );
 }
 
+interface CustodyEnvelopeCommitJournal {
+  v: typeof CUSTODY_ENVELOPE_COMMIT_JOURNAL_VERSION;
+  state: typeof CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED;
+  envelope_key: string;
+  sentinel_key: string;
+  envelope_bytes: string;
+  sentinel_bytes: string;
+  created_at: string;
+}
+
+function custodyEnvelopeCommitJournalKey(opts?: {
+  envelopeKey?: string;
+  sentinelKey?: string;
+}): string {
+  const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
+  const sentinelKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
+  if (
+    envelopeKey === CUSTODY_ENVELOPE_KEY &&
+    sentinelKey === CUSTODY_SENTINEL_KEY
+  ) {
+    return CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY;
+  }
+  return `${CUSTODY_ENVELOPE_COMMIT_JOURNAL_PREFIX}.${envelopeKey}.${sentinelKey}`;
+}
+
+function custodyEnvelopeCommitJournal(
+  envelopeKey: string,
+  sentinelKey: string,
+  envelopeBytes: Uint8Array,
+  sentinelBytes: Uint8Array,
+): CustodyEnvelopeCommitJournal {
+  return {
+    v: CUSTODY_ENVELOPE_COMMIT_JOURNAL_VERSION,
+    state: CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED,
+    envelope_key: envelopeKey,
+    sentinel_key: sentinelKey,
+    envelope_bytes: toBase64url(envelopeBytes),
+    sentinel_bytes: toBase64url(sentinelBytes),
+    created_at: new Date().toISOString(),
+  };
+}
+
+function parseCustodyEnvelopeCommitJournal(
+  raw: Uint8Array,
+): CustodyEnvelopeCommitJournal | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch {
+    return null;
+  }
+  const journal = parsed as Partial<CustodyEnvelopeCommitJournal>;
+  if (
+    journal === null ||
+    typeof journal !== "object" ||
+    journal.v !== CUSTODY_ENVELOPE_COMMIT_JOURNAL_VERSION ||
+    journal.state !== CUSTODY_ENVELOPE_COMMIT_STATE_PREPARED ||
+    typeof journal.envelope_key !== "string" ||
+    typeof journal.sentinel_key !== "string" ||
+    typeof journal.envelope_bytes !== "string" ||
+    typeof journal.sentinel_bytes !== "string" ||
+    typeof journal.created_at !== "string"
+  ) {
+    return null;
+  }
+  return journal as CustodyEnvelopeCommitJournal;
+}
+
+async function writeMetaDurable(
+  storage: StorageBackend,
+  key: string,
+  data: Uint8Array,
+): Promise<void> {
+  // FilesystemStorage.write routes through writeFileCustody: temp file, file
+  // fsync, atomic rename, then directory fsync. Keeping the custody commit on
+  // that existing path avoids the slower delegated durable-write worker.
+  await storage.write("_meta", key, data);
+}
+
+async function recoverCustodyEnvelopeCommitIfPresent(
+  storage: StorageBackend,
+  opts?: { envelopeKey?: string; sentinelKey?: string },
+): Promise<void> {
+  const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
+  const sentinelKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
+  const journalKey = custodyEnvelopeCommitJournalKey(opts);
+  const raw = await storage.read("_meta", journalKey);
+  if (raw === null) return;
+  await withCustodyWriteLock(
+    storage,
+    (lease) =>
+      recoverCustodyEnvelopeCommitLocked(storage, journalKey, lease, {
+        envelopeKey,
+        sentinelKey,
+      }),
+    { metadata: { owner: "recover-custody-envelope-commit" } },
+  );
+}
+
+async function recoverCustodyEnvelopeCommitLocked(
+  storage: StorageBackend,
+  journalKey: string,
+  lease: CrossProcessLockLease,
+  expected: { envelopeKey: string; sentinelKey: string },
+): Promise<void> {
+  lease.assertHeld();
+  // The locked journal read is the recovery authority; a pre-lock hint can be
+  // stale after another process completes or supersedes the prepared record.
+  const raw = await storage.read("_meta", journalKey);
+  if (raw === null) return;
+  const journal = parseCustodyEnvelopeCommitJournal(raw);
+  if (journal === null) {
+    await storage.delete("_meta", journalKey);
+    return;
+  }
+  if (
+    journal.envelope_key !== expected.envelopeKey ||
+    journal.sentinel_key !== expected.sentinelKey
+  ) {
+    // The journal key selects exactly one custody pair; mismatched targets are
+    // stale or malformed local state, so recovery discards rather than replaying.
+    await storage.delete("_meta", journalKey);
+    return;
+  }
+  await state_PREPARED_completeCustodyPair(storage, journal, lease);
+  await storage.delete("_meta", journalKey);
+  lease.assertHeld();
+}
+
+async function state_PREPARED_completeCustodyPair(
+  storage: StorageBackend,
+  journal: CustodyEnvelopeCommitJournal,
+  lease: CrossProcessLockLease,
+): Promise<void> {
+  lease.assertHeld();
+  // The prepared record is the recovery authority: both target bytes replay
+  // from one journal, so an interrupted pair cannot mix generations.
+  await writeMetaDurable(
+    storage,
+    journal.envelope_key,
+    fromBase64url(journal.envelope_bytes),
+  );
+  lease.assertHeld();
+  await writeMetaDurable(
+    storage,
+    journal.sentinel_key,
+    fromBase64url(journal.sentinel_bytes),
+  );
+  lease.assertHeld();
+}
+
 async function writeCustodyEnvelopeLocked(
   storage: StorageBackend,
   envelope: Omit<CustodyEnvelope, "mac"> | CustodyEnvelope,
@@ -1016,6 +1177,19 @@ async function writeCustodyEnvelopeLocked(
 ): Promise<CustodyEnvelope> {
   lease.assertHeld();
   assertMaster(master);
+  const pendingJournalKey = custodyEnvelopeCommitJournalKey(opts);
+  const pendingJournal = await storage.read("_meta", pendingJournalKey);
+  if (pendingJournal !== null) {
+    await recoverCustodyEnvelopeCommitLocked(
+      storage,
+      pendingJournalKey,
+      lease,
+      {
+        envelopeKey: opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
+        sentinelKey: opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
+      },
+    );
+  }
   const stamped: CustodyEnvelope = {
     v: envelope.v,
     install_mode: envelope.install_mode,
@@ -1027,12 +1201,6 @@ async function writeCustodyEnvelopeLocked(
       : {}),
     mac: computeEnvelopeMac(envelope, master),
   };
-  await storage.write(
-    "_meta",
-    opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
-    stringToBytes(JSON.stringify(stamped))
-  );
-  lease.assertHeld();
   const sentinelKey = derivePurposeKey(master, "custody-sentinel");
   const sentinel = encrypt(
     stringToBytes(CUSTODY_SENTINEL_PLAINTEXT),
@@ -1040,11 +1208,25 @@ async function writeCustodyEnvelopeLocked(
     stringToBytes(CUSTODY_SENTINEL_PLAINTEXT)
   );
   sentinelKey.fill(0);
-  await storage.write(
-    "_meta",
-    opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
-    stringToBytes(JSON.stringify(sentinel))
+  const envelopeKey = opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY;
+  const sentinelTargetKey = opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY;
+  const journalKey = pendingJournalKey;
+  const envelopeBytes = stringToBytes(JSON.stringify(stamped));
+  const sentinelBytes = stringToBytes(JSON.stringify(sentinel));
+  const journal = custodyEnvelopeCommitJournal(
+    envelopeKey,
+    sentinelTargetKey,
+    envelopeBytes,
+    sentinelBytes,
   );
+  await writeMetaDurable(
+    storage,
+    journalKey,
+    stringToBytes(JSON.stringify(journal)),
+  );
+  lease.assertHeld();
+  await state_PREPARED_completeCustodyPair(storage, journal, lease);
+  await storage.delete("_meta", journalKey);
   lease.assertHeld();
   return stamped;
 }
@@ -1083,6 +1265,7 @@ export async function enforceCustodyFloor(
   action: string,
   masterKey: Uint8Array
 ): Promise<void> {
+  await recoverCustodyEnvelopeCommitIfPresent(storage);
   // Anti-rollback Stage 1: a suspected rollback freezes trust-bearing writes at
   // this same chokepoint. Checked FIRST. `isRollbackFrozenWithRecompute` is
   // fail-closed on a tampered freeze marker AND re-derives the verdict from the
@@ -1447,12 +1630,16 @@ async function establishMasterUnderBarrier(
   if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
     throw new CustodyRotationInProgressError();
   }
+  await recoverCustodyEnvelopeCommitIfPresent(opts.storage);
   const existingEnvelope = await readCustodyEnvelope(opts.storage);
   if (existingEnvelope) {
     const unlocked = await unlockEnvelopeReadOnly(existingEnvelope, opts);
     let transferred = false;
     try {
       opts.__testObserveSecretBuffer?.("master", unlocked.masterKey);
+      // A prepared custody-pair record can appear after the first pre-read; the
+      // later snapshot check refuses if recovery advanced the envelope we opened.
+      await recoverCustodyEnvelopeCommitIfPresent(opts.storage);
       const envelopeAfterUnlock = await readCustodyEnvelope(opts.storage);
       if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
         throw new CustodyRotationInProgressError();
@@ -1935,12 +2122,16 @@ export async function unlockExistingMasterReadOnlyWithEnvelope(
   if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
     throw new CustodyRotationInProgressError();
   }
+  await recoverCustodyEnvelopeCommitIfPresent(storage);
   const envelope = await readCustodyEnvelope(storage);
   if (!envelope) throw new CustodyCredentialMissingError(opts.storagePathHint);
 
   const unlocked = await unlockEnvelopeReadOnly(envelope, opts);
   let transferred = false;
   try {
+    // Re-check before sentinel verification so a prepared custody-pair record
+    // that appeared during unwrap is settled instead of reading a half-pair.
+    await recoverCustodyEnvelopeCommitIfPresent(storage);
     await verifyCustodySentinelReadOnly(storage, unlocked.masterKey);
     const envelopeAfterUnlock = await readCustodyEnvelope(storage);
     if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {

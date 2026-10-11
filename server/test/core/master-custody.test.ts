@@ -890,3 +890,167 @@ describe("checkCastlePinCustody", () => {
     }
   });
 });
+
+describe("custody-pair commit schedule", () => {
+  // Must match CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY in ../../src/core/master-custody.ts;
+  // kept local so existing typecheck diagnostic line pins stay fixed.
+  const CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
+    "custody-envelope-commit-journal";
+
+  it("defect.custody-envelope-two-write-crash-refuses-hands-free-boot: completes an interrupted custody pair before read-only unlock", async () => {
+    const storage = new MemoryStorage();
+    const originalWrite = storage.write.bind(storage);
+    let refusedSentinelWrite = false;
+    storage.write = async (namespace, key, value) => {
+      if (
+        namespace === "_meta" &&
+        key === CUSTODY_SENTINEL_KEY &&
+        !refusedSentinelWrite
+      ) {
+        refusedSentinelWrite = true;
+        throw new Error("injected custody pair interruption");
+      }
+      return originalWrite(namespace, key, value);
+    };
+
+    await expect(establishMaster({
+      storage,
+      passphrase: "interrupted-custody-pair-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    })).rejects.toThrow("injected custody pair interruption");
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).not.toBeNull();
+    expect(await storage.read("_meta", CUSTODY_SENTINEL_KEY)).toBeNull();
+
+    const reopened = await establishMaster({
+      storage,
+      passphrase: "interrupted-custody-pair-passphrase",
+    });
+    reopened.masterKey.fill(0);
+
+    const readOnly = await unlockExistingMasterReadOnly(storage, {
+      passphrase: "interrupted-custody-pair-passphrase",
+    });
+    expect(readOnly).toBeInstanceOf(Uint8Array);
+    readOnly.fill(0);
+  });
+
+  it.each([
+    {
+      name: "before the prepared record is durable",
+      failWriteKey: CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      failDeleteKey: null,
+      retryNeedsFirstRun: true,
+    },
+    {
+      name: "after the prepared record is durable",
+      failWriteKey: CUSTODY_ENVELOPE_KEY,
+      failDeleteKey: null,
+      retryNeedsFirstRun: false,
+    },
+    {
+      name: "after the envelope target is durable",
+      failWriteKey: CUSTODY_SENTINEL_KEY,
+      failDeleteKey: null,
+      retryNeedsFirstRun: false,
+    },
+    {
+      name: "after both custody targets are durable",
+      failWriteKey: null,
+      failDeleteKey: CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      retryNeedsFirstRun: false,
+    },
+  ])(
+    "settles custody-pair write schedule: $name",
+    async ({ failWriteKey, failDeleteKey, retryNeedsFirstRun }) => {
+      const storage = new MemoryStorage();
+      const originalWrite = storage.write.bind(storage);
+      const originalDelete = storage.delete.bind(storage);
+      let armed = true;
+      storage.write = async (namespace, key, value) => {
+        if (armed && namespace === "_meta" && key === failWriteKey) {
+          armed = false;
+          throw new Error(`injected custody write schedule: ${key}`);
+        }
+        return originalWrite(namespace, key, value);
+      };
+      storage.delete = async (namespace, key, secureOverwrite) => {
+        if (armed && namespace === "_meta" && key === failDeleteKey) {
+          armed = false;
+          throw new Error(`injected custody cleanup schedule: ${key}`);
+        }
+        return originalDelete(namespace, key, secureOverwrite);
+      };
+
+      await expect(establishMaster({
+        storage,
+        passphrase: "custody-pair-schedule-passphrase",
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+      })).rejects.toThrow(/injected custody .* schedule/);
+
+      const reopened = await establishMaster({
+        storage,
+        passphrase: "custody-pair-schedule-passphrase",
+        ...(retryNeedsFirstRun
+          ? { firstRun: { installMode: "headless" as const, mintRecoveryKey: false } }
+          : {}),
+      });
+      reopened.masterKey.fill(0);
+
+      expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).not.toBeNull();
+      expect(await storage.read("_meta", CUSTODY_SENTINEL_KEY)).not.toBeNull();
+      expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+        .toBeNull();
+      const readOnly = await unlockExistingMasterReadOnly(storage, {
+        passphrase: "custody-pair-schedule-passphrase",
+      });
+      expect(readOnly).toBeInstanceOf(Uint8Array);
+      readOnly.fill(0);
+    },
+  );
+
+  it("settles a custody-pair journal that appears during read-only unlock", async () => {
+    const storage = new MemoryStorage();
+    const originalWrite = storage.write.bind(storage);
+    let refusedSentinelWrite = false;
+    storage.write = async (namespace, key, value) => {
+      if (
+        namespace === "_meta" &&
+        key === CUSTODY_SENTINEL_KEY &&
+        !refusedSentinelWrite
+      ) {
+        refusedSentinelWrite = true;
+        throw new Error("injected custody read schedule");
+      }
+      return originalWrite(namespace, key, value);
+    };
+
+    await expect(establishMaster({
+      storage,
+      passphrase: "custody-read-schedule-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    })).rejects.toThrow("injected custody read schedule");
+    storage.write = originalWrite;
+
+    const originalRead = storage.read.bind(storage);
+    let hidPreparedRecord = false;
+    storage.read = async (namespace, key) => {
+      if (
+        namespace === "_meta" &&
+        key === CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY &&
+        !hidPreparedRecord
+      ) {
+        hidPreparedRecord = true;
+        return null;
+      }
+      return originalRead(namespace, key);
+    };
+
+    const readOnly = await unlockExistingMasterReadOnly(storage, {
+      passphrase: "custody-read-schedule-passphrase",
+    });
+    expect(readOnly).toBeInstanceOf(Uint8Array);
+    readOnly.fill(0);
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .toBeNull();
+  });
+});
