@@ -143,6 +143,7 @@ import type {
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { CustodyUnlockError } from "../core/master-custody.js";
 import {
+  AgentGuidedRecoveryStagingRefusal,
   establishWrapCustody,
   type WrapCustodyCredential,
   type WrapCustodyResult,
@@ -664,6 +665,41 @@ export interface WrapOptions {
    * anything.
    */
   unprotectEgressGate?: boolean;
+}
+
+export class ExplicitLocalIntelligenceRefusal extends Error {
+  readonly exitCode = 1;
+
+  constructor(reason: string) {
+    super(
+      `Sanctuary protect refused: --provision-local-intelligence was explicitly requested, ` +
+        `but local intelligence could not be provisioned (${reason}). The harness remains ` +
+        `wrapped and local surfaces remain DEGRADED. Resolve the named issue and rerun, ` +
+        `or rerun with --no-provision-local-intelligence to accept wrap without local intelligence.`,
+    );
+    this.name = "ExplicitLocalIntelligenceRefusal";
+  }
+}
+
+export function isWrapCliRefusal(
+  err: unknown,
+): err is (ExplicitLocalIntelligenceRefusal | AgentGuidedRecoveryStagingRefusal) {
+  return err instanceof ExplicitLocalIntelligenceRefusal ||
+    err instanceof AgentGuidedRecoveryStagingRefusal;
+}
+
+export function wrapCliRefusalExitCode(
+  err: ExplicitLocalIntelligenceRefusal | AgentGuidedRecoveryStagingRefusal,
+): number {
+  if (typeof process.exitCode === "number" && process.exitCode !== 0) {
+    return process.exitCode;
+  }
+  return err instanceof ExplicitLocalIntelligenceRefusal ? err.exitCode : 1;
+}
+
+interface LocalIntelligenceWrapResult {
+  explicitRefusal?: ExplicitLocalIntelligenceRefusal;
+  unexpectedError?: unknown;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -2521,7 +2557,9 @@ async function maybeRunAutoProvisionForWrap(
 
 /**
  * Run the same additive P1 ceremony used by `sanctuary init`. Any refusal is
- * loud but cannot undo or fail the cooperative wrap that already completed.
+ * loud but cannot undo the cooperative wrap that already completed; explicit
+ * failures are carried back to the caller so cleanup and terminal reporting
+ * finish before the caller chooses the final exit.
  */
 async function maybeRunLocalIntelligenceForWrap(
   storage: FilesystemStorage,
@@ -2530,7 +2568,7 @@ async function maybeRunLocalIntelligenceForWrap(
   identityId: string,
   options: WrapOptions,
   deps: RunWrapDeps,
-): Promise<void> {
+): Promise<LocalIntelligenceWrapResult> {
   try {
     const runner = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
     const outcome = await runner({
@@ -2556,6 +2594,17 @@ async function maybeRunLocalIntelligenceForWrap(
     } else if (outcome.kind === "refused") {
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+      // An explicit positive request is part of the operator's desired end
+      // state; continuing with exit 0 would make scripts treat that refused
+      // state as a completed local-intelligence setup.
+      if (
+        options.provisionLocalIntelligence === true &&
+        outcome.reason !== "declined"
+      ) {
+        return {
+          explicitRefusal: new ExplicitLocalIntelligenceRefusal(outcome.reason),
+        };
+      }
     }
   } catch (err) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
@@ -2563,7 +2612,51 @@ async function maybeRunLocalIntelligenceForWrap(
       `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
         `the harness remains wrapped and local surfaces remain DEGRADED.`,
     );
+    // Unexpected ceremony failures are crashes, not operator refusals. Keeping
+    // the original error preserves the stack and avoids relabeling a defect as
+    // an actionable local-intelligence decline.
+    if (options.provisionLocalIntelligence === true) {
+      return { unexpectedError: err };
+    }
   }
+  return {};
+}
+
+async function flushBeforeDeferredLocalIntelligenceExit(
+  auditLog: AuditLog | undefined,
+  result: LocalIntelligenceWrapResult,
+): Promise<void> {
+  if (!auditLog || (!result.explicitRefusal && result.unexpectedError === undefined)) {
+    return;
+  }
+  try {
+    await auditLog.flush();
+  } catch (err) {
+    if (result.unexpectedError === undefined) {
+      // The explicit refusal remains the exit cause; a late audit flush error
+      // is reported but cannot replace the operator-actionable remedy.
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `  WARNING: audit log flush before local-intelligence refusal exit failed ` +
+          `(${err instanceof Error ? err.message : String(err)}).`,
+      );
+      return;
+    }
+    // The setup error remains the crash cause; replacing it with a late flush
+    // error would hide the original stack the operator and tests need.
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `  WARNING: audit log flush before local-intelligence crash exit failed ` +
+        `(${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
+}
+
+function throwDeferredLocalIntelligenceExit(
+  result: LocalIntelligenceWrapResult,
+): never {
+  if (result.explicitRefusal) throw result.explicitRefusal;
+  throw result.unexpectedError;
 }
 
 async function exitAfterDeferredAutoProvisionSignal(
@@ -4088,28 +4181,31 @@ export async function runWrap(
     // confirmed `castle-wall re-pin` verb can. Do not re-add a machine-wide
     // write here.
     //
-    // provision-pin runs as a child with its OWN credential chain, which reads
-    // only these two env vars plus the fortress's stored passphrase. Hand it
-    // whichever credential this run actually used; when the fortress was opened
-    // by its OS-keyring custody factor there is nothing to hand over, and the
-    // child's own refusal ("no stored passphrase exists for this fortress")
-    // surfaces as the non-fatal note below rather than being papered over.
-    const pinCredentialEnv: NodeJS.ProcessEnv =
-      protectCredential.credential.kind === "passphrase"
-        ? { SANCTUARY_PASSPHRASE: protectCredential.credential.value }
-        : protectCredential.credential.kind === "recovery-key"
-          ? { SANCTUARY_RECOVERY_KEY: protectCredential.credential.value }
-          : {};
+    // INVARIANT (credential custody): pin bootstrap receives the already
+    // authenticated master over the internal call seam, never through argv or
+    // env-shaped fields that process-inspection tools can read.
+    const {
+      SANCTUARY_PASSPHRASE: _pinParentPassphrase,
+      SANCTUARY_RECOVERY_KEY: _pinParentRecoveryKey,
+      ...pinBaseEnv
+    } = process.env;
     try {
-      const pinResult = await runProvisionPin([], {
-        out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        env: {
-          ...process.env,
-          SANCTUARY_STORAGE_PATH: storagePath,
-          ...pinCredentialEnv,
-        },
-      });
+      const handoffMasterKey = wrapCustody.masterKey.slice();
+      const pinResult = await (async () => {
+        try {
+          return await runProvisionPin([], {
+            out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            env: {
+              ...pinBaseEnv,
+              SANCTUARY_STORAGE_PATH: storagePath,
+            },
+            __resolvedProvisionMasterKey: handoffMasterKey,
+          });
+        } finally {
+          handoffMasterKey.fill(0);
+        }
+      })();
       if (pinResult !== 0) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
@@ -4983,8 +5079,9 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
+    let ndLocalIntelligenceResult: LocalIntelligenceWrapResult = {};
     if (ndAuditStorage && ndAuditMasterKey && ndAuditLog) {
-      await maybeRunLocalIntelligenceForWrap(
+      ndLocalIntelligenceResult = await maybeRunLocalIntelligenceForWrap(
         ndAuditStorage,
         ndAuditMasterKey,
         ndAuditLog,
@@ -5044,6 +5141,16 @@ export async function runWrap(
         `  WARNING: the transient Castle Wall daemon could not be stopped before --no-dashboard exit ` +
           `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
       );
+    }
+    if (
+      ndLocalIntelligenceResult.explicitRefusal ||
+      ndLocalIntelligenceResult.unexpectedError !== undefined
+    ) {
+      await flushBeforeDeferredLocalIntelligenceExit(
+        ndAuditLog,
+        ndLocalIntelligenceResult,
+      );
+      throwDeferredLocalIntelligenceExit(ndLocalIntelligenceResult);
     }
     return;
   }
@@ -5259,8 +5366,9 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
+  let wrapLocalIntelligenceResult: LocalIntelligenceWrapResult = {};
   if (wrapAuditStorage && wrapAuditMasterKey && wrapAuditLog) {
-    await maybeRunLocalIntelligenceForWrap(
+    wrapLocalIntelligenceResult = await maybeRunLocalIntelligenceForWrap(
       wrapAuditStorage,
       wrapAuditMasterKey,
       wrapAuditLog,
@@ -5325,7 +5433,15 @@ export async function runWrap(
   // boot path is now the single production writer/clearer of runtime.json,
   // so the race is resolved by construction (asserted in
   // test/wrap/protect-ensure-dashboard.test.ts).
-  const dashboardUrl = ensuredDashboard?.url;
+  const deferredLocalIntelligenceExit =
+    wrapLocalIntelligenceResult.explicitRefusal !== undefined ||
+    wrapLocalIntelligenceResult.unexpectedError !== undefined;
+  // A reused dashboard is owned by another live process; the deferred exit
+  // stops only the dashboard this run started, so keep the reusable URL honest.
+  const dashboardUrl =
+    deferredLocalIntelligenceExit && ensuredDashboard?.reused !== true
+      ? undefined
+      : ensuredDashboard?.url;
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -5371,6 +5487,22 @@ export async function runWrap(
     // terminal-final success surface, not only the mid-flow warning.
     pinnedVersionResolvability: pinResolvability,
   });
+  if (deferredLocalIntelligenceExit) {
+    try {
+      await stopTransientCastleWallDaemonForAutoProvision();
+    } catch (err) {
+      // SAFETY: a lingering transient daemon keeps the fortress socket held and blocks the sudo retry.
+      console.error(
+        `  WARNING: the transient Castle Wall daemon could not be stopped before refusal exit ` +
+          `(${(err as Error).message}). Stop the holding process before retrying the sudo protect command.`,
+      );
+    }
+    await flushBeforeDeferredLocalIntelligenceExit(
+      wrapAuditLog,
+      wrapLocalIntelligenceResult,
+    );
+    throwDeferredLocalIntelligenceExit(wrapLocalIntelligenceResult);
+  }
 }
 
 // ── Dashboard-fold PR-4: ensure-and-reuse the ONE main dashboard ─────

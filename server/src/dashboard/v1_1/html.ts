@@ -1672,9 +1672,9 @@ export function renderDashboardV11Html(
         -->
         <div class="pills" id="sidebar-pills">
           <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
-          <span class="pill" data-pill="deployment">deployment: local</span>
-          <span class="pill" data-pill="mode">mode: solo</span>
-          <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
+          <span class="pill" data-pill="deployment">deployment: unavailable</span>
+          <span class="pill" data-pill="mode">mode: unavailable</span>
+          <span class="pill" data-pill="attestation">attestation: unavailable</span>
         </div>
       </div>
     </aside>
