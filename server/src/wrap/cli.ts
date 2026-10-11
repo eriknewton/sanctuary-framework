@@ -2661,8 +2661,12 @@ function throwDeferredLocalIntelligenceExit(
   throw result.unexpectedError?.value;
 }
 
+// 160 = two 80-column terminal lines: enough to identify a non-Error rejection in an operator
+// warning without letting an arbitrary value flood stderr.
 const DAEMON_STOP_REASON_MAX_CHARS = 160;
 
+// A stop() rejection may be any value; formatting it must never throw, because a throw here would
+// skip the deferred exit rethrow that follows the warning and turn a refusal into a different failure.
 function formatDaemonStopErrorReason(err: unknown): string {
   if (err instanceof Error) return err.message;
   try {
