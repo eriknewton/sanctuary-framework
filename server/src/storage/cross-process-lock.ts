@@ -379,7 +379,13 @@ export interface MasterWriteBarrierOptions {
   retryMs?: number;
   /** TEST ONLY: observe the shared reader socket after it is fully admitted. */
   __testAfterSharedSocketAcquired?: (path: string) => void;
-  /** TEST ONLY: observe a shared acquirer waiting behind an exclusive gate. */
+  /**
+   * TEST ONLY: observe a shared acquirer waiting behind an exclusive gate, so a
+   * lock-order test can prove the wait happened instead of sleeping. It is
+   * observation only: it runs before the timeout check, so it must settle
+   * promptly and must not throw. When unset, the acquire loop does no extra
+   * await.
+   */
   __testAfterSharedBarrierContention?: () => void | Promise<void>;
   /**
    * TEST ONLY: observe the exclusive gate after it is live.
@@ -994,10 +1000,11 @@ export async function acquireMasterWriteBarrier(
   if (coordinates === null) return inertMasterWriteBarrierLease();
   const timeoutMs = options.timeoutMs ?? CROSS_PROCESS_LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS;
+  const afterContention = options.__testAfterSharedBarrierContention;
   const started = Date.now();
   for (;;) {
     if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
-      await options.__testAfterSharedBarrierContention?.();
+      if (afterContention !== undefined) await afterContention();
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `master rotation barrier remained exclusive for ${timeoutMs}ms`,
@@ -1044,7 +1051,7 @@ export async function acquireMasterWriteBarrier(
       if (!(await exclusiveMasterBarrierIsAbsent(coordinates))) {
         await releaseKernelLock(acquired, options.__testReleaseTimeoutMs);
         acquired = undefined;
-        await options.__testAfterSharedBarrierContention?.();
+        if (afterContention !== undefined) await afterContention();
         if (Date.now() - started >= timeoutMs) {
           throw new CrossProcessLockError(
             `master rotation barrier remained exclusive for ${timeoutMs}ms`,
