@@ -22,6 +22,10 @@
  *   - A supplied-but-empty `stateNamespaces` array is rejected at the exporter
  *     boundary, so the ambiguous shape cannot be re-introduced by a future
  *     caller rather than merely being unused today.
+ *   - Discovery refusals happen before the bundle directory or export audit
+ *     entry exists, and the CLI prints only the neutral refusal.
+ *   - An absent state root is still a valid empty fortress: discovery returns
+ *     zero namespaces and the export completes as a zero-state bundle.
  *
  * Test discipline: real FilesystemStorage, real Argon2id derivation, real
  * Ed25519 identity, real state writes through the L1 tools. No mocks. Each
@@ -38,7 +42,7 @@
 // change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -425,6 +429,7 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     cleanup.push(parent);
     const bundleDir = join(parent, "bundle");
 
+    const beforeOps = await fortress.readAuditOperations();
     await chmod(stateStoragePath, 0o000);
     try {
       await expect(
@@ -445,12 +450,80 @@ describe("sanctuary exit export: state-namespace resolution", () => {
         name: "ExitNamespaceDiscoveryError",
         code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
       });
-      await expect(readFile(join(bundleDir, "manifest.json"))).rejects.toMatchObject({
+      await expect(stat(bundleDir)).rejects.toMatchObject({
         code: "ENOENT",
       });
+      await chmod(stateStoragePath, 0o700);
+      const afterOps = await fortress.readAuditOperations();
+      expect(afterOps.filter((op) => op === "exit_bundle_export")).toHaveLength(
+        beforeOps.filter((op) => op === "exit_bundle_export").length,
+      );
     } finally {
       await chmod(stateStoragePath, 0o700);
     }
+  });
+
+  it("prints the neutral namespace-discovery refusal through the CLI", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      console.warn("skipping mode-000 namespace enumeration check while running as root");
+      return;
+    }
+    const fortress = await seededFortress();
+    const blockedNamespacePath = join(fortress.stateStoragePath, "agent-memory");
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-cli-refusal-"));
+    cleanup.push(bundleDir);
+    process.env.SANCTUARY_STORAGE_PATH = fortress.storagePath;
+
+    await chmod(blockedNamespacePath, 0o000);
+    try {
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        argv: ["export", "--out", bundleDir, "--yes"],
+        out,
+        err,
+        env: { SANCTUARY_PASSPHRASE: TEST_PASSPHRASE },
+      });
+
+      expect(code).toBe(1);
+      expect(out.text).toBe("");
+      expect(err.text).toContain(
+        "exit-bundle: namespace discovery failed; export refused before writing bundle artifacts.",
+      );
+      expect(err.text).not.toContain(fortress.stateStoragePath);
+      expect(err.text).not.toContain(blockedNamespacePath);
+      expect(err.text).not.toContain("EACCES");
+      expect(err.text.toLowerCase()).not.toContain("permission denied");
+    } finally {
+      await chmod(blockedNamespacePath, 0o700);
+    }
+  });
+
+  it("exports an absent state root as a zero-state bundle", async () => {
+    const fortress = await bootstrapFortress();
+    cleanup.push(fortress.storagePath);
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-missing-root-"));
+    cleanup.push(bundleDir);
+    await rm(fortress.stateStoragePath, { recursive: true, force: true });
+    const auditLog = new AuditLog(fortress.storage, fortress.masterKey);
+
+    const result = await exportExitBundle({
+      unpartitionedLegacyExport: true,
+      bundleDir,
+      storage: fortress.storage,
+      masterKey: fortress.masterKey,
+      identityManager: fortress.identityManager,
+      auditLog,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateStoragePath: fortress.stateStoragePath,
+      keySource: "passphrase",
+    });
+
+    expect(result.state_entry_count).toBe(0);
+    const state = await readEncryptedState(bundleDir);
+    expect(state.total_keys).toBe(0);
+    expect(state.namespaces).toEqual([]);
   });
 
   it("exports the same namespace set that the storage layer enumerates", async () => {
@@ -597,9 +670,11 @@ describe("exportExitBundle: storage namespace enumeration failures refuse export
         name: "ExitNamespaceDiscoveryError",
         code: "EXIT_NAMESPACE_DISCOVERY_FAILED",
       });
-      await expect(readFile(join(bundleDir, "manifest.json"))).rejects.toMatchObject({
+      await expect(stat(bundleDir)).rejects.toMatchObject({
         code: "ENOENT",
       });
+      const { entries } = await auditLog.query({ limit: 500 });
+      expect(entries.map((entry) => entry.operation)).not.toContain("exit_bundle_export");
     } finally {
       await rm(parent, { recursive: true, force: true });
     }

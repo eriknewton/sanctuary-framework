@@ -402,6 +402,12 @@ export interface ExportExitBundleOptions {
   policy: PrincipalPolicy;
   config?: SanctuaryConfig;
   reputationStore?: ReputationStore;
+  /**
+   * Legacy provenance flag for zero-state audit metadata only. Full-fortress
+   * export discovery uses `storage.listNamespaces()` whether this is supplied
+   * or omitted, and that enumeration returns namespaces holding at least one
+   * entry; empty namespace directories are not exported.
+   */
   stateStoragePath?: string;
   /**
    * Restrict the encrypted-state export to these namespaces. OMIT the option
@@ -954,8 +960,8 @@ async function resolveExportStateNamespaces(
   try {
     // Must match StorageBackend.listNamespaces in storage/interface.ts: this is
     // the one namespace definition for full-fortress export. Continuing paths:
-    // empty-but-present and missing storage roots return []; unreadable roots,
-    // over-budget walks, and per-entry metadata failures are typed refusals.
+    // empty-present roots and missing roots return []; unreadable roots,
+    // over-bound walks, and per-entry failures are typed refusals.
     return await opts.storage.listNamespaces();
   } catch (error) {
     throw new ExitNamespaceDiscoveryError(error);
