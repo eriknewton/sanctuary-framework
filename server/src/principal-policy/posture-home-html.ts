@@ -957,7 +957,11 @@ export function renderPostureHomeHTML(): string {
   }
 
   function renderBanner(home, approvalState, anomalies) {
-    var openAnomalies = (anomalies && anomalies.length) || 0;
+    var anomalyReadUnavailable = !anomalies || anomalies.status !== "available";
+    var anomalyFindings = anomalyReadUnavailable ? [] : anomalies.findings;
+    var openAnomalies = anomalyReadUnavailable
+      ? '<span class="pill amber">UNAVAILABLE</span>'
+      : anomalyFindings.length;
     // See approvalsWaitingValue: LOCKED, never a confident 0, when the
     // approval-queue read was denied.
     var pendingCount = approvalsWaitingValue(approvalState);
@@ -1427,6 +1431,15 @@ export function renderPostureHomeHTML(): string {
 
   function renderAnomalies(findings) {
     var el = document.getElementById("anomalies");
+    if (!findings || findings.status !== "available") {
+      // Detector silence is not evidence of zero findings; the amber state
+      // keeps a missing producer visually distinct from the verified empty path.
+      el.innerHTML =
+        '<div class="story-line"><span class="pill amber">unavailable</span> ' +
+        "Anomaly detector unavailable. Open findings could not be checked.</div>";
+      return;
+    }
+    findings = findings.findings;
     if (!findings || !findings.length) {
       // S3 quiet empty state: earned calm. This is the DETECTOR-ANSWERED empty
       // case only. The separate "detector did not respond" path elsewhere on
@@ -1778,10 +1791,20 @@ export function renderPostureHomeHTML(): string {
 
   // ── Auxiliary fetches (pending approvals + anomaly findings) ────────────
   // Not carried on the home payload, so refreshed alongside each home frame.
-  // Failures degrade to empty (never block the home render); these are honest
-  // empties, not green claims.
+  // Failures never block the home render, but each producer keeps its own
+  // unavailable state so an unread source cannot borrow a verified-empty look.
   var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none", locked: false };
-  var lastFindings = [];
+  var lastFindings = { status: "unread", findings: [] };
+  function normalizeAnomalyRead(body) {
+    if (body && body.status === "unavailable") return body;
+    // Must match anomaly-routes.ts GET /api/anomaly/findings: only the
+    // route's explicit envelope earns the verified-empty/verified-open state.
+    // Any other shape is an unread producer, not evidence of zero findings.
+    if (body && body.data && Array.isArray(body.data.findings)) {
+      return { status: "available", findings: body.data.findings };
+    }
+    return { status: "unavailable", findings: [] };
+  }
   function refreshAuxiliary() {
     // BOTH approval reads require an operator credential; loopback position is
     // not one, because anything else running on this machine holds it too. A
@@ -1809,10 +1832,12 @@ export function renderPostureHomeHTML(): string {
         return { data: { entries: [] } };
       }),
       api("/api/status").catch(function () { return null; }),
-      api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
+      api("/api/anomaly/findings").catch(function () {
+        return { status: "unavailable", findings: [] };
+      }),
     ]).then(function (rest) {
       lastApprovals = buildApprovalState(rest[0], rest[1], rest[2], approvalsDenied);
-      lastFindings = rest[3].findings || rest[3] || [];
+      lastFindings = normalizeAnomalyRead(rest[3]);
     });
   }
 
