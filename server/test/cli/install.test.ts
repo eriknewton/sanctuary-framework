@@ -1,3 +1,4 @@
+// fail-before-exempt: this change pins existing planner behavior and changes no server/src code path (the only source edit is an invariant comment), so the new darwin gate-order ladder and non-darwin re-pin tests pass on pre-change source by construction. Their witness is a mutation run: hoisting the re-pin arm above the darwin gates, or above only the operator-twin gate, fails them.
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -1528,6 +1529,230 @@ describe("sanctuary install agent contract", () => {
     expect(notYetWalled.next_action?.id).toBe("repin_trust_anchor");
     expect(notYetWalled.status).not.toBe("complete");
   });
+
+  // Gate-order pin for the darwin full profile. Must match the order of the
+  // early returns in buildAgentInstallPlan in server/src/cli/install.ts, where
+  // the re-pin arm carries the matching "DARWIN-ONLY BY CONSTRUCTION" comment.
+  // Re-pin is reachable only after EVERY macOS full-profile safety gate has
+  // passed; a planner that names re-pin earlier would, for a non-sealed
+  // runtime, build the re-pin argv around a global or PATH-resolved CLI that
+  // the sealed-launcher refusal exists to reject.
+  //
+  // The ladder starts with every gate failing at once and the re-pin
+  // predicate already true, then repairs one gate per rung. Each rung records
+  // which gate answered, so the assertion is the FULL ordered list of gates,
+  // not merely "the first answer is not re-pin": dropping, duplicating, or
+  // reordering any gate (including hoisting re-pin to any position) changes
+  // the recorded sequence.
+  type DarwinGateRung = {
+    gate: string;
+    answered: (plan: AgentInstallPlan) => boolean;
+    repair: (state: { harness: "hermes" | "claude-code"; observed: InstallProbeResult }) => void;
+  };
+  const noteMatches = (plan: AgentInstallPlan, fragment: string): boolean =>
+    plan.next_action === null && plan.notes.some((note) => note.includes(fragment));
+  const actionIs = (plan: AgentInstallPlan, id: string): boolean => plan.next_action?.id === id;
+  const VALID_CASTLE_WALL_BUILD_SHA = "a61a7322ca80";
+  const DARWIN_FULL_PROFILE_GATE_ORDER: DarwinGateRung[] = [
+    {
+      gate: "sealed_launcher_required",
+      answered: (plan) => noteMatches(plan, "requires the verified signed launcher"),
+      repair: (state) => {
+        state.observed.persistentCliPath = DEFAULT_CASTLE_WALL_LAUNCHER;
+        state.observed.nodePath = DEFAULT_CASTLE_WALL_LAUNCHER;
+      },
+    },
+    {
+      gate: "hermes_harness_required",
+      answered: (plan) => noteMatches(plan, "supports Hermes only"),
+      repair: (state) => {
+        state.harness = "hermes";
+      },
+    },
+    {
+      gate: "first_custody_ceremony",
+      answered: (plan) => actionIs(plan, "prepare_local_keychain_session"),
+      repair: (state) => {
+        state.observed.existingCustody = "present";
+      },
+    },
+    {
+      gate: "cooperative_surface_first",
+      answered: (plan) => actionIs(plan, "install_cooperative_surface"),
+      repair: (state) => {
+        state.observed.cooperativeWrap = "present";
+      },
+    },
+    {
+      gate: "castle_wall_app_absent",
+      answered: (plan) => noteMatches(plan, "must be verified and installed"),
+      repair: (state) => {
+        state.observed.castleWallApp = "unknown";
+      },
+    },
+    {
+      gate: "castle_wall_app_unknown",
+      answered: (plan) => noteMatches(plan, "could not inspect"),
+      repair: (state) => {
+        state.observed.castleWallApp = "mismatch";
+      },
+    },
+    {
+      gate: "castle_wall_app_mismatch",
+      answered: (plan) => noteMatches(plan, "failed signature, Gatekeeper"),
+      repair: (state) => {
+        state.observed.castleWallApp = "present";
+        // Still failing the same gate on its second term: no build identity.
+        state.observed.castleWallBuildSha = null;
+      },
+    },
+    {
+      gate: "castle_wall_build_identity_missing",
+      answered: (plan) => noteMatches(plan, "failed signature, Gatekeeper"),
+      repair: (state) => {
+        state.observed.castleWallBuildSha = VALID_CASTLE_WALL_BUILD_SHA;
+      },
+    },
+    {
+      gate: "system_extension_approval",
+      answered: (plan) => actionIs(plan, "approve_macos_enforcement"),
+      repair: (state) => {
+        state.observed.systemExtension = "unknown";
+      },
+    },
+    {
+      gate: "system_extension_unknown",
+      answered: (plan) => noteMatches(plan, "system-extension probe failed"),
+      repair: (state) => {
+        state.observed.systemExtension = "[activated enabled]";
+      },
+    },
+    {
+      gate: "operator_twin_present",
+      answered: (plan) => noteMatches(plan, "operator-side Hermes twin is present"),
+      repair: (state) => {
+        state.observed.operatorTwin = "unknown";
+      },
+    },
+    {
+      gate: "operator_twin_unknown",
+      answered: (plan) => noteMatches(plan, "twin probe is unknown"),
+      repair: (state) => {
+        state.observed.operatorTwin = "absent";
+      },
+    },
+    {
+      gate: "repin_trust_anchor",
+      answered: (plan) => actionIs(plan, "repin_trust_anchor"),
+      repair: () => {},
+    },
+  ];
+  const EXPECTED_DARWIN_GATE_SEQUENCE = DARWIN_FULL_PROFILE_GATE_ORDER.map((rung) => rung.gate);
+
+  function walkDarwinGateLadder(
+    anchor: Pick<InstallProbeResult, "trustAnchor" | "vaultProvision">,
+  ): { sequence: string[]; finalPlan: AgentInstallPlan } {
+    const state: { harness: "hermes" | "claude-code"; observed: InstallProbeResult } = {
+      harness: "claude-code",
+      observed: fullObserved({
+        // Every darwin full-profile gate fails at the start of the ladder.
+        persistentCliPath: "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+        nodePath: "/opt/homebrew/bin/node",
+        existingCustody: "absent",
+        cooperativeWrap: "absent",
+        castleWallApp: "absent",
+        castleWallBuildSha: VALID_CASTLE_WALL_BUILD_SHA,
+        systemExtension: "not loaded",
+        operatorTwin: "present",
+        bootService: "mismatch",
+        contentFilter: "disabled",
+        enforcement: "unavailable",
+        ...anchor,
+      }),
+    };
+    const sequence: string[] = [];
+    let finalPlan: AgentInstallPlan | undefined;
+    for (const _rung of DARWIN_FULL_PROFILE_GATE_ORDER) {
+      const plan = buildAgentInstallPlan({
+        profile: "full",
+        harness: state.harness,
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: { ...state.observed },
+      });
+      // Exactly one gate signature may match each plan; an ambiguous match
+      // would let a reordered planner pass by accident.
+      const matching = DARWIN_FULL_PROFILE_GATE_ORDER.filter((candidate) => candidate.answered(plan));
+      const answeringGate =
+        matching.length === 0
+          ? `unrecognized:${plan.next_action?.id ?? plan.notes.join(" | ")}`
+          : matching.find((candidate) => candidate.gate === EXPECTED_DARWIN_GATE_SEQUENCE[sequence.length])
+            ?.gate ?? matching[0].gate;
+      sequence.push(answeringGate);
+      finalPlan = plan;
+      // Repair the gate that ACTUALLY answered, so the next rung exposes the
+      // next gate in the planner's real order rather than the expected one.
+      DARWIN_FULL_PROFILE_GATE_ORDER.find((candidate) => candidate.gate === answeringGate)?.repair(state);
+    }
+    return { sequence, finalPlan: finalPlan as AgentInstallPlan };
+  }
+
+  it.each([
+    ["a broken trust anchor", { trustAnchor: "broken", vaultProvision: "walled" }],
+    ["no trust anchor yet", { trustAnchor: "unprovisioned", vaultProvision: "walled" }],
+    ["a vault not yet on the wall", { trustAnchor: "unknown", vaultProvision: "not-yet-walled" }],
+  ] as const)(
+    "keeps every darwin full-profile gate ahead of re-pin, in order, for %s",
+    (_label, anchor) => {
+      const { sequence, finalPlan } = walkDarwinGateLadder(anchor);
+      expect(sequence).toEqual(EXPECTED_DARWIN_GATE_SEQUENCE);
+      // Re-pin is reached only once the runtime is the sealed launcher, so its
+      // argv never carries a global or PATH-resolved CLI path.
+      expect(finalPlan.next_action?.argv ?? []).not.toContain(
+        "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+      );
+      // The darwin re-pin wording is the macOS wording, byte for byte.
+      expect(finalPlan.next_action?.description).toBe(
+        "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.",
+      );
+    },
+  );
+
+  it.each(["linux", "win32", "freebsd"] as const)(
+    "never names re-pin, or any macOS re-pin wording, for a %s full-profile plan",
+    (platform) => {
+      // The shipped probe reports the anchor and vault claim `not-applicable`
+      // off darwin; these synthetic readings go further and set every re-pin
+      // trigger anyway, to show the non-darwin stop precedes the re-pin arm.
+      for (const anchor of [
+        { trustAnchor: "broken", vaultProvision: "walled" },
+        { trustAnchor: "unprovisioned", vaultProvision: "walled" },
+        { trustAnchor: "unknown", vaultProvision: "not-yet-walled" },
+      ] as const) {
+        const plan = buildAgentInstallPlan({
+          profile: "full",
+          harness: "hermes",
+          fortress: "/tmp/fortress",
+          platform,
+          observed: fullObserved({
+            cooperativeWrap: "present",
+            systemExtension: "not-applicable",
+            bootService: "mismatch",
+            contentFilter: "not-applicable",
+            enforcement: "unavailable",
+            ...anchor,
+          }),
+        });
+        const rendered = JSON.stringify(plan);
+        expect(plan.status).toBe("blocked");
+        expect(plan.next_action).toBeNull();
+        expect(plan.notes).toContain("The full profile has no shipped live-enforcement path on this platform.");
+        expect(rendered).not.toContain("repin_trust_anchor");
+        expect(rendered).not.toContain("this Mac");
+        expect(rendered).not.toContain("macOS restart it");
+      }
+    },
+  );
 
   it("stops naming re-pin once the anchor is consistent, so the operator is not sent round the same command", () => {
     // THE LOOP THIS CLOSES: `re-pin` is idempotent. On an anchor that already

@@ -2089,6 +2089,19 @@ export function buildAgentInstallPlan(input: {
   // rerun of an already-re-pinned, not-yet-armed host: the operator runs the
   // command, the anchor is consistent, the vault is still not on the wall, and
   // the next plan asks for the same command again.
+  //
+  // DARWIN-ONLY BY CONSTRUCTION, and LAST among the gates: this arm is reached
+  // only after the non-darwin stop above and after every macOS full-profile
+  // gate (sealed launcher, Hermes harness, first custody, cooperative surface,
+  // signed app and build identity, system extension, operator twin). That is
+  // why the description below says "this Mac", "macOS" and "Terminal": no
+  // other platform can render it (the shipped probe also reports the anchor
+  // and vault claim `not-applicable` off darwin), so it needs no non-darwin
+  // wording branch. Hoisting this arm above any of those gates is a behavior
+  // change, not a wording change: for a non-sealed runtime the argv below
+  // would carry a global or PATH-resolved CLI that the sealed-launcher refusal
+  // exists to reject. Must match the gate ladder pinned by "keeps every darwin
+  // full-profile gate ahead of re-pin" in server/test/cli/install.test.ts.
   const trustAnchorNeedsRepin =
     input.observed.trustAnchor === "broken" ||
     input.observed.trustAnchor === "unprovisioned" ||
