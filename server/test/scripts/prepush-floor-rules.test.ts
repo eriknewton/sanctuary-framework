@@ -97,8 +97,9 @@ function git(args: string[], cwd: string, env = gitEnv()): string {
  * end-to-end without a real vitest install.
  */
 function buildRepo(opts: {
-  baselineMain: number;
-  baselineHead: number;
+  // A string carries a count past Number.MAX_SAFE_INTEGER exactly.
+  baselineMain: number | string;
+  baselineHead: number | string;
 }): { repoDir: string; originDir: string; mainSha: string; headSha: string } {
   const tmpRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "sanctuary-prepush-fixture-"),
@@ -421,6 +422,97 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
     expect(stderr).toContain("count-shaped matches");
     expect(stderr).toContain("expected exactly one");
     expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
+  // 2^64 + 50 and 2^64 + 5: 20-digit floors that signed 64-bit bash
+  // arithmetic wraps to 50 and 5. The hook compares counts as digit strings
+  // through the shared compare_counts, so neither wraps.
+  const FLOOR_WRAPS_TO_50 = "18446744073709551666";
+  const FLOOR_WRAPS_TO_5 = "18446744073709551621";
+
+  it("(xiv) a 7-digit passing count equal to a 7-digit floor allows the push", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 1234567,
+      baselineHead: 1234567,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD: ACCEPTED_TEST_STUB.replace(
+        "Tests  50 passed (50)",
+        "Tests  1234567 passed (1234567)",
+      ),
+    });
+
+    expect(stderr).toContain("1234567 tests passed (baseline: 1234567)");
+    expect(stderr).toContain("All baseline-guard checks passed");
+    expect(status).toBe(0);
+  });
+
+  it("(xv) a passing count below a 20-digit floor is a regression, never a wrapped pass", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: FLOOR_WRAPS_TO_50,
+      baselineHead: FLOOR_WRAPS_TO_50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("TEST BASELINE REGRESSION");
+    expect(stderr).toContain("(too long to subtract exactly)");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
+  it("(xvi) lowering a 20-digit previous floor is refused, never a wrapped pass", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: FLOOR_WRAPS_TO_5,
+      baselineHead: 10,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("PUSHED .test-baseline IS BELOW THE PREVIOUS FLOOR");
+  });
+
+  // The floor file's raw bytes are validated, never whitespace-stripped first:
+  // stripping would join these into a valid-looking floor nobody wrote.
+  it.each([
+    ["(xvii) an embedded newline", "123\n4567"],
+    ["(xviii) an embedded space", "123 4567"],
+    ["(xix) CRLF", "50\r"],
+  ])("%s in the pushed .test-baseline blocks the push", (_label, rawFloor) => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 50,
+      baselineHead: rawFloor,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("is not a single canonical integer");
+    expect(stderr).not.toContain("All baseline-guard checks passed");
+  });
+
+  it("(xx) a CRLF previous floor is refused as unreadable, never normalized", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: "50\r",
+      baselineHead: 50,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin);
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(".test-baseline is unreadable");
   });
 
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {

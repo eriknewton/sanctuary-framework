@@ -97,7 +97,7 @@ import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.
 // The vault-level wall claim written by wrap/init.ts. Wrap reads it and never
 // writes it.
 import {
-  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  castleWallNotYetWalledSentence,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
 import {
@@ -210,6 +210,7 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { stripTrailingSlashes } from "../strings.js";
+import { argvTokenForDisplay } from "../cli/argv.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -4127,7 +4128,7 @@ export async function runWrap(
       if (vaultProvision.state === "not-yet-walled") {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `\n  Sanctuary wrap: ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}`
+          `\n  Sanctuary wrap: ${castleWallNotYetWalledSentence(platform())}`
         );
       }
     } catch (err) {
@@ -6773,7 +6774,7 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
     // Reject unknown flags
     if (!WRAP_BOOLEAN_FLAGS.has(arg) && !WRAP_VALUE_FLAGS.has(arg)) {
       throw new Error(
-        `Unrecognized flag '${arg}'. Run 'sanctuary wrap --help' for valid flags.`,
+        `Unrecognized flag '${argvTokenForDisplay(arg)}'. Run 'sanctuary wrap --help' for valid flags.`,
       );
     }
 

@@ -1,3 +1,4 @@
+// fail-before-exempt: race-condition test fix whose old form was intermittently green.
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -14,6 +15,28 @@ import { rotateMaster } from "../../src/core/master-rotation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const supported = process.platform === "darwin" || process.platform === "linux";
+const CHILD_RELEASE_EVENT_TIMEOUT_MS = 2_000;
+const BARRIER_RETRY_MS = 1_000;
+// 250 = BARRIER_RETRY_MS / 4, long enough for one live-reader probe to block.
+const DRAIN_BLOCK_PROBE_MS = BARRIER_RETRY_MS / 4;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", () => {
   const cleanup: string[] = [];
@@ -22,13 +45,20 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
   // here so a failing assertion or timeout before that point cannot strand
   // a live writer holding the fortress lock past the test.
   const children: ChildProcess[] = [];
+  const rotations: Promise<unknown>[] = [];
 
   afterEach(async () => {
-    for (const child of children.splice(0)) {
+    const spawned = children.splice(0);
+    for (const child of spawned) {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
       }
     }
+    await Promise.all(spawned.map((child) =>
+      child.exitCode !== null || child.signalCode !== null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => child.once("close", () => resolve()))));
+    await Promise.allSettled(rotations.splice(0));
     await Promise.all(cleanup.splice(0).map((path) =>
       rm(path, { recursive: true, force: true })));
   });
@@ -68,21 +98,43 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     children.push(writer);
+    const writerClosed = deferred<number | null>();
+    writer.once("error", writerClosed.reject);
+    writer.once("close", writerClosed.resolve);
+
+    const eventOrder: Array<"writer-final-write" | "conversion"> = [];
+    const writerReady = deferred<void>();
+    const writerWrote = deferred<void>();
+    const writerReleased = deferred<void>();
     let stdout = "";
     let stderr = "";
-    writer.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    writer.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
-    await new Promise<void>((resolve, reject) => {
-      writer.once("error", reject);
-      const inspect = (): void => {
-        if (stdout.includes("READY\n")) resolve();
-        else writer.stdout.once("data", inspect);
-      };
-      inspect();
+    let sawWriterFinalWrite = false;
+    let sawWriterReleased = false;
+    writer.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      if (stdout.includes("READY\n")) writerReady.resolve();
+      if (!sawWriterFinalWrite && stdout.includes("WROTE\n")) {
+        sawWriterFinalWrite = true;
+        eventOrder.push("writer-final-write");
+        writerWrote.resolve();
+      }
+      if (!sawWriterReleased && stdout.includes("RELEASED\n")) {
+        sawWriterReleased = true;
+        writerReleased.resolve();
+      }
     });
+    writer.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    await Promise.race([
+      writerReady.promise,
+      writerClosed.promise.then((code) => {
+        throw new Error(`writer fixture closed before readiness with code ${code}; stderr: ${stderr}`);
+      }),
+    ]);
 
     let exclusiveBound!: () => void;
     const exclusiveIsBound = new Promise<void>((resolve) => { exclusiveBound = resolve; });
+    let releaseSent = false;
+    let exclusiveDrainHookFired = false;
     const rotation = rotateMaster({
       storage,
       fortressPath: root,
@@ -90,24 +142,70 @@ describe.skipIf(!supported)("master rotation shared/exclusive writer barrier", (
       passphrase,
       approve: async () => true,
       captureRecoveryKey: async (key, verify) => verify(key),
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          eventOrder.push("conversion");
+        }
+      },
       __testMasterRotationBarrierOptions: {
         timeoutMs: 10_000,
-        retryMs: 10,
-        __testAfterExclusiveSocketAcquired: () => exclusiveBound(),
+        retryMs: BARRIER_RETRY_MS,
+        __testAfterExclusiveSocketAcquired: async () => {
+          exclusiveBound();
+        },
+        __testAfterExclusiveDrain: async () => {
+          exclusiveDrainHookFired = true;
+          expect(releaseSent).toBe(true);
+          expect(sawWriterFinalWrite).toBe(true);
+          await Promise.race([
+            writerReleased.promise,
+            sleep(CHILD_RELEASE_EVENT_TIMEOUT_MS).then(() => {
+              throw new Error("writer release marker did not arrive after drain");
+            }),
+          ]);
+          expect(sawWriterReleased).toBe(true);
+        },
       },
-    });
-    await exclusiveIsBound;
+    }).then(
+      (value) => ({ status: "fulfilled", value } as const),
+      (error) => ({ status: "rejected", error } as const),
+    );
+    rotations.push(rotation);
+    await Promise.race([
+      exclusiveIsBound,
+      rotation.then((outcome) => {
+        if (outcome.status === "rejected") throw outcome.error;
+        throw new Error("rotation completed before the exclusive barrier bound");
+      }),
+    ]);
 
     // The writer was admitted before the exclusive gate. Its last write is
     // allowed to finish; no later reader can unlock until rotation finalizes.
-    writer.stdin.end("WRITE\n");
-    const writerExit = await new Promise<number | null>((resolve, reject) => {
-      writer.once("error", reject);
-      writer.once("close", resolve);
-    });
-    expect(writerExit, stderr).toBe(0);
+    writer.stdin.write("WRITE\n");
+    await Promise.race([
+      writerWrote.promise,
+      writerClosed.promise.then((code) => {
+        throw new Error(`writer fixture closed before final write with code ${code}; stderr: ${stderr}`);
+      }),
+    ]);
     expect(stdout).toContain("WROTE\n");
-    await rotation;
+    expect(eventOrder).toContain("writer-final-write");
+    // Bounded-time witness: proving the drain WAITS for the live reader needs a time bound, and this
+    // probe is it. A drain that does not wait is caught when it reaches __testAfterExclusiveDrain within
+    // DRAIN_BLOCK_PROBE_MS; one that also stalls past that window can pass a single run. The release
+    // handshake below removes the old close-window race; it does not remove this bound.
+    await sleep(DRAIN_BLOCK_PROBE_MS);
+    expect(exclusiveDrainHookFired).toBe(false);
+    expect(writer.exitCode).toBeNull();
+    releaseSent = true;
+    writer.stdin.end("RELEASE\n");
+    const rotationOutcome = await rotation;
+    if (rotationOutcome.status === "rejected") {
+      throw rotationOutcome.error;
+    }
+    expect(await writerClosed.promise, stderr).toBe(0);
+    expect(stdout).toContain("RELEASED\n");
+    expect(eventOrder).toEqual(["writer-final-write", "conversion"]);
 
     const final = await establishMaster({ storage, passphrase });
     try {

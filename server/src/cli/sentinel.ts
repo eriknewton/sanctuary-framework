@@ -34,6 +34,7 @@ import {
 import { PHI1_BASELINE_CATALOG } from "../sentinel/sentinels/index.js";
 import type { SentinelSeverity } from "../sentinel/types.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { argvTokenForDisplay } from "./argv.js";
 
 export interface SentinelArgs {
   argv: string[];
@@ -66,7 +67,7 @@ export async function runSentinelCommand(args: SentinelArgs): Promise<number> {
       case "findings":
         return await cmdFindings(rest, { out, err, args });
       default:
-        err.write(`Unknown subcommand: ${sub}\n`);
+        err.write(`Unknown subcommand: ${argvTokenForDisplay(sub)}\n`);
         printUsage(err);
         return 2;
     }

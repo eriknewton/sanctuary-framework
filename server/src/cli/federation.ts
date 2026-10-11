@@ -25,6 +25,8 @@ import {
   flagValue,
   flagValues,
   unknownFlagWithPrefix,
+  argvTokenForDisplay,
+  caughtErrorForDisplay,
 } from "./argv.js";
 import {
   toBase64url,
@@ -254,7 +256,7 @@ function parsedFederationFortressPath(argv: string[]): {
   fortressPath?: string;
 } {
   const unknown = unknownFlagWithPrefix(argv, "--fortress", ["--fortress-url"]);
-  if (unknown) return { parseError: `unknown fortress flag ${unknown}` };
+  if (unknown) return { parseError: `unknown fortress flag ${argvTokenForDisplay(unknown)}` };
   const parsed = consumeFlagValue(argv, "--fortress");
   if (parsed.error) return { parseError: parsed.error };
   return parsed.value === undefined ? {} : { fortressPath: parsed.value };
@@ -566,7 +568,7 @@ export async function runFederationJoin(args: {
       err.write(`sanctuary federation join: fortress unreachable at ${flags.fortressUrl}\n`);
       return 2;
     }
-    err.write(`sanctuary federation join: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation join: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   } finally {
     // Constraint 6: the node private key never persists past this call.
@@ -790,7 +792,7 @@ export async function runFederationAdopt(args: {
       err.write(`sanctuary federation adopt: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation adopt: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation adopt: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 
@@ -1536,7 +1538,7 @@ async function resolveAdminSessionToken(
       );
       return 2;
     }
-    err.write(`sanctuary federation ${verb}: unexpected error opening a /v1 session: ${String(cause)}\n`);
+    err.write(`sanctuary federation ${verb}: unexpected error opening a /v1 session: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 }
@@ -1562,7 +1564,7 @@ async function openAdminSigner(
       err.write(`sanctuary federation ${verb}: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation ${verb}: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation ${verb}: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 }
@@ -1685,7 +1687,7 @@ function mapAdminRequestError(
     err.write(`sanctuary federation ${verb}: fortress unreachable at ${fortressUrl}\n`);
     return 2;
   }
-  err.write(`sanctuary federation ${verb}: unexpected error: ${String(cause)}\n`);
+  err.write(`sanctuary federation ${verb}: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
   return 1;
 }
 
@@ -2177,7 +2179,7 @@ export async function runFederationRevokePush(args: {
       err.write(`sanctuary federation revoke-push: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation revoke-push: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation revoke-push: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 
@@ -2292,7 +2294,7 @@ export async function runFederationDowngradeLog(args: {
       err.write(`sanctuary federation downgrade-log: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation downgrade-log: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation downgrade-log: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 
@@ -2469,7 +2471,7 @@ export async function runFederationProvision(args: {
       err.write(`sanctuary federation provision: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation provision: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation provision: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 
@@ -2788,7 +2790,7 @@ export async function runFederationRotateRoot(args: {
       err.write(`sanctuary federation rotate-root: ${cause.message}\n`);
       return 3;
     }
-    err.write(`sanctuary federation rotate-root: unexpected error: ${String(cause)}\n`);
+    err.write(`sanctuary federation rotate-root: unexpected error: ${caughtErrorForDisplay(cause)}\n`);
     return 1;
   }
 
@@ -3064,7 +3066,7 @@ export async function runFederationRevealMasterSecret(args: {
       return 3;
     }
     err.write(
-      `sanctuary federation reveal-master-secret: unexpected error: ${String(cause)}\n`,
+      `sanctuary federation reveal-master-secret: unexpected error: ${caughtErrorForDisplay(cause)}\n`,
     );
     return 1;
   }
@@ -3477,7 +3479,7 @@ export async function runFederationCommand(args: {
     return runFederationDowngradeLog({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
-    `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,
+    `sanctuary federation: unknown subcommand "${argvTokenForDisplay(sub)}"\n\n${FEDERATION_HELP}`,
   );
   return 1;
 }

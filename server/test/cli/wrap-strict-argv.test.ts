@@ -14,7 +14,7 @@ describe("sanctuary wrap strict argv parsing (Finding EEE)", () => {
 
   it("rejects unknown flag", () => {
     expect(() => parseWrapArgs(["--name", "x"])).toThrow(
-      /Unrecognized flag '--name'/,
+      /Unrecognized flag '<argument not shown>'/,
     );
   });
 

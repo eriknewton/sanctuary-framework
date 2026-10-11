@@ -21,9 +21,15 @@ import {
   missingSealedCliRuntimeManifestEntries,
 } from "./sealed-cli-runtime-entries.mjs";
 
+const SOURCE_SHA_BYTES = 20; // SHA-1 commit ids are 20 raw bytes.
+const HEX_CHARS_PER_BYTE = 2;
+const SOURCE_SHA_HEX_CHARS = SOURCE_SHA_BYTES * HEX_CHARS_PER_BYTE;
+// Must match SOURCE_SHA_HEX_PATTERN in server/tsup.config.ts and server/src/cli/install.ts.
+const SOURCE_SHA_HEX_PATTERN = new RegExp(`^[0-9a-f]{${SOURCE_SHA_HEX_CHARS}}$`);
+
 const [app, sourceSha, cliVersion] = process.argv.slice(2);
-if (!app || !/^[a-f0-9]{40}$/.test(sourceSha ?? "") || !cliVersion) {
-  throw new Error("usage: build-castle-wall-runtime-manifest.mjs <app> <40-hex-source-sha> <cli-version>");
+if (!app || !SOURCE_SHA_HEX_PATTERN.test(sourceSha ?? "") || !cliVersion) {
+  throw new Error(`usage: build-castle-wall-runtime-manifest.mjs <app> <${SOURCE_SHA_HEX_CHARS}-hex-source-sha> <cli-version>`);
 }
 
 const contents = join(app, "Contents");

@@ -15,7 +15,7 @@ import {
   readSdwOwnerPin,
   transferSdwOwnerForOperator,
 } from "../sdw/memory-isolation.js";
-import { consumeFlagValue } from "./argv.js";
+import { consumeFlagValue, argvTokenForDisplay } from "./argv.js";
 
 // Must match DEFAULT_OWNER_REF in server/src/cli/memory-file.ts (which
 // refuses any `--owner-ref` other than this) and ownerRef: "fleet-self" in
@@ -78,7 +78,7 @@ function parseArgs(argv: readonly string[]): ParsedArgs | "help" {
   if (from.error !== undefined) throw new Error(from.error);
   const to = consumeFlagValue(from.argv, "--to-agent-id");
   if (to.error !== undefined) throw new Error(to.error);
-  if (to.argv.length > 0) throw new Error(`unknown argument: ${to.argv[0]}`);
+  if (to.argv.length > 0) throw new Error(`unknown argument: ${argvTokenForDisplay(to.argv[0]!)}`);
   if (command === "claim" && !agent.value) {
     throw new Error("claim requires --agent-id <wrapped-agent-id>");
   }
