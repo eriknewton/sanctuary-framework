@@ -894,6 +894,16 @@ describe("checkCastlePinCustody", () => {
 });
 
 describe("custody-pair commit schedule", () => {
+  const SNAPSHOT_CHANGED_MESSAGE =
+    "Sanctuary: custody state changed while it was being unlocked. Retry after the concurrent custody operation completes.";
+  // Must match the unexported CUSTODY_SENTINEL_PLAINTEXT in master-custody.ts:
+  // the test mints a structurally valid sentinel under a different master so the
+  // refusal proves the writer's-master authentication check, not JSON parsing.
+  const TEST_CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
+  // 2 = the conventional JSON pretty-print width used only to produce a byte
+  // string whose parsed envelope content is identical while its bytes differ.
+  const JSON_PRETTY_PRINT_SPACES = 2;
+
   async function leavePendingCustodyPair(args: {
     storage: MemoryStorage;
     passphrase: string;
@@ -938,6 +948,66 @@ describe("custody-pair commit schedule", () => {
     });
     opened.masterKey.fill(0);
     return storage;
+  }
+
+  async function readCommitJournal(storage: MemoryStorage): Promise<Record<string, unknown>> {
+    const raw = await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY);
+    expect(raw).not.toBeNull();
+    return JSON.parse(bytesToString(raw!)) as Record<string, unknown>;
+  }
+
+  async function writeCommitJournal(
+    storage: MemoryStorage,
+    journal: Record<string, unknown>,
+  ): Promise<void> {
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      stringToBytes(JSON.stringify(journal)),
+    );
+  }
+
+  async function replaceJournalEnvelopeBytes(
+    storage: MemoryStorage,
+    envelopeBytes: Uint8Array,
+  ): Promise<void> {
+    const journal = await readCommitJournal(storage);
+    journal.envelope_bytes = toBase64url(envelopeBytes);
+    journal.envelope_sha256 = hashToString(envelopeBytes);
+    await writeCommitJournal(storage, journal);
+  }
+
+  async function replaceJournalSentinelBytes(
+    storage: MemoryStorage,
+    sentinelBytes: Uint8Array,
+  ): Promise<void> {
+    const journal = await readCommitJournal(storage);
+    journal.sentinel_bytes = toBase64url(sentinelBytes);
+    journal.sentinel_sha256 = hashToString(sentinelBytes);
+    await writeCommitJournal(storage, journal);
+  }
+
+  async function expectSnapshotChanged(
+    action: Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await action;
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(CustodySnapshotChangedError);
+      expect((error as Error).message).toBe(SNAPSHOT_CHANGED_MESSAGE);
+    }
+  }
+
+  function sentinelBytesForMaster(master: Uint8Array): Uint8Array {
+    const sentinelKey = derivePurposeKey(master, "custody-sentinel");
+    const sentinel = encrypt(
+      stringToBytes(TEST_CUSTODY_SENTINEL_PLAINTEXT),
+      sentinelKey,
+      stringToBytes(TEST_CUSTODY_SENTINEL_PLAINTEXT),
+    );
+    sentinelKey.fill(0);
+    return stringToBytes(JSON.stringify(sentinel));
   }
 
   it("defect.custody-envelope-two-write-crash-refuses-hands-free-boot: completes an interrupted custody pair before read-only unlock", async () => {
@@ -1325,5 +1395,119 @@ describe("custody-pair commit schedule", () => {
     const current = await readCustodyEnvelope(storage);
     expect(current?.created_at).toBe("2030-01-01T00:00:00.000Z");
     opened.masterKey.fill(0);
+  });
+
+  it("refuses a recovered pair whose requested envelope matches but sentinel authenticates under another master", async () => {
+    const storage = await seedConsistentPair("custody-mixed-sentinel-passphrase");
+    const opened = await establishMaster({
+      storage,
+      passphrase: "custody-mixed-sentinel-passphrase",
+    });
+    const requestedEnvelope = await readCustodyEnvelope(storage);
+    expect(requestedEnvelope).not.toBeNull();
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-mixed-sentinel-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+      envelope: requestedEnvelope!,
+    });
+    const otherMaster = generateRandomKey();
+    await replaceJournalSentinelBytes(storage, sentinelBytesForMaster(otherMaster));
+    otherMaster.fill(0);
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelope(storage, requestedEnvelope!, opened.masterKey),
+    );
+    opened.masterKey.fill(0);
+  });
+
+  it("refuses a recovered pair whose envelope bytes came from a concurrent writer", async () => {
+    const storage = await seedConsistentPair("custody-concurrent-writer-passphrase");
+    const opened = await establishMaster({
+      storage,
+      passphrase: "custody-concurrent-writer-passphrase",
+    });
+    const requestedEnvelope = await readCustodyEnvelope(storage);
+    expect(requestedEnvelope).not.toBeNull();
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-concurrent-writer-passphrase",
+      failTarget: CUSTODY_ENVELOPE_KEY,
+      envelope: {
+        ...requestedEnvelope!,
+        created_at: "2031-01-01T00:00:00.000Z",
+      },
+    });
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelope(storage, requestedEnvelope!, opened.masterKey),
+    );
+    opened.masterKey.fill(0);
+  });
+
+  it("refuses a recovered envelope with identical parsed content but different bytes", async () => {
+    const storage = await seedConsistentPair("custody-exact-envelope-bytes-passphrase");
+    const opened = await establishMaster({
+      storage,
+      passphrase: "custody-exact-envelope-bytes-passphrase",
+    });
+    const requestedEnvelope = await readCustodyEnvelope(storage);
+    expect(requestedEnvelope).not.toBeNull();
+    const requestedBytes = (await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!;
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-exact-envelope-bytes-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+      envelope: requestedEnvelope!,
+    });
+    const sameContentDifferentBytes = stringToBytes(
+      JSON.stringify(requestedEnvelope, null, JSON_PRETTY_PRINT_SPACES),
+    );
+    expect(bytesToString(sameContentDifferentBytes)).not.toBe(bytesToString(requestedBytes));
+    expect(JSON.parse(bytesToString(sameContentDifferentBytes))).toEqual(requestedEnvelope);
+    await replaceJournalEnvelopeBytes(storage, sameContentDifferentBytes);
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelope(storage, requestedEnvelope!, opened.masterKey),
+    );
+    opened.masterKey.fill(0);
+  });
+
+  it("refuses a stale prepared live pair from an earlier master", async () => {
+    const storage = await seedConsistentPair("custody-earlier-master-passphrase");
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-earlier-master-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+    });
+    const stalePreparedPair = (await storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    ))!;
+    await storage.delete("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY, true);
+
+    const nextMaster = generateRandomKey();
+    await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: "headless",
+        wraps: [await wrapMasterWithPassphrase(nextMaster, "custody-next-master-passphrase")],
+        created_at: "2032-01-01T00:00:00.000Z",
+      },
+      nextMaster,
+    );
+    const currentEnvelope = await readCustodyEnvelope(storage);
+    expect(currentEnvelope).not.toBeNull();
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      stalePreparedPair,
+    );
+
+    await expectSnapshotChanged(
+      writeCustodyEnvelope(storage, currentEnvelope!, nextMaster),
+    );
+    nextMaster.fill(0);
   });
 });
