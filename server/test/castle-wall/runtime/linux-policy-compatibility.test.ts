@@ -35,11 +35,20 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     const rustSource = readFileSync(resolve("..", "castle-wall-daemon/src/policy.rs"), "utf8");
     // Narrow parser for the Rust `pub struct RuleScope { ... }` declaration:
     // this test is a full-field parity tripwire, not a general Rust parser.
-    const block = rustSource.match(/pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/)?.groups?.body;
-    expect(block).toBeDefined();
-    expect(block).not.toMatch(/#\s*\[\s*serde\s*\([^)]*\brename\s*=/);
+    const declaration = rustSource.match(
+      /(?<attrs>(?:#\[[^\n]*\]\n)*)pub struct RuleScope \{(?<body>[\s\S]*?)\n\}/
+    )?.groups;
+    expect(declaration).toBeDefined();
+    // Comment lines are dropped so prose inside the struct can never read as a field or an attribute.
+    const block = declaration!.body.replace(/^\s*\/\/.*$/gm, "");
+    // Any serde option that changes accepted wire names makes field identifiers stop matching the
+    // JSON keys the daemon admits, so the tripwire refuses them rather than modelling each form.
+    const wireNameOption = /#\s*\[\s*serde\s*\([^\]]*\b(?:rename|rename_all|alias|flatten)\b/;
+    expect(declaration!.attrs).not.toMatch(wireNameOption);
+    expect(block).not.toMatch(wireNameOption);
+    // Every field counts, public or not: serde deserializes private fields too.
     const rustScopeFields = [
-      ...block!.matchAll(/^\s*pub(?:\s*\([^)]*\))?\s+([a-z_][a-z0-9_]*)\s*:/gm),
+      ...block.matchAll(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:/gm),
     ]
       .map((match) => match[1])
       .sort();
