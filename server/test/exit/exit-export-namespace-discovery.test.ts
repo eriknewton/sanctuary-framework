@@ -540,6 +540,9 @@ describe("sanctuary exit export: state-namespace resolution", () => {
       await expect(stat(bundleDir)).rejects.toMatchObject({
         code: "ENOENT",
       });
+      // The export audit append is fire-and-forget; flush first so an entry written before
+      // discovery has landed and this count can see it.
+      await fortress.auditLog.flush();
       const afterOps = await fortress.readAuditOperations();
       expect(afterOps.filter((op) => op === "exit_bundle_export")).toHaveLength(
         beforeOps.filter((op) => op === "exit_bundle_export").length,
