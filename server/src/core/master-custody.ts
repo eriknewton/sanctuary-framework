@@ -1378,9 +1378,12 @@ async function pruneCustodyEnvelopeCommitJournalQuarantine(
   const excess =
     entries.length - CUSTODY_ENVELOPE_COMMIT_JOURNAL_QUARANTINE_RETAINED_PER_SLOT;
   for (const entry of excess > 0 ? entries.slice(0, excess) : []) {
-    // DEBT(CUSTODY-QUARANTINE-RETENTION-ORDER): between custody mutations,
-    // quarantines retain old wraps for inspection; the cap bounds that residual
-    // by securely deleting the oldest record per slot.
+    // DEBT(CUSTODY-QUARANTINE-RETENTION-ORDER): retention is ordered by the
+    // parsed suffix. A non-numeric suffix becomes Number.MAX_SAFE_INTEGER and
+    // sorts as newest, so the cap deletes numeric records first. A backward
+    // wall-clock step can make the copy just written sort old enough to prune
+    // before the slot journal is deleted. Records created by boot recovery
+    // persist until the next recovery-key rekey or rotation.
     await storage.delete("_meta", entry.key, true);
   }
 }
@@ -1540,9 +1543,11 @@ export async function deleteCustodyEnvelopeCommitJournalQuarantines(
   for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
     const prefix = custodyEnvelopeCommitJournalQuarantinePrefix(slot);
     for (const entry of await storage.list("_meta", prefix)) {
-      // Quarantine records are inspection artifacts, not recovery material; any
-      // successful custody rekey securely drops both slots so retired wraps do
-      // not remain as an alternate credential path.
+      // Quarantine records are inspection artifacts, not recovery material.
+      // Rotation preflight deletes every quarantine before generating the new
+      // key; recovery-key rekey deletes before writing new wraps; only rotation
+      // finalize calls this after the rotation body. A rotation that fails after
+      // preflight has already removed these records.
       await storage.delete("_meta", entry.key, true);
     }
   }
