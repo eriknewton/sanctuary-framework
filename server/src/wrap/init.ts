@@ -1424,21 +1424,26 @@ export async function runInit(
             handoffMasterKey.fill(0);
           }
         }
-        return runProvisionPinAlreadyLocked([], {
-          out: new Writable({
-            write(_chunk, _encoding, callback) {
-              callback();
+        const handoffMasterKey = masterKey.slice();
+        try {
+          return await runProvisionPinAlreadyLocked([], {
+            out: new Writable({
+              write(_chunk, _encoding, callback) {
+                callback();
+              },
+            }),
+            env: {
+              ...process.env,
+              SANCTUARY_STORAGE_PATH: lockedFortressPath,
             },
-          }),
-          env: {
-            ...process.env,
-            SANCTUARY_STORAGE_PATH: lockedFortressPath,
-          },
-          // INVARIANT (master ownership): runProvisionPinAlreadyLocked scrubs
-          // the transferred buffer, so init hands it a copy and keeps the
-          // original live until init's final scrub.
-          __resolvedProvisionMasterKey: masterKey.slice(),
-        });
+            // INVARIANT (master ownership): runProvisionPinAlreadyLocked scrubs
+            // the transferred buffer, so init hands it a copy and keeps the
+            // original live until init's final scrub.
+            __resolvedProvisionMasterKey: handoffMasterKey,
+          });
+        } finally {
+          handoffMasterKey.fill(0);
+        }
       },
     );
     const pinResult = typeof pinExecution === "number"

@@ -1166,9 +1166,6 @@ export async function runProvisionPinAlreadyLocked(
     masterKey?.fill(0);
     return 2;
   }
-  const storagePath = resolveFortressArg(parsed.fortress, env);
-  const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
-  const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
   // INVARIANT (one anchor writer): provision-pin mints and publishes THIS
   // FORTRESS's local Castle key pair and nothing else. It does not read,
   // compare, or write the machine-wide enforcement anchor at
@@ -1183,6 +1180,9 @@ export async function runProvisionPinAlreadyLocked(
   // confirmed `castle-wall re-pin` verb.
   let privateSeed: Uint8Array | undefined;
   try {
+    const storagePath = resolveFortressArg(parsed.fortress, env);
+    const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
+    const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
     if (masterKey === undefined) {
       throw new Error("provision-pin requires an already-authenticated master");
@@ -1287,14 +1287,15 @@ export async function runProvisionPin(
     suppliedMasterKey?.fill(0);
     return 2;
   }
-  const storagePath = resolveFortressArg(parsed.fortress, env);
-  const storage = new FilesystemStorage(join(storagePath, "state"));
   let preLockMasterWriteBarrier:
     | Awaited<ReturnType<typeof acquireFortressMasterWriteBarrier>>
     | undefined;
   let result: number | undefined;
   let failure: unknown;
+  let releaseContext: unknown;
   try {
+    const storagePath = resolveFortressArg(parsed.fortress, env);
+    const storage = new FilesystemStorage(join(storagePath, "state"));
     if (suppliedMasterKey === undefined) {
       // INVARIANT (lock order): provision-pin acquires the shared rotation
       // barrier before the custody write lock, matching rotate-master's
@@ -1315,6 +1316,7 @@ export async function runProvisionPin(
         let masterWriteBarrier = preLockMasterWriteBarrier;
         let resolvedCredential: ResolvedCustodyCredential | undefined;
         let masterKey: Uint8Array | undefined;
+        let provisionFailure: unknown;
         try {
           masterKey =
             suppliedMasterKey ??
@@ -1382,6 +1384,9 @@ export async function runProvisionPin(
           if (result.stderr) write(err, result.stderr);
           for (const warning of result.warnings) console.warn(warning);
           return result.code;
+        } catch (error) {
+          provisionFailure = error;
+          throw error;
         } finally {
           masterKey?.fill(0);
           if (resolvedCredential?.kind === "keychain-key") {
@@ -1392,10 +1397,17 @@ export async function runProvisionPin(
           }
           const barrierToRelease = masterWriteBarrier;
           if (barrierToRelease !== undefined) {
-            if (barrierToRelease === preLockMasterWriteBarrier) {
-              preLockMasterWriteBarrier = undefined;
+            try {
+              await barrierToRelease.release();
+              if (barrierToRelease === preLockMasterWriteBarrier) {
+                preLockMasterWriteBarrier = undefined;
+              }
+            } catch (error) {
+              releaseContext = error;
+              if (provisionFailure === undefined) {
+                throw error;
+              }
             }
-            await barrierToRelease.release();
           }
         }
       },
@@ -1411,6 +1423,9 @@ export async function runProvisionPin(
   } finally {
     suppliedMasterKey?.fill(0);
   }
+  if (failure !== undefined && releaseContext !== undefined) {
+    failure = attachContextWithoutReplacingMessage(failure, releaseContext);
+  }
   if (preLockMasterWriteBarrier !== undefined) {
     try {
       await preLockMasterWriteBarrier.release();
@@ -1418,11 +1433,7 @@ export async function runProvisionPin(
     } catch (releaseError) {
       failure = failure === undefined
         ? releaseError
-        : new AggregateError(
-            [failure, releaseError],
-            "provision-pin failed and its master-write barrier did not release cleanly",
-            { cause: releaseError },
-          );
+        : attachContextWithoutReplacingMessage(failure, releaseError);
     }
   }
   if (failure !== undefined) {
@@ -1430,6 +1441,24 @@ export async function runProvisionPin(
     return 1;
   }
   return result ?? 1;
+}
+
+function attachContextWithoutReplacingMessage(
+  primary: unknown,
+  context: unknown,
+): unknown {
+  if (primary instanceof Error) {
+    const writable = primary as Error & { cause?: unknown };
+    writable.cause = writable.cause === undefined
+      ? context
+      : new AggregateError(
+          [writable.cause, context],
+          "additional provision-pin cleanup context",
+          { cause: context },
+        );
+    return primary;
+  }
+  return new Error(String(primary), { cause: context });
 }
 
 async function readOptionalFile(

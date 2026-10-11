@@ -1636,6 +1636,42 @@ describe("castle-wall audit-chain operator override", () => {
     }
   });
 
+  it("scrubs transferred masters when relative fortress resolution cannot continue", async () => {
+    const originalCwd = process.cwd();
+    const removedCwd = await mkdtemp(join(tmpdir(), "sanctuary-cw-removed-cwd-"));
+    try {
+      process.chdir(removedCwd);
+      await rm(removedCwd, { recursive: true, force: true });
+
+      for (const run of [
+        (master: Uint8Array) => runProvisionPin(["--fortress", "relative-fortress"], {
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+          __resolvedProvisionMasterKey: master,
+        }),
+        (master: Uint8Array) => runProvisionPinAlreadyLocked(["--fortress", "relative-fortress"], {
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+          __resolvedProvisionMasterKey: master,
+        }),
+      ]) {
+        const master = generateRandomKey();
+        let thrown: unknown;
+        let code: number | undefined;
+        try {
+          code = await run(master);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(master).toEqual(new Uint8Array(master.length));
+        expect(thrown).toBeUndefined();
+        expect(code).toBe(1);
+      }
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
   it("scrubs the resolved custody key when provision-pin establishment refuses", async () => {
     const { fortressPath } = await makeFortress();
     const custodyKey = generateRandomKey();

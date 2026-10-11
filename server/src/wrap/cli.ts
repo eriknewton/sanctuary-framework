@@ -4096,15 +4096,22 @@ export async function runWrap(
       ...pinBaseEnv
     } = process.env;
     try {
-      const pinResult = await runProvisionPin([], {
-        out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        env: {
-          ...pinBaseEnv,
-          SANCTUARY_STORAGE_PATH: storagePath,
-        },
-        __resolvedProvisionMasterKey: wrapCustody.masterKey.slice(),
-      });
+      const handoffMasterKey = wrapCustody.masterKey.slice();
+      const pinResult = await (async () => {
+        try {
+          return await runProvisionPin([], {
+            out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            env: {
+              ...pinBaseEnv,
+              SANCTUARY_STORAGE_PATH: storagePath,
+            },
+            __resolvedProvisionMasterKey: handoffMasterKey,
+          });
+        } finally {
+          handoffMasterKey.fill(0);
+        }
+      })();
       if (pinResult !== 0) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
