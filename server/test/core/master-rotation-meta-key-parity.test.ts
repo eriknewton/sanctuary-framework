@@ -60,6 +60,8 @@ import {
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
 } from "../../src/core/master-custody.js";
 import {
   EPOCH_WITNESS_META_KEY,
@@ -109,6 +111,14 @@ const ROTATION_RECOGNIZED_META_KEYS: readonly MetaKeyWriteSite[] = [
   { key: PENDING_RECOVERY_KEY, writer: "core/master-rotation.ts" },
   { key: STAGED_CUSTODY_ENVELOPE_KEY, writer: "core/master-rotation.ts" },
   { key: STAGED_CUSTODY_SENTINEL_KEY, writer: "core/master-rotation.ts" },
+  {
+    key: CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalKey default)",
+  },
+  {
+    key: STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    writer: "core/master-custody.ts (custodyEnvelopeCommitJournalKey staged)",
+  },
   // State-store metadata.
   { key: STATE_ENVELOPE_PUBLIC_KEYS_KEY, writer: "cognitive/state-store.ts" },
   { key: STATE_ENVELOPE_VERSION_ANCHORS_KEY, writer: "cognitive/state-store.ts" },
@@ -188,6 +198,11 @@ const ROTATION_DEFERRED_META_KEYS: readonly MetaKeyWriteSite[] = [
 const LEGACY_KEYS_WITHOUT_A_WRITER: ReadonlySet<string> = new Set([
   "key-params",
   "recovery-key-hash",
+]);
+
+const DYNAMIC_CUSTODY_PAIR_JOURNAL_KEYS: ReadonlySet<string> = new Set([
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
 ]);
 
 // ── Mechanical scan ──────────────────────────────────────────────────────────
@@ -335,7 +350,11 @@ describe("master rotation: `_meta` key classification is total over the tree's w
     // state-store.ts's saveJsonRecord definition takes `key`. Pinned so a new
     // unresolvable shape is noticed rather than absorbed.
     expect(scan.unresolved.sort()).toEqual(
-      [join("core", "master-rotation.ts") + ":key", join("cognitive", "state-store.ts") + ":key"].sort()
+      [
+        join("core", "master-custody.ts") + ":key",
+        join("core", "master-rotation.ts") + ":key",
+        join("cognitive", "state-store.ts") + ":key",
+      ].sort()
     );
   });
 
@@ -343,6 +362,7 @@ describe("master rotation: `_meta` key classification is total over the tree's w
     const inventoryKeys = inventory
       .map((site) => site.key)
       .filter((key) => !LEGACY_KEYS_WITHOUT_A_WRITER.has(key))
+      .filter((key) => !DYNAMIC_CUSTODY_PAIR_JOURNAL_KEYS.has(key))
       .sort();
     const scanned = [...scan.keys].sort();
     expect(

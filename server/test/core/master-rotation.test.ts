@@ -22,6 +22,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   establishMaster,
   readCustodyEnvelope,
+  writeCustodyEnvelope,
   countVerifiedWraps,
   envelopeEpochOf,
   readEnvelopeEpoch,
@@ -30,6 +31,7 @@ import {
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
+  STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
 } from "../../src/core/master-custody.js";
 import {
   readEpochWitness,
@@ -592,6 +594,51 @@ describe("master rotation — happy path", () => {
     expect(ops).toContain("fixture_op_0"); // epoch 0
     expect(ops).toContain("epoch1_op"); // epoch 1
     expect(ops.filter((o) => o === "custody_master_rotated")).toHaveLength(2);
+  });
+
+  it("settles and clears an abandoned staged custody pair before preflight", async () => {
+    const fortress = await buildFortress();
+    const stagedMaster = generateRandomKey();
+    const originalWrite = fortress.storage.write.bind(fortress.storage);
+    let armed = true;
+    fortress.storage.write = async (namespace, key, data) => {
+      if (armed && namespace === "_meta" && key === STAGED_CUSTODY_SENTINEL_KEY) {
+        armed = false;
+        throw new Error("injected staged custody pair interruption");
+      }
+      return originalWrite(namespace, key, data);
+    };
+    await expect(writeCustodyEnvelope(
+      fortress.storage,
+      {
+        v: 1,
+        install_mode: "interactive",
+        wraps: [],
+        created_at: new Date().toISOString(),
+      },
+      stagedMaster,
+      {
+        envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+        sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
+      },
+    )).rejects.toThrow(/staged custody pair/);
+    fortress.storage.write = originalWrite;
+    stagedMaster.fill(0);
+    expect(await fortress.storage.read(
+      "_meta",
+      STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).not.toBeNull();
+
+    await rotateMaster(rotateOpts(fortress));
+
+    expect(await fortress.storage.read(
+      "_meta",
+      STAGED_CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY))
+      .toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_SENTINEL_KEY))
+      .toBeNull();
   });
 });
 

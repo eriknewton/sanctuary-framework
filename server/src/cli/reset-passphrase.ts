@@ -98,6 +98,8 @@ import {
   verifyEnvelopeMac,
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
+  writeCustodyEnvelopeBytes,
+  recoverCustodyEnvelopeCommitIfPresent,
   withCustodyWriteLock,
   CustodyUnlockError,
   CUSTODY_ENVELOPE_KEY,
@@ -1454,7 +1456,7 @@ async function healInterruptedRekey(
   // ROLL BACK: restore the EXACT prior envelope bytes. The old credential /
   // recovery key still open it, and the orphaned new wrap is gone (no accretion).
   lease.assertHeld();
-  await storage.write("_meta", CUSTODY_ENVELOPE_KEY, authenticatedPrior.bytes);
+  await writeCustodyEnvelopeBytes(storage, authenticatedPrior.bytes, master);
   lease.assertHeld();
   await clearRekeyJournal(storage);
   lease.assertHeld();
@@ -1571,6 +1573,7 @@ async function runRecoveryKeyPath(
             delete: () => fortressFiles.delete("passphrase.enc"),
           },
         };
+        await recoverCustodyEnvelopeCommitIfPresent(storage);
         let envelope = await readCustodyEnvelope(storage);
         if (!envelope) {
           ctx.err.write(
@@ -1707,7 +1710,7 @@ async function runRecoveryKeyPath(
           // wrap → no accretion). The stored credential was never touched, so the
           // fortress stays consistent.
           lease.assertHeld();
-          await storage.write("_meta", CUSTODY_ENVELOPE_KEY, priorRaw);
+          await writeCustodyEnvelopeBytes(storage, priorRaw, master);
           lease.assertHeld();
           await clearRekeyJournal(storage);
           lease.assertHeld();
@@ -1784,7 +1787,7 @@ async function runRecoveryKeyPath(
           } else {
             // Confirmed pre-commit: no stored credential opens the new wrap.
             lease.assertHeld();
-            await storage.write("_meta", CUSTODY_ENVELOPE_KEY, priorRaw);
+            await writeCustodyEnvelopeBytes(storage, priorRaw, master);
             lease.assertHeld();
             await clearRekeyJournal(storage);
             lease.assertHeld();

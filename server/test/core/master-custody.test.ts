@@ -897,6 +897,35 @@ describe("custody-pair commit schedule", () => {
   const CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY =
     "custody-envelope-commit-journal";
 
+  async function leavePendingCustodyPair(args: {
+    storage: MemoryStorage;
+    passphrase: string;
+    failTarget: typeof CUSTODY_ENVELOPE_KEY | typeof CUSTODY_SENTINEL_KEY;
+  }): Promise<void> {
+    const opened = await establishMaster({
+      storage: args.storage,
+      passphrase: args.passphrase,
+    });
+    const envelope = await readCustodyEnvelope(args.storage);
+    expect(envelope).not.toBeNull();
+    const originalWrite = args.storage.write.bind(args.storage);
+    let armed = true;
+    args.storage.write = async (namespace, key, value) => {
+      if (armed && namespace === "_meta" && key === args.failTarget) {
+        armed = false;
+        throw new Error(`injected custody pair target refusal: ${key}`);
+      }
+      return originalWrite(namespace, key, value);
+    };
+    await expect(
+      writeCustodyEnvelope(args.storage, envelope!, opened.masterKey),
+    ).rejects.toThrow(/injected custody pair target refusal/);
+    args.storage.write = originalWrite;
+    opened.masterKey.fill(0);
+    expect(await args.storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .not.toBeNull();
+  }
+
   it("defect.custody-envelope-two-write-crash-refuses-hands-free-boot: completes an interrupted custody pair before read-only unlock", async () => {
     const storage = new MemoryStorage();
     const originalWrite = storage.write.bind(storage);
@@ -1008,7 +1037,7 @@ describe("custody-pair commit schedule", () => {
     },
   );
 
-  it("settles a custody-pair journal that appears during read-only unlock", async () => {
+  it("refuses a custody-pair journal that appears during read-only unlock", async () => {
     const storage = new MemoryStorage();
     const originalWrite = storage.write.bind(storage);
     let refusedSentinelWrite = false;
@@ -1045,12 +1074,94 @@ describe("custody-pair commit schedule", () => {
       return originalRead(namespace, key);
     };
 
-    const readOnly = await unlockExistingMasterReadOnly(storage, {
+    await expect(unlockExistingMasterReadOnly(storage, {
       passphrase: "custody-read-schedule-passphrase",
-    });
-    expect(readOnly).toBeInstanceOf(Uint8Array);
-    readOnly.fill(0);
+    })).rejects.toThrow(/pending custody pair/i);
     expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
-      .toBeNull();
+      .not.toBeNull();
+  });
+
+  it("read-only unlock reports a pending custody pair without taking the write path", async () => {
+    const { ReadOnlyStorageGuard } = await import(
+      "../../src/storage/read-only-guard.js"
+    );
+    const storage = new MemoryStorage();
+    await establishMaster({
+      storage,
+      passphrase: "custody-read-only-pending-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-read-only-pending-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+    });
+
+    await expect(
+      unlockExistingMasterReadOnly(new ReadOnlyStorageGuard(storage), {
+        passphrase: "custody-read-only-pending-passphrase",
+      }),
+    ).rejects.toThrow(/pending custody pair/i);
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))
+      .not.toBeNull();
+  });
+
+  it("keeps an unreadable custody-pair journal for an operator write path", async () => {
+    const storage = new MemoryStorage();
+    await establishMaster({
+      storage,
+      passphrase: "custody-corrupt-journal-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-corrupt-journal-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+    });
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      stringToBytes("{"),
+    );
+
+    await expect(establishMaster({
+      storage,
+      passphrase: "custody-corrupt-journal-passphrase",
+    })).rejects.toThrow(/custody pair journal/i);
+    expect(bytesToString(
+      (await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))!,
+    )).toBe("{");
+  });
+
+  it("keeps a custody-pair journal whose key binding does not match its slot", async () => {
+    const storage = new MemoryStorage();
+    await establishMaster({
+      storage,
+      passphrase: "custody-mismatched-journal-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    await leavePendingCustodyPair({
+      storage,
+      passphrase: "custody-mismatched-journal-passphrase",
+      failTarget: CUSTODY_SENTINEL_KEY,
+    });
+    const journal = JSON.parse(bytesToString(
+      (await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))!,
+    )) as Record<string, unknown>;
+    journal.envelope_key = "custody-envelope-other";
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+      stringToBytes(JSON.stringify(journal)),
+    );
+
+    await expect(establishMaster({
+      storage,
+      passphrase: "custody-mismatched-journal-passphrase",
+    })).rejects.toThrow(/custody pair journal/i);
+    const preserved = JSON.parse(bytesToString(
+      (await storage.read("_meta", CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY))!,
+    )) as Record<string, unknown>;
+    expect(preserved.envelope_key).toBe("custody-envelope-other");
   });
 });
