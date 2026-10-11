@@ -61,6 +61,24 @@ const APPROVE_DIALOG = () => ({
 // test's own `env` already sets one; a test that specifically exercises the
 // missing-identity refusal lives in memory-file-owner-pin.test.ts.
 const TEST_AGENT_ID = "claude_code:memory-file-cli-test";
+// 30 s = 6x the production 5 s barrier window; this file is not testing
+// barrier admission timing, so shared-runner load should not decide CLI cases.
+const TEST_MASTER_WRITE_BARRIER_TIMEOUT_MS = 30_000;
+const TEST_MASTER_WRITE_BARRIER_OPTIONS = {
+  timeoutMs: TEST_MASTER_WRITE_BARRIER_TIMEOUT_MS,
+};
+// 120 s = 24x the production 5 s Darwin capability operation bound; this file
+// exercises memory CLI behavior, not worker startup or per-operation deadlines.
+const TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS = 120_000;
+// 360 s = 3x the widened operation bound; setup performs several serialized
+// custody writes, so the hook budget covers total setup, not one operation.
+const TEST_HOOK_TIMEOUT_MS = 360_000;
+
+function memoryFileStorage(statePath: string): FilesystemStorage {
+  return new FilesystemStorage(statePath, {
+    __testDirectoryCapabilityTimeoutMs: TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
+  });
+}
 
 // memory_ingest is Tier-1 (S4): it now passes the human ApprovalGate like the
 // other memory verbs, so default the local-operator dialog to APPROVE unless a
@@ -70,6 +88,10 @@ const runMemoryIngestCommand: typeof runMemoryIngestCommandProduction = (args) =
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
+    __testMasterWriteBarrierOptions:
+      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
+    __testDirectoryCapabilityTimeoutMs:
+      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 // STEP1-F2: memory_emit/transcode/transcode_restore now apply the same
 // owner-pin precheck as memory_ingest (STEP1-F1), so they need the same
@@ -80,18 +102,30 @@ const runMemoryEmitCommand: typeof runMemoryEmitCommandProduction = (args) =>
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
+    __testMasterWriteBarrierOptions:
+      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
+    __testDirectoryCapabilityTimeoutMs:
+      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 const runMemoryTranscodeCommand: typeof runMemoryTranscodeCommandProduction = (args) =>
   runMemoryTranscodeCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
+    __testMasterWriteBarrierOptions:
+      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
+    __testDirectoryCapabilityTimeoutMs:
+      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 const runMemoryTranscodeRestoreCommand: typeof runMemoryTranscodeRestoreCommandProduction = (args) =>
   runMemoryTranscodeRestoreCommandProduction({
     ...args,
     dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
     env: { SANCTUARY_AGENT_ID: TEST_AGENT_ID, ...(args.env ?? {}) },
+    __testMasterWriteBarrierOptions:
+      args.__testMasterWriteBarrierOptions ?? TEST_MASTER_WRITE_BARRIER_OPTIONS,
+    __testDirectoryCapabilityTimeoutMs:
+      args.__testDirectoryCapabilityTimeoutMs ?? TEST_DIRECTORY_CAPABILITY_TIMEOUT_MS,
   });
 
 function makeSink(): { stream: Writable; text: () => string } {
@@ -307,7 +341,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     // Bootstrap a real passphrase-mode fortress so the CLI's unbootstrapped
     // resolveCliMasterKey unlocks an existing custody envelope. Failure mode if
     // this is skipped: the command fails on unlock, which looks like a CLI bug.
-    const storage = new FilesystemStorage(join(fortress, "state"));
+    const storage = memoryFileStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -320,18 +354,18 @@ describe("memory file CLI: fortress-backed round trip", () => {
       "passphrase",
     );
     await identities.save(storedIdentity);
-  });
+  }, TEST_HOOK_TIMEOUT_MS);
 
   afterEach(async () => {
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
-  });
+  }, TEST_HOOK_TIMEOUT_MS);
 
   async function auditEntries(): Promise<
     Array<{ operation: string; details: Record<string, unknown> }>
   > {
-    const storage = new FilesystemStorage(join(fortress, "state"));
+    const storage = memoryFileStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       storagePathHint: fortress,
@@ -882,7 +916,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
     }, 60_000);
 
     async function fortressAdapterForCheckOnly(): Promise<SdwMemoryBackendAdapter> {
-      const storage = new FilesystemStorage(join(fortress, "state"));
+      const storage = memoryFileStorage(join(fortress, "state"));
       const masterKey = await resolveCliMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
@@ -912,7 +946,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       // the pin already exists). That isolates this test to its intended
       // target: a commit-phase corpus-write failure, not the unrelated
       // owner-pin machinery (covered by memory-file-owner-pin.test.ts).
-      const storage = new FilesystemStorage(join(fortress, "state"));
+      const storage = memoryFileStorage(join(fortress, "state"));
       const masterKey = await resolveCliMasterKey(storage, {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
@@ -1143,17 +1177,17 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
 
   beforeEach(() => {
     prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
-  });
+  }, TEST_HOOK_TIMEOUT_MS);
   afterEach(async () => {
     if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
     else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
-  });
+  }, TEST_HOOK_TIMEOUT_MS);
 
   async function seedFortressWithStoredCustody(prefix: string): Promise<string> {
     const fortress = join(await tempDir(prefix), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
-    const storage = new FilesystemStorage(join(fortress, "state"));
+    const storage = memoryFileStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1240,7 +1274,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     const fortress = join(await tempDir("memfile-f6-nocred"), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
     // Bootstrap custody but store NO credential in the keyring.
-    const storage = new FilesystemStorage(join(fortress, "state"));
+    const storage = memoryFileStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1263,7 +1297,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
   it("mismatch: a stored credential that does not open the fortress is refused", async () => {
     const fortress = join(await tempDir("memfile-f6-mismatch"), ".sanctuary");
     await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
-    const storage = new FilesystemStorage(join(fortress, "state"));
+    const storage = memoryFileStorage(join(fortress, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
@@ -1296,7 +1330,7 @@ describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () =>
     expect(code).toBe(0);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.every((b) => b === 0)).toBe(true);
-  });
+  }, 60_000);
 
   it("F4: the owned master is zeroed even when the verb body errors after unlock", async () => {
     const fortress = await seedFortressWithStoredCustody("memfile-f4-err");

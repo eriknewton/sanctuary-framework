@@ -46,7 +46,10 @@ import {
   transcodeMemoryDirectory,
 } from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
+import type {
+  MasterWriteBarrierLease,
+  MasterWriteBarrierOptions,
+} from "../storage/cross-process-lock.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
@@ -75,6 +78,10 @@ export interface MemoryFileCommandArgs {
    */
   readonly observeMasterKey?: (buf: Uint8Array) => void;
   readonly dialogRunner?: MemoryArchiveDialogRunner;
+  /** Test only: drive the shared master-rotation barrier used by write verbs. */
+  readonly __testMasterWriteBarrierOptions?: MasterWriteBarrierOptions;
+  /** Test only: drive the Darwin directory-capability operation bound. */
+  readonly __testDirectoryCapabilityTimeoutMs?: number;
 }
 
 // Must match ownerRef: "fleet-self" in server/src/index.ts
@@ -293,7 +300,15 @@ export async function runMemoryIngestCommand(
     },
   };
 
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
+  const boot = await bootstrap(
+    parsed,
+    env,
+    err,
+    args.stdin ?? process.stdin,
+    args.observeMasterKey,
+    args.__testMasterWriteBarrierOptions,
+    args.__testDirectoryCapabilityTimeoutMs,
+  );
   if (!boot) return 1;
 
   try {
@@ -610,7 +625,15 @@ export async function runMemoryEmitCommand(
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
 
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
+  const boot = await bootstrap(
+    parsed,
+    env,
+    err,
+    args.stdin ?? process.stdin,
+    args.observeMasterKey,
+    args.__testMasterWriteBarrierOptions,
+    args.__testDirectoryCapabilityTimeoutMs,
+  );
   if (!boot) return 1;
 
   try {
@@ -734,7 +757,15 @@ export async function runMemoryTranscodeCommand(
   }
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
+  const boot = await bootstrap(
+    parsed,
+    env,
+    err,
+    args.stdin ?? process.stdin,
+    args.observeMasterKey,
+    args.__testMasterWriteBarrierOptions,
+    args.__testDirectoryCapabilityTimeoutMs,
+  );
   if (!boot) return 1;
 
   try {
@@ -870,7 +901,15 @@ export async function runMemoryTranscodeRestoreCommand(
   }
   const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
   if (!approvalChannel) return 1;
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
+  const boot = await bootstrap(
+    parsed,
+    env,
+    err,
+    args.stdin ?? process.stdin,
+    args.observeMasterKey,
+    args.__testMasterWriteBarrierOptions,
+    args.__testDirectoryCapabilityTimeoutMs,
+  );
   if (!boot) return 1;
 
   try {
@@ -1136,6 +1175,8 @@ async function bootstrap(
   err: Writable,
   stdin: NodeJS.ReadableStream,
   observeMasterKey?: (buf: Uint8Array) => void,
+  __testMasterWriteBarrierOptions?: MasterWriteBarrierOptions,
+  __testDirectoryCapabilityTimeoutMs?: number,
 ): Promise<BootstrappedMemoryFileCommand | null> {
   if (args.fortress !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = args.fortress;
@@ -1147,7 +1188,11 @@ async function bootstrap(
 
   const config = await loadConfig();
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
-  const storage = new FilesystemStorage(join(config.storage_path, "state"));
+  const storage = new FilesystemStorage(join(config.storage_path, "state"), {
+    ...(__testDirectoryCapabilityTimeoutMs !== undefined
+      ? { __testDirectoryCapabilityTimeoutMs }
+      : {}),
+  });
 
   // Unlock via the shared local-fortress chokepoint: argv/stdin/env credentials
   // first (the pre-existing compatibility path), then the EXACT-fortress OS
@@ -1169,6 +1214,9 @@ async function bootstrap(
     // shared rotation barrier across the whole verb so a concurrent
     // rotate-master serializes or the write fails closed (S1).
     writeIntent: true,
+    ...(__testMasterWriteBarrierOptions !== undefined
+      ? { __testMasterWriteBarrierOptions }
+      : {}),
   });
   if (!unlocked.ok) {
     // Fail closed AND diagnosable, with a secret-free remediation. The message
