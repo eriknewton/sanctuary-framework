@@ -46,7 +46,7 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     // This is a narrow tripwire on single-line attributes, not a serde model; the daemon itself
     // still fails closed on any key it does not model because of `deny_unknown_fields`.
     const wireNameOption =
-      /#\s*\[\s*serde\s*\([^\]]*\b(?:rename|rename_all|alias|flatten|from|try_from|transparent)\b/;
+      /#\s*\[\s*serde\s*\([^\]]*\b(?:rename|rename_all|alias|flatten|from|try_from|transparent|remote)\b/;
     expect(declaration!.attrs).toMatch(/#\s*\[\s*serde\s*\([^\]]*\bdeny_unknown_fields\b/);
     // A derived Deserialize is required: deny_unknown_fields binds only the derive, and Rust refuses a
     // second hand-written impl for the same type, so this also rules out a custom deserializer.
@@ -55,7 +55,7 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
     expect(block).not.toMatch(wireNameOption);
     // Every field counts, public or not: serde deserializes private fields too.
     const rustScopeFields = [
-      ...block.matchAll(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:/gm),
+      ...block.matchAll(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:r#)?([a-z_][a-z0-9_]*)\s*:/gm),
     ]
       .map((match) => match[1])
       .sort();
