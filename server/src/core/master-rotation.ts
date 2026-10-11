@@ -2465,7 +2465,7 @@ async function rotateMasterLocked(
         throw error;
       }
     }
-    let abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
+    const abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
       envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
     });
     const abandonedStagedSentinel =

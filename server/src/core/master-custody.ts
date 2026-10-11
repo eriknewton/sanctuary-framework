@@ -1454,10 +1454,12 @@ async function recoverCustodyEnvelopeCommitLocked(
   // - staged slot absent fallback: finalize/resume may accept both staged files
   //   absent only when the live pair authenticates under the supplied new
   //   master, proving the staged pair was already promoted;
-  // - preflight two-step retry: preflight first records an unusable staged
-  //   journal, then retries this slot with an override consistency check that
-  //   authenticates the live pair under the old master, quarantines only the
-  //   staged journal, and lets the writer clear the abandoned staged pair;
+  // - rotation preflight staged-slot recovery: rotateMasterLocked recovers the
+  //   staged slot once under oldMaster with liveCustodyPairAuthenticates as the
+  //   consistency check; an unusable staged journal is quarantined only when the
+  //   live pair authenticates, because preflight discards the staged pair either
+  //   way, otherwise the stored unusable error is rethrown after the staged
+  //   reads as the preflight staged REFUSE arm;
   // - writers that observe a changed pair after replay raise
   //   CustodySnapshotChangedError so the caller retries from disk truth;
   // - boot refuses on a rotation journal before any slot recovery, because
