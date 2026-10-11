@@ -6,7 +6,7 @@
  */
 
 import { createReadStream, openSync } from "node:fs";
-import { access, readFile as fsReadFile, mkdir, stat } from "node:fs/promises";
+import { access, mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -37,7 +37,7 @@ import type {
   ExitBundleDidWebBinding,
   ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
-import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
+import { verifyExitBundle, InvalidExitBundleError, readManifest } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 import { flagValue, flagValues, consumeFlagValue, argvTokenForDisplay } from "../cli/argv.js";
@@ -109,6 +109,8 @@ const FAILURE_CLASS_EXPLANATIONS: Record<
     "At least one artifact's contents do not match the hash recorded in the signed manifest. The file was altered, or the bundle is corrupted.",
   artifact_missing:
     "At least one artifact the manifest lists could not be found in the bundle directory. The download or copy is incomplete.",
+  artifact_read_rejected:
+    "At least one artifact the manifest lists is present but cannot be read as a regular bundle file. Refusing this bundle.",
   artifact_size_mismatch:
     "At least one artifact's size does not match what the signed manifest recorded. The file was truncated, altered, or the bundle is corrupted.",
   aggregate_hash_mismatch:
@@ -1103,8 +1105,7 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       }
       const manifestPath = join(bundleRoot, "manifest.json");
       try {
-        const raw = await fsReadFile(manifestPath, "utf8");
-        JSON.parse(raw);
+        await readManifest(bundleRoot);
       } catch {
         write(
           err,

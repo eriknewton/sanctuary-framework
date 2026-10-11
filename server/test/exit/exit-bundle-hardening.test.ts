@@ -1,5 +1,15 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -11,11 +21,18 @@ import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import {
+  loadExitArtifact,
   exportExitBundle,
   importExitBundle,
+  readManifest,
   verifyExitBundle,
   ExitBundleImportError,
 } from "../../src/exit/index.js";
+import {
+  InvalidExitBundleError,
+  MAX_EXIT_ARTIFACT_READ_BYTES,
+  MAX_EXIT_MANIFEST_READ_BYTES,
+} from "../../src/exit/verifier.js";
 import { EXIT_BUNDLE_DID_WEB_AUDIT_OPS } from "../../src/exit/bundle.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -23,12 +40,19 @@ import {
   canonicalize,
   canonicalizeToBytes,
 } from "../../src/mesh/canonical-json.js";
+import type { ExitBundleVerifierResult } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { hash as sha256 } from "../../src/core/hashing.js";
 import {
   reputationBundleSigningBytes,
   type ReputationBundle,
 } from "../../src/reputation/reputation-store.js";
+import * as custodyFs from "../../src/storage/custody-fs.js";
+
+const execFileAsync = promisify(execFile);
+const NON_REGULAR_READ_SETTLE_TIMEOUT_MS = 250; // Quarter-second witness: local regular-file classification must settle before the no-hang guard fires.
+type ExitBundleFailureClass =
+  NonNullable<ExitBundleVerifierResult["failure_class"]>;
 
 interface ToolDef {
   name: string;
@@ -101,6 +125,10 @@ async function exportFromSource(
   });
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
   const tempDirs: string[] = [];
 
@@ -108,6 +136,263 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
+    vi.restoreAllMocks();
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: InvalidExitBundleError carries the shared failure_class contract", () => {
+    expectTypeOf(new InvalidExitBundleError("typed", "other").failure_class)
+      .toEqualTypeOf<ExitBundleFailureClass | undefined>();
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact applies the per-artifact read cap before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-load-cap-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{");
+    // The verifier's documented cap is 24 MiB; +1 proves the refusal branch
+    // without forcing the fixture to allocate a dense artifact on disk.
+    const oversizedArtifactBytes = MAX_EXIT_ARTIFACT_READ_BYTES + 1;
+    await truncate(artifactPath, oversizedArtifactBytes);
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: oversizedArtifactBytes,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact refuses non-regular artifacts before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-regular-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await execFileAsync("mkfifo", [artifactPath]);
+
+    const settled = await Promise.race([
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 0,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      ).catch((err: unknown) => err),
+      delay(NON_REGULAR_READ_SETTLE_TIMEOUT_MS).then(() => "timed_out" as const),
+    ]);
+
+    expect(settled).toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_read_rejected",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact classifies a larger artifact with an in-range declaration", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-size-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{}");
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 1,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: readManifest applies the manifest read cap before parsing", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-cap-"));
+    tempDirs.push(bundleDir);
+    const manifestPath = join(bundleDir, "manifest.json");
+    await writeFile(manifestPath, "{");
+    await truncate(manifestPath, MAX_EXIT_MANIFEST_READ_BYTES + 1);
+
+    await expect(readManifest(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "artifact_size_mismatch",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: readManifest preserves the symlink failure class", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-link-"));
+    tempDirs.push(bundleDir);
+    const manifestTarget = join(bundleDir, "manifest-target.json");
+    await writeFile(manifestTarget, "{}");
+    await symlink(manifestTarget, join(bundleDir, "manifest.json"));
+
+    await expect(readManifest(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "archive_contains_symlink",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: verifyExitBundle shares readManifest malformed-manifest classification", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-manifest-json-"));
+    tempDirs.push(bundleDir);
+    await writeFile(join(bundleDir, "manifest.json"), "{");
+
+    await expect(verifyExitBundle(bundleDir)).rejects.toMatchObject({
+      name: "InvalidExitBundleError",
+      failure_class: "other",
+    });
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: loadExitArtifact wraps malformed artifact JSON", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-artifact-json-"));
+    tempDirs.push(bundleDir);
+    const artifactPath = join(bundleDir, "artifacts/audit_receipts.json");
+    await mkdir(join(bundleDir, "artifacts"));
+    await writeFile(artifactPath, "{");
+
+    await expect(
+      loadExitArtifact(
+        bundleDir,
+        {
+          body: {
+            manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+            exported_at: "2026-10-10T00:00:00.000Z",
+            identity_binding: {
+              identity_id: "identity-test",
+              fortress_id: "fortress-test",
+              fortress_master_pubkey: "",
+            },
+            source_sanctuary_version: "test",
+            artifacts: [
+              {
+                kind: "audit_receipts",
+                path: "artifacts/audit_receipts.json",
+                hash_alg: "sha256",
+                hash: "0".repeat(64),
+                size_bytes: 1,
+              },
+            ],
+            artifacts_aggregate_hash: "0".repeat(64),
+            artifacts_aggregate_hash_alg: "sha256",
+            export_approval_audit_id: "audit-test",
+            signature_scheme: "ed25519-v1",
+          },
+          signature: "",
+        },
+        "audit_receipts"
+      )
+    ).rejects.toBeInstanceOf(InvalidExitBundleError);
+  });
+
+  it("defect.exit-verifier-per-artifact-read-cap: known_signers reload preserves the shared read failure class", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", { label: "ks-reload-class" });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-ks-read-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const originalReadFileCustodyWithStats = custodyFs.readFileCustodyWithStats;
+    const knownSignersPathSuffix = join("artifacts", "known_signers.json");
+    let knownSignersReads = 0;
+    vi.spyOn(custodyFs, "readFileCustodyWithStats").mockImplementation(
+      (async (
+        path: string,
+        options: custodyFs.ReadFileCustodyOptions = {}
+      ) => {
+        if (path.endsWith(knownSignersPathSuffix)) {
+          knownSignersReads += 1;
+          if (knownSignersReads === 2) {
+            throw new custodyFs.CustodyFsError(
+              "not_regular_file",
+              "known_signers reload fixture rejected the artifact read"
+            );
+          }
+        }
+        return originalReadFileCustodyWithStats(path, options);
+      }) as typeof custodyFs.readFileCustodyWithStats
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(knownSignersReads).toBe(2);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("artifact_read_rejected");
   });
 
   it("#54: refuses identity overwrite without forceRebind, allows it with forceRebind, records audit", async () => {
