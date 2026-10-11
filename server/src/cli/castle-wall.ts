@@ -886,6 +886,10 @@ async function resolveMasterKey(
       storagePathHint: storagePath,
       barrierDegradeMode: "read-only",
     });
+    // INVARIANT (read-only resolver): this helper returns only key bytes, not a
+    // session handle, so its internal shared reader must be released before the
+    // caller continues in the same process.
+    await result.masterWriteBarrier?.release();
     return result.masterKey;
   }
 
@@ -900,6 +904,10 @@ async function resolveMasterKey(
     storagePathHint: storagePath,
     barrierDegradeMode: "read-only",
   });
+  // INVARIANT (read-only resolver): this helper returns only key bytes, not a
+  // session handle, so its internal shared reader must be released before the
+  // caller continues in the same process.
+  await result.masterWriteBarrier?.release();
   return result.masterKey;
 }
 
@@ -2457,7 +2465,8 @@ export async function runDaemon(
     join(storagePath, "state"),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  let derived: { key: Uint8Array };
+  let derived: { key: Uint8Array } | undefined;
+  let daemonMasterWriteBarrier: { release(): Promise<void> } | undefined;
   try {
     const custodyResult = await establishMaster({
       storage,
@@ -2473,6 +2482,7 @@ export async function runDaemon(
       barrierDegradeMode: "inert",
     });
     derived = { key: custodyResult.masterKey };
+    daemonMasterWriteBarrier = custodyResult.masterWriteBarrier;
   } catch (error) {
     write(
       err,
@@ -2481,6 +2491,25 @@ export async function runDaemon(
     );
     return 1;
   }
+  if (derived === undefined) return 1;
+  const releaseDaemonMasterSession = async (): Promise<boolean> => {
+    derived?.key.fill(0);
+    try {
+      // INVARIANT (daemon session lifetime): the foreground daemon keeps the
+      // shared rotation reader only while it may perform master-derived writes;
+      // every startup refusal and normal stop releases it before returning to an
+      // in-process caller.
+      await daemonMasterWriteBarrier?.release();
+      daemonMasterWriteBarrier = undefined;
+      return true;
+    } catch (error) {
+      write(
+        err,
+        `Error: master-write barrier release failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return false;
+    }
+  };
   // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
   // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
   // primitives), while every OTHER caller of this same binary runs as the
@@ -2528,6 +2557,7 @@ export async function runDaemon(
           "cross-uid unreadability. Investigate before retrying (see " +
           "'sanctuary castle-wall audit-findings').\n",
       );
+      await releaseDaemonMasterSession();
       return 1;
     }
     // The daemon's own chain is fresh from this migration onward (nothing but
@@ -2593,6 +2623,7 @@ export async function runDaemon(
           err,
           `Refusing to report armed: Linux producer-signed activation did not engage (${outcome.reason}).\n`,
         );
+        await releaseDaemonMasterSession();
         return 1;
       }
       const socketPath = resolveCastleWallSocketPath({
@@ -2608,6 +2639,7 @@ export async function runDaemon(
     } catch (error) {
       write(err, `Daemon failed to start (Linux producer-signed, fail-closed): ${(error as Error).message}\n`);
       write(err, "The producer-signed close is fail-closed: a daemon-start, key, handshake, or drain failure surfaces NOT-ARMED rather than degrading to the channel basis.\n");
+      await releaseDaemonMasterSession();
       return 1;
     }
   } else {
@@ -2669,6 +2701,7 @@ export async function runDaemon(
           globalPinPath: CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
         });
       }
+      await releaseDaemonMasterSession();
       return 1;
     }
   }
@@ -2734,6 +2767,7 @@ export async function runDaemon(
     } catch (error) {
       write(err, `${(error as Error).message}\n`);
       await daemon.stop().catch(() => undefined);
+      await releaseDaemonMasterSession();
       return 1;
     }
     if (intervalMs !== null) {
@@ -2852,7 +2886,7 @@ export async function runDaemon(
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
-  return 0;
+  return (await releaseDaemonMasterSession()) ? 0 : 1;
 }
 
 /**

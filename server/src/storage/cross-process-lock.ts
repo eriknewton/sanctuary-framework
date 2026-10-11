@@ -87,6 +87,11 @@ const CUSTODY_LOCK_ROOT_LEAF = "sanctuary-custody-locks";
 const CUSTODY_LOCK_MAX_ENTRY_BYTES = 40 + ".reaper".length;
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
+// 40 = the shared scaffold digest width used in `<digest>.reaper` paths below.
+const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
+// 24 = the reader socket digest prefix width used in `<digest>.reader-*.sock`.
+const BARRIER_READER_PREFIX_HEX_CHARS = 24;
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT = 128;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
 // reader socket per live unlock plus a few fixed scaffolds. A real host has a
 // handful; anything past this ceiling means crashed-reader leakage or a same-uid
@@ -781,11 +786,14 @@ async function resolveMasterBarrierCoordinates(
   };
   const lockIdentity = `${directoryIdentity.dev}:${directoryIdentity.ino}:${barrierName}`;
   const digest = createHash("sha256").update(lockIdentity).digest("hex");
-  const exclusiveSocketPath = join(runtimeDir, `${digest.slice(0, 40)}.sock`);
-  const exclusiveReaperScaffoldName = `${digest.slice(0, 40)}.reaper`;
-  const readerReaperScaffoldName = `${digest.slice(0, 40)}.reader-reaper`;
+  const scaffoldDigest = digest.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
+  const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
+  const exclusiveSocketPath = join(runtimeDir, `${scaffoldDigest}.sock`);
+  const exclusiveReaperScaffoldName = `${scaffoldDigest}.reaper`;
+  const readerReaperScaffoldName = `${scaffoldDigest}.reader-reaper`;
   await ensureInertLockScaffold(runtimeDir, exclusiveReaperScaffoldName);
   await ensureInertLockScaffold(runtimeDir, readerReaperScaffoldName);
+  await sweepUnusedBarrierScaffolds(runtimeDir, scaffoldDigest).catch(() => undefined);
   return {
     host,
     lockIdentity,
@@ -795,7 +803,7 @@ async function resolveMasterBarrierCoordinates(
     runtimeIdentity,
     exclusiveSocketPath,
     exclusiveReaperScaffoldPath: join(runtimeDir, exclusiveReaperScaffoldName),
-    readerSocketPrefix: `${digest.slice(0, 24)}.reader-`,
+    readerSocketPrefix: `${readerDigest}.reader-`,
     readerReaperScaffoldPath: join(runtimeDir, readerReaperScaffoldName),
   };
 }
@@ -1101,6 +1109,55 @@ export async function acquireMasterWriteBarrier(
   }
 }
 
+async function sweepUnusedBarrierScaffolds(
+  runtimeDir: string,
+  activeScaffoldDigest: string,
+): Promise<void> {
+  const names = await readdir(runtimeDir);
+  const nameSet = new Set(names);
+  const scaffoldDigests = new Set<string>();
+  const exclusiveSocketDigests = new Set<string>();
+  const readerSocketDigests = new Set<string>();
+  for (const name of names) {
+    if (BARRIER_REAPER_SCAFFOLD_PATTERN.test(name)) {
+      scaffoldDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
+      continue;
+    }
+    if (name.endsWith(".sock")) {
+      const readerMarker = ".reader-";
+      const readerMarkerAt = name.indexOf(readerMarker);
+      if (readerMarkerAt === BARRIER_READER_PREFIX_HEX_CHARS) {
+        readerSocketDigests.add(name.slice(0, BARRIER_READER_PREFIX_HEX_CHARS));
+      } else if (
+        name.length === BARRIER_SCAFFOLD_DIGEST_HEX_CHARS + ".sock".length
+      ) {
+        exclusiveSocketDigests.add(name.slice(0, BARRIER_SCAFFOLD_DIGEST_HEX_CHARS));
+      }
+    }
+  }
+
+  let removed = 0;
+  for (const digest of scaffoldDigests) {
+    if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
+    if (digest === activeScaffoldDigest) continue;
+    const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
+    const hasLiveEntry =
+      exclusiveSocketDigests.has(digest) || readerSocketDigests.has(readerDigest);
+    if (hasLiveEntry) continue;
+    for (const suffix of [".reaper", ".reader-reaper"] as const) {
+      const scaffoldName = `${digest}${suffix}`;
+      if (!nameSet.has(scaffoldName)) continue;
+      // INVARIANT (bounded runtime dir): inert scaffolds have no socket owner;
+      // removing them only after the identity has no socket leaves live readers
+      // and rotators coordinated while preventing one scaffold pair per old
+      // fortress from accumulating forever.
+      await rm(join(runtimeDir, scaffoldName), { force: true });
+      removed += 1;
+      if (removed >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) return;
+    }
+  }
+}
+
 async function waitForMasterBarrierReaders(
   coordinates: MasterBarrierCoordinates,
   timeoutMs: number,
@@ -1182,6 +1239,9 @@ const BARRIER_READER_EVICTION_THRESHOLD = 16;
 // Bound the serialized reaper spawns per eviction sweep (defense-in-depth with
 // the rotator's MAX_STALE_REAPS_PER_PASS); the rest wait for a later sweep.
 const MAX_EVICTIONS_PER_SWEEP = 8;
+const BARRIER_REAPER_SCAFFOLD_PATTERN = new RegExp(
+  `^[0-9a-f]{${BARRIER_SCAFFOLD_DIGEST_HEX_CHARS}}\\.(?:reader-)?reaper$`,
+);
 
 /**
  * Best-effort, bounded reap of DEAD reader sockets left in the shared runtime
@@ -1299,6 +1359,30 @@ export async function withExclusiveMasterRotationBarrier<T>(
   if (operationError !== undefined) throw operationError;
   if (releaseError !== undefined) throw releaseError;
   return result;
+}
+
+export async function __testListMasterBarrierReaderSockets(
+  storage: StorageBackend,
+  namespace: string,
+  barrierName: string,
+  options: Pick<MasterWriteBarrierOptions, "__testPlatform" | "__testGetuid"> = {},
+): Promise<string[]> {
+  const host = options.__testPlatform ?? platform();
+  const coordinates = await resolveMasterBarrierCoordinates(
+    storage,
+    namespace,
+    barrierName,
+    host,
+    options.__testGetuid,
+  );
+  if (coordinates === null) return [];
+  const names = await readdir(coordinates.runtimeDir);
+  return names
+    .filter(
+      (name) =>
+        name.startsWith(coordinates.readerSocketPrefix) && name.endsWith(".sock"),
+    )
+    .map((name) => join(coordinates.runtimeDir, name));
 }
 
 /**

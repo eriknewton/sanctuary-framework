@@ -15,6 +15,7 @@ import {
   chmod,
   mkdtemp,
   lstat,
+  readdir,
   readFile,
   rm,
   unlink,
@@ -29,6 +30,7 @@ import { createServer } from "node:net";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
+  acquireMasterWriteBarrier,
   withCrossProcessLock,
   withPathLock,
   CrossProcessLockError,
@@ -37,6 +39,11 @@ import {
 
 const NS = "_lock_test";
 const LOCK = ".unit.lock";
+const DISTINCT_BARRIER_FORTRESS_COUNT = 32;
+// 2 = one `.reaper` plus one `.reader-reaper` pair for the most recent identity.
+const MAX_SCAFFOLDS_AFTER_SWEEP = 2;
+// 1_000 ms = one second, short enough for unit tests and long enough for a local socket bind.
+const SHORT_KERNEL_TEST_TIMEOUT_MS = 1_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -127,6 +134,37 @@ describe("withCrossProcessLock", () => {
     expect(trace[0]!.startsWith("enter:")).toBe(true);
     expect(trace[1]).toBe(`exit:${trace[0]!.slice("enter:".length)}`);
   });
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "bounds unused master-barrier scaffolds across distinct fortresses",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = join(base, "runtime-locks");
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        for (let index = 0; index < DISTINCT_BARRIER_FORTRESS_COUNT; index += 1) {
+          const fortress = await mkdtemp(join(base, `barrier-fortress-${index}-`));
+          const lease = await acquireMasterWriteBarrier(
+            new FilesystemStorage(join(fortress, "state")),
+            "_meta",
+            "scaffold-sweep-test",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          );
+          await lease.release();
+        }
+        const scaffolds = (await readdir(runtimeRoot)).filter(
+          (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
+        );
+        expect(scaffolds.length).toBeLessThanOrEqual(MAX_SCAFFOLDS_AFTER_SWEEP);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+      }
+    },
+  );
 
   it("removes the lockfile after the operation (even when it throws)", async () => {
     await expect(

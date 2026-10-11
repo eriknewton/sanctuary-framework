@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +52,7 @@ import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report
 import { runInit } from "../../src/wrap/init.js";
 import {
   CrossProcessLockError,
+  __testListMasterBarrierReaderSockets,
   withExclusiveMasterRotationBarrier,
 } from "../../src/storage/cross-process-lock.js";
 
@@ -98,6 +99,26 @@ const ONE_EVENT_LOOP_TURN_MS = 50;
 const LOCK_ORDER_SETTLE_MS = 150;
 const SHORT_LOCK_TIMEOUT_MS = 250;
 
+let previousCustodyLockRoot: string | undefined;
+let castleWallTestLockRoot: string | undefined;
+
+beforeAll(async () => {
+  previousCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  castleWallTestLockRoot = await mkdtemp(join(tmpdir(), "sanctuary-cw-locks-"));
+  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = castleWallTestLockRoot;
+});
+
+afterAll(async () => {
+  if (previousCustodyLockRoot === undefined) {
+    delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  } else {
+    process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
+  }
+  if (castleWallTestLockRoot !== undefined) {
+    await rm(castleWallTestLockRoot, { recursive: true, force: true });
+  }
+});
+
 class CaptureStream extends Writable {
   chunks: string[] = [];
   override _write(chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
@@ -109,10 +130,29 @@ class CaptureStream extends Writable {
   }
 }
 
+async function assertNoMasterBarrierReadersForTempDirs(
+  dirs: readonly string[],
+): Promise<void> {
+  const leaked: string[] = [];
+  for (const dir of dirs) {
+    const lockDir = join(dir, "state", CUSTODY_WRITE_LOCK_NAMESPACE);
+    const stats = await stat(lockDir).catch(() => null);
+    if (stats === null || !stats.isDirectory()) continue;
+    const sockets = await __testListMasterBarrierReaderSockets(
+      new FilesystemStorage(join(dir, "state")),
+      CUSTODY_WRITE_LOCK_NAMESPACE,
+      MASTER_ROTATION_BARRIER_NAME,
+    );
+    leaked.push(...sockets);
+  }
+  expect(leaked).toEqual([]);
+}
+
 describe("castle-wall CLI verbs", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -1499,6 +1539,7 @@ describe("castle-wall audit-chain operator override", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -1524,6 +1565,7 @@ describe("castle-wall audit-chain operator override", () => {
       recoveryKey,
       storagePathHint: fortressPath,
     });
+    await custody.masterWriteBarrier?.release();
     custody.masterKey.fill(0);
     return { fortressPath, masterKey, recoveryKey };
   }
@@ -2021,6 +2063,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -2586,6 +2629,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         firstRun: { installMode: "headless", mintRecoveryKey: false },
         storagePathHint: fortressPath,
       });
+      await custody.masterWriteBarrier?.release();
       custody.masterKey.fill(0);
       // The daemon only fingerprints this key; 32 = ED25519_PUBLIC_KEY_BYTES,
       // the length its own length check enforces before fingerprinting.

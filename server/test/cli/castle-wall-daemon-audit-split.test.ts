@@ -53,6 +53,10 @@ class CaptureStream extends Writable {
 }
 
 const STOP_AFTER_CAPTURE = new Error("captured");
+type DaemonCapture = {
+  input?: MacOSCastleWallDaemonInput;
+  onStart?: (input: MacOSCastleWallDaemonInput) => Promise<void>;
+};
 
 describe("castle-wall daemon: F2 Option A audit-store split", () => {
   const tempDirs: string[] = [];
@@ -79,9 +83,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     return { fortressPath };
   }
 
-  function baseCtx(fortressPath: string, capture: {
-    input?: MacOSCastleWallDaemonInput;
-  }): CastleWallCommandContext {
+  function baseCtx(fortressPath: string, capture: DaemonCapture): CastleWallCommandContext {
     return {
       out: new CaptureStream(),
       err: new CaptureStream(),
@@ -93,6 +95,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
       },
       fullDaemonStart: async (input) => {
         capture.input = input;
+        await capture.onStart?.(input);
         throw STOP_AFTER_CAPTURE;
       },
     };
@@ -100,21 +103,22 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
 
   it("non-root: unchanged — writes straight into _audit, never provisions _audit-daemon", async () => {
     const { fortressPath } = await makeLocalFortress();
-    const capture: { input?: MacOSCastleWallDaemonInput } = {};
+    const capture: DaemonCapture = {};
+    capture.onStart = async (input) => {
+      await input.auditLog.appendCritical({
+        layer: "l1",
+        operation: "probe",
+        identity_id: "id-1",
+        result: "success",
+      });
+      await input.auditLog.flush();
+    };
     const ctx = baseCtx(fortressPath, capture);
     ctx.getuid = () => 501; // ordinary (non-root) operator uid
 
     const code = await runDaemon([], ctx);
     expect(code).toBe(1); // capture-throw surfaces as start failure
     expect(capture.input).toBeDefined();
-
-    await capture.input!.auditLog.appendCritical({
-      layer: "l1",
-      operation: "probe",
-      identity_id: "id-1",
-      result: "success",
-    });
-    await capture.input!.auditLog.flush();
 
     const auditDir = join(fortressPath, "state", "_audit");
     const entries = (await readdir(auditDir)).filter((f) => f.startsWith("entry-"));
@@ -131,7 +135,16 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
 
   it("root: migrates first, then writes into _audit-daemon (never _audit)", async () => {
     const { fortressPath } = await makeLocalFortress();
-    const capture: { input?: MacOSCastleWallDaemonInput } = {};
+    const capture: DaemonCapture = {};
+    capture.onStart = async (input) => {
+      await input.auditLog.appendCritical({
+        layer: "l1",
+        operation: "probe",
+        identity_id: "id-1",
+        result: "success",
+      });
+      await input.auditLog.flush();
+    };
     const ctx = baseCtx(fortressPath, capture);
     ctx.getuid = () => 0;
 
@@ -147,25 +160,11 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     );
     expect(JSON.parse(boundaryRaw).data.sealed_tip_sequence).toBe(0);
 
-    // Its own genesis marker entry already landed (migration wrote it).
-    const daemonEntriesBefore = (
+    // The wired-up auditLog wrote into the daemon namespace, not the shared one.
+    const daemonEntries = (
       await readdir(join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE))
     ).filter((f) => f.startsWith("entry-"));
-    expect(daemonEntriesBefore.length).toBe(1);
-
-    // The wired-up auditLog writes into the daemon namespace, not the shared one.
-    await capture.input!.auditLog.appendCritical({
-      layer: "l1",
-      operation: "probe",
-      identity_id: "id-1",
-      result: "success",
-    });
-    await capture.input!.auditLog.flush();
-
-    const daemonEntriesAfter = (
-      await readdir(join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE))
-    ).filter((f) => f.startsWith("entry-"));
-    expect(daemonEntriesAfter.length).toBe(2); // genesis marker + probe
+    expect(daemonEntries.length).toBe(2); // genesis marker + probe
 
     // The shared operator `_audit` namespace never received the probe entry
     // (it may not even exist yet on a fortress this fresh, since it starts
@@ -184,17 +183,19 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
 
     // Seed one operator entry, then corrupt it, so the migration's own
     // (root-context) chain re-verification finds a REAL problem.
-    const seedCapture: { input?: MacOSCastleWallDaemonInput } = {};
+    const seedCapture: DaemonCapture = {};
+    seedCapture.onStart = async (input) => {
+      await input.auditLog.appendCritical({
+        layer: "l1",
+        operation: "seed",
+        identity_id: "id-1",
+        result: "success",
+      });
+      await input.auditLog.flush();
+    };
     const seedCtx = baseCtx(fortressPath, seedCapture);
     seedCtx.getuid = () => 501;
     await runDaemon([], seedCtx);
-    await seedCapture.input!.auditLog.appendCritical({
-      layer: "l1",
-      operation: "seed",
-      identity_id: "id-1",
-      result: "success",
-    });
-    await seedCapture.input!.auditLog.flush();
 
     const auditDir = join(fortressPath, "state", "_audit");
     const files = (await readdir(auditDir)).filter((f) => f.startsWith("entry-"));
@@ -204,7 +205,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     raw.entry_hash = "0".repeat(64);
     await writeFile(filePath, JSON.stringify(raw));
 
-    const capture: { input?: MacOSCastleWallDaemonInput } = {};
+    const capture: DaemonCapture = {};
     const ctx = baseCtx(fortressPath, capture);
     ctx.getuid = () => 0;
 
