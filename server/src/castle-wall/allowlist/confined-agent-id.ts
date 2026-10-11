@@ -41,7 +41,8 @@ export function parseConfinedAgentId(id: string): number | null {
 
 /**
  * Refuse Linux uid-mode policy scopes that do not name the single confined agent uid. Called by
- * the Linux installer and by the broker publisher (`publishLinuxCompatiblePolicy`) before signing.
+ * the Linux install-bundle signer (`buildInstallBundle`) and by the broker publisher
+ * (`publishLinuxCompatiblePolicy`) before signing.
  */
 export function validateLinuxInstallAgentIdScopes(
   rules: readonly AllowlistRule[],
@@ -57,7 +58,7 @@ export function validateLinuxInstallAgentIdScopes(
           `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
       }
-      // The Linux daemon binds and queues only the agent uid (nftables.rs `binding_set_rule`), so a scope naming
+      // The Linux daemon binds and queues only the agent uid (enforced by nftables.rs `binding_set_rule`), so a scope naming
       // any other uid, including a gate uid, can never match; the admitted confined-id set is the agent uid
       // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
