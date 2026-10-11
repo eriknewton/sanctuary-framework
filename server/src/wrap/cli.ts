@@ -2631,7 +2631,16 @@ async function flushBeforeDeferredLocalIntelligenceExit(
   try {
     await auditLog.flush();
   } catch (err) {
-    if (result.unexpectedError === undefined) throw err;
+    if (result.unexpectedError === undefined) {
+      // The explicit refusal remains the exit cause; a late audit flush error
+      // is reported but cannot replace the operator-actionable remedy.
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `  WARNING: audit log flush before local-intelligence refusal exit failed ` +
+          `(${err instanceof Error ? err.message : String(err)}).`,
+      );
+      return;
+    }
     // The setup error remains the crash cause; replacing it with a late flush
     // error would hide the original stack the operator and tests need.
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
@@ -5423,9 +5432,12 @@ export async function runWrap(
   const deferredLocalIntelligenceExit =
     wrapLocalIntelligenceResult.explicitRefusal !== undefined ||
     wrapLocalIntelligenceResult.unexpectedError !== undefined;
-  const dashboardUrl = deferredLocalIntelligenceExit
-    ? undefined
-    : ensuredDashboard?.url;
+  // A reused dashboard is owned by another live process; the deferred exit
+  // stops only the dashboard this run started, so keep the reusable URL honest.
+  const dashboardUrl =
+    deferredLocalIntelligenceExit && ensuredDashboard?.reused !== true
+      ? undefined
+      : ensuredDashboard?.url;
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);

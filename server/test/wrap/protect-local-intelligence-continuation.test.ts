@@ -5,7 +5,7 @@
  * the same post-wrap sequencing that the CLI uses before it chooses an exit.
  */
 
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ vi.mock("../../src/castle-wall/runtime/index.js", () => ({
 }));
 
 import { AuditLog } from "../../src/operational/audit-log.js";
+import { RUNTIME_FILE_NAME } from "../../src/cli/agents/runtime.js";
 import {
   __resetProcessShutdownStateForTest,
   ExplicitLocalIntelligenceRefusal,
@@ -42,6 +43,25 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
 const AGENT_GUIDED_NOT_ARMED_EXIT_CODE = 2;
+const OTHER_LIVE_PID = process.ppid;
+
+async function writeRuntimeRecord(
+  storagePath: string,
+  port: number,
+): Promise<void> {
+  await mkdir(storagePath, { recursive: true });
+  await writeFile(
+    join(storagePath, RUNTIME_FILE_NAME),
+    JSON.stringify({
+      version: "9.9.9-test",
+      pid: OTHER_LIVE_PID,
+      started_at: new Date().toISOString(),
+      dashboard_host: "127.0.0.1",
+      dashboard_port: port,
+      mode: "standalone",
+    }),
+  );
+}
 
 describe("runWrap explicit local-intelligence continuation", () => {
   let tmpHome: string;
@@ -169,6 +189,53 @@ describe("runWrap explicit local-intelligence continuation", () => {
     expect(order.lastIndexOf("flush")).toBeGreaterThan(order.indexOf("auto-provision"));
   });
 
+  it("keeps the explicit refusal when the final pre-exit audit flush fails", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    let finalFlushShouldThrow = false;
+    castleWallMocks.stop.mockImplementationOnce(async () => {
+      finalFlushShouldThrow = true;
+    });
+    const flushError = new Error("synthetic flush failure");
+    const originalFlush = AuditLog.prototype.flush;
+    vi.spyOn(AuditLog.prototype, "flush").mockImplementation(async function (
+      this: AuditLog,
+    ): Promise<void> {
+      if (finalFlushShouldThrow) throw flushError;
+      return originalFlush.apply(this);
+    });
+
+    let caught: unknown;
+    try {
+      await runWrap(
+        {
+          hermes: true,
+          noOpen: true,
+          noDashboard: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          runAutoProvisionForWrap: async () => ({
+            ran: true,
+            outcome: {
+              kind: "skipped-non-tty-cooperative-only",
+              reason: "test non-interactive provisioning skip",
+            },
+          }),
+          runLocalIntelligenceSetup: async () => ({ kind: "refused", reason: "non_tty" }),
+        }),
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ExplicitLocalIntelligenceRefusal);
+    expect((caught as Error).message).toContain("Sanctuary protect refused");
+    expect(wrapCliRefusalExitCode(caught as ExplicitLocalIntelligenceRefusal)).toBe(1);
+    const stderr = stderrSpy.mock.calls.flat().join("\n");
+    expect(stderr).toContain("audit log flush before local-intelligence refusal exit failed");
+    expect(stderr).not.toContain("Sanctuary MCP Server failed to start");
+  });
+
   it("finishes no-dashboard continuation before surfacing an unexpected explicit setup error", async () => {
     Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
     const localError = new TypeError("synthetic local-intelligence failure");
@@ -284,6 +351,41 @@ describe("runWrap explicit local-intelligence continuation", () => {
     expect(stderrSpy.mock.calls.flat().join("\n")).not.toContain(
       "Sovereignty Dashboard running at",
     );
+  });
+
+  it("opens and reports a reused dashboard before surfacing an explicit refusal", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    const reusedDashboardPort = 3507;
+    const reusedDashboardUrl = `http://127.0.0.1:${reusedDashboardPort}`;
+    await writeRuntimeRecord(process.env.SANCTUARY_STORAGE_PATH!, reusedDashboardPort);
+    const openBrowser = vi.fn(async () => {});
+    const startOwnedDashboard = vi.fn(async () => ({
+      url: "http://127.0.0.1:3501",
+      port: 3501,
+    }));
+
+    await expect(
+      runWrap(
+        {
+          hermes: true,
+          provisionLocalIntelligence: true,
+        },
+        deps({
+          openBrowser,
+          runAutoProvisionForWrap: async () => ({ ran: true }),
+          runLocalIntelligenceSetup: async () => ({ kind: "refused", reason: "pull_failed" }),
+          startOwnedDashboard,
+          probeDashboardHealth: async (url) => url === reusedDashboardUrl,
+        }),
+      ),
+    ).rejects.toThrow("--provision-local-intelligence was explicitly requested");
+
+    expect(startOwnedDashboard).not.toHaveBeenCalled();
+    expect(openBrowser).toHaveBeenCalledWith(reusedDashboardUrl);
+    const stderr = stderrSpy.mock.calls.flat().join("\n");
+    expect(stderr).toContain("Sovereignty Dashboard already running at");
+    expect(stderr).toContain(reusedDashboardUrl);
+    expect(stderr).not.toContain("Dashboard unavailable in this run");
   });
 
   it("preserves an existing specific refusal exit code", () => {
