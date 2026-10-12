@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — In-Memory Storage Backend
+ * Sanctuary MCP Server - In-Memory Storage Backend
  *
  * Used for testing. Implements the same interface as filesystem storage
  * but stores everything in memory. Data does not persist across restarts.
@@ -41,13 +41,14 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = predecessor.catch(() => undefined).then(() => gate);
     this.namespaceLockTails.set(identity, tail);
-    void tail.then(() => {
+    const dropTail = () => {
       // The map retains this tail until both the predecessor and this waiter's
       // gate settle, so an aborting waiter cannot hide a still-held namespace.
       if (this.namespaceLockTails.get(identity) === tail) {
         this.namespaceLockTails.delete(identity);
       }
-    });
+    };
+    void tail.then(dropTail, dropTail);
     const controller = new AbortController();
     try {
       // The tail is published before waiting so later callers chain behind this

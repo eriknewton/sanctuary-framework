@@ -92,6 +92,25 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     expect(overlap).toBe(false);
   });
 
+  it("keeps namespace locks usable when a rejecting holder and aborted waiter settle together", async () => {
+    const storage = new MemoryStorage();
+    const controller = new AbortController();
+    const holder = storage.withNamespaceLock("probe_ns", "x.lock", async () => {
+      throw new Error("holder rejected");
+    });
+    const waiter = storage.withNamespaceLock("probe_ns", "x.lock", async () => {
+      throw new Error("waiter entered");
+    }, {
+      abortSignal: controller.signal,
+    });
+    controller.abort();
+
+    await expect(holder).rejects.toThrow(/holder rejected/);
+    await expect(waiter).rejects.toThrow(/aborted/);
+    const third = storage.withNamespaceLock("probe_ns", "x.lock", async () => "ran");
+    expect(await within(third, 1000)).toBe("ran");
+  });
+
   it("keeps a later corpus waiter behind the original holder when the middle waiter aborts", async () => {
     const storage = new MemoryStorage();
     let releaseA!: () => void;
@@ -148,6 +167,25 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     await a;
     await c;
     expect(overlap).toBe(false);
+  });
+
+  it("keeps corpus locks usable when a rejecting holder and aborted waiter settle together", async () => {
+    const storage = new MemoryStorage();
+    const controller = new AbortController();
+    const holder = withSdwMemoryCorpusMutationLock(storage, async () => {
+      throw new Error("holder rejected");
+    });
+    const waiter = withSdwMemoryCorpusMutationLock(storage, async () => {
+      throw new Error("waiter entered");
+    }, {
+      abortSignal: controller.signal,
+    });
+    controller.abort();
+
+    await expect(holder).rejects.toThrow(/holder rejected/);
+    await expect(waiter).rejects.toMatchObject({ category: "operation_aborted" });
+    const third = withSdwMemoryCorpusMutationLock(storage, async () => "ran");
+    expect(await within(third, 1000)).toBe("ran");
   });
 
   it("refuses instead of entering the corpus critical section when abort races the grant", async () => {

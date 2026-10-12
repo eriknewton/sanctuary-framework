@@ -290,12 +290,13 @@ export async function withSdwMemoryCorpusMutationLock<T>(
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const tail = previous.catch(() => {}).then(() => gate);
   corpusMutationTails.set(storage, tail);
-  void tail.then(() => {
+  const dropTail = () => {
     // The published tail remains visible until the prior holder and this
     // waiter's gate have both settled, so a later caller cannot skip a live
     // holder after this waiter aborts.
     if (corpusMutationTails.get(storage) === tail) corpusMutationTails.delete(storage);
-  });
+  };
+  void tail.then(dropTail, dropTail);
   try {
     // The tail is linked before this waiter can abort, so a later waiter stays
     // behind the original holder even when this waiter refuses early.
@@ -490,9 +491,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     if (transactional !== null) {
       if (this.mode === "hermes-bridge") {
         // Bridge approval is bound to the non-transactional write order below;
-        // a late transactional capability can reach the hook but never writes.
-        this.assertHermesBridgeInsertAllowed();
-        await this.assertHermesBridgeCommitAllowed(prepared);
+        // a transactional branch cannot preserve that order, so it refuses first.
         throw new SdwValidationError(
           "operation_refused",
           "Hermes bridge SDW memory adapter refuses transactional storage",
