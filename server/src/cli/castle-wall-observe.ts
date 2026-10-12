@@ -1899,7 +1899,8 @@ export async function runObservePromote(
       write(
         err,
         `Aborted: observe promote cannot publish this ruleset on Linux: ${error.message}. ` +
-          "Nothing changed; no manifest was re-signed.\n",
+          "Nothing changed; no manifest was re-signed. " +
+          "On Linux, promote IP/CIDR-only rules or author a Linux-compatible policy with `sanctuary linux-policy sign`.\n",
       );
       return 1;
     }

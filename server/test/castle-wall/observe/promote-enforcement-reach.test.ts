@@ -97,7 +97,7 @@ import {
   type HarnessEndpointSet,
 } from "../../../src/castle-wall/provision/egress.js";
 import { egressPolicyWriterLock } from "../../../src/castle-wall/provision/lockfile.js";
-import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
+import type { AgentOrigin, SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { IdentityManager } from "../../../src/cognitive/tools.js";
 import { createIdentity } from "../../../src/core/identity.js";
@@ -128,6 +128,14 @@ function candidate(host: string): CandidateObservation {
     last_seen: "2026-07-27T01:00:00Z",
     would_be_disposition: "denied",
     exfil_risk: false,
+  };
+}
+
+function ipOnlyCandidate(): CandidateObservation {
+  return {
+    ...candidate("ip-only.invalid"),
+    host: null,
+    hostname_source: null,
   };
 }
 
@@ -995,6 +1003,7 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
   async function makeCliFortress(opts: {
     exclusive: boolean;
     candidates: CandidateObservation[];
+    initialAgentOrigin?: AgentOrigin;
   }): Promise<{
     fortressPath: string;
     recoveryKey: string;
@@ -1020,6 +1029,22 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       join(fortressPath, "castle-pinned-privkey.enc"),
       JSON.stringify(encrypt(seed, masterKey)),
     );
+    if (opts.initialAgentOrigin !== undefined) {
+      await publishSignedManifest(
+        {
+          fortressId: "fortress-test",
+          issuedAt: "2026-10-11T00:00:00Z",
+          rules: [],
+          signer: localManifestSigner({
+            signingKeyId: castleWallSigningKeyId(pinnedPublicKey),
+            encryptedPrivateKey: encrypt(seed, masterKey),
+            encryptionKey: masterKey,
+          }),
+          agentOrigin: opts.initialAgentOrigin,
+        },
+        new FilesystemManifestStorage(join(fortressPath, "policy", "egress")),
+      );
+    }
 
     const observeStore = new ObserveStore(new StateStore(storage, masterKey), {
       identityId: storedIdentity.identity_id,
@@ -1129,10 +1154,86 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(code).toBe(1);
     expect(err.text()).toContain("cannot publish this ruleset on Linux");
     expect(err.text()).toContain("match.host");
+    expect(err.text()).toContain("sanctuary linux-policy sign");
     expect(await fortress.listStoredCandidates()).toBe(1);
     await expect(readFile(join(fortress.fortressPath, "policy", "egress", "manifest.json"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("FAIL-WITHOUT-FIX: Linux promote reports uid-mode scope refusal without policy state changes", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [ipOnlyCandidate()],
+      initialAgentOrigin: {
+        mode: "uid",
+        agent_uid: AGENT_UID,
+        system_uid_allow_ceiling: AGENT_UID - 1,
+      },
+    });
+    const manifestPath = join(fortress.fortressPath, "policy", "egress", "manifest.json");
+    const beforeManifest = await readFile(manifestPath, "utf8");
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(
+      [
+        "--destination",
+        "93.184.216.34:443",
+        "--granularity",
+        "per_instance_domain",
+        "--fortress",
+        fortress.fortressPath,
+      ],
+      {
+        out,
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        approvalChannel: new AutoApproveChannel(),
+        platform: "linux",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("cannot publish this ruleset on Linux");
+    expect(err.text()).toContain("scope.agent_ids");
+    expect(err.text()).toContain("Nothing changed; no manifest was re-signed.");
+    expect(out.text()).not.toContain("Promote complete");
+    expect(await fortress.listStoredCandidates()).toBe(1);
+    expect(await readFile(manifestPath, "utf8")).toBe(beforeManifest);
+    await expect(readdir(join(fortress.fortressPath, "policy", "egress", "rules"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("Linux-compatible promote publishes an ip-scoped rule and verifies the signed manifest", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: true,
+      candidates: [ipOnlyCandidate()],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+      platform: "linux",
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    const verified = await readVerifiedManifest(
+      join(fortress.fortressPath, "policy", "egress"),
+      fortress.pinnedPublicKey,
+    );
+    expect(verified.status).toBe("ok");
+    if (verified.status !== "ok") throw new Error("unreachable");
+    expect(
+      verified.rules.some(
+        (rule) => rule.match.ip?.[0] === "93.184.216.34" && rule.scope.uids?.[0] === GATE_UID,
+      ),
+    ).toBe(true);
+    expect(await fortress.listStoredCandidates()).toBe(1);
   });
 
   it("macOS promote continues to publish host-scoped rules through the existing path", async () => {
@@ -1148,6 +1249,33 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
       approvalChannel: new AutoApproveChannel(),
       platform: "darwin",
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    expect(await fortress.listStoredCandidates()).toBe(0);
+    const verified = await readVerifiedManifest(
+      join(fortress.fortressPath, "policy", "egress"),
+      fortress.pinnedPublicKey,
+    );
+    expect(verified.status).toBe("ok");
+    if (verified.status !== "ok") throw new Error("unreachable");
+    expect(verified.rules.some((rule) => rule.match.host?.[0] === "api.newlyapproved.example")).toBe(true);
+  });
+
+  it("unknown platforms continue through the generic publisher and produce a verified host rule", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [candidate("api.newlyapproved.example")],
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+      approvalChannel: new AutoApproveChannel(),
+      platform: "freebsd",
     });
 
     expect(code).toBe(0);

@@ -17,6 +17,13 @@ const UINT32_BIT_COUNT = 32;
 /** u32 max = 2^32 - 1, matching Rust `u32::MAX`. */
 const UINT32_MAX = 2 ** UINT32_BIT_COUNT - 1;
 
+export class LinuxInstallAgentIdScopeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LinuxInstallAgentIdScopeError";
+  }
+}
+
 /** Format the canonical Linux confined-agent id for one admitted uid. */
 export function confinedAgentIdForUid(uid: number): string | null {
   if (!Number.isInteger(uid) || uid < 0 || uid > UINT32_MAX) return null;
@@ -54,7 +61,7 @@ export function validateLinuxInstallAgentIdScopes(
     for (const agentId of rule.scope.agent_ids ?? []) {
       const uid = parseConfinedAgentId(agentId);
       if (uid === null) {
-        throw new Error(
+        throw new LinuxInstallAgentIdScopeError(
           `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
       }
@@ -62,7 +69,7 @@ export function validateLinuxInstallAgentIdScopes(
       // any other uid, including a gate uid, can never match; the admitted confined-id set is the agent uid
       // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
-        throw new Error(
+        throw new LinuxInstallAgentIdScopeError(
           `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected admitted uid ${admittedUid}`,
         );
       }
