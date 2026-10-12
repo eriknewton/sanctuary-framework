@@ -35,6 +35,7 @@ import {
   withPathLock,
   CrossProcessLockError,
   resetKernelLockPoisonForTests,
+  __testSweepUnusedBarrierScaffolds,
 } from "../../src/storage/cross-process-lock.js";
 
 const NS = "_lock_test";
@@ -57,6 +58,20 @@ const SHORT_SOCKET_TMP_PARENT =
 // src/storage/cross-process-lock.ts, the filename width this test plants.
 const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
 const SECURE_SCAFFOLD_MODE = 0o600;
+const CROSS_PROCESS_LOCK_MODULE_URL = new URL(
+  "../../src/storage/cross-process-lock.ts",
+  import.meta.url,
+).href;
+// 10_000 ms = 5 stale-reaper helper deadlines; enough for a child probe to
+// finish or be killed without overlapping the next test.
+const CHILD_PROBE_TIMEOUT_MS = 5 * 2_000;
+// 4_500 ms = 2 helper deadlines plus 500 ms scheduling slack. A pass that
+// spawns more than one hung helper exceeds the bound and fails the test.
+const SLOW_SWEEP_PASS_TEST_BOUND_MS = 2 * 2_000 + 500;
+const SLOW_SWEEP_PAIR_COUNT = 3;
+const SLOW_SWEEP_DIGEST_SEED = 30;
+const SLOW_SWEEP_ACTIVE_DIGEST_SEED = 100;
+const ACTIVE_SWEEP_DIGEST_SEED = 40;
 
 function scaffoldDigest(seed: number): string {
   return seed.toString(16).padStart(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS, "0");
@@ -81,6 +96,38 @@ async function scaffoldModes(root: string): Promise<Map<string, number>> {
     modes.set(name, stats.mode & 0o777);
   }
   return modes;
+}
+
+async function runChildProbe(
+  script: string,
+  env: Record<string, string>,
+): Promise<{ stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, ["--import", "tsx", "-e", script], {
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`child probe exceeded ${CHILD_PROBE_TIMEOUT_MS}ms: ${stderr}`));
+    }, CHILD_PROBE_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(`child probe failed (${signal ?? code}): ${stderr}`));
+    });
+  });
 }
 
 function reaperLockCommand(host: NodeJS.Platform): string {
@@ -223,7 +270,7 @@ describe("withCrossProcessLock", () => {
           const lease = await acquireMasterWriteBarrier(
             new FilesystemStorage(join(fortress, "state")),
             "_meta",
-            "scaffold-sweep-test",
+            `scaffold-sweep-test-${index}`,
             { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
           );
           await lease.release();
@@ -241,7 +288,7 @@ describe("withCrossProcessLock", () => {
         const triggerLease = await acquireMasterWriteBarrier(
           new FilesystemStorage(join(triggerFortress, "state")),
           "_meta",
-          "scaffold-sweep-test",
+          "scaffold-sweep-trigger-test",
           { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
         );
         await triggerLease.release();
@@ -545,6 +592,151 @@ describe("withCrossProcessLock", () => {
         } else {
           process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
         }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "creates rechecked sweep scaffolds at secure mode under a restrictive umask",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const digest = scaffoldDigest(12);
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        await runChildProbe(`
+          const { lstat } = await import("node:fs/promises");
+          const { join } = await import("node:path");
+          const mod = await import(process.env.MODULE_URL);
+          process.umask(0o027);
+          const root = process.env.RUNTIME_ROOT;
+          const digest = process.env.DIGEST;
+          await mod.__testSweepOneUnusedBarrierScaffoldAfterRemovingPair(
+            root,
+            digest,
+            process.platform,
+          );
+          for (const suffix of [".reaper", ".reader-reaper"]) {
+            const mode = (await lstat(join(root, digest + suffix))).mode & 0o777;
+            if (mode !== 0o600) {
+              console.error(String(mode.toString(8)));
+              process.exit(1);
+            }
+          }
+        `, {
+          MODULE_URL: CROSS_PROCESS_LOCK_MODULE_URL,
+          RUNTIME_ROOT: runtimeRoot,
+          DIGEST: digest,
+        });
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "creates stale-socket reaper scaffolds at secure mode under a restrictive umask",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        await runChildProbe(`
+          const { linkSync } = await import("node:fs");
+          const { chmod, lstat } = await import("node:fs/promises");
+          const { createServer } = await import("node:net");
+          const { join } = await import("node:path");
+          const mod = await import(process.env.MODULE_URL);
+          process.umask(0o027);
+          const root = process.env.RUNTIME_ROOT;
+          const source = join(root, "stale-source.sock");
+          const socketPath = join(root, "stale.sock");
+          const scaffoldPath = join(root, "stale.reaper");
+          const stale = createServer((socket) => socket.destroy());
+          await new Promise((resolve, reject) => {
+            stale.once("error", reject);
+            stale.listen(source, resolve);
+          });
+          linkSync(source, socketPath);
+          await new Promise((resolve) => stale.close(() => resolve()));
+          await chmod(socketPath, 0o600);
+          const socketStats = await lstat(socketPath, { bigint: true });
+          await mod.__testReapStaleSocketWithSerializedAuthority(
+            socketPath,
+            { dev: String(socketStats.dev), ino: String(socketStats.ino) },
+            scaffoldPath,
+            process.platform,
+          );
+          const mode = (await lstat(scaffoldPath)).mode & 0o777;
+          if (mode !== 0o600) {
+            console.error(String(mode.toString(8)));
+            process.exit(1);
+          }
+        `, {
+          MODULE_URL: CROSS_PROCESS_LOCK_MODULE_URL,
+          RUNTIME_ROOT: runtimeRoot,
+        });
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "stops spawning unused-scaffold helpers after the pass cap",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const helperLog = join(base, "slow-sweep-helper.log");
+        for (let index = 0; index < SLOW_SWEEP_PAIR_COUNT; index += 1) {
+          const digest = scaffoldDigest(SLOW_SWEEP_DIGEST_SEED + index);
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const slowHelperScript = `
+          const fs = require("node:fs");
+          const [runtimeDir, digest] = process.argv.slice(1);
+          void runtimeDir;
+          fs.appendFileSync(${JSON.stringify(helperLog)}, digest + "\\n");
+          setInterval(() => undefined, 1_000);
+        `;
+        const started = Date.now();
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript: slowHelperScript },
+        );
+        expect(Date.now() - started).toBeLessThan(SLOW_SWEEP_PASS_TEST_BOUND_MS);
+        const log = await readFile(helperLog, "utf8");
+        expect(log.trim().split("\n")).toHaveLength(1);
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "keeps the active scaffold digest out of the unused-pair sweep",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const activeDigest = scaffoldDigest(ACTIVE_SWEEP_DIGEST_SEED);
+        await writeSecureScaffold(join(runtimeRoot, `${activeDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${activeDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          activeDigest,
+          process.platform,
+        );
+
+        const names = await readdir(runtimeRoot);
+        expect(names).toContain(`${activeDigest}.reaper`);
+        expect(names).toContain(`${activeDigest}.reader-reaper`);
+      } finally {
         await rm(runtimeRoot, { recursive: true, force: true });
       }
     },

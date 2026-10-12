@@ -102,9 +102,14 @@ const MAX_BARRIER_READER_SOCKETS = 4_096;
 // 128 = one helper spawn per 32 entries under the shared fail-closed ceiling.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT =
   MAX_BARRIER_READER_SOCKETS / 32;
+// The whole sweep pass gets one helper deadline, not one deadline per candidate:
+// STALE_REAPER_TIMEOUT_MS is already the maximum useful wait for one serialized
+// authority attempt, so spending more in one acquire would only delay admission.
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_PASS_TIMEOUT_MS = STALE_REAPER_TIMEOUT_MS;
 // The sweep is amortized by identity; the interval is derived from the
-// stale-reaper deadline so one admitting peer gets a full scaffold-freshness
-// window before the same identity may sweep again.
+// stale-reaper deadline so the in-process cache avoids repeated local scans
+// while the ctime gate and helper oldEnough check provide the cross-process
+// scaffold-freshness window.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_INTERVAL_MS = STALE_REAPER_TIMEOUT_MS;
 // A peer can create its scaffold pair before it binds the socket. A scaffold
 // younger than the stale-reaper deadline is treated as possibly in-admission.
@@ -1156,8 +1161,10 @@ async function sweepUnusedBarrierScaffolds(
   runtimeDir: string,
   activeScaffoldDigest: string,
   host: NodeJS.Platform,
+  options: { helperScript?: string } = {},
 ): Promise<void> {
   const now = Date.now();
+  const passStarted = now;
   const lastSweep = lastUnusedBarrierSweepByDigest.get(activeScaffoldDigest) ?? 0;
   if (now - lastSweep < UNUSED_BARRIER_SCAFFOLD_SWEEP_INTERVAL_MS) return;
   if (lastUnusedBarrierSweepByDigest.size > MAX_BARRIER_READER_SOCKETS) {
@@ -1194,6 +1201,11 @@ async function sweepUnusedBarrierScaffolds(
     let helperSpawns = 0;
     for (const digest of scaffoldDigests) {
       if (helperSpawns >= UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT) break;
+      if (
+        Date.now() - passStarted >= UNUSED_BARRIER_SCAFFOLD_SWEEP_PASS_TIMEOUT_MS
+      ) {
+        break;
+      }
       if (digest === activeScaffoldDigest) continue;
       const readerDigest = digest.slice(0, BARRIER_READER_PREFIX_HEX_CHARS);
       const hasLiveEntry =
@@ -1229,6 +1241,9 @@ async function sweepUnusedBarrierScaffolds(
       await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host, {
         exclusiveSnapshot,
         readerSnapshot,
+        ...(options.helperScript !== undefined
+          ? { helperScript: options.helperScript }
+          : {}),
       }).catch(() => 0);
     }
     completed = true;
@@ -1248,9 +1263,11 @@ async function sweepOneUnusedBarrierScaffold(
   options: {
     exclusiveSnapshot: SweepScaffoldSnapshot;
     readerSnapshot: SweepScaffoldSnapshot;
+    afterPreSpawnCheck?: () => Promise<void>;
+    helperScript?: string;
   },
 ): Promise<number> {
-  const script = String.raw`
+  const script = options.helperScript ?? String.raw`
 const fs=require('node:fs'); const path=require('node:path');
 const [runtimeDir,digest,readerPrefix,minAgeRaw]=process.argv.slice(1);
 const minAgeMs=Number(minAgeRaw); const now=Date.now();
@@ -1291,6 +1308,7 @@ process.stdout.write(String(removed));
   ) {
     return 0;
   }
+  await options.afterPreSpawnCheck?.();
   const command = kernelReaperCommand(host);
   const commandArgs = host === "darwin"
     ? [
@@ -1326,13 +1344,7 @@ process.stdout.write(String(removed));
         String(UNUSED_BARRIER_SCAFFOLD_MIN_AGE_MS),
       ];
   return await new Promise<number>((resolve, reject) => {
-    const child = spawn("/bin/sh", [
-      "-c",
-      "umask 077; exec \"$@\"",
-      "unused-scaffold-lock",
-      command,
-      ...commandArgs,
-    ], {
+    const child = spawnReaperLockTool(command, commandArgs, "unused-scaffold-lock", {
       stdio: ["ignore", "pipe", "ignore"],
       detached: true,
     });
@@ -1374,6 +1386,55 @@ process.stdout.write(String(removed));
       }
       resolve(0);
     });
+  });
+}
+
+function spawnReaperLockTool(
+  command: string,
+  commandArgs: string[],
+  label: string,
+  options: Parameters<typeof spawn>[2],
+): ChildProcessWithoutNullStreams {
+  return spawn("/bin/sh", [
+    "-c",
+    // INVARIANT (reaper scaffold creation): if lockf/flock opens a name after a
+    // peer removed it, the shell clamps creation to 0600 so the next classifier
+    // sees a valid inert scaffold rather than a process-umask artifact.
+    "umask 077; exec \"$@\"",
+    label,
+    command,
+    ...commandArgs,
+  ], options) as ChildProcessWithoutNullStreams;
+}
+
+export async function __testSweepUnusedBarrierScaffolds(
+  runtimeDir: string,
+  activeScaffoldDigest: string,
+  host: NodeJS.Platform,
+  options: { helperScript?: string } = {},
+): Promise<void> {
+  await sweepUnusedBarrierScaffolds(runtimeDir, activeScaffoldDigest, host, options);
+}
+
+export async function __testSweepOneUnusedBarrierScaffoldAfterRemovingPair(
+  runtimeDir: string,
+  digest: string,
+  host: NodeJS.Platform,
+): Promise<number> {
+  const exclusiveScaffoldPath = join(runtimeDir, `${digest}.reaper`);
+  const readerScaffoldPath = join(runtimeDir, `${digest}.reader-reaper`);
+  const exclusiveSnapshot = await readSweepScaffoldSnapshot(exclusiveScaffoldPath);
+  const readerSnapshot = await readSweepScaffoldSnapshot(readerScaffoldPath);
+  if (exclusiveSnapshot === null || readerSnapshot === null) {
+    throw new CrossProcessLockError("test scaffold pair is not sweepable", "io");
+  }
+  return await sweepOneUnusedBarrierScaffold(runtimeDir, digest, host, {
+    exclusiveSnapshot,
+    readerSnapshot,
+    afterPreSpawnCheck: async () => {
+      await rm(exclusiveScaffoldPath, { force: true });
+      await rm(readerScaffoldPath, { force: true });
+    },
   });
 }
 
@@ -2142,7 +2203,7 @@ function probe(){if(!same())return finish(73);const s=net.createConnection(path)
 probe();`;
   const command = kernelReaperCommand(host);
   const commandArgs = host === "darwin"
-    ? ["-t", "0", scaffoldPath, process.execPath, "-e", script, socketPath, expected.dev, expected.ino]
+    ? ["-k", "-t", "0", scaffoldPath, process.execPath, "-e", script, socketPath, expected.dev, expected.ino]
     : ["-n", scaffoldPath, process.execPath, "-e", script, socketPath, expected.dev, expected.ino];
   return await new Promise<"reaped" | "retry">((resolve, reject) => {
     // `detached: true` makes the reaper command its own process-group leader, so
@@ -2151,7 +2212,7 @@ probe();`;
     // direct child: killing only lockf would ORPHAN the node script, which could
     // then `unlinkSync` the target socket AFTER we gave up and retried — a TOCTOU
     // double/wrong-reap against a possibly-recycled inode (round-2 reaper-orphan).
-    const child = spawn(command, commandArgs, {
+    const child = spawnReaperLockTool(command, commandArgs, "stale-socket-reaper-lock", {
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
@@ -2200,6 +2261,20 @@ probe();`;
       ));
     });
   });
+}
+
+export async function __testReapStaleSocketWithSerializedAuthority(
+  socketPath: string,
+  expected: KernelDirectoryIdentity,
+  scaffoldPath: string,
+  host: NodeJS.Platform,
+): Promise<"reaped" | "retry"> {
+  return await reapStaleSocketWithSerializedAuthority(
+    socketPath,
+    expected,
+    scaffoldPath,
+    host,
+  );
 }
 
 /** Injected inputs for {@link resolveCustodyLockRoot}; production passes the real environment. */
