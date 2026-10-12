@@ -145,7 +145,8 @@ which switches `protect` to its non-interactive custody confirmation and skips
 opening the dashboard in a browser, and `--agent-guided`, described under
 Secret boundary below. Three observations are absent from v1.8.4:
 `tier1_approval` and `staged_recovery_file` arrive from 1.8.6 (present on the
-`next` channel), and `vault_provision` exists on `main` only.
+`next` channel), and `vault_provision` arrives from 1.8.6-rc.5 (npm `next`)
+and is absent on v1.8.4.
 
 ## Secret boundary
 

@@ -97,7 +97,8 @@ with; those are governed by their own policies.
 ## Verify Before You Trust
 
 Each release of `@sanctuary-framework/mcp-server` can be checked before it is
-installed, with no account and no network beyond the npm registry and GitHub.
+installed, with no network beyond the npm registry and GitHub; the `curl` form
+below needs no account, and `gh release download` needs a `gh auth login`.
 The commands below are written against `1.8.4`; substitute the release you are
 checking.
 
@@ -110,12 +111,17 @@ checking.
   and provenance for every package installed in a project, so run it where the
   package is installed; an empty directory reports nothing to audit, which is
   not a pass.
-- **Signed release manifest.** Every release attaches `release-manifest.json`
-  and the tarball to the GitHub release, and the manifest is signed with a
-  pinned Ed25519 key. From a clone of this repository at the tag:
+- **Signed release manifest.** Every `1.8.x` release attaches
+  `release-manifest.json` and the tarball to the GitHub release (earlier
+  releases such as v1.7.0 carry neither), and the manifest is signed with a
+  pinned Ed25519 key. From a clone of this repository at the tag, with the two
+  assets fetched by `curl` (or by `gh release download v1.8.4 --pattern
+  release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz`
+  after `gh auth login`):
 
   ```bash
-  gh release download v1.8.4 --pattern release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz
+  curl -LO https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.4/release-manifest.json
+  curl -LO https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.4/sanctuary-framework-mcp-server-1.8.4.tgz
   node scripts/verify-release-artifact.mjs --tarball sanctuary-framework-mcp-server-1.8.4.tgz --manifest release-manifest.json --version 1.8.4 --expected-public-key 61YBfiq_zlbTP5rl_r_msbPk40IXJL-_PuAxlpBVeF0
   ```
 
@@ -124,8 +130,9 @@ checking.
   from the tag you are verifying if it ever differs from this page. Success
   prints `Verified sanctuary-framework-mcp-server-1.8.4.tgz for release 1.8.4.`
   and exits 0; any mismatch exits 1 with `Release verification refused:` and
-  the reason. The private half of the key is custodied by the maintainer
-  outside this repository.
+  the reason. The private half of the key is held as a GitHub Actions secret
+  of this repository (`RELEASE_SIGNING_KEY`, read only by
+  `publish-on-tag.yml`); it is never in the tree.
 - **macOS app.** `Sanctuary-CastleWall.app.zip` is Developer-ID-signed and
   notarized; compare `shasum -a 256 Sanctuary-CastleWall.app.zip` with the
   SHA-256 published in [`README.md`](README.md) under Release status for the

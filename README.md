@@ -8,7 +8,7 @@
 
 An AI agent running on your machine can do anything your account can do. It holds your credentials, reads your files, and talks to the whole internet, and a single poisoned web page can turn that into exfiltration. Every sandbox on offer today is one the agent, or its vendor, chooses to run inside. That is not a wall. That is a request.
 
-Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, one agent per fortress; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
+Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, one agent per fortress; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --claude-code
@@ -24,9 +24,9 @@ Quote the block below to your operator. It was written against v1.8.4, the npm `
 What Sanctuary is: the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read.
 What it is not: no Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail. Windows enforcement is roadmapped; nothing enforces on Windows today. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven.
 Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. macOS: proven, on a patched host. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Windows: roadmapped.
-Install:   npx @sanctuary-framework/mcp-server protect --claude-code --no-open
-Verify:    npx @sanctuary-framework/mcp-server doctor --json
-Uninstall: npx @sanctuary-framework/mcp-server uninstall
+Install:   npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+Verify:    npx -y @sanctuary-framework/mcp-server doctor --json
+Uninstall: npx -y @sanctuary-framework/mcp-server uninstall
 Evidence: every capability claim traces to a row in ASSURANCE_MATRIX.md, and a row reads proven only when a captured drill on the platform that matters says so. Drill records are under docs/audit/.
 ```
 
@@ -63,7 +63,7 @@ Your harness already has a sandbox, and the two are built for different question
 Harness column sources, each fetched 2026-10-12 (none of the three pages shows a last-updated date; the Cursor page's newest changelog entry is dated 2026-10-01):
 
 - [Claude Code: Configure the sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing). The sandbox covers shell commands only and is off by default; it uses Seatbelt on macOS and `bubblewrap` plus `socat` on Linux and WSL2; network goes through a local proxy checked against an allowed-domain list; on native Windows commands run unsandboxed; MCP servers, hooks, and the built-in file and web tools run outside it; Claude can ask to retry a failed command unsandboxed.
-- [Codex: Sandboxing](https://developers.openai.com/codex/sandboxing). The sandbox constrains which files the agent can modify and whether commands can use the network; Seatbelt on macOS, `bubblewrap` on Linux and WSL2, a native Windows sandbox in PowerShell; `workspace-write` is the default mode and `danger-full-access` removes the filesystem and network boundaries.
+- [Codex: Sandboxing](https://learn.chatgpt.com/docs/sandboxing). The sandbox constrains which files the agent can modify and whether commands can use the network; Seatbelt on macOS, `bubblewrap` on Linux and WSL2, a native Windows sandbox in PowerShell; `workspace-write` is the default mode and `danger-full-access` removes the filesystem and network boundaries.
 - [Cursor: Run modes](https://cursor.com/docs/agent/run-modes). Sandboxed commands read and write inside the workspace; network is blocked by default and then opened per `sandbox.json`; Seatbelt through `sandbox-exec` on macOS, Landlock plus seccomp on Linux kernel 6.2 or later with a Bubblewrap fallback; no Windows sandbox is described; a command that fails on a sandbox restriction can be rerun outside it after classifier review.
 
 The argument for why the two layers are different problems: [Containment is an isolation problem](docs/_posts/2026-10-10-containment-is-an-isolation-problem.md).
@@ -88,12 +88,14 @@ The vocabulary, so the rest reads: **Castle Wall** is the kernel-level egress fi
 Three commands, in order: install, verify, uninstall. Each exists on the v1.8.4 tag that `npx` resolves to, and none of them prompts when stdin is not a terminal.
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --claude-code --no-open
-npx @sanctuary-framework/mcp-server doctor --json
-npx @sanctuary-framework/mcp-server uninstall
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server doctor --json
+npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx @sanctuary-framework/mcp-server` prefix, and the rest of this README writes `sanctuary`. Already running OpenClaw, Hermes, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Compatibility for the named harnesses is exercised on every release; Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness, so start it later with `sanctuary dashboard`.
+
+After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx -y @sanctuary-framework/mcp-server` prefix, and the rest of this README writes `sanctuary`. Already running OpenClaw, Hermes, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Config rewriting and bootstrap behavior for the named harnesses are proven by tests on representative harness paths; those tests do not prove interception for every listed harness version or non-MCP agent surface, and the Assurance Matrix "Agent wrapping" row is partial and states that bound. Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
 
 What happens when you run protect:
 
@@ -105,7 +107,7 @@ shared/network/FUSE filesystems are refused rather than presenting a local Unix
 socket as cross-host exclusion.
 2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
 3. The config is rewritten so every tool call routes through Sanctuary.
-4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
+4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) and opens in your browser with a one-click auth token.
 5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity layer on top per the Assurance Matrix: fingerprintable-header stripping is on by default, and an opt-in, consent-gated PII rewrite scrubs query content before it leaves the machine, with the rewrite's internal classifier pinned to local processing so a privacy feature can never become an egress channel. Dangerous operations require your approval.
 
 Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal. `--unwrap` restores the original harness config. `--passphrase-stdin` (from 1.8.6, unreleased; an unknown-flag refusal on the v1.8.4 tag and on the 1.8.6 pre-releases) reads the fortress passphrase from piped stdin. Two other verbs have non-interactive forms: `sanctuary init --no-confirm` skips the recovery-key confirmation that otherwise refuses to run without a terminal, and `sanctuary export-passphrase --yes` skips its `Continue? [y/N]` prompt. An installing agent never runs `export-passphrase`; see the agent section below.
@@ -118,7 +120,7 @@ sanctuary export-passphrase
 
 Prints the passphrase to stdout after a confirmation prompt. Store it in a password manager. If you lose it, encrypted state cannot be recovered.
 
-**Verify.** `sanctuary doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Failing: exit code 1 and at least one `FAIL` check whose `hint` names the next step; a fortress that has never completed `protect` reports `identity`, `principal policy`, and `audit chain` as `FAIL` with hints that say so. What a mistake looks like from the outside: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress, so read `storage_path` before the checks.
+**Verify.** `sanctuary doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Failing: exit code 1 and at least one `FAIL` check whose `hint` names the next step; a fortress that has never completed `protect` reports `identity`, `principal policy`, and `audit chain` as `FAIL` with hints that say so, and `state dir` also reads `FAIL` when the directory is absent or is not a directory. What a mistake looks like from the outside: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress, so read `storage_path` before the checks.
 
 **Uninstall.** `sanctuary uninstall` removes Sanctuary's installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it refuses `--remove-operator-data` by design, and it reports any residue that needs sudo, the Castle Wall host app, or a reboot rather than reporting a clean uninstall while that residue remains. `sanctuary protect --unwrap` restores the original harness config from `~/.sanctuary/backup/` and removes nothing else. Enforcement footprint: `uninstall`. Harness config: `--unwrap`. Operator data stays in place under both.
 
@@ -140,7 +142,7 @@ installs still resolve to v1.8.4, and RC5 does not widen any capability claim.
 ```bash
 npm install -g @sanctuary-framework/mcp-server@1.8.6-rc.5
 # or run the guided installer without a global install
-npx @sanctuary-framework/mcp-server@1.8.6-rc.5 protect --claude-code
+npx -y @sanctuary-framework/mcp-server@1.8.6-rc.5 protect --claude-code --no-open --no-dashboard
 ```
 
 The [v1.8.6-rc.5 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.8.6-rc.5)
@@ -151,7 +153,7 @@ See the [RC5 release notes](docs/releases/v1.8.6.md) for the bounded fix set.
 
 ### Verify before you trust
 
-Each check below runs without an account, and an agent can run all of them before it installs anything.
+An agent can run every check below before it installs anything; the `curl` form needs no account, and `gh release download` needs a `gh auth login`.
 
 ```bash
 npm view @sanctuary-framework/mcp-server@1.8.4 dist.attestations
@@ -163,11 +165,12 @@ The first prints the npm provenance attestation for the release (`predicateType:
 The release tarball is also signed with a pinned Ed25519 key, and the verifier ships in this repository. From a clone at the tag:
 
 ```bash
-gh release download v1.8.4 --pattern release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz
+curl -LO https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.4/release-manifest.json
+curl -LO https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.4/sanctuary-framework-mcp-server-1.8.4.tgz
 node scripts/verify-release-artifact.mjs --tarball sanctuary-framework-mcp-server-1.8.4.tgz --manifest release-manifest.json --version 1.8.4 --expected-public-key 61YBfiq_zlbTP5rl_r_msbPk40IXJL-_PuAxlpBVeF0
 ```
 
-The expected public key is `PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL` in [`server/src/release-manifest.ts`](server/src/release-manifest.ts); if this paragraph and that constant at the tag ever differ, the constant wins. The script prints `Verified sanctuary-framework-mcp-server-1.8.4.tgz for release 1.8.4.` and exits 0 on success; any mismatch exits 1 with `Release verification refused:` and the reason. For the macOS app, compare `shasum -a 256 Sanctuary-CastleWall.app.zip` with the SHA-256 printed above for the release you downloaded. The Linux package is checksum-only today: the [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1) pre-release ships a `.sha256` beside the `.deb`, with no signature and no apt repository, so `sha256sum -c sanctuary-castle-wall_0.1.0-1_amd64.deb.sha256` is the whole check.
+With `gh auth login` done, `gh release download v1.8.4 --pattern release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz` fetches the same two assets. The expected public key is `PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL` in [`server/src/release-manifest.ts`](server/src/release-manifest.ts); if this paragraph and that constant at the tag ever differ, the constant wins. The script prints `Verified sanctuary-framework-mcp-server-1.8.4.tgz for release 1.8.4.` and exits 0 on success; any mismatch exits 1 with `Release verification refused:` and the reason. For the macOS app, compare `shasum -a 256 Sanctuary-CastleWall.app.zip` with the SHA-256 printed above for the release you downloaded. The Linux package is checksum-only today: the [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1) pre-release ships a `.sha256` beside the `.deb`, with no signature and no apt repository, so `sha256sum -c sanctuary-castle-wall_0.1.0-1_amd64.deb.sha256` is the whole check.
 
 Current capability summary:
 
@@ -306,7 +309,7 @@ private, such as moving a staged recovery file into a password manager.
 prose for the operator (v1.8.4 puts one reminder string there on every
 response: rerun the planner after each action). Two observations arrive from 1.8.6 (present on the
 `next` channel, absent from v1.8.4): `tier1_approval` and
-`staged_recovery_file`; `vault_provision` exists on `main` only.
+`staged_recovery_file`; `vault_provision` arrives from 1.8.6-rc.5 (npm `next`) and is absent on v1.8.4.
 
 The operator, not the agent, performs three things: Apple consent, bounded
 privilege authorization, and private recovery custody. In particular, never read
@@ -453,7 +456,7 @@ Sanctuary ships the rights substrate. Access (compute, devices, bandwidth, liter
 
 ## Works with
 
-Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag or direct MCP config and gain release-tested coverage as drills extend the [Assurance Matrix](ASSURANCE_MATRIX.md).
+Sanctuary wraps MCP-compatible harnesses. For the named harnesses below, tests prove config rewrite and bootstrap behavior for representative harness paths; they do not prove interception for every listed harness version or non-MCP agent surface (the [Assurance Matrix](ASSURANCE_MATRIX.md) "Agent wrapping" row, partial). Other MCP-compatible harnesses work via the `--wrap` flag or direct MCP config and gain coverage as drills extend the matrix.
 
 - **OpenClaw** (`sanctuary protect --openclaw`)
 - **Hermes Agent** (`sanctuary protect --hermes`)
@@ -475,11 +478,11 @@ When your agent needs to negotiate or make deals, **Concordia Protocol** adds st
 Install both if you want the full stack:
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --claude-code
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
 pip install concordia-protocol
 ```
 
-A bare `npx @sanctuary-framework/mcp-server` with no subcommand starts the stdio MCP server and waits for a client; in a shell it never returns. That bare form is the right entry inside a harness configuration and the wrong command to type in a terminal, where `protect` is the verb.
+`-y` skips npm's install prompt, and `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; start it later with `sanctuary dashboard`. A bare `npx @sanctuary-framework/mcp-server` with no subcommand starts the stdio MCP server and waits for a client; in a shell it never returns. That bare form is the right entry inside a harness configuration and the wrong command to type in a terminal, where `protect` is the verb.
 
 ---
 
