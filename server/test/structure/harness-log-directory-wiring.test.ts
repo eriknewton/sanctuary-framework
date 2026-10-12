@@ -20,6 +20,15 @@ function installHarnessDaemonSource(source: string): string {
 }
 
 describe("structure: harness log directory install wiring", () => {
+  it("pins the default directory open flags at the production helper", async () => {
+    const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
+
+    expect(source).toMatch(
+      /export const HARNESS_LOG_DIRECTORY_OPEN_FLAGS =\s*fsConstants\.O_RDONLY \|\s*fsConstants\.O_NOFOLLOW \|\s*fsConstants\.O_DIRECTORY;/,
+    );
+    expect(source).toContain("open(path, HARNESS_LOG_DIRECTORY_OPEN_FLAGS)");
+  });
+
   it("routes the install path through the custody helper and keeps path mutation out of the caller", async () => {
     const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
     const installSource = installHarnessDaemonSource(source);

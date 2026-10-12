@@ -163,6 +163,9 @@ import {
 // diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 import { stripTrailingSlashes } from "../strings.js";
+import { resolveHarnessDaemonLogDir } from "./harness-log-dir.js";
+
+export { resolveHarnessDaemonLogDir } from "./harness-log-dir.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -174,26 +177,29 @@ const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
 export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
-/** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
-export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
-  return `${stripTrailingSlashes(newAccountHome)}/logs`;
-}
-
 export class HarnessLogDirectoryCustodyError extends Error {
+  readonly internalCode: string;
+
   constructor(
     harnessLogDir: string,
-    options?: ErrorOptions,
+    options?: { internalCode?: string },
   ) {
     super(
       `Harness log directory custody check failed for ${harnessLogDir}; inspect the dedicated account home and re-run protect.`,
-      options,
     );
     this.name = "HarnessLogDirectoryCustodyError";
+    this.internalCode = options?.internalCode ?? "harness_log_custody";
   }
 }
 
 const HARNESS_LOG_DIR_MODE = 0o700;
 const HARNESS_LOG_DIR_MODE_MASK = 0o7777;
+const ROOT_UID = 0;
+const ROOT_GID = 0;
+// 0o022 = group-write plus other-write; the dedicated account home may keep any group, but not writable group/other bits.
+const GROUP_OR_OTHER_WRITE_MASK = 0o022;
+export const HARNESS_LOG_DIRECTORY_OPEN_FLAGS =
+  fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY;
 // 1 = the minimum directory link count APFS and POSIX filesystems report for a live directory.
 const MIN_DIRECTORY_NLINK_SANITY = 1;
 // 3 = the first child stdio fd; stdin/stdout/stderr occupy 0, 1, and 2.
@@ -215,6 +221,7 @@ export interface HarnessLogDirectoryHandle {
   chown(uid: number, gid: number): Promise<void>;
   chmod(mode: number): Promise<void>;
   stat(): Promise<HarnessLogDirectoryStats>;
+  readEntries?(): Promise<string[]>;
   close(): Promise<void>;
 }
 
@@ -224,10 +231,10 @@ export interface HarnessLogDirectoryOps {
   openDirectoryNoFollow(path: string): Promise<HarnessLogDirectoryHandle>;
 }
 
-function harnessLogCustodyError(harnessLogDir: string, cause?: unknown): HarnessLogDirectoryCustodyError {
-  return cause === undefined
-    ? new HarnessLogDirectoryCustodyError(harnessLogDir)
-    : new HarnessLogDirectoryCustodyError(harnessLogDir, { cause });
+function harnessLogCustodyError(harnessLogDir: string, reason?: unknown): HarnessLogDirectoryCustodyError {
+  return new HarnessLogDirectoryCustodyError(harnessLogDir, {
+    internalCode: typeof reason === "string" ? reason : "harness_log_custody",
+  });
 }
 
 function sameHarnessLogDirectoryIdentity(
@@ -264,6 +271,24 @@ function harnessLogDirectoryOwnerIs(stats: HarnessLogDirectoryStats, owner: { ui
   return stats.uid === owner.uid && stats.gid === owner.gid;
 }
 
+function harnessLogDirectoryIsRootOwnedAdoptionCandidate(
+  stats: HarnessLogDirectoryStats,
+  parentGid: number,
+): boolean {
+  return stats.uid === ROOT_UID && (stats.gid === ROOT_GID || stats.gid === parentGid);
+}
+
+function assertHarnessLogDirectoryParentCustody(
+  harnessLogDir: string,
+  stats: HarnessLogDirectoryStats,
+  uid: number,
+): void {
+  assertHarnessLogDirectoryShape(harnessLogDir, stats);
+  if (stats.uid !== uid || (harnessLogDirectoryMode(stats) & GROUP_OR_OTHER_WRITE_MASK) !== 0) {
+    throw harnessLogCustodyError(harnessLogDir, "parent_custody");
+  }
+}
+
 function assertHarnessLogDirectoryMode(
   harnessLogDir: string,
   stats: HarnessLogDirectoryStats,
@@ -281,6 +306,25 @@ function assertHarnessLogDirectoryIdentity(
 ): void {
   if (!sameHarnessLogDirectoryIdentity(expected, actual)) {
     throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+async function assertHarnessLogDirectoryEmpty(
+  harnessLogDir: string,
+  handle: HarnessLogDirectoryHandle,
+): Promise<void> {
+  if (handle.readEntries === undefined) {
+    throw harnessLogCustodyError(harnessLogDir, "directory_entry_reader_unavailable");
+  }
+  let entries: string[];
+  try {
+    // The adoption decision reads through the opened directory handle; a path replacement cannot change which inode is judged empty.
+    entries = await handle.readEntries();
+  } catch {
+    throw harnessLogCustodyError(harnessLogDir, "directory_entry_read_failed");
+  }
+  if (entries.length !== 0) {
+    throw harnessLogCustodyError(harnessLogDir, "directory_not_empty");
   }
 }
 
@@ -315,26 +359,13 @@ async function clearHarnessLogDirectoryAcl(
     throw harnessLogCustodyError(harnessLogDir);
   }
   const inheritedPath = `/dev/fd/${INHERITED_DIRECTORY_FD}`;
-  const result = await runCommandWithInheritedDirectoryFd("/bin/chmod", ["-N", inheritedPath], handle.fd);
+  let result: { code: number | null; stdout: string; stderr: string };
+  try {
+    result = await runCommandWithInheritedDirectoryFd("/bin/chmod", ["-N", inheritedPath], handle.fd);
+  } catch {
+    throw harnessLogCustodyError(harnessLogDir, "acl_clear_spawn_failed");
+  }
   if (result.code !== 0) {
-    throw harnessLogCustodyError(harnessLogDir);
-  }
-}
-
-async function assertHarnessLogDirectoryAclClear(
-  harnessLogDir: string,
-  handle: HarnessLogDirectoryHandle,
-): Promise<void> {
-  if (osPlatform() !== "darwin") return;
-  if (handle.fd === undefined) {
-    throw harnessLogCustodyError(harnessLogDir);
-  }
-  const inheritedPath = `/dev/fd/${INHERITED_DIRECTORY_FD}`;
-  const result = await runCommandWithInheritedDirectoryFd("/bin/ls", ["-lde", inheritedPath], handle.fd);
-  if (result.code !== 0) {
-    throw harnessLogCustodyError(harnessLogDir);
-  }
-  if (/^\s*\d+:/m.test(result.stdout)) {
     throw harnessLogCustodyError(harnessLogDir);
   }
 }
@@ -346,8 +377,17 @@ export async function ensureHarnessDaemonLogDir(
   ops: HarnessLogDirectoryOps = {
     lstat,
     mkdir,
-    openDirectoryNoFollow: (path) =>
-      open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
+    openDirectoryNoFollow: async (path) => {
+      const handle = await open(path, HARNESS_LOG_DIRECTORY_OPEN_FLAGS);
+      return {
+        fd: handle.fd,
+        chown: (targetUid, targetGid) => handle.chown(targetUid, targetGid),
+        chmod: (mode) => handle.chmod(mode),
+        stat: () => handle.stat() as Promise<HarnessLogDirectoryStats>,
+        readEntries: () => readdir(`/dev/fd/${handle.fd}`),
+        close: () => handle.close(),
+      };
+    },
   },
 ): Promise<void> {
   const parent = dirname(harnessLogDir);
@@ -357,8 +397,7 @@ export async function ensureHarnessDaemonLogDir(
   } catch (err) {
     throw harnessLogCustodyError(harnessLogDir, err);
   }
-  assertHarnessLogDirectoryShape(harnessLogDir, parentStats);
-  assertHarnessLogDirectoryOwner(harnessLogDir, parentStats, [{ uid, gid }]);
+  assertHarnessLogDirectoryParentCustody(harnessLogDir, parentStats, uid);
 
   let stats: HarnessLogDirectoryStats | undefined;
   try {
@@ -369,10 +408,11 @@ export async function ensureHarnessDaemonLogDir(
     }
   }
 
-  const processOwner = {
-    uid: process.geteuid?.() ?? 0,
-    gid: process.getegid?.() ?? 0,
-  };
+  const agentOwner = { uid, gid };
+  const rootOwnedAdoptionOwners = [
+    { uid: ROOT_UID, gid: ROOT_GID },
+    { uid: ROOT_UID, gid: parentStats.gid },
+  ];
   if (stats === undefined) {
     try {
       await ops.mkdir(harnessLogDir, { recursive: false, mode: HARNESS_LOG_DIR_MODE });
@@ -387,10 +427,10 @@ export async function ensureHarnessDaemonLogDir(
   }
   assertHarnessLogDirectoryShape(harnessLogDir, stats);
   assertHarnessLogDirectoryOwner(harnessLogDir, stats, [
-    { uid, gid },
-    processOwner,
+    agentOwner,
+    ...rootOwnedAdoptionOwners,
   ]);
-  if (!harnessLogDirectoryOwnerIs(stats, { uid, gid }) && harnessLogDirectoryOwnerIs(stats, processOwner)) {
+  if (!harnessLogDirectoryOwnerIs(stats, agentOwner)) {
     assertHarnessLogDirectoryMode(harnessLogDir, stats, HARNESS_LOG_DIR_MODE);
   }
 
@@ -414,19 +454,20 @@ export async function ensureHarnessDaemonLogDir(
     assertHarnessLogDirectoryShape(harnessLogDir, handleStats);
     assertHarnessLogDirectoryIdentity(harnessLogDir, stats, handleStats);
     assertHarnessLogDirectoryOwner(harnessLogDir, handleStats, [
-      { uid, gid },
-      processOwner,
+      agentOwner,
+      ...rootOwnedAdoptionOwners,
     ]);
-    if (!harnessLogDirectoryOwnerIs(handleStats, { uid, gid }) && harnessLogDirectoryOwnerIs(handleStats, processOwner)) {
+    if (!harnessLogDirectoryOwnerIs(handleStats, agentOwner)) {
       assertHarnessLogDirectoryMode(harnessLogDir, handleStats, HARNESS_LOG_DIR_MODE);
     }
     const preMutationPathStats = await ops.lstat(harnessLogDir).catch((err) => {
       throw harnessLogCustodyError(harnessLogDir, err);
     });
     assertHarnessLogDirectoryIdentity(harnessLogDir, handleStats, preMutationPathStats);
-    await clearHarnessLogDirectoryAcl(harnessLogDir, handle).catch((err) => {
-      throw harnessLogCustodyError(harnessLogDir, err);
-    });
+    if (harnessLogDirectoryIsRootOwnedAdoptionCandidate(handleStats, parentStats.gid)) {
+      await assertHarnessLogDirectoryEmpty(harnessLogDir, handle);
+    }
+    await clearHarnessLogDirectoryAcl(harnessLogDir, handle);
     await handle.chown(uid, gid).catch((err) => {
       throw harnessLogCustodyError(harnessLogDir, err);
     });
@@ -437,9 +478,8 @@ export async function ensureHarnessDaemonLogDir(
       throw harnessLogCustodyError(harnessLogDir, err);
     });
     assertHarnessLogDirectoryShape(harnessLogDir, repairedStats);
-    assertHarnessLogDirectoryOwner(harnessLogDir, repairedStats, [{ uid, gid }]);
+    assertHarnessLogDirectoryOwner(harnessLogDir, repairedStats, [agentOwner]);
     assertHarnessLogDirectoryMode(harnessLogDir, repairedStats, HARNESS_LOG_DIR_MODE);
-    await assertHarnessLogDirectoryAclClear(harnessLogDir, handle);
     const finalPathStats = await ops.lstat(harnessLogDir).catch((err) => {
       throw harnessLogCustodyError(harnessLogDir, err);
     });

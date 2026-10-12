@@ -41,7 +41,7 @@ import {
   getOrCreatePassphrase,
   observeStoredPassphrase,
 } from "../wrap/passphrase.js";
-import { resolveHarnessDaemonLogDir } from "../wrap/auto-provision.js";
+import { resolveHarnessDaemonLogDir } from "../wrap/harness-log-dir.js";
 import {
   custodyCredentialRefusal,
   resolveFortressCustodyCredential,

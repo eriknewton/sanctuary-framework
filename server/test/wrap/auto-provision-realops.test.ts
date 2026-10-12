@@ -1540,6 +1540,10 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     };
   }
 
+  async function overlayStats(path: string, uid: number, gid: number): Promise<HarnessLogDirectoryStats> {
+    return statsWithOwner(await lstat(path), uid, gid);
+  }
+
   it("AGENT-HOME-LOGS-SYMLINK-01: refuses an unsafe pre-existing harness log entry before ownership repair", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-harness-log-custody-"));
     let openedForMutation = false;
@@ -1581,6 +1585,138 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       expect(logStats.uid).toBe(currentUid);
       expect(logStats.gid).toBe(currentGid);
       expect(logStats.mode & 0o7777).toBe(0o700);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: accepts a fresh root-owned log directory under a staff-group home", async () => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
+    const targetUid = currentUid + 1000;
+    const targetGid = targetUid;
+    const inheritedHomeGid = currentGid;
+    let logOwner = { uid: 0, gid: inheritedHomeGid };
+    try {
+      await ensureHarnessDaemonLogDir(logDir, targetUid, targetGid, {
+        lstat: async (path) => {
+          if (path === agentHome) return overlayStats(path, targetUid, inheritedHomeGid);
+          if (path === logDir) return overlayStats(path, logOwner.uid, logOwner.gid);
+          return lstat(path);
+        },
+        mkdir,
+        openDirectoryNoFollow: async (path) => {
+          const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+          return {
+            fd: realHandle.fd,
+            chown: async (uid, gid) => {
+              logOwner = { uid, gid };
+            },
+            chmod: (mode) => realHandle.chmod(mode),
+            stat: async () => overlayStats(path, logOwner.uid, logOwner.gid),
+            close: () => realHandle.close(),
+            readEntries: () => readdir(path),
+          };
+        },
+      });
+      expect(logOwner).toEqual({ uid: targetUid, gid: targetGid });
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: refuses a non-empty root-owned log directory before ownership repair", async () => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
+    const targetUid = currentUid + 1000;
+    const targetGid = targetUid;
+    let chownCalled = false;
+    try {
+      await mkdir(logDir, { mode: 0o700 });
+      await writeFile(join(logDir, "existing.log"), "preserve");
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, targetUid, targetGid, {
+          lstat: async (path) => {
+            if (path === agentHome) return overlayStats(path, targetUid, currentGid);
+            if (path === logDir) return overlayStats(path, 0, currentGid);
+            return lstat(path);
+          },
+          mkdir,
+          openDirectoryNoFollow: async (path) => {
+            const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+            return {
+              fd: realHandle.fd,
+              chown: async () => {
+                chownCalled = true;
+              },
+              chmod: (mode) => realHandle.chmod(mode),
+              stat: async () => overlayStats(path, 0, currentGid),
+              close: () => realHandle.close(),
+              readEntries: () => readdir(path),
+            };
+          },
+        }),
+        logDir,
+      );
+      expect(chownCalled).toBe(false);
+      expect(await readFile(join(logDir, "existing.log"), "utf8")).toBe("preserve");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a dedicated account home whose group is inherited from the platform", async () => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
+    const targetUid = currentUid + 1000;
+    const targetGid = targetUid;
+    let logOwner = { uid: targetUid, gid: targetGid };
+    try {
+      await mkdir(logDir, { mode: 0o755 });
+      await ensureHarnessDaemonLogDir(logDir, targetUid, targetGid, {
+        lstat: async (path) => {
+          if (path === agentHome) return overlayStats(path, targetUid, currentGid);
+          if (path === logDir) return overlayStats(path, logOwner.uid, logOwner.gid);
+          return lstat(path);
+        },
+        mkdir,
+        openDirectoryNoFollow: async (path) => {
+          const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+          return {
+            fd: realHandle.fd,
+            chown: async (uid, gid) => {
+              logOwner = { uid, gid };
+            },
+            chmod: (mode) => realHandle.chmod(mode),
+            stat: async () => overlayStats(path, logOwner.uid, logOwner.gid),
+            close: () => realHandle.close(),
+          };
+        },
+      });
+      expect(logOwner).toEqual({ uid: targetUid, gid: targetGid });
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("wraps harness log custody failures without attaching the raw platform error as cause", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    try {
+      let caught: unknown;
+      try {
+        await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async () => {
+            throw Object.assign(new Error("raw platform path detail"), { code: "EIO" });
+          },
+          mkdir,
+          openDirectoryNoFollow: async () => {
+            throw new Error("open should not run");
+          },
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(HarnessLogDirectoryCustodyError);
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+      expect(caught).toMatchObject({ internalCode: expect.any(String) });
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
