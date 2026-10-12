@@ -179,6 +179,104 @@ export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
   return `${stripTrailingSlashes(newAccountHome)}/logs`;
 }
 
+export class HarnessLogDirectoryCustodyError extends Error {
+  constructor(
+    message = "Harness log directory custody check failed; inspect the dedicated account home and re-run protect.",
+  ) {
+    super(message);
+    this.name = "HarnessLogDirectoryCustodyError";
+  }
+}
+
+const HARNESS_LOG_DIR_MODE = 0o700;
+// 2 = the minimum POSIX directory link count for "." plus its parent entry.
+const MIN_DIRECTORY_NLINK = 2;
+
+export interface HarnessLogDirectoryStats {
+  uid: number;
+  gid: number;
+  mode: number;
+  nlink: number;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+export interface HarnessLogDirectoryHandle {
+  chown(uid: number, gid: number): Promise<void>;
+  chmod(mode: number): Promise<void>;
+  stat(): Promise<HarnessLogDirectoryStats>;
+  close(): Promise<void>;
+}
+
+export interface HarnessLogDirectoryOps {
+  lstat(path: string): Promise<HarnessLogDirectoryStats>;
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<string | undefined>;
+  openDirectoryNoFollow(path: string): Promise<HarnessLogDirectoryHandle>;
+}
+
+function assertHarnessLogDirectoryCustody(
+  stats: HarnessLogDirectoryStats,
+  expected: { uid: number; gid: number },
+  requireExpectedOwner: boolean,
+): void {
+  if (!stats.isDirectory() || stats.isSymbolicLink() || stats.nlink < MIN_DIRECTORY_NLINK) {
+    throw new HarnessLogDirectoryCustodyError();
+  }
+  if (requireExpectedOwner && (stats.uid !== expected.uid || stats.gid !== expected.gid)) {
+    throw new HarnessLogDirectoryCustodyError();
+  }
+}
+
+export async function ensureHarnessDaemonLogDir(
+  harnessLogDir: string,
+  uid: number,
+  gid: number,
+  ops: HarnessLogDirectoryOps = {
+    lstat,
+    mkdir,
+    openDirectoryNoFollow: (path) =>
+      open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
+  },
+): Promise<void> {
+  let stats: HarnessLogDirectoryStats | undefined;
+  try {
+    stats = await ops.lstat(harnessLogDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new HarnessLogDirectoryCustodyError();
+    }
+  }
+
+  if (stats === undefined) {
+    await ops.mkdir(harnessLogDir, { recursive: true, mode: HARNESS_LOG_DIR_MODE });
+    try {
+      stats = await ops.lstat(harnessLogDir);
+    } catch {
+      throw new HarnessLogDirectoryCustodyError();
+    }
+    assertHarnessLogDirectoryCustody(stats, { uid, gid }, false);
+  } else {
+    assertHarnessLogDirectoryCustody(stats, { uid, gid }, true);
+  }
+
+  // The log directory is re-opened with no-follow directory flags before
+  // ownership or mode changes, so a final path component cannot redirect the
+  // privileged repair to some other filesystem object.
+  let handle: HarnessLogDirectoryHandle;
+  try {
+    handle = await ops.openDirectoryNoFollow(harnessLogDir);
+  } catch {
+    throw new HarnessLogDirectoryCustodyError();
+  }
+  try {
+    await handle.chown(uid, gid);
+    await handle.chmod(HARNESS_LOG_DIR_MODE);
+    assertHarnessLogDirectoryCustody(await handle.stat(), { uid, gid }, true);
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * Bug B (consistency): resolve the fortress path whose Castle Wall the
  * auto-provision flow ensures a policy daemon for AND arms. This flow ONLY runs
@@ -1385,9 +1483,7 @@ export async function runAutoProvisionForWrap(
           operatorHome,
         });
         const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
-        await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
-        await chmod(harnessLogDir, 0o700);
-        await fsChown(harnessLogDir, uid, uid);
+        await ensureHarnessDaemonLogDir(harnessLogDir, uid, uid);
         if (options.exclusiveEgress === true) {
           // S5-6 fine-grained mode: the S5-5 PARKED install. The plist is the
           // barrier form (Disabled + RunAtLoad=false + wrapper argv), the job

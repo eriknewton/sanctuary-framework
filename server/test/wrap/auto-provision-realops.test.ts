@@ -51,6 +51,8 @@ import {
   resolveCredentialDestPathsToVerify,
   resolveWallFortressPath,
   resolveHarnessDaemonLogDir,
+  ensureHarnessDaemonLogDir,
+  HarnessLogDirectoryCustodyError,
   hermesRuntimeRehomePaths,
   moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
@@ -1472,6 +1474,39 @@ describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", 
     expect(resolveHarnessDaemonLogDir("/var/sanctuary-agents/sanctuary-hermes/")).toBe(
       "/var/sanctuary-agents/sanctuary-hermes/logs",
     );
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: harness log directory custody", () => {
+  it("AGENT-HOME-LOGS-SYMLINK-01: refuses an unsafe pre-existing harness log entry before ownership repair", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-harness-log-custody-"));
+    let openedForMutation = false;
+    try {
+      // 502 is the fixture dedicated-agent uid used throughout this wrap suite.
+      const targetUid = 502;
+      const agentHome = join(tmpRoot, "agent-home");
+      const outside = join(tmpRoot, "outside");
+      const logDir = join(agentHome, "logs");
+      await mkdir(agentHome);
+      await mkdir(outside);
+      await symlink(outside, logDir);
+
+      await expect(
+        ensureHarnessDaemonLogDir(logDir, targetUid, targetUid, {
+          lstat,
+          mkdir,
+          openDirectoryNoFollow: async () => {
+            openedForMutation = true;
+            throw new Error("open must not run for an unsafe log entry");
+          },
+        }),
+      ).rejects.toBeInstanceOf(HarnessLogDirectoryCustodyError);
+
+      expect(openedForMutation).toBe(false);
+      expect(await readlink(logDir)).toBe(outside);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 
