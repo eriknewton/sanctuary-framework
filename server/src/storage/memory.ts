@@ -41,6 +41,13 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = predecessor.catch(() => undefined).then(() => gate);
     this.namespaceLockTails.set(identity, tail);
+    void tail.then(() => {
+      // The map retains this tail until both the predecessor and this waiter's
+      // gate settle, so an aborting waiter cannot hide a still-held namespace.
+      if (this.namespaceLockTails.get(identity) === tail) {
+        this.namespaceLockTails.delete(identity);
+      }
+    });
     const controller = new AbortController();
     try {
       // The tail is published before waiting so later callers chain behind this
@@ -50,9 +57,6 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
       return await operation({ signal: controller.signal, assertHeld: () => undefined });
     } finally {
       release();
-      if (this.namespaceLockTails.get(identity) === tail) {
-        this.namespaceLockTails.delete(identity);
-      }
     }
   }
 

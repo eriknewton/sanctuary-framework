@@ -20,7 +20,13 @@ import type {
   NamespaceLockStorageCapabilities,
   StorageBackend,
 } from "../../storage/interface.js";
-import { withCrossProcessLock, withRequiredCrossProcessLock } from "../../storage/cross-process-lock.js";
+import {
+  type CrossProcessLockLease,
+  type CrossProcessLockOptions,
+  withCrossProcessLock,
+  withPathLock,
+  withRequiredCrossProcessLock,
+} from "../../storage/cross-process-lock.js";
 import { constantTimeEqual, stringToBytes, toBase64url } from "../../core/encoding.js";
 import { hash, hmacSha256 } from "../../core/hashing.js";
 import { derivePurposeKey } from "../../core/key-derivation.js";
@@ -99,8 +105,6 @@ const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
 export const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
 export const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
 export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
-export const SDW_MEMORY_CORPUS_LOCK_ABORT_POLL_MS = 100;
-
 // Exported: `sdw/memory-tools.ts` derives the memory_search needle byte cap
 // from this so the tool boundary and the store agree on "one chunk of text".
 export const DEFAULT_MAX_CHUNK_CHARS = 8192;
@@ -265,7 +269,6 @@ export type SdwMemoryBackendAdapterModeOptions =
 
 export interface SdwMemoryCorpusMutationLockOptions {
   readonly abortSignal?: AbortSignal;
-  readonly pollIntervalMs?: number;
 }
 
 /** Must match every C2 writer and the C3 migration lock acquisition. */
@@ -287,14 +290,22 @@ export async function withSdwMemoryCorpusMutationLock<T>(
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const tail = previous.catch(() => {}).then(() => gate);
   corpusMutationTails.set(storage, tail);
+  void tail.then(() => {
+    // The published tail remains visible until the prior holder and this
+    // waiter's gate have both settled, so a later caller cannot skip a live
+    // holder after this waiter aborts.
+    if (corpusMutationTails.get(storage) === tail) corpusMutationTails.delete(storage);
+  });
   try {
     // The tail is linked before this waiter can abort, so a later waiter stays
     // behind the original holder even when this waiter refuses early.
     await waitForSdwMemoryCorpusTurn(previous.catch(() => {}), options);
+    // A grant that races an abort is still refused immediately before the
+    // critical section, with no await between this check and the storage work.
+    assertSdwMemoryCorpusWaitNotAborted(options.abortSignal);
     return await fn();
   } finally {
     release();
-    if (corpusMutationTails.get(storage) === tail) corpusMutationTails.delete(storage);
   }
 }
 
@@ -477,6 +488,16 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
     const transactional = asSdwTransactional(this.storage);
     if (transactional !== null) {
+      if (this.mode === "hermes-bridge") {
+        // Bridge approval is bound to the non-transactional write order below;
+        // a late transactional capability can reach the hook but never writes.
+        this.assertHermesBridgeInsertAllowed();
+        await this.assertHermesBridgeCommitAllowed(prepared);
+        throw new SdwValidationError(
+          "operation_refused",
+          "Hermes bridge SDW memory adapter refuses transactional storage",
+        );
+      }
       await transactional.sdwTransaction(async (txn) => {
         this.assertSignerStillPrimary(prepared);
         await this.assertCandidateCapacity([prepared], txn);
@@ -490,7 +511,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       });
     } else {
       const acquireCorpusLock =
-        this.mode === "hermes-bridge" ? withRequiredCrossProcessLock : withCrossProcessLock;
+        this.mode === "hermes-bridge" ? withHermesBridgeStorageLock : withCrossProcessLock;
       await this.withDocumentLock(documentId, () => acquireCorpusLock(
         this.storage,
         MEMORY_BATCH_LOCK_NAMESPACE,
@@ -2130,6 +2151,27 @@ function hasRequiredHermesBridgeLockCapability(storage: StorageBackend): boolean
   const filesystem = storage as Partial<FilesystemStorageCapabilities>;
   return typeof filesystem.namespacePath === "function" &&
     typeof filesystem.writeDurable === "function";
+}
+
+function withHermesBridgeStorageLock<T>(
+  storage: StorageBackend,
+  namespace: string,
+  lockFileName: string,
+  operation: (lease: CrossProcessLockLease) => Promise<T>,
+  options: CrossProcessLockOptions = {},
+): Promise<T> {
+  const namespaceLock = storage as Partial<NamespaceLockStorageCapabilities>;
+  if (typeof namespaceLock.withNamespaceLock === "function") {
+    return withRequiredCrossProcessLock(storage, namespace, lockFileName, operation, options);
+  }
+  const filesystem = storage as Partial<FilesystemStorageCapabilities>;
+  if (typeof filesystem.namespacePath === "function" &&
+      typeof filesystem.writeDurable === "function") {
+    // Filesystem-backed bridge storage takes the path lock locally; the shared
+    // custody helper keeps its stricter explicit-namespace-lock contract.
+    return withPathLock(filesystem.namespacePath(namespace), lockFileName, operation, options);
+  }
+  return withRequiredCrossProcessLock(storage, namespace, lockFileName, operation, options);
 }
 
 function partialScopeError(cause?: unknown): SdwValidationError {

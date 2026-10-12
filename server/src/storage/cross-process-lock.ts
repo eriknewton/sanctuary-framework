@@ -546,15 +546,11 @@ export async function withRequiredCrossProcessLock<T>(
   if (explicit) {
     return explicit.withNamespaceLock(namespace, lockFileName, operation, options);
   }
-  const capabilities = asFilesystemCapabilities(storage);
-  if (!capabilities) {
-    throw new CrossProcessLockError(
-      "storage backend does not expose the required namespace-lock or filesystem lock capability; " +
-        "use a backend or decorator that explicitly implements a lock primitive",
-      "capability",
-    );
-  }
-  return withPathLock(capabilities.namespacePath(namespace), lockFileName, operation, options);
+  throw new CrossProcessLockError(
+    "storage backend does not expose the required namespace-lock capability; " +
+      "use a backend or decorator that explicitly implements withNamespaceLock",
+    "capability",
+  );
 }
 
 /**

@@ -61,6 +61,37 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     expect(await within(third, 1000)).toBe("ran");
   });
 
+  it("keeps a later namespace waiter behind the original holder after the middle waiter aborts", async () => {
+    const storage = new MemoryStorage();
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((r) => { releaseHolder = r; });
+    let holderRunning = false;
+    let overlap = false;
+    const holder = storage.withNamespaceLock("probe_ns", "x.lock", async () => {
+      holderRunning = true;
+      await held;
+      holderRunning = false;
+    });
+    await tick();
+    const controller = new AbortController();
+    const waiter = storage.withNamespaceLock("probe_ns", "x.lock", async () => undefined, {
+      abortSignal: controller.signal,
+    });
+    await tick();
+    controller.abort();
+    await expect(waiter).rejects.toThrow(/aborted/);
+    const third = storage.withNamespaceLock("probe_ns", "x.lock", async () => {
+      if (holderRunning) overlap = true;
+      return "ran";
+    });
+    await tick(50);
+    expect(overlap).toBe(false);
+    releaseHolder();
+    await holder;
+    expect(await within(third, 1000)).toBe("ran");
+    expect(overlap).toBe(false);
+  });
+
   it("keeps a later corpus waiter behind the original holder when the middle waiter aborts", async () => {
     const storage = new MemoryStorage();
     let releaseA!: () => void;
@@ -76,7 +107,6 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     const controller = new AbortController();
     const b = withSdwMemoryCorpusMutationLock(storage, async () => undefined, {
       abortSignal: controller.signal,
-      pollIntervalMs: 5,
     });
     const c = withSdwMemoryCorpusMutationLock(storage, async () => {
       if (aRunning) overlap = true;
@@ -84,6 +114,36 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     controller.abort();
     await expect(b).rejects.toMatchObject({ category: "operation_aborted" });
     await tick(50);
+    releaseA();
+    await a;
+    await c;
+    expect(overlap).toBe(false);
+  });
+
+  it("keeps a later corpus waiter behind the original holder after the middle waiter aborts", async () => {
+    const storage = new MemoryStorage();
+    let releaseA!: () => void;
+    const heldA = new Promise<void>((r) => { releaseA = r; });
+    let aRunning = false;
+    let overlap = false;
+    const a = withSdwMemoryCorpusMutationLock(storage, async () => {
+      aRunning = true;
+      await heldA;
+      aRunning = false;
+    });
+    await tick();
+    const controller = new AbortController();
+    const b = withSdwMemoryCorpusMutationLock(storage, async () => undefined, {
+      abortSignal: controller.signal,
+    });
+    await tick();
+    controller.abort();
+    await expect(b).rejects.toMatchObject({ category: "operation_aborted" });
+    const c = withSdwMemoryCorpusMutationLock(storage, async () => {
+      if (aRunning) overlap = true;
+    });
+    await tick(50);
+    expect(overlap).toBe(false);
     releaseA();
     await a;
     await c;
@@ -100,12 +160,95 @@ describe("Hermes bridge SDW memory abort boundary", () => {
     let ranAfterAbort = false;
     const b = withSdwMemoryCorpusMutationLock(storage, async () => {
       if (controller.signal.aborted) ranAfterAbort = true;
-    }, { abortSignal: controller.signal, pollIntervalMs: 1000 });
+    }, { abortSignal: controller.signal });
     releaseA();
     controller.abort();
     await a;
     await b.catch(() => undefined);
     expect(ranAfterAbort).toBe(false);
+  });
+
+  it("refuses a corpus grant when the abort is scheduled from the granted predecessor", async () => {
+    const storage = new MemoryStorage();
+    let releaseA!: () => void;
+    const heldA = new Promise<void>((r) => { releaseA = r; });
+    const a = withSdwMemoryCorpusMutationLock(storage, async () => { await heldA; });
+    await tick();
+    const controller = new AbortController();
+    let ran = false;
+    const b = withSdwMemoryCorpusMutationLock(storage, async () => {
+      ran = true;
+    }, { abortSignal: controller.signal });
+    a.then(() => controller.abort(), () => controller.abort());
+    releaseA();
+    await a;
+    await expect(b).rejects.toMatchObject({ category: "operation_aborted" });
+    expect(ran).toBe(false);
+  });
+
+  it("refuses a namespace grant when the abort is scheduled from the granted predecessor", async () => {
+    const storage = new MemoryStorage();
+    let releaseA!: () => void;
+    const heldA = new Promise<void>((r) => { releaseA = r; });
+    const a = storage.withNamespaceLock("probe_ns", "x.lock", async () => { await heldA; });
+    await tick();
+    const controller = new AbortController();
+    let ran = false;
+    const b = storage.withNamespaceLock("probe_ns", "x.lock", async () => {
+      ran = true;
+    }, { abortSignal: controller.signal });
+    a.then(() => controller.abort(), () => controller.abort());
+    releaseA();
+    await a;
+    await expect(b).rejects.toThrow(/aborted/);
+    expect(ran).toBe(false);
+  });
+
+  it("keeps bridge inserts serialized across two aborted waiters and a fresh adapter", async () => {
+    const storage = new MemoryStorage();
+    const controllerOne = new AbortController();
+    const controllerTwo = new AbortController();
+    let releaseFirst!: () => void;
+    const parked = new Promise<void>((r) => { releaseFirst = r; });
+    let firstAtCheck = false;
+    let freshAtCheck = false;
+    const firstAdapter = adapter(storage, {
+      abortSignal: controllerOne.signal,
+      async assertAllowedToCommit(ctx) {
+        if (ctx.passageId === "first") {
+          firstAtCheck = true;
+          await parked;
+        }
+      },
+    });
+    const first = firstAdapter.insertPassage(input("first", "a"), "user_content");
+    for (let i = 0; i < 100 && !firstAtCheck; i += 1) await tick(5);
+    const second = firstAdapter.insertPassage(input("second", "b"), "user_content");
+    await tick();
+    controllerOne.abort();
+    await expect(second).rejects.toMatchObject({ category: "operation_aborted" });
+
+    const secondAdapter = adapter(storage, {
+      abortSignal: controllerTwo.signal,
+      async assertAllowedToCommit() {},
+    });
+    const third = secondAdapter.insertPassage(input("third", "c"), "user_content");
+    await tick();
+    controllerTwo.abort();
+    await expect(third).rejects.toMatchObject({ category: "operation_aborted" });
+
+    const freshAdapter = adapter(storage, {
+      async assertAllowedToCommit(ctx) {
+        if (ctx.passageId === "fresh") freshAtCheck = true;
+      },
+    });
+    const fresh = freshAdapter.insertPassage(input("fresh", "d"), "user_content");
+    await tick(50);
+    expect(freshAtCheck).toBe(false);
+    releaseFirst();
+    await first;
+    await fresh;
+    expect(freshAtCheck).toBe(true);
   });
 
   it("keeps the shared store usable after an adapter abort races the grant", async () => {
@@ -215,6 +358,22 @@ describe("Hermes bridge SDW memory abort boundary", () => {
       badSignerAuthority: BAD_SIGNER_AUTHORITY,
       commitCheck: undefined as unknown as HermesBridgeCommitCheck,
     })).toThrow(/commit check/);
+  });
+
+  it("refuses a missing bad-signer authority at Hermes bridge construction", () => {
+    const deps = testMemoryProvenanceDependencies(MASTER_KEY);
+    expect(() => new SdwMemoryBackendAdapter({
+      mode: "hermes-bridge",
+      storage: new MemoryStorage(),
+      masterKey: MASTER_KEY,
+      fortressId: "fortress:probe",
+      ownerRef: OWNER_REF,
+      resolvePrimarySigningHandle: deps.resolvePrimarySigningHandle,
+      resolveSignerPublicKey: deps.resolveSignerPublicKey,
+      resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
+      commitCheck: { async assertAllowedToCommit() {} },
+      badSignerAuthority: undefined,
+    } as never)).toThrow(/bad-signer authority/);
   });
 
   it("releases locks after a post-hook write failure rolls back cleanly", async () => {
