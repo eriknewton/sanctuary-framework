@@ -1143,7 +1143,7 @@ export async function applyCustodyRollback(
               result.identityChanged.push(entry.path);
               continue;
             }
-            // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): rollback shares the forward socket/symlink pathname window; detection is best-effort, the ownership call is never reverted, and a transient second name gone before the post-check is not seen.
+            // Rollback shares the forward socket/symlink pathname window tracked by the CUSTODY-SOCKET-LCHOWN-WINDOW debt handle at the forward check; detection is best-effort, the ownership call is never reverted, and a transient second name gone before the post-check is not seen.
             const skip = multiplyNamedNonDirectorySkip(entry, operationFresh);
             if (skip !== null) {
               result.skipped.push(skip);
