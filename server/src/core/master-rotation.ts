@@ -2026,6 +2026,7 @@ async function walkFortress(
     namespaces = await ctx.storage.listNamespaces();
   } catch (error) {
     if (isFilesystemStorageNameError(error)) {
+      if (!verifyOnly) throw error;
       throw new RotationPreflightError(
         `storage-name preflight refused during namespace discovery: ${
           error instanceof Error ? error.message : String(error)
@@ -2050,6 +2051,7 @@ async function walkFortress(
       entries = (await ctx.storage.list(namespace)).length;
     } catch (error) {
       if (isFilesystemStorageNameError(error)) {
+        if (!verifyOnly) throw error;
         throw new RotationPreflightError(
           `storage-name preflight refused in namespace "${namespace}": ${
             error instanceof Error ? error.message : String(error)

@@ -1232,9 +1232,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       for await (const entry of await opendir(path)) {
         chargeEntry();
         if (entry.name.endsWith(".enc")) {
-          // Discovery must prove a namespace's child entries are also
-          // byte-addressable; otherwise a later list(namespace) refusal would
-          // arrive after callers treated discovery as a complete custody set.
+          // Discovery proves the namespace directory and first stored entry;
+          // every consumer lists the namespace itself before acting on entries.
           try {
             decodeRawFilesystemStorageName(entry.name.slice(0, -4), "key");
           } catch (error) {
@@ -1247,6 +1246,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
             throw error;
           }
           hasEntries = true;
+          break;
         }
       }
       if (!hasEntries) continue;

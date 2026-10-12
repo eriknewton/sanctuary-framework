@@ -32,9 +32,13 @@ import {
   DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
   FilesystemStorage,
 } from "../../src/storage/filesystem.js";
+import { MAX_NAMESPACE_DISCOVERY_ENTRIES } from "../../src/storage/interface.js";
 import type { ToolDefinition } from "../../src/router.js";
 
 // NAMESPACE-ENCODER-NON-BIJECTIVE-01
+
+const LARGE_NAMESPACE_EXTRA_ENTRIES = 10;
+const FILE_CREATE_BATCH_SIZE = 256;
 
 it("keeps the directory-capability readiness bound load-tolerant and finite", () => {
   expect(DIRECTORY_CAPABILITY_READY_TIMEOUT_MS).toBe(15_000);
@@ -176,6 +180,27 @@ describe("FilesystemStorage", () => {
       expect(await storage.listNamespaces()).toContain("cafe-\u00F1");
     });
 
+    it("keeps namespace discovery bounded for one large clean namespace", async () => {
+      const namespace = "_audit-like";
+      const namespacePath = join(basePath, namespace);
+      await mkdir(namespacePath, { recursive: true, mode: 0o700 });
+      const totalEntries = MAX_NAMESPACE_DISCOVERY_ENTRIES + LARGE_NAMESPACE_EXTRA_ENTRIES;
+      for (let start = 0; start < totalEntries; start += FILE_CREATE_BATCH_SIZE) {
+        const end = Math.min(start + FILE_CREATE_BATCH_SIZE, totalEntries);
+        await Promise.all(
+          Array.from({ length: end - start }, async (_, offset) => {
+            const index = start + offset;
+            await writeFile(
+              join(namespacePath, `entry-${index}.enc`),
+              new Uint8Array(),
+            );
+          }),
+        );
+      }
+
+      expect(await storage.listNamespaces()).toEqual([namespace]);
+    });
+
     it("refuses raw stored names that cannot be re-addressed", async () => {
       await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });
       await writeFile(join(basePath, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
@@ -206,19 +231,6 @@ describe("FilesystemStorage", () => {
     });
 
     const darwinIt = process.platform === "darwin" ? it : it.skip;
-
-    it("checks every stored child during namespace discovery", async () => {
-      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
-      await writeFile(join(basePath, "plain", "z-good.enc"), new Uint8Array([1]));
-      await writeFile(
-        join(basePath, "plain", "a-!4E2D.enc"),
-        new Uint8Array([2]),
-      );
-
-      await expect(storage.listNamespaces()).rejects.toMatchObject({
-        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
-      });
-    });
 
     darwinIt("refuses raw stored names through the Darwin directory capability", async () => {
       await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });

@@ -8,7 +8,7 @@
  * the checkpoint bundle, and never touches reserved namespaces.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -30,6 +30,8 @@ import type { AuditLog } from "../../src/operational/audit-log.js";
 import { StateStore as RealStateStore } from "../../src/cognitive/state-store.js";
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
 import {
   CheckpointRestoreAgentNotParkedError,
   CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
@@ -50,7 +52,8 @@ type CriticalAuditCall = Parameters<AuditAppendCritical>[0];
 
 interface Fixture {
   fortressPath: string;
-  storage: MemoryStorage;
+  storage: StorageBackend;
+  statePath?: string;
   stateStore: RealStateStore;
   checkpointStore: MemoryCheckpointStore;
   masterKey: Uint8Array;
@@ -100,6 +103,33 @@ async function makeFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
   });
   return {
     fortressPath,
+    storage,
+    stateStore,
+    checkpointStore,
+    masterKey,
+    identity,
+    identityEncKey,
+    audit: makeAuditLog(),
+  };
+}
+
+async function makeFilesystemFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
+  const fortressPath = await makeTempFortress();
+  const statePath = join(fortressPath, "state");
+  await mkdir(statePath, { recursive: true, mode: 0o700 });
+  const storage = new FilesystemStorage(statePath);
+  const masterKey = generateRandomKey();
+  const stateStore = new RealStateStore(storage, masterKey);
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const identity = createIdentity("restore-test", identityEncKey, "recovery-key");
+  await persistStoredIdentity(storage, masterKey, identity.storedIdentity);
+  const checkpointStore = new MemoryCheckpointStore({
+    fortressPath,
+    clock: { now: () => new Date(now) },
+  });
+  return {
+    fortressPath,
+    statePath,
     storage,
     stateStore,
     checkpointStore,
@@ -592,9 +622,10 @@ describe("restoreCheckpoint", () => {
     });
   });
 
-  it("runs the import storage-name preflight before reconstruction effects", async () => {
-    const fixture = await makeFixture();
-    await writeEntry(fixture, "mem", "Q", "known-good");
+  it("runs the real import storage-name preflight before reconstruction effects", async () => {
+    const fixture = await makeFilesystemFixture();
+    if (!fixture.statePath) throw new Error("filesystem fixture missing state path");
+    await writeEntry(fixture, "omega", "Q", "known-good");
     const checkpoint = await createCheckpoint({
       stateStore: fixture.stateStore,
       store: fixture.checkpointStore,
@@ -605,38 +636,14 @@ describe("restoreCheckpoint", () => {
       retentionValue: "off",
       now: new Date("2026-08-03T12:06:30.000Z"),
     });
-
-    const calls: string[] = [];
-    const failingStateStore: Pick<
-      StateStore,
-      | "exportNamespaces"
-      | "delete"
-      | "import"
-      | "assertImportVersionFloors"
-      | "preflightImportStorageNames"
-    > = {
-      assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
-      preflightImportStorageNames: async () => {
-        calls.push("preflight");
-        throw new Error("checkpoint storage names refused");
-      },
-      exportNamespaces: async () => {
-        calls.push("export");
-        throw new Error("export should not be reached");
-      },
-      delete: async () => {
-        calls.push("delete");
-        throw new Error("delete should not be reached");
-      },
-      import: async () => {
-        calls.push("import");
-        throw new Error("import should not be reached");
-      },
-    };
+    await writeFile(
+      join(fixture.statePath, "omega", "key-!4E2D.enc"),
+      new Uint8Array([1]),
+    );
 
     await expect(
       restoreCheckpoint({
-        stateStore: failingStateStore,
+        stateStore: fixture.stateStore,
         checkpointStore: fixture.checkpointStore,
         masterKey: fixture.masterKey,
         auditLog: fixture.audit.auditLog,
@@ -645,9 +652,8 @@ describe("restoreCheckpoint", () => {
         assessParked: parkedClaim,
         publicKeyResolver: publicKeyResolver(fixture),
       }),
-    ).rejects.toThrow("checkpoint storage names refused");
+    ).rejects.toThrow(/storage name this version cannot address/);
 
-    expect(calls).toEqual(["preflight"]);
     const forensic = (await fixture.checkpointStore.list()).find(
       (record) => record.source === "forensic_quarantine",
     );

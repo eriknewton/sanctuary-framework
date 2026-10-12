@@ -1058,6 +1058,45 @@ describe("master rotation — fail-closed coverage", () => {
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
   });
 
+  it("keeps storage-name refusals honest after the rotation journal is durable", async () => {
+    const fortress = await buildFortress();
+    const originalListNamespaces = fortress.storage.listNamespaces!.bind(fortress.storage);
+    let refuseAfterJournal = false;
+    fortress.storage.listNamespaces = async () => {
+      if (refuseAfterJournal) {
+        throw new FilesystemStorageNameError("key", { rawName: "key-!4E2D" });
+      }
+      return originalListNamespaces();
+    };
+
+    let convertedError: unknown;
+    try {
+      await rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (point) => {
+            if (point === "journal-converting-written") {
+              refuseAfterJournal = true;
+            }
+          },
+        }),
+      );
+    } catch (error) {
+      convertedError = error;
+    }
+    expect(convertedError).toBeInstanceOf(FilesystemStorageNameError);
+    expect(convertedError).not.toBeInstanceOf(RotationPreflightError);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+
+    await expect(
+      resumeRotation({
+        storage: fortress.storage,
+        fortressPath: undefined,
+        fortressId: FORTRESS_ID,
+        passphrase: PASSPHRASE,
+      }),
+    ).rejects.toBeInstanceOf(FilesystemStorageNameError);
+  });
+
   it("aborts (nothing mutated) when an unsupported namespace holds data", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(
