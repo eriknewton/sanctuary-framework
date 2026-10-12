@@ -81,7 +81,7 @@ export function createSdwMemoryProvenanceMigrationTools(
         "Report the bounded local SDW memory provenance migration state and counts. " +
         "A complete state means every currently visible local candidate verified at completion; " +
         "it does not prove latest-state freshness or recover erased history." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       tool_class: "read",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       handler: async () => {

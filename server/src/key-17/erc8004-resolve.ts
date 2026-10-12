@@ -332,7 +332,7 @@ export function createErc8004ResolveTools(
         "owner match. Unavailable RPC, denied egress, or owner mismatch remains " +
         "unconfirmed and never becomes a false confirmed claim. Never returns " +
         "key material." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {

@@ -14,6 +14,8 @@ import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooper
 import {
   ASSURANCE_MATRIX_URL,
   COOPERATIVE_CAPABILITIES,
+  EVALUATE_NOUN_WORDS,
+  EVALUATE_NOUNS,
   EVALUATE_RELATED_TOOLS,
   EVALUATE_ROUTE_TOOLS,
   EVALUATE_ROUTES,
@@ -175,6 +177,22 @@ describe("first-class tool surfacing", () => {
         expect(entry.tier.startsWith(expected), entry.tool).toBe(true);
         if (expected === "Tier 3") expect(policy.tier3_always_allow).toContain(entry.tool);
       }
+    });
+
+    it("every evaluate noun resolves to a route, so a noun hit never falls to the ambiguous answer", () => {
+      // The catalog comment claims every noun lands on a question; this makes
+      // the claim an invariant the suite enforces (round-2 finding F2:
+      // "installation" once matched the noun gate and no route).
+      const unrouted = EVALUATE_NOUN_WORDS.filter(
+        (word) => EVALUATE_ROUTES.find((route) => route.matches.test(word)) === undefined
+      );
+      expect(unrouted).toEqual([]);
+      for (const word of EVALUATE_NOUN_WORDS) {
+        expect(EVALUATE_NOUNS.test(word), word).toBe(true);
+        expect(EVALUATE_NOUNS.test(`${word}ish`), word).toBe(false);
+      }
+      expect(EVALUATE_NOUNS.flags).not.toContain("g");
+      expect(EVALUATE_NOUNS.test("protected")).toBe(false);
     });
   });
 

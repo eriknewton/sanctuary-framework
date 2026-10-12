@@ -436,7 +436,7 @@ export function createSanctuaryTools(
         "authenticate and subsequently claim this agent's DID. The email is " +
         "sent by Verascore to the supplied address. This tool only initiates " +
         "the flow; it does not directly bind the DID." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {
@@ -515,7 +515,7 @@ export function createSanctuaryTools(
         "The `purpose` field binds the signature to a specific use case (e.g. " +
         "'verascore-claim') so a signature produced for one purpose cannot be " +
         "replayed against a different verifier." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {

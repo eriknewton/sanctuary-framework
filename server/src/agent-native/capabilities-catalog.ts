@@ -221,17 +221,45 @@ export interface EvaluateRoute {
 }
 
 /**
- * The evaluate nouns: an intent that carries one of these is a question about
- * the socket itself, so `classifyIntent` consults EVALUATE_ROUTES before the
- * ordinary remember/recall verbs ("read the bounds" is a bounds question, not
- * a memory read). An intent without one ("read my timezone") never reaches
- * the early evaluate check, which is what keeps the memory routes
- * byte-identical. Every noun here is matched by at least one route below, so
- * a noun hit always lands on a question. Never the `g` flag (test() would
- * keep state).
+ * The evaluate nouns, one word form per entry so a test can iterate them. An
+ * intent that carries one is a question about the socket itself, so
+ * `classifyIntent` consults EVALUATE_ROUTES before the ordinary memory
+ * routes, but only over a bare read/get verb: any other memory verb
+ * (remember, store, save, recall, lookup; the sets in
+ * MEMORY_VERBS, `cooperative-surface.ts`) outranks the noun, so "remember
+ * platform=linux" and "recall my bounds note" stay memory intents while
+ * "read the bounds" is a bounds question. "protected" is deliberately absent:
+ * it is an adjective about the agent's own data ("read my protected key"), not
+ * a question about this socket's protections. Every word here resolves to a
+ * route below, enforced by `test/agent-native/first-class-surfacing.test.ts`.
  */
-export const EVALUATE_NOUNS =
-  /\b(bounds?|platforms?|install(ing|ed|ation)?|uninstall|verify|verified|verification|protect(s|ed|ion|ions)?|evidence|matrix|tiers?|proven|unproven)\b/;
+export const EVALUATE_NOUN_WORDS = [
+  "bound",
+  "bounds",
+  "platform",
+  "platforms",
+  "install",
+  "installing",
+  "installed",
+  "installation",
+  "uninstall",
+  "verify",
+  "verified",
+  "verification",
+  "protect",
+  "protects",
+  "protection",
+  "protections",
+  "evidence",
+  "matrix",
+  "tier",
+  "tiers",
+  "proven",
+  "unproven",
+] as const;
+
+/** Word-boundary alternation over EVALUATE_NOUN_WORDS; never the `g` flag (test() would keep state). */
+export const EVALUATE_NOUNS = new RegExp(`\\b(${EVALUATE_NOUN_WORDS.join("|")})\\b`);
 
 /**
  * Evaluate-intent routing table, consumed by `classifyIntent` in
@@ -290,7 +318,7 @@ export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
   },
   {
     question: "install_decision",
-    matches: /\bshould i\b|\bworth\b|\binstall(ing|ed)?\b|\bevaluat(e|ing|ion)\b|\bassess\b|\badopt\b|\btrust (this|it|you)\b/,
+    matches: /\bshould i\b|\bworth\b|\binstall(ing|ed|ation)?\b|\bevaluat(e|ing|ion)\b|\bassess\b|\badopt\b|\btrust (this|it|you)\b/,
     tool: EVALUATE_ROUTE_TOOLS.sovereigntyAudit,
     example: { deep_scan: false },
     why_sanctuary: "sovereignty_audit is read-only and returns a scored gap analysis; read the bounds before weighing the score.",

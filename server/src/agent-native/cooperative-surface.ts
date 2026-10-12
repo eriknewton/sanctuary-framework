@@ -78,6 +78,29 @@ export interface CooperativeSurfaceOptions {
   approvalProofStore?: ApprovalProofStore;
 }
 
+/**
+ * The memory verbs, defined once and derived three ways so the routes and
+ * the evaluate-noun yield rule cannot drift apart (pinned from
+ * EVALUATE_NOUN_WORDS in capabilities-catalog.ts). `remember` and `recall`
+ * are the ordinary route regexes, byte-for-byte the sets the routes used
+ * before the evaluate state existed; `ordinary` is their union (the
+ * multi-clause check); `outranksEvaluateNoun` is every memory verb except the
+ * bare read/get, which are also everyday words for "tell me" and so yield to
+ * an evaluate noun.
+ */
+const REMEMBER_VERB_WORDS = ["remember", "store", "save"] as const;
+const RECALL_VERB_WORDS = ["recall", "read", "lookup", "get"] as const;
+const BARE_READ_VERB_WORDS: ReadonlySet<string> = new Set(["read", "get"]);
+const wordAlternation = (words: readonly string[]): RegExp => new RegExp(`\\b(${words.join("|")})\\b`);
+export const MEMORY_VERBS = {
+  remember: wordAlternation(REMEMBER_VERB_WORDS),
+  recall: wordAlternation(RECALL_VERB_WORDS),
+  ordinary: wordAlternation([...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS]),
+  outranksEvaluateNoun: wordAlternation(
+    [...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS].filter((word) => !BARE_READ_VERB_WORDS.has(word))
+  ),
+} as const;
+
 export function createAgentNativeCooperativeTools(
   options: CooperativeSurfaceOptions
 ): { tools: ToolDefinition[] } {
@@ -445,8 +468,7 @@ export function createAgentNativeCooperativeTools(
       "priorsession",
       "widen",
     ];
-    const isOrdinaryClause = (value: string): boolean =>
-      /\b(remember|store|save|recall|read|lookup|get)\b/.test(value);
+    const isOrdinaryClause = (value: string): boolean => MEMORY_VERBS.ordinary.test(value);
     const clauseHasGatedNeedle = (value: string): string | undefined => {
       const compact = value.replace(/[^a-z0-9:/._-]/g, "");
       return gated.find((needle) => value.includes(needle) || compact.includes(needle));
@@ -496,11 +518,14 @@ export function createAgentNativeCooperativeTools(
       };
     }
     // State order after the gated routes (gated always wins above):
-    //   state_EVALUATE_NOUN: an evaluate noun (EVALUATE_NOUNS) beats a bare
-    //     read verb, so "read the bounds" is a bounds question, not a recall;
-    //   state_REMEMBER, state_RECALL: the ordinary memory routes, reached only
-    //     by an intent without an evaluate noun, so their responses are
-    //     byte-identical to before the evaluate state existed;
+    //   state_EVALUATE_NOUN: an evaluate noun (EVALUATE_NOUNS) beats a BARE
+    //     read/get verb, so "read the bounds" is a bounds question, not a
+    //     recall; any other memory verb (MEMORY_VERBS.outranksEvaluateNoun)
+    //     keeps the intent on the memory routes, so "remember platform=linux"
+    //     and "recall my bounds note" are never hijacked;
+    //   state_REMEMBER, state_RECALL: the ordinary memory routes, with the
+    //     same verb sets as before the evaluate state existed, so their
+    //     responses are byte-identical;
     //   state_EVALUATE_FALLBACK: a question with no noun and no memory verb
     //     ("what do you not do") still lands on its route;
     //   otherwise the ambiguous fallback.
@@ -519,10 +544,10 @@ export function createAgentNativeCooperativeTools(
       guidance: route.guidance,
       related_tools: EVALUATE_RELATED_TOOLS,
     });
-    if (evaluateRoute && EVALUATE_NOUNS.test(lower)) {
+    if (evaluateRoute && EVALUATE_NOUNS.test(lower) && !MEMORY_VERBS.outranksEvaluateNoun.test(haystack)) {
       return evaluateAnswer(evaluateRoute);
     }
-    if (/\b(remember|store|save)\b/.test(haystack)) {
+    if (MEMORY_VERBS.remember.test(haystack)) {
       return {
         safety_class: "ordinary",
         tool: COOPERATIVE_TOOL_NAMES.remember,
@@ -530,7 +555,7 @@ export function createAgentNativeCooperativeTools(
         why_sanctuary: "State is encrypted, identity-bound, and audited.",
       };
     }
-    if (/\b(recall|read|lookup|get)\b/.test(haystack)) {
+    if (MEMORY_VERBS.recall.test(haystack)) {
       return {
         safety_class: "ordinary",
         tool: COOPERATIVE_TOOL_NAMES.recall,
@@ -828,7 +853,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a guidance string (the README bounds, or the CLI command), a runnable example only where a Tier 3 read-only tool answers unattended, and the related read-only tools with their tiers; an evaluate noun outranks a bare read verb, so \"read the bounds\" is a bounds question, not a memory read. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
+      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a guidance string (the README bounds, or the CLI command), a runnable example only where a Tier 3 read-only tool answers unattended, and the related read-only tools with their tiers. An evaluate noun outranks only a bare read or get verb (\"read the bounds\" is a bounds question); an intent with remember, store, save, recall or lookup keeps its memory route whatever nouns it carries. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
         type: "object",

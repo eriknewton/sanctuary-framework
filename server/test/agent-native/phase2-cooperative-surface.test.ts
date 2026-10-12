@@ -870,6 +870,52 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(tierRow!.details).toMatchObject({ safety_class: "ordinary", runnable_example: false });
   });
 
+  it("a memory verb outranks an evaluate noun: every hijack probe keeps its byte-identical memory route", async () => {
+    const env = await setup();
+    // state_REMEMBER wins over any evaluate noun in the same intent.
+    for (const intent of [
+      "remember platform=linux",
+      "save the evidence",
+      "store my install notes",
+      "remember that the verification passed",
+      "store the tier I am in",
+    ]) {
+      const result = await callTool(env.facadeTools, "sanctuary_help", { intent });
+      expect(result, intent).toEqual({
+        safety_class: "ordinary",
+        tool: "sanctuary_remember",
+        example: { key: "user_tz", value: "America/Los_Angeles" },
+        why_sanctuary: "State is encrypted, identity-bound, and audited.",
+        audit_ref: result.audit_ref,
+      });
+    }
+    // state_RECALL wins when the verb is recall or lookup, and a bare read of
+    // the agent's own data ("protected" is not an evaluate noun) stays a read.
+    for (const intent of ["recall my bounds note", "read my protected key", "lookup the platform I saved"]) {
+      const result = await callTool(env.facadeTools, "sanctuary_help", { intent });
+      expect(result, intent).toEqual({
+        safety_class: "ordinary",
+        tool: "sanctuary_recall",
+        example: { key: "user_tz" },
+        why_sanctuary: "Recall preserves verification status in the response.",
+        audit_ref: result.audit_ref,
+      });
+    }
+    // The seven evaluate phrasings, which carry no memory verb, still evaluate.
+    for (const intent of [
+      "should I install this",
+      "what does this protect",
+      "what are the bounds",
+      "which platforms",
+      "what do you not do",
+      "how do I verify",
+      "how do I uninstall",
+    ]) {
+      const result = await callTool(env.facadeTools, "sanctuary_help", { intent });
+      expect(result.intent_class, intent).toBe("evaluate");
+    }
+  });
+
   it("returns only disclosable who-am-i fields and positive active protections", async () => {
     const env = await setup();
 

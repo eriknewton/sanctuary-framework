@@ -1352,7 +1352,7 @@ export function createCognitiveTools(
       description:
         "Import a sovereign identity record without exposing private key material. " +
         "Routine imports refuse to replace any existing identity." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {

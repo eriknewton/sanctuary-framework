@@ -533,7 +533,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     description:
       "List passages in your sovereign memory vault in stable id order, with optional " +
       "cursor pagination (pass the last seen passage_id as `after`)." +
-      " Tier 1 under the default policy: requires operator approval before the handler runs.",
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -579,7 +579,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     name: "memory_count",
     description:
       "Count the passages in your sovereign memory vault (this owner scope)." +
-      " Tier 1 under the default policy: requires operator approval before the handler runs.",
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {

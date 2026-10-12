@@ -341,7 +341,7 @@ export function createErc8004Tools(
         "counterparties get an immediate signature; others require operator " +
         "approval via the inbox. No on-chain broadcast; the caller submits " +
         "the returned signature to the registry contract." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {

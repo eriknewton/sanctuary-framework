@@ -711,7 +711,7 @@ export function createContextGateTools(
         "enabled/disabled state, log_only mode, active policy, and statistics. " +
         "The enforcer automatically filters tool arguments when enabled. " +
         "Use this to monitor what the enforcer has been filtering." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {},
@@ -772,7 +772,7 @@ export function createContextGateTools(
         "set the active policy, and choose what to do when denied fields are " +
         "encountered (block the request or redact the field). " +
         "Use this to enable automatic context protection." +
-        " Tier 1 under the default policy: requires operator approval before the handler runs.",
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {
