@@ -1995,6 +1995,10 @@ mod tests {
     const EXPECTED_REFUSAL_CASE_IDS: &[&str] = &[
         "malformed_id",
         "wrong_uid",
+        "malformed_quote_rule_and_agent_id",
+        "malformed_backslash_rule_and_agent_id",
+        "wrong_uid_quote_rule_id",
+        "wrong_uid_backslash_rule_id",
         "long_rule_and_agent_id",
         "wrong_uid_long_rule_id",
         "rlo_id",

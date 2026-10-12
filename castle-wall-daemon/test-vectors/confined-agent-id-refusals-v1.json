@@ -22,6 +22,46 @@
       }
     },
     {
+      "name": "malformed_quote_rule_and_agent_id",
+      "kind": "malformed",
+      "rule_id": "rule-quote\"id",
+      "agent_id": "uid-60\"123",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"rule-quote\\\"id\" scope.agent_ids entry \"uid-60\\\"123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "malformed_backslash_rule_and_agent_id",
+      "kind": "malformed",
+      "rule_id": "rule-backslash\\id",
+      "agent_id": "uid-60\\123",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"rule-backslash\\\\id\" scope.agent_ids entry \"uid-60\\\\123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "wrong_uid_quote_rule_id",
+      "kind": "wrong_uid",
+      "rule_id": "rule-quote\"id",
+      "agent_id": "uid-60124",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"rule-quote\\\"id\" scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
+      }
+    },
+    {
+      "name": "wrong_uid_backslash_rule_id",
+      "kind": "wrong_uid",
+      "rule_id": "rule-backslash\\id",
+      "agent_id": "uid-60124",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"rule-backslash\\\\id\" scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
+      }
+    },
+    {
       "name": "long_rule_and_agent_id",
       "kind": "malformed",
       "rule_id": "rule-rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
