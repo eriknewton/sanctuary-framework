@@ -25,6 +25,15 @@ jobs:
     container:
       image: archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     timeout-minutes: 90
+    # Job scope, not workflow scope: only the job that produces the package may
+    # mint an OIDC token (id-token) and persist an attestation (attestations).
+    # The lifecycle and .deb gate jobs keep the workflow default of contents:
+    # read. A job-level block replaces the workflow block entirely, so
+    # contents: read is restated here rather than inherited.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
@@ -130,6 +139,30 @@ jobs:
           install -d "$RUNNER_TEMP/arch-package"
           cp -- "${pkg_a[0]}" "$RUNNER_TEMP/arch-package/"
           (cd "$RUNNER_TEMP/arch-package" && sha256sum ./*.pkg.tar.zst > SHA256SUMS)
+      # Build provenance for the package and its checksum file, the two files
+      # the artifact carries. The attestation is keyed by file digest, so the
+      # same bytes verify wherever they are fetched from:
+      #   gh attestation verify <file> --repo eriknewton/sanctuary-framework
+      # Runs after the reproducibility and RUSTFLAGS witnesses pass and before
+      # the upload. Runs only on push: PR builds never ship, and fork and
+      # Dependabot PRs get a read-only token with no id-token grant, so the step
+      # would fail a required job. The first attestation lands on the next push
+      # to main. This is provenance (which workflow built which commit), not a
+      # maintainer signature over the package.
+      - name: Assert both Arch package files exist before attesting
+        # No event guard: PR CI exercises the assertion so a renamed output fails here, not on main's push run.
+        # The action fails only when every pattern matches nothing; a renamed
+        # output would otherwise attest one file and report success.
+        run: |
+          pkg=("$RUNNER_TEMP"/arch-package/*.pkg.tar.zst)
+          [[ ${#pkg[@]} == 1 && -f "${pkg[0]}" && -f "$RUNNER_TEMP/arch-package/SHA256SUMS" ]]
+      - name: Attest build provenance for the Arch package files
+        if: github.event_name == 'push'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/arch-package/*.pkg.tar.zst
+            ${{ runner.temp }}/arch-package/SHA256SUMS
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
