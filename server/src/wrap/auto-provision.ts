@@ -1299,6 +1299,7 @@ export interface RunAutoProvisionForWrapOptions {
 export interface AutoProvisionSummary {
   ran: boolean;
   outcome?: ProvisionFlowOutcome;
+  custodyNormalize?: NormalizeFortressCustodyOutcome;
 }
 
 export function policyDaemonInstallBootArgs(
@@ -2319,12 +2320,12 @@ export async function finishProvisionOutcomeWithCustodyNormalize(input: {
   ) => Promise<NormalizeFortressCustodyOutcome>;
 }): Promise<AutoProvisionSummary> {
   const normalize = input.normalize ?? normalizeFortressCustody;
-  await normalize({
+  const custodyNormalize = await normalize({
     fortressPath: input.wallFortressPath,
     operator: input.operator,
     log: input.print,
   });
-  return { ran: true, outcome: input.outcome };
+  return { ran: true, outcome: input.outcome, custodyNormalize };
 }
 
 // ── Real op implementations (drill-only side effects; never exercised by CI) ──
