@@ -1685,6 +1685,16 @@ function verifyReputationArtifact(
   let unverifiable = 0;
   let firstUnverifiableSignerPrefix: string | undefined;
   for (const attestation of attestations) {
+    // Must match ReputationStore.importBundle in reputation-store.ts: a
+    // reputation artifact only verifies if every id names a storage key the
+    // importer can address before writing `_reputation`.
+    if (
+      typeof attestation.attestation_id !== "string" ||
+      !filesystemStorageNameRoundTrips(attestation.attestation_id)
+    ) {
+      invalid++;
+      continue;
+    }
     const signerKey = publicKeysByDid.get(attestation.signer);
     if (!signerKey) {
       unverifiable++;

@@ -7,7 +7,10 @@
 
 import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
 import { withRequiredCrossProcessLock } from "../storage/cross-process-lock.js";
-import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
+import {
+  assertFilesystemStorageNameAddressable,
+  isFilesystemStorageNameError,
+} from "../storage/filesystem-name-codec.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
@@ -1630,6 +1633,20 @@ export function createCognitiveTools(
           tags?: string[];
         } | undefined;
 
+        try {
+          // Continuing paths (AGENTS rule 13): requested-key and same-namespace
+          // stored-name refusals are checked before the success audit; only a
+          // namespace whose existing keys can be addressed proceeds to the
+          // audit-before-commit path below.
+          assertFilesystemStorageNameAddressable(args.key as string, "key");
+          await storage.list(args.namespace as string);
+        } catch (err) {
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_write", args.namespace as string, err);
+          }
+          throw err;
+        }
+
         await recordCriticalAudit(auditLog, "l1", "state_write", identity.identity_id, {
           namespace: args.namespace,
           key: args.key,
@@ -2010,6 +2027,20 @@ export function createCognitiveTools(
           await assertOpaqueNamespaceOwned(args.namespace as string);
         } catch {
           return denyNamespaceAccess("state_delete", args.namespace as string);
+        }
+
+        try {
+          // Continuing paths (AGENTS rule 13): requested-key and same-namespace
+          // stored-name refusals are checked before the success audit; only a
+          // namespace whose existing keys can be addressed proceeds to the
+          // audit-before-delete path below.
+          assertFilesystemStorageNameAddressable(args.key as string, "key");
+          await storage.list(args.namespace as string);
+        } catch (err) {
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_delete", args.namespace as string, err);
+          }
+          throw err;
         }
 
         await recordCriticalAudit(auditLog, "l1", "state_delete", "principal", {

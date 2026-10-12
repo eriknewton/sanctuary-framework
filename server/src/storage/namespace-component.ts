@@ -2,6 +2,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   decodeFilesystemStorageName,
   encodeFilesystemStorageName,
+  filesystemStorageNameRoundTrips,
 } from "./filesystem-name-codec.js";
 
 // Must match filesystem-name-codec.ts: namespace components and storage keys
@@ -39,7 +40,7 @@ export function storageNamespacePathComponent(namespace: string): string {
   const encoded = encodeStoragePathComponent(namespace);
   // Namespace directory names must be re-addressable by this build; otherwise
   // discovery could decode bytes that later resolve to a different directory.
-  if (decodeStoragePathComponent(encoded) !== namespace) {
+  if (!filesystemStorageNameRoundTrips(namespace)) {
     throw new InvalidStorageNamespaceError(namespace);
   }
   if (!isSingleEncodedComponent(encoded)) {

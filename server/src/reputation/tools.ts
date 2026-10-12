@@ -28,6 +28,7 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
+import { fixedDenial } from "../agent-native/safety-base.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { RuntimeStatus } from "../health/evidence.js";
@@ -42,6 +43,7 @@ import {
   type TieredAttestation,
   type SovereigntyTier,
 } from "./tiers.js";
+import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
 
 /**
  * Map an evidence-derived RuntimeStatus to the Verascore publish layer shape.
@@ -679,6 +681,10 @@ export function createReputationTools(
 
         let result;
         try {
+          // Continuing paths (AGENTS rule 13): only a completed importBundle
+          // call reaches the success audit below; storage-key, verification,
+          // quota, and exit-journal refusals all write a failure audit row and
+          // return without reporting partial success.
           // `callerIdentity` (LD3 gate fix-round-2, MUST-FIX 1): the
           // SERVER-SET agent-session principal that performed THIS import
           // call, threaded through as importBundle's quota-key origin — the
@@ -720,6 +726,23 @@ export function createReputationTools(
               completeness_verification: "failed",
               imported_at: new Date().toISOString(),
             });
+          }
+          if (isFilesystemStorageNameError(err)) {
+            await auditLog.appendCritical({
+              layer: "l4",
+              operation: "reputation_import",
+              identity_id: "system",
+              result: "failure",
+              details: {
+                imported: 0,
+                invalid: 0,
+                contexts: [],
+                completeness_verification: "failed",
+                denial_class: "namespace_unavailable",
+                storage_name_kind: err.kind,
+              },
+            });
+            return toolResult(fixedDenial("audit:reputation_import"));
           }
           const invalid =
             err instanceof ReputationBundleVerificationError

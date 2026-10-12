@@ -851,15 +851,17 @@ describe("master rotation — storage namespace discovery", () => {
       await mkdir(join(dir, "ns-!4E2D"), { recursive: true, mode: 0o700 });
       await writeFile(join(dir, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
 
-      await expect(
-        rotateMaster({
+      const refusal = rotateMaster({
           storage,
           fortressId: FORTRESS_ID,
           passphrase: PASSPHRASE,
           approve: async () => true,
           captureRecoveryKey: async (recoveryKey, verify) => verify(recoveryKey),
-        }),
-      ).rejects.toThrow(/storage name this version cannot address/);
+        });
+      await expect(refusal).rejects.toBeInstanceOf(RotationPreflightError);
+      await expect(refusal).rejects.toThrow(
+        /storage name this version cannot address/,
+      );
 
       const stillOld = await establishMaster({
         storage,

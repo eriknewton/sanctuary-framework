@@ -13,6 +13,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   REPUTATION_LEGACY_REJECT_MESSAGE,
   REPUTATION_UNKNOWN_ORIGIN,
@@ -28,6 +31,7 @@ import {
 } from "../../src/reputation/reputation-store.js";
 import type { SovereigntyTier } from "../../src/reputation/tiers.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -1453,6 +1457,107 @@ describe("L4 Reputation Store", () => {
       );
       expect(otherOriginResult.imported).toBe(1);
       expect((await targetStorage.list("_reputation")).length).toBe(2);
+    });
+
+    it("preflights every importBundle storage key before the first reputation write", async () => {
+      const exporterMasterKey = generateRandomKey();
+      const { identity: exporterIdentity, encryptionKey: exporterEncKey } =
+        setupIdentity(exporterMasterKey, "bundle-key-preflight-exporter");
+      const exporterStore = new ReputationStore(new MemoryStorage(), exporterMasterKey);
+      await exporterStore.record(
+        "bundle-key-preflight-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      await exporterStore.record(
+        "bundle-key-preflight-2",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        exporterIdentity,
+        exporterEncKey
+      );
+      const bundle = cloneBundle(
+        await exporterStore.exportBundle(exporterIdentity, exporterEncKey)
+      );
+      bundle.attestations[1]!.attestation_id = "att-\u4E2D";
+      resignAttestationAndBundle(bundle, exporterIdentity, exporterEncKey);
+
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-rep-import-key-"));
+      try {
+        const targetStorage = new FilesystemStorage(dir);
+        const targetStore = new ReputationStore(targetStorage, generateRandomKey());
+
+        await expect(
+          targetStore.importBundle(bundle, true, publicKeysFor(exporterIdentity))
+        ).rejects.toMatchObject({ code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE" });
+
+        await expect(targetStorage.list("_reputation")).resolves.toHaveLength(0);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reputation_import maps storage-key refusal to a generic denial and leaves no partial import", async () => {
+      const masterKey = generateRandomKey();
+      const { identity, encryptionKey } = setupIdentity(
+        masterKey,
+        "tool-key-preflight-exporter"
+      );
+      const exporterStore = new ReputationStore(new MemoryStorage(), masterKey);
+      await exporterStore.record(
+        "tool-key-preflight-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        identity,
+        encryptionKey
+      );
+      await exporterStore.record(
+        "tool-key-preflight-2",
+        "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "general",
+        identity,
+        encryptionKey
+      );
+      const bundle = cloneBundle(await exporterStore.exportBundle(identity, encryptionKey));
+      bundle.attestations[1]!.attestation_id = "att-\u4E2D";
+      resignAttestationAndBundle(bundle, identity, encryptionKey);
+
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-rep-tool-key-"));
+      try {
+        const storage = new FilesystemStorage(dir);
+        const identityManager = new IdentityManager(storage, masterKey);
+        await identityManager.save(identity);
+        await identityManager.setPrimary(identity.identity_id);
+        const auditLog = new AuditLog(storage, masterKey);
+        const { tools } = createReputationTools(
+          storage,
+          masterKey,
+          identityManager,
+          auditLog
+        );
+        const importTool = tools.find((tool) => tool.name === "reputation_import");
+        expect(importTool).toBeDefined();
+
+        const result = parseToolResult(
+          await importTool!.handler({
+            bundle: toBase64url(stringToBytes(JSON.stringify(bundle))),
+          })
+        );
+
+        expect(result.denied).toBe(true);
+        expect(JSON.stringify(result)).not.toContain("storage name");
+        await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+        const audit = await auditLog.query({ operation_type: "reputation_import" });
+        expect(audit.entries.at(-1)?.result).toBe("failure");
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     });
 
     // MUST-FIX 3: the admission queue's WAITER count (how many callers are

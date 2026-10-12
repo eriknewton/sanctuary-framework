@@ -937,6 +937,38 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  it("reputation artifact storage keys must pass the shared key predicate at verify time", async () => {
+    const source = await makeSource("aggregator-repkey-source");
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "aggregator-repkey-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: { type: "transaction", result: "completed", metrics: { score: 100 } },
+      context: "aggregator-test",
+      identity_id: source.identityId,
+    });
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir);
+
+    await tamperReputationBundleAndResignInner(bundleDir, source, (bundle) => {
+      const attestations = bundle.attestations.map((attestation, index) =>
+        index === 0
+          ? { ...attestation, attestation_id: "att-\u4E2D" }
+          : attestation
+      );
+      return {
+        ...bundle,
+        attestations,
+        completeness_manifest: bundle.completeness_manifest
+          ? buildReputationCompletenessManifest(bundle.exported_at, attestations)
+          : bundle.completeness_manifest,
+      };
+    });
+
+    const verified = await verifyExitBundle(bundleDir);
+    expect(verified.passed).toBe(false);
+    expect(verified.failure_class).toBe("reputation_attestation_signature_invalid");
+  });
+
   it("encrypted_state artifact whose JSON root is not an object: verify FAILS closed, import throws the NAMED error, never a crash", async () => {
     const source = await makeSource("aggregator-nullroot-source");
     const bundleDir = await newBundleDir();

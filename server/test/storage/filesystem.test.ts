@@ -161,7 +161,7 @@ describe("FilesystemStorage", () => {
       );
       await expect(
         storage.write("ns-\u4E2D", "plain", new Uint8Array([1])),
-      ).rejects.toThrow(/namespace/);
+      ).rejects.toMatchObject({ code: "INVALID_STORAGE_NAMESPACE" });
       expect(await readdir(basePath)).toEqual([]);
     });
 
@@ -277,6 +277,8 @@ describe("FilesystemStorage", () => {
       expect(result.denied).toBe(true);
       expect(JSON.stringify(result)).not.toContain("round-trip");
       expect(JSON.stringify(result)).not.toContain("stored name");
+      const audit = await auditLog.query({ operation_type: "state_write" });
+      expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
     });
 
     it("returns generic cooperative denials for keys that do not round-trip", async () => {
@@ -404,6 +406,8 @@ describe("FilesystemStorage", () => {
       expect(result.denied).toBe(true);
       expect(await storage.read("plain", "good")).toEqual(before);
       expect(JSON.stringify(result)).not.toContain("key-!4E2D");
+      const audit = await auditLog.query({ operation_type: "state_delete" });
+      expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
     });
 
     it("state_import refuses before writing into an unavailable namespace", async () => {

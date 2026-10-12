@@ -50,6 +50,7 @@ import {
   MAX_PENDING_ADMISSION_WAITERS,
   ON_EVICT_AUDIT_TIMEOUT_MS,
 } from "../core/bounded-map.js";
+import { assertFilesystemStorageNameAddressable } from "../storage/filesystem-name-codec.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -2096,6 +2097,14 @@ export class ReputationStore {
 
     const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     const contexts = new Set<string>();
+
+    // Continuing paths (AGENTS rule 13): verified bundle + addressable ids +
+    // quota headroom is the only path that reaches writes; storage-key,
+    // verification, quota, and exit-journal refusals all throw before the
+    // first `_reputation` write, so import remains all-or-nothing.
+    for (const attestation of bundle.attestations) {
+      assertFilesystemStorageNameAddressable(attestation.attestation_id, "key");
+    }
 
     // MUST-FIX 1: quota check + every write for this bundle run inside ONE
     // admission-locked, deadline-bounded section (runAdmissionExclusiveBounded
