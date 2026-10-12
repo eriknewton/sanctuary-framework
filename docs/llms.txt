@@ -1,0 +1,47 @@
+<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 6a7dabe0. Every sentence below is copied or condensed from README.md at that commit; the full text for agents is at https://sanctuaryprotocol.ai/llms-full.txt -->
+# Sanctuary
+
+> Open-source security for AI agents with no vendor in the path: a wall under the agent, imposed by the operating system under a policy you sign, keys that never leave hardware you control, and a hash-chained record of what the agent did. It works with the harness you already run (Claude Code, Cursor, Hermes, OpenClaw, Cline, or any MCP-compatible agent) on your machine or in your cloud.
+
+Bounds, copied from the README's "What is proven, and what is not" table. Every capability claim traces to a row in the Assurance Matrix, and a row reads proven only when a captured drill on the platform that matters says so; a green test suite is not a claim. The wall: macOS proven on a patched host, as a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail. Linux: proven on Ubuntu 24.04 (x86-64) only. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows: roadmapped. Custody (keys and state under your passphrase, on your hardware) and the gate (policy frozen at startup, three approval tiers) are proven. The record (hash-chained audit) and exit (keys, state, memory and reputation leave with you) are partial; the open defect ids are in the matrix.
+
+Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js 22 or newer, npm 10 or newer.
+
+## Install and verify
+
+- [Install](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#install): `npx @sanctuary-framework/mcp-server protect --claude-code`, or substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Protect backs up the harness config, routes every tool call through Sanctuary, and starts the dashboard on http://localhost:3501. The operating-system wall is a separate privileged arming step on macOS.
+- [Health check](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#health-check): `sovereignty_audit` scores the setup 0 to 100 from the live configuration and reports the gaps with the steps to close them; available as a CLI command and as an MCP tool inside any wrapped harness.
+- [Restore the harness config](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#troubleshooting): `sanctuary protect --unwrap` restores the original harness config from `~/.sanctuary/backup/`.
+- [For AI coding agents installing on behalf of an operator](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#for-ai-coding-agents-installing-sanctuary-on-behalf-of-an-operator): `sanctuary install --profile memory --harness claude-code --json`; execute only an `agent_action` argument vector, rerun the planner, stop on `human_action` and `blocked`, and treat `complete` as the only finished state. Never read the staged recovery file or capture secret output.
+- [Agent-guided installation contract](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/agent-guided-install.md): the observed-state planner, the secret boundary, and the cold-install acceptance criterion.
+- [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md): the signed app, system extension, boot service, uninstall, and restore and recovery.
+- [Troubleshooting](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#troubleshooting): the common install failures, written for AI coding agents.
+
+## Evidence
+
+- [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md): every claim, its platform, its evidence, its gap, and the next proof owed.
+- [Drill records](https://github.com/eriknewton/sanctuary-framework/tree/main/docs/audit): the captured drills the matrix cites.
+- [Release status](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#release-status) and the [CHANGELOG](https://github.com/eriknewton/sanctuary-framework/blob/main/CHANGELOG.md).
+- [Roadmap](https://github.com/eriknewton/sanctuary-framework/blob/main/ROADMAP.md): what ships today with its bounds, and what is next.
+
+## Security
+
+- [SECURITY.md](https://github.com/eriknewton/sanctuary-framework/blob/main/SECURITY.md): private vulnerability reporting, response times, and safe harbor.
+- [security.txt](https://sanctuaryprotocol.ai/.well-known/security.txt): the RFC 9116 contact record.
+
+## Architecture
+
+- [The Castle Architecture](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#the-castle-architecture): five named mechanisms, Castle Wall, Sentinels, Charter, Heralds, and Mantle, each with its bounds.
+- [SANCTUARY_ARCHITECTURE.md](https://github.com/eriknewton/sanctuary-framework/blob/main/SANCTUARY_ARCHITECTURE.md): entry points, data flow, trust model, and the sovereignty properties as testable assertions.
+- [Module map](https://github.com/eriknewton/sanctuary-framework/blob/main/server/src/README.md): the 63-module index of the TypeScript server.
+- [Start here if you read code](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#start-here-if-you-read-code): the reading order, about an hour.
+
+## Blog
+
+- [Journal](https://sanctuaryprotocol.ai/blog/): design decisions and security write-ups.
+- [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html): why this exists.
+
+## Optional
+
+- [npm package](https://www.npmjs.com/package/@sanctuary-framework/mcp-server): `@sanctuary-framework/mcp-server`, Apache-2.0.
+- [Source](https://github.com/eriknewton/sanctuary-framework) and [LICENSE](https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE).

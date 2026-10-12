@@ -18,6 +18,33 @@ layout: null
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
 <meta name="twitter:card" content="summary_large_image">
+<meta property="og:image" content="https://sanctuaryprotocol.ai/images/blog/operator-custody-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:image" content="https://sanctuaryprotocol.ai/images/blog/operator-custody-card.png">
+
+<!-- Structured data. Every claim here must match README.md "What is proven, and what is not";
+     softwareVersion must match the npm latest tag named in README.md "Release status". -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Sanctuary",
+  "alternateName": "@sanctuary-framework/mcp-server",
+  "applicationCategory": "SecurityApplication",
+  "operatingSystem": "macOS; Linux (Ubuntu 24.04 x86-64, bounded)",
+  "softwareVersion": "1.8.4",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "url": "https://sanctuaryprotocol.ai/",
+  "downloadUrl": "https://www.npmjs.com/package/@sanctuary-framework/mcp-server",
+  "codeRepository": "https://github.com/eriknewton/sanctuary-framework",
+  "author": {
+    "@type": "Person",
+    "name": "Erik Newton"
+  },
+  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS on a patched host (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Apache-2.0. Installs with npx."
+}
+</script>
 
 <!-- Fonts -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -87,8 +114,8 @@ layout: null
         <span>Node 22+ · macOS live wall · Ubuntu 24.04 bounded proof</span>
       </div>
       <div class="install__row">
-        <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
-        <button type="button" class="install__copy" data-copy="npx @sanctuary-framework/mcp-server" aria-label="Copy install command">Copy</button>
+        <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --claude-code</code>
+        <button type="button" class="install__copy" data-copy="npx @sanctuary-framework/mcp-server protect --claude-code" aria-label="Copy install command">Copy</button>
       </div>
     </div>
 
@@ -103,7 +130,7 @@ layout: null
     </div>
 
     <div class="hero__stats" aria-label="Project stats">
-      <div class="hero__stat"><strong>4</strong><span>Castle layers</span></div>
+      <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
   </section>
@@ -199,12 +226,12 @@ layout: null
         <span class="eyebrow">Architecture</span>
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
-          Four layers, each with a distinct contract: operating-system egress enforcement
-          (live on macOS today, with a narrowed Ubuntu 24.04 x86-64 fresh-install proof), behavioral observation
-          inside the box, an encrypted state surface for cooperative agents, and receipts and
-          reputation that travel across vendors. Underneath them, an install-time mechanism
-          called Mantle binds all four to your machine. The layers compose, and none of them
-          substitutes for another.
+          Five named layers, each with a distinct contract. Castle Wall: operating-system egress
+          enforcement, proven on macOS on a patched host and, on Linux, proven on Ubuntu 24.04
+          (x86-64) only. Sentinels: behavioral observation inside the box. Charter: the encrypted
+          state and policy surface for cooperative agents. Heralds: receipts and reputation that
+          travel across vendors. Mantle: the install-time mechanism that binds the other four to
+          your machine. The layers compose, and none of them substitutes for another.
         </p>
       </div>
 
@@ -248,9 +275,12 @@ layout: null
           <h3 class="layer__title">Charter (Cooperative MCP)</h3>
           <p class="layer__body">
             Encrypted state, hash-chained audit, mandate primitives, canonical policy slots, and
-            substrate selector. Production audit checkpoints are currently unsigned until IC-05
-            closes. Compliant agents that voluntarily route through Sanctuary get the full surface. On macOS with the wall
-            installed and armed, non-compliant agents still hit the wall and the Sentinels.
+            substrate selector. Production call sites sign audit checkpoints when the fortress
+            holds an identity; a fortress with no identity yet, and the root daemon's split audit
+            store, write honest unsigned checkpoints, and the audit-chain row stays partial
+            pending the IC-05 external-verifier drill. Compliant agents that voluntarily route
+            through Sanctuary get the full surface. On macOS with the wall installed and armed on
+            a patched host, non-compliant agents still hit the wall and the Sentinels.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">approval-gates</span>
@@ -360,10 +390,20 @@ agent = Agent(
           </div>
           <div class="code-card">
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
-from langchain_mcp import MCPTool
-sanctuary = MCPTool.from_stdio(
-  "npx", ["-y", "@sanctuary-framework/mcp-server"],
-)</code></pre>
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+async with MultiServerMCPClient(
+    {
+        "sanctuary": {
+            "command": "npx",
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
+            "transport": "stdio",
+        }
+    }
+) as client:
+    tools = client.get_tools()</code></pre>
           </div>
         </article>
       </div>
@@ -384,17 +424,17 @@ sanctuary = MCPTool.from_stdio(
 
       <div class="quickstart">
         <article class="step surface-card">
-          <span class="step__number">Step 01 · Install</span>
-          <h3 class="step__heading">Boot the server</h3>
-          <p class="step__body">One npx command. No global install, no build step, no config file required.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code></pre>
+          <span class="step__number">Step 01 · Protect</span>
+          <h3 class="step__heading">Wrap the harness you already run</h3>
+          <p class="step__body">One npx command. It backs up your harness config, routes every tool call through Sanctuary, and starts the dashboard.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --claude-code</code></pre>
         </article>
 
         <article class="step surface-card">
-          <span class="step__number">Step 02 · Connect</span>
-          <h3 class="step__heading">Wire into your harness</h3>
-          <p class="step__body">Add Sanctuary as an MCP server in your harness config. No agent code changes.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> claude mcp add sanctuary -- npx -y @sanctuary-framework/mcp-server</code></pre>
+          <span class="step__number">Step 02 · Any harness</span>
+          <h3 class="step__heading">Same command, different flag</h3>
+          <p class="step__body">Substitute <code>--openclaw</code>, <code>--hermes</code>, <code>--cursor</code>, <code>--cline</code>, or <code>--wrap &lt;path-to-config&gt;</code> for any other MCP-compatible harness. Existing MCP entries are preserved. <code>--dry-run</code> previews the changes; <code>--unwrap</code> restores the original config.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --openclaw</code></pre>
         </article>
 
         <article class="step surface-card">

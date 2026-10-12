@@ -11,14 +11,19 @@ module map at [`server/src/README.md`](server/src/README.md).
 
 ## WHAT THESE TOOLS ARE
 
-**Sanctuary** is a TypeScript MCP server with 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`). It gives AI agents four layers of cryptographic sovereignty without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Current release status is tracked in `CHANGELOG.md`.
+**Sanctuary** is a TypeScript MCP server with 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`). It is the cooperative surface of the Castle Architecture, which ships as five named mechanisms (Castle Wall, Sentinels, Charter, Heralds, Mantle; the root README's "The Castle Architecture" section is the canonical description), and it adds that surface without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Current release status is tracked in `CHANGELOG.md`.
 
-What it concretely does:
+What it concretely does, by Castle mechanism. The names and roles below must match the root README's "The Castle Architecture" section. The Sovereignty Health Report's four internal groups (Cognitive Sovereignty, Operational Isolation, Selective Disclosure, Verifiable Reputation) are a wire shape, not a second architecture: the first three live on Charter and the fourth on Heralds.
 
-- **Cognitive Sovereignty (Castle Wall).** Encrypts all agent-persistent state at rest using AES-256-GCM. Each namespace derives its own key via HKDF-SHA256 from a master key. The master key is derived from a user passphrase (Argon2id, m=64MB, t=3, p=4) or a one-time recovery key. Ed25519 keypairs provide self-custodied identity; private keys are always encrypted and never appear in MCP responses. State reads return Merkle proofs for integrity verification.
-- **Operational Isolation (Sentinels).** A three-tier Principal Policy gate evaluates every tool call before execution. Tier 1 operations (export, import, key rotation) always require human approval through an out-of-band channel (stderr prompt, web dashboard, or signed webhook). Tier 2 operations trigger approval when a behavioral anomaly is detected (new namespace, unfamiliar counterparty, frequency spike). Tier 3 operations auto-allow with audit logging. The policy file is loaded at startup and is immutable to the agent. Denial responses never reveal policy rules.
-- **Selective Disclosure (Charter).** SHA-256 commitments with random blinding factors, Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs, allowing an agent to prove claims about its data without revealing the underlying values.
-- **Verifiable Reputation (Heralds).** Signed attestations in EAS-compatible format, stored encrypted under Castle Wall. Sovereignty-gated tiers weight attestations from verified-sovereign agents higher. Escrow mechanism for trust bootstrapping. Reputation bundles are exportable and portable across instances. Current bound: every stored or imported attestation's self-declared sovereignty tier is clamped, unconditionally, at the storage read boundary regardless of how it arrived. A verified-sovereign or verified-degraded weight is reachable only through live handshake resolution against a genuine remote counterparty; a stored claim of either tier is never trusted on its own. Handshake-verified peer trust is tracked separately, in the federation layer.
+- **Castle Wall (the perimeter).** Operating-system egress enforcement at the operator-external boundary, under a policy the operator signs, imposed below the agent and independent of its cooperation. It is not an MCP tool surface: the signed macOS app, system extension and root boot service, and the shipped Linux package, enforce; the server's `castle-wall` CLI drives them. Status is a matrix row, never this file: proven on macOS on a patched host (a signed operator policy with a per-uid allow/deny demonstration that survives attended reboot cycles; not an audited per-rule, per-flow trail); on Linux, proven on Ubuntu 24.04 (x86-64) only; Windows roadmapped.
+- **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining; anomalies surface to the operator through the menubar or notifications. Observation only; Sentinels never block.
+- **Charter (the will).** The additive cooperative MCP surface for compliant agents. The server implements it as three internal capability groups plus the audit chain:
+  - *Cognitive Sovereignty.* Encrypts all agent-persistent state at rest using AES-256-GCM. Each namespace derives its own key via HKDF-SHA256 from a master key. The master key is derived from a user passphrase (Argon2id, m=64MB, t=3, p=4) or a one-time recovery key. Ed25519 keypairs provide self-custodied identity; private keys are always encrypted and never appear in MCP responses. State reads return Merkle proofs for integrity verification.
+  - *Operational Isolation.* A three-tier Principal Policy gate evaluates every tool call before execution. Tier 1 operations (export, import, key rotation) always require human approval through an out-of-band channel (stderr prompt, web dashboard, or signed webhook). Tier 2 operations trigger approval when a behavioral anomaly is detected (new namespace, unfamiliar counterparty, frequency spike). Tier 3 operations auto-allow with audit logging. The policy file is loaded at startup and is immutable to the agent. Denial responses never reveal policy rules.
+  - *Selective Disclosure.* SHA-256 commitments with random blinding factors, Pedersen commitments on Ristretto255, Schnorr proofs, and bit-decomposition range proofs, allowing an agent to prove claims about its data without revealing the underlying values.
+  - *Audit chain.* Hash-chained audit with rollback detection. Production call sites sign checkpoints when the fortress holds an identity; a fortress with no identity yet, and the root daemon's split audit store, write honest unsigned checkpoints. The Assurance Matrix row stays partial pending the **IC-05** external-verifier drill.
+- **Heralds (the voice).** How the agent is recognized by other sovereigns: *Verifiable Reputation* plus the optional composition surface (Concordia for structured negotiation, Verascore for portable reputation; default off, neither required). Signed attestations in EAS-compatible format, stored encrypted under the Charter state layer. Sovereignty-gated tiers weight attestations from verified-sovereign agents higher. Escrow mechanism for trust bootstrapping. Reputation bundles are exportable and portable across instances. Current bound: every stored or imported attestation's self-declared sovereignty tier is clamped, unconditionally, at the storage read boundary regardless of how it arrived. A verified-sovereign or verified-degraded weight is reachable only through live handshake resolution against a genuine remote counterparty; a stored claim of either tier is never trusted on its own. Handshake-verified peer trust is tracked separately, in the federation layer.
+- **Mantle (the substrate binding).** Install-time check that locks Sanctuary to the operator's machine and rejects orphan agent identifiers that are not bound to a wrapped harness.
 
 Additional subsystems: Sovereignty Health Report (SHR) generation and verification; sovereignty handshake protocol (nonce challenge-response + SHR exchange between two agents); federation registry for MCP-to-MCP peer discovery; Concordia bridge module; and the sovereignty audit tool (environment fingerprinting, OpenClaw-aware gap analysis, scored posture assessment with prioritized recommendations).
 
@@ -62,7 +67,7 @@ The bridge introduces no new cryptographic primitives. Everything delegates to e
 Tool call from agent harness
   -> MCP SDK (router.ts: schema validation, size caps, enum checks)
   -> ApprovalGate (gate.ts: Tier 1/2/3 evaluation)
-  -> Tool handler (Castle Wall/Sentinels/Charter/Heralds)
+  -> Tool handler (Charter and Heralds tool surfaces)
   -> StateStore (state-store.ts: encrypt via AES-256-GCM, sign via Ed25519, compute Merkle root)
   -> StorageBackend (filesystem.ts: write to ~/.sanctuary/state/{namespace}/{key}.enc)
   -> AuditLog (audit-log.ts: append encrypted entry)
@@ -188,17 +193,17 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 A structured security review ran in March 2026, followed by delta reviews at later releases. Their findings are tracked privately and are not published; current trust claims and their bounds are in [`ASSURANCE_MATRIX.md`](ASSURANCE_MATRIX.md).
 
-Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`), with environment fingerprinting, OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0-100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
+Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`), with environment fingerprinting, OpenClaw-specific detection, gap analysis over the four SHR sovereignty groups with deterministic scoring (0-100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
 
 **Current release status:** see `CHANGELOG.md`. The server currently exposes 111 registered MCP tools (measured 2026-10-06 from `server/test/fixtures/tools-list-wire-golden.json`). Major additions since v0.4.2: Sovereignty Dashboard, `sanctuary wrap` one-command install, EU AI Act compliance generator, context gating, SIEM export, sovereignty profile, governor, and federation tools.
 
 ---
 
-## DELTA - 2026-03-31 - Operational (Sentinels) Context Gating
+## DELTA - 2026-03-31 - Operational Isolation (Charter) Context Gating
 
 ### Subsystem Summary
 
-Context gating is a new Operational Isolation (Sentinels) subsystem that controls what agent context flows to remote providers (LLM inference APIs, tool APIs, logging services, analytics). It enforces "minimum-necessary context" at the execution boundary before any outbound call, where the agent filters its context through a policy that classifies each top-level field as allow, redact, hash, summarize, or deny.
+Context gating is a new Operational Isolation subsystem on the Charter surface that controls what agent context flows to remote providers (LLM inference APIs, tool APIs, logging services, analytics). It enforces "minimum-necessary context" at the execution boundary before any outbound call, where the agent filters its context through a policy that classifies each top-level field as allow, redact, hash, summarize, or deny.
 
 **New source files:**
 - `server/src/operational/context-gate.ts` - Core types, `evaluateField()`, `filterContext()`, pattern matching, encrypted policy store (`ContextGatePolicyStore`)
@@ -228,7 +233,7 @@ Context gating is a new Operational Isolation (Sentinels) subsystem that control
 
 ### New Encrypted Storage
 
-Policy store uses AES-256-GCM with HKDF domain separation key `"l2-context-gate"` derived from the master key. Policies are stored under the `_context_gate_policies` namespace (underscore-prefixed = reserved, protected from Castle Wall tools). Each policy is individually encrypted and addressable by policy ID.
+Policy store uses AES-256-GCM with HKDF domain separation key `"l2-context-gate"` derived from the master key. Policies are stored under the `_context_gate_policies` namespace (underscore-prefixed = reserved, protected from the Charter state tools). Each policy is individually encrypted and addressable by policy ID.
 
 ### New Entry Points (5 MCP Tools)
 
