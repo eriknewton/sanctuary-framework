@@ -7,13 +7,13 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap.">
+<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Enforcement is proven on macOS on a patched host; on Ubuntu 24.04 x86-64, on a patched host, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Enforcement is proven on macOS on a patched host; on Ubuntu 24.04 x86-64, on a patched host, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -42,7 +42,7 @@ layout: null
     "@type": "Person",
     "name": "Erik Newton"
   },
-  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS on a patched host (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only; Windows is roadmapped. Apache-2.0. Installs with npx."
+  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS on a patched host (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only, on a patched host; Windows is roadmapped. Apache-2.0. Installs with npx."
 }
 </script>
 
@@ -114,8 +114,8 @@ layout: null
         <span>Node 22+ · macOS live wall · Ubuntu 24.04 bounded proof</span>
       </div>
       <div class="install__row">
-        <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --claude-code</code>
-        <button type="button" class="install__copy" data-copy="npx @sanctuary-framework/mcp-server protect --claude-code" aria-label="Copy install command">Copy</button>
+        <code class="install__cmd mono"><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code</code>
+        <button type="button" class="install__copy" data-copy="npx -y @sanctuary-framework/mcp-server protect --claude-code" aria-label="Copy install command">Copy</button>
       </div>
     </div>
 
@@ -181,12 +181,12 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Kernel-level egress wall</h3>
               <p class="provisioning__body">
-                On macOS today, the Castle Wall blocks unauthorized outbound calls at the
-                operating system. A prompt-injected agent cannot route around that path within
+                On macOS today, on a patched host, the Castle Wall blocks unauthorized outbound calls
+                at the operating system. A prompt-injected agent cannot route around that path within
                 the proven scope because the kernel itself enforces. It enforces a signed
                 operator policy, per account, and re-establishes itself after a restart.
-                On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces
-                a signed operator policy per user account: blocked destinations stay blocked
+                On Ubuntu 24.04 (x86-64), on a patched host, a fresh install of the shipped package
+                enforces a signed operator policy per user account: blocked destinations stay blocked
                 and allowed ones connect, through five reboots, on three fresh servers, with
                 the evidence checked by two independent reviewers. Other Linux distributions,
                 DNS, DoH, DoT, hostname paths, and a real-agent harness remain unproven.
@@ -228,7 +228,7 @@ layout: null
         <p>
           Five named layers, each with a distinct contract. Castle Wall: operating-system egress
           enforcement, proven on macOS on a patched host and, on Linux, proven on Ubuntu 24.04
-          (x86-64) only. Sentinels: behavioral observation inside the box. Charter: the encrypted
+          (x86-64) only, on a patched host. Sentinels: behavioral observation inside the box. Charter: the encrypted
           state and policy surface for cooperative agents. Heralds: receipts and reputation that
           travel across vendors. Mantle: the install-time mechanism that binds the other four to
           your machine. The layers compose, and none of them substitutes for another.
@@ -241,10 +241,10 @@ layout: null
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
             Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
-            is proven on a signed and notarized build. On Ubuntu 24.04 (x86-64), a fresh
-            install of the shipped package enforces a signed operator policy per user account
-            through five reboots on three fresh servers; DNS, DoH, DoT, hostname paths, and
-            other Linux platforms remain unproven.
+            is proven on a signed and notarized build, on a patched host. On Ubuntu 24.04 (x86-64),
+            on a patched host, a fresh install of the shipped package enforces a signed operator
+            policy per user account through five reboots on three fresh servers; DNS, DoH, DoT,
+            hostname paths, and other Linux platforms remain unproven.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">kernel-binding</span>
@@ -427,14 +427,14 @@ async with MultiServerMCPClient(
           <span class="step__number">Step 01 · Protect</span>
           <h3 class="step__heading">Wrap the harness you already run</h3>
           <p class="step__body">One npx command. It backs up your harness config, routes every tool call through Sanctuary, and starts the dashboard.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --claude-code</code></pre>
+<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code</code></pre>
         </article>
 
         <article class="step surface-card">
           <span class="step__number">Step 02 · Any harness</span>
           <h3 class="step__heading">Same command, different flag</h3>
           <p class="step__body">Substitute <code>--openclaw</code>, <code>--hermes</code>, <code>--cursor</code>, <code>--cline</code>, or <code>--wrap &lt;path-to-config&gt;</code> for any other MCP-compatible harness. Existing MCP entries are preserved. <code>--dry-run</code> previews the changes; <code>--unwrap</code> restores the original config.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server protect --openclaw</code></pre>
+<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --openclaw</code></pre>
         </article>
 
         <article class="step surface-card">
@@ -517,7 +517,7 @@ async with MultiServerMCPClient(
       <div class="cta surface-card">
         <span class="eyebrow">Ship agents you actually control</span>
         <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
-        <p>Open source and local-first. Castle Wall enforcement is proven on macOS and, on Ubuntu 24.04 (x86-64), for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
+        <p>Open source and local-first. Castle Wall enforcement is proven on a patched host: on macOS, and on Ubuntu 24.04 (x86-64) for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
         <div class="btn-row" style="justify-content: center;">
           <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
           <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>

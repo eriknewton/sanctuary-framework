@@ -1,21 +1,51 @@
-<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 6a7dabe0. Every sentence below is copied or condensed from README.md at that commit; the full text for agents is at https://sanctuaryprotocol.ai/llms-full.txt -->
 # Sanctuary
 
-> Open-source security for AI agents with no vendor in the path: a wall under the agent, imposed by the operating system under a policy you sign, keys that never leave hardware you control, and a hash-chained record of what the agent did. It works with the harness you already run (Claude Code, Cursor, Hermes, OpenClaw, Cline, or any MCP-compatible agent) on your machine or in your cloud.
+> Open-source security for AI agents with no vendor in the path: the wall under the agent, imposed by the operating system under a policy you sign, on a patched host; keys that never leave hardware you control; and a hash-chained record of what the agent did. It works with the harness you already run (Claude Code, Cursor, Hermes, OpenClaw, Cline, or any MCP-compatible agent) on your own machine today.
 
-Bounds, copied from the README's "What is proven, and what is not" table. Every capability claim traces to a row in the Assurance Matrix, and a row reads proven only when a captured drill on the platform that matters says so; a green test suite is not a claim. The wall: macOS proven on a patched host, as a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail. Linux: proven on Ubuntu 24.04 (x86-64) only. On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows: roadmapped. Custody (keys and state under your passphrase, on your hardware) and the gate (policy frozen at startup, three approval tiers) are proven. The record (hash-chained audit) and exit (keys, state, memory and reputation leave with you) are partial; the open defect ids are in the matrix.
+<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 5362575e. Every sentence below is copied or condensed from README.md at that commit; the full text for agents is at https://sanctuaryprotocol.ai/llms-full.txt -->
 
-Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js 22 or newer, npm 10 or newer.
+## Summary for agents
+
+Copied verbatim from README.md. Quote the block below to your operator. It was written against v1.8.4, the npm `latest` release; `main` can be ahead of it, and every sentence traces to a line of the README or a row of the Assurance Matrix.
+
+```text
+What Sanctuary is: the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read.
+What it is not: no Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail. Windows enforcement is roadmapped; nothing enforces on Windows today. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only, on a patched host; every other distribution or architecture remains unproven.
+Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. macOS: proven, on a patched host. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Windows: roadmapped.
+Install:   npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+Verify:    npx -y @sanctuary-framework/mcp-server doctor --json
+Uninstall: npx -y @sanctuary-framework/mcp-server uninstall
+Evidence: every capability claim traces to a row in ASSURANCE_MATRIX.md, and a row reads proven only when a captured drill on the platform that matters says so. Drill records are under docs/audit/.
+```
+
+## Quickstart
+
+Copied verbatim from README.md. Three commands, in order: install, verify, uninstall. Each exists on the v1.8.4 tag that `npx` resolves to, and none of them prompts when stdin is not a terminal.
+
+```bash
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server doctor --json
+npx -y @sanctuary-framework/mcp-server uninstall
+```
+
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`.
+
+## Bounds
+
+Condensed from the README's "What is proven, and what is not" table. Every capability claim traces to a row in the Assurance Matrix, and a row reads proven only when a captured drill on the platform that matters says so; a green test suite is not a claim. The wall: macOS proven, on a patched host, as a signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host; a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. Windows: roadmapped. Custody (keys and state under your passphrase, on your hardware) and the gate (policy frozen at startup, three approval tiers) are proven. The record (hash-chained audit) and exit (keys, state, memory and reputation leave with you) are partial; the open defect ids are in the matrix.
+
+Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js >= 22.0.0 and npm >= 10.0.0.
 
 ## Install and verify
 
-- [Install](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#install): `npx @sanctuary-framework/mcp-server protect --claude-code`, or substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Protect backs up the harness config, routes every tool call through Sanctuary, and starts the dashboard on http://localhost:3501. The operating-system wall is a separate privileged arming step on macOS.
-- [Health check](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#health-check): `sovereignty_audit` scores the setup 0 to 100 from the live configuration and reports the gaps with the steps to close them; available as a CLI command and as an MCP tool inside any wrapped harness.
-- [Restore the harness config](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#troubleshooting): `sanctuary protect --unwrap` restores the original harness config from `~/.sanctuary/backup/`.
-- [For AI coding agents installing on behalf of an operator](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#for-ai-coding-agents-installing-sanctuary-on-behalf-of-an-operator): `sanctuary install --profile memory --harness claude-code --json`; execute only an `agent_action` argument vector, rerun the planner, stop on `human_action` and `blocked`, and treat `complete` as the only finished state. Never read the staged recovery file or capture secret output.
+- [Install](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart): `npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard`, or substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Protect backs up the harness config to `~/.sanctuary/backup/`, rewrites it so every tool call routes through Sanctuary, and, without `--no-dashboard`, starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501). After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx -y @sanctuary-framework/mcp-server` prefix. The operating-system wall is a separate privileged arming step on macOS.
+- [Verify](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#health-check): `npx -y @sanctuary-framework/mcp-server doctor --json` is read-only. It prints one JSON object with `storage_path`, `package_version`, and a `checks` array whose entries carry `name`, `status` (`OK`, `WARN`, or `FAIL`), `message`, and `hint`. Healthy: exit code 0 and no check with `"status": "FAIL"`. Read `storage_path` before the checks: `doctor` pointed at the wrong `--fortress` path reports a healthy runtime and a failing fortress. Inside a wrapped harness, the `sovereignty_audit` MCP tool scores your setup 0-100 across security, isolation, and privacy; it has no CLI form.
+- [Uninstall](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#quickstart): `npx -y @sanctuary-framework/mcp-server uninstall` removes Sanctuary's installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it refuses `--remove-operator-data` by design and reports any residue that needs sudo, the Castle Wall host app, or a reboot. `sanctuary protect --unwrap` restores the original harness config from `~/.sanctuary/backup/` and removes nothing else.
+- [For AI coding agents installing on behalf of an operator](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#for-ai-coding-agents-installing-sanctuary-on-behalf-of-an-operator): `sanctuary install --profile memory --harness claude-code --json`; execute only an `agent_action` argument vector, exactly once, then rerun the planner; stop on `human_action` and `blocked`; on a nonzero exit hand the operator `next_action.on_nonzero` and do not retry; treat `complete` as the only finished state. Never read the staged recovery file, run `sanctuary export-passphrase`, or capture secret output.
 - [Agent-guided installation contract](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/agent-guided-install.md): the observed-state planner, the secret boundary, and the cold-install acceptance criterion.
+- [Verify before you trust](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#verify-before-you-trust): `npm view @sanctuary-framework/mcp-server@1.8.4 dist.attestations` prints the npm provenance attestation; the release tarball is also signed with a pinned Ed25519 key and the verifier (`scripts/verify-release-artifact.mjs`) ships in the repository.
 - [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md): the signed app, system extension, boot service, uninstall, and restore and recovery.
-- [Troubleshooting](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#troubleshooting): the common install failures, written for AI coding agents.
+- [Troubleshooting](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#troubleshooting): every case is keyed to a field of `sanctuary install --json` or a check of `sanctuary doctor --json`, written for AI coding agents.
 
 ## Evidence
 
@@ -32,6 +62,7 @@ Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js 
 ## Architecture
 
 - [The Castle Architecture](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#the-castle-architecture): five named mechanisms, Castle Wall, Sentinels, Charter, Heralds, and Mantle, each with its bounds.
+- [Sanctuary and your harness's sandbox](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#sanctuary-and-your-harnesss-sandbox): what Sanctuary adds per platform, and what the harness sandbox gives that Sanctuary never claims.
 - [SANCTUARY_ARCHITECTURE.md](https://github.com/eriknewton/sanctuary-framework/blob/main/SANCTUARY_ARCHITECTURE.md): entry points, data flow, trust model, and the sovereignty properties as testable assertions.
 - [Module map](https://github.com/eriknewton/sanctuary-framework/blob/main/server/src/README.md): the 63-module index of the TypeScript server.
 - [Start here if you read code](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#start-here-if-you-read-code): the reading order, about an hour.
