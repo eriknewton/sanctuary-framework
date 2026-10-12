@@ -14,7 +14,7 @@ import { Writable } from "node:stream";
 import { runCheckpointCommand } from "../../src/cli/checkpoint.js";
 import { StateStore, STATE_ENVELOPE_VERSION_ANCHORS_KEY } from "../../src/cognitive/state-store.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { createIdentity, sign } from "../../src/core/identity.js";
+import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -255,6 +255,103 @@ describe("cold checkpoint CLI", () => {
     expect(result.stderr).toContain(`Error: checkpoint restore failed. ${refusal}\n`);
     expect(result.stdout).not.toContain("Checkpoint restored:");
     expect(await durableBytes(f.path)).toEqual(before);
+  });
+
+  it("restores checkpoint entries signed before an identity rotation", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "cold checkpoint restore rotation-chain test",
+    );
+    await persistStoredIdentity(f.storage, f.masterKey, updatedIdentity);
+    await f.stateStore.delete("alpha", "note");
+    await f.stateStore.write(
+      "gamma",
+      "note",
+      "post-rotation-added",
+      updatedIdentity.identity_id,
+      updatedIdentity.encrypted_private_key,
+      identityEncKey,
+    );
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(0);
+    expect(result.stdout).toContain(`Checkpoint restored: ${checkpoint!.id}\n`);
+    await expect(f.stateStore.read("alpha", "note")).resolves.toMatchObject({
+      value: "original",
+    });
+    await expect(f.stateStore.read("beta", "note")).resolves.toMatchObject({
+      value: "original",
+    });
+    expect(await f.storage.read("gamma", "note")).toBeNull();
+  });
+
+  it("refuses a cold restore of entries signed only by a declared-compromise retired key", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "key compromised",
+    );
+    await persistStoredIdentity(f.storage, f.masterKey, updatedIdentity);
+    await f.stateStore.delete("alpha", "note");
+    await f.write("gamma", "post-checkpoint");
+    const before = withoutAuditAndPolicy(await durableBytes(f.path));
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain(
+      "0 checkpoint entries are signed by an identity this fortress does not hold and 2 checkpoint entries do not verify",
+    );
+    expect(result.stdout).not.toContain("Checkpoint restored:");
+    expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(before);
+  });
+
+  it("refuses a cold restore when the local rotation chain is not verified", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "cold checkpoint restore broken-chain test",
+    );
+    const [firstHop] = updatedIdentity.rotation_history;
+    if (!firstHop) throw new Error("missing rotation hop");
+    await persistStoredIdentity(f.storage, f.masterKey, {
+      ...updatedIdentity,
+      rotation_history: [
+        {
+          ...firstHop,
+          rotation_event: toBase64url(stringToBytes("{}")),
+        },
+      ],
+    });
+    await f.stateStore.delete("alpha", "note");
+    await f.write("gamma", "post-checkpoint");
+    const before = withoutAuditAndPolicy(await durableBytes(f.path));
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain(
+      "2 checkpoint entries are signed by an identity this fortress does not hold and 0 checkpoint entries do not verify",
+    );
+    expect(result.stderr).not.toContain(
+      "0 checkpoint entries are signed by an identity this fortress does not hold and 2 checkpoint entries do not verify",
+    );
+    expect(result.stdout).not.toContain("Checkpoint restored:");
+    expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(before);
   });
 
   it.each(["read failure", "invalid MAC"])("refuses a cold restore on anchor %s without changing durable bytes", async (failure) => {

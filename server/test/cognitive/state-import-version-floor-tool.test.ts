@@ -2,6 +2,7 @@
  * state_import enforces durable version floors through the MCP tool path.
  *
  * STATE-IMPORT-VERSION-FLOOR-01
+ * COMPROMISED-RETIRED-KEY-TRUST-01
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -19,7 +20,11 @@ import {
   StateStore,
   isStateVersionFloorRefusal,
 } from "../../src/cognitive/state-store.js";
-import type { StoredIdentity } from "../../src/core/identity.js";
+import {
+  sign as identitySign,
+  rotateKeys,
+  type StoredIdentity,
+} from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -139,6 +144,7 @@ async function makeToolRig(storage: StorageBackend = new MemoryStorage()): Promi
   const server = createServer(
     selectedTools(tools, [
       "identity_create",
+      "identity_rotate",
       "state_write",
       "state_export",
       "state_import",
@@ -185,6 +191,31 @@ function stripCompleteness(bundleBase64: string): string {
   delete decoded.completeness_manifest;
   delete decoded.bundle_integrity;
   return encodeBundle(decoded);
+}
+
+function resignLegacyCiphertextWithIdentity(
+  entry: unknown,
+  identity: StoredIdentity,
+  identityEncKey: Uint8Array
+): void {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("missing state entry");
+  }
+  const payload = (entry as Record<string, unknown>).payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("missing state payload");
+  }
+  const ciphertext = (payload as Record<string, unknown>).ct;
+  if (typeof ciphertext !== "string") {
+    throw new Error("missing state ciphertext");
+  }
+  (entry as Record<string, unknown>).sig = toBase64url(
+    identitySign(
+      fromBase64url(ciphertext),
+      identity.encrypted_private_key,
+      identityEncKey
+    )
+  );
 }
 
 function duplicateFirstEntry(bundleBase64: string): string {
@@ -306,7 +337,76 @@ async function sourceBundle(args: {
   return (await sourceStore.exportNamespaces(["notes"])).bundle;
 }
 
+async function sourceBundleFromSignedEntries(args: {
+  masterKey: Uint8Array;
+  identityEncKey: Uint8Array;
+  entries: Array<{ key: string; value: string; identity: StoredIdentity }>;
+}): Promise<string> {
+  const sourceStorage = new MemoryStorage();
+  const sourceStore = new StateStore(sourceStorage, args.masterKey);
+  for (const item of args.entries) {
+    await sourceStore.write(
+      "notes",
+      item.key,
+      item.value,
+      item.identity.identity_id,
+      item.identity.encrypted_private_key,
+      args.identityEncKey
+    );
+  }
+  return (await sourceStore.exportNamespaces(["notes"])).bundle;
+}
+
 describe("state_import version floor tool path", () => {
+  it("imports only entries signed by rotation-chain keys eligible for external restore", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const firstIdentity = rig.identityManager.get(identityId);
+      if (!firstIdentity) throw new Error("missing initial identity");
+      const { updatedIdentity: secondIdentity } = rotateKeys(
+        firstIdentity,
+        rig.identityEncKey,
+        "compromised"
+      );
+      await rig.identityManager.save(secondIdentity);
+      const { updatedIdentity: currentIdentity } = rotateKeys(
+        secondIdentity,
+        rig.identityEncKey,
+        "periodic"
+      );
+      await rig.identityManager.save(currentIdentity);
+
+      const bundle = await sourceBundleFromSignedEntries({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        entries: [
+          {
+            key: "retired-compromised",
+            value: "should-not-import",
+            identity: firstIdentity,
+          },
+          {
+            key: "retired-periodic",
+            value: "should-import",
+            identity: secondIdentity,
+          },
+        ],
+      });
+
+      const imported = await callTool(rig.client, "state_import", { bundle });
+
+      expect(imported.imported_keys).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(1);
+      const refused = await readValue(rig.client, "retired-compromised");
+      expect(refused.denied).toBe(true);
+      const accepted = await readValue(rig.client, "retired-periodic");
+      expect(accepted.value).toBe("should-import");
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("continues when the imported key has no established floor", async () => {
     const rig = await makeToolRig();
     try {
@@ -383,6 +483,131 @@ describe("state_import version floor tool path", () => {
       const current = await readValue(rig.client, "above");
       expect(current.value).toBe("second");
       expect(current.version).toBe(2);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("imports entries signed before and after an identity rotation", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "rotation-before", "old-key");
+      const rotated = await callTool(rig.client, "identity_rotate", {
+        identity_id: identityId,
+        reason: "state import rotation-chain test",
+      });
+      expect(rotated.identity_id).toBe(identityId);
+      await writeValue(rig.client, identityId, "rotation-after", "new-key");
+
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: exported.bundle,
+        conflict_resolution: "overwrite",
+      });
+
+      expect(imported.imported_keys).toBe(2);
+      expect(imported.skipped_keys).toBe(0);
+      expect(imported.skipped_invalid_sig).toBe(0);
+      expect(imported.skipped_unknown_kid).toBe(0);
+      await expect(readValue(rig.client, "rotation-before")).resolves.toMatchObject({
+        value: "old-key",
+        version: 1,
+      });
+      await expect(readValue(rig.client, "rotation-after")).resolves.toMatchObject({
+        value: "new-key",
+        version: 1,
+      });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("refuses a pre-rotation entry when the identity rotation chain is not verified", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const originalIdentity = rig.identityManager.get(identityId);
+      if (!originalIdentity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity: originalIdentity,
+        values: [{ key: "broken-chain-entry", value: "old-key" }],
+      });
+      const rotated = await rig.identityManager.rotate(
+        identityId,
+        "state import broken-chain test"
+      );
+      if (!rotated) throw new Error("rotation failed");
+      const [firstHop] = rotated.updatedIdentity.rotation_history;
+      if (!firstHop) throw new Error("missing rotation hop");
+      await rig.identityManager.save({
+        ...rotated.updatedIdentity,
+        rotation_history: [
+          {
+            ...firstHop,
+            rotation_event: toBase64url(stringToBytes("{}")),
+          },
+        ],
+      });
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+
+      expect(imported.imported_keys).toBe(0);
+      expect(imported.skipped_keys).toBe(1);
+      expect(imported.skipped_unknown_kid).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(0);
+      expect(await rig.storage.read("notes", "broken-chain-entry")).toBeNull();
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("refuses an imported entry unless one rotation-chain key verifies the full signed envelope", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const originalIdentity = rig.identityManager.get(identityId);
+      if (!originalIdentity) throw new Error("missing identity");
+      const rotated = await callTool(rig.client, "identity_rotate", {
+        identity_id: identityId,
+        reason: "state import paired-signature test",
+      });
+      expect(rotated.identity_id).toBe(identityId);
+      await writeValue(rig.client, identityId, "paired-signature", "new-key");
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      const decoded = decodeBundle(exported.bundle as string);
+      const data = decoded.data as Record<string, Array<{ key: string; entry: unknown }>>;
+      const item = data.notes?.find((entry) => entry.key === "paired-signature");
+      if (!item) throw new Error("missing paired-signature entry");
+      resignLegacyCiphertextWithIdentity(
+        item.entry,
+        originalIdentity,
+        rig.identityEncKey
+      );
+      delete decoded.completeness_manifest;
+      delete decoded.bundle_integrity;
+      await rig.stateStore.delete("notes", "paired-signature");
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: encodeBundle(decoded),
+        conflict_resolution: "overwrite",
+        allow_unverified_legacy: true,
+      });
+
+      expect(imported.imported_keys).toBe(0);
+      expect(imported.skipped_keys).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(1);
+      expect(imported.skipped_unknown_kid).toBe(0);
+      expect(await rig.storage.read("notes", "paired-signature")).toBeNull();
     } finally {
       await rig.close();
     }
@@ -716,7 +941,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
@@ -754,7 +979,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
@@ -788,7 +1013,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null,
           { allowUnverifiedLegacy: true }
         )
@@ -846,7 +1071,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).resolves.toMatchObject({ imported_keys: 2 });
@@ -896,7 +1121,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).resolves.toMatchObject({ imported_keys: 1 });
@@ -907,7 +1132,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
