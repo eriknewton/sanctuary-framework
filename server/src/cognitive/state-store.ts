@@ -210,12 +210,17 @@ export interface StateImportPartialApplyDetails {
   partial: true;
   importedBeforeRefusal: number;
   writtenKeys: StateImportWrittenKey[];
+  inFlightKey?: StateImportWrittenKey;
+}
+
+function cloneWrittenKey(writtenKey: StateImportWrittenKey): StateImportWrittenKey {
+  return { ...writtenKey };
 }
 
 function cloneWrittenKeys(
   writtenKeys: StateImportWrittenKey[]
 ): StateImportWrittenKey[] {
-  return writtenKeys.map((written) => ({ ...written }));
+  return writtenKeys.map(cloneWrittenKey);
 }
 
 export function getStateImportPartialApplyDetails(
@@ -226,6 +231,7 @@ export function getStateImportPartialApplyDetails(
     partial?: unknown;
     importedBeforeRefusal?: unknown;
     writtenKeys?: unknown;
+    inFlightKey?: unknown;
   };
   if (
     candidate.partial !== true ||
@@ -247,20 +253,33 @@ export function getStateImportPartialApplyDetails(
         );
       })
     ),
+    ...(candidate.inFlightKey !== null &&
+    typeof candidate.inFlightKey === "object" &&
+    typeof (candidate.inFlightKey as StateImportWrittenKey).namespace === "string" &&
+    typeof (candidate.inFlightKey as StateImportWrittenKey).key === "string"
+      ? { inFlightKey: cloneWrittenKey(candidate.inFlightKey as StateImportWrittenKey) }
+      : {}),
   };
 }
 
 function attachStateImportPartialApplyDetails<T>(
   error: T,
-  writtenKeys: StateImportWrittenKey[]
+  writtenKeys: StateImportWrittenKey[],
+  inFlightKey?: StateImportWrittenKey
 ): T {
-  if (writtenKeys.length === 0 || !error || typeof error !== "object") {
+  if ((writtenKeys.length === 0 && !inFlightKey) || !error || typeof error !== "object") {
+    return error;
+  }
+  if (getStateImportPartialApplyDetails(error)) {
     return error;
   }
   const target = error as T & StateImportPartialApplyDetails;
   target.partial = true;
   target.importedBeforeRefusal = writtenKeys.length;
   target.writtenKeys = cloneWrittenKeys(writtenKeys);
+  if (inFlightKey) {
+    target.inFlightKey = cloneWrittenKey(inFlightKey);
+  }
   return target;
 }
 
@@ -268,8 +287,13 @@ export class StateImportPartialApplyError extends StateVerificationError {
   readonly partial = true;
   readonly importedBeforeRefusal: number;
   readonly writtenKeys: StateImportWrittenKey[];
+  readonly inFlightKey?: StateImportWrittenKey;
 
-  constructor(cause: StateVerificationError, writtenKeys: StateImportWrittenKey[]) {
+  constructor(
+    cause: StateVerificationError,
+    writtenKeys: StateImportWrittenKey[],
+    inFlightKey?: StateImportWrittenKey
+  ) {
     super(
       cause.classification,
       `State import partially applied before verification refused: ${cause.message}`,
@@ -278,6 +302,9 @@ export class StateImportPartialApplyError extends StateVerificationError {
     this.name = "StateImportPartialApplyError";
     this.importedBeforeRefusal = writtenKeys.length;
     this.writtenKeys = cloneWrittenKeys(writtenKeys);
+    if (inFlightKey) {
+      this.inFlightKey = cloneWrittenKey(inFlightKey);
+    }
     (this as Error & { cause?: unknown }).cause = cause;
   }
 }
@@ -3382,17 +3409,24 @@ export class StateStore {
     // skip: existing entries are skipped and not floor-checked; absent entries write.
     // version: non-newer entries are skipped and not floor-checked; newer entries write.
     // overwrite: every verified non-reserved entry writes and is floor-checked.
-    // per-write floor refusal after earlier writes: those earlier writes remain
-    // applied, and the thrown error carries their count and keys for the operator audit.
+    // journal, per-write floor, storage, and facade-marker refusals after earlier
+    // writes leave those writes applied; storage refusals additionally name the
+    // in-flight key because the backend may have landed it before reporting.
     await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
 
     let importedKeys = 0;
     const writtenKeys: StateImportWrittenKey[] = [];
-    const throwWithPartialDetails = (err: unknown): never => {
-      if (err instanceof StateVerificationError && writtenKeys.length > 0) {
-        throw new StateImportPartialApplyError(err, writtenKeys);
+    const throwWithPartialDetails = (
+      err: unknown,
+      inFlightKey?: StateImportWrittenKey
+    ): never => {
+      if (getStateImportPartialApplyDetails(err)) {
+        throw err;
       }
-      throw attachStateImportPartialApplyDetails(err, writtenKeys);
+      if (err instanceof StateVerificationError && (writtenKeys.length > 0 || inFlightKey)) {
+        throw new StateImportPartialApplyError(err, writtenKeys, inFlightKey);
+      }
+      throw attachStateImportPartialApplyDetails(err, writtenKeys, inFlightKey);
     };
     for (const { namespace: ns, key, entry } of plan.writeCandidates) {
       try {
@@ -3417,7 +3451,11 @@ export class StateStore {
         ]);
         // Write the entry
         const serialized = stringToBytes(JSON.stringify(entry));
-        await this.storage.write(ns, key, serialized);
+        try {
+          await this.storage.write(ns, key, serialized);
+        } catch (err) {
+          throwWithPartialDetails(err, { namespace: ns, key });
+        }
         importedKeys++;
         writtenKeys.push({ namespace: ns, key });
 
@@ -3462,11 +3500,18 @@ export class StateStore {
               `state_import_facade_marker:${record.key}`
             );
           }
-          await this.storage.write(
-            FACADE_HIDDEN_MARKER_NAMESPACE,
-            record.key,
-            stringToBytes(JSON.stringify(markerRecord))
-          );
+          try {
+            await this.storage.write(
+              FACADE_HIDDEN_MARKER_NAMESPACE,
+              record.key,
+              stringToBytes(JSON.stringify(markerRecord))
+            );
+          } catch (err) {
+            throwWithPartialDetails(err, {
+              namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
+              key: record.key,
+            });
+          }
           writtenKeys.push({
             namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
             key: record.key,

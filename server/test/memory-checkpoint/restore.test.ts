@@ -807,6 +807,7 @@ describe("restoreCheckpoint", () => {
         "version_below_floor",
       ),
       [{ namespace: "mem", key: "Q" }],
+      { namespace: "mem", key: "R" },
     );
     const failingStateStore: Pick<
       StateStore,
@@ -849,6 +850,7 @@ describe("restoreCheckpoint", () => {
       delete_remaining: [],
       import_applied: true,
       written_keys: [{ namespace: "mem", key: "Q" }],
+      in_flight_key: { namespace: "mem", key: "R" },
     });
     const failureAudit = fixture.audit.criticalCalls.at(-1);
     expect(failureAudit).toMatchObject({
@@ -858,6 +860,7 @@ describe("restoreCheckpoint", () => {
         reconstruct_progress: {
           import_applied: true,
           written_keys: [{ namespace: "mem", key: "Q" }],
+          in_flight_key: { namespace: "mem", key: "R" },
         },
       },
     });
@@ -910,6 +913,9 @@ describe("restoreCheckpoint", () => {
       name: "CheckpointRestoreSkippedEntriesError",
       reason: "checkpoint_skipped_entries_refused",
     });
+    expect((thrown as Error).message).toBe(
+      "memory checkpoint restore refused: 1 checkpoint entry is signed by an identity this fortress does not hold and 0 do not verify against the signer's current key (entries written before an identity key rotation are one cause). No override exists; state is unchanged",
+    );
     expect(deleteSpy).not.toHaveBeenCalled();
     expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);
     const forensic = (await fixture.checkpointStore.list()).find(

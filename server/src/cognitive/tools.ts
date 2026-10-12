@@ -1150,6 +1150,9 @@ export function createCognitiveTools(
           partial: true,
           imported_before_refusal: partialDetails.importedBeforeRefusal,
           written_keys: partialDetails.writtenKeys,
+          ...(partialDetails.inFlightKey
+            ? { in_flight_key: partialDetails.inFlightKey }
+            : {}),
         }
       : {};
     await recordCriticalAudit(
@@ -2249,6 +2252,9 @@ export function createCognitiveTools(
                       imported_before_refusal:
                         partialDetails.importedBeforeRefusal,
                       written_keys: partialDetails.writtenKeys,
+                      ...(partialDetails.inFlightKey
+                        ? { in_flight_key: partialDetails.inFlightKey }
+                        : {}),
                     }
                   : {}),
               },
@@ -2272,9 +2278,13 @@ export function createCognitiveTools(
               {
                 namespaces: targetNamespaces,
                 error_name: err instanceof Error ? err.name : typeof err,
+                error_message: err instanceof Error ? err.message : String(err),
                 partial: true,
                 imported_before_refusal: genericPartialDetails.importedBeforeRefusal,
                 written_keys: genericPartialDetails.writtenKeys,
+                ...(genericPartialDetails.inFlightKey
+                  ? { in_flight_key: genericPartialDetails.inFlightKey }
+                  : {}),
               },
               "failure"
             );

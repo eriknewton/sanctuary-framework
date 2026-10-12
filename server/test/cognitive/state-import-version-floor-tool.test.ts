@@ -4,7 +4,7 @@
  * STATE-IMPORT-VERSION-FLOOR-01
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
@@ -444,6 +444,41 @@ describe("state_import version floor tool path", () => {
       })).entries).toHaveLength(1);
     } finally {
       storage.onWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("aborts import before mutation when the attempt audit cannot be recorded", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "attempt-audit-abort", value: "imported" }],
+      });
+      const appendCritical = rig.auditLog.appendCritical.bind(rig.auditLog);
+      const appendSpy = vi
+        .spyOn(rig.auditLog, "appendCritical")
+        .mockImplementation(async (entry) => {
+          if (entry.operation === "state_import_attempt") {
+            throw new Error("injected attempt audit refusal");
+          }
+          return appendCritical(entry);
+        });
+
+      const result = await rig.client.callTool({
+        name: "state_import",
+        arguments: { bundle, conflict_resolution: "overwrite" },
+      });
+      expect(result.isError).toBe(true);
+      expect(parseToolPayload(result).error).toBe("tool execution failed");
+      expect(await rig.storage.read("notes", "attempt-audit-abort")).toBeNull();
+      appendSpy.mockRestore();
+    } finally {
       await rig.close();
     }
   });
@@ -1046,12 +1081,106 @@ describe("state_import version floor tool path", () => {
       expect(audit.entries).toHaveLength(1);
       expect(audit.entries[0]?.details).toMatchObject({
         error_name: "Error",
+        error_message: "injected storage refusal",
         partial: true,
         imported_before_refusal: 1,
         written_keys: [{ namespace: "notes", key: "storage-first" }],
       });
     } finally {
       storage.beforeWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("audits the in-flight import key when the first storage write refuses", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "storage-first-in-flight", value: "imported" }],
+      });
+      storage.onWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "storage-first-in-flight") {
+          throw new Error("injected first storage refusal");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      const first = await readValue(rig.client, "storage-first-in-flight");
+      expect(first.value).toBe("imported");
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        error_name: "Error",
+        error_message: "injected first storage refusal",
+        partial: true,
+        imported_before_refusal: 0,
+        written_keys: [],
+        in_flight_key: { namespace: "notes", key: "storage-first-in-flight" },
+      });
+    } finally {
+      storage.onWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("audits the in-flight import key when a later storage write refuses", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "storage-landed-first", value: "imported" },
+          { key: "storage-landed-second", value: "imported" },
+        ],
+      });
+      storage.onWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "storage-landed-second") {
+          throw new Error("injected landed storage refusal");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      expect((await readValue(rig.client, "storage-landed-first")).value).toBe("imported");
+      expect((await readValue(rig.client, "storage-landed-second")).value).toBe("imported");
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        error_name: "Error",
+        error_message: "injected landed storage refusal",
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "storage-landed-first" }],
+        in_flight_key: { namespace: "notes", key: "storage-landed-second" },
+      });
+    } finally {
+      storage.onWrite = undefined;
       await rig.close();
     }
   });

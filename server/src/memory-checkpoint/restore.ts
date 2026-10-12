@@ -362,9 +362,9 @@ export async function preflightCheckpointRestore(
     );
     if (preflight.skippedKeys > 0) {
       throw new CheckpointRestoreSkippedEntriesError(
-        `memory checkpoint restore refused: checkpoint contains ${preflight.skippedKeys} entr${
-          preflight.skippedKeys === 1 ? "y" : "ies"
-        } this build cannot verify; state is unchanged`,
+        `memory checkpoint restore refused: ${preflight.skippedUnknownKid} checkpoint ${
+          preflight.skippedUnknownKid === 1 ? "entry is" : "entries are"
+        } signed by an identity this fortress does not hold and ${preflight.skippedInvalidSig} do not verify against the signer's current key (entries written before an identity key rotation are one cause). No override exists; state is unchanged`,
         "checkpoint_skipped_entries_refused",
       );
     }
@@ -477,7 +477,12 @@ export async function restoreCheckpoint(
           delete_remaining: [],
           import_applied: partialDetails ? true : false,
           ...(partialDetails
-            ? { written_keys: partialDetails.writtenKeys }
+            ? {
+                written_keys: partialDetails.writtenKeys,
+                ...(partialDetails.inFlightKey
+                  ? { in_flight_key: partialDetails.inFlightKey }
+                  : {}),
+              }
             : {}),
         },
         err,
