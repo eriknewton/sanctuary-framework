@@ -89,6 +89,15 @@ jobs:
     needs: install-rust
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # Job scope, not workflow scope: only the job that produces the package may
+    # mint an OIDC token (id-token) and persist an attestation (attestations).
+    # The lifecycle, composition and evidence jobs keep the workflow default of
+    # contents: read. A job-level block replaces the workflow block entirely, so
+    # contents: read is restated here rather than inherited.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -125,6 +134,39 @@ jobs:
           python3 "$source/record-install-ci.py" "$RUNNER_TEMP/build-context.json"
           sudo install -o root -g root -m 0644 "$RUNNER_TEMP/build-context.json" "$RUNNER_TEMP/install/build-context.json"
           (cd "$RUNNER_TEMP/install" && sha256sum --check ./*.deb.sha256)
+      # Build provenance for the three files a GitHub Release carries for this
+      # package (the .deb, its .sha256 and its .build.json). The attestation is
+      # keyed by file digest, so the same bytes verify wherever they are fetched
+      # from, including a release asset the maintainer uploads by hand:
+      #   gh attestation verify <file> --repo eriknewton/sanctuary-framework
+      # Runs after the package bytes are checked and before any upload. Runs only
+      # on push: PR builds never ship, fork and Dependabot PRs get a read-only
+      # token with no id-token grant (the step would fail a required job), and a
+      # workflow_dispatch on an arbitrary ref must not mint an attestation that
+      # a bare verify command for this repository accepts. The first attestation
+      # lands on the next push to main.
+      # This is provenance (which workflow built which commit), not a maintainer
+      # signature over the package. Not attested: internal/*.deb and
+      # build-context.json, which are CI-only inputs to the downstream jobs.
+      - name: Assert the three published package files exist before attesting
+        # No event guard: PR CI exercises the assertion so a renamed output fails here, not on main's push run.
+        # The action fails only when every pattern matches nothing; a renamed
+        # output would otherwise attest two files and report success.
+        run: |
+          deb=("$RUNNER_TEMP"/install/*.deb)
+          sha=("$RUNNER_TEMP"/install/*.deb.sha256)
+          build=("$RUNNER_TEMP"/install/*.deb.build.json)
+          [[ ${#deb[@]} == 1 && -f "${deb[0]}" ]]
+          [[ ${#sha[@]} == 1 && -f "${sha[0]}" ]]
+          [[ ${#build[@]} == 1 && -f "${build[0]}" ]]
+      - name: Attest build provenance for the published package files
+        if: github.event_name == 'push'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/install/*.deb
+            ${{ runner.temp }}/install/*.deb.sha256
+            ${{ runner.temp }}/install/*.deb.build.json
       - name: Retain exact package bytes for required downstream jobs
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
