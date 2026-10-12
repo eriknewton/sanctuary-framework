@@ -217,11 +217,13 @@ export interface CustodyRepairAction {
   chmodTo?: number;
 }
 
+export type CustodySkipReason = "foreign_owner" | "multiple_names";
+
 export interface CustodySkip {
   path: string;
   uid: number;
   gid: number;
-  reason: "foreign_owner";
+  reason: CustodySkipReason;
 }
 
 export interface CustodyRepairPlan {
@@ -247,11 +249,20 @@ export interface CustodyRepairPlan {
 export interface CustodyApplyResult {
   /** Relative paths actually repaired (chown and/or chmod applied). */
   repaired: string[];
+  /** Entries deliberately left untouched with a typed reason. */
+  skipped: CustodySkip[];
   /** Entries that vanished between observe and apply (skip-and-note). */
   vanished: string[];
   /** Entries whose on-disk identity changed since observation (skipped, reported). */
   identityChanged: string[];
   failed: { path: string; reason: string }[];
+}
+
+export function custodySkipOperatorMessage(skip: CustodySkip): string {
+  if (skip.reason === "multiple_names") {
+    return `fortress entry ${skip.path} has more than one name and was left untouched.`;
+  }
+  return `fortress entry ${skip.path} is owned by uid ${skip.uid} (neither root nor the operator); left untouched.`;
 }
 
 export type FortressCustodyBaseFailureReason =
@@ -467,6 +478,23 @@ function sameIdentity(entry: FortressCustodyEntry, stats: Stats): boolean {
   );
 }
 
+const SINGLE_NAME_LINK_COUNT = 1;
+
+function multiplyNamedRegularFileSkip(
+  entry: FortressCustodyEntry,
+  stats: Stats,
+): CustodySkip | null {
+  if (entry.type !== "file" || stats.nlink <= SINGLE_NAME_LINK_COUNT) {
+    return null;
+  }
+  return {
+    path: entry.path,
+    uid: stats.uid,
+    gid: stats.gid,
+    reason: "multiple_names",
+  };
+}
+
 /** Directory-open flags: never follow a symlink, never open a non-directory. */
 function dirOpenFlags(): number {
   return (
@@ -598,13 +626,19 @@ async function applyOneAction(
   action: CustodyRepairAction,
   observed: ReadonlyMap<string, FortressCustodyEntry>,
   ops: FortressCustodyFsOps,
-): Promise<"repaired" | "vanished" | "identity_changed" | "ancestor_changed"> {
+): Promise<
+  | { kind: "repaired" }
+  | { kind: "vanished" }
+  | { kind: "identity_changed" }
+  | { kind: "ancestor_changed" }
+  | { kind: "skipped"; skip: CustodySkip }
+> {
   const relPath = action.entry.path;
   // 1. Every ancestor must still be the exact directory we observed, opened
   //    no-follow, and is HELD OPEN for the duration of this operation.
   const ancestors = await openVerifiedAncestors(fortressPath, relPath, observed, ops);
   if (ancestors === null) {
-    return "ancestor_changed";
+    return { kind: "ancestor_changed" };
   }
   try {
     if (action.entry.type === "file" || action.entry.type === "dir") {
@@ -618,25 +652,30 @@ async function applyOneAction(
       try {
         handle = await ops.open(relPath === "." ? fortressPath : join(fortressPath, relPath), flags);
       } catch (err) {
-        if (isEnoent(err)) return "vanished";
+        if (isEnoent(err)) return { kind: "vanished" };
         throw err;
       }
       try {
         // 2. The opened inode must be the one we observed.
         const fresh = await handle.stat();
-        if (!sameIdentity(action.entry, fresh)) return "identity_changed";
+        if (!sameIdentity(action.entry, fresh)) return { kind: "identity_changed" };
         // 3. Two-sided close-out: resolve the path again and require it to
         //    name the observed inode, then revalidate every held ancestor path
         //    immediately before the root operation.
         let viaPath: Stats;
-    try {
+        try {
           viaPath = await ops.lstat(relPath === "." ? fortressPath : join(fortressPath, relPath));
         } catch (err) {
-          if (isEnoent(err)) return "vanished";
+          if (isEnoent(err)) return { kind: "vanished" };
           throw err;
         }
-        if (!sameIdentity(action.entry, viaPath)) return "identity_changed";
-        if (!(await revalidateHeldAncestors(ancestors, ops))) return "ancestor_changed";
+        if (!sameIdentity(action.entry, viaPath)) return { kind: "identity_changed" };
+        if (!(await revalidateHeldAncestors(ancestors, ops))) return { kind: "ancestor_changed" };
+        const operationFresh = await handle.stat();
+        if (!sameIdentity(action.entry, operationFresh)) return { kind: "identity_changed" };
+        // Repair may run as root, and a second name for a file can point outside the fortress, so descriptor-pinned metadata changes stop here.
+        const skip = multiplyNamedRegularFileSkip(action.entry, operationFresh);
+        if (skip !== null) return { kind: "skipped", skip };
         if (action.chownTo !== undefined) {
           await handle.chown(action.chownTo.uid, action.chownTo.gid);
         }
@@ -646,7 +685,7 @@ async function applyOneAction(
       } finally {
         await handle.close().catch(() => undefined);
       }
-      return "repaired";
+      return { kind: "repaired" };
     }
     // Socket / symlink / other: not openable, so the ancestor verification
     // above is the containment guarantee; re-verify the entry's own identity
@@ -655,11 +694,11 @@ async function applyOneAction(
     try {
       fresh = await ops.lstat(join(fortressPath, relPath));
     } catch (err) {
-      if (isEnoent(err)) return "vanished";
+      if (isEnoent(err)) return { kind: "vanished" };
       throw err;
     }
-    if (!sameIdentity(action.entry, fresh)) return "identity_changed";
-    if (!(await revalidateHeldAncestors(ancestors, ops))) return "ancestor_changed";
+    if (!sameIdentity(action.entry, fresh)) return { kind: "identity_changed" };
+    if (!(await revalidateHeldAncestors(ancestors, ops))) return { kind: "ancestor_changed" };
     if (action.chownTo !== undefined) {
       await ops.lchown(join(fortressPath, relPath), action.chownTo.uid, action.chownTo.gid);
     }
@@ -670,7 +709,7 @@ async function applyOneAction(
     // (lchown never follows) but never chmod them. `castle.sock`'s 0600 is
     // re-established by the daemon that binds it; a deviant socket mode is
     // REPORTED by the plan instead of silently left, see `socketModeDeviations`.
-    return "repaired";
+    return { kind: "repaired" };
   } finally {
     for (const { handle } of ancestors.handles.reverse()) {
       await handle.close().catch(() => undefined);
@@ -692,6 +731,7 @@ export async function applyFortressCustodyRepairs(
 ): Promise<CustodyApplyResult> {
   const result: CustodyApplyResult = {
     repaired: [],
+    skipped: [],
     vanished: [],
     identityChanged: [],
     failed: [],
@@ -703,14 +743,16 @@ export async function applyFortressCustodyRepairs(
     const relPath = action.entry.path;
     try {
       const disposition = await applyOneAction(fortressPath, action, observed, ops);
-      if (disposition === "vanished") {
+      if (disposition.kind === "vanished") {
         result.vanished.push(relPath);
-      } else if (disposition === "identity_changed") {
+      } else if (disposition.kind === "identity_changed") {
         result.identityChanged.push(relPath);
-      } else if (disposition === "ancestor_changed") {
+      } else if (disposition.kind === "ancestor_changed") {
         // Reported, never silently dropped: a changed ancestor is the
         // symlink-escape attack shape, so it is surfaced distinctly.
         result.identityChanged.push(`${relPath} (ancestor changed)`);
+      } else if (disposition.kind === "skipped") {
+        result.skipped.push(disposition.skip);
       } else {
         result.repaired.push(relPath);
       }
@@ -915,6 +957,7 @@ export async function applyCustodyRollback(
 ): Promise<CustodyApplyResult> {
   const result: CustodyApplyResult = {
     repaired: [],
+    skipped: [],
     vanished: [],
     identityChanged: [],
     failed: [],
@@ -1105,9 +1148,7 @@ export async function normalizeFortressCustody(
     outcome.skips = plan.skips;
     if (plan.skips.length > 0) {
       for (const skip of plan.skips) {
-        input.log(
-          `Warning: fortress entry ${skip.path} is owned by uid ${skip.uid} (neither root nor the operator); left untouched.`,
-        );
+        input.log(`Warning: ${custodySkipOperatorMessage(skip)}`);
       }
     }
     if (plan.actions.length === 0) {
@@ -1115,6 +1156,7 @@ export async function normalizeFortressCustody(
     }
     const applied = await applyFortressCustodyRepairs(input.fortressPath, plan, ops);
     outcome.repaired = applied.repaired;
+    outcome.skips.push(...applied.skipped);
     outcome.vanished.push(...applied.vanished);
     outcome.failed = applied.failed;
     if (applied.repaired.length > 0) {
@@ -1124,6 +1166,12 @@ export async function normalizeFortressCustody(
           applied.repaired.length === 1 ? "y" : "ies"
         } under ${input.fortressPath} handed back to the operator (uid ${input.operator.uid}).`,
       );
+    }
+    if (applied.skipped.length > 0) {
+      outcome.status = "failed";
+      for (const skip of applied.skipped) {
+        input.log(`Warning: ${custodySkipOperatorMessage(skip)}`);
+      }
     }
     // 2026-07-31 gate round 3 (LOW): identity/ancestor changes were dropped
     // here, so a race could leave root-owned residue behind a "clean"

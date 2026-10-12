@@ -36,7 +36,7 @@ interface FakeNode {
   uid: number;
   gid: number;
   mode: number;
-  ino: number;
+  ino: number; nlink?: number;
 }
 
 function fakeStats(node: FakeNode): Stats {
@@ -49,7 +49,7 @@ function fakeStats(node: FakeNode): Stats {
     gid: node.gid,
     mode: node.mode,
     dev: 1,
-    ino: node.ino,
+    ino: node.ino, nlink: node.nlink ?? 1,
   } as unknown as Stats;
 }
 
@@ -549,6 +549,39 @@ describe("castle-wall repair-custody", () => {
       expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
       expect(ctx.err.text()).toContain("Repair incomplete");
       expect(ctx.err.text()).toContain("changed identity");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports and leaves a root-owned file with more than one name untouched", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/shared.enc": {
+            type: "file",
+            uid: 0,
+            gid: 20,
+            mode: 0o640,
+            ino: 2,
+            nlink: 2,
+          },
+          "/outside/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
+        },
+        { "/Users/mini2/.sanctuary": ["shared.enc"] },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/shared.enc")!.uid).toBe(0);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/shared.enc")!.mode).toBe(0o640);
+      expect(ctx.out.text()).toContain(
+        "fortress entry shared.enc has more than one name and was left untouched",
+      );
     } finally {
       await rm(manifestDir, { recursive: true, force: true });
     }

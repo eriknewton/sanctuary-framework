@@ -43,6 +43,7 @@ import {
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_DIR,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  custodySkipOperatorMessage,
   manifestCarriesPrivilegeBits,
   parseCustodyRepairManifest,
   planFortressCustodyRepairs,
@@ -181,6 +182,9 @@ export function parseRepairCustodyArgs(argv: string[]): ParsedRepairCustodyArgs 
 }
 
 function describeApply(result: CustodyApplyResult, out: Writable): void {
+  for (const skip of result.skipped) {
+    write(out, `  skipped: ${custodySkipOperatorMessage(skip)}\n`);
+  }
   for (const path of result.vanished) {
     write(out, `  note: ${path} vanished mid-repair (live daemon churn); skipped.\n`);
   }
@@ -487,6 +491,15 @@ export async function runRepairCustody(
 
   const applied = await applyFortressCustodyRepairs(fortressPath, plan, ops);
   describeApply(applied, out);
+  if (applied.skipped.length > 0) {
+    write(
+      err,
+      `Repair incomplete: ${applied.skipped.length} entr${
+        applied.skipped.length === 1 ? "y was" : "ies were"
+      } left untouched (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+    );
+    return REPAIR_CUSTODY_EXIT_FAILED;
+  }
   if (applied.failed.length > 0) {
     write(
       err,
@@ -519,6 +532,9 @@ export async function runRepairCustody(
       manifest_path: manifestPath,
       repaired: applied.repaired.length,
       skipped_foreign_owner: plan.skips.length,
+      skipped_multiple_names: applied.skipped.filter(
+        (skip) => skip.reason === "multiple_names",
+      ).length,
       vanished: walk.vanished.length + applied.vanished.length,
       identity_changed: applied.identityChanged.length,
       operator_uid: identity.uid,
@@ -539,7 +555,11 @@ export async function runRepairCustody(
       // on the floor, so an audit write that minted root-owned state the
       // sweep could not repair still exited success. Surface it and downgrade
       // the exit code -- never report a clean repair over known residue.
-      if (swept.failed.length > 0 || swept.identityChanged.length > 0) {
+      if (
+        swept.failed.length > 0 ||
+        swept.identityChanged.length > 0 ||
+        swept.skipped.length > 0
+      ) {
         describeApply(swept, out);
         write(
           err,

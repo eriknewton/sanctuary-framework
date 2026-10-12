@@ -33,6 +33,7 @@ interface FakeNode {
   gid: number;
   mode: number;
   ino: number;
+  nlink?: number;
 }
 
 function fakeStats(node: FakeNode): Stats {
@@ -46,6 +47,7 @@ function fakeStats(node: FakeNode): Stats {
     mode: node.mode | (node.type === "dir" ? 0o040000 : 0),
     dev: 1,
     ino: node.ino,
+    nlink: node.nlink ?? 1,
   } as unknown as Stats;
 }
 
@@ -330,6 +332,77 @@ describe("fortress-custody: apply", () => {
     expect(applied.vanished).toEqual(["castle-pinned-pubkey.bin"]);
     expect(applied.failed).toEqual([]);
     expect(applied.repaired).toContain(".");
+  });
+
+  it("records a typed skip and leaves a root-owned file with more than one name untouched", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
+        "/outside/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
+      },
+      { "/f": ["shared.enc"] },
+    );
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    expect(outcome.status).not.toBe("clean");
+    expect(outcome.skips).toEqual([
+      { path: "shared.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/shared.enc")!.uid).toBe(0);
+    expect(fake.nodes.get("/f/shared.enc")!.mode).toBe(0o640);
+    expect(fake.fchowns.some((call) => call.path === "/f/shared.enc")).toBe(false);
+    expect(fake.fchmods.some((call) => call.path === "/f/shared.enc")).toBe(false);
+    expect(lines.join("\n")).toContain(
+      "fortress entry shared.enc has more than one name and was left untouched",
+    );
+  });
+
+  it("refuses when an opened file gains another name after the observe walk", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/late.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["late.enc"] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    fake.nodes.get("/f/late.enc")!.nlink = 2;
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    const skipped = (applied as unknown as { skipped?: unknown[] }).skipped;
+
+    expect(skipped).toEqual([
+      { path: "late.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/late.enc")!.uid).toBe(0);
+    expect(fake.fchowns.some((call) => call.path === "/f/late.enc")).toBe(false);
+  });
+
+  it("still repairs a root-owned file with one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/single.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["single.enc"] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.repaired).toContain("single.enc");
+    expect(fake.nodes.get("/f/single.enc")!.uid).toBe(501);
+    expect(fake.fchowns.some((call) => call.path === "/f/single.enc")).toBe(true);
   });
 });
 
