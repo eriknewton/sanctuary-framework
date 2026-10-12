@@ -27,17 +27,36 @@ function ensureHarnessDaemonLogDirSource(source: string): string {
   return source.slice(start, end);
 }
 
+function createHarnessLogDirectoryAsAgentSource(source: string): string {
+  const start = source.indexOf("export function createHarnessLogDirectoryAsAgent(");
+  const end = source.indexOf("export async function ensureHarnessDaemonLogDir(", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
+
 function awaitedCalls(source: string): string[] {
   return [...source.matchAll(/\bawait\s+([A-Za-z0-9_.]+)\s*\(/g)].map((match) => match[1]!);
+}
+
+function expectNoRootFilesystemMutation(source: string): void {
+  expect(source).not.toMatch(
+    /(?:\b|\.)(?:chown|lchown|fchown|chmod|fchmod|mkdir|rename|open|unlink|writeFile|symlink)\s*\(/,
+  );
+  expect(source).not.toMatch(/(?:\b|\.)[A-Za-z0-9_]+Sync\s*\(/);
 }
 
 describe("structure: harness log directory install wiring", () => {
   it("pins agent-authority creation at the production helper", async () => {
     const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
     const helperSource = ensureHarnessDaemonLogDirSource(source);
+    const creatorSource = createHarnessLogDirectoryAsAgentSource(source);
 
     expect(source).toContain("createHarnessLogDirectoryAsAgent");
     expect(source).toContain('spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options)');
+    expect(creatorSource).toContain(
+      'spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options)',
+    );
     expect(helperSource).toContain(
       [
         "ops: HarnessLogDirectoryOps = {",
@@ -53,9 +72,8 @@ describe("structure: harness log directory install wiring", () => {
       "ops.createDirectoryAsAgent",
       "ops.lstat",
     ]);
-    expect(helperSource).not.toMatch(
-      /(?:\b|\.)?(?:fsChown|chown|lchown|fchown|chmod|fchmod|mkdir|rename|open|unlink|writeFile)\s*\(/,
-    );
+    expectNoRootFilesystemMutation(helperSource);
+    expectNoRootFilesystemMutation(creatorSource);
     expect(helperSource).not.toContain("openDirectoryNoFollow");
     expect(helperSource).not.toContain("readEntries");
     expect(helperSource).not.toContain("/dev/fd");

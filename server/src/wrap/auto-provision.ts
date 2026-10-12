@@ -178,9 +178,10 @@ export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 export class HarnessLogDirectoryCustodyError extends Error {
-  constructor(harnessLogDir: string) {
+  constructor(harnessLogDir: string, message?: string) {
     super(
-      `${harnessLogDir} must be a real directory owned by the dedicated agent account; move it aside or remove it, then re-run protect.`,
+      message ??
+        `${harnessLogDir} must be a real directory owned by the dedicated agent account; move it aside or remove it, then re-run protect.`,
     );
     this.name = "HarnessLogDirectoryCustodyError";
   }
@@ -218,6 +219,13 @@ function harnessLogCustodyError(harnessLogDir: string): HarnessLogDirectoryCusto
   return new HarnessLogDirectoryCustodyError(harnessLogDir);
 }
 
+function harnessLogParentCustodyError(parentDir: string): HarnessLogDirectoryCustodyError {
+  return new HarnessLogDirectoryCustodyError(
+    parentDir,
+    `${parentDir} must be a real directory owned by the dedicated agent account and not writable by group or others; fix its ownership and mode, then re-run protect.`,
+  );
+}
+
 function harnessLogDirectoryMode(stats: HarnessLogDirectoryStats): number {
   return stats.mode & HARNESS_LOG_DIR_MODE_MASK;
 }
@@ -232,13 +240,17 @@ function assertHarnessLogDirectoryShape(
 }
 
 function assertHarnessLogDirectoryParentCustody(
-  harnessLogDir: string,
+  parentDir: string,
   stats: HarnessLogDirectoryStats,
   uid: number,
 ): void {
-  assertHarnessLogDirectoryShape(harnessLogDir, stats);
+  try {
+    assertHarnessLogDirectoryShape(parentDir, stats);
+  } catch {
+    throw harnessLogParentCustodyError(parentDir);
+  }
   if (stats.uid !== uid || (harnessLogDirectoryMode(stats) & GROUP_OR_OTHER_WRITE_MASK) !== 0) {
-    throw harnessLogCustodyError(harnessLogDir);
+    throw harnessLogParentCustodyError(parentDir);
   }
 }
 
@@ -258,6 +270,7 @@ function spawnMkdirOptions(uid: number, gid: number): SpawnOptions {
     env: HARNESS_LOG_MKDIR_ENV,
     shell: false,
     stdio: ["ignore", "ignore", "ignore"],
+    // uid and gid are always passed so the child never inherits the caller's privileged group.
     uid,
     gid,
   };
@@ -268,9 +281,7 @@ export function createHarnessLogDirectoryAsAgent(
   uid: number,
   gid: number,
   spawnImpl: typeof spawn = spawn,
-  _current?: { uid?: number; gid?: number },
 ): Promise<void> {
-  void _current;
   const options = spawnMkdirOptions(uid, gid);
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -288,10 +299,18 @@ export function createHarnessLogDirectoryAsAgent(
       clearTimeout(timer);
       resolve();
     };
+    const childNeverStarted = (): boolean => {
+      const processHandle = (child as (ChildProcess & { _handle?: unknown }) | undefined)?._handle;
+      return child?.pid === undefined || processHandle === null;
+    };
     const failAfterChildClose = () => {
       if (settled || rejectAfterClose) return;
       rejectAfterClose = true;
       if (child === undefined) {
+        finishReject();
+        return;
+      }
+      if (childNeverStarted()) {
         finishReject();
         return;
       }
@@ -334,10 +353,10 @@ export async function ensureHarnessDaemonLogDir(
   try {
     parentStats = await ops.lstat(parent);
   } catch {
-    throw harnessLogCustodyError(harnessLogDir);
+    throw harnessLogParentCustodyError(parent);
   }
   // The parent check pins the helper to the dedicated account home shape before root delegates creation.
-  assertHarnessLogDirectoryParentCustody(harnessLogDir, parentStats, uid);
+  assertHarnessLogDirectoryParentCustody(parent, parentStats, uid);
 
   let stats: HarnessLogDirectoryStats | undefined;
   try {

@@ -1484,6 +1484,8 @@ describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", 
 describe("wrap/auto-provision real-ops chokepoint: harness log directory custody", () => {
   const currentUid = process.getuid?.() ?? 501;
   const currentGid = process.getgid?.() ?? 20;
+  // Any positive pid is enough to model a started child in these spawn fakes.
+  const FAKE_STARTED_CHILD_PID = 42_424;
 
   async function makeHarnessLogFixture(prefix = "sanctuary-harness-log-custody-"): Promise<{
     tmpRoot: string;
@@ -1521,6 +1523,13 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     });
   }
 
+  async function expectParentCustodyRefusal(action: Promise<unknown>, path: string): Promise<void> {
+    await expect(action).rejects.toMatchObject({
+      name: "HarnessLogDirectoryCustodyError",
+      message: `${path} must be a real directory owned by the dedicated agent account and not writable by group or others; fix its ownership and mode, then re-run protect.`,
+    });
+  }
+
   function statsWithOwner(
     stats: Awaited<ReturnType<typeof lstat>>,
     uid: number,
@@ -1549,6 +1558,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     return ((command: string, args: readonly string[], options: SpawnOptions): ChildProcess => {
       calls.push({ command, args: [...args], options });
       const child = new EventEmitter() as ChildProcess;
+      Object.defineProperty(child, "pid", { value: FAKE_STARTED_CHILD_PID });
       child.kill = (() => true) as ChildProcess["kill"];
       queueMicrotask(() => child.emit("close", code));
       return child;
@@ -1600,7 +1610,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
-  it("AGENT-HOME-LOGS-SYMLINK-01: spawns mkdir with the requested agent uid and gid for root callers", async () => {
+  it("AGENT-HOME-LOGS-SYMLINK-01: spawns mkdir with distinct requested uid and gid", async () => {
     const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
     // 7001/7002 are arbitrary non-current ids that make uid and gid distinct in the spawn assertion.
     const targetUid = 7001;
@@ -1611,7 +1621,6 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       targetUid,
       targetGid,
       fakeMkdirSpawn(calls),
-      { uid: 0, gid: 0 },
     );
 
     expect(calls).toHaveLength(1);
@@ -1635,7 +1644,6 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       currentUid,
       currentGid,
       fakeMkdirSpawn(calls),
-      { uid: currentUid, gid: currentGid },
     );
 
     expect(calls).toHaveLength(1);
@@ -1666,6 +1674,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     const events: string[] = [];
     const failingSpawn = (() => {
       const child = new EventEmitter() as ChildProcess;
+      Object.defineProperty(child, "pid", { value: FAKE_STARTED_CHILD_PID });
       child.kill = (() => {
         events.push("kill");
         queueMicrotask(() => {
@@ -1693,11 +1702,45 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     expect(events).toEqual(["error", "kill", "close"]);
   });
 
+  it("AGENT-HOME-LOGS-SYMLINK-01: rejects a mkdir child error when the child never started", async () => {
+    vi.useFakeTimers();
+    const failingSpawn = (() => {
+      const child = new EventEmitter() as ChildProcess;
+      Object.defineProperty(child, "pid", { value: undefined });
+      child.kill = (() => false) as ChildProcess["kill"];
+      queueMicrotask(() => child.emit("error", new Error("spawn fault")));
+      return child;
+    }) as typeof spawn;
+    const promise = createHarnessLogDirectoryAsAgent(
+      "/tmp/sanctuary-agent-home/logs",
+      currentUid,
+      currentGid,
+      failingSpawn,
+    );
+    const timedOut = Symbol("timed-out");
+
+    try {
+      await Promise.resolve();
+      const result = await Promise.race([
+        promise.then(
+          () => "resolved",
+          (err: unknown) => err,
+        ),
+        vi.advanceTimersByTimeAsync(1).then(() => timedOut),
+      ]);
+      expect(result).toBeInstanceOf(HarnessLogDirectoryCustodyError);
+    } finally {
+      vi.useRealTimers();
+      promise.catch(() => undefined);
+    }
+  });
+
   it("AGENT-HOME-LOGS-SYMLINK-01: waits for close after timing out the mkdir child", async () => {
     vi.useFakeTimers();
     const child = new EventEmitter() as ChildProcess;
     const events: string[] = [];
     let settled = false;
+    Object.defineProperty(child, "pid", { value: FAKE_STARTED_CHILD_PID });
     child.kill = (() => {
       events.push("kill");
       return true;
@@ -1839,9 +1882,9 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       await mkdir(outsideHome);
       await symlink(outsideHome, parentLink);
 
-      await expectCustodyRefusal(
+      await expectParentCustodyRefusal(
         ensureHarnessDaemonLogDir(join(parentLink, "logs"), currentUid, currentGid),
-        join(parentLink, "logs"),
+        parentLink,
       );
 
       expect(await readlink(parentLink)).toBe(outsideHome);
