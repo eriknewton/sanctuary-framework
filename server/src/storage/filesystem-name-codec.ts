@@ -12,21 +12,27 @@ export const FILESYSTEM_STORAGE_NAME_REMEDIATION =
 export class FilesystemStorageNameError extends Error {
   readonly code = "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE";
   readonly rawName?: string;
+  readonly rawNamespace?: string;
   readonly requestedName?: string;
 
   constructor(
     readonly kind: FilesystemStorageNameKind,
-    options: { rawName?: string; requestedName?: string } = {},
+    options: { rawName?: string; rawNamespace?: string; requestedName?: string } = {},
   ) {
     const detail = options.rawName === undefined
       ? `requested ${kind} ${FILESYSTEM_STORAGE_NAME_REMEDIATION}`
-      : `stored ${kind} raw entry ${JSON.stringify(options.rawName)} ${FILESYSTEM_STORAGE_NAME_REMEDIATION}`;
+      : `stored ${kind} raw entry ${JSON.stringify(options.rawName)}${
+          options.rawNamespace === undefined
+            ? ""
+            : ` in namespace directory ${JSON.stringify(options.rawNamespace)}`
+        } ${FILESYSTEM_STORAGE_NAME_REMEDIATION}`;
     const recovery = options.rawName === undefined
-      ? "choose a byte-addressable storage name"
-      : "if the original logical name is known, use an older build to read it and rewrite it under a byte-addressable storage name before upgrading; otherwise restore the entry from backup";
+      ? "choose a supported storage name"
+      : "if the original logical name is known, use an older build to read the entry, write it under a supported storage name, then delete the original with the older build; if it is not known, move the raw entry out of the storage directory, accepting that this entry will be unavailable";
     super(`Storage refused: ${detail}; ${recovery}.`);
     this.name = "FilesystemStorageNameError";
     this.rawName = options.rawName;
+    this.rawNamespace = options.rawNamespace;
     this.requestedName = options.requestedName;
   }
 }
@@ -78,7 +84,8 @@ export function decodeRawFilesystemStorageName(
 ): string {
   const decoded = decodeFilesystemStorageName(rawName);
   // Enumeration must refuse a raw segment it cannot re-address to the same
-  // bytes; this proves byte coverage only, not the original logical spelling.
+  // bytes; names outside the supported range are refused on write and may not
+  // round-trip when read from older storage.
   if (encodeFilesystemStorageName(decoded) !== rawName) {
     throw new FilesystemStorageNameError(kind, { rawName });
   }

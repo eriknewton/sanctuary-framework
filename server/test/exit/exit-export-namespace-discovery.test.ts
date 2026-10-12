@@ -358,6 +358,71 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     expect(audit.entries).toEqual([]);
   });
 
+  it.each([
+    { label: "discovery", stateNamespaces: undefined },
+    { label: "explicit", stateNamespaces: ["plain"] },
+  ] as const)(
+    "refuses $label export before artifacts when a stored key cannot be addressed",
+    async ({ stateNamespaces }) => {
+      const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-exit-key-"));
+      cleanup.push(storagePath);
+      const stateStoragePath = join(storagePath, "state");
+      await mkdir(join(stateStoragePath, "plain"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await writeFile(
+        join(stateStoragePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+      const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-key-"));
+      cleanup.push(bundleDir);
+      const storage = new FilesystemStorage(stateStoragePath);
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const { reputationStore } = createL4Tools(
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+      );
+      await callTool(tools as ToolLike[], "identity_create", { label: "agent" });
+
+      await expect(
+        exportExitBundle({
+          unpartitionedLegacyExport: true,
+          bundleDir,
+          storage,
+          masterKey,
+          identityManager,
+          auditLog,
+          reputationStore,
+          policy: DEFAULT_POLICY,
+          config: defaultConfig(),
+          stateStoragePath,
+          ...(stateNamespaces === undefined
+            ? {}
+            : { stateNamespaces: [...stateNamespaces] }),
+          keySource: "recovery-key",
+        }),
+      ).rejects.toThrow(/storage name this version cannot address/);
+
+      expect(await readdir(bundleDir)).toEqual([]);
+      await auditLog.flush();
+      const audit = await auditLog.query({ operation_type: "exit_bundle_export" });
+      expect(audit.entries).toEqual([]);
+    },
+  );
+
   it("still restricts the export to the namespaces --state-namespace names", async () => {
     await seededFortress();
     const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-one-"));

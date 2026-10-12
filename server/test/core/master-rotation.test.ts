@@ -20,6 +20,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { FilesystemStorageNameError } from "../../src/storage/filesystem-name-codec.js";
 import {
   establishMaster,
   readCustodyEnvelope,
@@ -1039,6 +1040,20 @@ describe("master rotation — fail-closed coverage", () => {
     await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
     expect(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION).toContain("1024 namespaces or 65536 scanned directory entries");
     expect(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION).toContain("Remedy:");
+    expect(await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toEqual(before);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+  });
+
+  it("reports storage-name refusals as rotation preflight failures", async () => {
+    const fortress = await buildFortress();
+    const before = await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    fortress.storage.listNamespaces = async () => {
+      throw new FilesystemStorageNameError("key", { rawName: "key-!4E2D" });
+    };
+
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+      RotationPreflightError
+    );
     expect(await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toEqual(before);
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
   });

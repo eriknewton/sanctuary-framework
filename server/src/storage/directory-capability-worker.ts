@@ -297,6 +297,10 @@ async function main(): Promise<void> {
               error instanceof Error && "rawName" in error && typeof (error as { rawName?: unknown }).rawName === "string"
                 ? (error as { rawName: string }).rawName
                 : undefined,
+            rawNamespace:
+              error instanceof Error && "rawNamespace" in error && typeof (error as { rawNamespace?: unknown }).rawNamespace === "string"
+                ? (error as { rawNamespace: string }).rawNamespace
+                : undefined,
           },
         });
       }

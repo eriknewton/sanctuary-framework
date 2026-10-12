@@ -205,22 +205,20 @@ describe("FilesystemStorage", () => {
       });
     });
 
-    it("pins the residual alias class without rewriting stored bytes", async () => {
-      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
-      const rawName = "key-!3B1.enc";
-      const bytes = new Uint8Array([9, 8, 7]);
-      await writeFile(join(basePath, "plain", rawName), bytes);
-
-      const listed = await storage.list("plain");
-      // NAMESPACE-WIDE-NAME-ALIAS-01: this interim check proves byte
-      // re-addressability only; some older raw segments still enumerate under
-      // an alias name until envelope-level name verification is wired.
-      expect(listed.map((entry) => entry.key)).toEqual(["key-;1"]);
-      expect(await storage.read("plain", "key-;1")).toEqual(bytes);
-      expect(await readdir(join(basePath, "plain"))).toEqual([rawName]);
-    });
-
     const darwinIt = process.platform === "darwin" ? it : it.skip;
+
+    it("checks every stored child during namespace discovery", async () => {
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      await writeFile(join(basePath, "plain", "z-good.enc"), new Uint8Array([1]));
+      await writeFile(
+        join(basePath, "plain", "a-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+
+      await expect(storage.listNamespaces()).rejects.toMatchObject({
+        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+      });
+    });
 
     darwinIt("refuses raw stored names through the Darwin directory capability", async () => {
       await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });

@@ -42,7 +42,11 @@ export interface RestoreCheckpointResult {
 export interface RestoreCheckpointDeps {
   stateStore: Pick<
     StateStore,
-    "exportNamespaces" | "import" | "delete" | "assertImportVersionFloors"
+    | "exportNamespaces"
+    | "import"
+    | "delete"
+    | "assertImportVersionFloors"
+    | "preflightImportStorageNames"
   >;
   checkpointStore: MemoryCheckpointStore;
   masterKey: Uint8Array;
@@ -328,6 +332,7 @@ export async function preflightCheckpointRestore(
   }
 
   parseExportBundleData(checkpointBundle, "checkpoint");
+  await deps.stateStore.preflightImportStorageNames(checkpointBundle);
   try {
     // Every entry must clear the durable reader's floor before forensic writes
     // or deletions; a failed anchor read cannot authorize reconstruction.

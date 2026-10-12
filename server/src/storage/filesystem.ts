@@ -27,8 +27,8 @@
  *   etc. preserve their on-disk paths verbatim) and `!`-escapes every other
  *   character as the legacy byte escape `!XX`. The escape character
  *   `!` itself is NOT in the safe set, so a literal `!` in input encodes as
- *   `!21`. Older raw segments outside that byte-sized domain can still
- *   enumerate under an alias until envelope-level name checks are wired.
+ *   `!21`. Names stored by older builds outside the supported range are
+ *   refused on write and may not round-trip when enumerated.
  *
  * Legacy fallback (forward compatibility):
  *   Pre-fix code used `replace(/[^a-zA-Z0-9_-]/g, "_")` for namespaces and
@@ -75,6 +75,8 @@ import {
   assertFilesystemStorageNameAddressable,
   decodeRawFilesystemStorageName,
   encodeFilesystemStorageName,
+  FilesystemStorageNameError,
+  isFilesystemStorageNameError,
 } from "./filesystem-name-codec.js";
 import {
   cleanupFreshInitRecoveryResidue,
@@ -169,7 +171,13 @@ interface CapabilityResponse {
   ready?: boolean;
   ok?: boolean;
   value?: unknown;
-  error?: { message?: string; code?: string; kind?: string; rawName?: string };
+  error?: {
+    message?: string;
+    code?: string;
+    kind?: string;
+    rawName?: string;
+    rawNamespace?: string;
+  };
 }
 
 class DarwinDirectoryCapabilityClient {
@@ -196,10 +204,15 @@ class DarwinDirectoryCapabilityClient {
       } else {
         const error = new Error(
           raw.error?.message ?? "directory-capability worker operation failed",
-        ) as NodeJS.ErrnoException & { kind?: string; rawName?: string };
+        ) as NodeJS.ErrnoException & {
+          kind?: string;
+          rawName?: string;
+          rawNamespace?: string;
+        };
         if (raw.error?.code) error.code = raw.error.code;
         if (raw.error?.kind) error.kind = raw.error.kind;
         if (raw.error?.rawName) error.rawName = raw.error.rawName;
+        if (raw.error?.rawNamespace) error.rawNamespace = raw.error.rawNamespace;
         waiter.reject(error);
       }
     });
@@ -1222,9 +1235,18 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           // Discovery must prove a namespace's child entries are also
           // byte-addressable; otherwise a later list(namespace) refusal would
           // arrive after callers treated discovery as a complete custody set.
-          decodeRawFilesystemStorageName(entry.name.slice(0, -4), "key");
+          try {
+            decodeRawFilesystemStorageName(entry.name.slice(0, -4), "key");
+          } catch (error) {
+            if (isFilesystemStorageNameError(error)) {
+              throw new FilesystemStorageNameError("key", {
+                rawName: error.rawName,
+                rawNamespace: dir.name,
+              });
+            }
+            throw error;
+          }
           hasEntries = true;
-          break;
         }
       }
       if (!hasEntries) continue;

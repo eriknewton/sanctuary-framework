@@ -3068,6 +3068,10 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError("state_import");
     }
+    // Must match the import loop below: storage-name refusal is the first
+    // bundle-dependent gate so a direct StateStore caller gets the same
+    // before-write guarantee as the MCP tool path.
+    await this.preflightImportStorageNames(bundleBase64);
     // Must match assertImportVersionFloors above: reconstruction preflights this parser.
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
@@ -3078,8 +3082,6 @@ export class StateStore {
       data,
       options.allowUnverifiedLegacy === true
     );
-    await this.preflightImportStorageNames(bundleBase64);
-
     let importedKeys = 0;
     let skippedKeys = 0;
     let skippedInvalidSig = 0;

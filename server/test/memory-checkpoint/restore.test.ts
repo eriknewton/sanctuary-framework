@@ -524,10 +524,15 @@ describe("restoreCheckpoint", () => {
 
     const failingStateStore: Pick<
       StateStore,
-      "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
+      | "exportNamespaces"
+      | "delete"
+      | "import"
+      | "assertImportVersionFloors"
+      | "preflightImportStorageNames"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
       assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
+      preflightImportStorageNames: (bundle) => fixture.stateStore.preflightImportStorageNames(bundle),
       delete: async () => {
         throw new Error("injected reconstruct failure");
       },
@@ -585,6 +590,68 @@ describe("restoreCheckpoint", () => {
       changed: [],
       removed: [],
     });
+  });
+
+  it("runs the import storage-name preflight before reconstruction effects", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:06:30.000Z"),
+    });
+
+    const calls: string[] = [];
+    const failingStateStore: Pick<
+      StateStore,
+      | "exportNamespaces"
+      | "delete"
+      | "import"
+      | "assertImportVersionFloors"
+      | "preflightImportStorageNames"
+    > = {
+      assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
+      preflightImportStorageNames: async () => {
+        calls.push("preflight");
+        throw new Error("checkpoint storage names refused");
+      },
+      exportNamespaces: async () => {
+        calls.push("export");
+        throw new Error("export should not be reached");
+      },
+      delete: async () => {
+        calls.push("delete");
+        throw new Error("delete should not be reached");
+      },
+      import: async () => {
+        calls.push("import");
+        throw new Error("import should not be reached");
+      },
+    };
+
+    await expect(
+      restoreCheckpoint({
+        stateStore: failingStateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      }),
+    ).rejects.toThrow("checkpoint storage names refused");
+
+    expect(calls).toEqual(["preflight"]);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
   });
 
   it("refuses (before any state change) when the decrypted bundle hash does not match the recorded bundle_hash", async () => {

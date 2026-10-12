@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   StateStore,
   type StateEntry,
 } from "../../src/cognitive/state-store.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -320,6 +324,45 @@ describe("state export completeness manifest", () => {
       freshStore.import(encodeBundle(decoded), "skip", fixture.resolver)
     ).rejects.toThrow("State export bundle failed integrity verification");
     await expect(freshStorage.list("notes")).resolves.toHaveLength(0);
+  });
+
+  it("preflights direct imports before writing any namespace", async () => {
+    const fixture = createFixture();
+    await writeEntry(
+      fixture.stateStore,
+      fixture.identity,
+      fixture.identityEncKey,
+      "alpha",
+      "a",
+      "first"
+    );
+    await writeEntry(
+      fixture.stateStore,
+      fixture.identity,
+      fixture.identityEncKey,
+      "omega",
+      "z",
+      "second"
+    );
+
+    const exported = await fixture.stateStore.exportNamespaces(["alpha", "omega"]);
+    const basePath = await mkdtemp(join(tmpdir(), "sanctuary-import-preflight-"));
+    try {
+      await mkdir(join(basePath, "omega"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(basePath, "omega", "key-!4E2D.enc"),
+        new Uint8Array([1]),
+      );
+      const freshStorage = new FilesystemStorage(basePath);
+      const freshStore = new StateStore(freshStorage, fixture.masterKey);
+
+      await expect(
+        freshStore.import(exported.bundle, "skip", fixture.resolver)
+      ).rejects.toThrow(/storage name this version cannot address/);
+      await expect(freshStorage.list("alpha")).resolves.toHaveLength(0);
+    } finally {
+      await rm(basePath, { recursive: true, force: true });
+    }
   });
 
   it("rejects current bundles with completeness fields stripped unless explicitly importing unverified legacy", async () => {

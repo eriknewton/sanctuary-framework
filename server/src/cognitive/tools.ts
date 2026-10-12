@@ -1144,6 +1144,9 @@ export function createCognitiveTools(
       ? {
           ...(typeof error.kind === "string" ? { storage_name_kind: error.kind } : {}),
           ...(typeof error.rawName === "string" ? { raw_stored_entry: error.rawName } : {}),
+          ...(typeof error.rawNamespace === "string"
+            ? { raw_namespace_directory: error.rawNamespace }
+            : {}),
         }
       : {};
     await recordCriticalAudit(auditLog, "l1", operation, "system", {
