@@ -936,27 +936,38 @@ async function withResolvedMasterKeySession<T>(
   operation: (session: ResolvedMasterKeySession) => Promise<T>,
 ): Promise<T> {
   const session = await openResolvedMasterKeySession(storagePath, env);
-  let operationError: unknown;
+  // DEBT(BARRIER-READER-CALLERS): shared lease-scoped resolver for remaining
+  // CLI master-key callers that perform master-derived writes after unlock.
+  // Every exit zeroes the key and releases the shared rotation reader exactly
+  // once: the operation's outcome is captured first so the release runs on the
+  // success and the failure path alike, and a release failure is never lost
+  // and never masks the operation's own error.
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown };
   try {
-    return await operation(session);
+    outcome = { ok: true, value: await operation(session) };
   } catch (error) {
-    operationError = error;
-    throw error;
+    outcome = { ok: false, error };
   } finally {
-    // DEBT(BARRIER-READER-CALLERS): shared lease-scoped resolver for remaining
-    // CLI master-key callers that perform master-derived writes after unlock.
     session.masterKey.fill(0);
-    try {
-      await session.masterWriteBarrier?.release();
-    } catch (releaseError) {
-      if (operationError === undefined) throw releaseError;
-      throw new AggregateError(
-        [operationError, releaseError],
-        "master-key operation failed and its shared rotation reader did not release cleanly",
-        { cause: releaseError },
-      );
-    }
   }
+  let releaseFailed = false;
+  let releaseError: unknown;
+  try {
+    await session.masterWriteBarrier?.release();
+  } catch (error) {
+    releaseFailed = true;
+    releaseError = error;
+  }
+  if (!outcome.ok) {
+    if (!releaseFailed) throw outcome.error;
+    throw new AggregateError(
+      [outcome.error, releaseError],
+      "master-key operation failed and its shared rotation reader did not release cleanly",
+      { cause: releaseError },
+    );
+  }
+  if (releaseFailed) throw releaseError;
+  return outcome.value;
 }
 
 function provisionCredentialFields(
