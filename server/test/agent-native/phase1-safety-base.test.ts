@@ -161,7 +161,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -223,7 +223,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -262,7 +262,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -318,7 +318,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -377,7 +377,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -615,7 +615,7 @@ describe("agent-native Phase 1 safety base", () => {
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
-    const namespaceRegistry = new OpaqueNamespaceRegistry();
+    const namespaceRegistry = OpaqueNamespaceRegistry.testOnlyInMemory();
     let active: SessionBinding | undefined;
     const { tools, identityManager } = createL1Tools(
       stateStore,
@@ -670,5 +670,49 @@ describe("agent-native Phase 1 safety base", () => {
       discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
     });
     expect(fixedDenial("audit:ref").retry_after).toBeNull();
+  });
+
+  it("shares concurrent first-use persisted claims inside one registry", async () => {
+    let releaseClaim!: () => void;
+    const claimStarted = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    let claimCalls = 0;
+    const registry = new OpaqueNamespaceRegistry({
+      loadHandleForIdentity: async () => null,
+      claimHandleForIdentity: async (_identityId, mint) => {
+        claimCalls += 1;
+        await claimStarted;
+        return mint();
+      },
+      findOwnerForHandle: async () => undefined,
+    });
+
+    const left = registry.issuePersistedMemoryHandle("agent-a");
+    const right = registry.issuePersistedMemoryHandle("agent-a");
+    await Promise.resolve();
+    expect(claimCalls).toBe(1);
+
+    releaseClaim();
+    const [leftHandle, rightHandle] = await Promise.all([left, right]);
+    expect(rightHandle).toBe(leftHandle);
+  });
+
+  it("refuses conflicting persisted owner records instead of overwriting the owner map", async () => {
+    const registry = new OpaqueNamespaceRegistry({
+      loadHandleForIdentity: async (identityId) =>
+        identityId === "agent-a"
+          ? "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      claimHandleForIdentity: async (_identityId, mint) => mint(),
+      findOwnerForHandle: async () => undefined,
+    });
+
+    await expect(registry.issuePersistedMemoryHandle("agent-a")).resolves.toBe(
+      "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    await expect(registry.issuePersistedMemoryHandle("agent-b")).rejects.toThrow(
+      "memory handle ownership conflict"
+    );
   });
 });
