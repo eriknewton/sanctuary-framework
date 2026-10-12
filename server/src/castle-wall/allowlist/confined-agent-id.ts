@@ -18,6 +18,14 @@ const UINT32_BIT_COUNT = 32;
 /** u32 max = 2^32 - 1, matching Rust `u32::MAX`. */
 const UINT32_MAX = 2 ** UINT32_BIT_COUNT - 1;
 
+export class LinuxInstallAgentIdScopeError extends Error {
+  // Consumed by `publishLinuxCompatiblePolicy` to turn Linux uid-scope mismatches into a no-write policy refusal.
+  constructor(message: string) {
+    super(message);
+    this.name = "LinuxInstallAgentIdScopeError";
+  }
+}
+
 /** Format the canonical Linux confined-agent id for one admitted uid. */
 export function confinedAgentIdForUid(uid: number): string | null {
   if (!Number.isInteger(uid) || uid < 0 || uid > UINT32_MAX) return null;
@@ -56,7 +64,7 @@ export function validateLinuxInstallAgentIdScopes(
       const uid = parseConfinedAgentId(agentId);
       if (uid === null) {
         // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
-        throw new Error(
+        throw new LinuxInstallAgentIdScopeError(
           // Must match `MalformedAgentScope` in `castle-wall-daemon/src/policy.rs`.
           `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
@@ -66,7 +74,7 @@ export function validateLinuxInstallAgentIdScopes(
       // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
         // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
-        throw new Error(
+        throw new LinuxInstallAgentIdScopeError(
           // Must match `AgentScopeOutsideAdmission` in `castle-wall-daemon/src/policy.rs`.
           `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected admitted uid ${admittedUid}; scope agent rules to uid-${admittedUid}`,
         );
