@@ -86,7 +86,7 @@ const AUDITED_DYNAMIC_WRITES: AuditedDynamicWrite[] = [
     path: "server/src/cognitive/state-store.ts",
     callArgs: "ns, key, serialized",
     reason:
-      "StateStore import writes entries only after bundle namespace metadata, reserved-namespace refusal, signature checks, and version floors prove the imported namespace/key",
+      "StateStore import writes entries only after bundle namespace metadata admits the namespace, reserved namespaces are refused, and the entry signature verifies; the entry bytes are preserved as exported",
   },
   // Master rotation handles user-state namespaces through the registered state-namespace recipe and re-signs each rotated entry.
   {
@@ -95,12 +95,12 @@ const AUDITED_DYNAMIC_WRITES: AuditedDynamicWrite[] = [
     reason:
       "master rotation writes rotated user-state bytes only after recipeFor classified the namespace as state and rotateStateEntryBytes revalidated and re-signed the entry",
   },
-  // Master rotation handles purpose-keyed namespaces only through registered recipes with their explicit info/AAD set.
+  // Master rotation handles purpose-keyed namespaces only through registered recipes and the AAD candidates each recipe derives from the key.
   {
     path: "server/src/core/master-rotation.ts",
     callArgs: "namespace, key, stringToBytes(JSON.stringify(next))",
     reason:
-      "master rotation writes purpose-keyed bytes only after recipeFor selected a registered namespace recipe and the entry decrypted under one of that recipe's explicit AAD bindings",
+      "master rotation writes purpose-keyed bytes only after recipeFor selected a registered namespace recipe and the entry decrypted under that recipe's candidate AAD set for the key (which may be no AAD); the rotated bytes reuse the AAD that decrypted",
   },
 ];
 
