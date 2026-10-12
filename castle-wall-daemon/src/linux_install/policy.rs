@@ -46,21 +46,35 @@ pub struct Admitted {
 #[derive(Debug, thiserror::Error)]
 enum InstallPolicyAdmissionError {
     #[error(
-        "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected {expected_form}; re-sign with the uid-<uid> form"
+        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
     )]
     MalformedAgentScope {
-        rule_id: String,
-        agent_id: String,
+        rule_id_display: String,
+        agent_id_display: String,
         expected_form: &'static str,
     },
     #[error(
-        "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected admitted uid {admitted_uid}"
+        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}"
     )]
     AgentScopeOutsideAdmission {
-        rule_id: String,
-        agent_id: String,
+        rule_id_display: String,
+        agent_id_display: String,
         admitted_uid: u32,
     },
+}
+
+const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
+// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
+// server/src/castle-wall/allowlist/bounded-diagnostic-text.ts.
+const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let original_len = value.chars().count();
+    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+    format!("{prefix}... (original length {original_len})")
 }
 
 fn validate_install_agent_id_scopes(
@@ -74,17 +88,19 @@ fn validate_install_agent_id_scopes(
         }
         for agent_id in &rule.scope.agent_ids {
             let Some(uid) = crate::nftables::parse_confined_agent_id(agent_id) else {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
                 return Err(InstallPolicyAdmissionError::MalformedAgentScope {
-                    rule_id: rule.id.clone(),
-                    agent_id: agent_id.clone(),
+                    rule_id_display: bounded_diagnostic_text(&rule.id),
+                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
                     expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
                 });
             };
             // The install profile rejects gate_uid above, so its admitted confined-id set is the agent uid singleton.
             if uid != admitted_uid {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
                 return Err(InstallPolicyAdmissionError::AgentScopeOutsideAdmission {
-                    rule_id: rule.id.clone(),
-                    agent_id: agent_id.clone(),
+                    rule_id_display: bounded_diagnostic_text(&rule.id),
+                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
                     admitted_uid,
                 });
             }
@@ -545,5 +561,63 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("admitted uid 60123"), "{err}");
+    }
+
+    #[test]
+    fn install_scope_refusals_keep_operator_text_within_display_budget() {
+        const TEST_DIAGNOSTIC_TEXT_CAP: usize = 8 * 8;
+        const TEST_LONG_TEXT_LENGTH: usize = TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP;
+        let long_rule_id = format!("rule-{}", "r".repeat(TEST_LONG_TEXT_LENGTH));
+        let long_agent_id = format!("agent-{}", "a".repeat(TEST_LONG_TEXT_LENGTH));
+        let malformed_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": [long_agent_id] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let malformed = validate_install_agent_id_scopes(&[malformed_rule], TEST_ADMITTED_UID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            malformed.contains(&format!("original length {}", long_rule_id.len())),
+            "{malformed}"
+        );
+        assert!(
+            malformed.contains(&format!("original length {}", long_agent_id.len() + 2)),
+            "{malformed}"
+        );
+        assert!(!malformed.contains(&long_rule_id), "{malformed}");
+        assert!(!malformed.contains(&long_agent_id), "{malformed}");
+        assert!(
+            malformed.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{malformed}"
+        );
+
+        let outside_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": ["uid-60124"] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let outside = validate_install_agent_id_scopes(&[outside_rule], TEST_ADMITTED_UID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            outside.contains(&format!("original length {}", long_rule_id.len())),
+            "{outside}"
+        );
+        assert!(!outside.contains(&long_rule_id), "{outside}");
+        assert!(
+            outside.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{outside}"
+        );
     }
 }
