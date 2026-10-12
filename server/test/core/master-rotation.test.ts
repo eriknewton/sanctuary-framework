@@ -2550,6 +2550,86 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
   });
 
+  it("resume converges when its accepted live custody publish is interrupted", async () => {
+    const REPLAY_SENTINEL_WRITE_COUNT = 1;
+    // The resume hook targets the accepted publish: one replay sentinel write,
+    // then one publish sentinel write after the continue decision.
+    const ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT = REPLAY_SENTINEL_WRITE_COUNT + 1;
+    const fortress = await buildFortress();
+    const originalWrite = fortress.storage.write.bind(fortress.storage);
+    let disclosedKey = "";
+    let armLiveCustodyPairInterruption = false;
+    let interruptedLiveCustodyPair = false;
+    fortress.storage.write = async (namespace, key, data) => {
+      if (
+        armLiveCustodyPairInterruption &&
+        !interruptedLiveCustodyPair &&
+        namespace === "_meta" &&
+        key === CUSTODY_SENTINEL_KEY
+      ) {
+        interruptedLiveCustodyPair = true;
+        throw new Error("injected live custody pair interruption");
+      }
+      return originalWrite(namespace, key, data);
+    };
+
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        disclosedKey = rk;
+        return verify(rk);
+      },
+      failpoint: (point) => {
+        if (point === "journal-finalizing-written") {
+          armLiveCustodyPairInterruption = true;
+        }
+      },
+    }))).rejects.toThrow("injected live custody pair interruption");
+    expect(interruptedLiveCustodyPair).toBe(true);
+
+    let resumeSentinelWrites = 0;
+    let resumePublishJournalWritten = false;
+    fortress.storage.write = async (namespace, key, data) => {
+      if (namespace === "_meta" && key === CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY) {
+        resumePublishJournalWritten = true;
+      }
+      if (namespace === "_meta" && key === CUSTODY_SENTINEL_KEY) {
+        resumeSentinelWrites += 1;
+        if (resumeSentinelWrites === ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT) {
+          expect(resumePublishJournalWritten).toBe(true);
+          throw new Error("injected resume live custody publish interruption");
+        }
+      }
+      return originalWrite(namespace, key, data);
+    };
+    await expect(resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    })).rejects.toThrow("injected resume live custody publish interruption");
+    fortress.storage.write = originalWrite;
+    expect(resumeSentinelWrites).toBe(ACCEPTED_PUBLISH_SENTINEL_WRITE_COUNT);
+    expect(resumePublishJournalWritten).toBe(true);
+    expect(await fortress.storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).not.toBeNull();
+
+    await expect(
+      establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE })
+    ).rejects.toThrow(CustodyRotationInProgressError);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    });
+    expect(await fortress.storage.read(
+      "_meta",
+      CUSTODY_ENVELOPE_COMMIT_JOURNAL_KEY,
+    )).toBeNull();
+    await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
+  });
+
   it("resumes after a torn staged cleanup record in finalize", async () => {
     const fortress = await buildFortress();
     const originalDelete = fortress.storage.delete.bind(fortress.storage);
