@@ -252,10 +252,11 @@ export interface CrossProcessLockOptions {
    * leaves only a same-inode-validated stale socket that a later contender may
    * safely remove only after repeated refusal probes serialized by the inert
    * scaffold's OS advisory reaper lock.
-   * This is used only by bounded custody mutation ceremonies, where a stale
-   * existence lock would prevent the next invocation from reaching its durable
-   * recovery journal. Do not hold this across steady-state server lifetime; each
-   * caller must release it when its bounded mutation returns.
+   * This is used by bounded custody mutation ceremonies and memory-handle
+   * registry claims, where a stale existence lock would prevent the next bounded
+   * invocation from reaching its durable journal or record. Do not hold this
+   * across steady-state server lifetime; each caller must release it when its
+   * bounded mutation returns.
    */
   kernelBacked?: boolean;
   /**

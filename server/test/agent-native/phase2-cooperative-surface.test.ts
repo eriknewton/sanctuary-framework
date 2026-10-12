@@ -1,18 +1,28 @@
 // fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { generateRandomKey } from "../../src/core/random.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { AGENT_AUDIT_VIEW_FIELDS } from "../../src/operational/agent-audit-redaction.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
 import { toolResult, type ToolDefinition } from "../../src/router.js";
+import { createSanctuaryServer, type SanctuaryServer } from "../../src/index.js";
 import {
   ApprovalProofStore,
   classifyApprovalRequest,
   canonicalJson,
   fingerprintIdentityId,
   fixedDenial,
+  MemoryHandleOwnershipConflictError,
+  MEMORY_HANDLE_RECORD_VERSION,
+  MEMORY_HANDLE_REGISTRY_NAMESPACE,
   normalizedArgsHash,
   sha256,
   type SessionBinding,
@@ -23,7 +33,18 @@ import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "../../src/cast
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
-import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
+import {
+  DEFAULT_POLICY,
+  writeDefaultPrincipalPolicyFile,
+} from "../../src/principal-policy/loader.js";
+import type { ApprovalResponse } from "../../src/principal-policy/types.js";
+import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+
+const cleanup: Array<() => Promise<unknown>> = [];
+
+afterEach(async () => {
+  for (const close of cleanup.splice(0).reverse()) await close();
+});
 
 async function callTool(
   tools: ToolDefinition[],
@@ -45,6 +66,25 @@ async function callTool(
     return fixedDenial(`audit:gate:${name}`) as unknown as Record<string, unknown>;
   }
   const result = await tool.handler(args);
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+async function callServerTool(
+  app: SanctuaryServer,
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<Record<string, unknown>> {
+  const handler = (
+    app.server as unknown as { _requestHandlers: Map<string, Function> }
+  )._requestHandlers.get("tools/call");
+  if (!handler) throw new Error("tools/call handler not registered");
+  const result = await handler(
+    {
+      method: "tools/call" as const,
+      params: { name, arguments: args },
+    },
+    {}
+  );
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }
 
@@ -160,6 +200,84 @@ function facadeWithPrimitives(
   }).tools;
 }
 
+async function writeMemoryHandleRecord(
+  stateStore: StateStore,
+  masterKey: Uint8Array,
+  identity: {
+    identity_id: string;
+    encrypted_private_key: Parameters<StateStore["write"]>[4];
+  },
+  handle: string
+): Promise<void> {
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  await stateStore.write(
+    MEMORY_HANDLE_REGISTRY_NAMESPACE,
+    identity.identity_id,
+    JSON.stringify({
+      v: MEMORY_HANDLE_RECORD_VERSION,
+      identity_id: identity.identity_id,
+      handle,
+    }),
+    identity.identity_id,
+    identity.encrypted_private_key,
+    identityEncKey,
+    {
+      provenance: {
+        origin_actor: "system",
+        origin_ref: identity.identity_id,
+      },
+    }
+  );
+}
+
+async function setupFilesystemSurface() {
+  const path = await mkdtemp(join(tmpdir(), "memory-handle-"));
+  cleanup.push(() => rm(path, { recursive: true, force: true }));
+  const masterKey = generateRandomKey();
+  const storage = new FilesystemStorage(path);
+  let active: SessionBinding | undefined;
+  const build = async (backend: StorageBackend = storage) => {
+    const stateStore = new StateStore(backend, masterKey);
+    const auditLog = new AuditLog(backend, masterKey);
+    const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+      stateStore,
+      backend,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      { currentSessionBinding: () => active }
+    );
+    await identityManager.load();
+    const approvalProofStore = new ApprovalProofStore();
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+      identityManager,
+      namespaceRegistry,
+      auditLog,
+      currentSessionBinding: () => active,
+      primitiveTools: l1Tools,
+      storage: backend,
+      approvalProofStore,
+    });
+    return { l1Tools, identityManager, namespaceRegistry, facadeTools, auditLog };
+  };
+  const first = await build();
+  const identity = await callTool(first.l1Tools, "identity_create", { label: "agent-a" });
+  active = session(identity.identity_id as string);
+  return {
+    storage,
+    masterKey,
+    identity,
+    get active() {
+      return active;
+    },
+    set active(next: SessionBinding | undefined) {
+      active = next;
+    },
+    first,
+    build,
+  };
+}
+
 describe("agent-native Phase 2 cooperative surface", () => {
   it("maps convenience verbs to expanded primitive approval targets", async () => {
     const env = await setup();
@@ -181,7 +299,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(rememberPreflight.target_resource).toMatch(/^state_write:mem_[a-f0-9]{32}\/user_tz$/);
     expect(rememberTool.approvalTargetToolName).toBe("state_write");
 
-    const forgetTarget = forgetTool.approvalTargetArgs!({
+    const forgetTarget = await forgetTool.approvalTargetArgs!({
       key: "user_tz",
       mode: "secure",
       approval_ref: "approval:test",
@@ -190,6 +308,234 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(forgetTool.approvalTargetToolName).toBe("state_delete");
     expect(forgetTarget).toMatchObject({ key: "user_tz", reason: "operator request" });
   });
+
+  it("keeps cooperative memory reachable after a fresh server surface opens the same fortress", async () => {
+    const env = await setupFilesystemSurface();
+    const remembered = await callTool(env.first.facadeTools, "sanctuary_remember", {
+      key: "timezone",
+      value: "America/Los_Angeles",
+    });
+    const handle = remembered.namespace_handle as string;
+    expect(handle).toMatch(/^mem_[a-f0-9]{32}$/);
+
+    const fresh = await env.build();
+    expect(await fresh.namespaceRegistry.getOwner(handle)).toBe(env.identity.identity_id);
+    const recalled = await callTool(fresh.facadeTools, "sanctuary_recall", {
+      key: "timezone",
+    });
+    expect(recalled).toMatchObject({
+      value: "America/Los_Angeles",
+      verified: true,
+    });
+  });
+
+  it("keeps another identity out of a restarted handle owner map", async () => {
+    const env = await setupFilesystemSurface();
+    const bob = await callTool(env.first.l1Tools, "identity_create", { label: "agent-b" });
+    const remembered = await callTool(env.first.facadeTools, "sanctuary_remember", {
+      key: "timezone",
+      value: "America/Los_Angeles",
+    });
+    const handle = remembered.namespace_handle as string;
+
+    const fresh = await env.build();
+    env.active = session(bob.identity_id as string);
+    const crossRecall = await callTool(fresh.facadeTools, "sanctuary_recall", {
+      key: "timezone",
+      opts: { namespace: handle },
+    });
+    expect(crossRecall.denied).toBe(true);
+    expect(crossRecall).not.toHaveProperty("value");
+  });
+
+  it("refuses a cooperative memory call when the handle record cannot be stored", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    let active: SessionBinding | undefined;
+    const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      { currentSessionBinding: () => active }
+    );
+    await identityManager.load();
+    const identity = await callTool(l1Tools, "identity_create", { label: "agent-a" });
+    active = session(identity.identity_id as string);
+    const originalWrite = storage.write.bind(storage);
+    storage.write = async (namespace, key, data) => {
+      if (namespace === MEMORY_HANDLE_REGISTRY_NAMESPACE) {
+        throw new Error("forced handle persistence failure");
+      }
+      return originalWrite(namespace, key, data);
+    };
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+      identityManager,
+      namespaceRegistry,
+      auditLog,
+      currentSessionBinding: () => active,
+      primitiveTools: l1Tools,
+      storage,
+      approvalProofStore: new ApprovalProofStore(),
+    });
+
+    const result = await callTool(facadeTools, "sanctuary_remember", {
+      key: "timezone",
+      value: "America/Los_Angeles",
+    });
+    expect(result.denied).toBe(true);
+    expect(result).not.toHaveProperty("namespace_handle");
+
+    storage.write = originalWrite;
+    const retry = await callTool(facadeTools, "sanctuary_remember", {
+      key: "timezone",
+      value: "America/Los_Angeles",
+    });
+    expect(retry.namespace_handle).toMatch(/^mem_[a-f0-9]{32}$/);
+  });
+
+  it("refuses duplicate verified memory handle records before trusting scan order", async () => {
+    const exerciseOrder = async (labels: readonly [string, string]) => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      let active: SessionBinding | undefined;
+      const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+        { currentSessionBinding: () => active }
+      );
+      await identityManager.load();
+      const firstCreated = await callTool(l1Tools, "identity_create", { label: labels[0] });
+      const secondCreated = await callTool(l1Tools, "identity_create", { label: labels[1] });
+      const byLabel = new Map([
+        [labels[0], identityManager.get(firstCreated.identity_id as string)!],
+        [labels[1], identityManager.get(secondCreated.identity_id as string)!],
+      ]);
+      const handle = "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+      for (const label of labels) {
+        await writeMemoryHandleRecord(stateStore, masterKey, byLabel.get(label)!, handle);
+      }
+
+      active = session(byLabel.get("agent-a")!.identity_id);
+      await expect(namespaceRegistry.getOwner(handle)).rejects.toBeInstanceOf(
+        MemoryHandleOwnershipConflictError
+      );
+
+      const { tools: facadeTools } = createAgentNativeCooperativeTools({
+        identityManager,
+        namespaceRegistry,
+        auditLog,
+        currentSessionBinding: () => active,
+        primitiveTools: l1Tools,
+        storage,
+        approvalProofStore: new ApprovalProofStore(),
+      });
+      const denied = await callTool(facadeTools, "sanctuary_recall", {
+        key: "timezone",
+        opts: { namespace: handle },
+      });
+      expect(denied.denied).toBe(true);
+      expect(denied).not.toHaveProperty("value");
+    };
+
+    await exerciseOrder(["agent-a", "agent-b"]);
+    await exerciseOrder(["agent-b", "agent-a"]);
+  });
+
+  it("converges first-use handle claims across fresh registries on one fortress", async () => {
+    const env = await setupFilesystemSurface();
+    const left = await env.build();
+    const right = await env.build();
+    const [a, b] = await Promise.all([
+      callTool(left.facadeTools, "sanctuary_remember", {
+        key: "left",
+        value: "one",
+      }),
+      callTool(right.facadeTools, "sanctuary_remember", {
+        key: "right",
+        value: "two",
+      }),
+    ]);
+
+    expect(a.namespace_handle).toMatch(/^mem_[a-f0-9]{32}$/);
+    expect(b.namespace_handle).toBe(a.namespace_handle);
+    const recalledLeft = await callTool((await env.build()).facadeTools, "sanctuary_recall", {
+      key: "left",
+    });
+    const recalledRight = await callTool((await env.build()).facadeTools, "sanctuary_recall", {
+      key: "right",
+    });
+    expect(recalledLeft.value).toBe("one");
+    expect(recalledRight.value).toBe("two");
+  });
+
+  it("keeps cooperative memory reachable after the real server composition restarts", async () => {
+    const home = await createTempHome("memory-handle-composition");
+    cleanup.push(home.cleanup);
+    await mkdir(home.defaultFortressPath, { recursive: true, mode: 0o700 });
+    const { policyPath } = await writeDefaultPrincipalPolicyFile(home.defaultFortressPath);
+    const policy = await readFile(policyPath, "utf8");
+    await writeFile(policyPath, policy.replace("type: stderr", "type: callback"), {
+      mode: 0o600,
+    });
+    const originalSessionIdentity = process.env.SANCTUARY_SESSION_IDENTITY_ID;
+    const approve = async (): Promise<ApprovalResponse> => ({
+      decision: "approve" as const,
+      decided_at: new Date().toISOString(),
+      decided_by: "human" as const,
+    });
+    let first: SanctuaryServer | undefined;
+    let second: SanctuaryServer | undefined;
+    try {
+      first = await createSanctuaryServer({
+        passphrase: TEST_PASSPHRASE,
+        approvalCallback: approve,
+      });
+      const identity = await callServerTool(first, "identity_create", {
+        label: "agent-a",
+      });
+      process.env.SANCTUARY_SESSION_IDENTITY_ID = identity.identity_id as string;
+      const remembered = await callServerTool(first, "sanctuary_remember", {
+        key: "timezone",
+        value: "America/Los_Angeles",
+      });
+      const handle = remembered.namespace_handle as string;
+      expect(handle).toMatch(/^mem_[a-f0-9]{32}$/);
+      await first.cleanup();
+      first = undefined;
+
+      second = await createSanctuaryServer({
+        passphrase: TEST_PASSPHRASE,
+        approvalCallback: approve,
+      });
+      const recalled = await callServerTool(second, "sanctuary_recall", {
+        key: "timezone",
+      });
+      expect(recalled).toMatchObject({
+        value: "America/Los_Angeles",
+        verified: true,
+      });
+      const who = await callServerTool(second, "sanctuary_who_am_i");
+      expect(who.memory_namespace_handle).toBe(handle);
+    } finally {
+      if (first) await first.cleanup();
+      if (second) await second.cleanup();
+      if (originalSessionIdentity === undefined) {
+        delete process.env.SANCTUARY_SESSION_IDENTITY_ID;
+      } else {
+        process.env.SANCTUARY_SESSION_IDENTITY_ID = originalSessionIdentity;
+      }
+    }
+  }, 60_000);
 
   it("refuses cross-namespace convenience verb access below the facade", async () => {
     const env = await setup();
@@ -401,7 +747,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
     const who = await callTool(env.facadeTools, "sanctuary_who_am_i");
     expect(who.label).toBe("agent-a");
     expect(who.active_identity_fingerprint).toMatch(/^sha256:/);
-    expect(who.memory_namespace_handle).toMatch(/^mem_/);
+    expect(who.memory_namespace_handle).toBeNull();
     expect(who.did).toMatch(/^did:key:/);
     expect(JSON.stringify(who)).not.toContain("private");
     expect(JSON.stringify(who)).not.toContain("topology");

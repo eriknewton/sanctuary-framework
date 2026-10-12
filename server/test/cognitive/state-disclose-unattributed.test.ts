@@ -60,7 +60,10 @@ import {
   UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION,
   UNATTRIBUTED_DISCLOSURE_OPERATION,
 } from "../../src/cognitive/unattributed-disclosure.js";
-import { OpaqueNamespaceRegistry } from "../../src/agent-native/safety-base.js";
+import {
+  fingerprintIdentityId,
+  OpaqueNamespaceRegistry,
+} from "../../src/agent-native/safety-base.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
@@ -413,7 +416,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: NAMESPACE,
       key: "orphaned",
       identityId: "principal",
@@ -478,7 +481,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore: observingStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: NAMESPACE,
       key: "orphaned",
       identityId: "principal",
@@ -533,7 +536,7 @@ describe("the operator unattributed-disclosure surface", () => {
       discloseUnattributedState({
         auditLog,
         stateStore: throwingStore,
-        namespaceRegistry: new OpaqueNamespaceRegistry(),
+        namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
         namespace: NAMESPACE,
         key: "orphaned",
         identityId: "principal",
@@ -560,7 +563,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const reserved = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: "_identities",
       key: "target-key",
       identityId: "principal",
@@ -570,7 +573,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const unavailable = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: "mem_0123456789abcdef0123456789abcdef",
       key: "handle-key",
       identityId: "principal",
@@ -600,7 +603,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: NAMESPACE,
       key: "attributable",
       identityId: "principal",
@@ -790,7 +793,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: NAMESPACE,
       key: "absent",
       identityId: "principal",
@@ -821,7 +824,7 @@ describe("the namespace firewall belongs to the operation, not to one transport"
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: "_reputation",
       key: "anything",
       identityId: "principal",
@@ -864,7 +867,7 @@ describe("the namespace firewall belongs to the operation, not to one transport"
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
-      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespaceRegistry: OpaqueNamespaceRegistry.testOnlyInMemory(),
       namespace: "_not_on_the_curated_list",
       key: "anything",
       identityId: "principal",
@@ -874,7 +877,7 @@ describe("the namespace firewall belongs to the operation, not to one transport"
 
   it("refuses an opaque memory handle this caller does not own, and audits the denial", async () => {
     const { stateStore, auditLog } = await makeRig();
-    const registry = new OpaqueNamespaceRegistry();
+    const registry = OpaqueNamespaceRegistry.testOnlyInMemory();
     const someoneElsesHandle = registry.issueMemoryHandle("another-identity");
 
     // No session binding: there is no live session to own the handle with, so
@@ -898,6 +901,32 @@ describe("the namespace firewall belongs to the operation, not to one transport"
     expect(audit.entries[0]!.details).toMatchObject({
       denial_class: "namespace_unavailable",
     });
+  });
+
+  it("uses the persisted opaque-handle owner lookup after a fresh registry opens", async () => {
+    const { stateStore, auditLog } = await makeRig();
+    const registry = new OpaqueNamespaceRegistry({
+      loadHandleForIdentity: async () => null,
+      claimHandleForIdentity: async (_identityId, mint) => mint(),
+      findOwnerForHandle: async (handle) =>
+        handle === "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          ? "agent-a"
+          : undefined,
+    });
+
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: registry,
+      namespace: "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      key: "absent",
+      identityId: "principal",
+      sessionBinding: {
+        identity_id: "agent-a",
+        requester_identity_fingerprint: fingerprintIdentityId("agent-a"),
+      },
+    });
+    expect(outcome.status).toBe("not_found");
   });
 });
 
