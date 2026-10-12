@@ -39,6 +39,7 @@ import {
   stringToBytes,
 } from "../core/encoding.js";
 import type { StorageBackend } from "../storage/interface.js";
+import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
@@ -1148,6 +1149,34 @@ export function createCognitiveTools(
     }
   }
 
+  async function refuseInvalidStorageNamespace(
+    operation: string,
+    namespace: string
+  ): Promise<never> {
+    await denyNamespaceAccess(operation, namespace);
+    throw new Error("namespace_not_single_component");
+  }
+
+  async function assertToolNamespaceReady(
+    operation: string,
+    namespace: string
+  ): Promise<void> {
+    try {
+      assertStorageNamespacePathComponent(namespace);
+    } catch {
+      await refuseInvalidStorageNamespace(operation, namespace);
+    }
+  }
+
+  async function assertToolNamespacesReady(
+    operation: string,
+    namespaces: string[]
+  ): Promise<void> {
+    for (const namespace of namespaces) {
+      await assertToolNamespaceReady(operation, namespace);
+    }
+  }
+
   async function sessionOwnedExportNamespaces(): Promise<string[]> {
     const binding = options?.currentSessionBinding?.();
     const active = binding ? resolveActiveSessionIdentity(binding) : undefined;
@@ -1553,7 +1582,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key", "value"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_write", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_write", args.namespace as string);
         // Namespace firewall: reject writes to reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1640,7 +1674,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_read", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_read", args.namespace as string);
         // Namespace firewall: reject reads from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1753,12 +1792,22 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        return args;
+      },
       handler: async (args) => {
-        // THE NAMESPACE FIREWALL IS NOT APPLIED HERE. It lives inside
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        // The reserved/opaque namespace firewall lives inside
         // `discloseUnattributedState` with the rest of this operation's
         // obligations, so the CLI verb cannot ship without it; this handler
-        // only RENDERS the two refusals it can return. Applying it here as
-        // well would recreate the divergence that move closed.
+        // only renders the two refusal shapes it can return.
         //
         // FAIL CLOSED ON A MISSING AUDIT LOG. `auditLog` is optional on this
         // factory, and the shared `recordCriticalAudit` helper above silently
@@ -1848,7 +1897,12 @@ export function createCognitiveTools(
         },
         required: ["namespace"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_list", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_list", args.namespace as string);
         // Namespace firewall: reject listing of reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1892,7 +1946,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_delete", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_delete", args.namespace as string);
         // Namespace firewall: reject deletes from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1970,6 +2029,7 @@ export function createCognitiveTools(
       approvalTargetArgs: async (args) => {
         let namespaces: string[];
         if (typeof args.namespace === "string") {
+          await assertToolNamespaceReady("state_export", args.namespace);
           // Reject a reserved namespace BEFORE the human is asked to
           // approve it, rather than after: `exportNamespaces` (state-
           // store.ts F6) filters `_`-prefixed namespaces at execution, so
@@ -2037,6 +2097,7 @@ export function createCognitiveTools(
           );
         }
         const namespaces = [...binding.namespaces];
+        await assertToolNamespacesReady("state_export", namespaces);
 
         if (typeof args.namespace === "string") {
           try {
@@ -2081,14 +2142,19 @@ export function createCognitiveTools(
         },
         required: ["bundle"],
       },
-      approvalTargetArgs: (args) => ({
-        ...args,
-        namespaces: decodeExportBundleNamespaces(args.bundle as string),
-      }),
+      approvalTargetArgs: async (args) => {
+        const namespaces = decodeExportBundleNamespaces(args.bundle as string);
+        await assertToolNamespacesReady("state_import", namespaces);
+        return {
+          ...args,
+          namespaces,
+        };
+      },
       handler: async (args) => {
         let targetNamespaces: string[];
         try {
           targetNamespaces = decodeExportBundleNamespaces(args.bundle as string);
+          await assertToolNamespacesReady("state_import", targetNamespaces);
           await assertOpaqueNamespacesOwned(targetNamespaces);
         } catch {
           return denyNamespaceAccess("state_import", "state_import");

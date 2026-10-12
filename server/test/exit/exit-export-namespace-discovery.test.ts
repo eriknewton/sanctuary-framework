@@ -617,6 +617,31 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     expect(state.namespaces).toEqual(exportableNamespaces);
   });
 
+  it("discovers exportable namespaces when an empty non-canonical root directory is present", async () => {
+    const fortress = await seededFortress();
+    await mkdir(join(fortress.stateStoragePath, "Backup copy"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-empty-stray-"));
+    cleanup.push(bundleDir);
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runExitCommand({
+      argv: ["export", "--out", bundleDir, "--yes"],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: TEST_PASSPHRASE },
+    });
+
+    expect(code).toBe(0);
+    expect(err.text).not.toContain("namespace discovery failed");
+    const state = await readEncryptedState(bundleDir);
+    expect(state.total_keys).toBe(3);
+    expect(state.namespaces).toEqual(["agent-memory", "project-notes"]);
+  });
+
   it("round-trips an encoded filesystem namespace under its logical name", async () => {
     const namespace = "project notes";
     const fortress = await bootstrapFortress();
