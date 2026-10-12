@@ -454,7 +454,7 @@ async function verifyRotated(
   expect(toBase64url(ed25519.getPublicKey(seed))).toBe(identity.public_key);
 }
 
-describe("master rotation — happy path", () => {
+describe("master rotation: happy path", () => {
   it("rotates the master end to end: new wraps, re-encrypted data, retired old master, audit chain verifiable across the boundary", async () => {
     const fortress = await buildFortress();
     let disclosedKey = "";
@@ -837,7 +837,7 @@ describe("master rotation — happy path", () => {
   });
 });
 
-describe("master rotation — storage namespace discovery", () => {
+describe("master rotation: storage namespace discovery", () => {
   it("refuses before rotation when stored names cannot be addressed", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sanctuary-rotate-name-"));
     try {
@@ -875,7 +875,7 @@ describe("master rotation — storage namespace discovery", () => {
   });
 });
 
-describe("master rotation — Tier-1 gate and capture rules", () => {
+describe("master rotation: Tier-1 gate and capture rules", () => {
   it("refuses without operator approval, mutating nothing", async () => {
     const fortress = await buildFortress();
     await expect(
@@ -1031,7 +1031,7 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
   });
 });
 
-describe("master rotation — fail-closed coverage", () => {
+describe("master rotation: fail-closed coverage", () => {
   // LEGACY-BUG-001: shared enumeration refuses before rotation changes custody.
   it("surfaces fixed discovery remediation without staging rotation", async () => {
     const fortress = await buildFortress();
@@ -2286,7 +2286,7 @@ describe("master rotation — fail-closed coverage", () => {
   });
 });
 
-describe("master rotation — crash safety (journaled two-phase, forward resume)", () => {
+describe("master rotation: crash safety (journaled two-phase, forward resume)", () => {
   const POST_JOURNAL_FAILPOINTS = [
     "journal-converting-written",
     `converted:_identities/${KID}`,
@@ -2857,7 +2857,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
   });
 });
 
-describe("master rotation — custody floor on the rotated fortress", () => {
+describe("master rotation: custody floor on the rotated fortress", () => {
   it("the rotated envelope holds >= 2 verified distinct factors", async () => {
     const fortress = await buildFortress();
     await rotateMaster(rotateOpts(fortress));
@@ -2889,7 +2889,7 @@ describe("master rotation — custody floor on the rotated fortress", () => {
   });
 });
 
-describe("master rotation — anti-rollback epoch advance (Stage 1)", () => {
+describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
   it("a fresh fortress is epoch 0 with no witness yet", async () => {
     const fortress = await buildFortress();
     expect(await readEnvelopeEpoch(fortress.storage)).toBe(0);

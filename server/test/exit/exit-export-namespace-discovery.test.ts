@@ -65,6 +65,16 @@ import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interfa
 
 // ── Test scaffolding ─────────────────────────────────────────────────
 
+const RESERVED_EXPORT_PREFLIGHT_NAMESPACES = [
+  "_reputation",
+  "_known_signers",
+  "_identities",
+  "_commitments",
+  "_privacy_placeholder_vault",
+] as const;
+// RESERVED-EXPORT-PREFLIGHT-01: must match EXIT_RESERVED_EXPORT_PREFLIGHT_NAMESPACES in
+// src/exit/bundle.ts so each late-read reserved export namespace has a pre-mkdir witness.
+
 class StringWritable extends Writable {
   chunks: string[] = [];
   override _write(
@@ -425,60 +435,63 @@ describe("sanctuary exit export: state-namespace resolution", () => {
     },
   );
 
-  it("refuses reserved export namespaces before creating bundle artifacts or audit rows", async () => {
-    const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-exit-reserved-"));
-    cleanup.push(storagePath);
-    const stateStoragePath = join(storagePath, "state");
-    await mkdir(join(stateStoragePath, "plain"), { recursive: true, mode: 0o700 });
-    await mkdir(join(stateStoragePath, "_reputation"), { recursive: true, mode: 0o700 });
-    await writeFile(
-      join(stateStoragePath, "_reputation", "att-!4E2D.enc"),
-      new Uint8Array([2]),
-    );
-    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-reserved-"));
-    cleanup.push(bundleDir);
-    const storage = new FilesystemStorage(stateStoragePath);
-    const masterKey = generateRandomKey();
-    const auditLog = new AuditLog(storage, masterKey);
-    const stateStore = new StateStore(storage, masterKey);
-    const { tools, identityManager } = createL1Tools(
-      stateStore,
-      storage,
-      masterKey,
-      "recovery-key",
-      auditLog,
-    );
-    await identityManager.load();
-    const { reputationStore } = createL4Tools(
-      storage,
-      masterKey,
-      identityManager,
-      auditLog,
-    );
-    await callTool(tools as ToolLike[], "identity_create", { label: "agent" });
-
-    await expect(
-      exportExitBundle({
-        unpartitionedLegacyExport: true,
-        bundleDir,
+  it.each(RESERVED_EXPORT_PREFLIGHT_NAMESPACES)(
+    "refuses reserved export namespace %s before creating bundle artifacts or audit rows",
+    async (reservedNamespace) => {
+      const storagePath = await mkdtemp(join(tmpdir(), "sanctuary-exit-reserved-"));
+      cleanup.push(storagePath);
+      const stateStoragePath = join(storagePath, "state");
+      await mkdir(join(stateStoragePath, "plain"), { recursive: true, mode: 0o700 });
+      const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-reserved-"));
+      cleanup.push(bundleDir);
+      const storage = new FilesystemStorage(stateStoragePath);
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const { reputationStore } = createL4Tools(
         storage,
         masterKey,
         identityManager,
         auditLog,
-        reputationStore,
-        policy: DEFAULT_POLICY,
-        config: defaultConfig(),
-        stateStoragePath,
-        stateNamespaces: ["plain"],
-        keySource: "recovery-key",
-      }),
-    ).rejects.toThrow(/storage name this version cannot address/);
+      );
+      await callTool(tools as ToolLike[], "identity_create", { label: "agent" });
+      await mkdir(join(stateStoragePath, reservedNamespace), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(stateStoragePath, reservedNamespace, "att-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
 
-    expect(await readdir(bundleDir)).toEqual([]);
-    await auditLog.flush();
-    const audit = await auditLog.query({ operation_type: "exit_bundle_export" });
-    expect(audit.entries).toEqual([]);
-  });
+      await expect(
+        exportExitBundle({
+          unpartitionedLegacyExport: true,
+          bundleDir,
+          storage,
+          masterKey,
+          identityManager,
+          auditLog,
+          reputationStore,
+          policy: DEFAULT_POLICY,
+          config: defaultConfig(),
+          stateStoragePath,
+          stateNamespaces: ["plain"],
+          keySource: "recovery-key",
+        }),
+      ).rejects.toThrow(/storage name this version cannot address/);
+
+      expect(await readdir(bundleDir)).toEqual([]);
+      await auditLog.flush();
+      const audit = await auditLog.query({ operation_type: "exit_bundle_export" });
+      expect(audit.entries).toEqual([]);
+    },
+  );
 
   it("still restricts the export to the namespaces --state-namespace names", async () => {
     await seededFortress();

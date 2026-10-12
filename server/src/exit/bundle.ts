@@ -189,7 +189,19 @@ const EXIT_AUDIT_RECEIPTS_NAMESPACE = "_exit_audit_receipts";
 const EXIT_POLICY_SETS_NAMESPACE = "_exit_policy_sets";
 const EXIT_COMMITMENTS_NAMESPACE = "_exit_commitments";
 const EXIT_PLACEHOLDER_METADATA_NAMESPACE = "_exit_placeholder_metadata";
+const COMMITMENTS_NAMESPACE = "_commitments";
 const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
+
+const EXIT_RESERVED_EXPORT_PREFLIGHT_NAMESPACES = [
+  "_reputation",
+  KNOWN_SIGNERS_NAMESPACE,
+  "_identities",
+  COMMITMENTS_NAMESPACE,
+  PRIVACY_PLACEHOLDER_NAMESPACE,
+] as const;
+// RESERVED-EXPORT-PREFLIGHT-01: must match RESERVED_EXPORT_PREFLIGHT_NAMESPACES in
+// test/exit/exit-export-namespace-discovery.test.ts so removing one reserved
+// export reader from this preflight fails a full-set witness.
 
 /**
  * MEDIUM-C (Codex gate, 2026-08-22): caps how many journal-set locations a
@@ -986,12 +998,7 @@ async function preflightExitStateStorageNames(
     // export audit append can create residue.
     await opts.storage.list(namespace);
   }
-  const reservedExportNamespaces = [
-    "_reputation",
-    KNOWN_SIGNERS_NAMESPACE,
-    "_identities",
-  ] as const;
-  for (const namespace of reservedExportNamespaces) {
+  for (const namespace of EXIT_RESERVED_EXPORT_PREFLIGHT_NAMESPACES) {
     // These reserved namespaces are exported after the state artifact; proving
     // them here keeps every storage-name refusal before mkdir, artifact writes,
     // and the fire-and-forget exit audit append.
@@ -1304,8 +1311,8 @@ async function exportCommitments(
   const encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
   const publicCommitments: ExitCommitmentsArtifact["public_commitments"] = [];
   let unreadable = 0;
-  for (const meta of await storage.list("_commitments")) {
-    const raw = await storage.read("_commitments", meta.key);
+  for (const meta of await storage.list(COMMITMENTS_NAMESPACE)) {
+    const raw = await storage.read(COMMITMENTS_NAMESPACE, meta.key);
     if (!raw) continue;
     try {
       const encrypted = JSON.parse(bytesToString(raw)) as EncryptedPayload;

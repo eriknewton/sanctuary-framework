@@ -285,23 +285,25 @@ describe("FilesystemStorage", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const stateStore = new StateStore(storage, masterKey);
+      const binding: { current?: SessionBinding } = {};
       const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
         stateStore,
         storage,
         masterKey,
         "recovery-key",
         auditLog,
+        { currentSessionBinding: () => binding.current },
       );
       await identityManager.load();
       const identity = await callTool(l1Tools, "identity_create", {
         label: "cooperative-roundtrip-agent",
       });
-      const active = session(identity.identity_id as string);
+      binding.current = session(identity.identity_id as string);
       const { tools: facadeTools } = createAgentNativeCooperativeTools({
         identityManager,
         namespaceRegistry,
         auditLog,
-        currentSessionBinding: () => active,
+        currentSessionBinding: () => binding.current,
         primitiveTools: l1Tools,
         storage,
         approvalProofStore: new ApprovalProofStore(),
@@ -314,6 +316,11 @@ describe("FilesystemStorage", () => {
       expect(result.denied).toBe(true);
       expect(JSON.stringify(result)).not.toContain("round-trip");
       expect(JSON.stringify(result)).not.toContain("stored name");
+      const audit = await auditLog.query({ operation_type: "state_write" });
+      expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
+      expect(audit.entries[0]?.details).toMatchObject({
+        storage_name_kind: "key",
+      });
     });
 
     it("returns generic disclosure denials for storage names that do not round-trip", async () => {
