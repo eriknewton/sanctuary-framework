@@ -2865,12 +2865,16 @@ export async function runDaemon(
       const pkgVersion = getSanctuaryVersion();
       transparencyScheduler = startTransparencyScheduler({
         intervalMs,
-        emit: async () => {
+        emit: async (abortState) => {
+          // INVARIANT (shutdown/key custody): no await may separate this abort
+          // check from entering signer resolution with the daemon master key.
+          abortState.assertNotAborted("transparency signer resolution");
           const signer = await resolveTransparencySigner({
             fortressPath: storagePath,
             masterKey: derived.key,
             env,
             ...(localSign ? { mode: "local" as const } : {}),
+            abortState,
           });
           const record = await emitEnforcementCheckpoint({
             storage,
@@ -2881,6 +2885,7 @@ export async function runDaemon(
             signer,
             binaryPath: realpathSync(process.argv[1] ?? ""),
             version: pkgVersion,
+            abortState,
           });
           await auditLog.appendCritical({
             layer: "l2",
@@ -2910,6 +2915,7 @@ export async function runDaemon(
             const anchorState = await readAnchorConfig({
               storage,
               masterKey: derived.key,
+              abortState,
             });
             if (anchorState.status === "enabled") {
               const outcome = await anchorCheckpoint({
@@ -2917,6 +2923,7 @@ export async function runDaemon(
                 masterKey: derived.key,
                 auditLog,
                 record,
+                abortState,
               });
               if (outcome.status === "anchored") {
                 write(

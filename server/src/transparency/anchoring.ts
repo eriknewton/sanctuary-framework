@@ -79,6 +79,7 @@ import {
   type FetchLike,
   type RekorClient,
 } from "./rekor-client.js";
+import type { TransparencySchedulerAbortState } from "./scheduler.js";
 
 export const TRANSPARENCY_ANCHOR_NAMESPACE = "_transparency_anchors";
 export const TRANSPARENCY_ANCHOR_RECEIPT_PREFIX = "anchor-";
@@ -124,6 +125,7 @@ export type AnchorConfigState =
 interface AnchorKeyInput {
   storage: StorageBackend;
   masterKey: Uint8Array;
+  abortState?: TransparencySchedulerAbortState;
 }
 
 /**
@@ -162,6 +164,9 @@ export async function readAnchorConfig(
   if (!isAnchorConfigData(data) || typeof mac !== "string") {
     throw tamperError();
   }
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from deriving the anchoring-config MAC key from the daemon master key.
+  input.abortState?.assertNotAborted("anchoring config key derivation");
   const macKey = derivePurposeKey(
     input.masterKey,
     TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE
@@ -173,6 +178,9 @@ export async function readAnchorConfig(
     } catch {
       throw tamperError();
     }
+    // INVARIANT (shutdown/key custody): no await may separate this abort check
+    // from authenticating the anchoring config with master-derived key material.
+    input.abortState?.assertNotAborted("anchoring config MAC verification");
     if (!constantTimeEqual(provided, hmacSha256(macKey, anchorConfigMacInput(data)))) {
       throw tamperError();
     }
@@ -668,9 +676,15 @@ export async function anchorCheckpoint(
   };
 
   try {
+    // INVARIANT (shutdown/key custody): no await may separate this abort check
+    // from deriving the anchoring key from the daemon master key.
+    input.abortState?.assertNotAborted("anchor key derivation");
     const key = deriveAnchorSigningKey(input.masterKey);
     let proposal;
     try {
+      // INVARIANT (shutdown/key custody): no await may separate this abort
+      // check from signing the anchor preimage with derived key material.
+      input.abortState?.assertNotAborted("anchor preimage signing");
       proposal = buildHashedRekordProposal({
         digestHex,
         signatureDer: signAnchorPreimage(key.privateKey, preimage),

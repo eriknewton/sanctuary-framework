@@ -34,6 +34,7 @@ import {
   ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
 } from "../core/crypto-suite-registry.js";
+import type { TransparencySchedulerAbortState } from "./scheduler.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -51,6 +52,8 @@ export interface ResolveTransparencySignerInput {
   signerClientInvoke?: ShimInvoker;
   /** Override the root-owned global pin path (tests). */
   globalPinnedPublicKeyPath?: string;
+  /** Shutdown abort state for daemon-scheduled emissions. */
+  abortState?: TransparencySchedulerAbortState;
 }
 
 export async function resolveTransparencySigner(
@@ -65,7 +68,11 @@ export async function resolveTransparencySigner(
       : input.mode;
 
   if (mode === "local") {
-    return loadLocalTransparencySigner(input.fortressPath, input.masterKey);
+    return loadLocalTransparencySigner(
+      input.fortressPath,
+      input.masterKey,
+      input.abortState,
+    );
   }
 
   const clientBinaryPath = env.SANCTUARY_CASTLE_SIGNER_CLIENT;
@@ -129,7 +136,8 @@ async function assertGlobalPinMatches(
 /** Dev/test local path: decrypt the fortress castle-pinned key per emission. */
 async function loadLocalTransparencySigner(
   fortressPath: string,
-  masterKey: Uint8Array
+  masterKey: Uint8Array,
+  abortState?: TransparencySchedulerAbortState,
 ): Promise<TransparencySigner> {
   let publicKey: Uint8Array;
   let encryptedPrivateKey: EncryptedPayload;
@@ -157,6 +165,9 @@ async function loadLocalTransparencySigner(
   // mirroring the daemon's loadLocalSigningKey.
   let privateKey: Uint8Array;
   try {
+    // INVARIANT (shutdown/key custody): no await may separate this abort check
+    // from decrypting the pinned signing key with the daemon master key.
+    abortState?.assertNotAborted("local transparency signer decrypt");
     privateKey = decrypt(encryptedPrivateKey, masterKey);
   } catch {
     throw new TransparencyEmitError(
@@ -165,6 +176,9 @@ async function loadLocalTransparencySigner(
   }
   try {
     if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {
+      // INVARIANT (shutdown/key custody): no await may separate this abort
+      // check from re-encrypting normalized local signer custody material.
+      abortState?.assertNotAborted("local transparency signer normalization");
       encryptedPrivateKey = encrypt(privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES), masterKey);
     } else if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
       throw new TransparencyEmitError(
@@ -178,6 +192,11 @@ async function loadLocalTransparencySigner(
   return {
     signer_kid: `castle-wall:${toBase64url(publicKey)}`,
     publicKey: new Uint8Array(publicKey),
-    sign: async (bytes) => identitySign(bytes, frozenEncrypted, masterKey),
+    sign: async (bytes) => {
+      // INVARIANT (shutdown/key custody): no await may separate this abort check
+      // from signing with the master-key-encrypted local signer material.
+      abortState?.assertNotAborted("local transparency signing");
+      return identitySign(bytes, frozenEncrypted, masterKey);
+    },
   };
 }

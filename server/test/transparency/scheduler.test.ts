@@ -3,16 +3,18 @@ import {
   DEFAULT_TRANSPARENCY_INTERVAL_MS,
   parseTransparencyInterval,
   startTransparencyScheduler,
+  TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS,
+  TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS,
   TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
+  TRANSPARENCY_STOP_DRAIN_MARGIN_MS,
 } from "../../src/transparency/scheduler.js";
 import { REKOR_SUBMIT_TIMEOUT_MS } from "../../src/transparency/rekor-client.js";
 
-const LOCAL_EMIT_LOCK_TIMEOUT_MS = 5_000;
-const LOCAL_SIGN_APPEND_AND_MARGIN_MS = 5_000;
 const EXPECTED_STOP_DRAIN_DEADLINE_MS =
-  LOCAL_EMIT_LOCK_TIMEOUT_MS +
+  TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS +
   REKOR_SUBMIT_TIMEOUT_MS +
-  LOCAL_SIGN_APPEND_AND_MARGIN_MS;
+  TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS +
+  TRANSPARENCY_STOP_DRAIN_MARGIN_MS;
 
 describe("parseTransparencyInterval", () => {
   it("defaults to 6 hours when unset", () => {
@@ -141,14 +143,18 @@ describe("startTransparencyScheduler", () => {
   it("stop gives up after the named tick-work estimate", async () => {
     vi.useFakeTimers();
     try {
-      let barrierHeld = true;
+      let attempts = 0;
       let stopSettled = false;
       const scheduler = startTransparencyScheduler({
         intervalMs: 1_000,
-        emit: () => new Promise<void>(() => undefined),
+        emit: () => {
+          attempts += 1;
+          return new Promise<void>(() => undefined);
+        },
         onError: () => undefined,
       });
       await vi.advanceTimersByTimeAsync(1_000);
+      expect(attempts).toBe(1);
 
       const stopped = scheduler.stop();
       void stopped.then(() => {
@@ -164,13 +170,65 @@ describe("startTransparencyScheduler", () => {
       );
       expect(stopSettled).toBe(true);
 
-      barrierHeld = false;
-      const writeAfterRelease = async () => {
-        if (!barrierHeld) throw new Error("master write session was released");
-      };
-      await expect(writeAfterRelease()).rejects.toThrow(
-        "master write session was released",
-      );
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(attempts).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts deadline-straddling emissions before late key work or writes", async () => {
+    vi.useFakeTimers();
+    try {
+      const masterKey = new Uint8Array([7, 7, 7, 7]);
+      let releaseEmission: (() => void) | undefined;
+      let deriveCalls = 0;
+      let macCalls = 0;
+      let signCalls = 0;
+      let writes = 0;
+      const errors: unknown[] = [];
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: async (state) => {
+          await new Promise<void>((resolve) => {
+            releaseEmission = resolve;
+          });
+          // INVARIANT (shutdown/key custody): no await may separate this abort
+          // check from the synchronous derived-key operation it gates.
+          state.assertNotAborted("test key derivation");
+          expect(masterKey[0]).toBe(7);
+          deriveCalls += 1;
+          // INVARIANT (shutdown/key custody): no await may separate this abort
+          // check from the synchronous MAC operation it gates.
+          state.assertNotAborted("test MAC");
+          macCalls += 1;
+          // INVARIANT (shutdown/key custody): no await may separate this abort
+          // check from the synchronous signing operation it gates.
+          state.assertNotAborted("test signing");
+          signCalls += 1;
+          writes += 1;
+        },
+        onError: (error) => errors.push(error),
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(releaseEmission).toBeDefined();
+
+      const stopped = scheduler.stop();
+      await vi.advanceTimersByTimeAsync(TRANSPARENCY_STOP_DRAIN_DEADLINE_MS);
+      await stopped;
+      masterKey.fill(0);
+      releaseEmission!();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(deriveCalls).toBe(0);
+      expect(macCalls).toBe(0);
+      expect(signCalls).toBe(0);
+      expect(writes).toBe(0);
+      expect(errors[0]).toMatchObject({
+        name: "TransparencySchedulerAbortedError",
+      });
     } finally {
       vi.useRealTimers();
     }

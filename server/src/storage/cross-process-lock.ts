@@ -102,6 +102,12 @@ const MAX_BARRIER_READER_SOCKETS = 4_096;
 // 128 = one helper spawn per 32 entries under the shared fail-closed ceiling.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT =
   MAX_BARRIER_READER_SOCKETS / 32;
+// The unused-scaffold sweep may inspect ordinary runtime-dir entries plus one
+// bounded cleanup batch; beyond that, the sweep fails closed without scanning
+// candidates. Derived from the existing reader-socket ceiling plus the maximum
+// two scaffold names per cleanup candidate.
+const UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP =
+  MAX_BARRIER_READER_SOCKETS + UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2;
 // The whole sweep pass gets one helper deadline, not one deadline per candidate:
 // STALE_REAPER_TIMEOUT_MS is already the maximum useful wait for one serialized
 // authority attempt, so spending more in one acquire would only delay admission.
@@ -1179,6 +1185,10 @@ async function sweepUnusedBarrierScaffolds(
   let completed = false;
   try {
     const names = await readdir(runtimeDir);
+    if (names.length > UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP) {
+      completed = true;
+      return;
+    }
     const nameSet = new Set(names);
     const scaffoldDigests = new Set<string>();
     const exclusiveSocketDigests = new Set<string>();
@@ -1252,7 +1262,7 @@ async function sweepUnusedBarrierScaffolds(
     completed = true;
   } finally {
     if (completed) {
-      lastUnusedBarrierSweepByDigest.set(activeScaffoldDigest, now);
+      lastUnusedBarrierSweepByDigest.set(activeScaffoldDigest, Date.now());
     } else {
       lastUnusedBarrierSweepByDigest.delete(activeScaffoldDigest);
     }

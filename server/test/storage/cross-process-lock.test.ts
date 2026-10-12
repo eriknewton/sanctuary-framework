@@ -53,6 +53,10 @@ const OVER_CEILING_SCAFFOLD_PAIR_COUNT = 300;
 const OVER_CEILING_CUSTODY_REAPER_COUNT = 4;
 // 128 = MAX_BARRIER_READER_SOCKETS (4,096) / 32 in src/storage/cross-process-lock.ts.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT = 128;
+// 4,352 = MAX_BARRIER_READER_SOCKETS (4,096) plus two scaffold names for each
+// unused-scaffold sweep helper cap (128 * 2) in src/storage/cross-process-lock.ts.
+const UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP =
+  4_096 + UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2;
 // 2 = one `.reaper` plus one `.reader-reaper` pair for the most recent identity.
 const MAX_SCAFFOLDS_AFTER_SWEEP = 2;
 // 1_000 ms = one second, short enough for unit tests and long enough for a local socket bind.
@@ -721,6 +725,14 @@ describe("withCrossProcessLock", () => {
         expect(Date.now() - started).toBeLessThan(SLOW_SWEEP_PASS_TEST_BOUND_MS);
         const log = await readFile(helperLog, "utf8");
         expect(log.trim().split("\n")).toHaveLength(1);
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript: slowHelperScript },
+        );
+        const afterThrottledPass = await readFile(helperLog, "utf8");
+        expect(afterThrottledPass.trim().split("\n")).toHaveLength(1);
       } finally {
         await rm(runtimeRoot, { recursive: true, force: true });
       }
@@ -746,6 +758,45 @@ describe("withCrossProcessLock", () => {
         const names = await readdir(runtimeRoot);
         expect(names).toContain(`${activeDigest}.reaper`);
         expect(names).toContain(`${activeDigest}.reader-reaper`);
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "stops the unused-scaffold sweep when the runtime directory exceeds the scan cap",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const helperLog = join(base, "capped-sweep-helper.log");
+        for (
+          let index = 0;
+          index <= UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP;
+          index += 1
+        ) {
+          await writeFile(join(runtimeRoot, `ignored-${index}`), "");
+        }
+        const digest = scaffoldDigest(SLOW_SWEEP_DIGEST_SEED);
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const helperScript = `
+          const fs = require("node:fs");
+          fs.appendFileSync(${JSON.stringify(helperLog)}, "started\\n");
+        `;
+
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript },
+        );
+
+        await expect(readFile(helperLog, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect(await countReaperScaffolds(runtimeRoot)).toBe(2);
       } finally {
         await rm(runtimeRoot, { recursive: true, force: true });
       }

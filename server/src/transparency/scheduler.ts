@@ -75,7 +75,7 @@ export function parseTransparencyInterval(
 export interface TransparencySchedulerOptions {
   intervalMs: number;
   /** Emits one checkpoint; throws on failure (the emitter is fail-closed). */
-  emit: () => Promise<unknown>;
+  emit: (state: TransparencySchedulerAbortState) => Promise<unknown>;
   /** Invoked with every tick failure; must not throw. */
   onError: (err: unknown) => void;
   /** Test hooks. */
@@ -87,6 +87,18 @@ export interface TransparencySchedulerHandle {
   stop(): Promise<void>;
 }
 
+export class TransparencySchedulerAbortedError extends Error {
+  constructor(phase: string) {
+    super(`transparency checkpoint emission aborted before ${phase}`);
+    this.name = "TransparencySchedulerAbortedError";
+  }
+}
+
+export interface TransparencySchedulerAbortState {
+  readonly aborted: boolean;
+  assertNotAborted(phase: string): void;
+}
+
 export function startTransparencyScheduler(
   options: TransparencySchedulerOptions
 ): TransparencySchedulerHandle {
@@ -94,10 +106,19 @@ export function startTransparencyScheduler(
   const clearIntervalFn = options.clearIntervalFn ?? clearInterval;
   let inFlight: Promise<void> | undefined;
   let stopped = false;
+  let aborted = false;
+  const abortState: TransparencySchedulerAbortState = {
+    get aborted() {
+      return aborted;
+    },
+    assertNotAborted(phase: string): void {
+      if (aborted) throw new TransparencySchedulerAbortedError(phase);
+    },
+  };
   const timer = setIntervalFn(() => {
-    if (inFlight !== undefined || stopped) return; // never overlap emissions
+    if (inFlight !== undefined || stopped || aborted) return; // never overlap emissions
     inFlight = options
-      .emit()
+      .emit(abortState)
       .then(() => undefined)
       .catch((err) => {
         try {
@@ -123,7 +144,10 @@ export function startTransparencyScheduler(
       // its reader and writes that begin later fail closed through the storage
       // barrier.
       const current = inFlight;
-      if (current === undefined) return;
+      if (current === undefined) {
+        aborted = true;
+        return;
+      }
       let drainTimer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
@@ -134,6 +158,7 @@ export function startTransparencyScheduler(
           }),
         ]);
       } finally {
+        aborted = true;
         if (drainTimer !== undefined) clearTimeout(drainTimer);
       }
     },

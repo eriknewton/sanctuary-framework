@@ -216,7 +216,7 @@ describe("castle-wall CLI verbs", () => {
     }
   }
 
-  async function waitForTurn(): Promise<void> {
+  async function waitForTurn(): Promise<void> { // eslint-disable-line @typescript-eslint/no-unused-vars
     await new Promise((resolve) => setTimeout(resolve, ONE_EVENT_LOOP_TURN_MS));
   }
 
@@ -2677,6 +2677,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         err,
         env: {
           SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_CASTLE_LOCAL_SIGN: "1",
           [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
         },
         platform: "linux",
@@ -2698,15 +2699,16 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         err,
         env: {
           SANCTUARY_STORAGE_PATH: "/nonexistent/fortress",
+          SANCTUARY_CASTLE_LOCAL_SIGN: "1",
           [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
         },
         platform: "darwin",
       });
       expect(code).toBe(1);
       // The macOS path: it did NOT bail as "macOS-only" and did NOT enter the
-      // Linux producer-signed gate. The specific downstream failure (pin read /
-      // passphrase / establishMaster) depends on host Keychain state, so we
-      // assert the ROUTING (no Linux-gate involvement), not the exact failure.
+      // Linux producer-signed gate. Local signing keeps the downstream failure
+      // on the fixture fortress path, so this asserts routing without reading
+      // any host credential store.
       expect(err.text()).not.toMatch(/macOS-only/);
       expect(err.text()).not.toMatch(/Linux producer-signed/);
       expect(err.text()).not.toMatch(/fail-closed.*not armed/i);

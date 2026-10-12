@@ -21,8 +21,8 @@
  * armed-box Mini1 re-drill's job (see the PR body).
  */
 
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -34,7 +34,13 @@ import {
   type CastleWallCommandContext,
 } from "../../src/cli/castle-wall.js";
 import type { MacOSCastleWallDaemonInput } from "../../src/castle-wall/runtime/macos-daemon.js";
+import {
+  CUSTODY_WRITE_LOCK_NAMESPACE,
+  MASTER_ROTATION_BARRIER_NAME,
+} from "../../src/core/master-custody.js";
 import { AUDIT_DAEMON_NAMESPACE } from "../../src/operational/audit-store-split.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { __testListMasterBarrierReaderSockets } from "../../src/storage/cross-process-lock.js";
 import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
@@ -57,26 +63,75 @@ const SIGNAL_LISTENER_POLL_MS = 10;
 // 20_000 ms leaves room for transform-heavy workers to reach the foreground
 // signal wait after custody unlock and dynamic daemon setup.
 const SIGNAL_LISTENER_WAIT_DEADLINE_MS = 20_000;
+const EXPECTED_DAEMON_GENESIS_ENTRIES = 1;
+const EXPECTED_DAEMON_GENESIS_PLUS_PROBE_ENTRIES =
+  EXPECTED_DAEMON_GENESIS_ENTRIES + 1;
+const SHORT_SOCKET_TMP_PARENT =
+  process.platform === "darwin" ? "/private/tmp" : tmpdir();
 type DaemonCapture = {
   input?: MacOSCastleWallDaemonInput;
   onStart?: (input: MacOSCastleWallDaemonInput) => Promise<void>;
 };
 
-async function waitForNewSignalListener(
+type ProcessSignalListener = (...args: unknown[]) => unknown;
+
+function isCastleWallDaemonStopListener(candidate: ProcessSignalListener): boolean {
+  const unwrapped = (candidate as { listener?: unknown }).listener;
+  const listener = typeof unwrapped === "function" ? unwrapped : candidate;
+  return String(listener).includes("Stopping Castle Wall daemon");
+}
+
+async function waitForNewDaemonSignalListener(
   signal: NodeJS.Signals,
-  before: readonly Function[],
-): Promise<Function> {
+  before: readonly ProcessSignalListener[],
+): Promise<ProcessSignalListener> {
   const started = Date.now();
   for (;;) {
-    const listener = process.rawListeners(signal).find(
-      (candidate) => !before.includes(candidate),
+    const listeners = process.rawListeners(signal) as ProcessSignalListener[];
+    const listener = listeners.find(
+      (candidate) =>
+        !before.includes(candidate) && isCastleWallDaemonStopListener(candidate),
     );
     if (listener !== undefined) return listener;
     if (Date.now() - started > SIGNAL_LISTENER_WAIT_DEADLINE_MS) {
-      throw new Error(`timed out waiting for ${signal} listener`);
+      throw new Error(`timed out waiting for Castle Wall daemon ${signal} listener`);
     }
     await new Promise((resolve) => setTimeout(resolve, SIGNAL_LISTENER_POLL_MS));
   }
+}
+
+let previousCustodyLockRoot: string | undefined;
+let castleWallTestLockRoot: string | undefined;
+
+beforeAll(async () => {
+  previousCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  // macOS `sun_path` is 104 bytes including the terminator; the resolver's
+  // reviewed 100-byte cap leaves room only when the test root is short.
+  castleWallTestLockRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "cwdl-"));
+  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = castleWallTestLockRoot;
+});
+
+afterAll(async () => {
+  if (previousCustodyLockRoot === undefined) {
+    delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  } else {
+    process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
+  }
+  if (castleWallTestLockRoot !== undefined) {
+    await rm(castleWallTestLockRoot, { recursive: true, force: true });
+  }
+});
+
+async function assertNoMasterBarrierReaders(fortressPath: string): Promise<void> {
+  const lockDir = join(fortressPath, "state", CUSTODY_WRITE_LOCK_NAMESPACE);
+  const stats = await stat(lockDir).catch(() => null);
+  if (stats === null || !stats.isDirectory()) return;
+  const sockets = await __testListMasterBarrierReaderSockets(
+    new FilesystemStorage(join(fortressPath, "state")),
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    MASTER_ROTATION_BARRIER_NAME,
+  );
+  expect(sockets).toEqual([]);
 }
 
 describe("castle-wall daemon: F2 Option A audit-store split", () => {
@@ -140,6 +195,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     const code = await runDaemon([], ctx);
     expect(code).toBe(1); // capture-throw surfaces as start failure
     expect(capture.input).toBeDefined();
+    await assertNoMasterBarrierReaders(fortressPath);
 
     const auditDir = join(fortressPath, "state", "_audit");
     const entries = (await readdir(auditDir)).filter((f) => f.startsWith("entry-"));
@@ -157,7 +213,12 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
   it("root: migrates first, then writes into _audit-daemon (never _audit)", async () => {
     const { fortressPath } = await makeLocalFortress();
     const capture: DaemonCapture = {};
+    let daemonEntriesBeforeProbe: string[] | undefined;
     capture.onStart = async (input) => {
+      daemonEntriesBeforeProbe = (
+        await readdir(join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE))
+      ).filter((f) => f.startsWith("entry-"));
+
       await input.auditLog.appendCritical({
         layer: "l1",
         operation: "probe",
@@ -172,6 +233,8 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     const code = await runDaemon([], ctx);
     expect(code).toBe(1);
     expect(capture.input).toBeDefined();
+    expect(daemonEntriesBeforeProbe?.length).toBe(EXPECTED_DAEMON_GENESIS_ENTRIES);
+    await assertNoMasterBarrierReaders(fortressPath);
 
     // The boundary record now exists (migration ran on a fresh/empty chain,
     // so sealed_tip_sequence is 0 — still a real, MAC-authenticated record).
@@ -185,7 +248,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     const daemonEntries = (
       await readdir(join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE))
     ).filter((f) => f.startsWith("entry-"));
-    expect(daemonEntries.length).toBe(2); // genesis marker + probe
+    expect(daemonEntries.length).toBe(EXPECTED_DAEMON_GENESIS_PLUS_PROBE_ENTRIES);
 
     // The shared operator `_audit` namespace never received the probe entry
     // (it may not even exist yet on a fortress this fresh, since it starts
@@ -216,7 +279,9 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     };
     const seedCtx = baseCtx(fortressPath, seedCapture);
     seedCtx.getuid = () => 501;
-    await runDaemon([], seedCtx);
+    const seedCode = await runDaemon([], seedCtx);
+    expect(seedCode).toBe(1);
+    await assertNoMasterBarrierReaders(fortressPath);
 
     const auditDir = join(fortressPath, "state", "_audit");
     const files = (await readdir(auditDir)).filter((f) => f.startsWith("entry-"));
@@ -234,6 +299,7 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     expect(code).toBe(1);
     // The daemon never reached fullDaemonStart — it refused before arming.
     expect(capture.input).toBeUndefined();
+    await assertNoMasterBarrierReaders(fortressPath);
 
     // No boundary was written over the tampered chain.
     await expect(
@@ -245,7 +311,9 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     const { fortressPath } = await makeLocalFortress();
     let stopCalls = 0;
     let daemonAuditLog: MacOSCastleWallDaemonInput["auditLog"] | undefined;
-    const signalListenersBefore = process.rawListeners("SIGTERM");
+    const signalListenersBefore = process.rawListeners(
+      "SIGTERM",
+    ) as ProcessSignalListener[];
     const ctx: CastleWallCommandContext = {
       out: new CaptureStream(),
       err: new CaptureStream(),
@@ -276,10 +344,14 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
     };
 
     const running = runDaemon([], ctx);
-    const listener = await waitForNewSignalListener("SIGTERM", signalListenersBefore);
+    const listener = await waitForNewDaemonSignalListener(
+      "SIGTERM",
+      signalListenersBefore,
+    );
     listener();
 
     await expect(running).resolves.toBe(0);
+    await assertNoMasterBarrierReaders(fortressPath);
     expect(stopCalls).toBe(1);
     const stoppedEntries = await daemonAuditLog!.query({
       operation_type: "filter_stopped",
