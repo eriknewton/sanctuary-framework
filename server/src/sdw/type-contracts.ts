@@ -1,4 +1,5 @@
 import type { StorageBackend } from "../storage/interface.js";
+import type { MemoryProvenanceBadSignerAuthority } from "./memory-provenance-bad-signers.js";
 import type {
   CreateSdwMemoryAdapterOptions,
   HermesBridgeCommitCheck,
@@ -15,8 +16,12 @@ declare const key: Uint8Array;
 declare const catalogRecord: SdwCatalogRecord;
 declare const persistable: Persistable<SdwCatalogRecord>;
 declare const fortressId: string;
-declare const hermesAdapterBase: Omit<CreateSdwMemoryAdapterOptions, "mode" | "commitCheck">;
+declare const hermesAdapterBase: Omit<
+  CreateSdwMemoryAdapterOptions,
+  "mode" | "commitCheck" | "badSignerAuthority"
+>;
 declare const hermesCommitCheck: HermesBridgeCommitCheck;
+declare const badSignerAuthority: MemoryProvenanceBadSignerAuthority;
 
 void sdwBackendWrite(backend, persistable, key, fortressId);
 
@@ -44,11 +49,21 @@ void ({
   ...hermesAdapterBase,
   mode: "hermes-bridge",
   commitCheck: hermesCommitCheck,
+  badSignerAuthority,
 } satisfies CreateSdwMemoryAdapterOptions);
+
+// @ts-expect-error Hermes bridge mode must carry the bad-signer authority that provenance reads consume.
+const missingHermesBadSignerAuthority: CreateSdwMemoryAdapterOptions = {
+  ...hermesAdapterBase,
+  mode: "hermes-bridge",
+  commitCheck: hermesCommitCheck,
+};
+void missingHermesBadSignerAuthority;
 
 // @ts-expect-error Hermes bridge mode must supply the live commit check.
 const missingHermesCommitCheck: CreateSdwMemoryAdapterOptions = {
   ...hermesAdapterBase,
   mode: "hermes-bridge",
+  badSignerAuthority,
 };
 void missingHermesCommitCheck;

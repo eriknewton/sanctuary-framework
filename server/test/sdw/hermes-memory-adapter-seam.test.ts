@@ -7,11 +7,13 @@ import {
   createSdwMemoryAdapter,
   type HermesBridgeCommitCheck,
 } from "../../src/index.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import {
   SdwMemoryBackendAdapter,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
 import { documentChunkKey, documentKey } from "../../src/sdw/grammar.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
@@ -24,7 +26,7 @@ const FORTRESS_ID = "fortress:hermes";
 const MASTER_KEY = new Uint8Array(32).fill(13);
 const OWNER_REF = "fleet-self";
 const NOW = "2026-10-12T00:00:00.000Z";
-const BRIDGE_TEST_SEAM_SYMBOL = "__hermesBridgeTestSeam";
+const BAD_SIGNER_AUTHORITY = { async isMarked(): Promise<boolean> { return false; } };
 
 function sha256Base64url(text: string): string {
   return toBase64url(hash(new TextEncoder().encode(text)));
@@ -56,6 +58,7 @@ function makeAdapter(
     resolvePrimarySigningHandle: deps.resolvePrimarySigningHandle,
     resolveSignerPublicKey: deps.resolveSignerPublicKey,
     resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
+    badSignerAuthority: BAD_SIGNER_AUTHORITY,
     commitCheck,
   });
 }
@@ -154,6 +157,12 @@ class ParkingDocumentStorage extends RecordingStorage {
   }
 }
 
+const BRIDGE_TEST_DOUBLE_SYMBOLS = Object.freeze([
+  RecordingStorage.name,
+  RollbackFailureStorage.name,
+  ParkingDocumentStorage.name,
+]);
+
 async function waitUntil(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -215,6 +224,18 @@ describe("Hermes bridge SDW memory adapter seam", () => {
     expect(await ownerScopeKeys(storage)).toEqual([]);
   });
 
+  it("bridge mode refuses transactional storage construction", () => {
+    const transactionalStorage = Object.assign(new MemoryStorage(), {
+      async sdwTransaction<T>(fn: (txn: never) => Promise<T>): Promise<T> {
+        return fn(undefined as never);
+      },
+    });
+
+    expect(() => makeAdapter(transactionalStorage, {
+      async assertAllowedToCommit(): Promise<void> {},
+    })).toThrow(/transactional/i);
+  });
+
   it("a passing bridge check commits one document and bridge mutators other than insert refuse", async () => {
     const storage = new RecordingStorage();
     const adapter = makeAdapter(storage, {
@@ -256,6 +277,27 @@ describe("Hermes bridge SDW memory adapter seam", () => {
       unmodified.insertPassage(passageInput("hash-ok", text), "user_content"),
     ).resolves.toMatchObject({ passage_id: "hash-ok" });
     expect(await documentEntries(storage)).toHaveLength(1);
+  });
+
+  it("bridge memory_get frame size matches the shipped memory_get tool response", async () => {
+    const storage = new RecordingStorage();
+    let observedFrameBytes: number | undefined;
+    const adapter = makeAdapter(storage, {
+      async assertAllowedToCommit(context): Promise<void> {
+        observedFrameBytes = context.getFrameUtf8Bytes;
+      },
+    });
+    await adapter.insertPassage(passageInput("frame-size", "same bytes"), "user_content");
+
+    const tools = createSdwMemoryTools({
+      adapter,
+      auditLog: { appendCritical: async () => undefined } as unknown as AuditLog,
+    });
+    const memoryGet = tools.find((tool) => tool.name === "memory_get");
+    if (memoryGet === undefined) throw new Error("memory_get tool missing");
+    const result = await memoryGet.handler({ passage_id: "frame-size" });
+
+    expect(observedFrameBytes).toBe(Buffer.byteLength(JSON.stringify(result), "utf8"));
   });
 
   it("abort during the corpus lock wait refuses without writing", async () => {
@@ -329,12 +371,14 @@ describe("Hermes bridge SDW memory adapter seam", () => {
     expect(storage.parked).toBe(1);
   });
 
-  it("bridge test seam symbols are absent from product source", async () => {
+  it("bridge test double symbols are absent from product source", async () => {
     const files = await listSourceFiles(join(process.cwd(), "src"));
     const hits: string[] = [];
     for (const file of files) {
       const text = await readFile(file, "utf8");
-      if (text.includes(BRIDGE_TEST_SEAM_SYMBOL)) hits.push(file);
+      for (const symbol of BRIDGE_TEST_DOUBLE_SYMBOLS) {
+        if (text.includes(symbol)) hits.push(`${file}:${symbol}`);
+      }
     }
     expect(hits).toEqual([]);
   });

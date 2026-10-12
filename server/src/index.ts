@@ -130,7 +130,10 @@ import {
 import { createSdwTools } from "./sdw/tools.js";
 import { SdwMemoryProvenanceMigration } from "./sdw/memory-provenance-migration.js";
 import { createSdwMemoryProvenanceMigrationTools } from "./sdw/memory-provenance-migration-tools.js";
-import { MemoryProvenanceBadSignerStore } from "./sdw/memory-provenance-bad-signers.js";
+import {
+  MemoryProvenanceBadSignerStore,
+  type MemoryProvenanceBadSignerAuthority,
+} from "./sdw/memory-provenance-bad-signers.js";
 import { createMemoryProvenanceBadSignerTools } from "./sdw/memory-provenance-bad-signer-tools.js";
 import { MemoryProvenanceSignerPruner } from "./sdw/memory-provenance-signer-prune.js";
 import { createMemoryProvenanceSignerPruneTool } from "./sdw/memory-provenance-signer-prune-tools.js";
@@ -238,18 +241,39 @@ type CreateSdwMemoryAdapterBaseOptions = Pick<
   | "resolvePrimarySigningHandle"
   | "resolveSignerPublicKey"
   | "resolveMemoryIntegrityState"
-  | "badSignerAuthority"
 >;
 
 export type CreateSdwMemoryAdapterOptions = CreateSdwMemoryAdapterBaseOptions & (
-  | { readonly mode: "standard" }
-  | { readonly mode: "hermes-bridge"; readonly commitCheck: HermesBridgeCommitCheck }
+  | {
+      readonly mode: "standard";
+      readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
+    }
+  | {
+      readonly mode: "hermes-bridge";
+      readonly commitCheck: HermesBridgeCommitCheck;
+      readonly badSignerAuthority: MemoryProvenanceBadSignerAuthority;
+    }
 );
 
 export function createSdwMemoryAdapter(
   options: CreateSdwMemoryAdapterOptions,
 ): SdwMemoryBackendAdapter {
+  if (options.mode === "hermes-bridge") {
+    return new SdwMemoryBackendAdapter({
+      mode: "hermes-bridge",
+      storage: options.storage,
+      masterKey: options.masterKey,
+      fortressId: options.fortressId,
+      ownerRef: options.ownerRef,
+      resolvePrimarySigningHandle: options.resolvePrimarySigningHandle,
+      resolveSignerPublicKey: options.resolveSignerPublicKey,
+      resolveMemoryIntegrityState: options.resolveMemoryIntegrityState,
+      commitCheck: options.commitCheck,
+      badSignerAuthority: options.badSignerAuthority,
+    });
+  }
   return new SdwMemoryBackendAdapter({
+    mode: "standard",
     storage: options.storage,
     masterKey: options.masterKey,
     fortressId: options.fortressId,
@@ -258,9 +282,6 @@ export function createSdwMemoryAdapter(
     resolveSignerPublicKey: options.resolveSignerPublicKey,
     resolveMemoryIntegrityState: options.resolveMemoryIntegrityState,
     badSignerAuthority: options.badSignerAuthority,
-    ...(options.mode === "hermes-bridge"
-      ? { mode: "hermes-bridge" as const, commitCheck: options.commitCheck }
-      : { mode: "standard" as const }),
   });
 }
 

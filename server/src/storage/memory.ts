@@ -16,6 +16,7 @@ import type {
 } from "./cross-process-lock.js";
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
+import { SdwValidationError } from "../sdw/errors.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "./interface.js";
 import { assertStorageNamespacePathComponent } from "./namespace-component.js";
 
@@ -40,9 +41,12 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = predecessor.catch(() => undefined).then(() => gate);
     this.namespaceLockTails.set(identity, tail);
-    await waitForNamespaceLockTurn(predecessor.catch(() => undefined), options.abortSignal);
     const controller = new AbortController();
     try {
+      // The tail is published before waiting so later callers chain behind this
+      // waiter; abort still releases the gate so that chain cannot wedge.
+      await waitForNamespaceLockTurn(predecessor.catch(() => undefined), options.abortSignal);
+      assertNamespaceLockWaitNotAborted(options.abortSignal);
       return await operation({ signal: controller.signal, assertHeld: () => undefined });
     } finally {
       release();
@@ -194,17 +198,36 @@ async function waitForNamespaceLockTurn(
   predecessor: Promise<void>,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  if (signal?.aborted === true) throw new Error("namespace lock wait aborted");
+  assertNamespaceLockWaitNotAborted(signal);
   if (signal === undefined) {
     await predecessor;
     return;
   }
-  await Promise.race([
-    predecessor,
-    new Promise<never>((_resolve, reject) => {
-      const abort = () => reject(new Error("namespace lock wait aborted"));
-      signal.addEventListener("abort", abort, { once: true });
-      void predecessor.finally(() => signal.removeEventListener("abort", abort));
-    }),
-  ]);
+  let abort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      predecessor,
+      new Promise<never>((_resolve, reject) => {
+        abort = () => reject(namespaceLockAbortedError());
+        signal.addEventListener("abort", abort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (abort !== undefined) signal.removeEventListener("abort", abort);
+  }
+  // A grant that races an abort is still refused; no caller may enter the
+  // namespace critical section on a stale bridge shutdown signal.
+  assertNamespaceLockWaitNotAborted(signal);
+}
+
+function assertNamespaceLockWaitNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  throw namespaceLockAbortedError();
+}
+
+function namespaceLockAbortedError(): SdwValidationError {
+  return new SdwValidationError(
+    "operation_aborted",
+    "namespace lock wait aborted",
+  );
 }

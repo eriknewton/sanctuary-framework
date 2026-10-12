@@ -181,6 +181,7 @@ export type CrossProcessLockErrorKind =
   | "capability"
   | "contention"
   | "holder-lost"
+  | "operation_aborted"
   | "poisoned"
   | "io";
 
@@ -542,14 +543,18 @@ export async function withRequiredCrossProcessLock<T>(
   options: CrossProcessLockOptions = {},
 ): Promise<T> {
   const explicit = asNamespaceLockCapabilities(storage);
-  if (!explicit) {
+  if (explicit) {
+    return explicit.withNamespaceLock(namespace, lockFileName, operation, options);
+  }
+  const capabilities = asFilesystemCapabilities(storage);
+  if (!capabilities) {
     throw new CrossProcessLockError(
-      "storage backend does not expose the required namespace-lock capability; " +
-        "use a backend or decorator that explicitly implements withNamespaceLock",
+      "storage backend does not expose the required namespace-lock or filesystem lock capability; " +
+        "use a backend or decorator that explicitly implements a lock primitive",
       "capability",
     );
   }
-  return explicit.withNamespaceLock(namespace, lockFileName, operation, options);
+  return withPathLock(capabilities.namespacePath(namespace), lockFileName, operation, options);
 }
 
 /**
@@ -605,6 +610,13 @@ export async function withPathLock<T>(
     assertLockWaitNotAborted(options.abortSignal, lockPath);
     try {
       const handle = await open(lockPath, "wx", 0o600);
+      if (options.abortSignal?.aborted === true) {
+        // The lockfile has become visible, so an abort after O_EXCL acquire must
+        // remove it before refusing or every later bridge writer would see a
+        // stale holder created by this process.
+        await closeAndRemoveAbortedPathLock(handle, lockPath);
+        assertLockWaitNotAborted(options.abortSignal, lockPath);
+      }
       // MEDIUM (Codex gate, 2026-08-22 / 2026-08-23): the O_EXCL create
       // SUCCEEDED at this point, so this process (uniquely) owns the lock
       // file - a failure writing/syncing its metadata, OR a failure in
@@ -696,7 +708,7 @@ export async function withPathLock<T>(
             `crashed while holding it; clear it with: rm '${lockPath}'`,
         );
       }
-      await sleep(retryMs);
+      await sleepLockRetry(retryMs, options.abortSignal, lockPath);
     }
   }
 
@@ -711,8 +723,62 @@ function assertLockWaitNotAborted(signal: AbortSignal | undefined, lockPath: str
   if (signal?.aborted !== true) return;
   throw new CrossProcessLockError(
     `cross-process lock wait aborted before acquiring ${lockPath}`,
-    "contention",
+    "operation_aborted",
   );
+}
+
+async function closeAndRemoveAbortedPathLock(
+  handle: Awaited<ReturnType<typeof open>>,
+  lockPath: string,
+): Promise<void> {
+  let closeErr: unknown;
+  try {
+    await handle.close();
+  } catch (err) {
+    closeErr = err;
+  }
+  let unlinkErr: unknown;
+  try {
+    await rm(lockPath, { force: true });
+  } catch (err) {
+    unlinkErr = err;
+  }
+  if (closeErr !== undefined || unlinkErr !== undefined) {
+    throw new CrossProcessLockError(
+      `cross-process lock wait aborted after acquiring ${lockPath}, but cleanup failed ` +
+        `(close: ${closeErr === undefined ? "ok" : errorMessage(closeErr)}; ` +
+        `remove: ${unlinkErr === undefined ? "ok" : errorMessage(unlinkErr)})`,
+      "operation_aborted",
+    );
+  }
+}
+
+async function sleepLockRetry(
+  ms: number,
+  signal: AbortSignal | undefined,
+  lockPath: string,
+): Promise<void> {
+  if (signal === undefined) {
+    await sleep(ms);
+    return;
+  }
+  assertLockWaitNotAborted(signal, lockPath);
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timer = setTimeout(resolve, ms);
+      abort = () => reject(new CrossProcessLockError(
+        `cross-process lock wait aborted before acquiring ${lockPath}`,
+        "operation_aborted",
+      ));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (abort !== undefined) signal.removeEventListener("abort", abort);
+  }
+  assertLockWaitNotAborted(signal, lockPath);
 }
 
 interface KernelDirectoryIdentity {

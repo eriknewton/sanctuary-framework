@@ -882,7 +882,7 @@ describe("withCrossProcessLock", () => {
     controller.abort();
 
     await expect(contender).rejects.toMatchObject({
-      kind: "contention",
+      kind: "operation_aborted",
       message: expect.stringContaining("wait aborted"),
     });
     expect(ran).toBe(false);
