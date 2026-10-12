@@ -23,9 +23,9 @@ import {
 } from "../../src/cognitive/state-store.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { encrypt } from "../../src/core/encryption.js";
-import { createIdentity, sign } from "../../src/core/identity.js";
+import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
-import { hashToString } from "../../src/core/hashing.js";
+import { hashToString, hmacSha256 } from "../../src/core/hashing.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
@@ -90,6 +90,14 @@ interface DecodedExportBundle {
 }
 
 const HMAC_SHA256_BYTE_LENGTH = 32;
+// Must match the state export bundle integrity constants in src/cognitive/state-store.ts.
+const STATE_EXPORT_BUNDLE_MAC_PURPOSE = "state-export-bundle-mac-v1";
+const STATE_EXPORT_BUNDLE_MAC_DOMAIN = "sanctuary.state-export-bundle.v1\n";
+const STATE_EXPORT_BUNDLE_MAC_COVERAGE =
+  "sanctuary-v1-body-and-completeness-manifest";
+// Must match the state export schema constants in src/cognitive/state-store.ts.
+const STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION = 1;
+const STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION = 1;
 
 const tempDirs: string[] = [];
 
@@ -236,6 +244,71 @@ function decodeBundle(bundle: string): DecodedExportBundle {
 
 function encodeBundle(bundle: DecodedExportBundle): string {
   return toBase64url(stringToBytes(JSON.stringify(bundle)));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    const item = (value as Record<string, unknown>)[key];
+    if (item !== undefined) out[key] = canonicalize(item);
+  }
+  return out;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function refreshStateBundleCompleteness(
+  bundle: DecodedExportBundle,
+  masterKey: Uint8Array,
+): void {
+  const namespaces = Object.keys(bundle.data).sort();
+  const namespaceItems: Record<string, { item_count: number; content_sha256: string }> = {};
+  let totalKeys = 0;
+  for (const namespace of namespaces) {
+    const entries = [...(bundle.data[namespace] ?? [])].sort((a, b) =>
+      a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+    );
+    namespaceItems[namespace] = {
+      item_count: entries.length,
+      content_sha256: hashToString(stringToBytes(canonicalJson(entries))),
+    };
+    totalKeys += entries.length;
+  }
+  bundle.namespaces = namespaces;
+  bundle.completeness_manifest = {
+    schema_version: STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION,
+    format: "sanctuary-v1",
+    exported_at: (bundle as unknown as Record<string, unknown>).exported_at as string,
+    namespaces,
+    namespace_count: namespaces.length,
+    total_keys: totalKeys,
+    namespace_items: namespaceItems,
+  };
+  const macPayload: Record<string, unknown> = {
+    sanctuary_export_version: (bundle as unknown as Record<string, unknown>).sanctuary_export_version,
+    format: (bundle as unknown as Record<string, unknown>).format,
+    exported_at: (bundle as unknown as Record<string, unknown>).exported_at,
+    namespaces: bundle.namespaces,
+    data: bundle.data,
+    completeness_manifest: bundle.completeness_manifest,
+  };
+  const facadeHiddenMarkers = (bundle as unknown as Record<string, unknown>).facade_hidden_markers;
+  if (facadeHiddenMarkers !== undefined) {
+    macPayload.facade_hidden_markers = facadeHiddenMarkers;
+  }
+  bundle.bundle_integrity = {
+    schema_version: STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION,
+    algo: "HMAC-SHA256",
+    coverage: STATE_EXPORT_BUNDLE_MAC_COVERAGE,
+    mac: toBase64url(hmacSha256(
+      derivePurposeKey(masterKey, STATE_EXPORT_BUNDLE_MAC_PURPOSE),
+      stringToBytes(STATE_EXPORT_BUNDLE_MAC_DOMAIN + canonicalJson(macPayload)),
+    )),
+  };
 }
 
 function stripCompleteness(bundle: string): string {
@@ -1138,6 +1211,75 @@ describe("restoreCheckpoint", () => {
     );
     expect(deleteSpy).not.toHaveBeenCalled();
     expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
+  it("refuses checkpoint entries unless one rotation-chain key verifies the full signed envelope", async () => {
+    const fixture = await makeFixture();
+    const { updatedIdentity } = rotateKeys(
+      fixture.identity.storedIdentity,
+      fixture.identityEncKey,
+      "warm checkpoint restore paired-signature test",
+    );
+    const sourceStorage = new MemoryStorage();
+    const sourceStore = new RealStateStore(sourceStorage, fixture.masterKey);
+    await sourceStore.write(
+      "mem",
+      "paired",
+      "checkpoint",
+      updatedIdentity.identity_id,
+      updatedIdentity.encrypted_private_key,
+      fixture.identityEncKey,
+    );
+    const decoded = decodeBundle((await sourceStore.exportNamespaces(["mem"])).bundle);
+    const entry = decoded.data.mem?.find((item) => item.key === "paired")?.entry;
+    if (!entry) throw new Error("missing checkpoint entry");
+    entry.sig = toBase64url(sign(
+      fromBase64url((entry.payload as { ct: string }).ct),
+      fixture.identity.storedIdentity.encrypted_private_key,
+      fixture.identityEncKey,
+    ));
+    refreshStateBundleCompleteness(decoded, fixture.masterKey);
+    const checkpointId = await createCheckpointFromBundle(
+      fixture,
+      encodeBundle(decoded),
+      "2026-08-03T12:12:00.000Z",
+    );
+    await writeEntry(fixture, "mem", "post", "post-checkpoint");
+    const deleteSpy = vi.spyOn(fixture.stateStore, "delete");
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId,
+        assessParked: parkedClaim,
+        publicKeyResolver: (kid) =>
+          kid === updatedIdentity.identity_id
+            ? resolveAuthenticatedIdentityWriterPublicKeys(updatedIdentity).map(
+                (key) => key.publicKey,
+              )
+            : null,
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    expect(thrown).toMatchObject({
+      name: "CheckpointRestoreSkippedEntriesError",
+      reason: "checkpoint_skipped_entries_refused",
+    });
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect((await exportEntries(fixture.stateStore)).has("mem/post")).toBe(true);
     const forensic = (await fixture.checkpointStore.list()).find(
       (record) => record.source === "forensic_quarantine",
     );

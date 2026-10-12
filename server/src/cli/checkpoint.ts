@@ -17,7 +17,7 @@ import { Writable } from "node:stream";
 import { promisify } from "node:util";
 
 import {
-  resolveAuthenticatedIdentityWriterPublicKeys,
+  createStateImportWriterKeyResolver,
   StateStore,
 } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
@@ -545,14 +545,9 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
-  const publicKeyResolver = (kid: string): Uint8Array[] | null => {
-    const identity = boot.identityManager.get(kid);
-    if (!identity) return null;
-    // INVARIANT: checkpoint restore verifies imported entries with the same
-    // authenticated current-plus-rotation-chain key set as state_read.
-    const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
-    return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
-  };
+  const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
+    boot.identityManager.get(kid)
+  );
 
   // Check before approval auditing writes reserved state; restore repeats this
   // read-only preflight at its own boundary before any reconstruction writes.

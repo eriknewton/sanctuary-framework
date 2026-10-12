@@ -19,7 +19,10 @@ import {
   StateStore,
   isStateVersionFloorRefusal,
 } from "../../src/cognitive/state-store.js";
-import { type StoredIdentity } from "../../src/core/identity.js";
+import {
+  sign as identitySign,
+  type StoredIdentity,
+} from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -186,6 +189,31 @@ function stripCompleteness(bundleBase64: string): string {
   delete decoded.completeness_manifest;
   delete decoded.bundle_integrity;
   return encodeBundle(decoded);
+}
+
+function resignLegacyCiphertextWithIdentity(
+  entry: unknown,
+  identity: StoredIdentity,
+  identityEncKey: Uint8Array
+): void {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("missing state entry");
+  }
+  const payload = (entry as Record<string, unknown>).payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("missing state payload");
+  }
+  const ciphertext = (payload as Record<string, unknown>).ct;
+  if (typeof ciphertext !== "string") {
+    throw new Error("missing state ciphertext");
+  }
+  (entry as Record<string, unknown>).sig = toBase64url(
+    identitySign(
+      fromBase64url(ciphertext),
+      identity.encrypted_private_key,
+      identityEncKey
+    )
+  );
 }
 
 function duplicateFirstEntry(bundleBase64: string): string {
@@ -465,6 +493,50 @@ describe("state_import version floor tool path", () => {
       expect(imported.skipped_unknown_kid).toBe(1);
       expect(imported.skipped_invalid_sig).toBe(0);
       expect(await rig.storage.read("notes", "broken-chain-entry")).toBeNull();
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("refuses an imported entry unless one rotation-chain key verifies the full signed envelope", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const originalIdentity = rig.identityManager.get(identityId);
+      if (!originalIdentity) throw new Error("missing identity");
+      const rotated = await callTool(rig.client, "identity_rotate", {
+        identity_id: identityId,
+        reason: "state import paired-signature test",
+      });
+      expect(rotated.identity_id).toBe(identityId);
+      await writeValue(rig.client, identityId, "paired-signature", "new-key");
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      const decoded = decodeBundle(exported.bundle as string);
+      const data = decoded.data as Record<string, Array<{ key: string; entry: unknown }>>;
+      const item = data.notes?.find((entry) => entry.key === "paired-signature");
+      if (!item) throw new Error("missing paired-signature entry");
+      resignLegacyCiphertextWithIdentity(
+        item.entry,
+        originalIdentity,
+        rig.identityEncKey
+      );
+      delete decoded.completeness_manifest;
+      delete decoded.bundle_integrity;
+      await rig.stateStore.delete("notes", "paired-signature");
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: encodeBundle(decoded),
+        conflict_resolution: "overwrite",
+        allow_unverified_legacy: true,
+      });
+
+      expect(imported.imported_keys).toBe(0);
+      expect(imported.skipped_keys).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(1);
+      expect(imported.skipped_unknown_kid).toBe(0);
+      expect(await rig.storage.read("notes", "paired-signature")).toBeNull();
     } finally {
       await rig.close();
     }
@@ -798,7 +870,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
@@ -836,7 +908,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
@@ -870,7 +942,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null,
           { allowUnverifiedLegacy: true }
         )
@@ -928,7 +1000,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).resolves.toMatchObject({ imported_keys: 2 });
@@ -978,7 +1050,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).resolves.toMatchObject({ imported_keys: 1 });
@@ -989,7 +1061,7 @@ describe("state_import version floor tool path", () => {
           "overwrite",
           (kid) =>
             kid === identity.identity_id
-              ? fromBase64url(identity.public_key)
+              ? [fromBase64url(identity.public_key)]
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });

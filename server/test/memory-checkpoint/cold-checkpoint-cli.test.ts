@@ -291,6 +291,39 @@ describe("cold checkpoint CLI", () => {
     expect(await f.storage.read("gamma", "note")).toBeNull();
   });
 
+  it("refuses a cold restore when the local rotation chain is not verified", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "cold checkpoint restore broken-chain test",
+    );
+    const [firstHop] = updatedIdentity.rotation_history;
+    if (!firstHop) throw new Error("missing rotation hop");
+    await persistStoredIdentity(f.storage, f.masterKey, {
+      ...updatedIdentity,
+      rotation_history: [
+        {
+          ...firstHop,
+          rotation_event: toBase64url(stringToBytes("{}")),
+        },
+      ],
+    });
+    await f.stateStore.delete("alpha", "note");
+    await f.write("gamma", "post-checkpoint");
+    const before = withoutAuditAndPolicy(await durableBytes(f.path));
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain("signed by an identity this fortress does not hold");
+    expect(result.stdout).not.toContain("Checkpoint restored:");
+    expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(before);
+  });
+
   it.each(["read failure", "invalid MAC"])("refuses a cold restore on anchor %s without changing durable bytes", async (failure) => {
     const f = await fixture();
     await f.call(["create"]);

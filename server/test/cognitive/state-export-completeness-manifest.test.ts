@@ -132,8 +132,8 @@ function createFixture() {
     "recovery-key"
   );
   const publicKey = fromBase64url(identity.storedIdentity.public_key);
-  const resolver = (kid: string): Uint8Array | null =>
-    kid === identity.storedIdentity.identity_id ? publicKey : null;
+  const resolver = (kid: string): Uint8Array[] | null =>
+    kid === identity.storedIdentity.identity_id ? [publicKey] : null;
 
   return {
     masterKey,

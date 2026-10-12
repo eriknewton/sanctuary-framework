@@ -11,9 +11,9 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
+  createStateImportWriterKeyResolver,
   getStateImportPartialApplyDetails,
   getReservedNamespaceViolation,
-  resolveAuthenticatedIdentityWriterPublicKeys,
   StateStore,
   StateVerificationError,
   UNATTRIBUTED_DISCLOSURE_NOTICE,
@@ -2309,14 +2309,9 @@ export function createCognitiveTools(
           return denyNamespaceAccess("state_import", "state_import");
         }
 
-        // INVARIANT: import verification accepts only keys authenticated by the
-        // held identity record and its signed rotation chain, matching state_read.
-        const publicKeyResolver = (kid: string): Uint8Array[] | null => {
-          const identity = identityMgr.get(kid);
-          if (!identity) return null;
-          const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
-          return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
-        };
+        const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
+          identityMgr.get(kid)
+        );
 
         try {
           // Storage-name refusal intentionally precedes version-floor planning:
