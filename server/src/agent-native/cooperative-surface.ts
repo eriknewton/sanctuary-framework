@@ -7,7 +7,13 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
-import { COOPERATIVE_CAPABILITIES } from "./capabilities-catalog.js";
+import {
+  COOPERATIVE_CAPABILITIES,
+  EVALUATE_RELATED_TOOLS,
+  EVALUATE_ROUTES,
+  type EvaluateQuestion,
+  type EvaluateRouteToolName,
+} from "./capabilities-catalog.js";
 import {
   ApprovalProofStore,
   approvalEnvelopeHash,
@@ -363,9 +369,14 @@ export function createAgentNativeCooperativeTools(
 
   function classifyIntent(intent: string): {
     safety_class: "ordinary" | "sensitive" | "gated";
-    tool: CooperativeToolName | null;
+    /** Present only on the evaluate state; the ordinary/sensitive/gated routes are unchanged. */
+    intent_class?: "evaluate";
+    evaluate_question?: EvaluateQuestion;
+    tool: CooperativeToolName | EvaluateRouteToolName | null;
     example: Record<string, unknown> | null;
     why_sanctuary: string;
+    guidance?: string;
+    related_tools?: typeof EVALUATE_RELATED_TOOLS;
     remediation_class?: "request_review" | "try_lower_scope" | "wait";
     probe_key?: string;
   } {
@@ -496,6 +507,29 @@ export function createAgentNativeCooperativeTools(
         tool: COOPERATIVE_TOOL_NAMES.recall,
         example: { key: "user_tz" },
         why_sanctuary: "Recall preserves verification status in the response.",
+      };
+    }
+    // state_EVALUATE: an agent deciding whether to install or keep this socket
+    // asks what it protects, what the bounds are, which platforms, how to
+    // verify, which tier waits on a human, or how to uninstall. Checked AFTER
+    // the gated and ordinary routes, so a gated needle still wins and the
+    // remember/recall routes are byte-identical to before this state existed:
+    // only an intent that previously fell to the ambiguous fallback can land
+    // here. Matched on the lower-cased intent only, not the decoded haystack:
+    // the decoded variants exist to catch obfuscated gated requests, and an
+    // evaluate question has nothing to obfuscate. Routing table and tool-name
+    // pins: EVALUATE_ROUTES in capabilities-catalog.ts.
+    const evaluateRoute = EVALUATE_ROUTES.find((route) => route.matches.test(lower));
+    if (evaluateRoute) {
+      return {
+        safety_class: "ordinary",
+        intent_class: "evaluate",
+        evaluate_question: evaluateRoute.question,
+        tool: evaluateRoute.tool,
+        example: evaluateRoute.example,
+        why_sanctuary: evaluateRoute.why_sanctuary,
+        guidance: evaluateRoute.guidance,
+        related_tools: EVALUATE_RELATED_TOOLS,
       };
     }
     return {
@@ -784,7 +818,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
+      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a read-only posture tool or the CLI command that answers, a guidance string copied from the README bounds, and the related read-only tools with their tiers. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -797,7 +831,10 @@ export function createAgentNativeCooperativeTools(
           await recordHelpProbe(args.intent as string, classified.probe_key, classified.safety_class);
           const auditRef = await audit("sanctuary_help", {
             safety_class: classified.safety_class,
-            runnable_example: classified.safety_class === "ordinary",
+            // An evaluate route with no tool (uninstall) has no example to run;
+            // every pre-existing ordinary route carries one, so this is
+            // unchanged for them.
+            runnable_example: classified.safety_class === "ordinary" && classified.example !== null,
           });
           return toolResult({ ...classified, probe_key: undefined, audit_ref: auditRef });
         } catch {

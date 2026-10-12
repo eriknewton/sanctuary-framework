@@ -331,7 +331,8 @@ export function createErc8004ResolveTools(
         "registry_confirmation plus assurance=registry_confirmed only on an " +
         "owner match. Unavailable RPC, denied egress, or owner mismatch remains " +
         "unconfirmed and never becomes a false confirmed claim. Never returns " +
-        "key material.",
+        "key material." +
+        " Tier 1 under the default policy: requires operator approval before the handler runs.",
       inputSchema: {
         type: "object",
         properties: {

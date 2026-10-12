@@ -26,8 +26,9 @@ export function createPrincipalPolicyTools(
     {
       name: "principal_policy_view",
       description:
-        "View the current Principal Policy — the human-controlled rules " +
-        "governing what operations require approval. Read-only.",
+        "View the current Principal Policy: the human-controlled rules " +
+        "governing what operations require approval. Read-only." +
+        " Tier 1 and non-relaxable: requires operator approval on every call.",
       inputSchema: {
         type: "object",
         properties: {
@@ -71,9 +72,10 @@ export function createPrincipalPolicyTools(
     {
       name: "principal_baseline_view",
       description:
-        "View the current behavioral baseline — the session profile used " +
+        "View the current behavioral baseline: the session profile used " +
         "for anomaly detection. Shows known namespaces, counterparties, " +
-        "and tool call counts. Read-only.",
+        "and tool call counts. Read-only." +
+        " Tier 1 and non-relaxable: requires operator approval on every call.",
       inputSchema: {
         type: "object",
         properties: {},

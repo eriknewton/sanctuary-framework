@@ -607,7 +607,7 @@ function buildSdwTools(
       "no transaction primitive today, so on that backend this tool refuses; only " +
       "the source key reference `this-fortress` (a bundle this fortress exported) " +
       "resolves, since cross-fortress source key material is not yet " +
-      "operator-configurable. Tier 1.",
+      "operator-configurable. Tier 1: requires operator approval.",
     tool_class: "write",
     inputSchema: {
       type: "object",

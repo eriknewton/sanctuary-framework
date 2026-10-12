@@ -87,7 +87,8 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "A call naming allow_files always requires operator approval, even if a " +
     "custom policy relaxed memory_ingest itself. This does not sync, watch, or replace " +
     "the harness write path, and memory later sent to a model vendor is " +
-    "exposed to that vendor at inference.",
+    "exposed to that vendor at inference." +
+    " Tier 1: requires operator approval.",
   memory_emit:
     "Manually emit Claude Code or Codex memory files from the SDW vault into an " +
     "operator-named output directory. Existing memory files are never " +
@@ -95,7 +96,8 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "tree cannot be re-ingested as that harness's memory directory. Emitted " +
     "files are plaintext for the harness; " +
     "this does not sync or write back to the source memory directory, and " +
-    "memory later sent to a model vendor is exposed to that vendor at inference.",
+    "memory later sent to a model vendor is exposed to that vendor at inference." +
+    " Tier 1: requires operator approval.",
   memory_transcode:
     "Manually project one already-mirrored Claude Code or Codex memory snapshot " +
     "from the encrypted SDW vault into the other harness format. The output is " +
@@ -103,13 +105,15 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "versioned encrypted archive returned as archive_id, not the projection. " +
     "Existing output files are never overwritten. This does not sync, watch, or " +
     "replace either harness write path, and memory later sent to a model vendor " +
-    "is exposed to that vendor at inference.",
+    "is exposed to that vendor at inference." +
+    " Tier 1: requires operator approval.",
   memory_transcode_restore:
     "Manually restore the exact source files from a completed encrypted Sanctuary " +
     "memory transcode archive into an empty operator-named directory. Restored " +
     "files are plaintext and existing files are never overwritten. This does not " +
     "sync, watch, or write back to a live harness directory, and memory later sent " +
-    "to a model vendor is exposed to that vendor at inference.",
+    "to a model vendor is exposed to that vendor at inference." +
+    " Tier 1: requires operator approval.",
 } as const;
 
 export interface MemoryFileApprovalContext {

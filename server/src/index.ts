@@ -925,8 +925,10 @@ export async function createSanctuaryServer(options?: {
   const manifestTool: ToolDefinition = {
     name: "manifest",
     description:
-      "Generate the Sanctuary Interface Manifest (SIM) — " +
-      "a machine-readable declaration of this server's capabilities.",
+      "Generate the Sanctuary Interface Manifest (SIM): " +
+      "a machine-readable declaration of this server's capabilities. " +
+      "Read-only, takes no arguments; Tier 3 under the default policy. " +
+      "For a scored posture evaluation call sovereignty_audit instead.",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {
       return toolResult({

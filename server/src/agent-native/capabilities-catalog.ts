@@ -46,8 +46,8 @@ export interface CapabilityEntry {
 export const COOPERATIVE_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     tool: COOPERATIVE_TOOL_NAMES.help,
-    does: "Classifies a free-text intent and returns which Sanctuary tool to use, with a runnable example for ordinary requests.",
-    when: "You are unsure which tool fits. Ask here first before acting.",
+    does: "Classifies a free-text intent and returns which Sanctuary tool to use, with a runnable example for ordinary requests; evaluation questions (what this protects, the bounds, which platforms, how to verify, how to uninstall) route to the read-only posture tools or to the CLI command that answers.",
+    when: "You are unsure which tool fits, or you are deciding whether to install or keep this server. Ask here first before acting.",
   },
   {
     tool: COOPERATIVE_TOOL_NAMES.whoAmI,
@@ -97,12 +97,197 @@ if (catalogToolNames.join("\0") !== CATALOG_COOPERATIVE_TOOL_NAMES.join("\0")) {
 }
 
 /**
+ * Canonical URL of the Assurance Matrix, the evidence ledger every capability
+ * claim in this repository traces to. Must match the `ASSURANCE_MATRIX.md`
+ * link target in the root README.md (the file at the repository root on
+ * `main`).
+ */
+export const ASSURANCE_MATRIX_URL =
+  "https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md";
+
+/**
+ * The bounds an evaluating agent must hear before it believes anything else
+ * this server says about itself: the platforms the wall is proven on, the
+ * approval tiers, what is never claimed, and where the evidence lives.
+ *
+ * Must match README.md "What is proven, and what is not" (the wall row, the
+ * gate row) and the Assurance Matrix rows they cite. The wording is COPIED
+ * from the README bound, never paraphrased into a stronger claim: a sentence
+ * here may say less than the README, never more. Every enforcement sentence
+ * carries "on a patched host" because the drills that proved it ran on a
+ * patched host and nothing here extends the proof beyond that.
+ */
+export const SERVER_BOUNDS = {
+  platforms:
+    "The outbound wall is proven on macOS on a patched host (a signed operator policy with a per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail) and on Linux on Ubuntu 24.04 x86-64 only, on a patched host; every other distribution or architecture is unproven, and Windows enforcement is roadmapped, not shipped.",
+  tiers:
+    "Approval runs in three tiers: Tier 3 auto-allows with an audit record, Tier 2 asks a human on anomaly, and Tier 1 always waits for a human.",
+  neverClaimed:
+    "Sanctuary governs what leaves the machine; it claims no filesystem or process isolation of the agent and no per-flow content audit.",
+  evidence:
+    `Every claim, its platform and its evidence is a row in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
+} as const;
+
+/** The four bounds sentences as one paragraph, in the order an agent needs them. */
+export function buildBoundsParagraph(): string {
+  return [
+    SERVER_BOUNDS.platforms,
+    SERVER_BOUNDS.tiers,
+    SERVER_BOUNDS.neverClaimed,
+    SERVER_BOUNDS.evidence,
+  ].join(" ");
+}
+
+/**
+ * The read-only tools an evaluating agent is routed to by `sanctuary_help`.
+ *
+ * These are wire tool names registered outside this module, so they are
+ * pinned here rather than imported: must match the `name` literal of
+ * `monitor_health` in `server/src/index.ts`, of `sovereignty_audit` in
+ * `server/src/audit/tools.ts`, and of `sanctuary_policy_status` in
+ * `server/src/sanctuary-tools.ts`; `test/agent-native/first-class-surfacing.test.ts`
+ * boots the real server and fails if any of them stops being registered.
+ */
+export const EVALUATE_ROUTE_TOOLS = {
+  activeProtections: COOPERATIVE_TOOL_NAMES.activeProtections,
+  monitorHealth: "monitor_health",
+  sovereigntyAudit: "sovereignty_audit",
+  policyStatus: "sanctuary_policy_status",
+} as const;
+
+export type EvaluateRouteToolName =
+  (typeof EVALUATE_ROUTE_TOOLS)[keyof typeof EVALUATE_ROUTE_TOOLS];
+
+/**
+ * What each evaluate-route tool answers and the tier it runs at under the
+ * default policy. Tier labels must match `DEFAULT_POLICY` in
+ * `server/src/principal-policy/loader.ts`: the three posture reads are in
+ * `tier3_always_allow`; `sanctuary_policy_status` is a forced Tier 1 read
+ * (reading the policy is never unattended). The first-class-surfacing test
+ * asserts this table against the policy so a re-tiering cannot leave it stale.
+ */
+export const EVALUATE_RELATED_TOOLS = [
+  {
+    tool: EVALUATE_ROUTE_TOOLS.activeProtections,
+    tier: "Tier 3 (auto-allowed with an audit record)",
+    use_for: "the guarantees in force for this session, reported only when active",
+  },
+  {
+    tool: EVALUATE_ROUTE_TOOLS.monitorHealth,
+    tier: "Tier 3 (auto-allowed with an audit record)",
+    use_for: "this instance's health, wall status and configured-but-unverified posture",
+  },
+  {
+    tool: EVALUATE_ROUTE_TOOLS.sovereigntyAudit,
+    tier: "Tier 3 (auto-allowed with an audit record)",
+    use_for: "a scored gap analysis of the local sovereignty posture",
+  },
+  {
+    tool: EVALUATE_ROUTE_TOOLS.policyStatus,
+    tier: "Tier 1 (waits for operator approval on every call)",
+    use_for: "the active Tier 1 and Tier 3 operation lists",
+  },
+] as const;
+
+/**
+ * The two evaluate questions no MCP tool answers: verification runs end to
+ * end on the CLI, and removal is deliberately not an MCP tool. Must match the
+ * `doctor` and `uninstall` verbs in `server/src/cli/subcommands.ts`.
+ */
+export const EVALUATE_CLI_GUIDANCE = {
+  verify:
+    "On the CLI, run `sanctuary doctor --json` for a machine-readable end-to-end check of this install; in-session, monitor_health reports what this server can see of its own posture.",
+  uninstall:
+    "On the CLI, run `sanctuary uninstall`; there is no MCP tool for removal.",
+} as const;
+
+/** The named evaluate states `sanctuary_help` can land in; first match wins. */
+export type EvaluateQuestion =
+  | "uninstall"
+  | "verify"
+  | "tiers"
+  | "protections"
+  | "bounds"
+  | "install_decision";
+
+export interface EvaluateRoute {
+  readonly question: EvaluateQuestion;
+  /** Word-boundary needles over the lower-cased intent; never the `g` flag (test() would keep state). */
+  readonly matches: RegExp;
+  readonly tool: EvaluateRouteToolName | null;
+  readonly example: Record<string, unknown> | null;
+  readonly why_sanctuary: string;
+  readonly guidance: string;
+}
+
+/**
+ * Evaluate-intent routing table, consumed by `classifyIntent` in
+ * `cooperative-surface.ts`. Ordered from the most specific question to the
+ * broadest so "how do I verify the install" lands on `verify`, not on
+ * `install_decision`. Every route is read-only or CLI guidance: nothing here
+ * can mutate state, so the help tool may return a runnable example for it.
+ */
+export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
+  {
+    question: "uninstall",
+    matches: /\b(uninstall|unwrap|tear\s*down|teardown)\b/,
+    tool: null,
+    example: null,
+    why_sanctuary: "Removal is an operator action on the CLI, never an agent-callable tool.",
+    guidance: EVALUATE_CLI_GUIDANCE.uninstall,
+  },
+  {
+    question: "verify",
+    matches: /\b(verify|verified|verification|working|healthy|health|doctor)\b|\bcheck\b.*\binstall/,
+    tool: EVALUATE_ROUTE_TOOLS.monitorHealth,
+    example: {},
+    why_sanctuary: "monitor_health is read-only and reports configured-but-unverified posture, not observed enforcement.",
+    guidance: EVALUATE_CLI_GUIDANCE.verify,
+  },
+  {
+    question: "tiers",
+    matches: /\btiers?\b|\bneeds? a human\b/,
+    tool: EVALUATE_ROUTE_TOOLS.policyStatus,
+    example: {},
+    why_sanctuary: "sanctuary_policy_status is read-only but Tier 1: it waits for operator approval on every call, because reading the policy is never unattended.",
+    guidance: SERVER_BOUNDS.tiers,
+  },
+  {
+    question: "protections",
+    matches: /\bprotect(s|ed|ion|ions)?\b|\bguarantees?\b|\bsafeguards?\b/,
+    tool: EVALUATE_ROUTE_TOOLS.activeProtections,
+    example: {},
+    why_sanctuary: "sanctuary_active_protections reports only what is active; absence of a flag is not a claim.",
+    guidance: buildBoundsParagraph(),
+  },
+  {
+    question: "bounds",
+    matches:
+      /\bbounds?\b|\blimits?\b|\blimitations?\b|\bunproven\b|\bnot proven\b|\bplatforms?\b|\bmacos\b|\blinux\b|\bwindows\b|\bubuntu\b|\b(not|never|cannot|can't|don't|do not) do\b|\bgaps?\b|\bmissing\b/,
+    tool: EVALUATE_ROUTE_TOOLS.monitorHealth,
+    example: {},
+    why_sanctuary: "The bounds are stated here from the README and the Assurance Matrix; monitor_health shows which of them apply to this instance.",
+    guidance: buildBoundsParagraph(),
+  },
+  {
+    question: "install_decision",
+    matches: /\bshould i\b|\bworth\b|\binstall(ing|ed)?\b|\bevaluat(e|ing|ion)\b|\bassess\b|\badopt\b|\btrust (this|it|you)\b/,
+    tool: EVALUATE_ROUTE_TOOLS.sovereigntyAudit,
+    example: { deep_scan: false },
+    why_sanctuary: "sovereignty_audit is read-only and returns a scored gap analysis; read the bounds before weighing the score.",
+    guidance: buildBoundsParagraph(),
+  },
+] as const;
+
+/**
  * Build the agent-facing MCP `instructions` string from the catalog.
  *
  * This is what a harness reads at connect time. It is a concise "start here"
  * for an AI agent: what this server offers cooperatively and why to route
- * through it, followed by the per-tool catalog. It makes no enforcement claim
- * the cooperative layer cannot back on its own.
+ * through it, followed by the per-tool catalog, then the bounds paragraph
+ * (platforms, tiers, what is never claimed, where evidence lives). It makes
+ * no enforcement claim the cooperative layer cannot back on its own; the
+ * bounds paragraph is copied from the README bound, never strengthened.
  */
 export function buildServerInstructions(): string {
   const lines: string[] = [
@@ -118,5 +303,8 @@ export function buildServerInstructions(): string {
   for (const entry of COOPERATIVE_CAPABILITIES) {
     lines.push(`- ${entry.tool}: ${entry.does} Use when: ${entry.when}`);
   }
+  // Bounds come last and are never omitted: an agent that reads only the
+  // catalog above would believe the cooperative layer is the whole product.
+  lines.push("", "Bounds, tiers and evidence:", buildBoundsParagraph());
   return lines.join("\n");
 }

@@ -246,7 +246,8 @@ export function createSdwMemoryProvenanceTool(
       "through a memory archive import reports its origin-trust tier and " +
       "the transfer lineage reference; unsigned PRE_MIGRATION rows are explicit. " +
       "Verification does not prove true authorship, content truth, safety, or a " +
-      "remote identity.",
+      "remote identity." +
+      " Tier 1 under the default policy: requires operator approval before the handler runs.",
     tool_class: "read",
     inputSchema: {
       type: "object",

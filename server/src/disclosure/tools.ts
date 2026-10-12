@@ -609,7 +609,7 @@ export function createDisclosureTools(
     {
       name: "zk_range_verify",
       description:
-        "Verify a zero-knowledge range proof — confirms a committed value " +
+        "Verify a zero-knowledge range proof: confirms a committed value " +
         "is within the claimed range without learning the value.",
       inputSchema: {
         type: "object",

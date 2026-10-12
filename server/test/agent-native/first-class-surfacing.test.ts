@@ -12,9 +12,18 @@ import {
 } from "../../src/agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
 import {
+  ASSURANCE_MATRIX_URL,
   COOPERATIVE_CAPABILITIES,
+  EVALUATE_RELATED_TOOLS,
+  EVALUATE_ROUTE_TOOLS,
+  EVALUATE_ROUTES,
+  SERVER_BOUNDS,
+  buildBoundsParagraph,
   buildServerInstructions,
 } from "../../src/agent-native/capabilities-catalog.js";
+import { createSanctuaryServer } from "../../src/index.js";
+import { DEFAULT_POLICY, enforceForcedTiers } from "../../src/principal-policy/loader.js";
+import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 import {
   CATALOG_COOPERATIVE_TOOL_NAMES,
   COOPERATIVE_TOOL_NAMES,
@@ -110,6 +119,62 @@ describe("first-class tool surfacing", () => {
       // the instructions must not promise enforcement it cannot deliver.
       expect(instructions.toLowerCase()).not.toContain("unbypassable");
       expect(instructions.toLowerCase()).not.toContain("block");
+      // The bounds paragraph is appended, whole, after the catalog: platforms
+      // with the patched-host qualifier on the enforcement sentence, the three
+      // tiers with Tier 1 waiting on a human, the never-claimed line, and the
+      // evidence URL. At most four sentences, zero em-dashes.
+      expect(instructions.endsWith(buildBoundsParagraph())).toBe(true);
+      expect(instructions).toContain("Bounds, tiers and evidence:");
+      for (const sentence of Object.values(SERVER_BOUNDS)) {
+        expect(instructions).toContain(sentence);
+      }
+      expect(SERVER_BOUNDS.platforms).toContain("on a patched host");
+      expect(SERVER_BOUNDS.platforms).toContain("Windows");
+      expect(SERVER_BOUNDS.tiers).toContain("Tier 1");
+      expect(SERVER_BOUNDS.evidence).toContain(ASSURANCE_MATRIX_URL);
+      expect(Object.keys(SERVER_BOUNDS)).toHaveLength(4);
+      expect(instructions).not.toContain("\u2014");
+    });
+
+    it("pins the evaluate-route tools to the real registry and their tiers to the default policy", async () => {
+      // Registry pin: a rename of monitor_health, sovereignty_audit or
+      // sanctuary_policy_status anywhere in server/src fails here, because the
+      // route table names them by literal rather than importing them.
+      const fortressHome = await createTempHome("sanctuary-evaluate-routes");
+      const booted = await createSanctuaryServer({
+        storage: new MemoryStorage(),
+        passphrase: TEST_PASSPHRASE,
+      });
+      try {
+        const handler = (
+          booted.server as unknown as { _requestHandlers: Map<string, (...a: unknown[]) => unknown> }
+        )._requestHandlers.get("tools/list")!;
+        const listed = (await handler({ method: "tools/list", params: {} }, {})) as {
+          tools: Array<{ name: string }>;
+        };
+        const registered = new Set(listed.tools.map((tool) => tool.name));
+        for (const name of Object.values(EVALUATE_ROUTE_TOOLS)) {
+          expect(registered.has(name), name).toBe(true);
+        }
+      } finally {
+        await booted.cleanup();
+        await fortressHome.cleanup();
+      }
+      // Every route resolves to a pinned tool or to CLI guidance, never to a
+      // name outside the pin table.
+      const pinned = new Set<string>(Object.values(EVALUATE_ROUTE_TOOLS));
+      for (const route of EVALUATE_ROUTES) {
+        expect(route.tool === null || pinned.has(route.tool), route.question).toBe(true);
+        expect(route.guidance.length, route.question).toBeGreaterThan(0);
+        expect(route.matches.flags, route.question).not.toContain("g");
+      }
+      // Tier labels agree with the default policy the gate enforces.
+      const policy = enforceForcedTiers(DEFAULT_POLICY);
+      for (const entry of EVALUATE_RELATED_TOOLS) {
+        const expected = policy.tier1_always_approve.includes(entry.tool) ? "Tier 1" : "Tier 3";
+        expect(entry.tier.startsWith(expected), entry.tool).toBe(true);
+        if (expected === "Tier 3") expect(policy.tier3_always_allow).toContain(entry.tool);
+      }
     });
   });
 

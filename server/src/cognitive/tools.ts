@@ -1298,7 +1298,11 @@ export function createCognitiveTools(
       name: "identity_create",
       description:
         "Create a new sovereign identity (Ed25519 keypair). " +
-        "The private key is encrypted and never exposed.",
+        "The private key is encrypted and never exposed. A wrapped install " +
+        "normally already has a primary identity, so call identity_list first " +
+        "and create another only for a separate persona. Returns identity_id, " +
+        "public_key and did. Tier 3 under the default policy (auto-allowed " +
+        "with an audit record).",
       inputSchema: {
         type: "object",
         properties: {
@@ -1347,7 +1351,8 @@ export function createCognitiveTools(
       name: "identity_import",
       description:
         "Import a sovereign identity record without exposing private key material. " +
-        "Routine imports refuse to replace any existing identity.",
+        "Routine imports refuse to replace any existing identity." +
+        " Tier 1 under the default policy: requires operator approval before the handler runs.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1417,7 +1422,8 @@ export function createCognitiveTools(
     {
       name: "identity_sign",
       description:
-        "Sign data with a managed identity after operator approval. " +
+        "Sign data with a managed identity. Tier 1 and non-relaxable: requires " +
+        "operator approval on every call. " +
         "The private key is decrypted in memory only during signing.",
       inputSchema: {
         type: "object",
@@ -1536,8 +1542,10 @@ export function createCognitiveTools(
     {
       name: "identity_rotate",
       description:
-        "Rotate keys for an identity. Generates a new keypair and " +
-        "signs a rotation event with the old key.",
+        "Rotate keys for an identity: generates a new keypair and " +
+        "signs a rotation event with the old key. Tier 1: requires operator " +
+        "approval, because the previous key is retired and the rotation is " +
+        "not reversible.",
       inputSchema: {
         type: "object",
         properties: {
@@ -2045,7 +2053,8 @@ export function createCognitiveTools(
         "random-byte overwrite before unlinking. On copy-on-write/SSD media " +
         "the original bytes may survive, so at-rest confidentiality rests on " +
         "encryption (data is stored as ciphertext), not on the overwrite. " +
-        "Satisfies right-to-deletion (S1.6) by removing the entry.",
+        "Satisfies right-to-deletion (S1.6) by removing the entry. " +
+        "Tier 1: requires operator approval, because the deletion is irreversible.",
       inputSchema: {
         type: "object",
         properties: {

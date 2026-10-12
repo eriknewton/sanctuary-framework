@@ -80,7 +80,8 @@ export function createSdwMemoryProvenanceMigrationTools(
       description:
         "Report the bounded local SDW memory provenance migration state and counts. " +
         "A complete state means every currently visible local candidate verified at completion; " +
-        "it does not prove latest-state freshness or recover erased history.",
+        "it does not prove latest-state freshness or recover erased history." +
+        " Tier 1 under the default policy: requires operator approval before the handler runs.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       handler: async () => {
@@ -97,7 +98,7 @@ export function createSdwMemoryProvenanceMigrationTools(
     {
       name: SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.migrate,
       description:
-        "Operator-approved bounded migration of one local SDW memory page into signed " +
+        "Operator-approved (Tier 1) bounded migration of one local SDW memory page into signed " +
         "legacy-unattested provenance. This binds only a current local observation; it does " +
         "not recover true authorship, original ingress, content truth, or safety. " +
         "Reinvoke until complete; conflicts stay quarantined.",
@@ -111,7 +112,7 @@ export function createSdwMemoryProvenanceMigrationTools(
     {
       name: SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.abort,
       description:
-        "Operator-approved abandonment of a recoverable incomplete provenance migration. " +
+        "Operator-approved (Tier 1) abandonment of a recoverable incomplete provenance migration. " +
         "Verified companions remain and the store returns to temporary pre-migration compatibility.",
       tool_class: "write",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -123,7 +124,7 @@ export function createSdwMemoryProvenanceMigrationTools(
     {
       name: SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.repair,
       description:
-        "Operator-approved repair of a missing post-completion marker. The operation restores " +
+        "Operator-approved (Tier 1) repair of a missing post-completion marker. The operation restores " +
         "only the prior replay-anchor epoch after a fresh bounded full verification pass.",
       tool_class: "write",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },

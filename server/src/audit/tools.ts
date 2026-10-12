@@ -40,9 +40,10 @@ export function createAuditTools(
       name: "sovereignty_audit",
       description:
         "Audit your agent's sovereignty posture. Inspects the local environment for " +
-        "encryption, identity, approval gates, selective disclosure, and reputation — " +
+        "encryption, identity, approval gates, selective disclosure, and reputation, " +
         "including OpenClaw-specific configurations. Returns a scored gap analysis with " +
-        "prioritized recommendations.",
+        "prioritized recommendations. Read-only; Tier 3 under the default policy " +
+        "(auto-allowed with an audit record). Call this to evaluate an install.",
       inputSchema: {
         type: "object",
         properties: {

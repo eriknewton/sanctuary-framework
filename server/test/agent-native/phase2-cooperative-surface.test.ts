@@ -741,6 +741,77 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(ambiguousMultiIntent.example).toBeNull();
   });
 
+  it("routes the seven evaluate phrasings to a read-only tool or CLI guidance and leaves remember/recall byte-identical", async () => {
+    const env = await setup();
+    // Each phrasing an installing agent asks before it trusts the socket, with
+    // the state it must land in and the read-only tool (or null for a
+    // CLI-only answer) that state routes to.
+    const phrasings: Array<[string, string, string | null]> = [
+      ["should I install this", "install_decision", "sovereignty_audit"],
+      ["what does this protect", "protections", "sanctuary_active_protections"],
+      ["what are the bounds", "bounds", "monitor_health"],
+      ["which platforms", "bounds", "monitor_health"],
+      ["what do you not do", "bounds", "monitor_health"],
+      ["how do I verify", "verify", "monitor_health"],
+      ["how do I uninstall", "uninstall", null],
+    ];
+    for (const [intent, question, tool] of phrasings) {
+      const result = await callTool(env.facadeTools, "sanctuary_help", { intent });
+      expect(result.intent_class, intent).toBe("evaluate");
+      expect(result.evaluate_question, intent).toBe(question);
+      expect(result.safety_class, intent).toBe("ordinary");
+      expect(result.tool, intent).toBe(tool);
+      expect(typeof result.guidance, intent).toBe("string");
+      // A non-null route: a runnable read-only tool, or the CLI command.
+      expect(result.tool !== null || (result.guidance as string).length > 0, intent).toBe(true);
+      expect(result.remediation_class, intent).toBeUndefined();
+      const related = result.related_tools as Array<{ tool: string; tier: string }>;
+      expect(related.map((entry) => entry.tool).sort()).toEqual([
+        "monitor_health",
+        "sanctuary_active_protections",
+        "sanctuary_policy_status",
+        "sovereignty_audit",
+      ]);
+      expect(related.find((entry) => entry.tool === "sanctuary_policy_status")!.tier).toContain("Tier 1");
+      expect(JSON.stringify(result)).not.toContain("\u2014");
+    }
+    const verify = await callTool(env.facadeTools, "sanctuary_help", { intent: "how do I verify" });
+    expect(verify.guidance).toContain("sanctuary doctor --json");
+    const uninstall = await callTool(env.facadeTools, "sanctuary_help", { intent: "how do I uninstall" });
+    expect(uninstall.guidance).toContain("sanctuary uninstall");
+    expect(uninstall.example).toBeNull();
+    const bounds = await callTool(env.facadeTools, "sanctuary_help", { intent: "what are the bounds" });
+    expect(bounds.guidance).toContain("ASSURANCE_MATRIX.md");
+    expect(bounds.guidance).toContain("on a patched host");
+    expect(bounds.guidance).toContain("Windows");
+    expect(bounds.guidance).toContain("Tier 1");
+
+    // The pre-existing routes are byte-identical: same fields, same values,
+    // and none of the evaluate-only fields appear on them.
+    const remember = await callTool(env.facadeTools, "sanctuary_help", { intent: "remember my timezone" });
+    expect(remember).toEqual({
+      safety_class: "ordinary",
+      tool: "sanctuary_remember",
+      example: { key: "user_tz", value: "America/Los_Angeles" },
+      why_sanctuary: "State is encrypted, identity-bound, and audited.",
+      audit_ref: remember.audit_ref,
+    });
+    const recall = await callTool(env.facadeTools, "sanctuary_help", { intent: "recall my timezone" });
+    expect(recall).toEqual({
+      safety_class: "ordinary",
+      tool: "sanctuary_recall",
+      example: { key: "user_tz" },
+      why_sanctuary: "Recall preserves verification status in the response.",
+      audit_ref: recall.audit_ref,
+    });
+    // A gated needle still wins over an evaluate needle.
+    const gatedEvaluate = await callTool(env.facadeTools, "sanctuary_help", {
+      intent: "what are the bounds on exporting my identity bundle",
+    });
+    expect(gatedEvaluate.safety_class).toBe("gated");
+    expect(gatedEvaluate.intent_class).toBeUndefined();
+  });
+
   it("returns only disclosable who-am-i fields and positive active protections", async () => {
     const env = await setup();
 

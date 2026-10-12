@@ -126,7 +126,8 @@ export function createSanctuaryTools(
         "One-shot bootstrap for a new sovereign agent identity. " +
         "Generates an Ed25519 keypair, stores the encrypted identity, " +
         "constructs an SHR, and OPTIONALLY publishes to Verascore when publish=true " +
-        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status.",
+        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status. " +
+        "Tier 1: requires operator approval, because it mints a new identity and may publish.",
       inputSchema: {
         type: "object",
         properties: {
@@ -299,7 +300,8 @@ export function createSanctuaryTools(
       description:
         "Return active Principal Policy summary: explicit Tier 1 and Tier 3 operation " +
         "lists plus Tier 2 anomaly-detection configuration. Tier 2 is not exposed as " +
-        "a named operation list.",
+        "a named operation list." +
+        " Tier 1 and non-relaxable: requires operator approval on every call.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -341,7 +343,8 @@ export function createSanctuaryTools(
       description:
         "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. " +
         "The bundle is signed with the identity's Ed25519 key so a recipient can verify " +
-        "authenticity against the public key. Private keys are never included.",
+        "authenticity against the public key. Private keys are never included. " +
+        "Tier 1: requires operator approval, because the bundle leaves the local store.",
       inputSchema: {
         type: "object",
         properties: {
@@ -431,7 +434,8 @@ export function createSanctuaryTools(
         "Trigger a Verascore magic-link login flow so a human principal can " +
         "authenticate and subsequently claim this agent's DID. The email is " +
         "sent by Verascore to the supplied address. This tool only initiates " +
-        "the flow — it does not directly bind the DID.",
+        "the flow; it does not directly bind the DID." +
+        " Tier 1 under the default policy: requires operator approval before the handler runs.",
       inputSchema: {
         type: "object",
         properties: {
@@ -506,10 +510,11 @@ export function createSanctuaryTools(
         "Used in DID-ownership proof flows. The signed message is constructed as: " +
         "'sanctuary-sign-challenge-v1\\x00' + purpose + '\\x00' + nonce. " +
         "The verifier MUST reconstruct the same domain-prefixed message before " +
-        "calling Ed25519 verify — a raw-nonce signature is NOT valid for this tool. " +
+        "calling Ed25519 verify; a raw-nonce signature is NOT valid for this tool. " +
         "The `purpose` field binds the signature to a specific use case (e.g. " +
         "'verascore-claim') so a signature produced for one purpose cannot be " +
-        "replayed against a different verifier.",
+        "replayed against a different verifier." +
+        " Tier 1 under the default policy: requires operator approval before the handler runs.",
       inputSchema: {
         type: "object",
         properties: {
