@@ -118,6 +118,23 @@ describe("storage namespace names", () => {
     }
   });
 
+  it("refuses state-bearing root directories whose names are not canonical encodings", async () => {
+    // Each name decodes to a valid namespace whose canonical encoding is a
+    // different directory, so listing it would point a full export elsewhere.
+    for (const raw of ["Backup copy", "a!2db", "untitled folder"]) {
+      const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-noncanonical-"));
+      try {
+        const storage = new FilesystemStorage(basePath);
+        await storage.write("notes", "k", new Uint8Array([1]));
+        await mkdir(join(basePath, raw), { recursive: true, mode: 0o700 });
+        await writeFile(join(basePath, raw, "k.enc"), new Uint8Array([2]));
+        await expect(storage.listNamespaces()).rejects.toThrow(/namespace/);
+      } finally {
+        await rm(basePath, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("ignores non-directory root entries before validating namespace directory names", async () => {
     const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-stray-file-"));
     try {

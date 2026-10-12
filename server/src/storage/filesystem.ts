@@ -77,6 +77,7 @@ import {
 import {
   decodeStoragePathComponent,
   encodeStoragePathComponent,
+  InvalidStorageNamespaceError,
   resolveStorageNamespacePath,
   storageNamespacePathComponent,
 } from "./namespace-component.js";
@@ -1261,7 +1262,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       // Empty non-canonical directories are root noise, but a directory with
       // entries is state-bearing; fail closed before a full export can omit it.
       const namespace = bijectiveDecode(dir.name);
-      storageNamespacePathComponent(namespace);
+      // The directory must be the canonical encoding of the name it decodes to;
+      // otherwise the listed name addresses a different (absent) directory and a
+      // full export would silently omit this one's data.
+      if (storageNamespacePathComponent(namespace) !== dir.name) {
+        throw new InvalidStorageNamespaceError(namespace);
+      }
       namespaces.push(namespace);
     }
     return namespaces.sort();
