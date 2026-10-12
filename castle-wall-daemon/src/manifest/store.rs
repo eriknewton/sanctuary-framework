@@ -2362,7 +2362,7 @@ mod tests {
             .unwrap_err();
         let text = format!("{error:?}");
 
-        assert!(text.contains("rule uuid-0"));
+        assert!(text.contains("rule \\\"uuid-0\\\""));
         assert!(text.contains(&confined_scope(TEST_GATE_UID)));
         assert!(text.contains(&confined_scope(TEST_AGENT_UID)));
         assert!(!policy.dir.path().join(ACTIVE_GENERATION_FILENAME).exists());
