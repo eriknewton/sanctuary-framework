@@ -4,7 +4,7 @@
 
 An AI agent running on your machine can do anything your account can do. It holds your credentials, reads your files, and talks to the whole internet, and a single poisoned web page can turn that into exfiltration. Every sandbox on offer today is one the agent, or its vendor, chooses to run inside. That is not a wall. That is a request.
 
-Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your machine or in your cloud, one agent or a fleet.
+Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, any number of wrapped harnesses behind one persistent dashboard; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#deployment-modes)).
 
 ## What is proven, and what is not
 
@@ -20,15 +20,17 @@ Every capability claim in this repository traces to a row in the [Assurance Matr
 
 ## Install, verify, uninstall
 
-Three commands, run in order; none of them reads from stdin, and `--no-open` keeps `protect` from opening a browser. Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run.
+Three commands, run in order. Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run.
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --claude-code
-npx @sanctuary-framework/mcp-server doctor --json
-npx @sanctuary-framework/mcp-server uninstall
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server doctor --json
+npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`protect` backs up the harness configuration to `~/.sanctuary/backup/`, rewrites it so every tool call routes through Sanctuary, generates a passphrase that lives only in the macOS Keychain or Linux Secret Service, and starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port up to 3510). `doctor --json` is a read-only diagnostic of the state directory, identity, principal policy, audit-chain integrity, runtime versions, and Castle Wall status. `uninstall` removes the installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. `protect --unwrap` restores the original harness configuration from the backup. Every verb and flag in this section is on v1.8.4, the npm `latest` channel.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps.
+
+`protect` backs up the harness configuration to `~/.sanctuary/backup/`, rewrites it so every tool call routes through Sanctuary, generates a passphrase that lives only in the macOS Keychain or Linux Secret Service, and starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501). `doctor --json` is a read-only diagnostic of the state directory, identity, principal policy, audit-chain integrity, runtime versions, and Castle Wall status. `uninstall` removes the installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. `protect --unwrap` restores the original harness configuration from the backup. Every verb and flag in this section is on v1.8.4, the npm `latest` channel.
 
 That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
 
@@ -53,13 +55,13 @@ Every enforcement sentence below assumes a patched host. On macOS, the Castle Wa
 Do not translate the manual Castle Wall reference into a pile of shell commands. Use the resumable observed-state contract:
 
 ```bash
-npx @sanctuary-framework/mcp-server install --profile memory --harness claude-code --json
+npx -y @sanctuary-framework/mcp-server install --profile memory --harness claude-code --json
 ```
 
 For the full macOS sovereignty surface, use Hermes:
 
 ```bash
-npx @sanctuary-framework/mcp-server install --profile full --harness hermes --json
+npx -y @sanctuary-framework/mcp-server install --profile full --harness hermes --json
 ```
 
 Execute only an `agent_action` argument vector, then rerun the same planner. Stop on `human_action` and guide the operator through the named Apple consent, exact privileged command, or private custody step; never execute a human action on the operator's behalf. Stop on `blocked` and report the missing trust input rather than improvising. Installation is mechanically finished only at `complete`.
@@ -68,13 +70,13 @@ The `memory` profile is the sovereign encrypted-memory and cooperative-policy ru
 
 ## Useful `protect` flags
 
-All on v1.8.4 unless marked. `--dry-run` previews changes without touching anything. `--no-open` runs headless for CI. `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps. `--fortress <path>` keeps multiple fortresses isolated on one host (honors `SANCTUARY_FORTRESS_PATH` when the flag is absent). `--port <port>` and `--dashboard-port <port>` choose the dashboard port. `--unwrap` restores the original harness configuration. `--passphrase-stdin` reads the fortress passphrase from piped stdin (from 1.8.6; not in 1.8.6-rc.5). Run `sanctuary protect --help` for the full list on your installed version.
+All on v1.8.4 unless marked. `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps. `--fortress <path>` keeps multiple fortresses isolated on one host (honors `SANCTUARY_FORTRESS_PATH` when the flag is absent). `--port <port>` and `--dashboard-port <port>` choose the dashboard port. `--unwrap` restores the original harness configuration. `--passphrase-stdin` reads the fortress passphrase from piped stdin (from 1.8.6; not in 1.8.6-rc.5). Run `sanctuary protect --help` for the full list on your installed version.
 
 **Back up your passphrase:** `sanctuary export-passphrase` prints it to stdout after a confirmation prompt. Store it in a password manager. If you lose it, encrypted state cannot be recovered. An agent never runs this command on an operator's behalf.
 
 ## Running alongside another MCP server
 
-`sanctuary protect` preserves the harness's existing tool configuration and routes configured MCP servers through Sanctuary's cooperative gateway. Merely adding Sanctuary as an independent parallel MCP server (for example a bare `npx @sanctuary-framework/mcp-server` entry) starts a stdio server but does not apply cooperative policy gates to calls made directly to another server. Castle Wall enforcement, when installed and armed on a patched macOS host, operates at the OS level regardless of MCP routing; the wall sees egress, not MCP tool calls.
+`sanctuary protect` preserves the harness's existing tool configuration and routes configured MCP servers through Sanctuary's cooperative gateway. Merely adding Sanctuary as an independent parallel MCP server (for example a bare `npx -y @sanctuary-framework/mcp-server` entry) starts a stdio server but does not apply cooperative policy gates to calls made directly to another server. Castle Wall enforcement, when installed and armed on a patched macOS host, operates at the OS level regardless of MCP routing; the wall sees egress, not MCP tool calls.
 
 For the full setup guide (installation options, passphrase management, service managers, bootstrap, rollback), see [DEPLOYMENT.md](https://github.com/eriknewton/sanctuary-framework/blob/main/server/docs/DEPLOYMENT.md). For the deliberately ungated parallel shape, see the caveats in [docs/examples](https://github.com/eriknewton/sanctuary-framework/blob/main/server/docs/examples/README.md). Prefer `sanctuary protect`.
 
@@ -104,7 +106,7 @@ See [RFC-0002](https://github.com/eriknewton/sanctuary-framework/blob/main/rfcs/
 
 ## MCP tools
 
-Once connected, your agent has access to these selected foundational tools, organized by capability surface within the cooperative MCP layer (Charter). The MCP protocol advertises bare tool names such as `identity_create`; clients may display them with the configured server namespace, for example `sanctuary/identity_create`. Tier 1 marks the operations the default `persistent-agent` policy sends to a human.
+Once connected, your agent has access to these selected foundational tools, organized by capability surface within the cooperative MCP layer (Charter). The MCP protocol advertises bare tool names such as `identity_create`; clients may display them with the configured server namespace, for example `sanctuary/identity_create`. Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human; the opt-in `persistent-agent` template relaxes that set for always-on agents.
 
 ### Cognitive Sovereignty
 | Tool | Description |
@@ -117,7 +119,7 @@ Once connected, your agent has access to these selected foundational tools, orga
 | `sanctuary/state_write` | Write encrypted state (signed, Merkle-verified) |
 | `sanctuary/state_read` | Read and verify encrypted state |
 | `sanctuary/state_list` | List keys in a namespace |
-| `sanctuary/state_delete` | Securely delete state (overwrite plus unlink; Tier 1 when `secure_delete` is set) |
+| `sanctuary/state_delete` | Securely delete state (overwrite plus unlink; Tier 1) |
 | `sanctuary/state_export` | Export state as encrypted portable bundle (Tier 1) |
 | `sanctuary/state_import` | Import state bundle with conflict resolution (Tier 1) |
 
@@ -127,8 +129,8 @@ Once connected, your agent has access to these selected foundational tools, orga
 | `sanctuary/exec_attest` | Environment attestation with sovereignty assessment |
 | `sanctuary/monitor_health` | Sanctuary Health Report (all four capability surfaces) |
 | `sanctuary/monitor_audit_log` | Query the sovereignty audit log |
-| `sanctuary/principal_policy_view` | View the current Principal Policy (read-only) |
-| `sanctuary/principal_baseline_view` | View the behavioral baseline profile (read-only) |
+| `sanctuary/principal_policy_view` | View the current Principal Policy (read-only; Tier 1) |
+| `sanctuary/principal_baseline_view` | View the behavioral baseline profile (read-only; Tier 1) |
 
 ### Selective Disclosure
 | Tool | Description |
@@ -149,10 +151,10 @@ Once connected, your agent has access to these selected foundational tools, orga
 | `sanctuary/reputation_record` | Record signed interaction attestation (sovereignty-weighted) |
 | `sanctuary/reputation_query` | Query aggregated reputation data |
 | `sanctuary/reputation_query_weighted` | Query with sovereignty-tier weighting |
-| `sanctuary/reputation_export` | Export portable reputation bundle |
+| `sanctuary/reputation_export` | Export portable reputation bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import bundle with signature verification (Tier 1) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
-| `sanctuary/bootstrap_provide_guarantee` | Principal signs guarantee for agent |
+| `sanctuary/bootstrap_provide_guarantee` | Principal signs guarantee for agent (Tier 1) |
 | `sanctuary/handshake_initiate` | Start a sovereignty handshake |
 | `sanctuary/handshake_respond` | Respond to incoming handshake |
 | `sanctuary/handshake_complete` | Complete handshake (initiator side) |

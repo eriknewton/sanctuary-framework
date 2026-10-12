@@ -19,12 +19,14 @@ Sanctuary gives your agent protection it can prove: encrypted state, self-custod
 ## Install, verify, uninstall
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --claude-code
-npx @sanctuary-framework/mcp-server doctor --json
-npx @sanctuary-framework/mcp-server uninstall
+npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server doctor --json
+npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. `protect` routes every tool call through Sanctuary; a bare `npx @sanctuary-framework/mcp-server` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps.
+
+Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. `protect` routes every tool call through Sanctuary; a bare `npx -y @sanctuary-framework/mcp-server` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
 
 ## Quick Start
 
@@ -53,7 +55,7 @@ If you're running OpenClaw, Sanctuary adds protections that OpenClaw doesn't pro
 **One-command setup:**
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --openclaw
+npx -y @sanctuary-framework/mcp-server protect --openclaw --no-open --no-dashboard
 ```
 
 Then run `sanctuary/sovereignty_audit` to see your protection posture with OpenClaw-specific gap analysis.
@@ -101,13 +103,13 @@ the destructive last resort.
 | `sanctuary/state_write` | Write encrypted state (AES-256-GCM, Merkle integrity) |
 | `sanctuary/state_read` | Read and decrypt state with integrity verification |
 | `sanctuary/state_list` | List keys in a namespace (metadata only) |
-| `sanctuary/state_delete` | Securely delete state (overwrite + unlink; Tier 1 when `secure_delete` is set) |
+| `sanctuary/state_delete` | Securely delete state (overwrite + unlink; Tier 1) |
 | `sanctuary/state_export` | Export all state as encrypted portable bundle (Tier 1) |
 | `sanctuary/state_import` | Import state bundle with conflict resolution (Tier 1) |
 | `sanctuary/shr_generate` | Generate signed, machine-readable Sovereignty Health Report |
 | `sanctuary/shr_verify` | Verify a counterparty's SHR |
 
-Tier 1 rows follow the default `persistent-agent` policy template; the operator's own policy decides.
+Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human; the opt-in `persistent-agent` template relaxes that set for always-on agents. The operator's own policy file decides.
 
 **First use:**
 1. `sanctuary/identity_create`: create your primary identity
@@ -156,10 +158,10 @@ Tier 1 rows follow the default `persistent-agent` policy template; the operator'
 | `sanctuary/reputation_record` | Record signed interaction attestation (posture-weighted) |
 | `sanctuary/reputation_query` | Query reputation with filters |
 | `sanctuary/reputation_query_weighted` | Query reputation with posture-tier weighting |
-| `sanctuary/reputation_export` | Export reputation as portable bundle |
+| `sanctuary/reputation_export` | Export reputation as portable bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import reputation bundle (verify signatures; Tier 1) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
-| `sanctuary/bootstrap_provide_guarantee` | Principal guarantee certificate |
+| `sanctuary/bootstrap_provide_guarantee` | Principal guarantee certificate (Tier 1) |
 
 **Building portable reputation:**
 1. After each interaction, `sanctuary/reputation_record`: create a signed attestation
@@ -173,12 +175,12 @@ Tier 1 rows follow the default `persistent-agent` policy template; the operator'
 | `sanctuary/exec_attest` | Generate execution environment attestation |
 | `sanctuary/monitor_health` | Sovereignty Health Report (human-readable) |
 | `sanctuary/monitor_audit_log` | Query the audit log |
-| `sanctuary/principal_policy_view` | View current principal policy |
-| `sanctuary/principal_baseline_view` | View behavioral baseline |
+| `sanctuary/principal_policy_view` | View current principal policy (Tier 1) |
+| `sanctuary/principal_baseline_view` | View behavioral baseline (Tier 1) |
 | `sanctuary/manifest` | Generate Sanctuary Interface Manifest (SIM) |
 
 **Principal Dashboard:**
-Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `http://localhost:3501` (or the next free port up to 3510) where you can approve or deny operations, monitor the audit log, and view behavioral baselines. The `sanctuary protect` install flow starts the dashboard for you.
+Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) where you can approve or deny operations, monitor the audit log, and view behavioral baselines. The `sanctuary protect` install flow starts the dashboard for you.
 
 **Webhook Approval Channel:**
 Enable webhook approvals (`webhook.enabled: true`, `webhook.url`, `webhook.secret`) to route approval requests to external systems (Slack, Discord, PagerDuty, custom HTTP endpoints).

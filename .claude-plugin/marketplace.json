@@ -8,7 +8,7 @@
     {
       "name": "sanctuary-framework",
       "source": "./plugin",
-      "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record with signed checkpoints. Linux: proven on Ubuntu 24.04 (x86-64) only. Works with any MCP-compatible harness."
+      "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record. Linux: proven on Ubuntu 24.04 (x86-64) only. Works with any MCP-compatible harness."
     }
   ]
 }
