@@ -18,6 +18,10 @@ import { createServer } from "../../src/router.js";
 import type { ToolDefinition } from "../../src/router.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import {
+  OpaqueNamespaceRegistry,
+  fingerprintIdentityId,
+} from "../../src/agent-native/safety-base.js";
 
 const INVALID_NAMESPACES = ["", ".", ".."];
 const READ_TOOLS = new Set(["state_read", "state_list"]);
@@ -255,6 +259,75 @@ describe("state tool namespace names", () => {
       expect((await storage.listNamespaces()).filter((name) => !name.startsWith("_"))).toEqual([
         "safe",
       ]);
+    } finally {
+      await client.close().catch(() => {});
+      await server.close().catch(() => {});
+    }
+  });
+
+  it("refuses state_import bundles naming an opaque namespace owned by another session", async () => {
+    const masterKey = generateRandomKey();
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const registry = OpaqueNamespaceRegistry.testOnlyInMemory();
+    const activeIdentity = "identity-active";
+    const foreignNamespace = registry.issueMemoryHandle("identity-foreign");
+    const { tools, identityManager } = createCognitiveTools(
+      stateStore,
+      storage,
+      masterKey,
+      "passphrase",
+      auditLog,
+      {
+        namespaceRegistry: registry,
+        currentSessionBinding: () => ({
+          identity_id: activeIdentity,
+          requester_identity_fingerprint: fingerprintIdentityId(activeIdentity),
+        }),
+      }
+    );
+    await identityManager.load();
+
+    let approvalRequests = 0;
+    const baseline = new BaselineTracker(storage, masterKey);
+    await baseline.load();
+    const gate = new ApprovalGate(
+      DEFAULT_POLICY,
+      baseline,
+      new CallbackApprovalChannel(async () => {
+        approvalRequests++;
+        return {
+          decision: "approve",
+          decided_at: new Date().toISOString(),
+          decided_by: "human",
+        };
+      }),
+      auditLog
+    );
+    const server = createServer(selectedTools(tools, ["state_import"]), {
+      gate,
+      auditLog,
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "state-import-opaque-owner-test", version: "1.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    try {
+      const payload = parseToolPayload(
+        await client.callTool({
+          name: "state_import",
+          arguments: {
+            bundle: legacyBundleForNamespace(foreignNamespace),
+            conflict_resolution: "overwrite",
+            allow_unverified_legacy: true,
+          },
+        })
+      );
+      expect(payload.denied).toBe(true);
+      expect(approvalRequests).toBe(1);
+      expect(await storage.list(foreignNamespace)).toEqual([]);
     } finally {
       await client.close().catch(() => {});
       await server.close().catch(() => {});

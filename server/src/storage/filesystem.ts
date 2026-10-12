@@ -77,7 +77,6 @@ import {
 import {
   decodeStoragePathComponent,
   encodeStoragePathComponent,
-  resolveEncodedStorageNamespacePath,
   resolveStorageNamespacePath,
   storageNamespacePathComponent,
 } from "./namespace-component.js";
@@ -1245,12 +1244,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       const rootEntryPath = join(this.activeBasePath(), dir.name);
       const rootEntryStat = await stat(rootEntryPath);
       if (!rootEntryStat.isDirectory()) continue;
-      const path = resolveEncodedStorageNamespacePath(this.activeBasePath(), dir.name);
-      if (!(await stat(path)).isDirectory()) continue;
       let hasEntries = false;
       // Propagate subdirectory failures too: skipping an unreadable namespace
       // would turn a storage error into silent data loss in a full export.
-      for await (const entry of await opendir(path)) {
+      for await (const entry of await opendir(rootEntryPath)) {
         chargeEntry();
         if (entry.name.endsWith(".enc")) {
           hasEntries = true;
@@ -1261,10 +1258,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) {
         throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
       }
-      // bijectiveDecode is total (unmatched bytes pass through), so legacy
-      // pre-#41 sanitized directory names still surface — as their raw names
-      // — and the rotation walker's unknown-namespace abort catches them
-      // (fail closed) instead of silently skipping a namespace.
+      // Empty non-canonical directories are root noise, but a directory with
+      // entries is state-bearing; fail closed before a full export can omit it.
       const namespace = bijectiveDecode(dir.name);
       storageNamespacePathComponent(namespace);
       namespaces.push(namespace);
@@ -1283,7 +1278,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         const rootEntryPath = join(this.activeBasePath(), ns);
         const rootEntryStat = await stat(rootEntryPath);
         if (!rootEntryStat.isDirectory()) continue;
-        const nsPath = resolveEncodedStorageNamespacePath(this.activeBasePath(), ns);
+        // totalSize measures bytes already under the state root for emptiness
+        // gates; resolving root entries as namespaces would turn stray
+        // directories into false-empty or partial-size answers.
+        const nsPath = rootEntryPath;
 
         const files = await readdir(nsPath);
         for (const file of files) {

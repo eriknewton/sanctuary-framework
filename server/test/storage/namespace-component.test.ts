@@ -133,6 +133,26 @@ describe("storage namespace names", () => {
     }
   });
 
+  it("skips empty non-canonical root directories during namespace discovery while sizing root bytes", async () => {
+    const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-stray-dir-"));
+    try {
+      const storage = new FilesystemStorage(basePath);
+      const payload = new Uint8Array([1, 2, 3, 4]);
+      const strayPayload = new Uint8Array([5, 6, 7]);
+      await mkdir(join(basePath, "Backup copy"), { recursive: true, mode: 0o700 });
+      await storage.write("notes", "k", payload);
+
+      await expect(storage.listNamespaces()).resolves.toEqual(["notes"]);
+      await mkdir(join(basePath, "!2E"), { recursive: true, mode: 0o700 });
+      await writeFile(join(basePath, "!2E", "stray.enc"), strayPayload);
+      await expect(storage.totalSize()).resolves.toBe(
+        payload.byteLength + strayPayload.byteLength
+      );
+    } finally {
+      await rm(basePath, { recursive: true, force: true });
+    }
+  });
+
   it("keeps ordinary namespace names working", async () => {
     const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-legit-"));
     try {

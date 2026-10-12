@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { linkSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, renameSync } from "node:fs";
 import {
   chmod,
   mkdtemp,
@@ -722,6 +722,8 @@ describe("withCrossProcessLock", () => {
 
       await expect(new FilesystemStorage(statePath).read(NS, "direct")).resolves.toBeNull();
       await expect(new FilesystemStorage(statePath).read(NS, "tool")).resolves.toBeNull();
+      expect(existsSync(join(statePath, "direct.enc"))).toBe(false);
+      expect(existsSync(join(statePath, "tool.enc"))).toBe(false);
       await expect(
         new FilesystemStorage(statePath).read(formerInternalNamespace, "direct"),
       ).rejects.toThrow(/namespace/);
