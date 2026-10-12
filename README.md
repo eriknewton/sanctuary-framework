@@ -11,7 +11,7 @@ An AI agent running on your machine can do anything your account can do. It hold
 Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, any number of wrapped harnesses behind one persistent dashboard; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --claude-code
+npx -y @sanctuary-framework/mcp-server protect --claude-code
 ```
 
 That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](docs/castle-wall-macos-install.md).
