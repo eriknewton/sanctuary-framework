@@ -1230,6 +1230,19 @@ function isLinuxPolicyCompatibilityRefusal(error: unknown): error is RuntimeLinu
   );
 }
 
+function linuxObservePromoteRemedy(message: string): string {
+  if (message.includes("scope.uids")) {
+    return (
+      "On Linux, exclusive observe promote uses scope.uids, which the Linux profile refuses. " +
+      "Promote a uid-mode IP/CIDR rule scoped as scope.agent_ids=uid-<uid>, or author one with `sanctuary linux-policy sign`."
+    );
+  }
+  return (
+    "On Linux, promote IP/CIDR-only rules scoped as scope.agent_ids=uid-<uid> for uid-mode walls, " +
+    "or author a Linux-compatible policy with `sanctuary linux-policy sign`."
+  );
+}
+
 /** Shared O_EXCL fortress lockfile implementation behind both locks above. */
 function fortressExclusiveFileLock(
   lockPath: string,
@@ -1896,11 +1909,12 @@ export async function runObservePromote(
     });
   } catch (error) {
     if (isLinuxPolicyCompatibilityRefusal(error)) {
+      const message = error.message;
       write(
         err,
-        `Aborted: observe promote cannot publish this ruleset on Linux: ${error.message}. ` +
+        `Aborted: observe promote cannot publish this ruleset on Linux: ${message}. ` +
           "Nothing changed; no manifest was re-signed. " +
-          "On Linux, promote IP/CIDR-only rules or author a Linux-compatible policy with `sanctuary linux-policy sign`.\n",
+          `${linuxObservePromoteRemedy(message)}\n`,
       );
       return 1;
     }

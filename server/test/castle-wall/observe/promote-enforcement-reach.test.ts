@@ -139,6 +139,13 @@ function ipOnlyCandidate(): CandidateObservation {
   };
 }
 
+function linuxUidIpOnlyCandidate(): CandidateObservation {
+  return {
+    ...ipOnlyCandidate(),
+    agent_id: `uid-${AGENT_UID}`,
+  };
+}
+
 function exclusiveMarkerDoc(): string {
   return renderExclusiveRoutingMarker({
     agent_uid: AGENT_UID,
@@ -1207,6 +1214,53 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
 
   it("Linux-compatible promote publishes an ip-scoped rule and verifies the signed manifest", async () => {
     const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [linuxUidIpOnlyCandidate()],
+      initialAgentOrigin: {
+        mode: "uid",
+        agent_uid: AGENT_UID,
+        system_uid_allow_ceiling: AGENT_UID - 1,
+      },
+    });
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(
+      [
+        "--destination",
+        "93.184.216.34:443",
+        "--granularity",
+        "per_instance_domain",
+        "--fortress",
+        fortress.fortressPath,
+      ],
+      {
+        out,
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        approvalChannel: new AutoApproveChannel(),
+        platform: "linux",
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(err.text()).toBe("");
+    const verified = await readVerifiedManifest(
+      join(fortress.fortressPath, "policy", "egress"),
+      fortress.pinnedPublicKey,
+    );
+    expect(verified.status).toBe("ok");
+    if (verified.status !== "ok") throw new Error("unreachable");
+    expect(
+      verified.rules.some(
+        (rule) => rule.match.ip?.[0] === "93.184.216.34" && rule.scope.agent_ids?.[0] === `uid-${AGENT_UID}`,
+      ),
+    ).toBe(true);
+    expect(verified.agentOrigin).toMatchObject({ mode: "uid", agent_uid: AGENT_UID });
+    expect(await fortress.listStoredCandidates()).toBe(0);
+  });
+
+  it("Linux exclusive promote refuses the macOS-only gate scope without policy state changes", async () => {
+    const fortress = await makeCliFortress({
       exclusive: true,
       candidates: [ipOnlyCandidate()],
     });
@@ -1220,20 +1274,20 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
       platform: "linux",
     });
 
-    expect(code).toBe(0);
-    expect(err.text()).toBe("");
-    const verified = await readVerifiedManifest(
-      join(fortress.fortressPath, "policy", "egress"),
-      fortress.pinnedPublicKey,
-    );
-    expect(verified.status).toBe("ok");
-    if (verified.status !== "ok") throw new Error("unreachable");
-    expect(
-      verified.rules.some(
-        (rule) => rule.match.ip?.[0] === "93.184.216.34" && rule.scope.uids?.[0] === GATE_UID,
-      ),
-    ).toBe(true);
+    expect(code).toBe(1);
+    expect(err.text()).toContain("cannot publish this ruleset on Linux");
+    expect(err.text()).toContain("scope.uids");
+    expect(err.text()).toContain("exclusive observe promote uses scope.uids");
+    expect(err.text()).toContain("sanctuary linux-policy sign");
+    expect(err.text()).toContain("Nothing changed; no manifest was re-signed.");
+    expect(out.text()).not.toContain("Promote complete");
     expect(await fortress.listStoredCandidates()).toBe(1);
+    await expect(readFile(join(fortress.fortressPath, "policy", "egress", "manifest.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readdir(join(fortress.fortressPath, "policy", "egress", "rules"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("macOS promote continues to publish host-scoped rules through the existing path", async () => {
