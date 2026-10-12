@@ -73,7 +73,7 @@ Run `sanctuary/sovereignty_audit` to get a scored report (0-100) across security
 
 | Tool | Purpose |
 |------|---------|
-| `sanctuary/memory_insert` | Store a memory record in the encrypted vault (requires operator approval under the default policy (not named in a policy tier; the gate's safe default)). |
+| `sanctuary/memory_insert` | Store a memory record in the encrypted vault (Tier 1) |
 | `sanctuary/memory_search` | Find records by content. |
 | `sanctuary/memory_get` | Read a record back byte-faithfully (decrypts and re-verifies the stored content hash; proves exact content, not signer data). |
 | `sanctuary/sdw_memory_provenance` | Prove verified provenance for a record: per-writer signing status and the fortress-recorded origin/admission bindings (requires operator approval under the default policy (not named in a policy tier; the gate's safe default)). |
@@ -180,7 +180,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 | `sanctuary/manifest` | Generate Sanctuary Interface Manifest (SIM) |
 
 **Principal Dashboard:**
-Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) where you can approve or deny operations, monitor the audit log, and view behavioral baselines. The `sanctuary protect` install flow starts the dashboard for you.
+Enable the dashboard in config (`dashboard.enabled: true`) to get a web UI at `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) where you can approve or deny operations, monitor the audit log, and view behavioral baselines. The `sanctuary protect` install flow starts the dashboard for you unless you pass `--no-dashboard`.
 
 **Webhook Approval Channel:**
 Enable webhook approvals (`webhook.enabled: true`, `webhook.url`, `webhook.secret`) to route approval requests to external systems (Slack, Discord, PagerDuty, custom HTTP endpoints).
