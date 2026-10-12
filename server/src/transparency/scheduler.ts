@@ -5,8 +5,8 @@
  * in) emits an enforcement checkpoint on a fixed cadence so the published
  * chain stays fresh without operator action. Emission failures are LOUD
  * (reported through onError, surfaced on the operator console by the
- * caller) but never crash the host process, and a failed tick never
- * persists anything (the emitter is fail-closed).
+ * caller) but never crash the host process, and a refused tick never starts a
+ * new checkpoint write after shutdown begins (the emitter is fail-closed).
  */
 
 import { REKOR_SUBMIT_TIMEOUT_MS } from "./rekor-client.js";
@@ -99,6 +99,12 @@ export interface TransparencySchedulerAbortState {
   assertNotAborted(phase: string): void;
 }
 
+export const TRANSPARENCY_NEVER_ABORTED: TransparencySchedulerAbortState =
+  Object.freeze({
+    aborted: false,
+    assertNotAborted(): void {},
+  });
+
 export function startTransparencyScheduler(
   options: TransparencySchedulerOptions
 ): TransparencySchedulerHandle {
@@ -145,6 +151,8 @@ export function startTransparencyScheduler(
       // barrier.
       const current = inFlight;
       if (current === undefined) {
+        // The caller releases master custody after stop() resolves; every
+        // production key-use site relies on this flag already being raised.
         aborted = true;
         return;
       }
@@ -158,6 +166,8 @@ export function startTransparencyScheduler(
           }),
         ]);
       } finally {
+        // The caller releases master custody after stop() resolves; every
+        // production key-use site relies on this flag already being raised.
         aborted = true;
         if (drainTimer !== undefined) clearTimeout(drainTimer);
       }

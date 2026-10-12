@@ -34,7 +34,10 @@ import {
   ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
 } from "../core/crypto-suite-registry.js";
-import type { TransparencySchedulerAbortState } from "./scheduler.js";
+import {
+  TransparencySchedulerAbortedError,
+  type TransparencySchedulerAbortState,
+} from "./scheduler.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -53,7 +56,7 @@ export interface ResolveTransparencySignerInput {
   /** Override the root-owned global pin path (tests). */
   globalPinnedPublicKeyPath?: string;
   /** Shutdown abort state for daemon-scheduled emissions. */
-  abortState?: TransparencySchedulerAbortState;
+  abortState: TransparencySchedulerAbortState;
 }
 
 export async function resolveTransparencySigner(
@@ -137,7 +140,7 @@ async function assertGlobalPinMatches(
 async function loadLocalTransparencySigner(
   fortressPath: string,
   masterKey: Uint8Array,
-  abortState?: TransparencySchedulerAbortState,
+  abortState: TransparencySchedulerAbortState,
 ): Promise<TransparencySigner> {
   let publicKey: Uint8Array;
   let encryptedPrivateKey: EncryptedPayload;
@@ -167,9 +170,10 @@ async function loadLocalTransparencySigner(
   try {
     // INVARIANT (shutdown/key custody): no await may separate this abort check
     // from decrypting the pinned signing key with the daemon master key.
-    abortState?.assertNotAborted("local transparency signer decrypt");
+    abortState.assertNotAborted("local transparency signer decrypt");
     privateKey = decrypt(encryptedPrivateKey, masterKey);
-  } catch {
+  } catch (err) {
+    if (err instanceof TransparencySchedulerAbortedError) throw err;
     throw new TransparencyEmitError(
       "pinned private key could not be decrypted (wrong passphrase for this fortress); refusing to emit"
     );
@@ -178,7 +182,7 @@ async function loadLocalTransparencySigner(
     if (privateKey.length === ED25519_LEGACY_SEED_AND_PUBKEY_BYTES) {
       // INVARIANT (shutdown/key custody): no await may separate this abort
       // check from re-encrypting normalized local signer custody material.
-      abortState?.assertNotAborted("local transparency signer normalization");
+      abortState.assertNotAborted("local transparency signer normalization");
       encryptedPrivateKey = encrypt(privateKey.slice(0, ED25519_PRIVATE_KEY_BYTES), masterKey);
     } else if (privateKey.length !== ED25519_PRIVATE_KEY_BYTES) {
       throw new TransparencyEmitError(
@@ -195,7 +199,7 @@ async function loadLocalTransparencySigner(
     sign: async (bytes) => {
       // INVARIANT (shutdown/key custody): no await may separate this abort check
       // from signing with the master-key-encrypted local signer material.
-      abortState?.assertNotAborted("local transparency signing");
+      abortState.assertNotAborted("local transparency signing");
       return identitySign(bytes, frozenEncrypted, masterKey);
     },
   };

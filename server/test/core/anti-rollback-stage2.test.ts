@@ -33,6 +33,7 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { toBase64url, stringToBytes, bytesToString } from "../../src/core/encoding.js";
 import { randomBytes, generateRandomKey } from "../../src/core/random.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../../src/transparency/scheduler.js";
 import {
   evaluateRekorCounterFloor,
   evaluateAndEnforceRekorCounterFloor,
@@ -193,7 +194,14 @@ async function anchorN(n: number): Promise<Anchored> {
   const signer = testSigner();
   const log = new FakeRekorLog();
   log.appendNoise("pre-existing");
-  await enableAnchoring({ storage, masterKey, auditLog, fortressId: FORTRESS_ID, rekorUrl: REKOR_URL });
+  await enableAnchoring({
+    storage,
+    masterKey,
+    auditLog,
+    fortressId: FORTRESS_ID,
+    rekorUrl: REKOR_URL,
+    abortState: TRANSPARENCY_NEVER_ABORTED,
+  });
   const records: EnforcementCheckpointRecord[] = [];
   for (let i = 0; i < n; i++) {
     await auditLog.appendCritical({
@@ -212,6 +220,7 @@ async function anchorN(n: number): Promise<Anchored> {
       signer,
       binaryPath,
       version: "0.0.0-test",
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     records.push(record);
     const outcome = await anchorCheckpoint({
@@ -220,6 +229,7 @@ async function anchorN(n: number): Promise<Anchored> {
       auditLog,
       record,
       fetchFn: log.fetchLike(),
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("anchored");
     log.appendNoise(`foreign-${i}`);
@@ -260,6 +270,7 @@ describe("computeHighestVerifiedAnchoredCounter (offline witness resolution)", (
       storage: a.storage,
       masterKey: a.masterKey,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(result.highestAnchoredCounter).toBe(3);
     expect(result.verifiedAnchorCount).toBe(3);
@@ -278,6 +289,7 @@ describe("computeHighestVerifiedAnchoredCounter (offline witness resolution)", (
       storage: a.storage,
       masterKey: a.masterKey,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(result.unverifiableAnchorPresent).toBe(true);
   });
@@ -384,6 +396,7 @@ describe("evaluateAndEnforceRekorCounterFloor (boot / on-demand)", () => {
       masterKey: a.masterKey,
       auditLog: a.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     await forceFloorTo(a.storage, a.masterKey, 0);
     const r = await evaluateAndEnforceRekorCounterFloor({
@@ -411,6 +424,7 @@ describe("evaluateAndEnforceRekorCounterFloor (boot / on-demand)", () => {
       masterKey: a.masterKey,
       auditLog: a.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const r = await evaluateAndEnforceRekorCounterFloor({
       storage: a.storage,
@@ -507,6 +521,7 @@ describe("evaluateAndEnforceRekorCounterFloor (boot / on-demand)", () => {
       auditLog,
       fortressId: FORTRESS_ID,
       rekorUrl: REKOR_URL,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const r = await evaluateAndEnforceRekorCounterFloor({
       storage,

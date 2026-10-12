@@ -70,6 +70,11 @@ import {
   RekorClientError,
   type FetchLike,
 } from "../../src/transparency/rekor-client.js";
+import {
+  TRANSPARENCY_NEVER_ABORTED,
+  TransparencySchedulerAbortedError,
+  type TransparencySchedulerAbortState,
+} from "../../src/transparency/scheduler.js";
 
 const FORTRESS_ID = "fortress-anchor-test";
 
@@ -131,6 +136,7 @@ async function emitOne(env: Env): Promise<EnforcementCheckpointRecord> {
     signer: testSigner(),
     binaryPath,
     version: "0.0.0-test",
+    abortState: TRANSPARENCY_NEVER_ABORTED,
   });
 }
 
@@ -208,8 +214,29 @@ async function enable(
     auditLog: env.auditLog,
     fortressId: FORTRESS_ID,
     rekorUrl,
+    abortState: TRANSPARENCY_NEVER_ABORTED,
     ...(allowUnsafeRekorUrl ? { allowUnsafeRekorUrl: true } : {}),
   });
+}
+
+function mutableAbortState(): {
+  state: TransparencySchedulerAbortState;
+  abort(): void;
+} {
+  let aborted = false;
+  return {
+    state: {
+      get aborted() {
+        return aborted;
+      },
+      assertNotAborted(phase: string): void {
+        if (aborted) throw new TransparencySchedulerAbortedError(phase);
+      },
+    },
+    abort() {
+      aborted = true;
+    },
+  };
 }
 
 async function auditOps(env: Env, operation: string) {
@@ -228,6 +255,7 @@ describe("opt-in, default OFF (hard constraint #1)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("disabled");
     expect(fixture.calls).toHaveLength(0);
@@ -243,6 +271,7 @@ describe("opt-in, default OFF (hard constraint #1)", () => {
       masterKey: env.masterKey,
       auditLog: env.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const fixture = makeFetchFixture();
     const outcome = await anchorCheckpoint({
@@ -251,6 +280,7 @@ describe("opt-in, default OFF (hard constraint #1)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("disabled");
     expect(fixture.calls).toHaveLength(0);
@@ -279,6 +309,7 @@ describe("opt-in, default OFF (hard constraint #1)", () => {
       masterKey: env.masterKey,
       auditLog: env.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const second = await enable(env);
     expect(second.salt).toBe(first.salt);
@@ -297,6 +328,7 @@ describe("hash-only anchors (privacy)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("anchored");
     expect(fixture.calls).toHaveLength(1);
@@ -375,6 +407,7 @@ describe("success path", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("anchored");
     const receipts = await readAnchorReceipts(env.storage);
@@ -403,6 +436,7 @@ describe("success path", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     };
     expect((await anchorCheckpoint(input)).status).toBe("anchored");
     expect((await anchorCheckpoint(input)).status).toBe("already_anchored");
@@ -439,6 +473,7 @@ describe("success path", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("anchored");
     if (outcome.status === "anchored") {
@@ -466,6 +501,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: outageFetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(failed.status).toBe("failed");
     if (failed.status === "failed") {
@@ -492,6 +528,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
       storage: env.storage,
       masterKey: env.masterKey,
       auditLog: env.auditLog,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
       fetchFn: fixture.fetch,
     });
     expect(result).toMatchObject({ anchored: 2, failed: 0 });
@@ -500,6 +537,49 @@ describe("fail loud, never blocking (outage fixture)", () => {
       "anchored",
       "anchored",
     ]);
+  });
+
+  it("a scheduler abort before anchor key derivation records no failed receipt or audit entry", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    await enable(env);
+    const abort = mutableAbortState();
+    const storage = new (class extends MemoryStorage {
+      override async read(namespace: string, key: string) {
+        const value = await env.storage.read(namespace, key);
+        if (
+          namespace === TRANSPARENCY_ANCHOR_NAMESPACE &&
+          key === anchorReceiptStorageKey(record.counter)
+        ) {
+          abort.abort();
+        }
+        return value;
+      }
+      override write(namespace: string, key: string, data: Uint8Array) {
+        return env.storage.write(namespace, key, data);
+      }
+      override delete(namespace: string, key: string, secureOverwrite?: boolean) {
+        return env.storage.delete(namespace, key, secureOverwrite);
+      }
+      override list(namespace: string, prefix?: string) {
+        return env.storage.list(namespace, prefix);
+      }
+    })();
+    const fixture = makeFetchFixture();
+
+    await expect(
+      anchorCheckpoint({
+        storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        record,
+        fetchFn: fixture.fetch,
+        abortState: abort.state,
+      })
+    ).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
+    expect(fixture.calls).toHaveLength(0);
+    expect(await readAnchorReceipts(env.storage)).toHaveLength(0);
+    expect(await auditOps(env, "transparency_anchor_failed")).toHaveLength(0);
   });
 
   it("an HTTP error from Rekor is a failure, not silently skipped", async () => {
@@ -516,6 +596,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("failed");
     expect((await auditOps(env, "transparency_anchor_failed"))).toHaveLength(1);
@@ -538,6 +619,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       });
       expect(outcome.status).toBe("failed");
     }
@@ -556,6 +638,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const raw = await env.storage.read(
       TRANSPARENCY_ANCHOR_NAMESPACE,
@@ -574,6 +657,7 @@ describe("fail loud, never blocking (outage fixture)", () => {
       fetchFn: async () => {
         throw new Error("offline");
       },
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(again.status).toBe("already_anchored");
   });
@@ -596,7 +680,11 @@ describe("tampered config refuses in both directions", () => {
       stringToBytes(JSON.stringify(envelope))
     );
     await expect(
-      readAnchorConfig({ storage: env.storage, masterKey: env.masterKey })
+      readAnchorConfig({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      })
     ).rejects.toThrow(TransparencyAnchorError);
     const fixture = makeFetchFixture();
     await expect(
@@ -606,6 +694,7 @@ describe("tampered config refuses in both directions", () => {
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       })
     ).rejects.toThrow(/failed authentication/);
     expect(fixture.calls).toHaveLength(0);
@@ -639,6 +728,7 @@ describe("tampered config refuses in both directions", () => {
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       })
     ).rejects.toThrow(TransparencyAnchorError);
     expect(fixture.calls).toHaveLength(0);
@@ -654,7 +744,11 @@ describe("tampered config refuses in both directions", () => {
       stringToBytes("garbage")
     );
     await expect(
-      readAnchorConfig({ storage: env.storage, masterKey: env.masterKey })
+      readAnchorConfig({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      })
     ).rejects.toThrow(TransparencyAnchorError);
     // The explicit operator verb recovers; automatic paths above refuse.
     const config = await enable(env);
@@ -662,6 +756,7 @@ describe("tampered config refuses in both directions", () => {
     const state = await readAnchorConfig({
       storage: env.storage,
       masterKey: env.masterKey,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(state.status).toBe("enabled");
     // And disable recovers from tamper too.
@@ -675,11 +770,13 @@ describe("tampered config refuses in both directions", () => {
       masterKey: env.masterKey,
       auditLog: env.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(disabled.enabled).toBe(false);
     const after = await readAnchorConfig({
       storage: env.storage,
       masterKey: env.masterKey,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(after.status).toBe("disabled");
   });
@@ -699,7 +796,11 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
       /must use https/
     );
     expect(
-      await readAnchorConfig({ storage: env.storage, masterKey: env.masterKey })
+      await readAnchorConfig({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      })
     ).toEqual({ status: "absent" });
   });
 
@@ -766,6 +867,7 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
       masterKey: env.masterKey,
       auditLog: env.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(config.rekor_url).toBe("https://rekor.sigstore.dev");
     expect(config.allow_unsafe_url).toBe(false);
@@ -803,6 +905,7 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
       masterKey: env.masterKey,
       auditLog: env.auditLog,
       fortressId: FORTRESS_ID,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     // Re-enable without the flag inherits the URL but NOT the override.
     await expect(
@@ -811,6 +914,7 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
         masterKey: env.masterKey,
         auditLog: env.auditLog,
         fortressId: FORTRESS_ID,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       })
     ).rejects.toThrow(/must use https/);
   });
@@ -852,6 +956,7 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       })
     ).rejects.toThrow(/must use https/);
     expect(fixture.calls).toHaveLength(0);
@@ -861,6 +966,7 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
         storage: env.storage,
         masterKey: env.masterKey,
         auditLog: env.auditLog,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
         fetchFn: fixture.fetch,
       })
     ).rejects.toThrow(/must use https/);
@@ -889,6 +995,7 @@ describe("409 duplicate handling (verified, same-origin, time-bounded)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
@@ -940,6 +1047,7 @@ describe("409 duplicate handling (verified, same-origin, time-bounded)", () => {
       auditLog: env.auditLog,
       record,
       fetchFn: fixture.fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {

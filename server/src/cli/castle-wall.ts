@@ -2947,7 +2947,7 @@ export async function runDaemon(
         onError: (error) => {
           write(
             err,
-            `[transparency] checkpoint emission FAILED (nothing was persisted): ${error instanceof Error ? error.message : String(error)}\n`,
+            `[transparency] checkpoint emission FAILED (no complete checkpoint-and-floor update was recorded): ${error instanceof Error ? error.message : String(error)}\n`,
           );
         },
       });

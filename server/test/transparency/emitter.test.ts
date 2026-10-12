@@ -40,6 +40,11 @@ import {
   transparencyRuleLabel,
   verifyEnforcementCheckpointSignature,
 } from "../../src/transparency/checkpoint.js";
+import {
+  TRANSPARENCY_NEVER_ABORTED,
+  TransparencySchedulerAbortedError,
+  type TransparencySchedulerAbortState,
+} from "../../src/transparency/scheduler.js";
 
 const MASTER_KEY = () => randomBytes(32);
 
@@ -128,6 +133,27 @@ function emitInput(env: Env, signer: TransparencySigner) {
     signer,
     binaryPath,
     version: "0.0.0-test",
+    abortState: TRANSPARENCY_NEVER_ABORTED,
+  };
+}
+
+function mutableAbortState(): {
+  state: TransparencySchedulerAbortState;
+  abort(): void;
+} {
+  let aborted = false;
+  return {
+    state: {
+      get aborted() {
+        return aborted;
+      },
+      assertNotAborted(phase: string): void {
+        if (aborted) throw new TransparencySchedulerAbortedError(phase);
+      },
+    },
+    abort() {
+      aborted = true;
+    },
   };
 }
 
@@ -241,6 +267,93 @@ describe("transparency emitter", () => {
     await expect(
       emitEnforcementCheckpoint(emitInput(env, failingSigner))
     ).rejects.toThrow(TransparencyEmitError);
+    expect(
+      await env.storage.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)
+    ).toHaveLength(0);
+    expect(await env.storage.read("_meta", TRANSPARENCY_FLOOR_META_KEY)).toBeNull();
+  });
+
+  it("passes a scheduler abort through unchanged before checkpoint signing", async () => {
+    const env = makeEnv();
+    await seedAuditEvents(env.auditLog);
+    const abort = mutableAbortState();
+    const promise = emitEnforcementCheckpoint({
+      ...emitInput(env, testSigner()),
+      abortState: abort.state,
+    });
+    abort.abort();
+
+    await expect(promise).rejects.toBeInstanceOf(
+      TransparencySchedulerAbortedError
+    );
+    expect(
+      await env.storage.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)
+    ).toHaveLength(0);
+    expect(await env.storage.read("_meta", TRANSPARENCY_FLOOR_META_KEY)).toBeNull();
+  });
+
+  it("aborts after the counter-floor read before signer or write effects", async () => {
+    const env = makeEnv();
+    await seedAuditEvents(env.auditLog);
+    await emitEnforcementCheckpoint(emitInput(env, testSigner()));
+    const abort = mutableAbortState();
+    const storage = new (class extends MemoryStorage {
+      override async read(namespace: string, key: string) {
+        const value = await env.storage.read(namespace, key);
+        if (namespace === "_meta" && key === TRANSPARENCY_FLOOR_META_KEY) {
+          abort.abort();
+        }
+        return value;
+      }
+      override write(namespace: string, key: string, data: Uint8Array) {
+        return env.storage.write(namespace, key, data);
+      }
+      override delete(namespace: string, key: string, secureOverwrite?: boolean) {
+        return env.storage.delete(namespace, key, secureOverwrite);
+      }
+      override list(namespace: string, prefix?: string) {
+        return env.storage.list(namespace, prefix);
+      }
+    })();
+    let signerCalls = 0;
+    const signer: TransparencySigner = {
+      ...testSigner(),
+      sign: async (bytes) => {
+        signerCalls++;
+        return testSigner().sign(bytes);
+      },
+    };
+
+    await expect(
+      emitEnforcementCheckpoint({
+        ...emitInput({ ...env, storage }, signer),
+        abortState: abort.state,
+      })
+    ).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
+    expect(signerCalls).toBe(0);
+    expect(await readPersistedCheckpoints(env.storage)).toHaveLength(1);
+  });
+
+  it("aborts after checkpoint signing without persisting a new record", async () => {
+    const env = makeEnv();
+    await seedAuditEvents(env.auditLog);
+    const abort = mutableAbortState();
+    const signer = testSigner();
+    const abortingSigner: TransparencySigner = {
+      ...signer,
+      sign: async (bytes) => {
+        const signature = await signer.sign(bytes);
+        abort.abort();
+        return signature;
+      },
+    };
+
+    await expect(
+      emitEnforcementCheckpoint({
+        ...emitInput(env, abortingSigner),
+        abortState: abort.state,
+      })
+    ).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
     expect(
       await env.storage.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)
     ).toHaveLength(0);

@@ -23,6 +23,7 @@ import {
 } from "../../src/transparency/emitter.js";
 import { verifyAgainstLog } from "../../src/transparency/against-log.js";
 import type { VerifierCheckpointRecord } from "../../src/transparency/verify.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../../src/transparency/scheduler.js";
 
 function testSigner(privateKey = randomBytes(32)): TransparencySigner {
   const publicKey = ed25519.getPublicKey(privateKey);
@@ -75,6 +76,7 @@ async function seedAndEmit(): Promise<VerifierCheckpointRecord> {
     signer: testSigner(),
     binaryPath: join(fortressPath, "fake-binary.js"),
     version: "0.0.0-test",
+    abortState: TRANSPARENCY_NEVER_ABORTED,
   });
   return record as unknown as VerifierCheckpointRecord;
 }
@@ -233,6 +235,7 @@ describe("verify-transparency --against-log", () => {
       signer: testSigner(),
       binaryPath: join(fortressPath, "fake-binary.js"),
       version: "0.0.0-test",
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     })) as unknown as VerifierCheckpointRecord;
     // Append past maxEntries so rotation prunes the checkpoint's prefix.
     for (let i = 0; i < 6; i++) {
