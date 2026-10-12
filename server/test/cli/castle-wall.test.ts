@@ -2848,6 +2848,216 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         vi.useRealTimers();
       }
     });
+
+    it("scheduled transparency emit forwards the live abort state through every daemon checkpoint site", async () => {
+      vi.useFakeTimers();
+      const abort = await schedulerAbortHarness();
+      try {
+        const { createTransparencyDaemonScheduledEmit } = await import(
+          "../../src/cli/castle-wall.js"
+        );
+        const { MemoryStorage } = await import("../../src/storage/memory.js");
+        const { enableAnchoring } = await import(
+          "../../src/transparency/anchoring.js"
+        );
+        const { TransparencySchedulerAbortState } = await import(
+          "../../src/transparency/scheduler.js"
+        );
+        const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
+        tempDirs.push(fortressPath);
+        const rulesDir = join(fortressPath, "policy", "egress", "rules");
+        await mkdir(rulesDir, { recursive: true });
+        await writeFile(
+          join(rulesDir, "allow-helper.json"),
+          JSON.stringify({ rule_id: "allow-helper", host: "helper.example" }),
+        );
+        const binaryPath = join(fortressPath, "daemon.js");
+        await writeFile(binaryPath, "console.log('daemon');");
+
+        const storage = new MemoryStorage();
+        const masterKey = generateRandomKey();
+        const auditLog = new AuditLog(storage, masterKey);
+        await auditLog.appendCritical({
+          layer: "l1",
+          operation: "egress_allowed",
+          identity_id: "fortress-test",
+          result: "success",
+          details: { rule_id: "allow-helper" },
+        });
+        await enableAnchoring({
+          storage,
+          masterKey,
+          auditLog,
+          fortressId: "fortress-test",
+          abortState: abort.state,
+        });
+        const privateKey = generateRandomKey();
+        const publicKey = ed25519.getPublicKey(privateKey);
+        await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), publicKey);
+        await writeFile(
+          join(fortressPath, "castle-pinned-privkey.enc"),
+          JSON.stringify(encrypt(privateKey, masterKey)),
+        );
+        vi.stubGlobal("fetch", async () => ({
+          status: 201,
+          headers: { get: () => null },
+          text: async () =>
+            JSON.stringify({
+              "uuid-daemon": {
+                body: "ZHVtbXk=",
+                integratedTime: 1_760_000_000,
+                logID: "c0ffee".padEnd(64, "0"),
+                logIndex: 1,
+                verification: {
+                  inclusionProof: {
+                    checkpoint: "rekor.sigstore.dev - 1234\n",
+                    hashes: ["ab".repeat(32)],
+                    logIndex: 1,
+                    rootHash: "cd".repeat(32),
+                    treeSize: 2,
+                  },
+                  signedEntryTimestamp: "c2V0LXNpZw==",
+                },
+              },
+            }),
+        }));
+        const guard = vi.spyOn(
+          TransparencySchedulerAbortState,
+          "assertNotAborted",
+        );
+        const scheduledEmit = createTransparencyDaemonScheduledEmit({
+          storage,
+          auditLog,
+          storagePath: fortressPath,
+          masterKey,
+          env: {},
+          localSign: true,
+          globalPinnedPublicKeyPath: join(fortressPath, "absent-global-pin.bin"),
+          binaryPath,
+          version: "0.0.0-test",
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+        });
+
+        await scheduledEmit(abort.state);
+        for (const [phase, expectedCount] of [
+          ["transparency signer resolution", 1],
+          ["local transparency signer decrypt", 1],
+          ["counter-floor key derivation", 1],
+          ["anchoring config key derivation", 2],
+          ["anchor key derivation", 1],
+        ] as const) {
+          expect(
+            guard.mock.calls.filter(
+              ([state, observedPhase]) =>
+                state === abort.state && observedPhase === phase,
+            ),
+          ).toHaveLength(expectedCount);
+        }
+        guard.mockRestore();
+      } finally {
+        vi.unstubAllGlobals();
+        abort.release();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      ["spread-forged", "spread"],
+      ["cast-forged", "cast"],
+    ] as const)(
+      "scheduled transparency emit refuses a %s abort state before signer use",
+      async (_label, forgeKind) => {
+        vi.useFakeTimers();
+        const abort = await schedulerAbortHarness();
+        try {
+          const { createTransparencyDaemonScheduledEmit } = await import(
+            "../../src/cli/castle-wall.js"
+          );
+          const { MemoryStorage } = await import("../../src/storage/memory.js");
+          const {
+            TRANSPARENCY_CHECKPOINT_NAMESPACE,
+            TRANSPARENCY_FLOOR_META_KEY,
+          } = await import("../../src/transparency/emitter.js");
+          const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
+          tempDirs.push(fortressPath);
+          const rulesDir = join(fortressPath, "policy", "egress", "rules");
+          await mkdir(rulesDir, { recursive: true });
+          await writeFile(
+            join(rulesDir, "allow-helper.json"),
+            JSON.stringify({ rule_id: "allow-helper", host: "helper.example" }),
+          );
+          const binaryPath = join(fortressPath, "daemon.js");
+          await writeFile(binaryPath, "console.log('daemon');");
+
+          const storage = new MemoryStorage();
+          const masterKey = generateRandomKey();
+          const auditLog = new AuditLog(storage, masterKey);
+          await auditLog.appendCritical({
+            layer: "l1",
+            operation: "egress_allowed",
+            identity_id: "fortress-test",
+            result: "success",
+            details: { rule_id: "allow-helper" },
+          });
+          const privateKey = generateRandomKey();
+          const publicKey = ed25519.getPublicKey(privateKey);
+          let signCalls = 0;
+          const signerClientInvoke: ShimInvoker = async (args, stdin) => {
+            if (args[0] === "get-pubkey") {
+              return { stdout: `${toBase64url(publicKey)}\n`, stderr: "", code: 0 };
+            }
+            if (args[0] === "sign-manifest" && stdin !== null) {
+              signCalls += 1;
+              return {
+                stdout: `${toBase64url(ed25519.sign(stdin, privateKey))}\n`,
+                stderr: "",
+                code: 0,
+              };
+            }
+            return { stdout: "", stderr: "unexpected signer request", code: 1 };
+          };
+          const out = new CaptureStream();
+          const err = new CaptureStream();
+          const scheduledEmit = createTransparencyDaemonScheduledEmit({
+            storage,
+            auditLog,
+            storagePath: fortressPath,
+            masterKey,
+            env: {},
+            localSign: false,
+            signerClientInvoke,
+            globalPinnedPublicKeyPath: join(fortressPath, "absent-global-pin.bin"),
+            binaryPath,
+            version: "0.0.0-test",
+            out,
+            err,
+          });
+
+          const forged =
+            forgeKind === "spread"
+              ? ({
+                  ...abort.state,
+                  assertNotAborted(): void {},
+                } as unknown as import("../../src/transparency/scheduler.js").TransparencySchedulerAbortState)
+              : ({
+                  aborted: false,
+                  assertNotAborted(): void {},
+                } as unknown as import("../../src/transparency/scheduler.js").TransparencySchedulerAbortState);
+
+          await expect(scheduledEmit(forged)).rejects.toThrow(
+            /transparency signer resolution/,
+          );
+          expect(signCalls).toBe(0);
+          expect(await storage.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)).toHaveLength(0);
+          expect(await storage.read("_meta", TRANSPARENCY_FLOOR_META_KEY)).toBeNull();
+          expect(out.text()).toBe("");
+        } finally {
+          abort.release();
+          vi.useRealTimers();
+        }
+      },
+    );
   });
 
   /**

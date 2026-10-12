@@ -94,35 +94,62 @@ export class TransparencySchedulerAbortedError extends Error {
   }
 }
 
-const TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND: unique symbol = Symbol(
-  "TransparencySchedulerAbortState"
+const TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT = Symbol(
+  "TransparencySchedulerAbortState.mint"
 );
 
-export interface TransparencySchedulerAbortState {
-  readonly aborted: boolean;
-  assertNotAborted(phase: string): void;
-  readonly [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true;
+export class TransparencySchedulerAbortState {
+  readonly #brand = true;
+  readonly #isAborted: () => boolean;
+
+  private constructor(isAborted: () => boolean) {
+    this.#isAborted = isAborted;
+  }
+
+  static create(
+    mint: typeof TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
+    isAborted: () => boolean
+  ): TransparencySchedulerAbortState {
+    // INVARIANT (shutdown/key custody): live states are minted only through the
+    // module-private token, so exporting the verifier does not export a forge
+    // path for callers outside scheduler.ts.
+    if (mint !== TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT) {
+      throw new TransparencySchedulerAbortedError("abort state authentication");
+    }
+    return new TransparencySchedulerAbortState(isAborted);
+  }
+
+  get aborted(): boolean {
+    return this.#isAborted();
+  }
+
+  static assertNotAborted(
+    value: TransparencySchedulerAbortState,
+    phase: string
+  ): void {
+    // INVARIANT (shutdown/key custody): the abort state is minted only by this
+    // module; a same-shape object must fail closed before any guarded key use.
+    if (!(#brand in value) || value.#isAborted()) {
+      throw new TransparencySchedulerAbortedError(phase);
+    }
+  }
 }
 
 export const TRANSPARENCY_NEVER_ABORTED: TransparencySchedulerAbortState =
-  Object.freeze({
-    [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true as const,
-    aborted: false,
-    assertNotAborted(): void {},
-  });
+  Object.freeze(
+    TransparencySchedulerAbortState.create(
+      TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
+      () => false
+    )
+  ) as TransparencySchedulerAbortState;
 
 function createSchedulerAbortState(
   isAborted: () => boolean
 ): TransparencySchedulerAbortState {
-  return {
-    [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true,
-    get aborted() {
-      return isAborted();
-    },
-    assertNotAborted(phase: string): void {
-      if (isAborted()) throw new TransparencySchedulerAbortedError(phase);
-    },
-  };
+  return TransparencySchedulerAbortState.create(
+    TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
+    isAborted
+  );
 }
 
 export function startTransparencyScheduler(

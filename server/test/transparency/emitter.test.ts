@@ -43,9 +43,9 @@ import {
 import {
   TRANSPARENCY_NEVER_ABORTED,
   TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
+  TransparencySchedulerAbortState,
   TransparencySchedulerAbortedError,
   startTransparencyScheduler,
-  type TransparencySchedulerAbortState,
 } from "../../src/transparency/scheduler.js";
 
 const MASTER_KEY = () => randomBytes(32);
@@ -312,6 +312,24 @@ describe("transparency emitter", () => {
     } finally {
       abort.release();
       vi.useRealTimers();
+    }
+  });
+
+  it("calls the scheduler guard at checkpoint signing", async () => {
+    const env = makeEnv();
+    await seedAuditEvents(env.auditLog);
+    const guard = vi.spyOn(
+      TransparencySchedulerAbortState,
+      "assertNotAborted",
+    );
+    try {
+      await emitEnforcementCheckpoint(emitInput(env, testSigner()));
+      expect(guard).toHaveBeenCalledWith(
+        TRANSPARENCY_NEVER_ABORTED,
+        "checkpoint signing",
+      );
+    } finally {
+      guard.mockRestore();
     }
   });
 

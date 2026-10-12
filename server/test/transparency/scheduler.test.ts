@@ -7,6 +7,7 @@ import {
   TRANSPARENCY_LOCAL_SIGN_APPEND_BUDGET_MS,
   TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
   TRANSPARENCY_STOP_DRAIN_MARGIN_MS,
+  TransparencySchedulerAbortState,
 } from "../../src/transparency/scheduler.js";
 import { REKOR_SUBMIT_TIMEOUT_MS } from "../../src/transparency/rekor-client.js";
 
@@ -177,6 +178,26 @@ describe("startTransparencyScheduler", () => {
     }
   });
 
+  it("stop marks the captured abort state even after an idle tick settles", async () => {
+    vi.useFakeTimers();
+    try {
+      let captured: TransparencySchedulerAbortState | undefined;
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: async (state) => {
+          captured = state;
+        },
+        onError: () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+      await scheduler.stop();
+      expect(captured?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborts deadline-straddling emissions before late key work or writes", async () => {
     vi.useFakeTimers();
     try {
@@ -195,16 +216,19 @@ describe("startTransparencyScheduler", () => {
           });
           // INVARIANT (shutdown/key custody): no await may separate this abort
           // check from the synchronous derived-key operation it gates.
-          state.assertNotAborted("test key derivation");
+          TransparencySchedulerAbortState.assertNotAborted(
+            state,
+            "test key derivation"
+          );
           expect(masterKey[0]).toBe(7);
           deriveCalls += 1;
           // INVARIANT (shutdown/key custody): no await may separate this abort
           // check from the synchronous MAC operation it gates.
-          state.assertNotAborted("test MAC");
+          TransparencySchedulerAbortState.assertNotAborted(state, "test MAC");
           macCalls += 1;
           // INVARIANT (shutdown/key custody): no await may separate this abort
           // check from the synchronous signing operation it gates.
-          state.assertNotAborted("test signing");
+          TransparencySchedulerAbortState.assertNotAborted(state, "test signing");
           signCalls += 1;
           writes += 1;
         },

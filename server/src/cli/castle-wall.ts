@@ -73,6 +73,7 @@ import {
 } from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import { TransparencySchedulerAbortState } from "../transparency/scheduler.js";
 // Type-only: the runtime module itself stays behind the dynamic import below
 // so the Linux activation path is not pulled into every CLI invocation.
 import type { CastleWallActivationCompleteness } from "../castle-wall/runtime/linux-activation-gate.js";
@@ -800,7 +801,7 @@ export function createTransparencyDaemonScheduledEmit(
   input: TransparencyDaemonScheduledEmitInput
 ) {
   return async function state_SCHEDULED_TRANSPARENCY_EMIT(
-    abortState: import("../transparency/scheduler.js").TransparencySchedulerAbortState
+    abortState: TransparencySchedulerAbortState
   ): Promise<void> {
     const { emitEnforcementCheckpoint } = await import(
       "../transparency/emitter.js"
@@ -814,7 +815,10 @@ export function createTransparencyDaemonScheduledEmit(
 
     // INVARIANT (shutdown/key custody): no await may separate this abort
     // check from entering signer resolution with the daemon master key.
-    abortState.assertNotAborted("transparency signer resolution");
+    TransparencySchedulerAbortState.assertNotAborted(
+      abortState,
+      "transparency signer resolution"
+    );
     const signer = await resolveTransparencySigner({
       fortressPath: input.storagePath,
       masterKey: input.masterKey,

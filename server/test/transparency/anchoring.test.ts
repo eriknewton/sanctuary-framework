@@ -57,6 +57,7 @@ import {
   anchorCheckpoint,
   anchorPendingCheckpoints,
   anchorReceiptStorageKey,
+  buildAnchorsExport,
   disableAnchoring,
   enableAnchoring,
   readAnchorConfig,
@@ -73,9 +74,9 @@ import {
 import {
   TRANSPARENCY_NEVER_ABORTED,
   TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
+  TransparencySchedulerAbortState,
   TransparencySchedulerAbortedError,
   startTransparencyScheduler,
-  type TransparencySchedulerAbortState,
 } from "../../src/transparency/scheduler.js";
 
 const FORTRESS_ID = "fortress-anchor-test";
@@ -686,6 +687,104 @@ describe("fail loud, never blocking (outage fixture)", () => {
 });
 
 describe("scheduler abort custody checks", () => {
+  it("calls the scheduler guard before writing anchoring config keys", async () => {
+    const env = makeEnv();
+    const guard = vi.spyOn(
+      TransparencySchedulerAbortState,
+      "assertNotAborted",
+    );
+    try {
+      await enable(env);
+      expect(guard).toHaveBeenCalledWith(
+        TRANSPARENCY_NEVER_ABORTED,
+        "anchoring config key write",
+      );
+    } finally {
+      guard.mockRestore();
+    }
+  });
+
+  it("calls the scheduler guard before authenticating anchoring config", async () => {
+    const env = makeEnv();
+    await enable(env);
+    const guard = vi.spyOn(
+      TransparencySchedulerAbortState,
+      "assertNotAborted",
+    );
+    try {
+      await readAnchorConfig({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
+      expect(guard).toHaveBeenCalledWith(
+        TRANSPARENCY_NEVER_ABORTED,
+        "anchoring config MAC verification",
+      );
+    } finally {
+      guard.mockRestore();
+    }
+  });
+
+  it("calls the scheduler guard before signing anchor preimages", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    await enable(env);
+    const fixture = makeFetchFixture();
+    const guard = vi.spyOn(
+      TransparencySchedulerAbortState,
+      "assertNotAborted",
+    );
+    try {
+      await anchorCheckpoint({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        record,
+        fetchFn: fixture.fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
+      expect(guard).toHaveBeenCalledWith(
+        TRANSPARENCY_NEVER_ABORTED,
+        "anchor preimage signing",
+      );
+    } finally {
+      guard.mockRestore();
+    }
+  });
+
+  it("calls the scheduler guard before deriving the anchor export key", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    await enable(env);
+    await anchorCheckpoint({
+      storage: env.storage,
+      masterKey: env.masterKey,
+      auditLog: env.auditLog,
+      record,
+      fetchFn: makeFetchFixture().fetch,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
+    });
+    const guard = vi.spyOn(
+      TransparencySchedulerAbortState,
+      "assertNotAborted",
+    );
+    try {
+      await buildAnchorsExport({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        fortressId: FORTRESS_ID,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
+      expect(guard).toHaveBeenCalledWith(
+        TRANSPARENCY_NEVER_ABORTED,
+        "anchor export key derivation",
+      );
+    } finally {
+      guard.mockRestore();
+    }
+  });
+
   it("a scheduler abort after reading anchor config stops before config key derivation", async () => {
     vi.useFakeTimers();
     const abort = await schedulerAbortHarness();

@@ -10,6 +10,14 @@ function readSource(relativePath: string): string {
 }
 
 describe("transparency scheduler abort state wiring", () => {
+  it("uses an ES private runtime brand for abort-state checks", () => {
+    const scheduler = readSource("server/src/transparency/scheduler.ts");
+
+    expect(scheduler).toContain("export class TransparencySchedulerAbortState");
+    expect(scheduler).toContain("#brand in value");
+    expect(scheduler).toContain("static assertNotAborted(");
+  });
+
   it("the daemon scheduled path never substitutes the foreground-only abort constant", () => {
     const daemon = readSource("server/src/cli/castle-wall.ts");
     const scheduledFactory = daemon.slice(
@@ -21,7 +29,16 @@ describe("transparency scheduler abort state wiring", () => {
     expect(daemon).toContain(
       "const scheduledEmit = createTransparencyDaemonScheduledEmit({",
     );
-    expect(scheduledFactory).toContain("abortState.assertNotAborted");
-    expect(scheduledFactory).toContain("abortState,");
+    expect(daemon).toContain("emit: scheduledEmit,");
+    expect(
+      [
+        ...scheduledFactory.matchAll(
+          /(?:resolveTransparencySigner|emitEnforcementCheckpoint|readAnchorConfig|anchorCheckpoint)\(\{[\s\S]*?\n\s+abortState,\n/g,
+        ),
+      ],
+    ).toHaveLength(4);
+    expect(scheduledFactory).not.toMatch(/\.\.\.\s*abortState\b/);
+    expect(scheduledFactory).not.toMatch(/\babortState\s+as\b/);
+    expect(scheduledFactory).not.toMatch(/\bas\s+[^;\n]*TransparencySchedulerAbortState\b/);
   });
 });
