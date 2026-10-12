@@ -181,6 +181,28 @@ function duplicateFirstEntry(bundleBase64: string): string {
   return encodeBundle(decoded);
 }
 
+function exportedEntry(bundleBase64: string, key: string): unknown {
+  const decoded = decodeBundle(bundleBase64);
+  const data = decoded.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("missing bundle data");
+  }
+  const entries = (data as Record<string, unknown>).notes;
+  if (!Array.isArray(entries)) throw new Error("missing notes entry");
+  const item = entries.find((candidate) => {
+    return (
+      candidate &&
+      typeof candidate === "object" &&
+      !Array.isArray(candidate) &&
+      (candidate as Record<string, unknown>).key === key
+    );
+  });
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    throw new Error("missing requested entry");
+  }
+  return (item as Record<string, unknown>).entry;
+}
+
 async function wait(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -723,6 +745,141 @@ describe("state_import version floor tool path", () => {
       expect(second.value).toBe("concurrent");
       expect(second.version).toBe(3);
     } finally {
+      await rig.close();
+    }
+  });
+
+  it("StateStore.import anchors imported entries before a later older import", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const newerBundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "imported-anchor", value: "first" },
+          { key: "imported-anchor", value: "second" },
+          { key: "imported-anchor", value: "third" },
+        ],
+      });
+      const olderBundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "imported-anchor", value: "first" },
+          { key: "imported-anchor", value: "second" },
+        ],
+      });
+
+      await expect(
+        rig.stateStore.import(
+          newerBundle,
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null
+        )
+      ).resolves.toMatchObject({ imported_keys: 1 });
+
+      await expect(
+        rig.stateStore.import(
+          olderBundle,
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null
+        )
+      ).rejects.toMatchObject({ classification: "rollback_detected" });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("audits partial import progress when a later entry is refused", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      await writeValue(rig.client, identityId, "partial-second", "first");
+      await writeValue(rig.client, identityId, "partial-second", "second");
+      await writeValue(rig.client, identityId, "partial-second", "third");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "partial-first", value: "imported" },
+          { key: "partial-second", value: "first" },
+          { key: "partial-second", value: "second" },
+          { key: "partial-second", value: "third" },
+        ],
+      });
+      const raisedBundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "partial-second", value: "first" },
+          { key: "partial-second", value: "second" },
+          { key: "partial-second", value: "third" },
+          { key: "partial-second", value: "fourth" },
+        ],
+      });
+      const raisedEntry = exportedEntry(raisedBundle, "partial-second");
+
+      let raised = false;
+      storage.onWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "partial-first" && !raised) {
+          raised = true;
+          await storage.write(
+            "notes",
+            "partial-second",
+            stringToBytes(JSON.stringify(raisedEntry))
+          );
+          await readValue(rig.client, "partial-second");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+
+      const first = await readValue(rig.client, "partial-first");
+      expect(first.value).toBe("imported");
+      const second = await readValue(rig.client, "partial-second");
+      expect(second.value).toBe("fourth");
+      expect(second.version).toBe(4);
+
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_verification_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "partial-first" }],
+      });
+      expect(String(audit.entries[0]?.details?.reason)).toContain(
+        "partially applied"
+      );
+      const success = await rig.auditLog.query({
+        operation_type: "state_import",
+        limit: 10,
+      });
+      expect(success.entries).toHaveLength(0);
+    } finally {
+      storage.onWrite = undefined;
       await rig.close();
     }
   });

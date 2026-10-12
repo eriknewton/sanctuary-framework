@@ -15,10 +15,7 @@
  * - Secure deletion overwrites before unlinking
  */
 
-import type {
-  NamespaceLockStorageCapabilities,
-  StorageBackend,
-} from "../storage/interface.js";
+import type { StorageBackend } from "../storage/interface.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
 import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import {
@@ -105,8 +102,6 @@ const STATE_EXPORT_BUNDLE_MAC_COVERAGE =
   "sanctuary-v1-body-and-completeness-manifest";
 const STATE_EXPORT_LEGACY_REJECT_MESSAGE =
   "export predates completeness verification; re-export, or re-run with allow_unverified_legacy to import without completeness guarantees";
-const STATE_STORE_MUTATION_LOCK_NAMESPACE = "_meta";
-const STATE_STORE_MUTATION_LOCK_FILE = ".state-store-mutation.lock";
 const ISO_8601_TIMESTAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 
@@ -179,14 +174,61 @@ export type StateVerificationClassification =
   // to bypass a control that would have succeeded.
   | "writer_is_establishable";
 
+export type StateVerificationReason =
+  | "legacy_version_ceiling"
+  | "version_below_floor";
+
 export class StateVerificationError extends Error {
   readonly classification: StateVerificationClassification;
+  readonly reason?: StateVerificationReason;
 
-  constructor(classification: StateVerificationClassification, message: string) {
+  constructor(
+    classification: StateVerificationClassification,
+    message: string,
+    reason?: StateVerificationReason
+  ) {
     super(message);
     this.name = "StateVerificationError";
     this.classification = classification;
+    this.reason = reason;
   }
+}
+
+export interface StateImportWrittenKey {
+  namespace: string;
+  key: string;
+}
+
+export class StateImportPartialApplyError extends StateVerificationError {
+  readonly partial = true;
+  readonly importedBeforeRefusal: number;
+  readonly writtenKeys: StateImportWrittenKey[];
+
+  constructor(cause: StateVerificationError, writtenKeys: StateImportWrittenKey[]) {
+    super(
+      cause.classification,
+      `State import partially applied before verification refused: ${cause.message}`,
+      cause.reason
+    );
+    this.name = "StateImportPartialApplyError";
+    this.importedBeforeRefusal = writtenKeys.length;
+    this.writtenKeys = writtenKeys.map((written) => ({ ...written }));
+    (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
+
+export function isStateImportPartialApplyError(
+  error: unknown
+): error is StateImportPartialApplyError {
+  return error instanceof StateImportPartialApplyError;
+}
+
+export function isStateVersionFloorRefusal(error: unknown): boolean {
+  return (
+    error instanceof StateVerificationError &&
+    error.classification === "rollback_detected" &&
+    error.reason === "version_below_floor"
+  );
 }
 
 function parseExportBundleObject(bundleBase64: string): StateExportBundle {
@@ -1182,21 +1224,12 @@ export class StateStore {
   }
 
   private async withStateMutationLock<T>(operation: () => Promise<T>): Promise<T> {
-    const storageWithLock = this.storage as StorageBackend &
-      Partial<NamespaceLockStorageCapabilities>;
-    if (typeof storageWithLock.withNamespaceLock === "function") {
-      // Import floor checks and ordinary writes share this existing storage
-      // serialization point; otherwise a local write could raise the durable
-      // floor between an import's check and its write.
-      return storageWithLock.withNamespaceLock(
-        STATE_STORE_MUTATION_LOCK_NAMESPACE,
-        STATE_STORE_MUTATION_LOCK_FILE,
-        async () => operation()
-      );
-    }
-
-    // Test and decorator backends can omit the cross-process capability; keep
-    // one StateStore instance serialized instead of falling through unlocked.
+    // This is deliberately process-local: write() and import() need one
+    // StateStore instance serialized without taking the storage backend's
+    // cross-process lockfile. Two processes on one fortress are NOT
+    // serialized here; the shipped server boot holds the shared master-write
+    // barrier from index.ts/establishMaster only against master rotation, not as
+    // a state-mutation mutex, so import keeps its per-write floor recheck.
     const predecessor = this.mutationTail;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -1720,7 +1753,8 @@ export class StateStore {
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
         throw new StateVerificationError(
           "rollback_detected",
-          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`,
+          "legacy_version_ceiling"
         );
       }
     }
@@ -1788,7 +1822,8 @@ export class StateStore {
     if (version < lastSeen) {
       throw new StateVerificationError(
         "rollback_detected",
-        `Rollback detected for ${namespace}/${key}: found version ${version}, expected at least ${lastSeen}`
+        `Rollback detected for ${namespace}/${key}: found version ${version}, expected at least ${lastSeen}`,
+        "version_below_floor"
       );
     }
 
@@ -3273,10 +3308,14 @@ export class StateStore {
     // skip: existing entries are skipped and not floor-checked; absent entries write.
     // version: non-newer entries are skipped and not floor-checked; newer entries write.
     // overwrite: every verified non-reserved entry writes and is floor-checked.
+    // per-write floor refusal after earlier writes: those earlier writes remain
+    // applied, and the thrown error carries their count and keys for the operator audit.
     await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
 
     let importedKeys = 0;
+    const writtenKeys: StateImportWrittenKey[] = [];
     for (const { namespace: ns, key, entry } of plan.writeCandidates) {
+      try {
         // Codex gate finding (2026-08-22): re-check per write, not once at
         // the top of import() for the whole loop - a bulk import can run
         // long enough for a journal to appear after the top-level check
@@ -3300,12 +3339,27 @@ export class StateStore {
         const serialized = stringToBytes(JSON.stringify(entry));
         await this.storage.write(ns, key, serialized);
         importedKeys++;
+        writtenKeys.push({ namespace: ns, key });
+
+        // Imported signed envelopes established the same writer-bound version
+        // that readInternal would accept, so pin the durable floor now rather
+        // than waiting for a later read to discover it. Legacy v1 entries never
+        // raise this floor because their signature does not bind path/version.
+        if (entry.v >= LEGACY_STATE_ENVELOPE_SCHEMA_VERSION) {
+          await this.observeVersion(ns, key, entry.ver);
+        }
 
         // Update caches
         const vk = this.versionKey(ns, key);
         this.versionCache.set(vk, entry.ver);
         const nsHashes = await this.getNamespaceHashes(ns);
         nsHashes.set(key, entry.integrity_hash);
+      } catch (err) {
+        if (err instanceof StateVerificationError && writtenKeys.length > 0) {
+          throw new StateImportPartialApplyError(err, writtenKeys);
+        }
+        throw err;
+      }
     }
 
     const bundle = parseExportBundleObject(bundleBase64);

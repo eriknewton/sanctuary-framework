@@ -9,6 +9,7 @@
  */
 
 import {
+  isStateVersionFloorRefusal,
   StateVerificationError,
   type StateStore,
 } from "../cognitive/state-store.js";
@@ -296,12 +297,9 @@ function forensicSource(record: MemoryCheckpointRecord): CheckpointRestoreForens
 }
 
 function isCheckpointRestoreVersionFloorRefusal(error: unknown): boolean {
-  if (!(error instanceof StateVerificationError)) return false;
-  if (error.classification !== "rollback_detected") return false;
-  // Legacy v1 ceiling refusals are a distinct verification classification for
-  // checkpoint restore: only an entry below the durable floor earns the
-  // read-only no-audit floor refusal promised to the CLI.
-  return !error.message.includes("legacy (v1)");
+  // The typed reason is set at the StateStore enforcement site; checkpoint
+  // restore must not infer audit semantics from human-facing error text.
+  return isStateVersionFloorRefusal(error);
 }
 
 /** Read and validate a restore source without writing state or audit records. */

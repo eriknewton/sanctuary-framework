@@ -12,6 +12,7 @@ import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
   getReservedNamespaceViolation,
+  isStateImportPartialApplyError,
   StateStore,
   StateVerificationError,
   UNATTRIBUTED_DISCLOSURE_NOTICE,
@@ -1143,6 +1144,13 @@ export function createCognitiveTools(
     error: StateVerificationError,
     namespaces: string[]
   ) {
+    const partial = isStateImportPartialApplyError(error)
+      ? {
+          partial: true,
+          imported_before_refusal: error.importedBeforeRefusal,
+          written_keys: error.writtenKeys,
+        }
+      : {};
     await recordCriticalAudit(
       auditLog,
       "l1",
@@ -1152,6 +1160,7 @@ export function createCognitiveTools(
         namespaces,
         classification: error.classification,
         reason: error.message,
+        ...partial,
       },
       "failure"
     );
@@ -2204,13 +2213,6 @@ export function createCognitiveTools(
           throw err;
         }
 
-        await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
-          conflict_resolution:
-            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
-            "skip",
-          namespaces: targetNamespaces,
-        });
-
         // N4 (coordinator gate, 2026-08-22): StateStore.import refuses
         // while an exit-import journal exists; catch that SPECIFIC error
         // to audit the refusal and return a clean tool-result error.
@@ -2243,6 +2245,13 @@ export function createCognitiveTools(
           }
           throw err;
         }
+
+        await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
+          conflict_resolution:
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+            "skip",
+          namespaces: targetNamespaces,
+        });
 
         return toolResult(result);
       },
