@@ -784,4 +784,22 @@ describe("wrap/cli custody normalize summary", () => {
     expect(out.join("\n")).toContain("left 1 entry untouched");
     expect(out.join("\n")).toContain("multi.enc");
   });
+
+  it("uses the foreign-owner remedy for foreign-owner custody skips", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [{ path: "foreign.enc", uid: 502, gid: 20, reason: "foreign_owner" }],
+        vanished: [],
+        failed: [],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain("foreign.enc");
+    expect(rendered).toContain("owned by uid 502");
+    expect(rendered).not.toContain("extra names");
+  });
 });

@@ -100,6 +100,7 @@ import {
   castleWallNotYetWalledSentence,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
+import { custodySkipOperatorMessage } from "../castle-wall/provision/fortress-custody.js";
 import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
@@ -2905,13 +2906,13 @@ function renderCustodyNormalizeLines(summary: AutoProvisionSummary): string[] {
     return [];
   }
   if (custody.skips.length > 0) {
-    const paths = custody.skips.map((skip) => skip.path).join(", ");
+    const details = custody.skips.map((skip) => custodySkipOperatorMessage(skip)).join(" ");
     return [
       `  Fortress custody normalize repaired ${custody.repaired.length} entr${
         custody.repaired.length === 1 ? "y" : "ies"
       } and left ${custody.skips.length} entr${
         custody.skips.length === 1 ? "y" : "ies"
-      } untouched (${paths}). Run \`sanctuary castle-wall repair-custody\` after removing the extra names, or inspect as root.`,
+      } untouched. ${details}`,
     ];
   }
   return [

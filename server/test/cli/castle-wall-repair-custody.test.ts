@@ -32,7 +32,7 @@ class CaptureStream extends Writable {
 }
 
 interface FakeNode {
-  type: "dir" | "file" | "socket" | "symlink";
+  type: "dir" | "file" | "socket" | "symlink" | "other";
   uid: number;
   gid: number;
   mode: number;
@@ -236,7 +236,7 @@ describe("castle-wall repair-custody", () => {
       expect(fake.nodes.get("/Users/mini2/.sanctuary")!.uid).toBe(501);
       expect(fake.nodes.get("/Users/mini2/.sanctuary/castle.sock")!.uid).toBe(501);
       expect(fake.nodes.get("/Users/mini2/.sanctuary/state/other.enc")!.uid).toBe(502);
-      expect(ctx.out.text()).toContain("skipped: state/other.enc");
+      expect(ctx.out.text()).toContain("state/other.enc is owned by uid 502");
       expect(ctx.out.text()).toContain("Rollback");
 
       // CLI-mutator audit rule: the repair writes a metadata-only audit entry.
@@ -649,6 +649,58 @@ describe("castle-wall repair-custody", () => {
       expect(ctx.out.text()).toContain(
         "fortress entry multi.enc has more than one name and was left untouched",
       );
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hands back audit state created during a skipped forward run", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/state": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 2 },
+          "/Users/mini2/.sanctuary/state/multi.enc": {
+            type: "file",
+            uid: 0,
+            gid: 20,
+            mode: 0o600,
+            ino: 3,
+            nlink: 2,
+          },
+        },
+        {
+          "/Users/mini2/.sanctuary": ["state"],
+          "/Users/mini2/.sanctuary/state": ["multi.enc"],
+        },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+      ctx.appendAudit = async (operation, details) => {
+        ctx.auditOps.push({ operation, details });
+        fake.nodes.set("/Users/mini2/.sanctuary/state/audit.json", {
+          type: "file",
+          uid: 0,
+          gid: 20,
+          mode: 0o600,
+          ino: 4,
+          nlink: 1,
+        });
+      };
+      const originalReaddir = fake.ops.readdir.bind(fake.ops);
+      fake.ops.readdir = async (path) => {
+        const names = await originalReaddir(path);
+        if (path === "/Users/mini2/.sanctuary/state" && fake.nodes.has(`${path}/audit.json`)) {
+          return [...new Set([...names, "audit.json"])];
+        }
+        return names;
+      };
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.auditOps[0]?.details).toMatchObject({ skipped_multiple_names: 1 });
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/state/audit.json")!.uid).toBe(501);
     } finally {
       await rm(manifestDir, { recursive: true, force: true });
     }

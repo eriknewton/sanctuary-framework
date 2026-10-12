@@ -217,7 +217,7 @@ export interface CustodyRepairAction {
   chmodTo?: number;
 }
 
-export type CustodySkipReason = "foreign_owner" | "multiple_names";
+export type CustodySkipReason = "foreign_owner" | "multiple_names" | "unsupported_type";
 
 export interface CustodySkip {
   path: string;
@@ -260,9 +260,13 @@ export interface CustodyApplyResult {
 
 export function custodySkipOperatorMessage(skip: CustodySkip): string {
   if (skip.reason === "multiple_names") {
-    return `fortress entry ${skip.path} has more than one name and was left untouched. Run \`sanctuary castle-wall repair-custody\` after removing the extra names, or inspect as root.`;
+    // DEBT(CUSTODY-TRANSIENT-SECOND-NAME): Sanctuary writers can briefly stage a same-fortress second name; repair stays fail-closed and tells the operator to remove a stale staging alias first.
+    return `fortress entry ${skip.path} has more than one name and was left untouched. If this is a stale same-fortress staging alias from an interrupted write, remove that stale alias first. Then run \`sudo sanctuary castle-wall repair-custody\`, or inspect as root.`;
   }
-  return `fortress entry ${skip.path} is owned by uid ${skip.uid} (neither root nor the operator); left untouched.`;
+  if (skip.reason === "unsupported_type") {
+    return `fortress entry ${skip.path} has an unsupported filesystem type and was left untouched. Inspect it with sudo and remove it from the fortress if it does not belong there.`;
+  }
+  return `fortress entry ${skip.path} is owned by uid ${skip.uid} (neither root nor the operator); left untouched. Inspect it with sudo before changing ownership.`;
 }
 
 export type FortressCustodyBaseFailureReason =
@@ -432,6 +436,15 @@ export function planFortressCustodyRepairs(
   const skips: CustodySkip[] = [];
   const socketModeDeviations: { path: string; mode: number }[] = [];
   for (const entry of entries) {
+    if (entry.type === "other") {
+      skips.push({
+        path: entry.path,
+        uid: entry.uid,
+        gid: entry.gid,
+        reason: "unsupported_type",
+      });
+      continue;
+    }
     if (entry.uid !== 0 && entry.uid !== operator.uid) {
       skips.push({
         path: entry.path,
@@ -501,6 +514,20 @@ function multiplyNamedRegularFileSkip(
 ): CustodySkip | null {
   if (entry.type !== "file") return null;
   return multiplyNamedNonDirectorySkip(entry, stats);
+}
+
+function unsupportedTypeSkip(entry: FortressCustodyEntry, stats: Stats): CustodySkip | null {
+  if (entry.type !== "other") return null;
+  return {
+    path: entry.path,
+    uid: stats.uid,
+    gid: stats.gid,
+    reason: "unsupported_type",
+  };
+}
+
+function hasUnsupportedTypeSkip(skips: readonly CustodySkip[]): boolean {
+  return skips.some((skip) => skip.reason === "unsupported_type");
 }
 
 /** Directory-open flags: never follow a symlink, never open a non-directory. */
@@ -697,7 +724,7 @@ async function applyOneAction(
     }
     // Socket / symlink / other: not openable, so the ancestor verification
     // above is the containment guarantee; re-verify the entry's own identity
-    // by a fresh no-follow lstat immediately before the no-follow chown.
+    // by a fresh no-follow lstat before considering the no-follow chown.
     let fresh: Stats;
     try {
       fresh = await ops.lstat(join(fortressPath, relPath));
@@ -708,10 +735,16 @@ async function applyOneAction(
     if (!sameIdentity(action.entry, fresh)) return { kind: "identity_changed" };
     if (!(await revalidateHeldAncestors(ancestors, ops))) return { kind: "ancestor_changed" };
     if (action.chownTo !== undefined) {
-      // Non-directory entries without a descriptor form are changed only when lstat shows exactly one name; otherwise they are left as found.
-      const skip = multiplyNamedNonDirectorySkip(action.entry, fresh);
+      const operationFresh = await ops.lstat(join(fortressPath, relPath));
+      if (!sameIdentity(action.entry, operationFresh)) return { kind: "identity_changed" };
+      const unsupported = unsupportedTypeSkip(action.entry, operationFresh);
+      if (unsupported !== null) return { kind: "skipped", skip: unsupported };
+      // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): Node has no fchownat-style descriptor form for sockets, so the last enforceable observation is the lstat immediately before lchown plus a post-change identity check.
+      const skip = multiplyNamedNonDirectorySkip(action.entry, operationFresh);
       if (skip !== null) return { kind: "skipped", skip };
       await ops.lchown(join(fortressPath, relPath), action.chownTo.uid, action.chownTo.gid);
+      const after = await ops.lstat(join(fortressPath, relPath));
+      if (!sameIdentity(action.entry, after)) return { kind: "identity_changed" };
     }
     // NOTE (2026-07-31 gate round 3): sockets and symlinks cannot be opened,
     // so a mode restore here could only be a PATHNAME chmod -- and a pathname
@@ -1015,6 +1048,11 @@ export async function applyCustodyRollback(
           result.identityChanged.push(entry.path);
           continue;
         }
+        const unsupported = unsupportedTypeSkip(entry, current);
+        if (unsupported !== null) {
+          result.skipped.push(unsupported);
+          continue;
+        }
         const targetMode = entry.mode & 0o777;
         const needsChown = current.uid !== entry.uid || current.gid !== entry.gid;
         const needsChmod =
@@ -1073,8 +1111,15 @@ export async function applyCustodyRollback(
               result.identityChanged.push(`${entry.path} (ancestor changed)`);
               continue;
             }
-            // Non-directory rollback entries without a descriptor form are changed only when lstat shows exactly one name; otherwise they are left as found.
-            const skip = multiplyNamedNonDirectorySkip(entry, current);
+            const operationFresh = await ops.lstat(
+              entry.path === "." ? fortressPath : join(fortressPath, entry.path),
+            );
+            if (!sameIdentity(entry, operationFresh)) {
+              result.identityChanged.push(entry.path);
+              continue;
+            }
+            // Socket rollback has the same bounded pathname operation as the forward socket bound above.
+            const skip = multiplyNamedNonDirectorySkip(entry, operationFresh);
             if (skip !== null) {
               result.skipped.push(skip);
               continue;
@@ -1084,6 +1129,13 @@ export async function applyCustodyRollback(
               entry.uid,
               entry.gid,
             );
+            const after = await ops.lstat(
+              entry.path === "." ? fortressPath : join(fortressPath, entry.path),
+            );
+            if (!sameIdentity(entry, after)) {
+              result.identityChanged.push(entry.path);
+              continue;
+            }
           }
         }
         result.repaired.push(entry.path);
@@ -1180,6 +1232,9 @@ export async function normalizeFortressCustody(
       }
     }
     if (plan.actions.length === 0) {
+      if (hasUnsupportedTypeSkip(plan.skips)) {
+        outcome.status = "failed";
+      }
       return outcome;
     }
     const applied = await applyFortressCustodyRepairs(input.fortressPath, plan, ops);
@@ -1188,6 +1243,7 @@ export async function normalizeFortressCustody(
     outcome.vanished.push(...applied.vanished);
     outcome.failed = applied.failed;
     const finalFailed =
+      hasUnsupportedTypeSkip(plan.skips) ||
       applied.skipped.length > 0 ||
       applied.identityChanged.length > 0 ||
       applied.failed.length > 0;
