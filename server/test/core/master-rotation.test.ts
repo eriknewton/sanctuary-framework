@@ -322,12 +322,15 @@ async function writeResidentIdentity(
   );
 }
 
-async function rotateResidentIdentity(fortress: Fortress): Promise<StoredIdentity> {
+async function rotateResidentIdentity(
+  fortress: Fortress,
+  reason = "test identity rotation",
+): Promise<StoredIdentity> {
   const { identity, identityKey } = await readResidentIdentity(fortress);
   const { updatedIdentity } = rotateKeys(
     identity,
     identityKey,
-    "test identity rotation"
+    reason
   );
   await writeResidentIdentity(fortress, updatedIdentity, identityKey);
   return updatedIdentity;
@@ -499,6 +502,39 @@ describe("master rotation: happy path", () => {
     expect(before?.signature_verified).toBe(true);
     expect(after?.value).toBe("written after identity rotation");
     expect(after?.signature_verified).toBe(true);
+  });
+
+  it("rotates the master after a declared-compromise identity rotation, preserving locally retained entries", async () => {
+    const fortress = await buildFortress();
+    const updatedIdentity = await rotateResidentIdentity(
+      fortress,
+      "key compromised during local recovery",
+    );
+    const { identityKey } = await readResidentIdentity(fortress);
+
+    const stateStore = new StateStore(fortress.storage, fortress.master);
+    await stateStore.write(
+      "notes",
+      "after-declared-compromise-rotate",
+      "written after declared-compromise rotation",
+      KID,
+      updatedIdentity.encrypted_private_key,
+      identityKey
+    );
+
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const rotatedStore = new StateStore(fortress.storage, est.masterKey);
+
+    const retained = await rotatedStore.read("notes", "k1");
+    const current = await rotatedStore.read("notes", "after-declared-compromise-rotate");
+    expect(retained?.value).toBe("hello sovereign world");
+    expect(retained?.signature_verified).toBe(true);
+    expect(current?.value).toBe("written after declared-compromise rotation");
+    expect(current?.signature_verified).toBe(true);
   });
 
   it("restamps the durable SDW owner pin under the new master", async () => {

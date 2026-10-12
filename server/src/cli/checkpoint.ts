@@ -16,9 +16,11 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 
-import { StateStore } from "../cognitive/state-store.js";
+import {
+  createStateImportWriterKeyResolver,
+  StateStore,
+} from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { fromBase64url } from "../core/encoding.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
@@ -543,11 +545,9 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
-  const publicKeyResolver = (kid: string): Uint8Array | null => {
-    const identity = boot.identityManager.get(kid);
-    if (!identity) return null;
-    return fromBase64url(identity.public_key);
-  };
+  const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
+    boot.identityManager.get(kid)
+  );
 
   // Check before approval auditing writes reserved state; restore repeats this
   // read-only preflight at its own boundary before any reconstruction writes.

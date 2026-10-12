@@ -11,6 +11,7 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
+  createStateImportWriterKeyResolver,
   getStateImportPartialApplyDetails,
   getReservedNamespaceViolation,
   StateStore,
@@ -2308,12 +2309,9 @@ export function createCognitiveTools(
           return denyNamespaceAccess("state_import", "state_import");
         }
 
-        // Wire public key resolver for signature verification (SEC-005)
-        const publicKeyResolver = (kid: string): Uint8Array | null => {
-          const identity = identityMgr.get(kid);
-          if (!identity) return null;
-          return fromBase64url(identity.public_key);
-        };
+        const publicKeyResolver = createStateImportWriterKeyResolver((kid) =>
+          identityMgr.get(kid)
+        );
 
         try {
           // Storage-name refusal intentionally precedes version-floor planning:

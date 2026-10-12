@@ -33,7 +33,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
   let identity: ReturnType<typeof createIdentity>;
 
   // Public key resolver that knows about the test identity
-  let resolver: (kid: string) => Uint8Array | null;
+  let resolver: (kid: string) => Uint8Array[] | null;
 
   beforeEach(async () => {
     masterKey = generateRandomKey();
@@ -42,9 +42,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
     identity = createIdentity("test-identity", identityEncKey, "recovery-key");
 
-    resolver = (kid: string): Uint8Array | null => {
+    resolver = (kid: string): Uint8Array[] | null => {
       if (kid === identity.storedIdentity.identity_id) {
-        return fromBase64url(identity.storedIdentity.public_key);
+        return [fromBase64url(identity.storedIdentity.public_key)];
       }
       return null;
     };

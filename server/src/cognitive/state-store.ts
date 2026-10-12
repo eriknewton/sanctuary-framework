@@ -95,8 +95,10 @@ const STATE_META_MAC_MARKER = "__sanctuary_meta_mac_v1";
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 const STATE_EXPORT_FORMAT = "sanctuary-v1";
 const STATE_EXPORT_BUNDLE_SCHEMA_VERSION = 1;
+// Must match the mirror constants in test/memory-checkpoint/restore.test.ts.
 const STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION = 1;
 const STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION = 1;
+// Must match the mirror constants in test/memory-checkpoint/restore.test.ts.
 const STATE_EXPORT_BUNDLE_MAC_PURPOSE = "state-export-bundle-mac-v1";
 const STATE_EXPORT_BUNDLE_MAC_DOMAIN =
   "sanctuary.state-export-bundle.v1\n";
@@ -597,23 +599,30 @@ export interface ResolvedWriterPublicKey {
   publicKey: Uint8Array;
   publicKeyBase64url: string;
   trustBasis: WriterPublicKeyTrustBasis;
+  /** true only for retired keys whose authenticated rotation reason declares compromise. */
+  compromised: boolean;
   source:
     | "identity-current"
     | "identity-rotation-chain"
     | "plaintext-registry";
 }
 
+export type StateImportPublicKeyResolver = (
+  kid: string
+) => readonly Uint8Array[] | null | undefined;
+
 function appendResolvedWriterKey(
   keys: ResolvedWriterPublicKey[],
   seen: Set<string>,
   publicKeyBase64url: string,
   source: ResolvedWriterPublicKey["source"],
-  trustBasis: WriterPublicKeyTrustBasis
+  trustBasis: WriterPublicKeyTrustBasis,
+  compromised = false
 ): boolean {
   if (seen.has(publicKeyBase64url)) return true;
   try {
     const publicKey = fromBase64url(publicKeyBase64url);
-    keys.push({ publicKey, publicKeyBase64url, trustBasis, source });
+    keys.push({ publicKey, publicKeyBase64url, trustBasis, source, compromised });
     seen.add(publicKeyBase64url);
     return true;
   } catch {
@@ -640,7 +649,8 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
         seen,
         retired.public_key_base64url,
         "identity-rotation-chain",
-        "authenticated"
+        "authenticated",
+        retired.compromised
       )
     ) {
       return [];
@@ -651,10 +661,56 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
     seen,
     identity.public_key,
     "identity-current",
-    "authenticated"
+    "authenticated",
+    false
   )
     ? keys
     : [];
+}
+
+export function createStateImportWriterKeyResolver(
+  getIdentity: (kid: string) => StoredIdentity | null | undefined
+): StateImportPublicKeyResolver {
+  return (kid: string): readonly Uint8Array[] | null => {
+    const identity = getIdentity(kid);
+    if (!identity) return null;
+    // INVARIANT: import and restore consume external bytes, so keys retired by
+    // a compromised-reason rotation are not admissible here; state_read keeps
+    // resolving them for locally retained entries until that separate policy changes.
+    const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
+    const importableKeys = keys.filter((key) => !key.compromised);
+    return importableKeys.length > 0
+      ? importableKeys.map((key) => key.publicKey)
+      : null;
+  };
+}
+
+export function verifyStateEntrySignaturesWithAuthenticatedKey(args: {
+  publicKeys: readonly Uint8Array[];
+  legacyCiphertext: Uint8Array;
+  legacySignature: Uint8Array;
+  envelopeBytes?: Uint8Array;
+  envelopeSignature?: Uint8Array;
+}): boolean {
+  // INVARIANT: schema-2+ entries bind the envelope and legacy ciphertext to
+  // the same authenticated writer key; separate matching keys would install
+  // bytes the enforcing reader refuses.
+  if (
+    (args.envelopeBytes === undefined) !==
+    (args.envelopeSignature === undefined)
+  ) {
+    return false;
+  }
+  return args.publicKeys.some((publicKey) => {
+    if (
+      args.envelopeBytes !== undefined &&
+      args.envelopeSignature !== undefined &&
+      !verify(args.envelopeBytes, args.envelopeSignature, publicKey)
+    ) {
+      return false;
+    }
+    return verify(args.legacyCiphertext, args.legacySignature, publicKey);
+  });
 }
 
 /** Result of a state write operation */
@@ -2461,13 +2517,11 @@ export class StateStore {
         return { verified: false, warnings };
       }
 
-      const sigValid = publicKeys.some((publicKey) =>
-        verify(
-          fromBase64url(entry.payload.ct),
-          fromBase64url(entry.sig),
-          publicKey
-        )
-      );
+      const sigValid = verifyStateEntrySignaturesWithAuthenticatedKey({
+        publicKeys,
+        legacyCiphertext: fromBase64url(entry.payload.ct),
+        legacySignature: fromBase64url(entry.sig),
+      });
       if (!sigValid) {
         throw new StateVerificationError(
           "signature_mismatch",
@@ -2511,10 +2565,13 @@ export class StateStore {
     const legacySig = fromBase64url(entry.sig);
     const signedEnvelope = stateEnvelopeSigningBytes(envelope);
     const legacyCiphertext = fromBase64url(entry.payload.ct);
-    const sigValid = publicKeys.some((publicKey) =>
-      verify(signedEnvelope, envelopeSig, publicKey) &&
-      verify(legacyCiphertext, legacySig, publicKey)
-    );
+    const sigValid = verifyStateEntrySignaturesWithAuthenticatedKey({
+      publicKeys,
+      envelopeBytes: signedEnvelope,
+      envelopeSignature: envelopeSig,
+      legacyCiphertext,
+      legacySignature: legacySig,
+    });
     if (!sigValid) {
       throw new StateVerificationError(
         "signature_mismatch",
@@ -3236,10 +3293,12 @@ export class StateStore {
     namespace: string,
     key: string,
     entry: StateEntry,
-    publicKeyResolver: (kid: string) => Uint8Array | null
+    publicKeyResolver: StateImportPublicKeyResolver
   ): Promise<"valid" | "unknown-kid" | "invalid-sig"> {
-    const signerPublicKey = publicKeyResolver(entry.kid);
-    if (!signerPublicKey) return "unknown-kid";
+    // INVARIANT: an empty authenticated key set is an unknown writer, never a
+    // cue to retry with the entry's embedded or registry-only key material.
+    const signerPublicKeys = publicKeyResolver(entry.kid) ?? [];
+    if (signerPublicKeys.length === 0) return "unknown-kid";
 
     try {
       if (
@@ -3249,35 +3308,41 @@ export class StateStore {
       ) {
         return "invalid-sig";
       }
-      const signaturePayload =
-        entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
-        entry.v === STATE_ENVELOPE_SCHEMA_VERSION
-          ? stateEnvelopeSigningBytes(
-              this.validateSignedEnvelope(entry, namespace, key)
-            )
-          : fromBase64url(entry.payload.ct);
-      const signature =
-        entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
-        entry.v === STATE_ENVELOPE_SCHEMA_VERSION
-          ? entry.envelope_sig
-          : entry.sig;
-      if (!signature) return "invalid-sig";
-      const sigValid = verify(
-        signaturePayload,
-        fromBase64url(signature),
-        signerPublicKey
-      );
-      if (!sigValid) return "invalid-sig";
       if (
         entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
         entry.v === STATE_ENVELOPE_SCHEMA_VERSION
       ) {
-        const legacySigValid = verify(
-          fromBase64url(entry.payload.ct),
-          fromBase64url(entry.sig),
-          signerPublicKey
+        if (!entry.envelope_sig || typeof entry.sig !== "string") {
+          return "invalid-sig";
+        }
+        const signedEnvelope = stateEnvelopeSigningBytes(
+          this.validateSignedEnvelope(entry, namespace, key)
         );
-        if (!legacySigValid) return "invalid-sig";
+        const envelopeSignature = fromBase64url(entry.envelope_sig);
+        const legacyCiphertext = fromBase64url(entry.payload.ct);
+        const legacySignature = fromBase64url(entry.sig);
+        if (
+          !verifyStateEntrySignaturesWithAuthenticatedKey({
+            publicKeys: signerPublicKeys,
+            envelopeBytes: signedEnvelope,
+            envelopeSignature,
+            legacyCiphertext,
+            legacySignature,
+          })
+        ) {
+          return "invalid-sig";
+        }
+      } else {
+        if (!entry.sig) return "invalid-sig";
+        if (
+          !verifyStateEntrySignaturesWithAuthenticatedKey({
+            publicKeys: signerPublicKeys,
+            legacyCiphertext: fromBase64url(entry.payload.ct),
+            legacySignature: fromBase64url(entry.sig),
+          })
+        ) {
+          return "invalid-sig";
+        }
       }
     } catch {
       return "invalid-sig";
@@ -3295,7 +3360,7 @@ export class StateStore {
   private async buildImportPlan(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution,
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<ImportPlan> {
     // Must match assertImportVersionFloors, StateStore.import, and
@@ -3409,7 +3474,7 @@ export class StateStore {
   async assertImportVersionFloors(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution,
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<StateImportVersionFloorPreflight> {
     const plan = await this.buildImportPlan(
@@ -3432,7 +3497,7 @@ export class StateStore {
   async import(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution = "skip",
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<{
     imported_keys: number;
@@ -3735,13 +3800,11 @@ export async function rotateStateEntryBytes(args: {
     if (entry.v === 1) {
       if (
         typeof entry.sig !== "string" ||
-        !verificationPublicKeys.some((publicKey) =>
-          verify(
-            fromBase64url(entry.payload.ct),
-            fromBase64url(entry.sig),
-            publicKey
-          )
-        )
+        !verifyStateEntrySignaturesWithAuthenticatedKey({
+          publicKeys: verificationPublicKeys,
+          legacyCiphertext: fromBase64url(entry.payload.ct),
+          legacySignature: fromBase64url(entry.sig),
+        })
       ) {
         throw new RotationStateEntryError(
           `state entry ${namespace}/${key} failed legacy signature verification; refusing to re-sign it`
@@ -3778,10 +3841,13 @@ export async function rotateStateEntryBytes(args: {
         typeof entry.sig === "string" ? fromBase64url(entry.sig) : null;
       const sigValid =
         legacySig !== null &&
-        verificationPublicKeys.some((publicKey) =>
-          verify(signedEnvelope, envelopeSig, publicKey) &&
-          verify(legacyCiphertext, legacySig, publicKey)
-        );
+        verifyStateEntrySignaturesWithAuthenticatedKey({
+          publicKeys: verificationPublicKeys,
+          envelopeBytes: signedEnvelope,
+          envelopeSignature: envelopeSig,
+          legacyCiphertext,
+          legacySignature: legacySig,
+        });
       if (!sigValid) {
         throw new RotationStateEntryError(
           `state entry ${namespace}/${key} failed signature verification; refusing to re-sign it`
