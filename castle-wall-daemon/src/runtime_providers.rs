@@ -5606,14 +5606,38 @@ mod tests {
         rule_id: &str,
         agent_origin: Option<crate::manifest::verify::AgentOrigin>,
     ) -> String {
+        write_watcher_policy_with_origin_and_scope(policy_dir, signing, rule_id, agent_origin, &[])
+    }
+
+    /// Extends the origin fixture with explicit rule scope so watcher tests can
+    /// exercise the same composed snapshot checks as the production reload path.
+    fn write_watcher_policy_with_origin_and_scope(
+        policy_dir: &Path,
+        signing: &SigningKey,
+        rule_id: &str,
+        agent_origin: Option<crate::manifest::verify::AgentOrigin>,
+        scope_agent_ids: &[String],
+    ) -> String {
         use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 
         fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
         let rule_file = format!("{rule_id}.json");
-        let rule_body = format!(
-            "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-02T00:00:00Z\",\"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
-        )
-        .into_bytes();
+        let rule_body = if scope_agent_ids.is_empty() {
+            format!(
+                "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-02T00:00:00Z\",\"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
+            )
+            .into_bytes()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "id": rule_id,
+                "schema_version": crate::constants::SCHEMA_VERSION_V1,
+                "created_at": "2026-09-02T00:00:00Z",
+                "match": { "ip": ["203.0.113.7"] },
+                "scope": { "agent_ids": scope_agent_ids },
+                "disposition": "allow"
+            }))
+            .unwrap()
+        };
         fs::write(policy_dir.join(RULES_SUBDIR).join(&rule_file), &rule_body).unwrap();
         let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
         let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
@@ -6331,6 +6355,71 @@ mod tests {
             .event_canonical_json
             .contains("\"operation\":\"manifest_verify_failed_kept_prior\""));
         assert!(event.event_canonical_json.contains("manifest file missing"));
+    }
+
+    #[test]
+    fn watcher_scope_refusal_keeps_prior_and_emits_steady_state_audit() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_uid = 60_123u32;
+        let origin = crate::manifest::verify::AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(agent_uid),
+            gate_uid: None,
+            system_uid_allow_ceiling: 500,
+        };
+        write_watcher_policy_with_origin_and_scope(
+            &policy_dir,
+            &signing,
+            "rule-old",
+            Some(origin.clone()),
+            &[format!("uid-{agent_uid}")],
+        );
+        let store = Arc::new(Mutex::new(crate::manifest::ManifestStore::new(
+            policy_dir.clone(),
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            "deadbeef".to_string(),
+        )));
+        store.lock().unwrap().reload().expect("load prior policy");
+        write_watcher_policy_with_origin_and_scope(
+            &policy_dir,
+            &signing,
+            "rule-new",
+            Some(origin),
+            &[format!("agent-{agent_uid}")],
+        );
+        let (engine, _wal, audit_buffer, _injection) =
+            audit_backed_engine(&dir, Some(Arc::clone(&store)));
+        assert!(
+            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
+                fortress_id: "deadbeef".to_string(),
+                subject: crate::decision::AdmittedSubject::Confined {
+                    agent_uid,
+                    ceiling: 500,
+                    gate_uid: None,
+                },
+            })
+        );
+
+        handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
+            .expect("verification refusal audit must succeed");
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.current().unwrap().signed.manifest.generation, 1);
+        drop(guard);
+        let audit = audit_buffer.lock().unwrap();
+        let event = audit.iter().next().expect("reload refusal audit event");
+        assert!(event.critical);
+        assert!(event
+            .event_canonical_json
+            .contains("\"operation\":\"manifest_verify_failed_kept_prior\""));
+        assert!(event.event_canonical_json.contains("rule-new"));
+        assert!(!event.event_canonical_json.contains("at boot"));
     }
 
     #[test]

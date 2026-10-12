@@ -1727,16 +1727,22 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot is
             // an operator-visible posture change, and this line is emitted before the
             // audit channel is trusted to carry it.
-            eprintln!(
-                "castle-wall-daemon: boot-time manifest load failed; running deny-by-default until a valid manifest is reloaded: {err}"
-            );
+            if err.boot_confined_subject().is_some() {
+                eprintln!(
+                    "castle-wall-daemon: boot-time manifest load failed; running deny-by-default for the confined agent uid with no operator policy until a valid manifest is reloaded: {err}"
+                );
+            } else {
+                eprintln!(
+                    "castle-wall-daemon: boot-time manifest load failed; running with NO policy until a valid manifest is reloaded: {err}"
+                );
+            }
         }
         Err(err) => return Err(DaemonError::ManifestStoreInit(err.to_string())),
     }
 
     // A REAL CHECK, not a `debug_assert`: both continuing outcomes above write
-    // the cell (a committed snapshot, or `Unconfined` on a verification
-    // failure), so reaching here unset is a composition-root bug, and refusing
+    // the cell (a committed snapshot, a confined boot refusal, or `Unconfined`
+    // on other verification failures), so reaching here unset is a composition-root bug, and refusing
     // to start is the honest response rather than running a half-initialized
     // daemon. This is a SECOND, INDEPENDENT refusal, not the only barrier: an
     // authenticated publish that later reached the identity chokepoint with an

@@ -694,7 +694,7 @@ impl DecisionEngine {
 
     /// Write the armed identity from the outcome of the boot load.
     ///
-    /// Three outcomes, and each is a different claim about what is live:
+    /// Continuing outcomes, and each is a different claim about what is live:
     /// * `Ok`  — the snapshot COMMITTED, read back from the store rather than
     ///   from the candidate, so the frozen identity is the one being enforced.
     /// * `Verify` with a boot-confined refusal: nothing committed and the
@@ -731,6 +731,11 @@ impl DecisionEngine {
             }
             Err(ManifestReloadAuthorizationError::Verify(err)) => {
                 if let Some((agent_uid, ceiling, gate_uid)) = err.boot_confined_subject() {
+                    // The subject fields carry the pinned signing key's authenticated
+                    // manifest claim: prepare_loaded already verified the signature,
+                    // fortress id, high-water ordering and agent-origin derivation;
+                    // only the scoped-rule admission failed, so arming this uid means
+                    // kernel binding may confine it with no operator allow rules.
                     AdmittedIdentity {
                         fortress_id: self.fortress_id().to_string(),
                         subject: AdmittedSubject::Confined {
@@ -1631,6 +1636,60 @@ mod armed_identity_tests {
         assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
         assert_eq!(read_high_water_fixture(&f.policy_dir), committed_high_water);
         assert!(f.store.lock().unwrap().current_snapshot().is_none());
+        assert!(matches!(
+            f.engine.armed_identity().map(|identity| identity.subject),
+            Some(AdmittedSubject::Confined {
+                agent_uid: TEST_AGENT_UID,
+                ceiling: FIXTURE_CEILING,
+                gate_uid: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn frozen_reload_refuses_a_new_scoped_generation_as_steady_state() {
+        let f = fixture();
+        write_policy_with_scope(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            TEST_AGENT_UID,
+            &[format!("uid-{TEST_AGENT_UID}")],
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let committed_high_water = read_high_water_fixture(&f.policy_dir);
+        write_policy_with_scope(
+            &f.policy_dir,
+            &f.signing,
+            2,
+            TEST_AGENT_UID,
+            &[format!("agent-{TEST_AGENT_UID}")],
+            "r2",
+        );
+
+        let err = f
+            .engine
+            .reload_manifest_authorized("manifest_watcher_reload_authorized", "watcher")
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
+        assert!(!text.contains("at boot"), "{text}");
+        assert_eq!(read_high_water_fixture(&f.policy_dir), committed_high_water);
+        let guard = f.store.lock().unwrap();
+        assert_eq!(guard.current().unwrap().signed.manifest.generation, 1);
+        assert!(guard.current_snapshot().is_some());
+        drop(guard);
+        let operations = audit_operations(&f.wal);
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| op.as_str() == "manifest_watcher_reload_authorized")
+                .count(),
+            0,
+            "a refused reload must leave no success row: {operations:?}"
+        );
         assert!(matches!(
             f.engine.armed_identity().map(|identity| identity.subject),
             Some(AdmittedSubject::Confined {

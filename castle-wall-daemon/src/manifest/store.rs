@@ -96,6 +96,20 @@ fn default_scope_admission_warning_sink(message: &str) {
     eprintln!("{message}");
 }
 
+fn scope_admission_refusal_message(
+    errors: &[crate::policy::ConfinedAgentScopeError],
+    admitted_uid: u32,
+) -> String {
+    let mut seen_rule_ids = HashSet::new();
+    let details = errors
+        .iter()
+        .filter(|error| seen_rule_ids.insert(error.rule_id().to_string()))
+        .map(|error| PolicySnapshotError::ConfinedAgentScope(error.clone()).to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{details}; remedy: re-sign with uid-{admitted_uid}")
+}
+
 /// Errors emitted by the manifest store. All of these are F-2 (mid-session)
 /// or F-4 (startup) candidates; the IPC dispatch decides which based on
 /// whether the daemon is in boot or in steady state.
@@ -138,6 +152,10 @@ pub enum ManifestStoreError {
     RuleIdentityPreflight { issues: Vec<String> },
     #[error("policy snapshot construction failed: {source_message}")]
     PolicySnapshot { source_message: String },
+    /// Boot-only scoped-agent refusal after the pinned-key signature, fortress id,
+    /// high-water ordering and agent-origin fields have verified. Consumers may
+    /// arm only the named confined subject, not any operator allow rule from the
+    /// refused snapshot.
     #[error("manifest scoped-agent admission refused at boot: {source_message}")]
     BootConfinedScopeRefusal {
         source_message: String,
@@ -414,16 +432,17 @@ impl ManifestStore {
                 ) {
                     (Some(ceiling), gate_uid) => (ceiling, gate_uid),
                     (None, _) => {
+                        // `PolicySnapshot::from_loaded_manifest` derives the uid and
+                        // ceiling from the same AgentOrigin; a uid without its ceiling
+                        // means that internal pair invariant changed before this
+                        // admission gate, so the snapshot is refused as malformed.
                         return Err(ManifestStoreError::from(
                             PolicySnapshotError::ConfinedAgentScope(errors[0].clone()),
-                        ))
+                        ));
                     }
                 };
                 Err(ManifestStoreError::BootConfinedScopeRefusal {
-                    source_message: format!(
-                        "{}; remedy: re-sign with uid-{admitted_uid}",
-                        PolicySnapshotError::ConfinedAgentScope(errors[0].clone())
-                    ),
+                    source_message: scope_admission_refusal_message(&errors, admitted_uid),
                     agent_uid: admitted_uid,
                     ceiling,
                     gate_uid,
@@ -485,7 +504,7 @@ impl ManifestStore {
         authorize: impl FnOnce(&LoadedManifest) -> Result<(), E>,
     ) -> Result<&LoadedManifest, AuthorizedReloadError<E>> {
         let prepared = self
-            .prepare_reload(ScopeAdmissionMode::WarnOnlyCommittedGeneration)
+            .prepare_reload(ScopeAdmissionMode::EnforceNewGeneration)
             .map_err(AuthorizedReloadError::Verify)?;
         authorize(prepared.loaded()).map_err(AuthorizedReloadError::Authorization)?;
         self.commit_prepared_reload(prepared)
@@ -1371,6 +1390,53 @@ mod tests {
         });
     }
 
+    fn rewrite_uid_policy_rule_scopes(
+        policy: &WrittenPolicy,
+        generation: u64,
+        agent_uid: u32,
+        gate_uid: Option<u32>,
+        scopes_by_rule: &[(&str, Vec<String>)],
+    ) {
+        for (rule_id, scope_agent_ids) in scopes_by_rule {
+            let body = rule_body_for_scope(rule_id, scope_agent_ids);
+            fs::write(
+                policy
+                    .dir
+                    .path()
+                    .join(RULES_SUBDIR)
+                    .join(format!("{rule_id}.json")),
+                &body,
+            )
+            .unwrap();
+        }
+        let digests = scopes_by_rule
+            .iter()
+            .map(|(rule_id, scope_agent_ids)| {
+                (
+                    *rule_id,
+                    sha256_hex(&rule_body_for_scope(rule_id, scope_agent_ids)),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        rewrite_signed_manifest(policy, |manifest| {
+            manifest.generation = generation;
+            manifest.agent_origin = Some(crate::manifest::verify::AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(agent_uid),
+                gate_uid,
+                system_uid_allow_ceiling: TEST_SYSTEM_UID_CEILING,
+            });
+            for entry in &mut manifest.rules {
+                if let Some(digest) = digests.get(entry.rule_id.as_str()) {
+                    entry.sha256 = digest.clone();
+                }
+            }
+        });
+    }
+
     fn policy_request(agent_id: &str) -> crate::policy::EvaluationRequest {
         crate::policy::EvaluationRequest {
             agent_id: agent_id.to_string(),
@@ -2065,6 +2131,50 @@ mod tests {
         );
         assert!(warnings[0].contains("uuid-0"));
         assert!(warnings[0].contains(&format!("uid-{TEST_AGENT_UID}")));
+    }
+
+    #[test]
+    fn boot_refusal_names_each_offending_rule_once() {
+        let policy = write_valid_policy(2);
+        rewrite_uid_policy_rule_scopes(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[
+                ("uuid-0", vec![confined_scope(TEST_AGENT_UID)]),
+                ("uuid-1", vec![confined_scope(TEST_AGENT_UID)]),
+            ],
+        );
+        persist_high_water_for_current_policy(&policy);
+        rewrite_uid_policy_rule_scopes(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[
+                (
+                    "uuid-0",
+                    vec![legacy_scope(TEST_AGENT_UID), confined_scope(TEST_GATE_UID)],
+                ),
+                ("uuid-1", vec![legacy_scope(TEST_AGENT_UID)]),
+            ],
+        );
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+
+        let error = store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .unwrap_err();
+
+        let text = format!("{error:?}");
+        assert_eq!(text.matches("uuid-0").count(), 1, "{text}");
+        assert_eq!(text.matches("uuid-1").count(), 1, "{text}");
+        assert!(text.contains(&format!("uid-{TEST_AGENT_UID}")), "{text}");
     }
 
     #[test]
