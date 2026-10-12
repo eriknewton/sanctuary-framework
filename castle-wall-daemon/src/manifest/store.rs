@@ -414,10 +414,10 @@ impl ManifestStore {
             return Ok(());
         }
         if exact_committed_reclaim {
-            // The exact committed generation is kept because refusing it at boot
-            // would drop the daemon into no-policy startup; any newer generation
-            // is refused below because boot must not admit what the running path
-            // would refuse.
+            // The exact committed generation is kept because it is already the
+            // committed policy, including the derived distress lane; any newer
+            // generation is refused below because boot must not admit what the
+            // running path would refuse.
             self.emit_scope_admission_warnings(&errors, admitted_uid);
             return Ok(());
         }

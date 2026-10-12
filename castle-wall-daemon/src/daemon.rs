@@ -1727,15 +1727,7 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot is
             // an operator-visible posture change, and this line is emitted before the
             // audit channel is trusted to carry it.
-            if err.boot_confined_subject().is_some() {
-                eprintln!(
-                    "castle-wall-daemon: boot-time manifest load failed; running deny-by-default for the confined agent uid with no operator policy until a valid manifest is reloaded: {err}"
-                );
-            } else {
-                eprintln!(
-                    "castle-wall-daemon: boot-time manifest load failed; running with NO policy until a valid manifest is reloaded: {err}"
-                );
-            }
+            eprintln!("{}", boot_manifest_verify_stderr_line(&err));
         }
         Err(err) => return Err(DaemonError::ManifestStoreInit(err.to_string())),
     }
@@ -1964,6 +1956,18 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         watchdog,
         started_at: Instant::now(),
     })
+}
+
+fn boot_manifest_verify_stderr_line(err: &ManifestStoreError) -> String {
+    if err.boot_confined_subject().is_some() {
+        format!(
+            "castle-wall-daemon: boot-time manifest load failed; running deny-by-default for the confined agent uid with no operator policy until a valid manifest is reloaded: {err}"
+        )
+    } else {
+        format!(
+            "castle-wall-daemon: boot-time manifest load failed; running with NO policy until a valid manifest is reloaded: {err}"
+        )
+    }
 }
 
 /// Poll cadence for the manifest watcher's degraded (non-inotify) fallback.
@@ -3757,6 +3761,28 @@ mod tests {
             default_disposition(mode),
             FailureDisposition::RefuseToStart { .. }
         ));
+    }
+
+    #[test]
+    fn boot_manifest_verify_stderr_line_matches_confined_posture() {
+        let confined = ManifestStoreError::BootConfinedScopeRefusal {
+            source_message: "rule rule-new scope.agent_ids entry".to_string(),
+            agent_uid: 60_123,
+            ceiling: 500,
+            gate_uid: None,
+        };
+        let confined_line = boot_manifest_verify_stderr_line(&confined);
+        assert!(confined_line.contains("deny-by-default for the confined agent uid"));
+        assert!(confined_line.contains("rule rule-new"));
+        assert!(!confined_line.contains("with NO policy"));
+
+        let unconfined = ManifestStoreError::GenerationRollback {
+            candidate: 1,
+            high_water: 1,
+        };
+        let unconfined_line = boot_manifest_verify_stderr_line(&unconfined);
+        assert!(unconfined_line.contains("running with NO policy"));
+        assert!(!unconfined_line.contains("confined agent uid"));
     }
 
     #[test]

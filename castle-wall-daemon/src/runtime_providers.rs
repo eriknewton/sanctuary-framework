@@ -5618,6 +5618,34 @@ mod tests {
         agent_origin: Option<crate::manifest::verify::AgentOrigin>,
         scope_agent_ids: &[String],
     ) -> String {
+        write_watcher_policy_with_generation_origin_and_scope(
+            policy_dir,
+            signing,
+            rule_id,
+            watcher_policy_generation_for_rule_id(rule_id),
+            agent_origin,
+            scope_agent_ids,
+        )
+    }
+
+    fn watcher_policy_generation_for_rule_id(rule_id: &str) -> u64 {
+        if rule_id.contains("old") || rule_id == "rule-boot" {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Same fixture, but with generation under test control so a reload test can
+    /// prove it reached steady-state admission rather than rollback/refork checks.
+    fn write_watcher_policy_with_generation_origin_and_scope(
+        policy_dir: &Path,
+        signing: &SigningKey,
+        rule_id: &str,
+        generation: u64,
+        agent_origin: Option<crate::manifest::verify::AgentOrigin>,
+        scope_agent_ids: &[String],
+    ) -> String {
         use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 
         fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
@@ -5651,11 +5679,7 @@ mod tests {
             schema_version: crate::constants::SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: format!("2026-09-02T00:00:0{}Z", rule_id.len() % 10),
-            generation: if rule_id.contains("old") || rule_id == "rule-boot" {
-                1
-            } else {
-                2
-            },
+            generation,
             agent_origin,
             operator_baseline: None,
             rules: vec![
@@ -6359,6 +6383,9 @@ mod tests {
 
     #[test]
     fn watcher_scope_refusal_keeps_prior_and_emits_steady_state_audit() {
+        const COMMITTED_GENERATION: u64 = 1;
+        const NEXT_GENERATION: u64 = COMMITTED_GENERATION + 1;
+
         let dir = TempDir::new().unwrap();
         let policy_dir = dir.path().join("policy");
         let signing = SigningKey::generate(&mut OsRng);
@@ -6372,10 +6399,11 @@ mod tests {
             gate_uid: None,
             system_uid_allow_ceiling: 500,
         };
-        write_watcher_policy_with_origin_and_scope(
+        write_watcher_policy_with_generation_origin_and_scope(
             &policy_dir,
             &signing,
             "rule-old",
+            COMMITTED_GENERATION,
             Some(origin.clone()),
             &[format!("uid-{agent_uid}")],
         );
@@ -6386,10 +6414,11 @@ mod tests {
             "deadbeef".to_string(),
         )));
         store.lock().unwrap().reload().expect("load prior policy");
-        write_watcher_policy_with_origin_and_scope(
+        write_watcher_policy_with_generation_origin_and_scope(
             &policy_dir,
             &signing,
             "rule-new",
+            NEXT_GENERATION,
             Some(origin),
             &[format!("agent-{agent_uid}")],
         );
@@ -6410,16 +6439,27 @@ mod tests {
             .expect("verification refusal audit must succeed");
 
         let guard = store.lock().unwrap();
-        assert_eq!(guard.current().unwrap().signed.manifest.generation, 1);
+        assert_eq!(
+            guard.current().unwrap().signed.manifest.generation,
+            COMMITTED_GENERATION
+        );
         drop(guard);
         let audit = audit_buffer.lock().unwrap();
         let event = audit.iter().next().expect("reload refusal audit event");
         assert!(event.critical);
-        assert!(event
-            .event_canonical_json
-            .contains("\"operation\":\"manifest_verify_failed_kept_prior\""));
-        assert!(event.event_canonical_json.contains("rule-new"));
-        assert!(!event.event_canonical_json.contains("at boot"));
+        let event_json: serde_json::Value =
+            serde_json::from_str(&event.event_canonical_json).expect("canonical audit JSON");
+        assert_eq!(event_json["operation"], "manifest_verify_failed_kept_prior");
+        let detail = event_json["detail"].as_str().expect("audit detail text");
+        assert!(detail.contains("policy snapshot construction failed"));
+        assert!(detail.contains("rule rule-new scope.agent_ids"));
+        assert!(detail.contains(&format!("agent-{agent_uid}")));
+        assert!(detail.contains("uid-<decimal uid>"));
+        assert!(
+            !detail.contains("manifest generation rollback/refork"),
+            "generation 2 must reach steady-state scope admission: {detail}"
+        );
+        assert!(!detail.contains("at boot"));
     }
 
     #[test]
