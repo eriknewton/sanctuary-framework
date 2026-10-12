@@ -19,7 +19,7 @@ import {
   StateStore,
   isStateVersionFloorRefusal,
 } from "../../src/cognitive/state-store.js";
-import type { StoredIdentity } from "../../src/core/identity.js";
+import { type StoredIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -139,6 +139,7 @@ async function makeToolRig(storage: StorageBackend = new MemoryStorage()): Promi
   const server = createServer(
     selectedTools(tools, [
       "identity_create",
+      "identity_rotate",
       "state_write",
       "state_export",
       "state_import",
@@ -383,6 +384,87 @@ describe("state_import version floor tool path", () => {
       const current = await readValue(rig.client, "above");
       expect(current.value).toBe("second");
       expect(current.version).toBe(2);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("imports entries signed before and after an identity rotation", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "rotation-before", "old-key");
+      const rotated = await callTool(rig.client, "identity_rotate", {
+        identity_id: identityId,
+        reason: "state import rotation-chain test",
+      });
+      expect(rotated.identity_id).toBe(identityId);
+      await writeValue(rig.client, identityId, "rotation-after", "new-key");
+
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: exported.bundle,
+        conflict_resolution: "overwrite",
+      });
+
+      expect(imported.imported_keys).toBe(2);
+      expect(imported.skipped_keys).toBe(0);
+      expect(imported.skipped_invalid_sig).toBe(0);
+      expect(imported.skipped_unknown_kid).toBe(0);
+      await expect(readValue(rig.client, "rotation-before")).resolves.toMatchObject({
+        value: "old-key",
+        version: 1,
+      });
+      await expect(readValue(rig.client, "rotation-after")).resolves.toMatchObject({
+        value: "new-key",
+        version: 1,
+      });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("refuses a pre-rotation entry when the identity rotation chain is not verified", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const originalIdentity = rig.identityManager.get(identityId);
+      if (!originalIdentity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity: originalIdentity,
+        values: [{ key: "broken-chain-entry", value: "old-key" }],
+      });
+      const rotated = await rig.identityManager.rotate(
+        identityId,
+        "state import broken-chain test"
+      );
+      if (!rotated) throw new Error("rotation failed");
+      const [firstHop] = rotated.updatedIdentity.rotation_history;
+      if (!firstHop) throw new Error("missing rotation hop");
+      await rig.identityManager.save({
+        ...rotated.updatedIdentity,
+        rotation_history: [
+          {
+            ...firstHop,
+            rotation_event: toBase64url(stringToBytes("{}")),
+          },
+        ],
+      });
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+
+      expect(imported.imported_keys).toBe(0);
+      expect(imported.skipped_keys).toBe(1);
+      expect(imported.skipped_unknown_kid).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(0);
+      expect(await rig.storage.read("notes", "broken-chain-entry")).toBeNull();
     } finally {
       await rig.close();
     }

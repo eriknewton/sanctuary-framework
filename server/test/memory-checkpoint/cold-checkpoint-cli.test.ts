@@ -14,7 +14,7 @@ import { Writable } from "node:stream";
 import { runCheckpointCommand } from "../../src/cli/checkpoint.js";
 import { StateStore, STATE_ENVELOPE_VERSION_ANCHORS_KEY } from "../../src/cognitive/state-store.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { createIdentity, sign } from "../../src/core/identity.js";
+import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -255,6 +255,40 @@ describe("cold checkpoint CLI", () => {
     expect(result.stderr).toContain(`Error: checkpoint restore failed. ${refusal}\n`);
     expect(result.stdout).not.toContain("Checkpoint restored:");
     expect(await durableBytes(f.path)).toEqual(before);
+  });
+
+  it("restores checkpoint entries signed before an identity rotation", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "cold checkpoint restore rotation-chain test",
+    );
+    await persistStoredIdentity(f.storage, f.masterKey, updatedIdentity);
+    await f.stateStore.delete("alpha", "note");
+    await f.stateStore.write(
+      "gamma",
+      "note",
+      "post-rotation-added",
+      updatedIdentity.identity_id,
+      updatedIdentity.encrypted_private_key,
+      identityEncKey,
+    );
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(0);
+    expect(result.stdout).toContain(`Checkpoint restored: ${checkpoint!.id}\n`);
+    await expect(f.stateStore.read("alpha", "note")).resolves.toMatchObject({
+      value: "original",
+    });
+    await expect(f.stateStore.read("beta", "note")).resolves.toMatchObject({
+      value: "original",
+    });
+    expect(await f.storage.read("gamma", "note")).toBeNull();
   });
 
   it.each(["read failure", "invalid MAC"])("refuses a cold restore on anchor %s without changing durable bytes", async (failure) => {

@@ -13,6 +13,7 @@ import {
   isStateVersionFloorRefusal,
   StateVerificationError,
   type StateStore,
+  type StateImportPublicKeyResolver,
 } from "../cognitive/state-store.js";
 import { bytesToString, fromBase64url } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
@@ -62,7 +63,7 @@ export interface RestoreCheckpointDeps {
   identityId: string;
   checkpointId: string;
   assessParked: () => Promise<ParkedClaim>;
-  publicKeyResolver: (kid: string) => Uint8Array | null;
+  publicKeyResolver: StateImportPublicKeyResolver;
   now?: Date;
 }
 

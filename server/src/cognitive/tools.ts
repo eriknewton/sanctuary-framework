@@ -13,6 +13,7 @@ import {
   decodeExportBundleNamespaces,
   getStateImportPartialApplyDetails,
   getReservedNamespaceViolation,
+  resolveAuthenticatedIdentityWriterPublicKeys,
   StateStore,
   StateVerificationError,
   UNATTRIBUTED_DISCLOSURE_NOTICE,
@@ -2308,11 +2309,13 @@ export function createCognitiveTools(
           return denyNamespaceAccess("state_import", "state_import");
         }
 
-        // Wire public key resolver for signature verification (SEC-005)
-        const publicKeyResolver = (kid: string): Uint8Array | null => {
+        // INVARIANT: import verification accepts only keys authenticated by the
+        // held identity record and its signed rotation chain, matching state_read.
+        const publicKeyResolver = (kid: string): Uint8Array[] | null => {
           const identity = identityMgr.get(kid);
           if (!identity) return null;
-          return fromBase64url(identity.public_key);
+          const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
+          return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
         };
 
         try {

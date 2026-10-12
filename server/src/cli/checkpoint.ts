@@ -16,9 +16,11 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 
-import { StateStore } from "../cognitive/state-store.js";
+import {
+  resolveAuthenticatedIdentityWriterPublicKeys,
+  StateStore,
+} from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
-import { fromBase64url } from "../core/encoding.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
@@ -543,10 +545,13 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
-  const publicKeyResolver = (kid: string): Uint8Array | null => {
+  const publicKeyResolver = (kid: string): Uint8Array[] | null => {
     const identity = boot.identityManager.get(kid);
     if (!identity) return null;
-    return fromBase64url(identity.public_key);
+    // INVARIANT: checkpoint restore verifies imported entries with the same
+    // authenticated current-plus-rotation-chain key set as state_read.
+    const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
+    return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
   };
 
   // Check before approval auditing writes reserved state; restore repeats this

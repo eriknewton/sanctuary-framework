@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  resolveAuthenticatedIdentityWriterPublicKeys,
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
   StateImportPartialApplyError,
   StateVerificationError,
@@ -196,11 +197,14 @@ async function writeEntry(
   );
 }
 
-function publicKeyResolver(fixture: Fixture): (kid: string) => Uint8Array | null {
-  return (kid: string): Uint8Array | null =>
-    kid === fixture.identity.storedIdentity.identity_id
-      ? fromBase64url(fixture.identity.storedIdentity.public_key)
-      : null;
+function publicKeyResolver(fixture: Fixture): (kid: string) => Uint8Array[] | null {
+  return (kid: string): Uint8Array[] | null => {
+    if (kid !== fixture.identity.storedIdentity.identity_id) return null;
+    const keys = resolveAuthenticatedIdentityWriterPublicKeys(
+      fixture.identity.storedIdentity,
+    );
+    return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
+  };
 }
 
 async function parkedClaim() {

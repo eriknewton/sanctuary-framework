@@ -603,6 +603,10 @@ export interface ResolvedWriterPublicKey {
     | "plaintext-registry";
 }
 
+export type StateImportPublicKeyResolver = (
+  kid: string
+) => Uint8Array | readonly Uint8Array[] | null | undefined;
+
 function appendResolvedWriterKey(
   keys: ResolvedWriterPublicKey[],
   seen: Set<string>,
@@ -655,6 +659,13 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
   )
     ? keys
     : [];
+}
+
+function normalizeImportPublicKeys(
+  resolved: ReturnType<StateImportPublicKeyResolver>
+): Uint8Array[] {
+  if (!resolved) return [];
+  return resolved instanceof Uint8Array ? [resolved] : [...resolved];
 }
 
 /** Result of a state write operation */
@@ -3236,10 +3247,14 @@ export class StateStore {
     namespace: string,
     key: string,
     entry: StateEntry,
-    publicKeyResolver: (kid: string) => Uint8Array | null
+    publicKeyResolver: StateImportPublicKeyResolver
   ): Promise<"valid" | "unknown-kid" | "invalid-sig"> {
-    const signerPublicKey = publicKeyResolver(entry.kid);
-    if (!signerPublicKey) return "unknown-kid";
+    // INVARIANT: an empty authenticated key set is an unknown writer, never a
+    // cue to retry with the entry's embedded or registry-only key material.
+    const signerPublicKeys = normalizeImportPublicKeys(
+      publicKeyResolver(entry.kid)
+    );
+    if (signerPublicKeys.length === 0) return "unknown-kid";
 
     try {
       if (
@@ -3262,20 +3277,19 @@ export class StateStore {
           ? entry.envelope_sig
           : entry.sig;
       if (!signature) return "invalid-sig";
-      const sigValid = verify(
-        signaturePayload,
-        fromBase64url(signature),
-        signerPublicKey
+      const signatureBytes = fromBase64url(signature);
+      const sigValid = signerPublicKeys.some((signerPublicKey) =>
+        verify(signaturePayload, signatureBytes, signerPublicKey)
       );
       if (!sigValid) return "invalid-sig";
       if (
         entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
         entry.v === STATE_ENVELOPE_SCHEMA_VERSION
       ) {
-        const legacySigValid = verify(
-          fromBase64url(entry.payload.ct),
-          fromBase64url(entry.sig),
-          signerPublicKey
+        const legacyCiphertext = fromBase64url(entry.payload.ct);
+        const legacySignature = fromBase64url(entry.sig);
+        const legacySigValid = signerPublicKeys.some((signerPublicKey) =>
+          verify(legacyCiphertext, legacySignature, signerPublicKey)
         );
         if (!legacySigValid) return "invalid-sig";
       }
@@ -3295,7 +3309,7 @@ export class StateStore {
   private async buildImportPlan(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution,
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<ImportPlan> {
     // Must match assertImportVersionFloors, StateStore.import, and
@@ -3409,7 +3423,7 @@ export class StateStore {
   async assertImportVersionFloors(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution,
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<StateImportVersionFloorPreflight> {
     const plan = await this.buildImportPlan(
@@ -3432,7 +3446,7 @@ export class StateStore {
   async import(
     bundleBase64: string,
     conflictResolution: ImportConflictResolution = "skip",
-    publicKeyResolver: (kid: string) => Uint8Array | null,
+    publicKeyResolver: StateImportPublicKeyResolver,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<{
     imported_keys: number;
