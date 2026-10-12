@@ -343,8 +343,10 @@ fn matches_suffix_pattern(pattern: &str, host_lower: &str) -> bool {
 ///
 /// `deny_unknown_fields`: scope fields carry enforcement semantics too — an
 /// ignored (unmodeled) scope axis would apply a rule to MORE agents than the
-/// operator intended. The TS scope surface (agent_ids / template_ids) is
-/// fully modeled, so unknown fields are rejected (fail closed).
+/// operator intended. Must match `LINUX_DAEMON_RULE_SCOPE_AXES` in
+/// server/src/castle-wall/runtime/linux-policy-compatibility.ts. The TS
+/// Linux signing subset may be narrower while an axis is modeled but not yet
+/// attestable; unknown fields are rejected (fail closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuleScope {
@@ -606,27 +608,72 @@ pub enum PolicySnapshotError {
     ConfinedAgentScope(ConfinedAgentScopeError),
 }
 
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
+// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
+// `server/src/castle-wall/allowlist/bounded-diagnostic-text.ts`.
+const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let original_len = value.chars().count();
+    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+    format!("{prefix}... (original length {original_len})")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfinedAgentScopeError {
-    #[error(
-        "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected {expected_form}; re-sign with the uid-<uid> form"
-    )]
+    /// Must match `validateLinuxInstallAgentIdScopes` in
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
     MalformedAgentScope {
         rule_id: String,
         agent_id: String,
         expected_form: &'static str,
     },
-    #[error(
-        // Must match `validateLinuxInstallAgentIdScopes` in
-        // `server/src/castle-wall/allowlist/confined-agent-id.ts`.
-        "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected admitted uid {admitted_uid}; scope agent rules to uid-{admitted_uid}"
-    )]
+    /// Must match `validateLinuxInstallAgentIdScopes` in
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
     AgentScopeOutsideAdmission {
         rule_id: String,
         agent_id: String,
         admitted_uid: u32,
     },
 }
+
+impl std::fmt::Display for ConfinedAgentScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedAgentScope {
+                rule_id,
+                agent_id,
+                expected_form,
+            } => {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                let rule_id_display = bounded_diagnostic_text(rule_id);
+                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                write!(
+                    f,
+                    "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
+                )
+            }
+            Self::AgentScopeOutsideAdmission {
+                rule_id,
+                agent_id,
+                admitted_uid,
+            } => {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                let rule_id_display = bounded_diagnostic_text(rule_id);
+                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                write!(
+                    f,
+                    "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}; scope agent rules to uid-{admitted_uid}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfinedAgentScopeError {}
 
 impl ConfinedAgentScopeError {
     pub(crate) fn rule_id(&self) -> &str {

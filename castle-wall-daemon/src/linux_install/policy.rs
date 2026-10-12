@@ -496,4 +496,64 @@ mod tests {
             .to_string();
         assert!(err.contains("admitted uid 60123"), "{err}");
     }
+
+    #[test]
+    fn install_scope_refusals_keep_operator_text_within_display_budget() {
+        const TEST_DIAGNOSTIC_TEXT_CAP: usize = 8 * 8;
+        const TEST_LONG_TEXT_LENGTH: usize = TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP;
+        let long_rule_id = format!("rule-{}", "r".repeat(TEST_LONG_TEXT_LENGTH));
+        let long_agent_id = format!("agent-{}", "a".repeat(TEST_LONG_TEXT_LENGTH));
+        let malformed_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": [long_agent_id] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let malformed =
+            crate::policy::validate_confined_agent_id_scopes(&[malformed_rule], TEST_ADMITTED_UID)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            malformed.contains(&format!("original length {}", long_rule_id.len())),
+            "{malformed}"
+        );
+        assert!(
+            malformed.contains(&format!("original length {}", long_agent_id.len() + 2)),
+            "{malformed}"
+        );
+        assert!(!malformed.contains(&long_rule_id), "{malformed}");
+        assert!(!malformed.contains(&long_agent_id), "{malformed}");
+        assert!(
+            malformed.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{malformed}"
+        );
+
+        let outside_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": ["uid-60124"] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let outside =
+            crate::policy::validate_confined_agent_id_scopes(&[outside_rule], TEST_ADMITTED_UID)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            outside.contains(&format!("original length {}", long_rule_id.len())),
+            "{outside}"
+        );
+        assert!(!outside.contains(&long_rule_id), "{outside}");
+        assert!(
+            outside.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{outside}"
+        );
+    }
 }

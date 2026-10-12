@@ -643,8 +643,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       reputationStore: source.reputationStore,
       policy: DEFAULT_POLICY,
       config: defaultConfig(),
-      // No stateStoragePath is supplied, so discovery finds nothing; the
-      // exporter rejects an explicit empty list, so omit it.
+      // No explicit namespace list is supplied, so the exporter discovers
+      // every namespace the in-memory backend exposes.
       keySource: "recovery-key",
       didWeb: { identifier: DID_URI, authority_host: AUTHORITY_HOST },
     });
