@@ -27,7 +27,7 @@
  */
 
 import { platform as osPlatform } from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { promisify } from "node:util";
 import { constants as fsConstants, unlinkSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -163,6 +163,9 @@ import {
 // diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 import { stripTrailingSlashes } from "../strings.js";
+import { resolveHarnessDaemonLogDir } from "./harness-log-dir.js";
+
+export { resolveHarnessDaemonLogDir } from "./harness-log-dir.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -174,9 +177,211 @@ const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
 export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
-/** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
-export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
-  return `${stripTrailingSlashes(newAccountHome)}/logs`;
+export class HarnessLogDirectoryCustodyError extends Error {
+  constructor(harnessLogDir: string, message?: string) {
+    super(
+      message ??
+        `${harnessLogDir} must be a real directory owned by the dedicated agent account; move it aside or remove it, then re-run protect.`,
+    );
+    this.name = "HarnessLogDirectoryCustodyError";
+  }
+}
+
+const HARNESS_LOG_DIR_MODE = 0o700;
+const HARNESS_LOG_DIR_MODE_MASK = 0o7777;
+// 0o022 = group-write plus other-write; the dedicated account home may keep any group, but not writable group/other bits.
+const GROUP_OR_OTHER_WRITE_MASK = 0o022;
+// 1 = the minimum directory link count APFS and POSIX filesystems report for a live directory.
+const MIN_DIRECTORY_NLINK_SANITY = 1;
+// 5 seconds bounds a local /bin/mkdir helper without making a wedged child stall protect.
+const HARNESS_LOG_MKDIR_TIMEOUT_MS = 5_000;
+// The mode string must match HARNESS_LOG_DIR_MODE; /bin/mkdir -m accepts octal text.
+const HARNESS_LOG_DIR_MODE_ARG = HARNESS_LOG_DIR_MODE.toString(8);
+const HARNESS_LOG_MKDIR_ENV = Object.freeze({ PATH: "/usr/bin:/bin" });
+
+export interface HarnessLogDirectoryStats {
+  dev: number;
+  ino: number;
+  uid: number;
+  gid: number;
+  mode: number;
+  nlink: number;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+export interface HarnessLogDirectoryOps {
+  lstat(path: string): Promise<HarnessLogDirectoryStats>;
+  createDirectoryAsAgent(path: string, uid: number, gid: number): Promise<void>;
+}
+
+function harnessLogCustodyError(harnessLogDir: string): HarnessLogDirectoryCustodyError {
+  return new HarnessLogDirectoryCustodyError(harnessLogDir);
+}
+
+function harnessLogParentCustodyError(parentDir: string): HarnessLogDirectoryCustodyError {
+  return new HarnessLogDirectoryCustodyError(
+    parentDir,
+    `${parentDir} must be a real directory owned by the dedicated agent account and not writable by group or others; fix its ownership and mode, then re-run protect.`,
+  );
+}
+
+function harnessLogDirectoryMode(stats: HarnessLogDirectoryStats): number {
+  return stats.mode & HARNESS_LOG_DIR_MODE_MASK;
+}
+
+function assertHarnessLogDirectoryShape(
+  harnessLogDir: string,
+  stats: HarnessLogDirectoryStats,
+): void {
+  if (!stats.isDirectory() || stats.isSymbolicLink() || stats.nlink < MIN_DIRECTORY_NLINK_SANITY) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+function assertHarnessLogDirectoryParentCustody(
+  parentDir: string,
+  stats: HarnessLogDirectoryStats,
+  uid: number,
+): void {
+  try {
+    assertHarnessLogDirectoryShape(parentDir, stats);
+  } catch {
+    throw harnessLogParentCustodyError(parentDir);
+  }
+  if (stats.uid !== uid || (harnessLogDirectoryMode(stats) & GROUP_OR_OTHER_WRITE_MASK) !== 0) {
+    throw harnessLogParentCustodyError(parentDir);
+  }
+}
+
+function assertHarnessLogDirectoryAgentCustody(
+  harnessLogDir: string,
+  stats: HarnessLogDirectoryStats,
+  uid: number,
+): void {
+  assertHarnessLogDirectoryShape(harnessLogDir, stats);
+  if (stats.uid !== uid) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+function spawnMkdirOptions(uid: number, gid: number): SpawnOptions {
+  return {
+    env: HARNESS_LOG_MKDIR_ENV,
+    shell: false,
+    stdio: ["ignore", "ignore", "ignore"],
+    // uid and gid are always passed so the child never inherits the caller's privileged group.
+    uid,
+    gid,
+  };
+}
+
+export function createHarnessLogDirectoryAsAgent(
+  path: string,
+  uid: number,
+  gid: number,
+  spawnImpl: typeof spawn = spawn,
+): Promise<void> {
+  const options = spawnMkdirOptions(uid, gid);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let rejectAfterClose = false;
+    let child: ChildProcess | undefined;
+    const finishReject = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(harnessLogCustodyError(path));
+    };
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const childNeverStarted = (): boolean => {
+      const processHandle = (child as (ChildProcess & { _handle?: unknown }) | undefined)?._handle;
+      return child?.pid === undefined || processHandle === null;
+    };
+    const failAfterChildClose = () => {
+      if (settled || rejectAfterClose) return;
+      rejectAfterClose = true;
+      if (child === undefined) {
+        finishReject();
+        return;
+      }
+      if (childNeverStarted()) {
+        finishReject();
+        return;
+      }
+      child.kill(LAUNCHCTL_KILL_SIGNAL);
+    };
+    const timer = setTimeout(failAfterChildClose, HARNESS_LOG_MKDIR_TIMEOUT_MS);
+    try {
+      child = spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options);
+    } catch {
+      finishReject();
+      return;
+    }
+    child.on("error", failAfterChildClose);
+    child.on("close", (code) => {
+      if (settled) return;
+      if (rejectAfterClose) {
+        finishReject();
+        return;
+      }
+      if (code === 0) {
+        finishResolve();
+      } else {
+        finishReject();
+      }
+    });
+  });
+}
+
+export async function ensureHarnessDaemonLogDir(
+  harnessLogDir: string,
+  uid: number,
+  gid: number,
+  ops: HarnessLogDirectoryOps = {
+    lstat,
+    createDirectoryAsAgent: createHarnessLogDirectoryAsAgent,
+  },
+): Promise<void> {
+  const parent = dirname(harnessLogDir);
+  let parentStats: HarnessLogDirectoryStats;
+  try {
+    parentStats = await ops.lstat(parent);
+  } catch {
+    throw harnessLogParentCustodyError(parent);
+  }
+  // The parent check pins the helper to the dedicated account home shape before root delegates creation.
+  assertHarnessLogDirectoryParentCustody(parent, parentStats, uid);
+
+  let stats: HarnessLogDirectoryStats | undefined;
+  try {
+    stats = await ops.lstat(harnessLogDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw harnessLogCustodyError(harnessLogDir);
+    }
+  }
+
+  if (stats === undefined) {
+    try {
+      // Root delegates creation to the agent account and does not repair names inside the agent-owned home.
+      await ops.createDirectoryAsAgent(harnessLogDir, uid, gid);
+    } catch {
+      throw harnessLogCustodyError(harnessLogDir);
+    }
+  }
+  try {
+    stats = await ops.lstat(harnessLogDir);
+  } catch {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+  // Acceptance is limited to real-directory shape plus agent uid ownership: the agent owns this directory and can change mode, group, or entries after protect returns, so root-side mode/group checks here would not be a durable control.
+  assertHarnessLogDirectoryAgentCustody(harnessLogDir, stats, uid);
 }
 
 /**
@@ -1343,12 +1548,11 @@ export async function runAutoProvisionForWrap(
       return { plan, results };
     },
     installHarnessDaemon: async (uid) => {
-      // FIX R1: capture the target uid/gid here (see the comment above the
-      // `ops` object) so the endpoint probes below can check
-      // credential-readable-by-uid honestly instead of guessing. The new
-      // account's uid and gid are the same value (see `rehome`'s call site
-      // and `arm`'s `--agent-uid=<uid>` below, which both treat uid===gid
-      // for this dedicated service account).
+      // FIX R1: capture the target uid/gid here so the endpoint probes below can
+      // check credential-readable-by-uid honestly instead of guessing. The gid is
+      // still passed to spawned helpers as a process credential, but macOS may
+      // assign the account a different primary group and new directories can
+      // inherit their parent's group, so group is not the acceptance boundary.
       resolvedAgentUidGid = { uid, gid: uid };
       // FIX F-ALREADYDEDICATED: resolve the credential set the verify will
       // probe on EVERY path. On the fresh path `rehome` already set it (step 5
@@ -1385,9 +1589,7 @@ export async function runAutoProvisionForWrap(
           operatorHome,
         });
         const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
-        await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
-        await chmod(harnessLogDir, 0o700);
-        await fsChown(harnessLogDir, uid, uid);
+        await ensureHarnessDaemonLogDir(harnessLogDir, uid, uid);
         if (options.exclusiveEgress === true) {
           // S5-6 fine-grained mode: the S5-5 PARKED install. The plist is the
           // barrier form (Disabled + RunAtLoad=false + wrapper argv), the job
