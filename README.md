@@ -153,14 +153,13 @@ See the [RC5 release notes](docs/releases/v1.8.6.md) for the bounded fix set.
 
 ### Verify before you trust
 
-An agent can run every check below before it installs anything; the `curl` form needs no account, and `gh release download` needs a `gh auth login`.
+An agent can run the provenance and tarball checks below before it installs anything; the `curl` form needs no account, and `gh release download` needs a `gh auth login`.
 
 ```bash
 npm view @sanctuary-framework/mcp-server@1.8.4 dist.attestations
-npm audit signatures
 ```
 
-The first prints the npm provenance attestation for the release (`predicateType: https://slsa.dev/provenance/v1`): the package was published from this repository's release workflow with `npm publish --provenance` through npm Trusted Publishing. The second verifies registry signatures and provenance for every package in a project's `node_modules`, so run it in a directory where `@sanctuary-framework/mcp-server` is installed; an empty directory reports nothing to audit, which is not a pass.
+This prints the npm provenance attestation for the release (`predicateType: https://slsa.dev/provenance/v1`): the package was published from this repository's release workflow with `npm publish --provenance` through npm Trusted Publishing. After installing into a project (`npm install @sanctuary-framework/mcp-server@1.8.4` in that project's directory), `npm audit signatures` there verifies registry signatures and provenance for every package in its `node_modules`; it is a post-install check, and an empty directory reports nothing to audit, which is not a pass.
 
 The release tarball is also signed with a pinned Ed25519 key, and the verifier ships in this repository. From a clone at the tag:
 

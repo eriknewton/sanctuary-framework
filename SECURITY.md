@@ -97,7 +97,8 @@ with; those are governed by their own policies.
 ## Verify Before You Trust
 
 Each release of `@sanctuary-framework/mcp-server` can be checked before it is
-installed, with no network beyond the npm registry and GitHub; the `curl` form
+installed (the signature audit below is the one post-install check), with no
+network beyond the npm registry and GitHub; the `curl` form
 below needs no account, and `gh release download` needs a `gh auth login`.
 The commands below are written against `1.8.4`; substitute the release you are
 checking.
@@ -107,10 +108,10 @@ checking.
   https://slsa.dev/provenance/v1`). The package is published from
   [`.github/workflows/publish-on-tag.yml`](.github/workflows/publish-on-tag.yml)
   with `npm publish --provenance` through npm Trusted Publishing; no static
-  publish token exists. `npm audit signatures` verifies registry signatures
-  and provenance for every package installed in a project, so run it where the
-  package is installed; an empty directory reports nothing to audit, which is
-  not a pass.
+  publish token exists. After installing into a project, `npm audit signatures`
+  in that project's directory verifies registry signatures and provenance for
+  every package in its `node_modules`; it is a post-install check, and an empty
+  directory reports nothing to audit, which is not a pass.
 - **Signed release manifest.** Every `1.8.x` release attaches
   `release-manifest.json` and the tarball to the GitHub release (v1.7.0
   attaches the manifest but no tarball), and the manifest is signed with a
