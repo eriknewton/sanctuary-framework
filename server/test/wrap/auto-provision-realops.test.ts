@@ -33,14 +33,12 @@
  * per the re-gate spec's chokepoint requirement.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { constants as fsConstants } from "node:fs";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir, rename, open } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
-import { promisify } from "node:util";
 
 import {
   credentialReadableAsUidDecision,
@@ -86,8 +84,6 @@ import {
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
 import { parseBootArgs } from "../../src/cli/castle-wall-boot.js";
-
-const execFileAsync = promisify(execFile);
 
 describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
   it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
@@ -1604,16 +1600,16 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
-  it("AGENT-HOME-LOGS-SYMLINK-01: spawns mkdir with the agent uid and primary gid for root callers", async () => {
+  it("AGENT-HOME-LOGS-SYMLINK-01: spawns mkdir with the requested agent uid and gid for root callers", async () => {
     const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
-    // 7001/7002 are arbitrary non-current ids that make uid and primary gid distinct in the spawn assertion.
+    // 7001/7002 are arbitrary non-current ids that make uid and gid distinct in the spawn assertion.
     const targetUid = 7001;
-    const primaryGid = 7002;
+    const targetGid = 7002;
 
     await createHarnessLogDirectoryAsAgent(
       "/tmp/sanctuary-agent-home/logs",
       targetUid,
-      primaryGid,
+      targetGid,
       fakeMkdirSpawn(calls),
       { uid: 0, gid: 0 },
     );
@@ -1624,14 +1620,14 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       args: ["-m", "700", "--", "/tmp/sanctuary-agent-home/logs"],
       options: {
         uid: targetUid,
-        gid: primaryGid,
+        gid: targetGid,
         shell: false,
         env: { PATH: "/usr/bin:/bin" },
       },
     });
   });
 
-  it("AGENT-HOME-LOGS-SYMLINK-01: omits uid switching when the test process stands in for the agent", async () => {
+  it("AGENT-HOME-LOGS-SYMLINK-01: still passes uid and gid when the test process stands in for the agent", async () => {
     const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
 
     await createHarnessLogDirectoryAsAgent(
@@ -1643,20 +1639,98 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     );
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.options).not.toHaveProperty("uid");
-    expect(calls[0]!.options).not.toHaveProperty("gid");
     expect(calls[0]!.options).toMatchObject({
+      uid: currentUid,
+      gid: currentGid,
       shell: false,
       env: { PATH: "/usr/bin:/bin" },
     });
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: maps a non-zero mkdir exit to the fixed custody refusal", async () => {
+    const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+
+    await expect(
+      createHarnessLogDirectoryAsAgent(
+        "/tmp/sanctuary-agent-home/logs",
+        currentUid,
+        currentGid,
+        fakeMkdirSpawn(calls, 1),
+      ),
+    ).rejects.toBeInstanceOf(HarnessLogDirectoryCustodyError);
+
+    expect(calls).toHaveLength(1);
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: kills and waits for close after a mkdir child error", async () => {
+    const events: string[] = [];
+    const failingSpawn = (() => {
+      const child = new EventEmitter() as ChildProcess;
+      child.kill = (() => {
+        events.push("kill");
+        queueMicrotask(() => {
+          events.push("close");
+          child.emit("close", null, "SIGKILL");
+        });
+        return true;
+      }) as ChildProcess["kill"];
+      queueMicrotask(() => {
+        events.push("error");
+        child.emit("error", new Error("spawn fault"));
+      });
+      return child;
+    }) as typeof spawn;
+
+    await expect(
+      createHarnessLogDirectoryAsAgent(
+        "/tmp/sanctuary-agent-home/logs",
+        currentUid,
+        currentGid,
+        failingSpawn,
+      ),
+    ).rejects.toBeInstanceOf(HarnessLogDirectoryCustodyError);
+
+    expect(events).toEqual(["error", "kill", "close"]);
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: waits for close after timing out the mkdir child", async () => {
+    vi.useFakeTimers();
+    const child = new EventEmitter() as ChildProcess;
+    const events: string[] = [];
+    let settled = false;
+    child.kill = (() => {
+      events.push("kill");
+      return true;
+    }) as ChildProcess["kill"];
+    const hangingSpawn = (() => child) as typeof spawn;
+
+    try {
+      const promise = createHarnessLogDirectoryAsAgent(
+        "/tmp/sanctuary-agent-home/logs",
+        currentUid,
+        currentGid,
+        hangingSpawn,
+      );
+      promise.finally(() => {
+        settled = true;
+      }).catch(() => undefined);
+
+      await vi.runOnlyPendingTimersAsync();
+      expect(events).toEqual(["kill"]);
+      expect(settled).toBe(false);
+
+      child.emit("close", null, "SIGKILL");
+      await expect(promise).rejects.toBeInstanceOf(HarnessLogDirectoryCustodyError);
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("AGENT-HOME-LOGS-SYMLINK-01: refuses a root-owned leftover log directory without ownership repair", async () => {
     const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
     const targetUid = currentUid + 1000;
     const targetGid = targetUid;
-    let chownCalled = false;
-    let chmodCalled = false;
     let createCalled = false;
     try {
       await mkdir(logDir, { mode: 0o700 });
@@ -1671,27 +1745,10 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
           createDirectoryAsAgent: async () => {
             createCalled = true;
           },
-          openDirectoryNoFollow: async (path: string) => {
-            const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
-            return {
-              fd: realHandle.fd,
-              chown: async () => {
-                chownCalled = true;
-              },
-              chmod: async () => {
-                chmodCalled = true;
-              },
-              stat: async () => overlayStats(path, 0, currentGid),
-              close: () => realHandle.close(),
-              readEntries: async () => [],
-            };
-          },
-        } as never),
+        }),
         logDir,
       );
       expect(createCalled).toBe(false);
-      expect(chownCalled).toBe(false);
-      expect(chmodCalled).toBe(false);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1738,7 +1795,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       }
       expect(caught).toBeInstanceOf(HarnessLogDirectoryCustodyError);
       expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
-      expect(caught).toMatchObject({ internalCode: expect.any(String) });
+      expect(caught).not.toHaveProperty("internalCode");
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1880,6 +1937,55 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
 
       expect(await readlink(logDir)).toBe(outside);
       expect(await fileIdentity(outside)).toEqual(beforeOutside);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: refuses a symlink replaced after agent creation before final acceptance", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    const outside = join(tmpRoot, "outside");
+    try {
+      await mkdir(outside);
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat,
+          createDirectoryAsAgent: async () => {
+            await symlink(outside, logDir);
+          },
+        }),
+        logDir,
+      );
+
+      expect(await readlink(logDir)).toBe(outside);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: refuses a foreign-owned directory replaced after agent creation before final acceptance", async () => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
+    const foreignUid = currentUid + 1000;
+    let createCalled = false;
+    try {
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async (path) => {
+            if (path === agentHome) return overlayStats(path, currentUid, currentGid);
+            const stats = await lstat(path);
+            if (path === logDir && createCalled) return statsWithOwner(stats, foreignUid, currentGid);
+            return stats;
+          },
+          createDirectoryAsAgent: async () => {
+            createCalled = true;
+            await mkdir(logDir);
+          },
+        }),
+        logDir,
+      );
+
+      expect(createCalled).toBe(true);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -2894,7 +3000,8 @@ describe("buildHermesExclusiveCliWiring: gate-daemon interpreter prefix (real D9
     // plus a separate `parkPlistFallbackRemoval: true` -- two fields for one
     // condition, and the placeholder was what the parked-form COMPARISON
     // rendered against. The condition is now representable directly.
-    const { harnessLaunch: _drop, ...withoutLaunch } = baseInput(undefined);
+    const withoutLaunch = { ...baseInput(undefined) };
+    Reflect.deleteProperty(withoutLaunch, "harnessLaunch");
     const wiring = buildHermesExclusiveCliWiring(withoutLaunch);
     expect(wiring.harnessLaunch).toBeUndefined();
     expect(JSON.stringify(wiring)).not.toContain("/usr/bin/false");

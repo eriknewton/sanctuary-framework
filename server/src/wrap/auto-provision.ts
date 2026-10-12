@@ -178,17 +178,11 @@ export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 export class HarnessLogDirectoryCustodyError extends Error {
-  readonly internalCode: string;
-
-  constructor(
-    harnessLogDir: string,
-    options?: { internalCode?: string },
-  ) {
+  constructor(harnessLogDir: string) {
     super(
-      `Harness log directory custody check failed for ${harnessLogDir}; inspect the dedicated account home and re-run protect.`,
+      `${harnessLogDir} must be a real directory owned by the dedicated agent account; move it aside or remove it, then re-run protect.`,
     );
     this.name = "HarnessLogDirectoryCustodyError";
-    this.internalCode = options?.internalCode ?? "harness_log_custody";
   }
 }
 
@@ -259,17 +253,13 @@ function assertHarnessLogDirectoryAgentCustody(
   }
 }
 
-function currentProcessIds(): { uid?: number; gid?: number } {
-  return { uid: process.getuid?.(), gid: process.getgid?.() };
-}
-
-function spawnMkdirOptions(uid: number, gid: number, current = currentProcessIds()): SpawnOptions {
-  const sameProcessOwner = current.uid === uid && current.gid === gid;
+function spawnMkdirOptions(uid: number, gid: number): SpawnOptions {
   return {
     env: HARNESS_LOG_MKDIR_ENV,
     shell: false,
     stdio: ["ignore", "ignore", "ignore"],
-    ...(sameProcessOwner ? {} : { uid, gid }),
+    uid,
+    gid,
   };
 }
 
@@ -278,39 +268,53 @@ export function createHarnessLogDirectoryAsAgent(
   uid: number,
   gid: number,
   spawnImpl: typeof spawn = spawn,
-  current = currentProcessIds(),
+  _current?: { uid?: number; gid?: number },
 ): Promise<void> {
-  const options = spawnMkdirOptions(uid, gid, current);
+  void _current;
+  const options = spawnMkdirOptions(uid, gid);
   return new Promise((resolve, reject) => {
     let settled = false;
+    let rejectAfterClose = false;
     let child: ChildProcess | undefined;
-    const timer = setTimeout(() => {
+    const finishReject = () => {
       if (settled) return;
-      child?.kill(LAUNCHCTL_KILL_SIGNAL);
       settled = true;
-      reject(new Error("harness log mkdir timed out"));
-    }, HARNESS_LOG_MKDIR_TIMEOUT_MS);
+      clearTimeout(timer);
+      reject(harnessLogCustodyError(path));
+    };
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const failAfterChildClose = () => {
+      if (settled || rejectAfterClose) return;
+      rejectAfterClose = true;
+      if (child === undefined) {
+        finishReject();
+        return;
+      }
+      child.kill(LAUNCHCTL_KILL_SIGNAL);
+    };
+    const timer = setTimeout(failAfterChildClose, HARNESS_LOG_MKDIR_TIMEOUT_MS);
     try {
       child = spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options);
-    } catch (err) {
-      clearTimeout(timer);
-      reject(err);
+    } catch {
+      finishReject();
       return;
     }
-    child.on("error", (err) => {
-      if (settled) return;
-      clearTimeout(timer);
-      settled = true;
-      reject(err);
-    });
+    child.on("error", failAfterChildClose);
     child.on("close", (code) => {
       if (settled) return;
-      clearTimeout(timer);
-      settled = true;
+      if (rejectAfterClose) {
+        finishReject();
+        return;
+      }
       if (code === 0) {
-        resolve();
+        finishResolve();
       } else {
-        reject(new Error("harness log mkdir failed"));
+        finishReject();
       }
     });
   });
@@ -346,7 +350,7 @@ export async function ensureHarnessDaemonLogDir(
 
   if (stats === undefined) {
     try {
-      // Root never mutates inside the agent-controlled home for logs; creation runs with the agent's own authority, so any planted symlink is bounded by that uid.
+      // Root delegates creation to the agent account and does not repair names inside the agent-owned home.
       await ops.createDirectoryAsAgent(harnessLogDir, uid, gid);
     } catch {
       throw harnessLogCustodyError(harnessLogDir);
@@ -357,6 +361,7 @@ export async function ensureHarnessDaemonLogDir(
   } catch {
     throw harnessLogCustodyError(harnessLogDir);
   }
+  // Acceptance is limited to real-directory shape plus agent uid ownership: the agent owns this directory and can change mode, group, or entries after protect returns, so root-side mode/group checks here would not be a durable control.
   assertHarnessLogDirectoryAgentCustody(harnessLogDir, stats, uid);
 }
 
@@ -1524,12 +1529,11 @@ export async function runAutoProvisionForWrap(
       return { plan, results };
     },
     installHarnessDaemon: async (uid) => {
-      // FIX R1: capture the target uid/gid here (see the comment above the
-      // `ops` object) so the endpoint probes below can check
-      // credential-readable-by-uid honestly instead of guessing. The new
-      // account's uid and gid are the same value (see `rehome`'s call site
-      // and `arm`'s `--agent-uid=<uid>` below, which both treat uid===gid
-      // for this dedicated service account).
+      // FIX R1: capture the target uid/gid here so the endpoint probes below can
+      // check credential-readable-by-uid honestly instead of guessing. The gid is
+      // still passed to spawned helpers as a process credential, but macOS may
+      // assign the account a different primary group and new directories can
+      // inherit their parent's group, so group is not the acceptance boundary.
       resolvedAgentUidGid = { uid, gid: uid };
       // FIX F-ALREADYDEDICATED: resolve the credential set the verify will
       // probe on EVERY path. On the fresh path `rehome` already set it (step 5

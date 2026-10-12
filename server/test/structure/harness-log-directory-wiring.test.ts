@@ -27,6 +27,10 @@ function ensureHarnessDaemonLogDirSource(source: string): string {
   return source.slice(start, end);
 }
 
+function awaitedCalls(source: string): string[] {
+  return [...source.matchAll(/\bawait\s+([A-Za-z0-9_.]+)\s*\(/g)].map((match) => match[1]!);
+}
+
 describe("structure: harness log directory install wiring", () => {
   it("pins agent-authority creation at the production helper", async () => {
     const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
@@ -34,9 +38,24 @@ describe("structure: harness log directory install wiring", () => {
 
     expect(source).toContain("createHarnessLogDirectoryAsAgent");
     expect(source).toContain('spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options)');
+    expect(helperSource).toContain(
+      [
+        "ops: HarnessLogDirectoryOps = {",
+        "    lstat,",
+        "    createDirectoryAsAgent: createHarnessLogDirectoryAsAgent,",
+        "  },",
+      ].join("\n"),
+    );
     expect(helperSource).toContain("await ops.createDirectoryAsAgent(harnessLogDir, uid, gid);");
-    expect(helperSource).not.toMatch(/\b(?:fchown|fchmod)\b/);
-    expect(helperSource).not.toMatch(/\.(?:chown|chmod)\s*\(/);
+    expect(awaitedCalls(helperSource)).toEqual([
+      "ops.lstat",
+      "ops.lstat",
+      "ops.createDirectoryAsAgent",
+      "ops.lstat",
+    ]);
+    expect(helperSource).not.toMatch(
+      /(?:\b|\.)?(?:fsChown|chown|lchown|fchown|chmod|fchmod|mkdir|rename|open|unlink|writeFile)\s*\(/,
+    );
     expect(helperSource).not.toContain("openDirectoryNoFollow");
     expect(helperSource).not.toContain("readEntries");
     expect(helperSource).not.toContain("/dev/fd");
