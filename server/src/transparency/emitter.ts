@@ -7,7 +7,7 @@
  *   - audit chain fails integrity        → refuse (AuditIntegrityError)
  *   - no Castle Wall policy on disk      → refuse
  *   - emitting binary unreadable         → refuse
- *   - signer unreachable / bad signature → refuse; NOTHING is persisted
+ *   - signer unreachable / bad signature → refuse before persistence
  *   - checkpoint store rolled back       → refuse (MAC'd counter floor)
  *   - previous checkpoint malformed      → refuse
  *
@@ -50,6 +50,12 @@ import {
   type EnforcementCheckpointRecord,
 } from "./checkpoint.js";
 import { ED25519_SIGNATURE_BYTES } from "../core/crypto-suite-registry.js";
+import {
+  TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS,
+  TRANSPARENCY_NEVER_ABORTED,
+  TransparencySchedulerAbortState,
+  TransparencySchedulerAbortedError,
+} from "./scheduler.js";
 
 export const TRANSPARENCY_CHECKPOINT_NAMESPACE = "_transparency_checkpoints";
 export const TRANSPARENCY_CHECKPOINT_KEY_PREFIX = "enforcement-checkpoint-";
@@ -61,7 +67,6 @@ const TRANSPARENCY_FLOOR_MAC_DOMAIN =
 const TRANSPARENCY_POLICY_RULES_DOMAIN =
   "sanctuary.transparency.policy-rules.v1";
 const TRANSPARENCY_EMIT_LOCK_FILE = ".transparency-emit.lock";
-const TRANSPARENCY_EMIT_LOCK_TIMEOUT_MS = 5_000;
 const TRANSPARENCY_EMIT_LOCK_RETRY_MS = 100;
 
 /**
@@ -101,6 +106,8 @@ export interface EmitEnforcementCheckpointInput {
   version: string;
   /** Clock override for tests. */
   now?: () => Date;
+  /** Shutdown abort state for daemon-scheduled emissions. */
+  abortState: TransparencySchedulerAbortState;
 }
 
 /** Persisted-checkpoint key for a counter value (zero-padded, sort-stable). */
@@ -157,11 +164,19 @@ export async function readPersistedCheckpoints(
 /**
  * Emit one signed enforcement checkpoint. Returns the persisted record.
  * Throws `TransparencyEmitError` (or `AuditIntegrityError` from the audit
- * layer) on ANY failure; on failure nothing has been persisted.
+ * layer) on ANY failure. A failure before checkpoint persistence leaves no
+ * record; a failure between checkpoint persistence and floor write can leave
+ * the floor at counter-1, which remains a consistent lower bound.
  */
 export async function emitEnforcementCheckpoint(
   input: EmitEnforcementCheckpointInput
 ): Promise<EnforcementCheckpointRecord> {
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from deriving the floor MAC key from the daemon master key.
+  TransparencySchedulerAbortState.assertNotAborted(
+    input.abortState,
+    "counter-floor key derivation"
+  );
   const floorMacKey = derivePurposeKey(
     input.masterKey,
     "transparency-counter-floor"
@@ -211,7 +226,7 @@ export async function emitEnforcementCheckpoint(
       // 4. Counter continuity against the persisted store + MAC'd floor.
       const previous = await readPersistedCheckpoints(input.storage);
       const last = previous.at(-1);
-      const floor = await readCounterFloor(input.storage, floorMacKey);
+      const floor = await readCounterFloor(input.storage, floorMacKey, input.abortState);
       if (floor.status === "invalid") {
         throw new TransparencyEmitError(
           "transparency counter floor failed authentication (tampered, forged, or wrong key); refusing to emit"
@@ -261,8 +276,16 @@ export async function emitEnforcementCheckpoint(
       //    produce a persisted-but-unverifiable checkpoint).
       let signature: Uint8Array;
       try {
+        // INVARIANT (shutdown/key custody): the abort check is adjacent to the
+        // signer call so a deadline-abandoned tick cannot enter signing after
+        // the daemon starts releasing its master session.
+        TransparencySchedulerAbortState.assertNotAborted(
+          input.abortState,
+          "checkpoint signing"
+        );
         signature = await input.signer.sign(checkpointSigningBytes(payload));
       } catch (err) {
+        if (err instanceof TransparencySchedulerAbortedError) throw err;
         throw new TransparencyEmitError(
           `transparency checkpoint signing failed (nothing was emitted): ${errorMessage(err)}`
         );
@@ -289,13 +312,20 @@ export async function emitEnforcementCheckpoint(
       // 7. Persist the checkpoint durably, THEN raise the floor. A crash
       //    between the two leaves floor == counter-1, which still satisfies
       //    the floor invariant (floor is a lower bound).
+      // INVARIANT (shutdown/key custody): this is the last synchronous gate
+      // before the durable write; an aborted daemon tick must fail closed
+      // rather than starting a new checkpoint write.
+      TransparencySchedulerAbortState.assertNotAborted(
+        input.abortState,
+        "checkpoint persistence"
+      );
       await writeRecordDurable(
         input.storage,
         TRANSPARENCY_CHECKPOINT_NAMESPACE,
         checkpointStorageKey(counter),
         stringToBytes(JSON.stringify(record))
       );
-      await writeCounterFloor(input.storage, floorMacKey, counter);
+      await writeCounterFloor(input.storage, floorMacKey, counter, input.abortState);
       return record;
     });
   } finally {
@@ -465,7 +495,11 @@ export async function readTransparencyCounterFloor(
 ): Promise<CounterFloorState> {
   const floorMacKey = derivePurposeKey(masterKey, "transparency-counter-floor");
   try {
-    return await readCounterFloor(storage, floorMacKey);
+    return await readCounterFloor(
+      storage,
+      floorMacKey,
+      TRANSPARENCY_NEVER_ABORTED
+    );
   } finally {
     floorMacKey.fill(0);
   }
@@ -489,14 +523,23 @@ export async function rebaselineTransparencyCounterFloor(
 ): Promise<number> {
   const floorMacKey = derivePurposeKey(masterKey, "transparency-counter-floor");
   try {
-    const current = await readCounterFloor(storage, floorMacKey);
+    const current = await readCounterFloor(
+      storage,
+      floorMacKey,
+      TRANSPARENCY_NEVER_ABORTED
+    );
     const currentValue = current.status === "valid" ? current.highest_counter : 0;
     // Only raise (monotonic). A tampered floor (invalid) is treated as 0 here,
     // so the re-baseline writes a fresh authenticated floor at the target.
     const next = Math.max(currentValue, targetCounter);
     if (next <= 0) return currentValue; // nothing to anchor to; leave as-is
     if (current.status === "valid" && next === currentValue) return currentValue;
-    await writeCounterFloor(storage, floorMacKey, next);
+    await writeCounterFloor(
+      storage,
+      floorMacKey,
+      next,
+      TRANSPARENCY_NEVER_ABORTED
+    );
     return next;
   } finally {
     floorMacKey.fill(0);
@@ -505,7 +548,8 @@ export async function rebaselineTransparencyCounterFloor(
 
 async function readCounterFloor(
   storage: StorageBackend,
-  macKey: Uint8Array
+  macKey: Uint8Array,
+  abortState: TransparencySchedulerAbortState
 ): Promise<CounterFloorState> {
   let raw: Uint8Array | null;
   try {
@@ -546,6 +590,12 @@ async function readCounterFloor(
   } catch {
     return { status: "invalid" };
   }
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from the floor MAC verification using master-derived key material.
+  TransparencySchedulerAbortState.assertNotAborted(
+    abortState,
+    "counter-floor MAC verification"
+  );
   if (
     !constantTimeEqual(
       providedMac,
@@ -560,9 +610,16 @@ async function readCounterFloor(
 async function writeCounterFloor(
   storage: StorageBackend,
   macKey: Uint8Array,
-  highestCounter: number
+  highestCounter: number,
+  abortState: TransparencySchedulerAbortState
 ): Promise<void> {
   const data = { highest_counter: highestCounter };
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from the floor MAC write using master-derived key material.
+  TransparencySchedulerAbortState.assertNotAborted(
+    abortState,
+    "counter-floor MAC write"
+  );
   const envelope = {
     [TRANSPARENCY_FLOOR_MARKER]: true,
     data,

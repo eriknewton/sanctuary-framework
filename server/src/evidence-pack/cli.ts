@@ -36,6 +36,7 @@ import {
   buildAnchorsExport,
   readAnchorConfig,
 } from "../transparency/anchoring.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../transparency/scheduler.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
@@ -542,7 +543,11 @@ export async function gatherDiscreteExports(
   //     unlistable receipt store becomes read_failed here, not a false empty.
   const anchor: ReadOutcome<string> = await (async () => {
     try {
-      const state = await readAnchorConfig({ storage, masterKey });
+      const state = await readAnchorConfig({
+        storage,
+        masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       const receiptsPresent = await anchorReceiptsPresentOnDisk(storage);
       if (state.status === "absent") {
         return receiptsPresent
@@ -558,6 +563,7 @@ export async function gatherDiscreteExports(
         storage,
         masterKey,
         fortressId,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
         now: () => new Date(generatedAt),
       });
       // Only a receipt with status "anchored" is public-anchor evidence. A

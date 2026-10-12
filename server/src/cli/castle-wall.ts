@@ -48,6 +48,7 @@ import {
   type ResolvedCustodyCredential,
 } from "../wrap/custody-credential.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { StorageBackend } from "../storage/interface.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import {
   AuditLog,
@@ -73,6 +74,7 @@ import {
 } from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+import { TransparencySchedulerAbortState } from "../transparency/scheduler.js";
 // Type-only: the runtime module itself stays behind the dynamic import below
 // so the Linux activation path is not pulled into every CLI invocation.
 import type { CastleWallActivationCompleteness } from "../castle-wall/runtime/linux-activation-gate.js";
@@ -776,6 +778,133 @@ function write(stream: Writable, text: string): void {
   stream.write(text);
 }
 
+export interface TransparencyDaemonScheduledEmitInput {
+  storage: StorageBackend;
+  auditLog: AuditLog;
+  storagePath: string;
+  masterKey: Uint8Array;
+  env: NodeJS.ProcessEnv;
+  localSign: boolean;
+  signerClientInvoke?: ShimInvoker;
+  globalPinnedPublicKeyPath?: string;
+  binaryPath: string;
+  version: string;
+  out: Writable;
+  err: Writable;
+}
+
+/**
+ * Builds the exact transparency-emission callback the daemon scheduler runs.
+ * Keeping this as one factory gives tests a wired consumer of the daemon path
+ * without sending process signals through the test runner.
+ */
+export function createTransparencyDaemonScheduledEmit(
+  input: TransparencyDaemonScheduledEmitInput
+) {
+  return async function state_SCHEDULED_TRANSPARENCY_EMIT(
+    abortState: TransparencySchedulerAbortState
+  ): Promise<void> {
+    const { emitEnforcementCheckpoint } = await import(
+      "../transparency/emitter.js"
+    );
+    const { resolveTransparencySigner } = await import(
+      "../transparency/signer.js"
+    );
+    const { anchorCheckpoint, readAnchorConfig } = await import(
+      "../transparency/anchoring.js"
+    );
+
+    // INVARIANT (shutdown/key custody): no await may separate this abort
+    // check from entering signer resolution with the daemon master key.
+    TransparencySchedulerAbortState.assertNotAborted(
+      abortState,
+      "transparency signer resolution"
+    );
+    const signer = await resolveTransparencySigner({
+      fortressPath: input.storagePath,
+      masterKey: input.masterKey,
+      env: input.env,
+      ...(input.localSign ? { mode: "local" as const } : {}),
+      ...(input.signerClientInvoke ? { signerClientInvoke: input.signerClientInvoke } : {}),
+      ...(input.globalPinnedPublicKeyPath
+        ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+        : {}),
+      abortState,
+    });
+    const record = await emitEnforcementCheckpoint({
+      storage: input.storage,
+      auditLog: input.auditLog,
+      fortressId: fortressIdFromStoragePath(input.storagePath),
+      fortressPath: input.storagePath,
+      masterKey: input.masterKey,
+      signer,
+      binaryPath: input.binaryPath,
+      version: input.version,
+      abortState,
+    });
+    try {
+      await input.auditLog.appendCritical({
+        layer: "l2",
+        operation: "transparency_checkpoint_emitted",
+        identity_id: record.fortress_id,
+        result: "success",
+        details: {
+          counter: record.counter,
+          merkle_root: record.audit.merkle_root,
+          highest_sequence: record.audit.highest_sequence,
+          signer_kid: record.signer_kid,
+        },
+      });
+    } catch (auditError) {
+      write(
+        input.err,
+        `[transparency] checkpoint ${record.counter} emitted and floor recorded, but the audit entry was refused: ${auditError instanceof Error ? auditError.message : String(auditError)}\n`,
+      );
+      return;
+    }
+    write(
+      input.out,
+      `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
+    );
+    // Opt-in external anchoring (PR-2). OFF by default: with no consent record
+    // nothing is transmitted. FAIL LOUD, never blocking: an anchor failure (or
+    // a tampered anchoring config) is reported on the console and in the audit
+    // log, but the emitted checkpoint above stands and enforcement continues.
+    try {
+      const anchorState = await readAnchorConfig({
+        storage: input.storage,
+        masterKey: input.masterKey,
+        abortState,
+      });
+      if (anchorState.status === "enabled") {
+        const outcome = await anchorCheckpoint({
+          storage: input.storage,
+          masterKey: input.masterKey,
+          auditLog: input.auditLog,
+          record,
+          abortState,
+        });
+        if (outcome.status === "anchored") {
+          write(
+            input.out,
+            `[transparency] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`,
+          );
+        } else if (outcome.status === "failed") {
+          write(
+            input.err,
+            `[transparency] checkpoint ${record.counter} ANCHORING FAILED (emission stands; recorded in the audit log): ${outcome.error}. Retry with: sanctuary transparency anchor now\n`,
+          );
+        }
+      }
+    } catch (anchorError) {
+      write(
+        input.err,
+        `[transparency] checkpoint ${record.counter} ANCHORING REFUSED (emission stands): ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`,
+      );
+    }
+  };
+}
+
 /**
  * Default agent-origin descriptor presence probe for the `enable` boot-cut
  * WARNING (#877 follow-up). True iff `<fortress>/policy/egress/agent-origin.json`
@@ -871,10 +1000,16 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-async function resolveMasterKey(
+interface ResolvedMasterKeySession {
+  readonly storage: FilesystemStorage;
+  readonly masterKey: Uint8Array;
+  readonly masterWriteBarrier?: { release(): Promise<void> };
+}
+
+async function openResolvedMasterKeySession(
   storagePath: string,
-  env: NodeJS.ProcessEnv
-): Promise<Uint8Array> {
+  env: NodeJS.ProcessEnv,
+): Promise<ResolvedMasterKeySession> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
 
   // Unified custody path (master-custody.ts): envelope-first, legacy markers
@@ -896,7 +1031,13 @@ async function resolveMasterKey(
       storagePathHint: storagePath,
       barrierDegradeMode: "read-only",
     });
-    return result.masterKey;
+    return {
+      storage,
+      masterKey: result.masterKey,
+      ...(result.masterWriteBarrier !== undefined
+        ? { masterWriteBarrier: result.masterWriteBarrier }
+        : {}),
+    };
   }
 
   const passphrase =
@@ -910,7 +1051,53 @@ async function resolveMasterKey(
     storagePathHint: storagePath,
     barrierDegradeMode: "read-only",
   });
-  return result.masterKey;
+  return {
+    storage,
+    masterKey: result.masterKey,
+    ...(result.masterWriteBarrier !== undefined
+      ? { masterWriteBarrier: result.masterWriteBarrier }
+      : {}),
+  };
+}
+
+async function withResolvedMasterKeySession<T>(
+  storagePath: string,
+  env: NodeJS.ProcessEnv,
+  operation: (session: ResolvedMasterKeySession) => Promise<T>,
+): Promise<T> {
+  const session = await openResolvedMasterKeySession(storagePath, env);
+  // DEBT(BARRIER-READER-CALLERS): shared lease-scoped resolver for remaining
+  // CLI master-key callers that perform master-derived writes after unlock.
+  // Every exit zeroes the key and releases the shared rotation reader exactly
+  // once: the operation's outcome is captured first so the release runs on the
+  // success and the failure path alike, and a release failure is never lost
+  // and never masks the operation's own error.
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+  try {
+    outcome = { ok: true, value: await operation(session) };
+  } catch (error) {
+    outcome = { ok: false, error };
+  } finally {
+    session.masterKey.fill(0);
+  }
+  let releaseFailed = false;
+  let releaseError: unknown;
+  try {
+    await session.masterWriteBarrier?.release();
+  } catch (error) {
+    releaseFailed = true;
+    releaseError = error;
+  }
+  if (!outcome.ok) {
+    if (!releaseFailed) throw outcome.error;
+    throw new AggregateError(
+      [outcome.error, releaseError],
+      "master-key operation failed and its shared rotation reader did not release cleanly",
+      { cause: releaseError },
+    );
+  }
+  if (releaseFailed) throw releaseError;
+  return outcome.value;
 }
 
 function provisionCredentialFields(
@@ -1034,8 +1221,9 @@ export async function runAuditFindings(
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
     const findings = await auditLog.getIntegrityFindings();
 
@@ -1048,7 +1236,6 @@ export async function runAuditFindings(
     // returned `verified` / `empty` / `not_present` (never migrated). Run that
     // walk now and fold its verdict into the clean/unclean decision.
     const sealed = await verifySealedLegacyPrefix(storage, masterKey);
-    masterKey.fill(0);
 
     const sealedClean =
       sealed.status === "verified" ||
@@ -1107,6 +1294,7 @@ export async function runAuditFindings(
       write(err, `sealed legacy region: ${sealedNote}.\n`);
     }
     return 0;
+    });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
@@ -1135,10 +1323,12 @@ export async function runAuditStoreStatus(
   const fortressPath = resolveFortressArg(parsed.fortress, env);
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
-    const report = await verifyFortressAuditFullPicture({ storage, masterKey });
-    masterKey.fill(0);
+    const report = await withResolvedMasterKeySession(fortressPath, env, async (session) =>
+      verifyFortressAuditFullPicture({
+        storage: session.storage,
+        masterKey: session.masterKey,
+      }),
+    );
     write(out, JSON.stringify(report, null, 2) + "\n");
     return 0;
   } catch (error) {
@@ -2468,7 +2658,8 @@ export async function runDaemon(
     join(storagePath, "state"),
     fortressCreateOwner !== undefined ? { owner: fortressCreateOwner } : {},
   );
-  let derived: { key: Uint8Array };
+  let derived: { key: Uint8Array } | undefined;
+  let daemonMasterWriteBarrier: { release(): Promise<void> } | undefined;
   try {
     const custodyResult = await establishMaster({
       storage,
@@ -2484,6 +2675,7 @@ export async function runDaemon(
       barrierDegradeMode: "inert",
     });
     derived = { key: custodyResult.masterKey };
+    daemonMasterWriteBarrier = custodyResult.masterWriteBarrier;
   } catch (error) {
     write(
       err,
@@ -2492,6 +2684,38 @@ export async function runDaemon(
     );
     return 1;
   }
+  if (derived === undefined) return 1;
+  const releaseDaemonMasterSession = async (): Promise<boolean> => {
+    derived?.key.fill(0);
+    try {
+      // INVARIANT (daemon session lifetime): the foreground daemon keeps the
+      // shared rotation reader only while it may perform master-derived writes;
+      // every startup refusal and normal stop releases it before returning to an
+      // in-process caller.
+      await daemonMasterWriteBarrier?.release();
+      daemonMasterWriteBarrier = undefined;
+      return true;
+    } catch (error) {
+      write(
+        err,
+        `Error: master-write barrier release failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return false;
+    }
+  };
+  let transparencyScheduler: { stop(): Promise<void> } | undefined;
+  let daemon: { socketPath: string; stop: () => Promise<void> } | undefined;
+  const stopTransparencySchedulerOnce = async (): Promise<void> => {
+    const current = transparencyScheduler;
+    transparencyScheduler = undefined;
+    await current?.stop().catch(() => undefined);
+  };
+  const stopDaemonOnce = async (): Promise<void> => {
+    const current = daemon;
+    daemon = undefined;
+    await current?.stop().catch(() => undefined);
+  };
+  try {
   // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
   // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
   // primitives), while every OTHER caller of this same binary runs as the
@@ -2539,6 +2763,7 @@ export async function runDaemon(
           "cross-uid unreadability. Investigate before retrying (see " +
           "'sanctuary castle-wall audit-findings').\n",
       );
+      await releaseDaemonMasterSession();
       return 1;
     }
     // The daemon's own chain is fresh from this migration onward (nothing but
@@ -2562,7 +2787,6 @@ export async function runDaemon(
     });
   }
 
-  let daemon: { socketPath: string; stop: () => Promise<void> };
   // Carried out of the activation block so the console claim below is derived
   // from the activation's own evidence rather than from the fact that a start
   // did not throw. `undefined` means the Linux path was not taken at all.
@@ -2604,6 +2828,7 @@ export async function runDaemon(
           err,
           `Refusing to report armed: Linux producer-signed activation did not engage (${outcome.reason}).\n`,
         );
+        await releaseDaemonMasterSession();
         return 1;
       }
       const socketPath = resolveCastleWallSocketPath({
@@ -2619,6 +2844,7 @@ export async function runDaemon(
     } catch (error) {
       write(err, `Daemon failed to start (Linux producer-signed, fail-closed): ${(error as Error).message}\n`);
       write(err, "The producer-signed close is fail-closed: a daemon-start, key, handshake, or drain failure surfaces NOT-ARMED rather than degrading to the channel basis.\n");
+      await releaseDaemonMasterSession();
       return 1;
     }
   } else {
@@ -2680,11 +2906,17 @@ export async function runDaemon(
           globalPinPath: CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
         });
       }
+      await releaseDaemonMasterSession();
       return 1;
     }
   }
+  if (daemon === undefined) {
+    await releaseDaemonMasterSession();
+    return 1;
+  }
+  const runningDaemon = daemon;
 
-  write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
+  write(out, `Castle Wall daemon listening on ${runningDaemon.socketPath}\n`);
   if (linuxProducerSigned) {
     // ACTIVE is a claim about the KERNEL runtime, not about the process having
     // started. An indeterminate or unconfirmed activation prints DEGRADED here:
@@ -2731,8 +2963,7 @@ export async function runDaemon(
   // SANCTUARY_TRANSPARENCY_INTERVAL accepts "off", ms, or <n>s|m|h|d. A
   // misconfigured cadence refuses to start the daemon (no silent fallback);
   // a failed emission tick is loud on stderr but never crashes enforcement
-  // and never persists a partial checkpoint (the emitter is fail-closed).
-  let transparencyScheduler: { stop(): void } | undefined;
+  // and never signs or persists without the authenticated floor path.
   {
     const {
       parseTransparencyInterval,
@@ -2744,100 +2975,37 @@ export async function runDaemon(
       intervalMs = parseTransparencyInterval(env[TRANSPARENCY_INTERVAL_ENV]);
     } catch (error) {
       write(err, `${(error as Error).message}\n`);
-      await daemon.stop().catch(() => undefined);
+      await stopDaemonOnce();
+      await stopTransparencySchedulerOnce();
+      await releaseDaemonMasterSession();
       return 1;
     }
     if (intervalMs !== null) {
-      const { emitEnforcementCheckpoint } = await import(
-        "../transparency/emitter.js"
-      );
-      const { resolveTransparencySigner } = await import(
-        "../transparency/signer.js"
-      );
       const { realpathSync } = await import("node:fs");
       // Canonical version source. A bare require("../../package.json") resolves
       // to the repo-root package.json (no `version`) once bundled to
       // server/dist/, which corrupts the persisted checkpoint chain; the helper
       // reads server/package.json from both src/ and dist/.
       const pkgVersion = getSanctuaryVersion();
+      const scheduledEmit = createTransparencyDaemonScheduledEmit({
+        storage,
+        auditLog,
+        storagePath,
+        masterKey: derived.key,
+        env,
+        localSign,
+        binaryPath: realpathSync(process.argv[1] ?? ""),
+        version: pkgVersion,
+        out,
+        err,
+      });
       transparencyScheduler = startTransparencyScheduler({
         intervalMs,
-        emit: async () => {
-          const signer = await resolveTransparencySigner({
-            fortressPath: storagePath,
-            masterKey: derived.key,
-            env,
-            ...(localSign ? { mode: "local" as const } : {}),
-          });
-          const record = await emitEnforcementCheckpoint({
-            storage,
-            auditLog,
-            fortressId: fortressIdFromStoragePath(storagePath),
-            fortressPath: storagePath,
-            masterKey: derived.key,
-            signer,
-            binaryPath: realpathSync(process.argv[1] ?? ""),
-            version: pkgVersion,
-          });
-          await auditLog.appendCritical({
-            layer: "l2",
-            operation: "transparency_checkpoint_emitted",
-            identity_id: record.fortress_id,
-            result: "success",
-            details: {
-              counter: record.counter,
-              merkle_root: record.audit.merkle_root,
-              highest_sequence: record.audit.highest_sequence,
-              signer_kid: record.signer_kid,
-            },
-          });
-          write(
-            out,
-            `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
-          );
-          // Opt-in external anchoring (PR-2). OFF by default: with no
-          // consent record nothing is transmitted. FAIL LOUD, never
-          // blocking: an anchor failure (or a tampered anchoring config)
-          // is reported on the console and in the audit log, but the
-          // emitted checkpoint above stands and enforcement continues.
-          try {
-            const { anchorCheckpoint, readAnchorConfig } = await import(
-              "../transparency/anchoring.js"
-            );
-            const anchorState = await readAnchorConfig({
-              storage,
-              masterKey: derived.key,
-            });
-            if (anchorState.status === "enabled") {
-              const outcome = await anchorCheckpoint({
-                storage,
-                masterKey: derived.key,
-                auditLog,
-                record,
-              });
-              if (outcome.status === "anchored") {
-                write(
-                  out,
-                  `[transparency] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`,
-                );
-              } else if (outcome.status === "failed") {
-                write(
-                  err,
-                  `[transparency] checkpoint ${record.counter} ANCHORING FAILED (emission stands; recorded in the audit log): ${outcome.error}. Retry with: sanctuary transparency anchor now\n`,
-                );
-              }
-            }
-          } catch (anchorError) {
-            write(
-              err,
-              `[transparency] checkpoint ${record.counter} ANCHORING REFUSED (emission stands): ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`,
-            );
-          }
-        },
+        emit: scheduledEmit,
         onError: (error) => {
           write(
             err,
-            `[transparency] checkpoint emission FAILED (nothing was persisted): ${error instanceof Error ? error.message : String(error)}\n`,
+            `[transparency] checkpoint emission FAILED before a complete checkpoint-and-floor update was recorded: ${error instanceof Error ? error.message : String(error)}\n`,
           );
         },
       });
@@ -2854,16 +3022,24 @@ export async function runDaemon(
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall daemon...\n");
-      transparencyScheduler?.stop();
-      void daemon
-        .stop()
-        .catch(() => undefined)
-        .finally(() => resolveWait());
+      void (async () => {
+        await stopTransparencySchedulerOnce();
+        await stopDaemonOnce();
+        resolveWait();
+      })();
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
   });
-  return 0;
+  return (await releaseDaemonMasterSession()) ? 0 : 1;
+  } finally {
+    // INVARIANT (daemon session ownership): any path after master unlock that
+    // returns or throws must stop daemon work and drain checkpoint work before
+    // dropping the reader.
+    await stopTransparencySchedulerOnce();
+    await stopDaemonOnce();
+    await releaseDaemonMasterSession();
+  }
 }
 
 /**
@@ -3429,8 +3605,9 @@ export async function runAuditDump(
     : undefined;
 
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
       layer: "l1" as const,
@@ -3509,6 +3686,7 @@ export async function runAuditDump(
       write(out, JSON.stringify({ ...entry, _chain: "daemon" }) + "\n");
     }
     return 0;
+    });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
@@ -3691,8 +3869,9 @@ export async function runAuditVerify(
       },
     );
 
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
+    return await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+    const storage = session.storage;
+    const masterKey = session.masterKey;
     const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
       layer: "l1" as const,
@@ -3909,6 +4088,7 @@ export async function runAuditVerify(
       }
     }
     return 0;
+    });
   } catch (error) {
     write(
       err,
@@ -5489,20 +5669,23 @@ export async function appendCastleWallCliAuditBestEffort(
   fortressPath: string,
   env: NodeJS.ProcessEnv,
   err: Writable,
+  hooks: {
+    __testBeforeAuditAppend?: (session: ResolvedMasterKeySession) => void | Promise<void>;
+  } = {},
 ): Promise<void> {
   try {
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveMasterKey(fortressPath, env);
-    const auditLog = new AuditLog(storage, masterKey);
-    await auditLog.append(
-      "l1",
-      operation,
-      fortressIdFromStoragePath(fortressPath),
-      details,
-      "success",
-    );
-    await auditLog.flush();
-    masterKey.fill(0);
+    await withResolvedMasterKeySession(fortressPath, env, async (session) => {
+      const auditLog = new AuditLog(session.storage, session.masterKey);
+      await hooks.__testBeforeAuditAppend?.(session);
+      await auditLog.append(
+        "l1",
+        operation,
+        fortressIdFromStoragePath(fortressPath),
+        details,
+        "success",
+      );
+      await auditLog.flush();
+    });
   } catch (error) {
     write(
       err,

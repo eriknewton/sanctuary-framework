@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * PR-3 CLI surface + pre-declared drill fixtures for the anchor-verification
  * skeptic loop (synthetic-fixture rule: no network; Rekor is the
@@ -46,6 +47,7 @@ import {
 } from "../../src/transparency/emitter.js";
 import { resolveTransparencySigner } from "../../src/transparency/signer.js";
 import { TRANSPARENCY_BUNDLE_FORMAT } from "../../src/transparency/checkpoint.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../../src/transparency/scheduler.js";
 import type { FetchLike } from "../../src/transparency/rekor-client.js";
 import { FakeRekorLog } from "./fake-rekor-log.js";
 
@@ -438,6 +440,7 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
       masterKey: derived.key,
       env: {},
       mode: "local",
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     await emitEnforcementCheckpoint({
       storage: forkStorage,
@@ -446,6 +449,7 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
       fortressPath: forkPath,
       masterKey: derived.key,
       signer,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
       binaryPath,
       version: "0.0.0-test",
     });

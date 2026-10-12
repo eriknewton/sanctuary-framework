@@ -15,6 +15,7 @@ import {
   chmod,
   mkdtemp,
   lstat,
+  readdir,
   readFile,
   rm,
   unlink,
@@ -25,6 +26,7 @@ import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
+import { isMainThread } from "node:worker_threads";
 
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -33,14 +35,147 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import {
+  acquireMasterWriteBarrier,
   withCrossProcessLock,
   withPathLock,
   CrossProcessLockError,
   resetKernelLockPoisonForTests,
+  __testSweepUnusedBarrierScaffolds,
 } from "../../src/storage/cross-process-lock.js";
 
 const NS = "_lock_test";
 const LOCK = ".unit.lock";
+// 8 old pairs: enough that a missing sweep leaves far more than the bound, few enough that one
+// capped sweep pass clears them on a slow runner (measured ~37 ms per helper at load 10).
+const DISTINCT_BARRIER_FORTRESS_COUNT = 8;
+const OVER_CEILING_IGNORED_ENTRY_COUNT = 3_500;
+const OVER_CEILING_SCAFFOLD_PAIR_COUNT = 300;
+const OVER_CEILING_CUSTODY_REAPER_COUNT = 4;
+// 128 = MAX_BARRIER_READER_SOCKETS (4,096) / 32 in src/storage/cross-process-lock.ts.
+const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT = 128;
+// 4,352 = MAX_BARRIER_READER_SOCKETS (4,096) plus two scaffold names for each
+// unused-scaffold sweep helper cap (128 * 2) in src/storage/cross-process-lock.ts.
+const UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP =
+  4_096 + UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2;
+// 2 = one `.reaper` plus one `.reader-reaper` pair for the most recent identity.
+const MAX_SCAFFOLDS_AFTER_SWEEP = 2;
+// 1_000 ms = one second, short enough for unit tests and long enough for a local socket bind.
+const SHORT_KERNEL_TEST_TIMEOUT_MS = 1_000;
+// 2_100 ms is just past the production 2_000 ms stale-reaper deadline.
+const SCAFFOLD_STALE_SETTLE_MS = 2_100;
+const SHORT_SOCKET_TMP_PARENT =
+  process.platform === "darwin" ? "/private/tmp" : tmpdir();
+// Cross-file contract: must match BARRIER_SCAFFOLD_DIGEST_HEX_CHARS in
+// src/storage/cross-process-lock.ts, the filename width this test plants.
+const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
+const SECURE_SCAFFOLD_MODE = 0o600;
+const CROSS_PROCESS_LOCK_MODULE_URL = new URL(
+  "../../src/storage/cross-process-lock.ts",
+  import.meta.url,
+).href;
+// 10_000 ms = 5 stale-reaper helper deadlines; enough for a child probe to
+// finish or be killed without overlapping the next test.
+const CHILD_PROBE_TIMEOUT_MS = 5 * 2_000;
+// 4_500 ms = 2 helper deadlines plus 500 ms scheduling slack. A pass that
+// spawns more than one hung helper exceeds the bound and fails the test.
+const SLOW_SWEEP_PASS_TEST_BOUND_MS = 2 * 2_000 + 500;
+const SLOW_SWEEP_PAIR_COUNT = 3;
+const SLOW_SWEEP_DIGEST_SEED = 30;
+const SLOW_SWEEP_ACTIVE_DIGEST_SEED = 100;
+const ACTIVE_SWEEP_DIGEST_SEED = 40;
+
+function scaffoldDigest(seed: number): string {
+  return seed.toString(16).padStart(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS, "0");
+}
+
+async function countReaperScaffolds(root: string): Promise<number> {
+  return (await readdir(root)).filter(
+    (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
+  ).length;
+}
+
+async function writeSecureScaffold(path: string): Promise<void> {
+  await writeFile(path, "");
+  await chmod(path, SECURE_SCAFFOLD_MODE);
+}
+
+async function scaffoldModes(root: string): Promise<Map<string, number>> {
+  const modes = new Map<string, number>();
+  for (const name of await readdir(root)) {
+    if (!name.endsWith(".reaper") && !name.endsWith(".reader-reaper")) continue;
+    const stats = await lstat(join(root, name));
+    modes.set(name, stats.mode & 0o777);
+  }
+  return modes;
+}
+
+async function runChildProbe(
+  script: string,
+  env: Record<string, string>,
+): Promise<{ stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, ["--import", "tsx", "-e", script], {
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`child probe exceeded ${CHILD_PROBE_TIMEOUT_MS}ms: ${stderr}`));
+    }, CHILD_PROBE_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(`child probe failed (${signal ?? code}): ${stderr}`));
+    });
+  });
+}
+
+function reaperLockCommand(host: NodeJS.Platform): string {
+  if (host === "darwin") return "/usr/bin/lockf";
+  if (host === "linux") return "/usr/bin/flock";
+  throw new Error(`unsupported reaper-lock host ${host}`);
+}
+
+async function spawnScaffoldLockHolder(
+  scaffoldPath: string,
+  host: NodeJS.Platform,
+): Promise<ChildProcess> {
+  const script = "process.stdout.write('locked\\n'); process.stdin.resume();";
+  const args =
+    host === "darwin"
+      ? ["-k", "-t", "0", scaffoldPath, process.execPath, "-e", script]
+      : ["-n", scaffoldPath, process.execPath, "-e", script];
+  const child = spawn(reaperLockCommand(host), args, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.once("error", reject);
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (stdout.includes("locked")) resolve();
+    });
+    child.once("exit", (code, signal) => {
+      reject(new Error(`scaffold lock holder exited early (${signal ?? code}): ${stderr}`));
+    });
+  });
+  return child;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -131,6 +266,542 @@ describe("withCrossProcessLock", () => {
     expect(trace[0]!.startsWith("enter:")).toBe(true);
     expect(trace[1]).toBe(`exit:${trace[0]!.slice("enter:".length)}`);
   });
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "bounds unused master-barrier scaffolds across distinct fortresses",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      // macOS `sun_path` is 104 bytes including the terminator; the resolver's
+      // reviewed 100-byte cap leaves room only when the test root is short.
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        for (let index = 0; index < DISTINCT_BARRIER_FORTRESS_COUNT; index += 1) {
+          const fortress = await mkdtemp(join(base, `barrier-fortress-${index}-`));
+          const lease = await acquireMasterWriteBarrier(
+            new FilesystemStorage(join(fortress, "state")),
+            "_meta",
+            `scaffold-sweep-test-${index}`,
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          );
+          await lease.release();
+        }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const freshDigest = "f".repeat(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
+        const freshScaffolds = [
+          `${freshDigest}.reaper`,
+          `${freshDigest}.reader-reaper`,
+        ];
+        for (const scaffold of freshScaffolds) {
+          await writeSecureScaffold(join(runtimeRoot, scaffold));
+        }
+        const triggerFortress = await mkdtemp(join(base, "barrier-trigger-"));
+        const triggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(triggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-trigger-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await triggerLease.release();
+        const scaffolds = (await readdir(runtimeRoot)).filter(
+          (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
+        );
+        for (const scaffold of freshScaffolds) {
+          expect(scaffolds).toContain(scaffold);
+        }
+        expect(scaffolds.length).toBeLessThanOrEqual(
+          MAX_SCAFFOLDS_AFTER_SWEEP + freshScaffolds.length,
+        );
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "keeps an exclusive scaffold while its own reaper authority is held",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      const host = process.platform as "darwin" | "linux";
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      let holder: ChildProcess | undefined;
+      try {
+        const digest = "e".repeat(BARRIER_SCAFFOLD_DIGEST_HEX_CHARS);
+        const exclusiveScaffold = join(runtimeRoot, `${digest}.reaper`);
+        const readerScaffold = join(runtimeRoot, `${digest}.reader-reaper`);
+        await writeSecureScaffold(exclusiveScaffold);
+        await writeSecureScaffold(readerScaffold);
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        holder = trackChild(await spawnScaffoldLockHolder(exclusiveScaffold, host));
+
+        const triggerFortress = await mkdtemp(join(base, "barrier-trigger-"));
+        const triggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(triggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await triggerLease.release();
+
+        const names = await readdir(runtimeRoot);
+        expect(names).toContain(`${digest}.reaper`);
+        expect(names).toContain(`${digest}.reader-reaper`);
+      } finally {
+        holder?.stdin?.end();
+        holder?.kill("SIGTERM");
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "settles overlapping shared master-barrier releases once",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const fortress = await mkdtemp(join(base, "barrier-overlap-"));
+        const lease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(fortress, "state")),
+          "_meta",
+          "overlap-release-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await expect(Promise.all([lease.release(), lease.release()])).resolves.toEqual([
+          undefined,
+          undefined,
+        ]);
+        expect(lease.signal.aborted).toBe(true);
+        await expect(lease.release()).resolves.toBeUndefined();
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "keeps live and active identity scaffolds across the amortized sweep",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const liveFortress = await mkdtemp(join(base, "barrier-live-"));
+        const liveStorage = new FilesystemStorage(join(liveFortress, "state"));
+        const liveLease = await acquireMasterWriteBarrier(
+          liveStorage,
+          "_meta",
+          "scaffold-live-held-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        const liveBefore = (await readdir(runtimeRoot)).filter(
+          (name) => name.endsWith(".reaper") || name.endsWith(".reader-reaper"),
+        );
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        for (let index = 0; index < DISTINCT_BARRIER_FORTRESS_COUNT; index += 1) {
+          const fortress = await mkdtemp(join(base, `barrier-other-${index}-`));
+          const lease = await acquireMasterWriteBarrier(
+            new FilesystemStorage(join(fortress, "state")),
+            "_meta",
+            "scaffold-sweep-test",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          );
+          await lease.release();
+        }
+        const nonActiveTrigger = await mkdtemp(join(base, "barrier-non-active-"));
+        const reacquired = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(nonActiveTrigger, "state")),
+          "_meta",
+          "scaffold-sweep-trigger-test",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await reacquired.release();
+
+        const after = await readdir(runtimeRoot);
+        for (const scaffold of liveBefore) {
+          expect(after).toContain(scaffold);
+        }
+        await liveLease.release();
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "sweeps a bounded batch from an over-ceiling runtime directory",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        for (let index = 0; index < OVER_CEILING_IGNORED_ENTRY_COUNT; index += 1) {
+          await writeFile(join(runtimeRoot, `ignored-${index}`), "");
+        }
+        for (let index = 0; index < OVER_CEILING_SCAFFOLD_PAIR_COUNT; index += 1) {
+          const digest = scaffoldDigest(index);
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        }
+        for (let index = 0; index < OVER_CEILING_CUSTODY_REAPER_COUNT; index += 1) {
+          const digest = scaffoldDigest(OVER_CEILING_SCAFFOLD_PAIR_COUNT + index);
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+        }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const before = await countReaperScaffolds(runtimeRoot);
+        const firstTriggerFortress = await mkdtemp(join(base, "barrier-over-ceiling-a-"));
+        const firstTriggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(firstTriggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-trigger-a",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await firstTriggerLease.release();
+        const afterFirst = await countReaperScaffolds(runtimeRoot);
+        expect(afterFirst).toBeLessThan(before);
+        expect(before - afterFirst).toBeLessThanOrEqual(
+          UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2,
+        );
+
+        const secondTriggerFortress = await mkdtemp(join(base, "barrier-over-ceiling-b-"));
+        const secondTriggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(secondTriggerFortress, "state")),
+          "_meta",
+          "scaffold-sweep-trigger-b",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await secondTriggerLease.release();
+        const afterSecond = await countReaperScaffolds(runtimeRoot);
+        expect(afterSecond).toBeLessThan(afterFirst);
+        expect(afterFirst - afterSecond).toBeLessThanOrEqual(
+          UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT * 2,
+        );
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "sweeps complete scaffold pairs while leaving custody-only scaffolds inert",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const custodyDigest = scaffoldDigest(1);
+        const pairDigest = scaffoldDigest(2);
+        await writeSecureScaffold(join(runtimeRoot, `${custodyDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const triggerFortress = await mkdtemp(join(base, "barrier-complete-pair-"));
+        const triggerLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(triggerFortress, "state")),
+          "_meta",
+          "scaffold-complete-pair-trigger",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await triggerLease.release();
+
+        const names = await readdir(runtimeRoot);
+        expect(names).toContain(`${custodyDigest}.reaper`);
+        expect(names).not.toContain(`${custodyDigest}.reader-reaper`);
+        expect(names).not.toContain(`${pairDigest}.reaper`);
+        expect(names).not.toContain(`${pairDigest}.reader-reaper`);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // process.umask() cannot be set inside a worker thread (the Stryker thread pool); the
+  // child-process umask tests below are the load-bearing witnesses, this one is main-thread coverage.
+  it.runIf((process.platform === "darwin" || process.platform === "linux") && isMainThread)(
+    "keeps scaffold modes secure under a restrictive process umask",
+    async () => {
+      const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+      const previousUmask = process.umask(0o027);
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      process.env.SANCTUARY_CUSTODY_LOCK_ROOT = runtimeRoot;
+      try {
+        const custodyDigest = scaffoldDigest(10);
+        const pairDigest = scaffoldDigest(11);
+        await writeSecureScaffold(join(runtimeRoot, `${custodyDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${pairDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        const firstFortress = await mkdtemp(join(base, "barrier-umask-a-"));
+        const secondFortress = await mkdtemp(join(base, "barrier-umask-b-"));
+        const [firstLease, secondLease] = await Promise.all([
+          acquireMasterWriteBarrier(
+            new FilesystemStorage(join(firstFortress, "state")),
+            "_meta",
+            "scaffold-umask-a",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          ),
+          acquireMasterWriteBarrier(
+            new FilesystemStorage(join(secondFortress, "state")),
+            "_meta",
+            "scaffold-umask-b",
+            { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+          ),
+        ]);
+        await firstLease.release();
+        await secondLease.release();
+
+        for (const mode of (await scaffoldModes(runtimeRoot)).values()) {
+          expect(mode).toBe(SECURE_SCAFFOLD_MODE);
+        }
+
+        const laterFortress = await mkdtemp(join(base, "barrier-umask-later-"));
+        const laterLease = await acquireMasterWriteBarrier(
+          new FilesystemStorage(join(laterFortress, "state")),
+          "_meta",
+          "scaffold-umask-later",
+          { timeoutMs: SHORT_KERNEL_TEST_TIMEOUT_MS },
+        );
+        await expect(laterLease.release()).resolves.toBeUndefined();
+      } finally {
+        process.umask(previousUmask);
+        if (previousRoot === undefined) {
+          delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+        } else {
+          process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousRoot;
+        }
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "creates rechecked sweep scaffolds at secure mode under a restrictive umask",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const digest = scaffoldDigest(12);
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        await runChildProbe(`
+          const { lstat } = await import("node:fs/promises");
+          const { join } = await import("node:path");
+          const mod = await import(process.env.MODULE_URL);
+          process.umask(0o027);
+          const root = process.env.RUNTIME_ROOT;
+          const digest = process.env.DIGEST;
+          await mod.__testSweepOneUnusedBarrierScaffoldAfterRemovingPair(
+            root,
+            digest,
+            process.platform,
+          );
+          for (const suffix of [".reaper", ".reader-reaper"]) {
+            const mode = (await lstat(join(root, digest + suffix))).mode & 0o777;
+            if (mode !== 0o600) {
+              console.error(String(mode.toString(8)));
+              process.exit(1);
+            }
+          }
+        `, {
+          MODULE_URL: CROSS_PROCESS_LOCK_MODULE_URL,
+          RUNTIME_ROOT: runtimeRoot,
+          DIGEST: digest,
+        });
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "creates stale-socket reaper scaffolds at secure mode under a restrictive umask",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        await runChildProbe(`
+          const { linkSync } = await import("node:fs");
+          const { chmod, lstat } = await import("node:fs/promises");
+          const { createServer } = await import("node:net");
+          const { join } = await import("node:path");
+          const mod = await import(process.env.MODULE_URL);
+          process.umask(0o027);
+          const root = process.env.RUNTIME_ROOT;
+          const source = join(root, "stale-source.sock");
+          const socketPath = join(root, "stale.sock");
+          const scaffoldPath = join(root, "stale.reaper");
+          const stale = createServer((socket) => socket.destroy());
+          await new Promise((resolve, reject) => {
+            stale.once("error", reject);
+            // port-discipline: ignore - source is a private Unix-domain socket path, not a TCP port
+            stale.listen(source, resolve);
+          });
+          linkSync(source, socketPath);
+          await new Promise((resolve) => stale.close(() => resolve()));
+          await chmod(socketPath, 0o600);
+          const socketStats = await lstat(socketPath, { bigint: true });
+          await mod.__testReapStaleSocketWithSerializedAuthority(
+            socketPath,
+            { dev: String(socketStats.dev), ino: String(socketStats.ino) },
+            scaffoldPath,
+            process.platform,
+          );
+          const mode = (await lstat(scaffoldPath)).mode & 0o777;
+          if (mode !== 0o600) {
+            console.error(String(mode.toString(8)));
+            process.exit(1);
+          }
+        `, {
+          MODULE_URL: CROSS_PROCESS_LOCK_MODULE_URL,
+          RUNTIME_ROOT: runtimeRoot,
+        });
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "stops spawning unused-scaffold helpers after the pass cap",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const helperLog = join(base, "slow-sweep-helper.log");
+        for (let index = 0; index < SLOW_SWEEP_PAIR_COUNT; index += 1) {
+          const digest = scaffoldDigest(SLOW_SWEEP_DIGEST_SEED + index);
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+          await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        }
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const slowHelperScript = `
+          const fs = require("node:fs");
+          const [runtimeDir, digest] = process.argv.slice(1);
+          void runtimeDir;
+          fs.appendFileSync(${JSON.stringify(helperLog)}, digest + "\\n");
+          setInterval(() => undefined, 1_000);
+        `;
+        const started = Date.now();
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript: slowHelperScript },
+        );
+        expect(Date.now() - started).toBeLessThan(SLOW_SWEEP_PASS_TEST_BOUND_MS);
+        const log = await readFile(helperLog, "utf8");
+        expect(log.trim().split("\n")).toHaveLength(1);
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript: slowHelperScript },
+        );
+        const afterThrottledPass = await readFile(helperLog, "utf8");
+        expect(afterThrottledPass.trim().split("\n")).toHaveLength(1);
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "keeps the active scaffold digest out of the unused-pair sweep",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const activeDigest = scaffoldDigest(ACTIVE_SWEEP_DIGEST_SEED);
+        await writeSecureScaffold(join(runtimeRoot, `${activeDigest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${activeDigest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          activeDigest,
+          process.platform,
+        );
+
+        const names = await readdir(runtimeRoot);
+        expect(names).toContain(`${activeDigest}.reaper`);
+        expect(names).toContain(`${activeDigest}.reader-reaper`);
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "stops the unused-scaffold sweep when the runtime directory exceeds the scan cap",
+    async () => {
+      const runtimeRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "xplk-"));
+      try {
+        const helperLog = join(base, "capped-sweep-helper.log");
+        for (
+          let index = 0;
+          index <= UNUSED_BARRIER_SCAFFOLD_READDIR_ENTRY_CAP;
+          index += 1
+        ) {
+          await writeFile(join(runtimeRoot, `ignored-${index}`), "");
+        }
+        const digest = scaffoldDigest(SLOW_SWEEP_DIGEST_SEED);
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reaper`));
+        await writeSecureScaffold(join(runtimeRoot, `${digest}.reader-reaper`));
+        await sleep(SCAFFOLD_STALE_SETTLE_MS);
+        const helperScript = `
+          const fs = require("node:fs");
+          fs.appendFileSync(${JSON.stringify(helperLog)}, "started\\n");
+        `;
+
+        await __testSweepUnusedBarrierScaffolds(
+          runtimeRoot,
+          scaffoldDigest(SLOW_SWEEP_ACTIVE_DIGEST_SEED),
+          process.platform,
+          { helperScript },
+        );
+
+        await expect(readFile(helperLog, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect(await countReaperScaffolds(runtimeRoot)).toBe(2);
+      } finally {
+        await rm(runtimeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("removes the lockfile after the operation (even when it throws)", async () => {
     await expect(

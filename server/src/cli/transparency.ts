@@ -69,6 +69,7 @@ import {
 import { verifyAgainstLog } from "../transparency/against-log.js";
 import type { FetchLike } from "../transparency/rekor-client.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../transparency/scheduler.js";
 
 // Canonical version source. The previous `require("../../package.json")`
 // resolved to the repo-root package.json (which has no `version`) once this
@@ -204,7 +205,11 @@ async function runAnchorCommand(
       // here (cheap) so recovery can run before the read below.
       const statusAuditLog = new AuditLog(storage, masterKey);
       await recoverInterruptedExitImportsOrThrow(storage, statusAuditLog);
-      const state = await readAnchorConfig({ storage, masterKey });
+      const state = await readAnchorConfig({
+        storage,
+        masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       const receipts =
         state.status === "absent" ? [] : await readAnchorReceipts(storage);
       const anchored = receipts.filter((r) => r.status === "anchored");
@@ -266,7 +271,12 @@ async function runAnchorCommand(
     const fortressId = fortressIdFromStoragePath(storagePath);
 
     if (verb === "export") {
-      const doc = await buildAnchorsExport({ storage, masterKey, fortressId });
+      const doc = await buildAnchorsExport({
+        storage,
+        masterKey,
+        fortressId,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       const anchored = doc.receipts.filter((r) => r.status === "anchored").length;
       const json = JSON.stringify(doc, null, 2) + "\n";
       if (opts.values["--output"]) {
@@ -309,6 +319,7 @@ async function runAnchorCommand(
         masterKey,
         auditLog,
         fortressId,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
         ...(opts.values["--rekor-url"]
           ? { rekorUrl: opts.values["--rekor-url"] }
           : {}),
@@ -337,6 +348,7 @@ async function runAnchorCommand(
         masterKey,
         auditLog,
         fortressId,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
       });
       write(
         out,
@@ -350,6 +362,7 @@ async function runAnchorCommand(
       storage,
       masterKey,
       auditLog,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
       ...(fetchFn ? { fetchFn } : {}),
     });
     if ("status" in result && result.status === "disabled") {
@@ -449,6 +462,7 @@ async function runCheckpoint(
       masterKey,
       env,
       mode: opts.flags["--local-sign"] ? "local" : "auto",
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     const binaryPath =
       opts.values["--binary"] ?? realpathSync(process.argv[1] ?? "");
@@ -461,6 +475,7 @@ async function runCheckpoint(
       signer,
       binaryPath,
       version: PKG_VERSION,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     // Record the emission in the audit log (covered by the NEXT checkpoint).
     await auditLog.appendCritical({
@@ -484,13 +499,18 @@ async function runCheckpoint(
       const { anchorCheckpoint, readAnchorConfig } = await import(
         "../transparency/anchoring.js"
       );
-      const anchorState = await readAnchorConfig({ storage, masterKey });
+      const anchorState = await readAnchorConfig({
+        storage,
+        masterKey,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       if (anchorState.status === "enabled") {
         const outcome = await anchorCheckpoint({
           storage,
           masterKey,
           auditLog,
           record,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
           ...(fetchFn ? { fetchFn } : {}),
         });
         if (outcome.status === "anchored") {
