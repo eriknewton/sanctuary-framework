@@ -106,7 +106,7 @@ fortress and its private socket runtime must be on local filesystems; known
 shared/network/FUSE filesystems are refused rather than presenting a local Unix
 socket as cross-host exclusion.
 2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
-3. The config is rewritten so every MCP tool call routes through Sanctuary. The harness's own built-in tools are not MCP calls and are not gated by this step.
+3. The config is rewritten so the MCP servers it lists are called through Sanctuary. The harness's own built-in tools are not MCP calls and are not gated by this step. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
 4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) and opens in your browser with a one-click auth token.
 5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity layer on top per the Assurance Matrix: fingerprintable-header stripping is on by default, and an opt-in, consent-gated PII rewrite scrubs query content before it leaves the machine, with the rewrite's internal classifier pinned to local processing so a privacy feature can never become an egress channel. Dangerous operations require your approval.
 
