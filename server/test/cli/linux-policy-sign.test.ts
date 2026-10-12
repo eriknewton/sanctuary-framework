@@ -43,6 +43,25 @@ describe("install policy signer", () => {
     const rules = [{ id: "test", schema_version: 1 as const, created_at: input.issuedAt, match: { host: "example.com" }, scope: {}, disposition: "allow" as const }];
     await expect(buildInstallBundle({ ...input, rules }, publicKey)).rejects.toThrow();
   });
+  it("refuses malformed confined-agent scopes before signing", async () => {
+    let calls = 0;
+    const rules = [{
+      id: "bad-agent-scope",
+      schema_version: 1 as const,
+      created_at: input.issuedAt,
+      match: { ip: "203.0.113.10", port: 443, protocol: "tcp" as const },
+      scope: { agent_ids: ["0123456789abcdef/uid-60123"] },
+      disposition: "allow" as const,
+    }];
+    await expect(
+      buildInstallBundle({
+        ...input,
+        rules,
+        signer: { ...signer, sign: () => { calls++; return new Uint8Array(64); } },
+      }, publicKey),
+    ).rejects.toThrow("expected uid-<decimal uid>");
+    expect(calls).toBe(0);
+  });
 });
 
 // The package's real executable is the consumer: npm-style links and inherited fd 3 must work.

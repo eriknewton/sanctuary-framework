@@ -67,8 +67,8 @@ test/cli/auto-trigger-audit.test.ts(47,75): error TS2345: Argument of type '() =
 test/cli/castle-wall-audit-verify.test.ts(115,7): error TS2739: Type '{ host: string; ip: string; port: number; protocol: "tcp"; }' is missing the following properties from type 'IpcDestination': hostname_source, opaque
 test/cli/castle-wall-repair-custody.test.ts(140,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
 test/cli/castle-wall-repair-custody.test.ts(141,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
-test/cli/castle-wall.test.ts(1524,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
-test/cli/castle-wall.test.ts(1524,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1676,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1676,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
 test/cli/singleton-audit-writes.test.ts(179,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(217,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(239,8): error TS7006: Parameter 'c' implicitly has an 'any' type.
@@ -81,8 +81,8 @@ test/cognitive/memory-attest.test.ts(44,35): error TS2554: Expected 0 arguments,
 test/compliance/eu_ai_act/generator.test.ts(60,39): error TS2554: Expected 0 arguments, but got 1.
 test/compliance/eu_ai_act/generator.test.ts(70,7): error TS2345: Argument of type '"fixture-passphrase"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/composition/sidecar-trust-boundary.test.ts(41,7): error TS2741: Property 'signature_scheme' is missing in type '{ event_id: string; event_type: string; agent_id: string; counterparty_id: string; commitment_class: string; fortress_id: string; emitter_node: string; emitted_at: string; }' but required in type 'CommitmentEvent'.
-test/core/master-custody.test.ts(374,12): error TS18047: 'second.envelope' is possibly 'null'.
-test/core/master-custody.test.ts(783,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
+test/core/master-custody.test.ts(376,12): error TS18047: 'second.envelope' is possibly 'null'.
+test/core/master-custody.test.ts(785,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
 test/dashboard-slice2-park.test.ts(121,12): error TS18046: 'healthBody' is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(154,14): error TS2571: Object is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(172,12): error TS18046: 'body' is of type 'unknown'.
@@ -619,9 +619,9 @@ test/recognition/did-web-fortress-config.test.ts(66,7): error TS2322: Type '{ "@
 test/scripts/install-hooks.test.ts(11,8): error TS7016: Could not find a declaration file for module '../../scripts/install-hooks.js'. '<server>/scripts/install-hooks.js' implicitly has an 'any' type.
 test/sdw/memory-tools-wiring.test.ts(227,42): error TS2345: Argument of type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to parameter of type 'Record<string, unknown>'.
 test/sdw/memory-tools-wiring.test.ts(23,8): error TS2459: Module '"../../src/principal-policy/approval-channel.js"' declares 'ApprovalRequest' locally, but it is not exported.
-test/sdw/sdw-d2-export-import.test.ts(1243,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
-test/sdw/sdw-d2-export-import.test.ts(1266,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
-test/sdw/sdw-d2-export-import.test.ts(1280,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
+test/sdw/sdw-d2-export-import.test.ts(1356,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
+test/sdw/sdw-d2-export-import.test.ts(1379,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
+test/sdw/sdw-d2-export-import.test.ts(1393,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
 test/sdw/sdw-phase1.test.ts(336,47): error TS2345: Argument of type '"catalog.future"' is not assignable to parameter of type '"catalog.environment"'.
 test/sdw/sdw-phase1.test.ts(369,64): error TS2554: Expected 2 arguments, but got 3.
 test/security/agent-audit-allowlist.test.ts(150,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.

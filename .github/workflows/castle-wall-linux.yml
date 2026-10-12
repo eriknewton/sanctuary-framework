@@ -214,7 +214,7 @@ jobs:
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       test_isolation_gate; do
+                       confined_agent_id test_isolation_gate; do
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
               exit 1

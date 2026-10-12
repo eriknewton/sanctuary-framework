@@ -296,10 +296,14 @@ cd "$repo_root"
 # scripts/parse-vitest-summary.sh, never through (( )). Bash arithmetic is
 # signed 64-bit and wraps silently, so a long enough count could compare equal
 # to the floor; the shared string comparison has no overflow and no digit
-# ceiling. Sourcing only defines functions (the script returns before it
-# parses). Sourcing from this working tree is correct HERE: the hook runs on
-# the pusher's own machine against the pusher's own tree, so there is no
-# separate party whose code it must not trust.
+# ceiling. Must match the Gate 2c comparison in
+# .github/workflows/test-baseline-guard.yml, which sources the same helpers.
+# Sourcing only defines functions (the script returns before it parses).
+# Sourcing from this working tree is correct HERE: the hook runs on the
+# pusher's own machine against the pusher's own tree, so there is no
+# separate party whose code it must not trust. CI is different: on
+# pull_request Gate 2c sources the helper from the PR's base commit, so a
+# PR cannot grade itself with an edited helper.
 # FAILURE MODE: a missing or unreadable script fails the hook closed here
 # under `set -e`, before any floor is read.
 source scripts/parse-vitest-summary.sh
@@ -756,7 +760,7 @@ validate_counter "Test Files count" "$actual_total"
 # exactly one count, and prints only a canonical count of any length, so the
 # local hook and CI read the same count instead of keeping separate regexes.
 # The count is then compared only through the shared compare_counts (no digit
-# ceiling, no (( )) on the count).
+# ceiling, no (( )) on the count), matching Gate 2c in the workflow.
 set +e
 passing=$(
   VITEST_SUMMARY_ERROR_PREFIX="[baseline-guard] " \

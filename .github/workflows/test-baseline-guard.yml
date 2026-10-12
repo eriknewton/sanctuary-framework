@@ -44,20 +44,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Read test baseline floor
-        id: baseline
+      - name: Check test baseline floor file exists
         run: |
+          # Early existence check only, so a missing floor fails before the
+          # full suite runs. The floor's bytes are validated in Gate 2c by
+          # read_canonical_floor from the trusted helper copy (the pull
+          # request's own copy of the helper is never run in this job), with
+          # no whitespace strip.
           if [[ ! -f .test-baseline ]]; then
             echo "::error::.test-baseline file missing at repo root. Create it with a single integer: the current passing count."
             exit 1
           fi
-          baseline=$(tr -d '[:space:]' < .test-baseline)
-          if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
-            echo "::error::.test-baseline must contain a single integer, got: '$baseline'"
-            exit 1
-          fi
-          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-          echo "Baseline floor: $baseline"
 
       - name: Use Node.js 24
         uses: actions/setup-node@v7
@@ -215,20 +212,101 @@ jobs:
         run: scripts/gate2b-check.sh /tmp/vitest-output.log
 
       - name: Gate 2c - passing count >= baseline
+        # Expressions go through env, not into the script text, so the run
+        # block below is plain bash that server/test/scripts/
+        # baseline-guard-trusted-helper.test.ts executes against fixtures.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASELINE_FILE: .test-baseline
+          VITEST_LOG: /tmp/vitest-output.log
         run: |
-          baseline="${{ steps.baseline.outputs.baseline }}"
-          # Must match the caller pin in .githooks/pre-push and the header in
-          # scripts/parse-vitest-summary.sh: the shared parser strips ANSI and
-          # requires exactly one Vitest summary line.
-          passing=$(VITEST_SUMMARY_ERROR_STYLE=github bash scripts/parse-vitest-summary.sh /tmp/vitest-output.log)
-          if ! [[ "$passing" =~ ^(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Parsed passing-test count is not a non-negative integer: '$passing'"
+          # INVARIANT: on pull_request the count helper (parser and
+          # compare_counts) comes from the PR's BASE commit, never from the
+          # checked-out head: this guard judges the head, so a head that edits
+          # scripts/parse-vitest-summary.sh (for example to make compare_counts
+          # always print "eq") must not get to grade itself. On push (to main or
+          # release/**) the pushed commit's own copy is used, because it already
+          # merged through review.
+          # RESIDUAL (stated, not closed here): this guard is an honesty check
+          # against accidental regressions, not a boundary against a pull
+          # request's own code. On pull_request, any head-controlled code that
+          # runs before this gate can shape the log and the files it reads.
+          # Examples, not a complete list: `npm test` and the pull request's
+          # test files; npm ci (the head's lockfile), npm run build and npm run
+          # typecheck (the head's package scripts); scripts/gate2b-check.sh and
+          # scripts/gate2b-self-test.sh; scripts/redact-test-output.mjs and
+          # scripts/redact-test-output-self-test.mjs;
+          # scripts/ci/retry-with-timeout.sh; the local actions under
+          # .github/actions/; and this workflow file itself (GitHub runs the
+          # head's workflow on pull_request). Reading the helper from the base
+          # commit closes only the helper-substitution path. Review of changes
+          # to head-controlled CI code is the control for the rest.
+          # FAILURE MODE: a base commit that has no helper, or whose helper
+          # predates compare_counts, fails this step closed with a named error;
+          # it never falls back to the head's copy or to (( )) arithmetic.
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
+          trusted_dir="$RUNNER_TEMP/baseline-guard-trusted"
+          trusted_helper="$trusted_dir/parse-vitest-summary.sh"
+          mkdir -p "$trusted_dir"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # 40 = hex length of a SHA-1 object id, this repository's format.
+            if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::pull_request base SHA is missing or malformed: '$BASE_SHA'"
+              exit 1
+            fi
+            # actions/checkout is shallow, so the base commit may be absent.
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              if ! git fetch --no-tags --depth=1 origin "$BASE_SHA"; then
+                echo "::error::Could not fetch the pull request base commit $BASE_SHA to read the trusted count helper."
+                exit 1
+              fi
+            fi
+            if ! git show "${BASE_SHA}:scripts/parse-vitest-summary.sh" > "$trusted_helper"; then
+              echo "::error::The pull request base commit $BASE_SHA has no scripts/parse-vitest-summary.sh; refusing to use the head's copy."
+              exit 1
+            fi
+            helper_source="base commit $BASE_SHA"
+          else
+            cp scripts/parse-vitest-summary.sh "$trusted_helper"
+            helper_source="pushed commit (already reviewed)"
+          fi
+          echo "Count helper source: $helper_source"
+          # Must match the "Shared count helpers" block in .githooks/pre-push
+          # (which sources its own working tree, correct for a local push) and
+          # the header in scripts/parse-vitest-summary.sh.
+          source "$trusted_helper"
+          for required_fn in is_canonical_count compare_counts count_difference read_canonical_floor; do
+            if ! declare -F "$required_fn" >/dev/null; then
+              echo "::error::The count helper from the $helper_source does not define $required_fn; refusing to compare counts without it."
+              exit 1
+            fi
+          done
+          # The shared parser strips ANSI, requires exactly one Vitest summary
+          # line holding exactly one count, and prints only a canonical count.
+          passing=$(VITEST_SUMMARY_ERROR_STYLE=github bash "$trusted_helper" "$VITEST_LOG")
+          # Must match read_canonical_floor in scripts/parse-vitest-summary.sh
+          # and the hook's floor reads: the raw bytes must be exactly one
+          # canonical count plus at most one newline. They are never
+          # whitespace-stripped first, which would join "123 4567" into one
+          # valid-looking floor.
+          if ! baseline=$(VITEST_SUMMARY_ERROR_STYLE=github read_canonical_floor < "$BASELINE_FILE"); then
+            echo "::error::.test-baseline is not exactly one canonical integer with at most one trailing newline."
+            exit 1
+          fi
+          # INVARIANT: the counts are compared only through compare_counts,
+          # never with (( )): bash arithmetic is signed 64-bit and wraps
+          # silently, so a long enough count could compare equal to the floor
+          # and print success. The string comparison has no digit ceiling and
+          # no overflow; a non-canonical or empty operand is refused.
+          if ! relation=$(VITEST_SUMMARY_ERROR_STYLE=github compare_counts "$passing" "$baseline"); then
+            echo "::error::Could not compare the passing-test count '$passing' with the baseline floor '$baseline'."
             exit 1
           fi
           echo "Baseline floor: $baseline"
           echo "Passing tests:  $passing"
-          if (( passing < baseline )); then
-            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
+          if [[ "$relation" == "lt" ]]; then
+            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $(count_difference "$baseline" "$passing") tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
             exit 1
           fi
           # Fail-above (mirror of the pre-commit hook): a passing count
@@ -237,8 +315,12 @@ jobs:
           # under the gap - the extra passing tests mask the loss until
           # the floor is finally bumped. The fix is mechanical: set
           # .test-baseline to the new count in this PR.
-          if (( passing > baseline )); then
-            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $((passing - baseline)) new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+          if [[ "$relation" == "gt" ]]; then
+            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $(count_difference "$passing" "$baseline") new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+            exit 1
+          fi
+          if [[ "$relation" != "eq" ]]; then
+            echo "::error::compare_counts returned an unknown relation '$relation'; refusing to pass."
             exit 1
           fi
           echo "✓ Baseline guard passed."

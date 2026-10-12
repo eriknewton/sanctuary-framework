@@ -1391,7 +1391,44 @@ export async function runInit(
         // in the parent. Production uses the inode-bound worker so its
         // per-fortress pin write cannot be redirected by a root replacement.
         if (deps.provisionPin) {
-          return provisionPin([], {
+          const handoffMasterKey = masterKey.slice();
+          try {
+            return await provisionPin([], {
+              out: new Writable({
+                write(_chunk, _encoding, callback) {
+                  callback();
+                },
+              }),
+              env: {
+                ...process.env,
+                SANCTUARY_STORAGE_PATH: lockedFortressPath,
+                SANCTUARY_RECOVERY_KEY: recoveryKey,
+              },
+              // INVARIANT (master ownership): provision-pin may scrub the
+              // buffer it receives; init scrubs this handoff copy too and keeps
+              // the original master for its own cleanup boundary.
+              __resolvedProvisionMasterKey: handoffMasterKey,
+            });
+          } finally {
+            handoffMasterKey.fill(0);
+          }
+        }
+        if (lease.stableFortressCapability) {
+          const handoffMasterKey = masterKey.slice();
+          try {
+            return await lease.stableFortressCapability.provisionPin({
+              // INVARIANT (master ownership): the capability worker receives a
+              // copy over IPC; init scrubs the handoff copy and retains the
+              // original master for its own cleanup boundary.
+              masterKey: handoffMasterKey,
+            });
+          } finally {
+            handoffMasterKey.fill(0);
+          }
+        }
+        const handoffMasterKey = masterKey.slice();
+        try {
+          return await runProvisionPinAlreadyLocked([], {
             out: new Writable({
               write(_chunk, _encoding, callback) {
                 callback();
@@ -1400,27 +1437,15 @@ export async function runInit(
             env: {
               ...process.env,
               SANCTUARY_STORAGE_PATH: lockedFortressPath,
-              SANCTUARY_RECOVERY_KEY: recoveryKey,
             },
+            // INVARIANT (master ownership): runProvisionPinAlreadyLocked scrubs
+            // the transferred buffer, so init hands it a copy and keeps the
+            // original live until init's final scrub.
+            __resolvedProvisionMasterKey: handoffMasterKey,
           });
+        } finally {
+          handoffMasterKey.fill(0);
         }
-        if (lease.stableFortressCapability) {
-          return lease.stableFortressCapability.provisionPin({
-            masterKey,
-          });
-        }
-        return runProvisionPinAlreadyLocked([], {
-          out: new Writable({
-            write(_chunk, _encoding, callback) {
-              callback();
-            },
-          }),
-          env: {
-            ...process.env,
-            SANCTUARY_STORAGE_PATH: lockedFortressPath,
-          },
-          __resolvedProvisionMasterKey: masterKey,
-        });
       },
     );
     const pinResult = typeof pinExecution === "number"

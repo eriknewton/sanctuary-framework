@@ -34,6 +34,8 @@ import {
   establishMaster,
   readCustodyEnvelope,
   unwrapMaster,
+  CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS,
+  custodyEnvelopeCommitJournalQuarantinePrefix,
 } from "../../src/core/master-custody.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import { capturePassphraseCredentialIdentity } from "../../src/wrap/passphrase.js";
@@ -225,6 +227,37 @@ describe("reset-passphrase --mode recovery-key", () => {
     expect((await lstat(join(f.storagePath, ".reset-history.log"))).mode & 0o777).toBe(0o600);
     expect(marker).not.toContain(stored!);
     expect(marker).not.toContain(f.recoveryKey);
+  });
+
+  it("removes retained custody inspection records after recovery-key rekey", async () => {
+    const storage = new FilesystemStorage(join(f.storagePath, "state"));
+    for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
+      await storage.write(
+        "_meta",
+        `${custodyEnvelopeCommitJournalQuarantinePrefix(slot)}1700000000000`,
+        Buffer.from(`retained-${slot.key}`),
+      );
+    }
+
+    const kc = fakeKeychain();
+    const code = await runResetPassphraseCommand({
+      argv: ["--mode", "recovery-key", "--fortress", f.storagePath],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      stdin: nonTtyStdin(false),
+      home: f.home,
+      platformOverride: "darwin",
+      exec: kc.exec,
+      recoveryKeyOverride: f.recoveryKey,
+    });
+    expect(code).toBe(0);
+
+    for (const slot of CUSTODY_ENVELOPE_COMMIT_JOURNAL_SLOTS) {
+      expect(await storage.list(
+        "_meta",
+        custodyEnvelopeCommitJournalQuarantinePrefix(slot),
+      )).toHaveLength(0);
+    }
   });
 
   it("quarantines a symlink reset history without following its target or wedging custody", async () => {

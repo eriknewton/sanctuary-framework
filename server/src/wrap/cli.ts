@@ -4201,28 +4201,31 @@ export async function runWrap(
     // confirmed `castle-wall re-pin` verb can. Do not re-add a machine-wide
     // write here.
     //
-    // provision-pin runs as a child with its OWN credential chain, which reads
-    // only these two env vars plus the fortress's stored passphrase. Hand it
-    // whichever credential this run actually used; when the fortress was opened
-    // by its OS-keyring custody factor there is nothing to hand over, and the
-    // child's own refusal ("no stored passphrase exists for this fortress")
-    // surfaces as the non-fatal note below rather than being papered over.
-    const pinCredentialEnv: NodeJS.ProcessEnv =
-      protectCredential.credential.kind === "passphrase"
-        ? { SANCTUARY_PASSPHRASE: protectCredential.credential.value }
-        : protectCredential.credential.kind === "recovery-key"
-          ? { SANCTUARY_RECOVERY_KEY: protectCredential.credential.value }
-          : {};
+    // INVARIANT (credential custody): pin bootstrap receives the already
+    // authenticated master over the internal call seam, never through argv or
+    // env-shaped fields that process-inspection tools can read.
+    const {
+      SANCTUARY_PASSPHRASE: _pinParentPassphrase,
+      SANCTUARY_RECOVERY_KEY: _pinParentRecoveryKey,
+      ...pinBaseEnv
+    } = process.env;
     try {
-      const pinResult = await runProvisionPin([], {
-        out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-        env: {
-          ...process.env,
-          SANCTUARY_STORAGE_PATH: storagePath,
-          ...pinCredentialEnv,
-        },
-      });
+      const handoffMasterKey = wrapCustody.masterKey.slice();
+      const pinResult = await (async () => {
+        try {
+          return await runProvisionPin([], {
+            out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+            env: {
+              ...pinBaseEnv,
+              SANCTUARY_STORAGE_PATH: storagePath,
+            },
+            __resolvedProvisionMasterKey: handoffMasterKey,
+          });
+        } finally {
+          handoffMasterKey.fill(0);
+        }
+      })();
       if (pinResult !== 0) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(

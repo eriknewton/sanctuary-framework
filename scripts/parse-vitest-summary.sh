@@ -14,9 +14,9 @@
 #     non-canonical count.
 #   - Source it: defines emit_error, strip_ansi, is_canonical_count,
 #     compare_counts, count_difference and read_canonical_floor, and returns
-#     before parsing. The
-#     pre-push hook compares counts only through compare_counts, so it has no
-#     digit ceiling and does no overflow-prone arithmetic on a count.
+#     before parsing. Both callers compare counts only through compare_counts,
+#     so neither has a digit ceiling and neither does overflow-prone arithmetic
+#     on a count.
 
 set -euo pipefail
 
@@ -38,7 +38,8 @@ strip_ansi() {
 # count is accepted; there is deliberately no upper ceiling here, because the
 # comparison below never does arithmetic on a whole count.
 # Must match CANONICAL_COUNT_RE callers: is_canonical_count and compare_counts
-# below, and the floor checks in .githooks/pre-push.
+# below, the floor checks in .githooks/pre-push, and Gate 2c plus the baseline
+# read step in .github/workflows/test-baseline-guard.yml.
 CANONICAL_COUNT_RE='^(0|[1-9][0-9]*)$'
 
 is_canonical_count() {
@@ -85,7 +86,7 @@ compare_counts() {
 # 7-digit floor nobody wrote. The bytes are checked as hex pairs from od, which
 # keeps NUL and CR bytes visible (a bash variable silently drops NUL).
 # Must match every .test-baseline read: the Rule (a) and Rule (b) floor reads in
-# .githooks/pre-push.
+# .githooks/pre-push, and Gate 2c in .github/workflows/test-baseline-guard.yml.
 # FAILURE MODE: anything else (empty, a space, an inner or second newline,
 # CRLF, a sign, a leading zero, any other byte) is refused with a named error
 # and status 1, printing nothing on stdout; a caller must test the status.

@@ -13,7 +13,10 @@
  * (signature mismatch, hash mismatch) which return `passed: false`.
  */
 export class InvalidExitBundleError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    public readonly failure_class?: ExitBundleFailureClass,
+  ) {
     super(message);
     this.name = "InvalidExitBundleError";
   }
@@ -62,8 +65,8 @@ import {
 } from "../reputation/reputation-store.js";
 import { MAX_KNOWN_SIGNERS } from "../reputation/known-signers-store.js";
 import {
-  readFileCustody,
   readFileCustodyWithStats,
+  isCustodyFsError,
 } from "../storage/custody-fs.js";
 import {
   readSourceCustodyState,
@@ -379,7 +382,7 @@ async function assertDescendant(root: string, candidate: string): Promise<boolea
 const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
 
 /**
- * Absolute per-artifact read cap - the artifact-hash loop below refuses to
+ * Absolute per-artifact read cap - the shared descriptor reader refuses to
  * read ANY exit artifact whose on-disk size exceeds this, regardless of
  * what the manifest declares. 24 MiB matches the existing precedent for a
  * related exit-archive format's per-artifact cap
@@ -390,7 +393,129 @@ const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
  * lifetime is `encrypted_state`, and 24 MiB of serialized state is already
  * a very large single fortress).
  */
-const MAX_EXIT_ARTIFACT_READ_BYTES = 24 * 1024 * 1024;
+const BYTES_PER_MIB = 1024 * 1024;
+const EXIT_ARTIFACT_READ_CAP_MIB = 24;
+export const MAX_EXIT_ARTIFACT_READ_BYTES =
+  EXIT_ARTIFACT_READ_CAP_MIB * BYTES_PER_MIB;
+// manifest.json carries only metadata plus artifact descriptors, so the
+// per-artifact ceiling is already a generous same-format cap and keeps every
+// bundle file read on the same bounded descriptor primitive.
+export const MAX_EXIT_MANIFEST_READ_BYTES = MAX_EXIT_ARTIFACT_READ_BYTES;
+
+type ExitArtifactReadFailureClass = Extract<
+  ExitBundleFailureClass,
+  | "archive_contains_symlink"
+  | "artifact_path_escapes_root"
+  | "artifact_size_mismatch"
+  | "artifact_missing"
+  | "artifact_read_rejected"
+>;
+
+interface BoundedExitArtifactRead {
+  ok: true;
+  artifactPath: string;
+  bytes: Uint8Array;
+}
+
+interface FailedExitArtifactRead {
+  ok: false;
+  artifactPath: string;
+  failure_class: ExitArtifactReadFailureClass;
+}
+
+function artifactSizeWithinReadBounds(
+  entry: ExitBundleArtifactEntry,
+  size: number
+): boolean {
+  return (
+    size === entry.size_bytes &&
+    size <= MAX_EXIT_ARTIFACT_READ_BYTES
+  );
+}
+
+async function readExitArtifactBytesBounded(
+  root: string,
+  entry: ExitBundleArtifactEntry
+): Promise<BoundedExitArtifactRead | FailedExitArtifactRead> {
+  const artifactPath = join(root, entry.path);
+  try {
+    const linkStat = await lstat(artifactPath);
+    if (linkStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "archive_contains_symlink",
+      };
+    }
+    if (!linkStat.isFile()) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_read_rejected",
+      };
+    }
+    // INVARIANT (private register EXIT-KS-01): the manifest-declared size is
+    // untrusted until signature verification, but it is still the read budget;
+    // the descriptor reader below pulls at most that many bytes plus a sentinel.
+    if (!artifactSizeWithinReadBounds(entry, linkStat.size)) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_size_mismatch",
+      };
+    }
+    const descends = await assertDescendant(root, artifactPath);
+    if (!descends) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_path_escapes_root",
+      };
+    }
+    const { data: raw } = await readFileCustodyWithStats(
+      artifactPath,
+      {
+        verifyPathIdentity: true,
+        maxBytes: entry.size_bytes,
+      },
+    );
+    if (raw.byteLength !== entry.size_bytes) {
+      return {
+        ok: false,
+        artifactPath,
+        failure_class: "artifact_size_mismatch",
+      };
+    }
+    return {
+      ok: true,
+      artifactPath,
+      bytes: new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      artifactPath,
+      failure_class: mapBundleReadFailureClass(err),
+    };
+  }
+}
+
+function mapBundleReadFailureClass(err: unknown): ExitArtifactReadFailureClass {
+  if (isCustodyFsError(err)) {
+    switch (err.code) {
+      case "read_size_rejected":
+        return "artifact_size_mismatch";
+      case "symlink_rejected":
+        return "archive_contains_symlink";
+      default:
+        return "artifact_read_rejected";
+    }
+  }
+  if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    return "artifact_missing";
+  }
+  return "artifact_read_rejected";
+}
 
 /**
  * Cap on how many unlisted paths the `artifact_directory_unlisted_file`
@@ -885,11 +1010,52 @@ export function encryptedStateSubVerdictFailed(
   }
 }
 
+const EXIT_MANIFEST_FILE_NAME = "manifest.json";
+
+async function readManifestBytesBounded(bundleDir: string): Promise<Uint8Array> {
+  const manifestPath = join(bundleDir, EXIT_MANIFEST_FILE_NAME);
+  try {
+    const { data: raw } = await readFileCustodyWithStats(manifestPath, {
+      verifyPathIdentity: true,
+      maxBytes: MAX_EXIT_MANIFEST_READ_BYTES,
+    });
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  } catch (err) {
+    const failureClass = mapBundleReadFailureClass(err);
+    if (failureClass === "artifact_missing") {
+      // Operators rely on the exact missing-manifest wording, while callers
+      // still need the typed class introduced by the shared read chokepoint.
+      throw new InvalidExitBundleError(
+        `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: manifest.json missing at ${manifestPath}`,
+        failureClass,
+      );
+    }
+    throw new InvalidExitBundleError(
+      `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: ${EXIT_MANIFEST_FILE_NAME} could not be loaded: ${failureClass}`,
+      failureClass,
+    );
+  }
+}
+
+async function readManifestWithBytes(
+  bundleDir: string
+): Promise<{ manifest: ExitBundleManifest; bytes: Uint8Array }> {
+  const bytes = await readManifestBytesBounded(bundleDir);
+  try {
+    return {
+      manifest: JSON.parse(Buffer.from(bytes).toString("utf8")) as ExitBundleManifest,
+      bytes,
+    };
+  } catch {
+    throw new InvalidExitBundleError(
+      `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: ${EXIT_MANIFEST_FILE_NAME} is malformed.`,
+      "other",
+    );
+  }
+}
+
 export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
-  const bytes = await readFileCustody(join(bundleDir, "manifest.json"), {
-    verifyPathIdentity: true,
-  });
-  return JSON.parse(Buffer.from(bytes).toString("utf8")) as ExitBundleManifest;
+  return (await readManifestWithBytes(bundleDir)).manifest;
 }
 
 export async function loadExitArtifact<T = unknown>(
@@ -899,15 +1065,27 @@ export async function loadExitArtifact<T = unknown>(
 ): Promise<LoadedExitArtifact<T> | null> {
   const entry = manifest.body.artifacts.find((artifact) => artifact.kind === kind);
   if (!entry) return null;
-  const artifactPath = join(bundleDir, entry.path);
-  const bytes = await readFileCustody(artifactPath, {
-    verifyPathIdentity: true,
-  });
+  const read = await readExitArtifactBytesBounded(bundleDir, entry);
+  if (!read.ok) {
+    throw new InvalidExitBundleError(
+      `Exit artifact ${kind} could not be loaded: ${read.failure_class}`,
+      read.failure_class,
+    );
+  }
+  let json: T;
+  try {
+    json = JSON.parse(Buffer.from(read.bytes).toString("utf8")) as T;
+  } catch {
+    throw new InvalidExitBundleError(
+      `Exit artifact ${kind} could not be parsed.`,
+      "other",
+    );
+  }
   return {
     entry,
-    path: artifactPath,
-    bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-    json: JSON.parse(Buffer.from(bytes).toString("utf8")) as T,
+    path: read.artifactPath,
+    bytes: read.bytes,
+    json,
   };
 }
 
@@ -1016,39 +1194,19 @@ async function verifyIdentityBindingBeforeManifestKeyUse(
     };
   }
 
-  const artifactPath = join(root, entry.path);
-  let bytes: Uint8Array;
-  let fileSize: number;
-  try {
-    const linkStat = await lstat(artifactPath);
-    if (linkStat.isSymbolicLink()) {
-      return { failure_class: "archive_contains_symlink", warnings: [] };
-    }
-    const descends = await assertDescendant(root, artifactPath);
-    if (!descends) {
-      return { failure_class: "artifact_path_escapes_root", warnings: [] };
-    }
-    const { data: raw, stats } = await readFileCustodyWithStats(
-      artifactPath,
-      { verifyPathIdentity: true },
-    );
-    bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    fileSize = stats.size;
-  } catch {
-    return { failure_class: "artifact_missing", warnings: [] };
+  const read = await readExitArtifactBytesBounded(root, entry);
+  if (!read.ok) {
+    return { failure_class: read.failure_class, warnings: [] };
   }
 
-  const hashPassed = sha256Hex(bytes) === entry.hash;
+  const hashPassed = sha256Hex(read.bytes) === entry.hash;
   if (!hashPassed) {
     return { failure_class: "artifact_hash_mismatch", warnings: [] };
-  }
-  if (fileSize !== entry.size_bytes) {
-    return { failure_class: "artifact_size_mismatch", warnings: [] };
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    parsed = JSON.parse(Buffer.from(read.bytes).toString("utf8"));
   } catch {
     return {
       failure_class: "identity_signature_invalid",
@@ -1259,15 +1417,13 @@ export function checkKnownSignersStructure(record: {
  * BEFORE the artifact is parsed -
  * this is the "before parsing" half of the bound
  * (`checkKnownSignersStructure`'s element-COUNT cap, above, is the "before
- * iterating" half). This is narrower than a general per-artifact read cap:
- * `loadExitArtifact`'s hash/read loop already reads every declared
- * artifact's bytes off disk regardless of kind, so this check's job is
- * only to refuse an oversized known_signers artifact before its JSON is
- * ever handed to a parser - a general read-size cap across all artifact
- * kinds is a separate, unbuilt row, not this PR. ~300 bytes is a generous
- * per-entry estimate for one `{did, public_key}` JSON element (a real
- * entry serializes to roughly 130-150 bytes: a did:key string plus a
- * base64url public key plus object/quote/comma overhead), so
+ * iterating" half). This is intentionally narrower than the shared
+ * per-artifact descriptor cap: it refuses a present known_signers table whose
+ * DECLARED size is too large for that table's semantics before its JSON is
+ * handed to the parser. ~300 bytes is a generous per-entry estimate for one
+ * `{did, public_key}` JSON element (a real entry serializes to roughly
+ * 130-150 bytes: a did:key string plus a base64url public key plus
+ * object/quote/comma overhead), so
  * `MAX_KNOWN_SIGNERS` entries at that generous rate bounds the whole
  * artifact.
  */
@@ -1575,12 +1731,11 @@ export async function verifyExitBundle(
   let manifest: ExitBundleManifest;
   let manifestBytes: Uint8Array;
   try {
-    const raw = await readFileCustody(join(root, "manifest.json"), {
-      verifyPathIdentity: true,
-    });
-    manifestBytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as ExitBundleManifest;
-  } catch {
+    const manifestRead = await readManifestWithBytes(root);
+    manifest = manifestRead.manifest;
+    manifestBytes = manifestRead.bytes;
+  } catch (err) {
+    if (err instanceof InvalidExitBundleError) throw err;
     throw new InvalidExitBundleError(
       `Not a valid SANCTUARY_EXIT_BUNDLE_V1 directory: manifest.json missing at ${join(root, "manifest.json")}`,
     );
@@ -1750,72 +1905,9 @@ export async function verifyExitBundle(
   let sawEncryptedState = false;
 
   for (const artifact of body.artifacts) {
-    const artifactPath = join(root, artifact.path);
-    let bytes: Uint8Array;
-    let fileSize: number;
-    try {
-      const linkStat = await lstat(artifactPath);
-      if (linkStat.isSymbolicLink()) {
-        artifactFailure = "archive_contains_symlink";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      // Checked from the `lstat` already taken above - no extra syscall -
-      // and BEFORE the full-content read below. By this point in the
-      // function the manifest's signature and `artifacts_aggregate_hash`
-      // have ALREADY been verified (both run earlier in this function), so
-      // `artifact.size_bytes` is a value the exporting fortress genuinely
-      // signed; a REAL on-disk file that does not match it, or that
-      // exceeds the absolute per-artifact cap even when it does match, is
-      // never read in full - only hashed-and-refused after the fact. This
-      // closes that class for the common, realistic case (a stat lstat
-      // already returned, not a fresh syscall). RESIDUAL (private register
-      // EXIT-KS-01): it does not close a same-uid writer that grows this
-      // exact file, in place, in the narrow window between this check and
-      // `readFileCustodyWithStats`'s own internal path-identity recheck
-      // below - `verifyPathIdentity` catches a SWAPPED file (different
-      // inode) in that window but not a GROWN one (same inode); that
-      // residual requires a single fd-based bounded-read primitive shared
-      // with `readFileCustodyWithStats` and is tracked as a separate,
-      // unbuilt row rather than duplicated here (AGENTS.md rule 5 -
-      // custody checks live in ONE place, storage/custody-fs.ts).
-      if (
-        linkStat.size !== artifact.size_bytes ||
-        linkStat.size > MAX_EXIT_ARTIFACT_READ_BYTES
-      ) {
-        artifactFailure = "artifact_size_mismatch";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      const descends = await assertDescendant(root, artifactPath);
-      if (!descends) {
-        artifactFailure = "artifact_path_escapes_root";
-        artifactResults.push({
-          path: artifact.path,
-          kind: artifact.kind,
-          hash_passed: false,
-          size_passed: false,
-        });
-        continue;
-      }
-      const { data: raw, stats: fileStat } = await readFileCustodyWithStats(
-        artifactPath,
-        { verifyPathIdentity: true },
-      );
-      fileSize = fileStat.size;
-      bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    } catch {
-      artifactFailure = "artifact_missing";
+    const read = await readExitArtifactBytesBounded(root, artifact);
+    if (!read.ok) {
+      artifactFailure = read.failure_class;
       artifactResults.push({
         path: artifact.path,
         kind: artifact.kind,
@@ -1825,15 +1917,14 @@ export async function verifyExitBundle(
       continue;
     }
 
+    const bytes = read.bytes;
     const hashPassed = sha256Hex(bytes) === artifact.hash;
-    const sizePassed = fileSize === artifact.size_bytes;
     if (!hashPassed && !artifactFailure) artifactFailure = "artifact_hash_mismatch";
-    if (!sizePassed && !artifactFailure) artifactFailure = "artifact_size_mismatch";
     artifactResults.push({
       path: artifact.path,
       kind: artifact.kind,
       hash_passed: hashPassed,
-      size_passed: sizePassed,
+      size_passed: true,
     });
 
     try {
@@ -2027,7 +2118,20 @@ export async function verifyExitBundle(
   if (!isKnownSignersArtifactSizeAcceptable(manifest)) {
     return fail(root, manifest, "known_signers_invalid", warnings, unsupportedArtifacts);
   }
-  const knownSignersArtifact = await loadExitArtifact(root, manifest, "known_signers");
+  let knownSignersArtifact: LoadedExitArtifact<KnownSignersArtifact> | null;
+  try {
+    knownSignersArtifact = await loadExitArtifact<KnownSignersArtifact>(
+      root,
+      manifest,
+      "known_signers"
+    );
+  } catch (err) {
+    const failureClass =
+      err instanceof InvalidExitBundleError && err.failure_class !== undefined
+        ? err.failure_class
+        : "known_signers_invalid";
+    return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
+  }
   if (knownSignersArtifact) {
     if (
       identityVerification?.did === undefined ||
@@ -2058,7 +2162,16 @@ export async function verifyExitBundle(
     }
   }
 
-  const auditArtifact = await loadExitArtifact(root, manifest, "audit_receipts");
+  let auditArtifact: LoadedExitArtifact | null;
+  try {
+    auditArtifact = await loadExitArtifact(root, manifest, "audit_receipts");
+  } catch (err) {
+    const failureClass =
+      err instanceof InvalidExitBundleError && err.failure_class !== undefined
+        ? err.failure_class
+        : "other";
+    return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
+  }
   const audit = auditArtifact
     ? {
         receipt_count: Array.isArray((auditArtifact.json as { entries?: unknown[] }).entries)
@@ -2091,7 +2204,20 @@ export async function verifyExitBundle(
     }
   }
 
-  const reputationArtifact = await loadExitArtifact(root, manifest, "reputation_bundle");
+  let reputationArtifact: LoadedExitArtifact<ReputationBundle> | null;
+  try {
+    reputationArtifact = await loadExitArtifact<ReputationBundle>(
+      root,
+      manifest,
+      "reputation_bundle"
+    );
+  } catch (err) {
+    const failureClass =
+      err instanceof InvalidExitBundleError && err.failure_class !== undefined
+        ? err.failure_class
+        : "other";
+    return fail(root, manifest, failureClass, warnings, unsupportedArtifacts);
+  }
   const reputation = reputationArtifact
     ? verifyReputationArtifact(reputationArtifact.json, publicKeysByDid)
     : undefined;
@@ -2234,6 +2360,7 @@ export async function verifyExitBundle(
     archive_contains_symlink: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_path_escapes_root: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_missing: false, // early-returned by the per-artifact symlink/hash/size loop above
+    artifact_read_rejected: false, // early-returned by the shared bundle-file reader above
     artifact_hash_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
     artifact_size_mismatch: false, // early-returned by the per-artifact symlink/hash/size loop above
     private_material_present: false, // early-returned by the per-artifact symlink/hash/size loop above
