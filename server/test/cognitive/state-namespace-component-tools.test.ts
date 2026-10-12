@@ -23,7 +23,7 @@ import {
   fingerprintIdentityId,
 } from "../../src/agent-native/safety-base.js";
 
-const INVALID_NAMESPACES = ["", ".", ".."];
+const INVALID_NAMESPACES = ["", ".", "..", "ns-\u4E2D"];
 const READ_TOOLS = new Set(["state_read", "state_list"]);
 const UNIX_EPOCH_MS = 0; // JavaScript Date millisecond zero is 1970-01-01T00:00:00.000Z.
 

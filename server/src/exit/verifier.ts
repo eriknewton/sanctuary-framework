@@ -51,6 +51,7 @@ import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
 import { isStorageNamespacePathComponent } from "../storage/namespace-component.js";
+import { filesystemStorageNameRoundTrips } from "../storage/filesystem-name-codec.js";
 import {
   verifyRotationChain,
   type RotationChainInvalidReason,
@@ -234,6 +235,7 @@ export interface ExitBundleDetailedVerifierResult
     completeness_error?: string;
     attestation_count: number;
     verified_attestations: number;
+    storage_name_invalid_attestations: number;
     invalid_attestations: number;
     unverifiable_attestations: number;
     first_unverifiable_signer_prefix?: string;
@@ -679,6 +681,9 @@ export function isWellFormedExitStateEntryElement(
   if (typeof record.namespace !== "string") return false;
   if (!isStorageNamespacePathComponent(record.namespace)) return false;
   if (typeof record.key !== "string") return false;
+  // Must match assertFilesystemStorageNameAddressable in storage/filesystem-name-codec.ts:
+  // verify and import refuse the same key round-trip boundary before staging.
+  if (!filesystemStorageNameRoundTrips(record.key)) return false;
   const entry = record.entry;
   if (entry === null || typeof entry !== "object") return false;
   const entryRecord = entry as Record<string, unknown>;
@@ -1677,10 +1682,21 @@ function verifyReputationArtifact(
   }
 
   let verified = 0;
+  let storageNameInvalid = 0;
   let invalid = 0;
   let unverifiable = 0;
   let firstUnverifiableSignerPrefix: string | undefined;
   for (const attestation of attestations) {
+    // Must match ReputationStore.importBundle in reputation-store.ts: a
+    // reputation artifact only verifies if every id names a storage key the
+    // importer can address before writing `_reputation`.
+    if (
+      typeof attestation.attestation_id !== "string" ||
+      !filesystemStorageNameRoundTrips(attestation.attestation_id)
+    ) {
+      storageNameInvalid++;
+      continue;
+    }
     const signerKey = publicKeysByDid.get(attestation.signer);
     if (!signerKey) {
       unverifiable++;
@@ -1704,6 +1720,7 @@ function verifyReputationArtifact(
       : {}),
     attestation_count: attestations.length,
     verified_attestations: verified,
+    storage_name_invalid_attestations: storageNameInvalid,
     invalid_attestations: invalid,
     unverifiable_attestations: unverifiable,
     ...(firstUnverifiableSignerPrefix !== undefined
@@ -2242,6 +2259,11 @@ export async function verifyExitBundle(
         `${reputation.invalid_attestations} reputation attestation(s) failed signature verification`
       );
     }
+    if (reputation.storage_name_invalid_attestations > 0) {
+      warnings.push(
+        `${reputation.storage_name_invalid_attestations} reputation attestation(s) use storage names this verifier cannot address`
+      );
+    }
     if (reputation.completeness === "mismatch") {
       warnings.push(
         reputation.completeness_error !== undefined
@@ -2270,6 +2292,8 @@ export async function verifyExitBundle(
   const reputationBundleFailed =
     reputation !== undefined && reputation.bundle_signature_valid !== true;
   const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
+  const reputationStorageNameFailed =
+    (reputation?.storage_name_invalid_attestations ?? 0) > 0;
   const reputationCompletenessFailed = reputation?.completeness === "mismatch";
   const identityFailed = identity ? !identity.signature_valid : false;
   // EXIT-PASS-01: a present-but-invalid rotation chain is a verifier failure,
@@ -2342,6 +2366,7 @@ export async function verifyExitBundle(
     rotation_chain_invalid: rotationFailed,
     reputation_bundle_signature_invalid: reputationBundleFailed,
     reputation_completeness_mismatch: reputationCompletenessFailed,
+    reputation_attestation_storage_name_invalid: reputationStorageNameFailed,
     reputation_attestation_signature_invalid: reputationAttestationFailed,
     reputation_unverifiable_attestations: unverifiableFailed,
     encrypted_state_entries_unreadable: entriesUnreadableFailed,
@@ -2385,6 +2410,7 @@ export async function verifyExitBundle(
     "rotation_chain_invalid",
     "reputation_bundle_signature_invalid",
     "reputation_completeness_mismatch",
+    "reputation_attestation_storage_name_invalid",
     "reputation_attestation_signature_invalid",
     "reputation_unverifiable_attestations",
     "encrypted_state_entries_unreadable",
