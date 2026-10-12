@@ -1,4 +1,3 @@
-// fail-before-exempt: this PR's only edit here is re-pointing the exit/bundle.ts allowlist entry's `context` window string at restoreStorageSnapshots's new surrounding code (HIGH-1, Codex gate, 2026-08-22) after that function grew a divergence check between the loop and the write; the mechanical 220-char context-window match still finds the new string in pre-fix source too, so this file cannot fail-before by construction. HIGH-1's actual new behavior is covered fail-before by test/exit/exit-import-atomic-activation.test.ts and test/core/master-rotation.test.ts.
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -10,8 +9,65 @@ const SERVER_SRC = join(REPO_ROOT, "server", "src");
 interface WriteCall {
   relativePath: string;
   firstArg: string;
-  context: string;
+  callArgs: string;
 }
+
+interface AuditedDynamicWrite {
+  path: string;
+  callArgs: string;
+  reason: string;
+}
+
+const AUDITED_DYNAMIC_WRITES: AuditedDynamicWrite[] = [
+  {
+    path: "server/src/exit/bundle.ts",
+    callArgs: "namespace, key, jsonBytes(value)",
+    reason: "exit import stages only internal _exit_* artifact namespaces",
+  },
+  {
+    path: "server/src/exit/bundle.ts",
+    callArgs: "snapshot.namespace, snapshot.key, snapshot.data",
+    reason:
+      "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires. HIGH-1 (Codex gate, 2026-08-22): the write is now reached only after a post-image-confirmed divergence check (classifyRestoreSafety), not unconditionally.",
+  },
+  {
+    path: "server/src/transparency/anchoring.ts",
+    callArgs: "namespace, key, bytes",
+    reason: "transparency checkpoint helper uses frozen internal namespaces",
+  },
+  {
+    path: "server/src/transparency/emitter.ts",
+    callArgs: "namespace, key, bytes",
+    reason: "transparency emitter helper uses frozen internal namespaces",
+  },
+  {
+    path: "server/src/mesh/lifecycle/durable-spent-set-store.ts",
+    callArgs:
+      "this.namespace, this.recordKey, stringToBytes(JSON.stringify(encrypted))",
+    reason:
+      "federation single-use NONCE replay-protection metadata (the spent set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+  },
+  {
+    path: "server/src/mesh/lifecycle/durable-claim-set-store.ts",
+    callArgs:
+      "this.namespace, this.recordKey, stringToBytes(JSON.stringify(encrypted))",
+    reason:
+      "operator-cloud provision-claim single-use replay-protection metadata (the claim set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+  },
+  {
+    path: "server/src/storage/directory-capability-worker.ts",
+    callArgs: "namespace, String(args[0]), bytes(args[1])",
+    reason:
+      "the directory-capability worker is a narrow cwd-bound transport for an already-authorized FilesystemStorage.write call; export-eligible StateStore provenance is minted by the parent before bytes reach this backend, and the worker preserves the selected namespace/key rather than creating a second state-write API",
+  },
+  {
+    path: "server/src/v1/federation-sync-state-store.ts",
+    callArgs:
+      "this.namespace, this.recordKey, stringToBytes(JSON.stringify(encrypted))",
+    reason:
+      "federation peer-sync security state (Federation 3/3b P0): per-sender accepted high-water + outbound high-water + folded revocation projection, written to the frozen internal _federation namespace under its own AES-GCM purpose key; derived anti-replay/revocation metadata, not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+  },
+];
 
 function tsFiles(dir: string): string[] {
   const out: string[] = [];
@@ -75,22 +131,30 @@ function firstArgument(callBody: string): string {
   return callBody.trim();
 }
 
+function normalizeCallText(text: string): string {
+  return text.replace(/\s+/g, " ").trim().replace(/,$/, "").trim();
+}
+
 function storageWriteCalls(): WriteCall[] {
   const calls: WriteCall[] = [];
-  const pattern = /(?:this\.|ctx\.|opts\.|options\.)?storage\.write\s*\(/g;
   for (const file of tsFiles(SERVER_SRC)) {
     const source = readFileSync(file, "utf8");
-    for (const match of source.matchAll(pattern)) {
-      const openParen = source.indexOf("(", match.index);
-      const body = readBalancedCall(source, openParen);
-      const start = Math.max(0, match.index - 220);
-      const end = Math.min(source.length, openParen + body.length + 220);
-      calls.push({
-        relativePath: relative(REPO_ROOT, file),
-        firstArg: firstArgument(body).replace(/\s+/g, " "),
-        context: source.slice(start, end).replace(/\s+/g, " "),
-      });
-    }
+    calls.push(...storageWriteCallsFromSource(relative(REPO_ROOT, file), source));
+  }
+  return calls;
+}
+
+function storageWriteCallsFromSource(relativePath: string, source: string): WriteCall[] {
+  const calls: WriteCall[] = [];
+  const pattern = /(?:this\.|ctx\.|opts\.|options\.)?storage\.write\s*\(/g;
+  for (const match of source.matchAll(pattern)) {
+    const openParen = source.indexOf("(", match.index);
+    const body = readBalancedCall(source, openParen);
+    calls.push({
+      relativePath,
+      firstArg: normalizeCallText(firstArgument(body)),
+      callArgs: normalizeCallText(body),
+    });
   }
   return calls;
 }
@@ -117,60 +181,59 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
   ) {
     return true;
   }
-  const allowed = [
-    {
-      path: "server/src/exit/bundle.ts",
-      context: "async function stageArtifact",
-      reason: "exit import stages only internal _exit_* artifact namespaces",
-    },
-    {
-      path: "server/src/exit/bundle.ts",
-      context: "if (snapshot.data) {",
-      reason:
-        "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires. HIGH-1 (Codex gate, 2026-08-22): the write is now reached only after a post-image-confirmed divergence check (classifyRestoreSafety), not unconditionally.",
-    },
-    {
-      path: "server/src/transparency/anchoring.ts",
-      context: "storage.write(namespace, key, bytes)",
-      reason: "transparency checkpoint helper uses frozen internal namespaces",
-    },
-    {
-      path: "server/src/transparency/emitter.ts",
-      context: "storage.write(namespace, key, bytes)",
-      reason: "transparency emitter helper uses frozen internal namespaces",
-    },
-    {
-      path: "server/src/mesh/lifecycle/durable-spent-set-store.ts",
-      context: "storage.write(",
-      reason:
-        "federation single-use NONCE replay-protection metadata (the spent set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
-    },
-    {
-      path: "server/src/mesh/lifecycle/durable-claim-set-store.ts",
-      context: "storage.write(",
-      reason:
-        "operator-cloud provision-claim single-use replay-protection metadata (the claim set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
-    },
-    {
-      path: "server/src/storage/directory-capability-worker.ts",
-      context: "storage.write(namespace, String(args[0])",
-      reason:
-        "the directory-capability worker is a narrow cwd-bound transport for an already-authorized FilesystemStorage.write call; export-eligible StateStore provenance is minted by the parent before bytes reach this backend, and the worker preserves the selected namespace/key rather than creating a second state-write API",
-    },
-    {
-      path: "server/src/v1/federation-sync-state-store.ts",
-      context: "storage.write(",
-      reason:
-        "federation peer-sync security state (Federation 3/3b P0): per-sender accepted high-water + outbound high-water + folded revocation projection, written to the frozen internal _federation namespace under its own AES-GCM purpose key; derived anti-replay/revocation metadata, not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
-    },
-  ];
-  return allowed.some(
-    (item) =>
-      call.relativePath === item.path && call.context.includes(item.context),
+  return AUDITED_DYNAMIC_WRITES.some(
+    (item) => call.relativePath === item.path && call.callArgs === item.callArgs,
   );
 }
 
 describe("state provenance write chokepoint", () => {
+  it("ties audited dynamic write allowances to the matching call", () => {
+    const fixture = `
+      async function writeAllowed(storage, namespace, key, bytes) {
+        await storage.write(namespace, key, bytes);
+        await storage.write(userNamespace, key, bytes);
+      }
+    `;
+
+    const unsafe = storageWriteCallsFromSource(
+      "server/src/transparency/anchoring.ts",
+      fixture,
+    ).filter((call) => {
+      if (isReservedLiteral(call.firstArg)) return false;
+      if (isInternalConstant(call.firstArg)) return false;
+      return !isAllowedDynamicWrite(call);
+    });
+
+    expect(unsafe.map((call) => call.firstArg)).toEqual(["userNamespace"]);
+  });
+
+  it("keeps every audited dynamic write allowance bound to one call site", () => {
+    const calls = storageWriteCalls();
+    const matchCounts = AUDITED_DYNAMIC_WRITES.map((item) => ({
+      item,
+      matches: calls.filter(
+        (call) =>
+          call.relativePath === item.path && call.callArgs === item.callArgs,
+      ),
+    }));
+
+    expect(
+      matchCounts.map(({ item, matches }) => ({
+        path: item.path,
+        callArgs: item.callArgs,
+        count: matches.length,
+        reason: item.reason,
+      })),
+    ).toEqual(
+      AUDITED_DYNAMIC_WRITES.map((item) => ({
+        path: item.path,
+        callArgs: item.callArgs,
+        count: 1,
+        reason: item.reason,
+      })),
+    );
+  });
+
   it("has no unaudited direct raw storage writes to variable namespaces", () => {
     const unsafe = storageWriteCalls().filter((call) => {
       if (isReservedLiteral(call.firstArg)) return false;
