@@ -8,6 +8,7 @@ import {
   TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
   TRANSPARENCY_STOP_DRAIN_MARGIN_MS,
   TransparencySchedulerAbortState,
+  TransparencySchedulerAbortedError,
 } from "../../src/transparency/scheduler.js";
 import { REKOR_SUBMIT_TIMEOUT_MS } from "../../src/transparency/rekor-client.js";
 
@@ -198,6 +199,25 @@ describe("startTransparencyScheduler", () => {
     }
   });
 
+  it("stop marks the captured abort state before any tick starts", async () => {
+    vi.useFakeTimers();
+    try {
+      let captured: TransparencySchedulerAbortState | undefined;
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: async () => undefined,
+        onError: () => undefined,
+        captureAbortState: (state) => {
+          captured = state;
+        },
+      });
+      await scheduler.stop();
+      expect(captured?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborts deadline-straddling emissions before late key work or writes", async () => {
     vi.useFakeTimers();
     try {
@@ -256,5 +276,34 @@ describe("startTransparencyScheduler", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["primitive", 1],
+  ] as const)("refuses a %s abort-state value with the typed abort error", (_label, value) => {
+    expect(() =>
+      TransparencySchedulerAbortState.assertNotAborted(
+        value as unknown as TransparencySchedulerAbortState,
+        "abort state authentication",
+      ),
+    ).toThrow(TransparencySchedulerAbortedError);
+  });
+
+  it("refuses constructor access without the module mint", () => {
+    expect(() =>
+      Reflect.construct(TransparencySchedulerAbortState, [() => false]),
+    ).toThrow(TransparencySchedulerAbortedError);
+
+    const Ctor = TransparencySchedulerAbortState as unknown as new (
+      isAborted: () => boolean
+    ) => TransparencySchedulerAbortState;
+    expect(() => new Ctor(() => false)).toThrow(TransparencySchedulerAbortedError);
+
+    class Subclass extends (TransparencySchedulerAbortState as unknown as new (
+      ...args: unknown[]
+    ) => TransparencySchedulerAbortState) {}
+    expect(() => new Subclass()).toThrow(TransparencySchedulerAbortedError);
   });
 });

@@ -47,6 +47,7 @@ import {
   TransparencySchedulerAbortedError,
   startTransparencyScheduler,
 } from "../../src/transparency/scheduler.js";
+import { recordTransparencyAbortStateChecks } from "../helpers/transparency-abort-checks.js";
 
 const MASTER_KEY = () => randomBytes(32);
 
@@ -315,21 +316,28 @@ describe("transparency emitter", () => {
     }
   });
 
-  it("calls the scheduler guard at checkpoint signing", async () => {
-    const env = makeEnv();
-    await seedAuditEvents(env.auditLog);
-    const guard = vi.spyOn(
-      TransparencySchedulerAbortState,
-      "assertNotAborted",
-    );
+  it("checks the live scheduler abort state at checkpoint signing", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    const checks = recordTransparencyAbortStateChecks();
     try {
-      await emitEnforcementCheckpoint(emitInput(env, testSigner()));
-      expect(guard).toHaveBeenCalledWith(
-        TRANSPARENCY_NEVER_ABORTED,
-        "checkpoint signing",
-      );
+      const env = makeEnv();
+      await seedAuditEvents(env.auditLog);
+      await emitEnforcementCheckpoint({
+        ...emitInput(env, testSigner()),
+        abortState: abort.state,
+      });
+      expect(
+        checks.calls.filter(
+          (call) =>
+            call.state === abort.state && call.phase === "checkpoint signing",
+        ),
+      ).toHaveLength(1);
     } finally {
-      guard.mockRestore();
+      checks.stop();
+      abort.release();
+      await abort.abort();
+      vi.useRealTimers();
     }
   });
 

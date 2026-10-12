@@ -78,6 +78,7 @@ import {
   TransparencySchedulerAbortedError,
   startTransparencyScheduler,
 } from "../../src/transparency/scheduler.js";
+import { recordTransparencyAbortStateChecks } from "../helpers/transparency-abort-checks.js";
 
 const FORTRESS_ID = "fortress-anchor-test";
 
@@ -687,101 +688,124 @@ describe("fail loud, never blocking (outage fixture)", () => {
 });
 
 describe("scheduler abort custody checks", () => {
-  it("calls the scheduler guard before writing anchoring config keys", async () => {
-    const env = makeEnv();
-    const guard = vi.spyOn(
-      TransparencySchedulerAbortState,
-      "assertNotAborted",
-    );
+  it("checks the live scheduler abort state before writing anchoring config keys", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    const checks = recordTransparencyAbortStateChecks();
     try {
-      await enable(env);
-      expect(guard).toHaveBeenCalledWith(
-        TRANSPARENCY_NEVER_ABORTED,
-        "anchoring config key write",
-      );
+      const env = makeEnv();
+      await enableAnchoring({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        fortressId: FORTRESS_ID,
+        abortState: abort.state,
+      });
+      expect(
+        checks.calls.filter(
+          (call) =>
+            call.state === abort.state && call.phase === "anchoring config key write",
+        ),
+      ).toHaveLength(1);
     } finally {
-      guard.mockRestore();
+      checks.stop();
+      abort.release();
+      await abort.abort();
+      vi.useRealTimers();
     }
   });
 
-  it("calls the scheduler guard before authenticating anchoring config", async () => {
-    const env = makeEnv();
-    await enable(env);
-    const guard = vi.spyOn(
-      TransparencySchedulerAbortState,
-      "assertNotAborted",
-    );
+  it("checks the live scheduler abort state before authenticating anchoring config", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    const checks = recordTransparencyAbortStateChecks();
     try {
+      const env = makeEnv();
+      await enable(env);
       await readAnchorConfig({
         storage: env.storage,
         masterKey: env.masterKey,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
+        abortState: abort.state,
       });
-      expect(guard).toHaveBeenCalledWith(
-        TRANSPARENCY_NEVER_ABORTED,
-        "anchoring config MAC verification",
-      );
+      expect(
+        checks.calls.filter(
+          (call) =>
+            call.state === abort.state &&
+            call.phase === "anchoring config MAC verification",
+        ),
+      ).toHaveLength(1);
     } finally {
-      guard.mockRestore();
+      checks.stop();
+      abort.release();
+      await abort.abort();
+      vi.useRealTimers();
     }
   });
 
-  it("calls the scheduler guard before signing anchor preimages", async () => {
-    const env = makeEnv();
-    const record = await emitOne(env);
-    await enable(env);
-    const fixture = makeFetchFixture();
-    const guard = vi.spyOn(
-      TransparencySchedulerAbortState,
-      "assertNotAborted",
-    );
+  it("checks the live scheduler abort state before signing anchor preimages", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    const checks = recordTransparencyAbortStateChecks();
     try {
+      const env = makeEnv();
+      const record = await emitOne(env);
+      await enable(env);
+      const fixture = makeFetchFixture();
       await anchorCheckpoint({
         storage: env.storage,
         masterKey: env.masterKey,
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
+        abortState: abort.state,
       });
-      expect(guard).toHaveBeenCalledWith(
-        TRANSPARENCY_NEVER_ABORTED,
-        "anchor preimage signing",
-      );
+      expect(
+        checks.calls.filter(
+          (call) =>
+            call.state === abort.state && call.phase === "anchor preimage signing",
+        ),
+      ).toHaveLength(1);
     } finally {
-      guard.mockRestore();
+      checks.stop();
+      abort.release();
+      await abort.abort();
+      vi.useRealTimers();
     }
   });
 
-  it("calls the scheduler guard before deriving the anchor export key", async () => {
-    const env = makeEnv();
-    const record = await emitOne(env);
-    await enable(env);
-    await anchorCheckpoint({
-      storage: env.storage,
-      masterKey: env.masterKey,
-      auditLog: env.auditLog,
-      record,
-      fetchFn: makeFetchFixture().fetch,
-      abortState: TRANSPARENCY_NEVER_ABORTED,
-    });
-    const guard = vi.spyOn(
-      TransparencySchedulerAbortState,
-      "assertNotAborted",
-    );
+  it("checks the live scheduler abort state before deriving the anchor export key", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    const checks = recordTransparencyAbortStateChecks();
     try {
+      const env = makeEnv();
+      const record = await emitOne(env);
+      await enable(env);
+      await anchorCheckpoint({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        record,
+        fetchFn: makeFetchFixture().fetch,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       await buildAnchorsExport({
         storage: env.storage,
         masterKey: env.masterKey,
         fortressId: FORTRESS_ID,
-        abortState: TRANSPARENCY_NEVER_ABORTED,
+        abortState: abort.state,
       });
-      expect(guard).toHaveBeenCalledWith(
-        TRANSPARENCY_NEVER_ABORTED,
-        "anchor export key derivation",
-      );
+      expect(
+        checks.calls.filter(
+          (call) =>
+            call.state === abort.state && call.phase === "anchor export key derivation",
+        ),
+      ).toHaveLength(1);
     } finally {
-      guard.mockRestore();
+      checks.stop();
+      abort.release();
+      await abort.abort();
+      vi.useRealTimers();
     }
   });
 

@@ -9,6 +9,8 @@
  * new checkpoint write after shutdown begins (the emitter is fail-closed).
  */
 
+import { channel } from "node:diagnostics_channel";
+
 import { REKOR_SUBMIT_TIMEOUT_MS } from "./rekor-client.js";
 
 export const TRANSPARENCY_INTERVAL_ENV = "SANCTUARY_TRANSPARENCY_INTERVAL";
@@ -81,6 +83,7 @@ export interface TransparencySchedulerOptions {
   /** Test hooks. */
   setIntervalFn?: typeof setInterval;
   clearIntervalFn?: typeof clearInterval;
+  captureAbortState?: (state: TransparencySchedulerAbortState) => void;
 }
 
 export interface TransparencySchedulerHandle {
@@ -97,26 +100,30 @@ export class TransparencySchedulerAbortedError extends Error {
 const TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT = Symbol(
   "TransparencySchedulerAbortState.mint"
 );
+// Must match TRANSPARENCY_ABORT_STATE_CHECK_DIAGNOSTIC_CHANNEL in
+// ../../test/helpers/transparency-abort-checks.ts; subscribers observe guard
+// coverage only and cannot change the fail-closed decision below.
+const TRANSPARENCY_ABORT_STATE_CHECK_DIAGNOSTIC_CHANNEL =
+  "sanctuary.transparency.abort-state-check";
+const transparencyAbortStateChecks = channel(
+  TRANSPARENCY_ABORT_STATE_CHECK_DIAGNOSTIC_CHANNEL
+);
 
 export class TransparencySchedulerAbortState {
   readonly #brand = true;
   readonly #isAborted: () => boolean;
 
-  private constructor(isAborted: () => boolean) {
-    this.#isAborted = isAborted;
-  }
-
-  static create(
-    mint: typeof TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
+  constructor(
+    mint: symbol,
     isAborted: () => boolean
-  ): TransparencySchedulerAbortState {
-    // INVARIANT (shutdown/key custody): live states are minted only through the
-    // module-private token, so exporting the verifier does not export a forge
-    // path for callers outside scheduler.ts.
+  ) {
+    // INVARIANT (shutdown/key custody): the constructor itself authenticates
+    // the module-private mint, so Reflect.construct/subclasses cannot create a
+    // branded state outside this module.
     if (mint !== TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT) {
       throw new TransparencySchedulerAbortedError("abort state authentication");
     }
-    return new TransparencySchedulerAbortState(isAborted);
+    this.#isAborted = isAborted;
   }
 
   get aborted(): boolean {
@@ -124,20 +131,30 @@ export class TransparencySchedulerAbortState {
   }
 
   static assertNotAborted(
-    value: TransparencySchedulerAbortState,
+    value: unknown,
     phase: string
   ): void {
     // INVARIANT (shutdown/key custody): the abort state is minted only by this
     // module; a same-shape object must fail closed before any guarded key use.
-    if (!(#brand in value) || value.#isAborted()) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !(#brand in value)
+    ) {
+      throw new TransparencySchedulerAbortedError(phase);
+    }
+    transparencyAbortStateChecks.publish({ state: value, phase });
+    if (value.#isAborted()) {
       throw new TransparencySchedulerAbortedError(phase);
     }
   }
 }
 
+Object.freeze(TransparencySchedulerAbortState);
+
 export const TRANSPARENCY_NEVER_ABORTED: TransparencySchedulerAbortState =
   Object.freeze(
-    TransparencySchedulerAbortState.create(
+    new TransparencySchedulerAbortState(
       TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
       () => false
     )
@@ -146,7 +163,7 @@ export const TRANSPARENCY_NEVER_ABORTED: TransparencySchedulerAbortState =
 function createSchedulerAbortState(
   isAborted: () => boolean
 ): TransparencySchedulerAbortState {
-  return TransparencySchedulerAbortState.create(
+  return new TransparencySchedulerAbortState(
     TRANSPARENCY_SCHEDULER_ABORT_STATE_MINT,
     isAborted
   );
@@ -161,6 +178,7 @@ export function startTransparencyScheduler(
   let stopped = false;
   let aborted = false;
   const abortState = createSchedulerAbortState(() => aborted);
+  options.captureAbortState?.(abortState);
   const timer = setIntervalFn(() => {
     if (inFlight !== undefined || stopped || aborted) return; // never overlap emissions
     inFlight = options

@@ -16,6 +16,8 @@ describe("transparency scheduler abort state wiring", () => {
     expect(scheduler).toContain("export class TransparencySchedulerAbortState");
     expect(scheduler).toContain("#brand in value");
     expect(scheduler).toContain("static assertNotAborted(");
+    expect(scheduler).not.toContain("static create(");
+    expect(scheduler).toContain("Object.freeze(TransparencySchedulerAbortState)");
   });
 
   it("the daemon scheduled path never substitutes the foreground-only abort constant", () => {

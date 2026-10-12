@@ -2860,8 +2860,8 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         const { enableAnchoring } = await import(
           "../../src/transparency/anchoring.js"
         );
-        const { TransparencySchedulerAbortState } = await import(
-          "../../src/transparency/scheduler.js"
+        const { recordTransparencyAbortStateChecks } = await import(
+          "../helpers/transparency-abort-checks.js"
         );
         const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
         tempDirs.push(fortressPath);
@@ -2921,10 +2921,6 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
               },
             }),
         }));
-        const guard = vi.spyOn(
-          TransparencySchedulerAbortState,
-          "assertNotAborted",
-        );
         const scheduledEmit = createTransparencyDaemonScheduledEmit({
           storage,
           auditLog,
@@ -2939,22 +2935,26 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
           err: new CaptureStream(),
         });
 
-        await scheduledEmit(abort.state);
-        for (const [phase, expectedCount] of [
-          ["transparency signer resolution", 1],
-          ["local transparency signer decrypt", 1],
-          ["counter-floor key derivation", 1],
-          ["anchoring config key derivation", 2],
-          ["anchor key derivation", 1],
-        ] as const) {
-          expect(
-            guard.mock.calls.filter(
-              ([state, observedPhase]) =>
-                state === abort.state && observedPhase === phase,
-            ),
-          ).toHaveLength(expectedCount);
+        const checks = recordTransparencyAbortStateChecks();
+        try {
+          await scheduledEmit(abort.state);
+          for (const [phase, expectedCount] of [
+            ["transparency signer resolution", 1],
+            ["local transparency signer decrypt", 1],
+            ["counter-floor key derivation", 1],
+            ["anchoring config key derivation", 2],
+            ["anchor key derivation", 1],
+          ] as const) {
+            expect(
+              checks.calls.filter(
+                (call) =>
+                  call.state === abort.state && call.phase === phase,
+              ),
+            ).toHaveLength(expectedCount);
+          }
+        } finally {
+          checks.stop();
         }
-        guard.mockRestore();
       } finally {
         vi.unstubAllGlobals();
         abort.release();
