@@ -43,79 +43,13 @@ pub struct Admitted {
     pub loaded: LoadedManifest,
 }
 
-#[derive(Debug, thiserror::Error)]
-enum InstallPolicyAdmissionError {
-    #[error(
-        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
-    )]
-    MalformedAgentScope {
-        rule_id_display: String,
-        agent_id_display: String,
-        expected_form: &'static str,
-    },
-    #[error(
-        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}"
-    )]
-    AgentScopeOutsideAdmission {
-        rule_id_display: String,
-        agent_id_display: String,
-        admitted_uid: u32,
-    },
-}
-
-const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
-// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
-// server/src/castle-wall/allowlist/bounded-diagnostic-text.ts.
-const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
-
-fn bounded_diagnostic_text(value: &str) -> String {
-    let original_len = value.chars().count();
-    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
-        return value.to_string();
-    }
-    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
-    format!("{prefix}... (original length {original_len})")
-}
-
-fn validate_install_agent_id_scopes(
-    rules: &[crate::policy::AllowlistRule],
-    admitted_uid: u32,
-) -> std::result::Result<(), InstallPolicyAdmissionError> {
-    for rule in rules {
-        // The reserved distress lane is code-derived and shape-checked here; operator-authored agent scopes use confined ids.
-        if crate::habeas::is_derived_habeas_rule(rule) {
-            continue;
-        }
-        for agent_id in &rule.scope.agent_ids {
-            let Some(uid) = crate::nftables::parse_confined_agent_id(agent_id) else {
-                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
-                return Err(InstallPolicyAdmissionError::MalformedAgentScope {
-                    rule_id_display: bounded_diagnostic_text(&rule.id),
-                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
-                    expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
-                });
-            };
-            // The install profile rejects gate_uid above, so its admitted confined-id set is the agent uid singleton.
-            if uid != admitted_uid {
-                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
-                return Err(InstallPolicyAdmissionError::AgentScopeOutsideAdmission {
-                    rule_id_display: bounded_diagnostic_text(&rule.id),
-                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
-                    admitted_uid,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_loaded_install_agent_id_scopes(
     loaded: &LoadedManifest,
     admitted_uid: u32,
 ) -> Result<PolicySnapshot> {
     let snapshot = PolicySnapshot::from_loaded_manifest(loaded)?;
     // The scope check consumes the exact typed rules the daemon will install; unreadable bytes cannot be skipped.
-    validate_install_agent_id_scopes(&snapshot.rules, admitted_uid)?;
+    crate::policy::validate_confined_agent_id_scopes(&snapshot.rules, admitted_uid)?;
     Ok(snapshot)
 }
 
@@ -557,7 +491,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!crate::habeas::is_derived_habeas_rule(&rule));
-        let err = validate_install_agent_id_scopes(&[rule], TEST_ADMITTED_UID)
+        let err = crate::policy::validate_confined_agent_id_scopes(&[rule], TEST_ADMITTED_UID)
             .unwrap_err()
             .to_string();
         assert!(err.contains("admitted uid 60123"), "{err}");
@@ -579,9 +513,10 @@ mod tests {
                 "disposition": "allow"
             }))
             .unwrap();
-        let malformed = validate_install_agent_id_scopes(&[malformed_rule], TEST_ADMITTED_UID)
-            .unwrap_err()
-            .to_string();
+        let malformed =
+            crate::policy::validate_confined_agent_id_scopes(&[malformed_rule], TEST_ADMITTED_UID)
+                .unwrap_err()
+                .to_string();
         assert!(
             malformed.contains(&format!("original length {}", long_rule_id.len())),
             "{malformed}"
@@ -607,9 +542,10 @@ mod tests {
                 "disposition": "allow"
             }))
             .unwrap();
-        let outside = validate_install_agent_id_scopes(&[outside_rule], TEST_ADMITTED_UID)
-            .unwrap_err()
-            .to_string();
+        let outside =
+            crate::policy::validate_confined_agent_id_scopes(&[outside_rule], TEST_ADMITTED_UID)
+                .unwrap_err()
+                .to_string();
         assert!(
             outside.contains(&format!("original length {}", long_rule_id.len())),
             "{outside}"

@@ -58,7 +58,7 @@ describe("confined agent id form", () => {
   it("accepts only the admitted uid in install scopes", () => {
     expect(() => validateLinuxInstallAgentIdScopes([rule(["uid-60123"])], 60123)).not.toThrow();
     expect(() => validateLinuxInstallAgentIdScopes([rule(["uid-60124"])], 60123)).toThrow(
-      `scope.agent_ids entry "uid-60124": expected admitted uid 60123`,
+      `scope.agent_ids entry "uid-60124": expected admitted uid 60123; scope agent rules to uid-60123`,
     );
   });
 
@@ -74,6 +74,8 @@ describe("confined agent id form", () => {
     expect(isGenuineDerivedHabeasRule(derivedShapeWithOperatorScope)).toBe(false);
     expect(() =>
       validateLinuxInstallAgentIdScopes([derivedShapeWithOperatorScope], 60123),
-    ).toThrow(`scope.agent_ids entry "uid-60124": expected admitted uid 60123`);
+    ).toThrow(
+      `scope.agent_ids entry "uid-60124": expected admitted uid 60123; scope agent rules to uid-60123`,
+    );
   });
 });

@@ -12,12 +12,13 @@
 //! keep prior policy in force).
 //!
 //! The store does NOT do filesystem watching; that is `manifest::watcher`.
-//! Production callers can mutate the live snapshot only through
-//! `reload_with_authorization`, which owns prepare -> required authorization ->
-//! exact commit. The raw prepare/commit operations are private so no sibling
-//! module can accidentally publish an unaudited generation.
+//! Production callers can mutate the live snapshot only through three audited
+//! entries: steady-state reload, boot reclaim, and broker publication. Each owns
+//! prepare -> required authorization -> exact commit. The raw prepare/commit
+//! operations are private so no sibling module can accidentally publish an
+//! unaudited generation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -25,6 +26,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rand_core::{OsRng, RngCore};
 
@@ -42,7 +44,7 @@ pub const MANIFEST_FILENAME: &str = "manifest.json";
 
 /// Subdirectory of the policy directory holding the rule files.
 pub const RULES_SUBDIR: &str = "rules";
-const MANIFEST_HIGH_WATER_FILENAME: &str = ".manifest-high-water.json";
+pub(crate) const MANIFEST_HIGH_WATER_FILENAME: &str = ".manifest-high-water.json";
 const ACTIVE_GENERATION_FILENAME: &str = ".active-policy-generation";
 const GENERATIONS_SUBDIR: &str = ".policy-generations";
 /// Successful publications retain their immutable generation directories so
@@ -80,6 +82,36 @@ impl PreparedManifestReload {
     pub(crate) fn loaded(&self) -> &LoadedManifest {
         &self.loaded
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeAdmissionMode {
+    EnforceNewGeneration,
+    WarnOnlyCommittedGeneration,
+}
+
+type ScopeAdmissionWarningSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+fn default_scope_admission_warning_sink(message: &str) {
+    // SAFETY: stderr is the operator channel for scope warnings when the exact
+    // committed generation is reclaimed (at boot or on a same-generation reload);
+    // that generation keeps enforcing, so this line is the only place an operator
+    // learns a rule must be re-signed with the uid-<uid> form.
+    eprintln!("{message}");
+}
+
+fn scope_admission_refusal_message(
+    errors: &[crate::policy::ConfinedAgentScopeError],
+    admitted_uid: u32,
+) -> String {
+    let mut seen_rule_ids = HashSet::new();
+    let details = errors
+        .iter()
+        .filter(|error| seen_rule_ids.insert(error.rule_id().to_string()))
+        .map(|error| PolicySnapshotError::ConfinedAgentScope(error.clone()).to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{details}; remedy: re-sign with uid-{admitted_uid}")
 }
 
 /// Errors emitted by the manifest store. All of these are F-2 (mid-session)
@@ -124,6 +156,17 @@ pub enum ManifestStoreError {
     RuleIdentityPreflight { issues: Vec<String> },
     #[error("policy snapshot construction failed: {source_message}")]
     PolicySnapshot { source_message: String },
+    /// Boot-only scoped-agent refusal after the pinned-key signature, fortress id,
+    /// high-water ordering and agent-origin fields have verified. Consumers may
+    /// arm only the named confined subject, not any operator allow rule from the
+    /// refused snapshot.
+    #[error("manifest scoped-agent admission refused at boot: {source_message}")]
+    BootConfinedScopeRefusal {
+        source_message: String,
+        agent_uid: u32,
+        ceiling: u32,
+        gate_uid: Option<u32>,
+    },
     #[error("manifest fortress id {got:?} does not match configured fortress {expected:?}")]
     FortressMismatch { expected: String, got: String },
     #[error("manifest generation rollback/refork refused: candidate={candidate}, high_water={high_water}")]
@@ -146,6 +189,18 @@ impl ManifestStoreError {
     pub(crate) fn requires_supervised_restart(&self) -> bool {
         matches!(self, Self::PublicationCommitIndeterminate { .. })
     }
+
+    pub(crate) fn boot_confined_subject(&self) -> Option<(u32, u32, Option<u32>)> {
+        match self {
+            Self::BootConfinedScopeRefusal {
+                agent_uid,
+                ceiling,
+                gate_uid,
+                ..
+            } => Some((*agent_uid, *ceiling, *gate_uid)),
+            _ => None,
+        }
+    }
 }
 
 impl From<PolicySnapshotError> for ManifestStoreError {
@@ -160,7 +215,6 @@ impl From<PolicySnapshotError> for ManifestStoreError {
 /// successfully-verified `LoadedManifest` snapshot (if any), plus a
 /// derived [`PolicySnapshot`] that the policy evaluator runs against on
 /// every outbound attempt.
-#[derive(Debug)]
 pub struct ManifestStore {
     policy_dir: PathBuf,
     pinned_key_path: PathBuf,
@@ -169,6 +223,20 @@ pub struct ManifestStore {
     high_water_path: PathBuf,
     current: Option<LoadedManifest>,
     current_snapshot: Option<PolicySnapshot>,
+    scope_warning_sink: ScopeAdmissionWarningSink,
+}
+
+impl std::fmt::Debug for ManifestStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManifestStore")
+            .field("policy_dir", &self.policy_dir)
+            .field("pinned_key_path", &self.pinned_key_path)
+            .field("expected_fortress_id", &self.expected_fortress_id)
+            .field("high_water_path", &self.high_water_path)
+            .field("current", &self.current)
+            .field("current_snapshot", &self.current_snapshot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ManifestStore {
@@ -189,6 +257,7 @@ impl ManifestStore {
             high_water_path,
             current: None,
             current_snapshot: None,
+            scope_warning_sink: Arc::new(default_scope_admission_warning_sink),
         }
     }
 
@@ -288,15 +357,19 @@ impl ManifestStore {
     /// live policy. The returned value owns the exact bytes and snapshot that
     /// [`Self::commit_prepared_reload`] later installs, so a policy rewrite
     /// between authorization and commit cannot substitute another generation.
-    fn prepare_reload(&self) -> Result<PreparedManifestReload, ManifestStoreError> {
+    fn prepare_reload(
+        &self,
+        scope_admission: ScopeAdmissionMode,
+    ) -> Result<PreparedManifestReload, ManifestStoreError> {
         let loaded = load_signed_manifest_from_disk(&self.policy_dir, &self.pinned_key)?;
-        self.prepare_loaded(loaded, true)
+        self.prepare_loaded(loaded, true, scope_admission)
     }
 
     fn prepare_loaded(
         &self,
         loaded: LoadedManifest,
         allow_exact_reclaim: bool,
+        scope_admission: ScopeAdmissionMode,
     ) -> Result<PreparedManifestReload, ManifestStoreError> {
         if loaded.signed.manifest.fortress_id != self.expected_fortress_id {
             return Err(ManifestStoreError::FortressMismatch {
@@ -304,6 +377,7 @@ impl ManifestStore {
                 got: loaded.signed.manifest.fortress_id.clone(),
             });
         }
+        let mut exact_committed_reclaim = false;
         if let Some(high_water) = read_high_water(&self.high_water_path)? {
             if high_water.fortress_id != self.expected_fortress_id {
                 return Err(ManifestStoreError::FortressMismatch {
@@ -314,6 +388,7 @@ impl ManifestStore {
             let candidate_generation = loaded.signed.manifest.generation;
             let same_committed_manifest = candidate_generation == high_water.generation
                 && loaded.manifest_signature_b64url == high_water.manifest_signature_b64url;
+            exact_committed_reclaim = same_committed_manifest;
             if candidate_generation <= high_water.generation
                 && !(allow_exact_reclaim && same_committed_manifest)
             {
@@ -324,7 +399,77 @@ impl ManifestStore {
             }
         }
         let snapshot = PolicySnapshot::from_loaded_manifest(&loaded)?;
+        self.apply_confined_scope_admission(&snapshot, scope_admission, exact_committed_reclaim)?;
         Ok(PreparedManifestReload { loaded, snapshot })
+    }
+
+    fn apply_confined_scope_admission(
+        &self,
+        snapshot: &PolicySnapshot,
+        mode: ScopeAdmissionMode,
+        exact_committed_reclaim: bool,
+    ) -> Result<(), ManifestStoreError> {
+        let Some(admitted_uid) = snapshot.confined_agent_uid else {
+            return Ok(());
+        };
+        let errors =
+            crate::policy::collect_confined_agent_scope_errors(&snapshot.rules, admitted_uid);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        if exact_committed_reclaim {
+            // The exact committed generation is kept because it is already the
+            // committed policy, including the derived distress lane; any newer
+            // generation is refused below because boot must not admit what the
+            // running path would refuse.
+            self.emit_scope_admission_warnings(&errors, admitted_uid);
+            return Ok(());
+        }
+        match mode {
+            ScopeAdmissionMode::EnforceNewGeneration => Err(ManifestStoreError::from(
+                PolicySnapshotError::ConfinedAgentScope(errors[0].clone()),
+            )),
+            ScopeAdmissionMode::WarnOnlyCommittedGeneration => {
+                let (ceiling, gate_uid) = match (
+                    snapshot.confined_agent_uid_ceiling,
+                    snapshot.confined_gate_uid,
+                ) {
+                    (Some(ceiling), gate_uid) => (ceiling, gate_uid),
+                    (None, _) => {
+                        // `PolicySnapshot::from_loaded_manifest` derives the uid and
+                        // ceiling from the same AgentOrigin; a uid without its ceiling
+                        // means that internal pair invariant changed before this
+                        // admission gate, so the snapshot is refused as malformed.
+                        return Err(ManifestStoreError::from(
+                            PolicySnapshotError::ConfinedAgentScope(errors[0].clone()),
+                        ));
+                    }
+                };
+                Err(ManifestStoreError::BootConfinedScopeRefusal {
+                    source_message: scope_admission_refusal_message(&errors, admitted_uid),
+                    agent_uid: admitted_uid,
+                    ceiling,
+                    gate_uid,
+                })
+            }
+        }
+    }
+
+    fn emit_scope_admission_warnings(
+        &self,
+        errors: &[crate::policy::ConfinedAgentScopeError],
+        admitted_uid: u32,
+    ) {
+        let mut warned_rule_ids = HashSet::new();
+        for error in errors {
+            if !warned_rule_ids.insert(error.rule_id().to_string()) {
+                continue;
+            }
+            let message = format!(
+                "castle-wall-daemon: active policy scope warning: {error}; remedy: re-sign with uid-{admitted_uid}"
+            );
+            (self.scope_warning_sink)(&message);
+        }
     }
 
     /// Commit a previously verified, owned reload candidate. This operation is
@@ -352,16 +497,35 @@ impl ManifestStore {
             .expect("prepared reload committed above"))
     }
 
-    /// Sole production mutation primitive. `authorize` receives the exact
+    /// Steady-state production mutation path. `authorize` receives the exact
     /// owned candidate that will be committed; an error leaves prior state
     /// untouched. The callback is expected to return only after its durable
-    /// receipt exists.
+    /// receipt exists. The other production mutation paths are boot reclaim
+    /// (`reload_active_at_boot_with_authorization`) and broker publication
+    /// (`publish_bundle_with_authorization`).
     pub(crate) fn reload_with_authorization<E>(
         &mut self,
         authorize: impl FnOnce(&LoadedManifest) -> Result<(), E>,
     ) -> Result<&LoadedManifest, AuthorizedReloadError<E>> {
         let prepared = self
-            .prepare_reload()
+            .prepare_reload(ScopeAdmissionMode::EnforceNewGeneration)
+            .map_err(AuthorizedReloadError::Verify)?;
+        authorize(prepared.loaded()).map_err(AuthorizedReloadError::Authorization)?;
+        self.commit_prepared_reload(prepared)
+            .map_err(AuthorizedReloadError::Verify)
+    }
+
+    /// Boot may reclaim only the exact generation already committed before this
+    /// binary ran. It keeps that policy enforcing and emits remediation warnings
+    /// for confined-scope drift instead of converting the boot into no policy.
+    /// A newer generation is refused so restart cannot admit a policy the
+    /// running reload path would reject.
+    pub(crate) fn reload_active_at_boot_with_authorization<E>(
+        &mut self,
+        authorize: impl FnOnce(&LoadedManifest) -> Result<(), E>,
+    ) -> Result<&LoadedManifest, AuthorizedReloadError<E>> {
+        let prepared = self
+            .prepare_reload(ScopeAdmissionMode::WarnOnlyCommittedGeneration)
             .map_err(AuthorizedReloadError::Verify)?;
         authorize(prepared.loaded()).map_err(AuthorizedReloadError::Authorization)?;
         self.commit_prepared_reload(prepared)
@@ -469,7 +633,7 @@ impl ManifestStore {
             ));
         }
         let prepared = self
-            .prepare_loaded(loaded, false)
+            .prepare_loaded(loaded, false, ScopeAdmissionMode::EnforceNewGeneration)
             .map_err(AuthorizedReloadError::Verify)?;
         authorize(prepared.loaded()).map_err(AuthorizedReloadError::Authorization)?;
 
@@ -529,8 +693,16 @@ impl ManifestStore {
     /// `PolicyReloadResponse` with `ok: false`.
     #[cfg(test)]
     pub(crate) fn reload(&mut self) -> Result<&LoadedManifest, ManifestStoreError> {
-        let prepared = self.prepare_reload()?;
+        let prepared = self.prepare_reload(ScopeAdmissionMode::EnforceNewGeneration)?;
         self.commit_prepared_reload(prepared)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scope_admission_warning_sink_for_test(
+        &mut self,
+        sink: impl Fn(&str) + Send + Sync + 'static,
+    ) {
+        self.scope_warning_sink = Arc::new(sink);
     }
 }
 
@@ -1053,6 +1225,20 @@ mod tests {
         signing_key: SigningKey,
     }
 
+    // Fixture UIDs sit above the policy's system-uid ceiling and below sentinel
+    // values, so they model ordinary mapped principals on every host.
+    const TEST_AGENT_UID: u32 = 60_123;
+    const TEST_GATE_UID: u32 = 60_124;
+    const TEST_SYSTEM_UID_CEILING: u32 = 500;
+
+    fn confined_scope(uid: u32) -> String {
+        format!("uid-{uid}")
+    }
+
+    fn legacy_scope(uid: u32) -> String {
+        format!("agent-{uid}")
+    }
+
     /// Build a minimally-valid `AllowlistRule` JSON body whose `id` field
     /// matches the manifest entry's `rule_id`. The store tests historically
     /// used opaque blobs like `{"a":1}` because the loader did not parse
@@ -1063,6 +1249,18 @@ mod tests {
             "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
         );
         body.into_bytes()
+    }
+
+    fn rule_body_for_scope(rule_id: &str, scope_agent_ids: &[String]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": rule_id,
+            "schema_version": SCHEMA_VERSION_V1,
+            "created_at": "2026-05-05T00:00:00Z",
+            "match": { "ip": ["203.0.113.7"] },
+            "scope": { "agent_ids": scope_agent_ids },
+            "disposition": "allow"
+        }))
+        .unwrap()
     }
 
     /// Write a signed-manifest policy directory with `count` minimally-valid
@@ -1162,6 +1360,106 @@ mod tests {
         fs::write(path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
     }
 
+    fn rewrite_uid_policy_scope(
+        policy: &WrittenPolicy,
+        generation: u64,
+        agent_uid: u32,
+        gate_uid: Option<u32>,
+        scope_agent_ids: &[String],
+    ) {
+        let body = rule_body_for_scope("uuid-0", scope_agent_ids);
+        fs::write(
+            policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json"),
+            &body,
+        )
+        .unwrap();
+        let digest = sha256_hex(&body);
+        rewrite_signed_manifest(policy, |manifest| {
+            manifest.generation = generation;
+            manifest.agent_origin = Some(crate::manifest::verify::AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(agent_uid),
+                gate_uid,
+                system_uid_allow_ceiling: TEST_SYSTEM_UID_CEILING,
+            });
+            let entry = manifest
+                .rules
+                .iter_mut()
+                .find(|entry| entry.rule_id == "uuid-0")
+                .expect("uuid-0 manifest entry");
+            entry.sha256 = digest;
+        });
+    }
+
+    fn rewrite_uid_policy_rule_scopes(
+        policy: &WrittenPolicy,
+        generation: u64,
+        agent_uid: u32,
+        gate_uid: Option<u32>,
+        scopes_by_rule: &[(&str, Vec<String>)],
+    ) {
+        for (rule_id, scope_agent_ids) in scopes_by_rule {
+            let body = rule_body_for_scope(rule_id, scope_agent_ids);
+            fs::write(
+                policy
+                    .dir
+                    .path()
+                    .join(RULES_SUBDIR)
+                    .join(format!("{rule_id}.json")),
+                &body,
+            )
+            .unwrap();
+        }
+        let digests = scopes_by_rule
+            .iter()
+            .map(|(rule_id, scope_agent_ids)| {
+                (
+                    *rule_id,
+                    sha256_hex(&rule_body_for_scope(rule_id, scope_agent_ids)),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        rewrite_signed_manifest(policy, |manifest| {
+            manifest.generation = generation;
+            manifest.agent_origin = Some(crate::manifest::verify::AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(agent_uid),
+                gate_uid,
+                system_uid_allow_ceiling: TEST_SYSTEM_UID_CEILING,
+            });
+            for entry in &mut manifest.rules {
+                if let Some(digest) = digests.get(entry.rule_id.as_str()) {
+                    entry.sha256 = digest.clone();
+                }
+            }
+        });
+    }
+
+    fn policy_request(agent_id: &str) -> crate::policy::EvaluationRequest {
+        crate::policy::EvaluationRequest {
+            agent_id: agent_id.to_string(),
+            agent_template: "claude-code".to_string(),
+            dest_host: None,
+            dest_ip: Some("203.0.113.7".to_string()),
+            dest_port: 443,
+            dest_protocol: "tcp".to_string(),
+            opaque: true,
+        }
+    }
+
+    fn current_verdict_for(store: &ManifestStore, agent_id: &str) -> crate::policy::Verdict {
+        store
+            .current_snapshot()
+            .expect("snapshot")
+            .evaluate(&policy_request(agent_id))
+    }
+
     fn wire_bundle(policy: &WrittenPolicy) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         let manifest = fs::read(policy.dir.path().join(MANIFEST_FILENAME)).unwrap();
         let parsed: ParsedSignedManifest = serde_json::from_slice(&manifest).unwrap();
@@ -1177,6 +1475,20 @@ mod tests {
             })
             .collect();
         (manifest, rules)
+    }
+
+    fn persist_high_water_for_current_policy(policy: &WrittenPolicy) {
+        let loaded = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key)
+            .expect("fixture policy loads");
+        persist_high_water(
+            &policy.dir.path().join(MANIFEST_HIGH_WATER_FILENAME),
+            &ManifestHighWater {
+                fortress_id: "deadbeef".to_string(),
+                generation: loaded.signed.manifest.generation,
+                manifest_signature_b64url: loaded.manifest_signature_b64url,
+            },
+        )
+        .expect("fixture high-water writes");
     }
 
     #[test]
@@ -1755,6 +2067,312 @@ mod tests {
         assert_eq!(snap.rules[0].id, "uuid-0");
         assert_eq!(snap.rules[1].id, "uuid-1");
         assert_eq!(snap.rules[2].id, crate::habeas::HABEAS_LOCAL_RULE_ID);
+    }
+
+    #[test]
+    fn boot_reclaims_active_uid_policy_with_legacy_scope_and_keeps_enforcing() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID)],
+        );
+        persist_high_water_for_current_policy(&policy);
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+
+        store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .expect("boot keeps the active policy");
+
+        assert!(store.current().is_some());
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Deny {
+                reason: crate::policy::DeniedReason::DefaultDeny
+            }
+        );
+    }
+
+    #[test]
+    fn boot_reclaim_warning_is_deduped_by_rule_and_names_the_repair_form() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID), confined_scope(TEST_GATE_UID)],
+        );
+        persist_high_water_for_current_policy(&policy);
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let warnings_for_sink = std::sync::Arc::clone(&warnings);
+        store.set_scope_admission_warning_sink_for_test(move |message| {
+            warnings_for_sink.lock().unwrap().push(message.to_string());
+        });
+
+        store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .expect("boot keeps the exact committed policy");
+
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning per offending rule, not per scope entry: {warnings:?}"
+        );
+        assert!(warnings[0].contains("uuid-0"));
+        assert!(warnings[0].contains(&format!("uid-{TEST_AGENT_UID}")));
+    }
+
+    #[test]
+    fn boot_refusal_names_each_offending_rule_once() {
+        let policy = write_valid_policy(2);
+        rewrite_uid_policy_rule_scopes(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[
+                ("uuid-0", vec![confined_scope(TEST_AGENT_UID)]),
+                ("uuid-1", vec![confined_scope(TEST_AGENT_UID)]),
+            ],
+        );
+        persist_high_water_for_current_policy(&policy);
+        rewrite_uid_policy_rule_scopes(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[
+                (
+                    "uuid-0",
+                    vec![legacy_scope(TEST_AGENT_UID), confined_scope(TEST_GATE_UID)],
+                ),
+                ("uuid-1", vec![legacy_scope(TEST_AGENT_UID)]),
+            ],
+        );
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+
+        let error = store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .unwrap_err();
+
+        let text = format!("{error:?}");
+        assert_eq!(text.matches("uuid-0").count(), 1, "{text}");
+        assert_eq!(text.matches("uuid-1").count(), 1, "{text}");
+        assert!(text.contains(&format!("uid-{TEST_AGENT_UID}")), "{text}");
+    }
+
+    #[test]
+    fn same_generation_reclaim_keeps_the_boot_reclaimed_uid_policy() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID)],
+        );
+        persist_high_water_for_current_policy(&policy);
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .expect("boot keeps the active policy");
+
+        store.reload().expect("exact same generation reclaim");
+
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Deny {
+                reason: crate::policy::DeniedReason::DefaultDeny
+            }
+        );
+    }
+
+    #[test]
+    fn new_reload_generation_with_agent_uid_scope_becomes_current() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[confined_scope(TEST_AGENT_UID)],
+        );
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        store.reload().expect("initial good generation");
+
+        rewrite_uid_policy_scope(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            None,
+            &[confined_scope(TEST_AGENT_UID)],
+        );
+        store.reload().expect("new good generation");
+
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Allow {
+                rule_id: "uuid-0".to_string()
+            }
+        );
+        assert_eq!(store.current().unwrap().signed.manifest.generation, 2);
+    }
+
+    #[test]
+    fn new_reload_generation_with_legacy_scope_keeps_prior_snapshot() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[confined_scope(TEST_AGENT_UID)],
+        );
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        store.reload().expect("initial good generation");
+
+        rewrite_uid_policy_scope(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID)],
+        );
+        let error = store.reload().unwrap_err();
+
+        assert!(matches!(error, ManifestStoreError::PolicySnapshot { .. }));
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Allow {
+                rule_id: "uuid-0".to_string()
+            }
+        );
+        assert_eq!(store.current().unwrap().signed.manifest.generation, 1);
+    }
+
+    #[test]
+    fn bad_publication_while_active_policy_has_legacy_scope_keeps_the_active_snapshot() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID)],
+        );
+        persist_high_water_for_current_policy(&policy);
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        store
+            .reload_active_at_boot_with_authorization(|_| Ok::<_, ()>(()))
+            .expect("boot keeps the active policy");
+
+        rewrite_uid_policy_scope(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            None,
+            &[legacy_scope(TEST_AGENT_UID)],
+        );
+        let (manifest, rules) = wire_bundle(&policy);
+        let error = store
+            .publish_bundle_with_authorization(&manifest, &rules, |_| Ok::<_, ()>(()))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AuthorizedReloadError::Verify(ManifestStoreError::PolicySnapshot { .. })
+        ));
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Deny {
+                reason: crate::policy::DeniedReason::DefaultDeny
+            }
+        );
+        assert_eq!(store.current().unwrap().signed.manifest.generation, 1);
+    }
+
+    #[test]
+    fn broker_publication_refuses_gate_uid_scope_before_pointer_switch() {
+        let policy = write_valid_policy(1);
+        rewrite_uid_policy_scope(
+            &policy,
+            1,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[confined_scope(TEST_AGENT_UID)],
+        );
+        let mut store = ManifestStore::new(
+            policy.dir.path().to_path_buf(),
+            policy.dir.path().join("pinned.key"),
+            policy.pinned_key,
+            "deadbeef".to_string(),
+        );
+        store.reload().expect("initial good generation");
+
+        rewrite_uid_policy_scope(
+            &policy,
+            2,
+            TEST_AGENT_UID,
+            Some(TEST_GATE_UID),
+            &[confined_scope(TEST_GATE_UID)],
+        );
+        let (manifest, rules) = wire_bundle(&policy);
+        let error = store
+            .publish_bundle_with_authorization(&manifest, &rules, |_| Ok::<_, ()>(()))
+            .unwrap_err();
+        let text = format!("{error:?}");
+
+        assert!(text.contains("rule uuid-0"));
+        assert!(text.contains(&confined_scope(TEST_GATE_UID)));
+        assert!(text.contains(&confined_scope(TEST_AGENT_UID)));
+        assert!(!policy.dir.path().join(ACTIVE_GENERATION_FILENAME).exists());
+        assert_eq!(
+            current_verdict_for(&store, &confined_scope(TEST_AGENT_UID)),
+            crate::policy::Verdict::Allow {
+                rule_id: "uuid-0".to_string()
+            }
+        );
+        assert_eq!(store.current().unwrap().signed.manifest.generation, 1);
     }
 
     #[test]
