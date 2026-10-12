@@ -153,9 +153,9 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
     },
     {
       path: "server/src/storage/directory-capability-worker.ts",
-      context: "storage.write(namespaceArg(a[0])",
+      context: "storage.write(namespace, String(args[0])",
       reason:
-        "the directory-capability worker is a narrow filesystem transport for an already-authorized FilesystemStorage call; it preserves the caller's namespace and does not create a second state-write API",
+        "the directory-capability worker is a narrow cwd-bound transport for an already-authorized FilesystemStorage.write call; export-eligible StateStore provenance is minted by the parent before bytes reach this backend, and the worker preserves the selected namespace/key rather than creating a second state-write API",
     },
     {
       path: "server/src/v1/federation-sync-state-store.ts",

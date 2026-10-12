@@ -311,6 +311,9 @@ const STORAGE_READ_ONLY: ReadonlySet<string> = new Set([
   "legacyNamespaceSanitize",
   "bijectiveEncode",
   "bijectiveDecode",
+  // Pure namespace-name validator: it computes the encoded component and
+  // throws on invalid input, but performs no filesystem or storage I/O.
+  "assertStorageNamespacePathComponent",
   // pure predicates, error shaping, capability probing
   "asFilesystemCapabilities",
   "errorMessage",

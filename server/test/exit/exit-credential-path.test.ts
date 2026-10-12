@@ -48,6 +48,7 @@ import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import {
+  ExitBundleImportError,
   exportExitBundle,
   importExitBundle,
   type ExportExitBundleResult,
@@ -229,6 +230,24 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+async function snapshotStorage(storage: MemoryStorage): Promise<string> {
+  const namespaces = await storage.listNamespaces();
+  const rows: string[] = [];
+  for (const namespace of namespaces) {
+    for (const entry of await storage.list(namespace)) {
+      const raw = await storage.read(namespace, entry.key);
+      rows.push(
+        JSON.stringify({
+          namespace,
+          key: entry.key,
+          value: raw === null ? null : Buffer.from(raw).toString("base64"),
+        })
+      );
+    }
+  }
+  return rows.sort().join("\n");
+}
+
 describe("exit cluster A3/A4: which credential opens this bundle", () => {
   const tempDirs: string[] = [];
 
@@ -299,6 +318,40 @@ describe("exit cluster A3/A4: which credential opens this bundle", () => {
   });
 
   // ---- A3: import gate -----------------------------------------------------
+
+  it("import refuses encrypted state whose namespace is not a single path component before writing", async () => {
+    const source = await makeSource("namespace-component-source");
+    const bundleDir = await newBundleDir("sanctuary-ns-component-exit-");
+    const exported = await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      for (const entry of entries) {
+        entry.namespace = ".";
+      }
+      artifact.namespaces = ["."];
+    });
+
+    const destination = await makeDestination();
+    const before = await snapshotStorage(destination.storage);
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: destination.storage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toMatchObject({
+      name: "ExitBundleImportError",
+      code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
+    } satisfies Partial<ExitBundleImportError>);
+    expect(await snapshotStorage(destination.storage)).toBe(before);
+  });
 
   it("A3 import: malformed bundle-carried KDF params fail closed, not into Argon2id", async () => {
     // A pre-fix-damaged bundle already in the wild: signed, verifiable, and
