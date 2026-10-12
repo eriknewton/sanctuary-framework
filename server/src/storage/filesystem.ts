@@ -74,8 +74,13 @@ import {
   cleanupFreshInitRecoveryResidue,
   restoreFreshFortressLockScaffold,
 } from "./fresh-fortress.js";
-
-const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
+import {
+  decodeStoragePathComponent,
+  encodeStoragePathComponent,
+  InvalidStorageNamespaceError,
+  resolveStorageNamespacePath,
+  storageNamespacePathComponent,
+} from "./namespace-component.js";
 
 // Starting the source worker requires loading tsx; on a saturated host that
 // handshake can legitimately exceed two seconds even though the child is
@@ -84,17 +89,8 @@ const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 // shorter per-operation deadline used after admission.
 export const DIRECTORY_CAPABILITY_READY_TIMEOUT_MS = 15_000;
 
-function bijectiveEncode(name: string): string {
-  return name.replace(SAFE_CHARS, (ch) =>
-    "!" + ch.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase()
-  );
-}
-
-function bijectiveDecode(encoded: string): string {
-  return encoded.replace(/!([0-9A-Fa-f]{2})/g, (_match, hex) =>
-    String.fromCharCode(parseInt(hex, 16))
-  );
-}
+const bijectiveEncode = encodeStoragePathComponent;
+const bijectiveDecode = decodeStoragePathComponent;
 
 // Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
@@ -106,7 +102,7 @@ function legacyKeySanitize(name: string): string {
 }
 
 function encodedNamespacePath(basePath: string, namespace: string): string {
-  return join(basePath, bijectiveEncode(namespace));
+  return resolveStorageNamespacePath(basePath, namespace);
 }
 
 function stableFortressFilePath(root: string, value: string): string {
@@ -319,7 +315,11 @@ class DarwinDirectoryCapabilityClient {
     return this.child.pid;
   }
 
-  call<T>(op: string, args: unknown[] = []): Promise<T> {
+  call<T>(
+    op: string,
+    args: unknown[] = [],
+    options: { boundNamespace?: true } = {},
+  ): Promise<T> {
     const run = async (): Promise<T> => {
       this.assertAlive();
       const id = this.nextId++;
@@ -343,12 +343,20 @@ class DarwinDirectoryCapabilityClient {
             reject(error);
           },
         });
-        this.child.send({ id, op, args }, (error) => {
-          if (!error) return;
-          this.pending.delete(id);
-          clearTimeout(timeout);
-          reject(error);
-        });
+        this.child.send(
+          {
+            id,
+            op,
+            args,
+            ...(options.boundNamespace ? { boundNamespace: true } : {}),
+          },
+          (error) => {
+            if (!error) return;
+            this.pending.delete(id);
+            clearTimeout(timeout);
+            reject(error);
+          },
+        );
       });
     };
     const result = this.chain.then(run, run);
@@ -384,6 +392,8 @@ interface BoundStorageContext {
   darwinNamespaceClient?: DarwinDirectoryCapabilityClient;
 }
 
+// Must match DARWIN_BOUND_NAMESPACE_TOKEN in directory-capability-worker.ts:
+// this is an internal capability token, not a caller-supplied namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities {
@@ -405,10 +415,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
    * parent or chown failure fails the write.
    */
   private owner: { uid: number; gid: number } | undefined;
+  private readonly allowDirectoryCapabilityRootNamespace: boolean;
 
-  constructor(basePath: string, options: { owner?: { uid: number; gid: number } } = {}) {
+  constructor(
+    basePath: string,
+    options: {
+      owner?: { uid: number; gid: number };
+      allowDirectoryCapabilityRootNamespace?: boolean;
+    } = {}
+  ) {
     this.basePath = basePath;
     this.owner = options.owner;
+    this.allowDirectoryCapabilityRootNamespace =
+      options.allowDirectoryCapabilityRootNamespace === true;
   }
 
   private activeBasePath(): string {
@@ -422,6 +441,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   private darwinCapability(namespace?: string): {
     client: DarwinDirectoryCapabilityClient;
     namespace?: string;
+    boundNamespace?: true;
   } | undefined {
     const bound = this.boundBasePath.getStore();
     if (!bound) return undefined;
@@ -432,15 +452,40 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     ) {
       return {
         client: bound.darwinNamespaceClient,
-        namespace: DARWIN_BOUND_NAMESPACE_TOKEN,
+        boundNamespace: true,
       };
     }
+    if (namespace !== undefined) storageNamespacePathComponent(namespace);
     return bound.darwinClient ? { client: bound.darwinClient, namespace } : undefined;
   }
 
+  private callDarwinNamespace<T>(
+    capability: {
+      client: DarwinDirectoryCapabilityClient;
+      namespace?: string;
+      boundNamespace?: true;
+    },
+    op: string,
+    args: unknown[] = [],
+  ): Promise<T> {
+    if (capability.boundNamespace) {
+      return capability.client.call<T>(op, args, { boundNamespace: true });
+    }
+    return capability.client.call<T>(op, [capability.namespace, ...args]);
+  }
+
   private activeNamespacePath(namespace: string): string {
+    // The Darwin worker maps only parent-flagged bound requests to cwd; caller
+    // namespaces still pass through the shared component predicate first.
+    if (
+      this.allowDirectoryCapabilityRootNamespace &&
+      namespace === DARWIN_BOUND_NAMESPACE_TOKEN
+    ) {
+      return this.activeBasePath();
+    }
     const bound = this.boundBasePath.getStore();
     if (bound?.lockedNamespace === namespace && bound.namespaceBasePath) {
+      storageNamespacePathComponent(namespace);
       return bound.namespaceBasePath;
     }
     return encodedNamespacePath(this.activeBasePath(), namespace);
@@ -484,6 +529,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     // below onward, Linux paths are descriptor-relative and Darwin storage I/O
     // is delegated to a child whose cwd is that exact inode. A rename or
     // replacement of the lexical fortress root cannot redirect a mutation.
+    const namespaceComponent = storageNamespacePathComponent(namespace);
     await mkdir(this.basePath, { recursive: true, mode: 0o700 });
     await mkdir(encodedNamespacePath(this.basePath, namespace), {
       recursive: true,
@@ -526,7 +572,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           ? stat(join(descriptorParent, basename(this.basePath)))
           : lstat(this.basePath),
         host === "linux"
-          ? lstat(join(descriptorRoot, bijectiveEncode(namespace)))
+          ? lstat(join(descriptorRoot, namespaceComponent))
           : lstat(encodedNamespacePath(this.basePath, namespace)),
       ]);
       if (
@@ -779,8 +825,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      await capability.client.call("write", [
-        capability.namespace,
+      await this.callDarwinNamespace(capability, "write", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -800,8 +845,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("writeIfAbsent", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "writeIfAbsent", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -859,8 +903,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("replaceIfEquals", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "replaceIfEquals", [
         key,
         Buffer.from(expected).toString("base64"),
         Buffer.from(checkedData).toString("base64"),
@@ -898,8 +941,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      await capability.client.call("writeDurable", [
-        capability.namespace,
+      await this.callDarwinNamespace(capability, "writeDurable", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -954,10 +996,11 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      const encoded = await capability.client.call<string | null>("read", [
-        capability.namespace,
-        key,
-      ]);
+      const encoded = await this.callDarwinNamespace<string | null>(
+        capability,
+        "read",
+        [key],
+      );
       return encoded === null ? null : new Uint8Array(Buffer.from(encoded, "base64"));
     }
     const buf = await this.readAtPath(this.entryPath(namespace, key));
@@ -993,8 +1036,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     assertStorageMasterWriteBarrierHeld(this);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("delete", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "delete", [
         key,
         secureOverwrite,
       ]);
@@ -1110,11 +1152,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       // every entry from callers such as the master-rotation namespace walk.
       // Omit the optional argument entirely so the worker preserves the local
       // FilesystemStorage `list(namespace)` contract.
-      return capability.client.call(
+      return this.callDarwinNamespace(
+        capability,
         "list",
         prefix === undefined
-          ? [capability.namespace]
-          : [capability.namespace, prefix],
+          ? []
+          : [prefix],
       );
     }
     const dirPath = this.activeNamespacePath(namespace);
@@ -1157,7 +1200,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async exists(namespace: string, key: string): Promise<boolean> {
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("exists", [capability.namespace, key]);
+      return this.callDarwinNamespace(capability, "exists", [key]);
     }
     const newPath = this.entryPath(namespace, key);
     try {
@@ -1199,12 +1242,13 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     };
     for await (const dir of root) {
       chargeEntry();
-      const path = join(this.activeBasePath(), dir.name);
-      if (!(await stat(path)).isDirectory()) continue;
+      const rootEntryPath = join(this.activeBasePath(), dir.name);
+      const rootEntryStat = await stat(rootEntryPath);
+      if (!rootEntryStat.isDirectory()) continue;
       let hasEntries = false;
       // Propagate subdirectory failures too: skipping an unreadable namespace
       // would turn a storage error into silent data loss in a full export.
-      for await (const entry of await opendir(path)) {
+      for await (const entry of await opendir(rootEntryPath)) {
         chargeEntry();
         if (entry.name.endsWith(".enc")) {
           hasEntries = true;
@@ -1215,11 +1259,16 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) {
         throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
       }
-      // bijectiveDecode is total (unmatched bytes pass through), so legacy
-      // pre-#41 sanitized directory names still surface — as their raw names
-      // — and the rotation walker's unknown-namespace abort catches them
-      // (fail closed) instead of silently skipping a namespace.
-      namespaces.push(bijectiveDecode(dir.name));
+      // Empty non-canonical directories are root noise, but a directory with
+      // entries is state-bearing; fail closed before a full export can omit it.
+      const namespace = bijectiveDecode(dir.name);
+      // The directory must be the canonical encoding of the name it decodes to;
+      // otherwise the listed name addresses a different (absent) directory and a
+      // full export would silently omit this one's data.
+      if (storageNamespacePathComponent(namespace) !== dir.name) {
+        throw new InvalidStorageNamespaceError(namespace);
+      }
+      namespaces.push(namespace);
     }
     return namespaces.sort();
   }
@@ -1232,9 +1281,13 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     try {
       const namespaces = await readdir(this.activeBasePath());
       for (const ns of namespaces) {
-        const nsPath = join(this.activeBasePath(), ns);
-        const nsStat = await stat(nsPath);
-        if (!nsStat.isDirectory()) continue;
+        const rootEntryPath = join(this.activeBasePath(), ns);
+        const rootEntryStat = await stat(rootEntryPath);
+        if (!rootEntryStat.isDirectory()) continue;
+        // totalSize measures bytes already under the state root for emptiness
+        // gates; resolving root entries as namespaces would turn stray
+        // directories into false-empty or partial-size answers.
+        const nsPath = rootEntryPath;
 
         const files = await readdir(nsPath);
         for (const file of files) {

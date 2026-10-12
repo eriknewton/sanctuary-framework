@@ -50,6 +50,7 @@ import { publicKeyToDid, legacyPublicKeyToDid, publicKeyBytesEqual, verify as id
 import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
+import { isStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import {
   verifyRotationChain,
   type RotationChainInvalidReason,
@@ -676,6 +677,7 @@ export function isWellFormedExitStateEntryElement(
   if (item === null || typeof item !== "object") return false;
   const record = item as Record<string, unknown>;
   if (typeof record.namespace !== "string") return false;
+  if (!isStorageNamespacePathComponent(record.namespace)) return false;
   if (typeof record.key !== "string") return false;
   const entry = record.entry;
   if (entry === null || typeof entry !== "object") return false;
@@ -788,8 +790,8 @@ export function checkEncryptedStateStructure(record: {
         ok: false,
         problem: "entries_malformed_elements",
         detail:
-          "an entries element is missing or has a wrong-typed " +
-          "namespace/key/entry field",
+          "an entries element is missing, has a wrong-typed field, or names " +
+          "a namespace that is not one storage component",
       };
     }
   }

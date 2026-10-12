@@ -1,7 +1,7 @@
 /**
  * FilesystemStorage tests
  *
- * Covers: path traversal sanitization, 3-pass secure deletion, 0o600/0o700 permission
+ * Covers: path component encoding, 3-pass secure deletion, 0o600/0o700 permission
  * enforcement, ENOENT handling, list with prefix filtering, totalSize on empty base.
  * Not covered: performance, multi-process concurrency, symlink edge cases.
  */
@@ -40,19 +40,15 @@ describe("FilesystemStorage", () => {
     await rm(basePath, { recursive: true, force: true });
   });
 
-  // ── Path traversal sanitization ─────────────────────────────────────
+  // ── Path component encoding ─────────────────────────────────────────
 
-  describe("path traversal sanitization", () => {
-    it("prevents ../ in namespace from escaping basePath", async () => {
-      await storage.write("../etc", "key", new Uint8Array([1, 2, 3]));
-      // Security invariant: must NOT create basePath/etc (would be one level
-      // up's neighbor) or anything matching ".." literally. Specific encoded
-      // form is an implementation detail. Assert the invariant, not the form.
+  describe("path component encoding", () => {
+    it("stores a separator-containing namespace as one encoded component", async () => {
+      await storage.write("section/one", "key", new Uint8Array([1, 2, 3]));
       const entries = await readdir(basePath);
-      expect(entries).not.toContain("etc");
-      expect(entries).not.toContain("..");
+      expect(entries).not.toContain("section");
       // Round-trip works under the same namespace string.
-      const result = await storage.read("../etc", "key");
+      const result = await storage.read("section/one", "key");
       expect(result).toEqual(new Uint8Array([1, 2, 3]));
     });
 
