@@ -599,6 +599,8 @@ export interface ResolvedWriterPublicKey {
   publicKey: Uint8Array;
   publicKeyBase64url: string;
   trustBasis: WriterPublicKeyTrustBasis;
+  /** true only for retired keys whose authenticated rotation reason declares compromise. */
+  compromised: boolean;
   source:
     | "identity-current"
     | "identity-rotation-chain"
@@ -614,12 +616,13 @@ function appendResolvedWriterKey(
   seen: Set<string>,
   publicKeyBase64url: string,
   source: ResolvedWriterPublicKey["source"],
-  trustBasis: WriterPublicKeyTrustBasis
+  trustBasis: WriterPublicKeyTrustBasis,
+  compromised = false
 ): boolean {
   if (seen.has(publicKeyBase64url)) return true;
   try {
     const publicKey = fromBase64url(publicKeyBase64url);
-    keys.push({ publicKey, publicKeyBase64url, trustBasis, source });
+    keys.push({ publicKey, publicKeyBase64url, trustBasis, source, compromised });
     seen.add(publicKeyBase64url);
     return true;
   } catch {
@@ -646,7 +649,8 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
         seen,
         retired.public_key_base64url,
         "identity-rotation-chain",
-        "authenticated"
+        "authenticated",
+        retired.compromised
       )
     ) {
       return [];
@@ -657,7 +661,8 @@ export function resolveAuthenticatedIdentityWriterPublicKeys(
     seen,
     identity.public_key,
     "identity-current",
-    "authenticated"
+    "authenticated",
+    false
   )
     ? keys
     : [];
@@ -669,10 +674,14 @@ export function createStateImportWriterKeyResolver(
   return (kid: string): readonly Uint8Array[] | null => {
     const identity = getIdentity(kid);
     if (!identity) return null;
-    // INVARIANT: import and checkpoint restore accept only keys authenticated
-    // by the held identity and its signed rotation chain, matching state_read.
+    // INVARIANT: import and restore consume external bytes, so keys retired by
+    // a compromised-reason rotation are not admissible here; state_read keeps
+    // resolving them for locally retained entries until that separate policy changes.
     const keys = resolveAuthenticatedIdentityWriterPublicKeys(identity);
-    return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
+    const importableKeys = keys.filter((key) => !key.compromised);
+    return importableKeys.length > 0
+      ? importableKeys.map((key) => key.publicKey)
+      : null;
   };
 }
 

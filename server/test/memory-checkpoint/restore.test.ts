@@ -15,15 +15,22 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createStateImportWriterKeyResolver,
   resolveAuthenticatedIdentityWriterPublicKeys,
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
   StateImportPartialApplyError,
   StateVerificationError,
+  type StateImportPublicKeyResolver,
   type StateStore,
 } from "../../src/cognitive/state-store.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { encrypt } from "../../src/core/encryption.js";
-import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
+import {
+  createIdentity,
+  rotateKeys,
+  sign,
+  type StoredIdentity,
+} from "../../src/core/identity.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { hashToString, hmacSha256 } from "../../src/core/hashing.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -205,14 +212,16 @@ async function writeEntry(
   );
 }
 
-function publicKeyResolver(fixture: Fixture): (kid: string) => Uint8Array[] | null {
-  return (kid: string): Uint8Array[] | null => {
-    if (kid !== fixture.identity.storedIdentity.identity_id) return null;
-    const keys = resolveAuthenticatedIdentityWriterPublicKeys(
-      fixture.identity.storedIdentity,
-    );
-    return keys.length > 0 ? keys.map((key) => key.publicKey) : null;
-  };
+function publicKeyResolver(fixture: Fixture): StateImportPublicKeyResolver {
+  return publicKeyResolverForIdentity(fixture.identity.storedIdentity);
+}
+
+function publicKeyResolverForIdentity(
+  identity: StoredIdentity,
+): StateImportPublicKeyResolver {
+  return createStateImportWriterKeyResolver((kid) =>
+    kid === identity.identity_id ? identity : null
+  );
 }
 
 async function parkedClaim() {
@@ -1211,6 +1220,70 @@ describe("restoreCheckpoint", () => {
     );
     expect(deleteSpy).not.toHaveBeenCalled();
     expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
+  it("refuses checkpoint entries signed only by a retired key excluded from external restore", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "checkpoint");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:11:30.000Z"),
+    });
+    const { updatedIdentity } = rotateKeys(
+      fixture.identity.storedIdentity,
+      fixture.identityEncKey,
+      "compromised",
+    );
+    await persistStoredIdentity(fixture.storage, fixture.masterKey, updatedIdentity);
+    await fixture.stateStore.delete("mem", "Q");
+    await fixture.stateStore.write(
+      "mem",
+      "P",
+      "post-checkpoint",
+      updatedIdentity.identity_id,
+      updatedIdentity.encrypted_private_key,
+      fixture.identityEncKey,
+    );
+    const before = await exportEntries(fixture.stateStore);
+    const deleteSpy = vi.spyOn(fixture.stateStore, "delete");
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolverForIdentity(updatedIdentity),
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    expect(thrown).toMatchObject({
+      name: "CheckpointRestoreSkippedEntriesError",
+      reason: "checkpoint_skipped_entries_refused",
+    });
+    expect((thrown as Error).message).toBe(
+      "memory checkpoint restore refused: 0 checkpoint entries are signed by an identity this fortress does not hold and 1 checkpoint entry does not verify. No override exists; state is unchanged",
+    );
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(await exportEntries(fixture.stateStore)).toEqual(before);
     const forensic = (await fixture.checkpointStore.list()).find(
       (record) => record.source === "forensic_quarantine",
     );

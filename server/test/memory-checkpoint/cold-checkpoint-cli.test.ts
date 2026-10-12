@@ -319,7 +319,12 @@ describe("cold checkpoint CLI", () => {
     const result = await coldRestore(f, checkpoint!.id);
 
     expect(result.code, JSON.stringify(result)).toBe(1);
-    expect(result.stderr).toContain("signed by an identity this fortress does not hold");
+    expect(result.stderr).toContain(
+      "2 checkpoint entries are signed by an identity this fortress does not hold and 0 checkpoint entries do not verify",
+    );
+    expect(result.stderr).not.toContain(
+      "0 checkpoint entries are signed by an identity this fortress does not hold and 2 checkpoint entries do not verify",
+    );
     expect(result.stdout).not.toContain("Checkpoint restored:");
     expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(before);
   });

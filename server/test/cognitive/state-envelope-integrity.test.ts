@@ -6,7 +6,12 @@ import {
   stringToBytes,
   toBase64url,
 } from "../../src/core/encoding.js";
-import { createIdentity, rotateKeys, sign } from "../../src/core/identity.js";
+import {
+  createIdentity,
+  rotateKeys,
+  sign,
+  type StoredIdentity,
+} from "../../src/core/identity.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -50,14 +55,22 @@ function makeStateRig() {
 type StateRig = ReturnType<typeof makeStateRig>;
 
 async function persistRigIdentity(rig: StateRig): Promise<void> {
-  await rig.storage.write(
+  await persistIdentity(rig.storage, rig.identityEncKey, rig.identity.storedIdentity);
+}
+
+async function persistIdentity(
+  storage: MemoryStorage,
+  identityEncKey: Uint8Array,
+  identity: StoredIdentity
+): Promise<void> {
+  await storage.write(
     "_identities",
-    rig.identity.storedIdentity.identity_id,
+    identity.identity_id,
     stringToBytes(
       JSON.stringify(
         encrypt(
-          stringToBytes(JSON.stringify(rig.identity.storedIdentity)),
-          rig.identityEncKey
+          stringToBytes(JSON.stringify(identity)),
+          identityEncKey
         )
       )
     )
@@ -171,6 +184,31 @@ describe("state envelope integrity", () => {
     };
 
     expect(resolveAuthenticatedIdentityWriterPublicKeys(tamperedIdentity)).toEqual([]);
+  });
+
+  it("keeps local reads compatible with entries signed before a compromised rotation", async () => {
+    const rig = makeStateRig();
+    const { storage, stateStore, identity, identityEncKey } = rig;
+
+    await stateStore.write(
+      "memory",
+      "retained",
+      "locally retained value",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+    const { updatedIdentity } = rotateKeys(
+      identity.storedIdentity,
+      identityEncKey,
+      "compromised"
+    );
+    await persistIdentity(storage, identityEncKey, updatedIdentity);
+
+    await expect(stateStore.read("memory", "retained")).resolves.toMatchObject({
+      value: "locally retained value",
+      signature_verified: true,
+    });
   });
 
   it("round trips with default envelope verification", async () => {

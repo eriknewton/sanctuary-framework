@@ -2,6 +2,7 @@
  * state_import enforces durable version floors through the MCP tool path.
  *
  * STATE-IMPORT-VERSION-FLOOR-01
+ * COMPROMISED-RETIRED-KEY-TRUST-01
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -21,6 +22,7 @@ import {
 } from "../../src/cognitive/state-store.js";
 import {
   sign as identitySign,
+  rotateKeys,
   type StoredIdentity,
 } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -335,7 +337,76 @@ async function sourceBundle(args: {
   return (await sourceStore.exportNamespaces(["notes"])).bundle;
 }
 
+async function sourceBundleFromSignedEntries(args: {
+  masterKey: Uint8Array;
+  identityEncKey: Uint8Array;
+  entries: Array<{ key: string; value: string; identity: StoredIdentity }>;
+}): Promise<string> {
+  const sourceStorage = new MemoryStorage();
+  const sourceStore = new StateStore(sourceStorage, args.masterKey);
+  for (const item of args.entries) {
+    await sourceStore.write(
+      "notes",
+      item.key,
+      item.value,
+      item.identity.identity_id,
+      item.identity.encrypted_private_key,
+      args.identityEncKey
+    );
+  }
+  return (await sourceStore.exportNamespaces(["notes"])).bundle;
+}
+
 describe("state_import version floor tool path", () => {
+  it("imports only entries signed by rotation-chain keys eligible for external restore", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const firstIdentity = rig.identityManager.get(identityId);
+      if (!firstIdentity) throw new Error("missing initial identity");
+      const { updatedIdentity: secondIdentity } = rotateKeys(
+        firstIdentity,
+        rig.identityEncKey,
+        "compromised"
+      );
+      await rig.identityManager.save(secondIdentity);
+      const { updatedIdentity: currentIdentity } = rotateKeys(
+        secondIdentity,
+        rig.identityEncKey,
+        "periodic"
+      );
+      await rig.identityManager.save(currentIdentity);
+
+      const bundle = await sourceBundleFromSignedEntries({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        entries: [
+          {
+            key: "retired-compromised",
+            value: "should-not-import",
+            identity: firstIdentity,
+          },
+          {
+            key: "retired-periodic",
+            value: "should-import",
+            identity: secondIdentity,
+          },
+        ],
+      });
+
+      const imported = await callTool(rig.client, "state_import", { bundle });
+
+      expect(imported.imported_keys).toBe(1);
+      expect(imported.skipped_invalid_sig).toBe(1);
+      const refused = await readValue(rig.client, "retired-compromised");
+      expect(refused.denied).toBe(true);
+      const accepted = await readValue(rig.client, "retired-periodic");
+      expect(accepted.value).toBe("should-import");
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("continues when the imported key has no established floor", async () => {
     const rig = await makeToolRig();
     try {
