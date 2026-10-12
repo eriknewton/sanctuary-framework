@@ -11,7 +11,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
 import {
   STATE_META_VERSION_ANCHORS_KEY,
+  StateImportPartialApplyError,
+  StateVerificationError,
   StateStore,
+  isStateVersionFloorRefusal,
 } from "../../src/cognitive/state-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -28,6 +31,7 @@ import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { createServer, type ToolDefinition } from "../../src/router.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../../src/storage/exit-import-journal.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 type ToolPayload = Record<string, unknown>;
@@ -35,11 +39,15 @@ type ToolPayload = Record<string, unknown>;
 const READ_TOOLS = new Set(["state_read"]);
 const HMAC_SHA256_BYTE_LENGTH = 32;
 const CONCURRENT_WRITE_BLOCKED_PROBE_MS = 25;
+// Must match FACADE_HIDDEN_MARKER_NAMESPACE in src/cognitive/state-store.ts.
+const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 
 class HookedMemoryStorage extends MemoryStorage {
+  beforeWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
   onWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
 
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    await this.beforeWrite?.(namespace, key);
     await super.write(namespace, key, data);
     await this.onWrite?.(namespace, key);
   }
@@ -260,8 +268,10 @@ async function sourceBundle(args: {
   identityEncKey: Uint8Array;
   identity: StoredIdentity;
   values: Array<{ key: string; value: string }>;
+  facadeHiddenMarkers?: Array<{ key: string; marker: { namespace: string; key: string } }>;
 }): Promise<string> {
-  const sourceStore = new StateStore(new MemoryStorage(), args.masterKey);
+  const sourceStorage = new MemoryStorage();
+  const sourceStore = new StateStore(sourceStorage, args.masterKey);
   for (const item of args.values) {
     await sourceStore.write(
       "notes",
@@ -270,6 +280,13 @@ async function sourceBundle(args: {
       args.identity.identity_id,
       args.identity.encrypted_private_key,
       args.identityEncKey
+    );
+  }
+  for (const item of args.facadeHiddenMarkers ?? []) {
+    await sourceStorage.write(
+      FACADE_HIDDEN_MARKER_NAMESPACE,
+      item.key,
+      stringToBytes(JSON.stringify(item.marker))
     );
   }
   return (await sourceStore.exportNamespaces(["notes"])).bundle;
@@ -378,6 +395,55 @@ describe("state_import version floor tool path", () => {
       expect(currentRead.value).toBe("second");
       expect(currentRead.version).toBe(2);
     } finally {
+      await rig.close();
+    }
+  });
+
+  it("records an import attempt before the first import mutation", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "attempt-before-write", value: "imported" }],
+      });
+
+      let attemptSeenDuringWrite = false;
+      let successSeenDuringWrite = false;
+      storage.onWrite = async (namespace, key) => {
+        if (namespace !== "notes" || key !== "attempt-before-write") return;
+        attemptSeenDuringWrite = (await rig.auditLog.query({
+          operation_type: "state_import_attempt",
+          limit: 10,
+        })).entries.length === 1;
+        successSeenDuringWrite = (await rig.auditLog.query({
+          operation_type: "state_import",
+          limit: 10,
+        })).entries.length > 0;
+      };
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(imported.imported_keys).toBe(1);
+      expect(attemptSeenDuringWrite).toBe(true);
+      expect(successSeenDuringWrite).toBe(false);
+      expect((await rig.auditLog.query({
+        operation_type: "state_import_attempt",
+        limit: 10,
+      })).entries).toHaveLength(1);
+      expect((await rig.auditLog.query({
+        operation_type: "state_import",
+        limit: 10,
+      })).entries).toHaveLength(1);
+    } finally {
+      storage.onWrite = undefined;
       await rig.close();
     }
   });
@@ -796,6 +862,9 @@ describe("state_import version floor tool path", () => {
               : null
         )
       ).rejects.toMatchObject({ classification: "rollback_detected" });
+      const current = await readValue(rig.client, "imported-anchor");
+      expect(current.value).toBe("third");
+      expect(current.version).toBe(3);
     } finally {
       await rig.close();
     }
@@ -882,5 +951,169 @@ describe("state_import version floor tool path", () => {
       storage.onWrite = undefined;
       await rig.close();
     }
+  });
+
+  it("audits partial import progress when a journal appears after an earlier key", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "journal-first", value: "imported" },
+          { key: "journal-second", value: "imported" },
+        ],
+      });
+
+      storage.onWrite = async (namespace, key) => {
+        if (namespace !== "notes" || key !== "journal-first") return;
+        await storage.write(
+          EXIT_IMPORT_JOURNAL_NAMESPACE,
+          "planted-import-journal",
+          stringToBytes(JSON.stringify({
+            import_id: "planted-import-journal",
+            identity_id: identityId,
+            started_at: new Date().toISOString(),
+            snapshots: [],
+          }))
+        );
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.error).toBe("exit_import_pending_recovery");
+
+      const first = await readValue(rig.client, "journal-first");
+      expect(first.value).toBe("imported");
+      const second = await readValue(rig.client, "journal-second");
+      expect(second.denied).toBe(true);
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_refused_pending_exit_import_recovery",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "journal-first" }],
+      });
+    } finally {
+      storage.onWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("audits partial import progress when storage refuses after an earlier key", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "storage-first", value: "imported" },
+          { key: "storage-second", value: "imported" },
+        ],
+      });
+      storage.beforeWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "storage-second") {
+          throw new Error("injected storage refusal");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      const first = await readValue(rig.client, "storage-first");
+      expect(first.value).toBe("imported");
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        error_name: "Error",
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "storage-first" }],
+      });
+    } finally {
+      storage.beforeWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("audits partial import progress when a facade marker write refuses", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "facade-first", value: "imported" }],
+        facadeHiddenMarkers: [
+          {
+            key: "facade-marker",
+            marker: { namespace: "notes", key: "facade-first" },
+          },
+        ],
+      });
+      storage.beforeWrite = async (namespace, key) => {
+        if (namespace === FACADE_HIDDEN_MARKER_NAMESPACE && key === "facade-marker") {
+          throw new Error("injected facade marker refusal");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      const first = await readValue(rig.client, "facade-first");
+      expect(first.value).toBe("imported");
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "facade-first" }],
+      });
+    } finally {
+      storage.beforeWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("keeps partial import errors out of read-only floor refusal classification", () => {
+    const cause = new StateVerificationError(
+      "rollback_detected",
+      "injected floor refusal",
+      "version_below_floor"
+    );
+    const partial = new StateImportPartialApplyError(cause, [
+      { namespace: "notes", key: "partial-classification" },
+    ]);
+    expect(isStateVersionFloorRefusal(cause)).toBe(true);
+    expect(isStateVersionFloorRefusal(partial)).toBe(false);
   });
 });

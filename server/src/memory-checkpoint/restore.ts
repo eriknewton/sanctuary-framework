@@ -9,6 +9,7 @@
  */
 
 import {
+  getStateImportPartialApplyDetails,
   isStateVersionFloorRefusal,
   StateVerificationError,
   type StateStore,
@@ -34,6 +35,7 @@ export interface CheckpointRestoreReconstructProgress {
   deleted_added: string[];
   delete_remaining: string[];
   import_applied: boolean;
+  written_keys?: Array<{ namespace: string; key: string }>;
 }
 
 export interface RestoreCheckpointResult {
@@ -86,6 +88,8 @@ export const CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL =
   "memory checkpoint restore refused: checkpoint versions cannot be safely restored (CHECKPOINT-RESTORE-COLD-VERSION-FLOOR-01). State is unchanged.";
 
 export class CheckpointRestoreVersionFloorError extends MemoryCheckpointError {}
+
+export class CheckpointRestoreSkippedEntriesError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreExportError extends MemoryCheckpointError {}
 
@@ -351,11 +355,19 @@ export async function preflightCheckpointRestore(
     // uses overwrite semantics, so every verified non-reserved checkpoint entry
     // is a write candidate and must clear the durable reader's floor before
     // forensic writes or deletions.
-    await deps.stateStore.assertImportVersionFloors(
+    const preflight = await deps.stateStore.assertImportVersionFloors(
       checkpointBundle,
       "overwrite",
       deps.publicKeyResolver,
     );
+    if (preflight.skippedKeys > 0) {
+      throw new CheckpointRestoreSkippedEntriesError(
+        `memory checkpoint restore refused: checkpoint contains ${preflight.skippedKeys} entr${
+          preflight.skippedKeys === 1 ? "y" : "ies"
+        } this build cannot verify; state is unchanged`,
+        "checkpoint_skipped_entries_refused",
+      );
+    }
   } catch (err) {
     if (!isCheckpointRestoreVersionFloorRefusal(err)) throw err;
     throw new CheckpointRestoreVersionFloorError(
@@ -454,6 +466,7 @@ export async function restoreCheckpoint(
         deps.publicKeyResolver,
       );
     } catch (err) {
+      const partialDetails = getStateImportPartialApplyDetails(err);
       throw new CheckpointRestoreReconstructError(
         `memory checkpoint restore failed while importing checkpoint ${deps.checkpointId}: ${
           err instanceof Error ? err.message : String(err)
@@ -462,7 +475,10 @@ export async function restoreCheckpoint(
         {
           deleted_added: deletedAdded,
           delete_remaining: [],
-          import_applied: false,
+          import_applied: partialDetails ? true : false,
+          ...(partialDetails
+            ? { written_keys: partialDetails.writtenKeys }
+            : {}),
         },
         err,
       );

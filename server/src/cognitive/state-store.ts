@@ -90,6 +90,7 @@ const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
 // Distinctive envelope marker so a MAC'd record is unambiguously distinguished
 // from a legacy bare record (legacy keys are versionKeys, never this).
 const STATE_META_MAC_MARKER = "__sanctuary_meta_mac_v1";
+// Must match FACADE_HIDDEN_MARKER_NAMESPACE in test/cognitive/state-import-version-floor-tool.test.ts.
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
 const STATE_EXPORT_FORMAT = "sanctuary-v1";
 const STATE_EXPORT_BUNDLE_SCHEMA_VERSION = 1;
@@ -149,6 +150,12 @@ interface ImportPlan {
   namespaces: string[];
 }
 
+export interface StateImportVersionFloorPreflight {
+  skippedKeys: number;
+  skippedInvalidSig: number;
+  skippedUnknownKid: number;
+}
+
 export type StateVerificationClassification =
   | "signature_mismatch"
   | "kid_unknown"
@@ -199,6 +206,64 @@ export interface StateImportWrittenKey {
   key: string;
 }
 
+export interface StateImportPartialApplyDetails {
+  partial: true;
+  importedBeforeRefusal: number;
+  writtenKeys: StateImportWrittenKey[];
+}
+
+function cloneWrittenKeys(
+  writtenKeys: StateImportWrittenKey[]
+): StateImportWrittenKey[] {
+  return writtenKeys.map((written) => ({ ...written }));
+}
+
+export function getStateImportPartialApplyDetails(
+  error: unknown
+): StateImportPartialApplyDetails | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as {
+    partial?: unknown;
+    importedBeforeRefusal?: unknown;
+    writtenKeys?: unknown;
+  };
+  if (
+    candidate.partial !== true ||
+    typeof candidate.importedBeforeRefusal !== "number" ||
+    !Array.isArray(candidate.writtenKeys)
+  ) {
+    return undefined;
+  }
+  return {
+    partial: true,
+    importedBeforeRefusal: candidate.importedBeforeRefusal,
+    writtenKeys: cloneWrittenKeys(
+      candidate.writtenKeys.filter((item): item is StateImportWrittenKey => {
+        return (
+          item !== null &&
+          typeof item === "object" &&
+          typeof (item as StateImportWrittenKey).namespace === "string" &&
+          typeof (item as StateImportWrittenKey).key === "string"
+        );
+      })
+    ),
+  };
+}
+
+function attachStateImportPartialApplyDetails<T>(
+  error: T,
+  writtenKeys: StateImportWrittenKey[]
+): T {
+  if (writtenKeys.length === 0 || !error || typeof error !== "object") {
+    return error;
+  }
+  const target = error as T & StateImportPartialApplyDetails;
+  target.partial = true;
+  target.importedBeforeRefusal = writtenKeys.length;
+  target.writtenKeys = cloneWrittenKeys(writtenKeys);
+  return target;
+}
+
 export class StateImportPartialApplyError extends StateVerificationError {
   readonly partial = true;
   readonly importedBeforeRefusal: number;
@@ -212,7 +277,7 @@ export class StateImportPartialApplyError extends StateVerificationError {
     );
     this.name = "StateImportPartialApplyError";
     this.importedBeforeRefusal = writtenKeys.length;
-    this.writtenKeys = writtenKeys.map((written) => ({ ...written }));
+    this.writtenKeys = cloneWrittenKeys(writtenKeys);
     (this as Error & { cause?: unknown }).cause = cause;
   }
 }
@@ -226,6 +291,7 @@ export function isStateImportPartialApplyError(
 export function isStateVersionFloorRefusal(error: unknown): boolean {
   return (
     error instanceof StateVerificationError &&
+    getStateImportPartialApplyDetails(error) === undefined &&
     error.classification === "rollback_detected" &&
     error.reason === "version_below_floor"
   );
@@ -1226,10 +1292,13 @@ export class StateStore {
   private async withStateMutationLock<T>(operation: () => Promise<T>): Promise<T> {
     // This is deliberately process-local: write() and import() need one
     // StateStore instance serialized without taking the storage backend's
-    // cross-process lockfile. Two processes on one fortress are NOT
-    // serialized here; the shipped server boot holds the shared master-write
-    // barrier from index.ts/establishMaster only against master rotation, not as
-    // a state-mutation mutex, so import keeps its per-write floor recheck.
+    // cross-process lockfile. A measured 2026-10-12 probe saw same-process
+    // writes wait for the whole import (about 16.4 s at 600 entries and
+    // 36.7 s at 1200 entries on the review Mac), then complete. Two processes
+    // on one fortress are NOT serialized here; the shipped server boot holds
+    // the shared master-write barrier from index.ts/establishMaster only
+    // against master rotation, so signed imports keep the per-write floor
+    // recheck and post-write detection.
     const predecessor = this.mutationTail;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -3259,7 +3328,7 @@ export class StateStore {
     conflictResolution: ImportConflictResolution,
     publicKeyResolver: (kid: string) => Uint8Array | null,
     options: { allowUnverifiedLegacy?: boolean } = {}
-  ): Promise<void> {
+  ): Promise<StateImportVersionFloorPreflight> {
     const plan = await this.buildImportPlan(
       bundleBase64,
       conflictResolution,
@@ -3267,6 +3336,11 @@ export class StateStore {
       options
     );
     await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
+    return {
+      skippedKeys: plan.skippedKeys,
+      skippedInvalidSig: plan.skippedInvalidSig,
+      skippedUnknownKid: plan.skippedUnknownKid,
+    };
   }
 
   /**
@@ -3314,6 +3388,12 @@ export class StateStore {
 
     let importedKeys = 0;
     const writtenKeys: StateImportWrittenKey[] = [];
+    const throwWithPartialDetails = (err: unknown): never => {
+      if (err instanceof StateVerificationError && writtenKeys.length > 0) {
+        throw new StateImportPartialApplyError(err, writtenKeys);
+      }
+      throw attachStateImportPartialApplyDetails(err, writtenKeys);
+    };
     for (const { namespace: ns, key, entry } of plan.writeCandidates) {
       try {
         // Codex gate finding (2026-08-22): re-check per write, not once at
@@ -3355,10 +3435,7 @@ export class StateStore {
         const nsHashes = await this.getNamespaceHashes(ns);
         nsHashes.set(key, entry.integrity_hash);
       } catch (err) {
-        if (err instanceof StateVerificationError && writtenKeys.length > 0) {
-          throw new StateImportPartialApplyError(err, writtenKeys);
-        }
-        throw err;
+        throwWithPartialDetails(err);
       }
     }
 
@@ -3366,29 +3443,37 @@ export class StateStore {
     if (Array.isArray(bundle.facade_hidden_markers)) {
       const importedNamespaceSet = new Set(plan.namespaces);
       for (const item of bundle.facade_hidden_markers) {
-        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-        const record = item as Record<string, unknown>;
-        if (typeof record.key !== "string" || record.key.includes("/") || record.key.length > 256) continue;
-        const marker = record.marker;
-        if (!marker || typeof marker !== "object" || Array.isArray(marker)) continue;
-        const markerRecord = marker as Record<string, unknown>;
-        if (
-          typeof markerRecord.namespace !== "string" ||
-          typeof markerRecord.key !== "string" ||
-          !importedNamespaceSet.has(markerRecord.namespace)
-        ) {
-          continue;
-        }
-        if (await hasInterruptedExitImport(this.storage)) {
-          throw new InterruptedExitImportPendingError(
-            `state_import_facade_marker:${record.key}`
+        try {
+          if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+          const record = item as Record<string, unknown>;
+          if (typeof record.key !== "string" || record.key.includes("/") || record.key.length > 256) continue;
+          const marker = record.marker;
+          if (!marker || typeof marker !== "object" || Array.isArray(marker)) continue;
+          const markerRecord = marker as Record<string, unknown>;
+          if (
+            typeof markerRecord.namespace !== "string" ||
+            typeof markerRecord.key !== "string" ||
+            !importedNamespaceSet.has(markerRecord.namespace)
+          ) {
+            continue;
+          }
+          if (await hasInterruptedExitImport(this.storage)) {
+            throw new InterruptedExitImportPendingError(
+              `state_import_facade_marker:${record.key}`
+            );
+          }
+          await this.storage.write(
+            FACADE_HIDDEN_MARKER_NAMESPACE,
+            record.key,
+            stringToBytes(JSON.stringify(markerRecord))
           );
+          writtenKeys.push({
+            namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
+            key: record.key,
+          });
+        } catch (err) {
+          throwWithPartialDetails(err);
         }
-        await this.storage.write(
-          FACADE_HIDDEN_MARKER_NAMESPACE,
-          record.key,
-          stringToBytes(JSON.stringify(markerRecord))
-        );
       }
     }
 

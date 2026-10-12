@@ -78,6 +78,7 @@ export {
   CheckpointRestoreReservedNamespaceError,
   CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
   CheckpointRestoreVersionFloorError,
+  CheckpointRestoreSkippedEntriesError,
   preflightCheckpointRestore,
   CheckpointRestoreExportError,
   CheckpointRestoreReconstructError,

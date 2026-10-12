@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
+  StateImportPartialApplyError,
   StateVerificationError,
   type StateStore,
 } from "../../src/cognitive/state-store.js";
@@ -784,6 +785,137 @@ describe("restoreCheckpoint", () => {
       changed: [],
       removed: [],
     });
+  });
+
+  it("records partial checkpoint import progress when reconstruct import partially applies", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:09:00.000Z"),
+    });
+    const partial = new StateImportPartialApplyError(
+      new StateVerificationError(
+        "rollback_detected",
+        "injected checkpoint import refusal",
+        "version_below_floor",
+      ),
+      [{ namespace: "mem", key: "Q" }],
+    );
+    const failingStateStore: Pick<
+      StateStore,
+      "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
+    > = {
+      exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
+      assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
+        fixture.stateStore.assertImportVersionFloors(
+          bundle,
+          conflictResolution,
+          resolver,
+          options,
+        ),
+      delete: (namespace, key) => fixture.stateStore.delete(namespace, key),
+      import: async () => {
+        throw partial;
+      },
+    };
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: failingStateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+        now: new Date("2026-08-03T12:10:00.000Z"),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CheckpointRestoreReconstructError);
+    expect((thrown as CheckpointRestoreReconstructError).progress).toEqual({
+      deleted_added: [],
+      delete_remaining: [],
+      import_applied: true,
+      written_keys: [{ namespace: "mem", key: "Q" }],
+    });
+    const failureAudit = fixture.audit.criticalCalls.at(-1);
+    expect(failureAudit).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        reconstruct_progress: {
+          import_applied: true,
+          written_keys: [{ namespace: "mem", key: "Q" }],
+        },
+      },
+    });
+  });
+
+  it("refuses checkpoints with skipped entries before reconstructing state", async () => {
+    const fixture = await makeFixture();
+    const otherIdentity = createIdentity(
+      "unknown-checkpoint-signer",
+      fixture.identityEncKey,
+      "recovery-key",
+    );
+    const sourceStorage = new MemoryStorage();
+    const sourceStore = new RealStateStore(sourceStorage, fixture.masterKey);
+    await sourceStore.write(
+      "mem",
+      "Q",
+      "checkpoint-from-unknown-signer",
+      otherIdentity.storedIdentity.identity_id,
+      otherIdentity.storedIdentity.encrypted_private_key,
+      fixture.identityEncKey,
+    );
+    const checkpointId = await createCheckpointFromBundle(
+      fixture,
+      (await sourceStore.exportNamespaces(["mem"])).bundle,
+      "2026-08-03T12:11:00.000Z",
+    );
+    await writeEntry(fixture, "mem", "P", "post-checkpoint");
+    const deleteSpy = vi.spyOn(fixture.stateStore, "delete");
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    expect(thrown).toMatchObject({
+      name: "CheckpointRestoreSkippedEntriesError",
+      reason: "checkpoint_skipped_entries_refused",
+    });
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
   });
 
   it("refuses (before any state change) when the decrypted bundle hash does not match the recorded bundle_hash", async () => {

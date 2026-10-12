@@ -11,8 +11,8 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
+  getStateImportPartialApplyDetails,
   getReservedNamespaceViolation,
-  isStateImportPartialApplyError,
   StateStore,
   StateVerificationError,
   UNATTRIBUTED_DISCLOSURE_NOTICE,
@@ -1144,11 +1144,12 @@ export function createCognitiveTools(
     error: StateVerificationError,
     namespaces: string[]
   ) {
-    const partial = isStateImportPartialApplyError(error)
+    const partialDetails = getStateImportPartialApplyDetails(error);
+    const partial = partialDetails
       ? {
           partial: true,
-          imported_before_refusal: error.importedBeforeRefusal,
-          written_keys: error.writtenKeys,
+          imported_before_refusal: partialDetails.importedBeforeRefusal,
+          written_keys: partialDetails.writtenKeys,
         }
       : {};
     await recordCriticalAudit(
@@ -2213,6 +2214,13 @@ export function createCognitiveTools(
           throw err;
         }
 
+        await recordCriticalAudit(auditLog, "l1", "state_import_attempt", "principal", {
+          conflict_resolution:
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+            "skip",
+          namespaces: targetNamespaces,
+        });
+
         // N4 (coordinator gate, 2026-08-22): StateStore.import refuses
         // while an exit-import journal exists; catch that SPECIFIC error
         // to audit the refusal and return a clean tool-result error.
@@ -2227,12 +2235,23 @@ export function createCognitiveTools(
           );
         } catch (err) {
           if (err instanceof InterruptedExitImportPendingError) {
+            const partialDetails = getStateImportPartialApplyDetails(err);
             await recordCriticalAudit(
               auditLog,
               "l1",
               "state_import_refused_pending_exit_import_recovery",
               "principal",
-              { namespaces: targetNamespaces },
+              {
+                namespaces: targetNamespaces,
+                ...(partialDetails
+                  ? {
+                      partial: true,
+                      imported_before_refusal:
+                        partialDetails.importedBeforeRefusal,
+                      written_keys: partialDetails.writtenKeys,
+                    }
+                  : {}),
+              },
               "failure"
             );
             return toolResult({
@@ -2242,6 +2261,24 @@ export function createCognitiveTools(
           }
           if (err instanceof StateVerificationError) {
             return denyStateImportVerification(err, targetNamespaces);
+          }
+          const genericPartialDetails = getStateImportPartialApplyDetails(err);
+          if (genericPartialDetails) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_import_failed",
+              "state-store",
+              {
+                namespaces: targetNamespaces,
+                error_name: err instanceof Error ? err.name : typeof err,
+                partial: true,
+                imported_before_refusal: genericPartialDetails.importedBeforeRefusal,
+                written_keys: genericPartialDetails.writtenKeys,
+              },
+              "failure"
+            );
+            return toolResult(fixedDenial("audit:state_import"));
           }
           throw err;
         }
