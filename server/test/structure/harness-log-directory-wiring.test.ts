@@ -19,14 +19,27 @@ function installHarnessDaemonSource(source: string): string {
   return source.slice(start, end);
 }
 
-describe("structure: harness log directory install wiring", () => {
-  it("pins the default directory open flags at the production helper", async () => {
-    const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
+function ensureHarnessDaemonLogDirSource(source: string): string {
+  const start = source.indexOf("export async function ensureHarnessDaemonLogDir(");
+  const end = source.indexOf("/**\n * Bug B", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
+}
 
-    expect(source).toMatch(
-      /export const HARNESS_LOG_DIRECTORY_OPEN_FLAGS =\s*fsConstants\.O_RDONLY \|\s*fsConstants\.O_NOFOLLOW \|\s*fsConstants\.O_DIRECTORY;/,
-    );
-    expect(source).toContain("open(path, HARNESS_LOG_DIRECTORY_OPEN_FLAGS)");
+describe("structure: harness log directory install wiring", () => {
+  it("pins agent-authority creation at the production helper", async () => {
+    const source = await readFile(AUTO_PROVISION_SOURCE, "utf8");
+    const helperSource = ensureHarnessDaemonLogDirSource(source);
+
+    expect(source).toContain("createHarnessLogDirectoryAsAgent");
+    expect(source).toContain('spawnImpl("/bin/mkdir", ["-m", HARNESS_LOG_DIR_MODE_ARG, "--", path], options)');
+    expect(helperSource).toContain("await ops.createDirectoryAsAgent(harnessLogDir, uid, gid);");
+    expect(helperSource).not.toMatch(/\b(?:fchown|fchmod)\b/);
+    expect(helperSource).not.toMatch(/\.(?:chown|chmod)\s*\(/);
+    expect(helperSource).not.toContain("openDirectoryNoFollow");
+    expect(helperSource).not.toContain("readEntries");
+    expect(helperSource).not.toContain("/dev/fd");
   });
 
   it("routes the install path through the custody helper and keeps path mutation out of the caller", async () => {

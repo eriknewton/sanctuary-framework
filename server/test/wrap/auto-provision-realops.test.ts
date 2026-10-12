@@ -34,10 +34,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { constants as fsConstants } from "node:fs";
 import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir, rename, open } from "node:fs/promises";
-import { tmpdir, platform as osPlatform, userInfo } from "node:os";
+import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { promisify } from "node:util";
 
@@ -55,6 +56,7 @@ import {
   resolveWallFortressPath,
   resolveHarnessDaemonLogDir,
   ensureHarnessDaemonLogDir,
+  createHarnessLogDirectoryAsAgent,
   HarnessLogDirectoryCustodyError,
   hermesRuntimeRehomePaths,
   moveAsideStaleHermesRuntimeDestination,
@@ -1544,9 +1546,22 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     return statsWithOwner(await lstat(path), uid, gid);
   }
 
+  function fakeMkdirSpawn(
+    calls: Array<{ command: string; args: string[]; options: SpawnOptions }>,
+    code = 0,
+  ): typeof spawn {
+    return ((command: string, args: readonly string[], options: SpawnOptions): ChildProcess => {
+      calls.push({ command, args: [...args], options });
+      const child = new EventEmitter() as ChildProcess;
+      child.kill = (() => true) as ChildProcess["kill"];
+      queueMicrotask(() => child.emit("close", code));
+      return child;
+    }) as typeof spawn;
+  }
+
   it("AGENT-HOME-LOGS-SYMLINK-01: refuses an unsafe pre-existing harness log entry before ownership repair", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-harness-log-custody-"));
-    let openedForMutation = false;
+    let createCalled = false;
     try {
       // 502 is the fixture dedicated-agent uid used throughout this wrap suite.
       const targetUid = 502;
@@ -1560,15 +1575,14 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       await expect(
         ensureHarnessDaemonLogDir(logDir, targetUid, targetUid, {
           lstat,
-          mkdir,
-          openDirectoryNoFollow: async () => {
-            openedForMutation = true;
-            throw new Error("open must not run for an unsafe log entry");
+          createDirectoryAsAgent: async () => {
+            createCalled = true;
+            throw new Error("create must not run for an unsafe log entry");
           },
         }),
       ).rejects.toBeInstanceOf(HarnessLogDirectoryCustodyError);
 
-      expect(openedForMutation).toBe(false);
+      expect(createCalled).toBe(false);
       expect(await readlink(logDir)).toBe(outside);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
@@ -1590,75 +1604,94 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
-  it("AGENT-HOME-LOGS-SYMLINK-01: accepts a fresh root-owned log directory under a staff-group home", async () => {
-    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
-    const targetUid = currentUid + 1000;
-    const targetGid = targetUid;
-    const inheritedHomeGid = currentGid;
-    let logOwner = { uid: 0, gid: inheritedHomeGid };
-    try {
-      await ensureHarnessDaemonLogDir(logDir, targetUid, targetGid, {
-        lstat: async (path) => {
-          if (path === agentHome) return overlayStats(path, targetUid, inheritedHomeGid);
-          if (path === logDir) return overlayStats(path, logOwner.uid, logOwner.gid);
-          return lstat(path);
-        },
-        mkdir,
-        openDirectoryNoFollow: async (path) => {
-          const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
-          return {
-            fd: realHandle.fd,
-            chown: async (uid, gid) => {
-              logOwner = { uid, gid };
-            },
-            chmod: (mode) => realHandle.chmod(mode),
-            stat: async () => overlayStats(path, logOwner.uid, logOwner.gid),
-            close: () => realHandle.close(),
-            readEntries: () => readdir(path),
-          };
-        },
-      });
-      expect(logOwner).toEqual({ uid: targetUid, gid: targetGid });
-    } finally {
-      await rm(tmpRoot, { recursive: true, force: true });
-    }
+  it("AGENT-HOME-LOGS-SYMLINK-01: spawns mkdir with the agent uid and primary gid for root callers", async () => {
+    const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+    // 7001/7002 are arbitrary non-current ids that make uid and primary gid distinct in the spawn assertion.
+    const targetUid = 7001;
+    const primaryGid = 7002;
+
+    await createHarnessLogDirectoryAsAgent(
+      "/tmp/sanctuary-agent-home/logs",
+      targetUid,
+      primaryGid,
+      fakeMkdirSpawn(calls),
+      { uid: 0, gid: 0 },
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      command: "/bin/mkdir",
+      args: ["-m", "700", "--", "/tmp/sanctuary-agent-home/logs"],
+      options: {
+        uid: targetUid,
+        gid: primaryGid,
+        shell: false,
+        env: { PATH: "/usr/bin:/bin" },
+      },
+    });
   });
 
-  it("AGENT-HOME-LOGS-SYMLINK-01: refuses a non-empty root-owned log directory before ownership repair", async () => {
+  it("AGENT-HOME-LOGS-SYMLINK-01: omits uid switching when the test process stands in for the agent", async () => {
+    const calls: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+
+    await createHarnessLogDirectoryAsAgent(
+      "/tmp/sanctuary-agent-home/logs",
+      currentUid,
+      currentGid,
+      fakeMkdirSpawn(calls),
+      { uid: currentUid, gid: currentGid },
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.options).not.toHaveProperty("uid");
+    expect(calls[0]!.options).not.toHaveProperty("gid");
+    expect(calls[0]!.options).toMatchObject({
+      shell: false,
+      env: { PATH: "/usr/bin:/bin" },
+    });
+  });
+
+  it("AGENT-HOME-LOGS-SYMLINK-01: refuses a root-owned leftover log directory without ownership repair", async () => {
     const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture();
     const targetUid = currentUid + 1000;
     const targetGid = targetUid;
     let chownCalled = false;
+    let chmodCalled = false;
+    let createCalled = false;
     try {
       await mkdir(logDir, { mode: 0o700 });
-      await writeFile(join(logDir, "existing.log"), "preserve");
 
       await expectCustodyRefusal(
         ensureHarnessDaemonLogDir(logDir, targetUid, targetGid, {
-          lstat: async (path) => {
+          lstat: async (path: string) => {
             if (path === agentHome) return overlayStats(path, targetUid, currentGid);
             if (path === logDir) return overlayStats(path, 0, currentGid);
             return lstat(path);
           },
-          mkdir,
-          openDirectoryNoFollow: async (path) => {
+          createDirectoryAsAgent: async () => {
+            createCalled = true;
+          },
+          openDirectoryNoFollow: async (path: string) => {
             const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
             return {
               fd: realHandle.fd,
               chown: async () => {
                 chownCalled = true;
               },
-              chmod: (mode) => realHandle.chmod(mode),
+              chmod: async () => {
+                chmodCalled = true;
+              },
               stat: async () => overlayStats(path, 0, currentGid),
               close: () => realHandle.close(),
-              readEntries: () => readdir(path),
+              readEntries: async () => [],
             };
           },
-        }),
+        } as never),
         logDir,
       );
+      expect(createCalled).toBe(false);
       expect(chownCalled).toBe(false);
-      expect(await readFile(join(logDir, "existing.log"), "utf8")).toBe("preserve");
+      expect(chmodCalled).toBe(false);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1677,18 +1710,8 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
           if (path === logDir) return overlayStats(path, logOwner.uid, logOwner.gid);
           return lstat(path);
         },
-        mkdir,
-        openDirectoryNoFollow: async (path) => {
-          const realHandle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
-          return {
-            fd: realHandle.fd,
-            chown: async (uid, gid) => {
-              logOwner = { uid, gid };
-            },
-            chmod: (mode) => realHandle.chmod(mode),
-            stat: async () => overlayStats(path, logOwner.uid, logOwner.gid),
-            close: () => realHandle.close(),
-          };
+        createDirectoryAsAgent: async () => {
+          logOwner = { uid: targetUid, gid: targetGid };
         },
       });
       expect(logOwner).toEqual({ uid: targetUid, gid: targetGid });
@@ -1706,9 +1729,8 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
           lstat: async () => {
             throw Object.assign(new Error("raw platform path detail"), { code: "EIO" });
           },
-          mkdir,
-          openDirectoryNoFollow: async () => {
-            throw new Error("open should not run");
+          createDirectoryAsAgent: async () => {
+            throw new Error("create should not run");
           },
         });
       } catch (err) {
@@ -1722,7 +1744,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
-  it("keeps an existing agent-owned harness log directory and normalizes its exact mode", async () => {
+  it("keeps an existing agent-owned harness log directory without root-side mode repair", async () => {
     const { tmpRoot, logDir } = await makeHarnessLogFixture();
     try {
       await mkdir(logDir, { mode: 0o755 });
@@ -1733,7 +1755,7 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       const logStats = await lstat(logDir);
       expect(logStats.uid).toBe(currentUid);
       expect(logStats.gid).toBe(currentGid);
-      expect(logStats.mode & 0o7777).toBe(0o700);
+      expect(logStats.mode & 0o7777).toBe(0o755);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -1788,10 +1810,9 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
             }
             return statsWithOwner(logStats, currentUid, currentGid);
           },
-          mkdir,
-          openDirectoryNoFollow: async () => {
+          createDirectoryAsAgent: async () => {
             openedForMutation = true;
-            throw new Error("open must not run for an owner mismatch");
+            throw new Error("create must not run for an owner mismatch");
           },
         }),
         logDir,
@@ -1850,9 +1871,9 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
             }
             return stats;
           },
-          mkdir,
-          openDirectoryNoFollow: (path) =>
-            open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
+          createDirectoryAsAgent: async () => {
+            throw new Error("create must not run for an existing log entry");
+          },
         }),
         logDir,
       );
@@ -1864,92 +1885,6 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
-  it("refuses a different directory renamed into place between inspection and open", async () => {
-    const { tmpRoot, logDir } = await makeHarnessLogFixture();
-    const oldLogDir = join(tmpRoot, "old-logs");
-    const replacement = join(tmpRoot, "replacement");
-    let swapped = false;
-    try {
-      await mkdir(logDir);
-      await mkdir(replacement, { mode: 0o755 });
-      await chmod(replacement, 0o755);
-
-      await expectCustodyRefusal(
-        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
-          lstat: async (path) => {
-            const stats = await lstat(path);
-            if (path === logDir && !swapped) {
-              swapped = true;
-              await rename(logDir, oldLogDir);
-              await rename(replacement, logDir);
-            }
-            return stats;
-          },
-          mkdir,
-          openDirectoryNoFollow: (path) =>
-            open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
-        }),
-        logDir,
-      );
-
-      const pathStats = await lstat(logDir);
-      expect(pathStats.mode & 0o7777).toBe(0o755);
-    } finally {
-      await rm(tmpRoot, { recursive: true, force: true });
-    }
-  });
-
-  it("refuses a replacement after open before reporting the repair complete", async () => {
-    const { tmpRoot, logDir } = await makeHarnessLogFixture();
-    const oldLogDir = join(tmpRoot, "old-logs");
-    try {
-      await mkdir(logDir);
-
-      await expectCustodyRefusal(
-        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
-          lstat,
-          mkdir,
-          openDirectoryNoFollow: async (path) => {
-            const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
-            await rename(logDir, oldLogDir);
-            await mkdir(logDir, { mode: 0o755 });
-            await chmod(logDir, 0o755);
-            return handle;
-          },
-        }),
-        logDir,
-      );
-
-      const replacementStats = await lstat(logDir);
-      expect(replacementStats.mode & 0o7777).toBe(0o755);
-    } finally {
-      await rm(tmpRoot, { recursive: true, force: true });
-    }
-  });
-
-  it("clears extended ACLs from the harness log directory on macOS", async () => {
-    if (osPlatform() !== "darwin") return;
-    const { tmpRoot, logDir } = await makeHarnessLogFixture();
-    try {
-      await mkdir(logDir, { mode: 0o755 });
-      await execFileAsync("/bin/chmod", [
-        "+a",
-        `${userInfo().username} allow list,search,readattr`,
-        logDir,
-      ]);
-      const before = await execFileAsync("/bin/ls", ["-lde", logDir]);
-      expect(before.stdout).toMatch(/^\s*\d+:/m);
-
-      await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid);
-
-      const after = await execFileAsync("/bin/ls", ["-lde", logDir]);
-      expect(after.stdout).not.toMatch(/^\s*\d+:/m);
-      const logStats = await lstat(logDir);
-      expect(logStats.mode & 0o7777).toBe(0o700);
-    } finally {
-      await rm(tmpRoot, { recursive: true, force: true });
-    }
-  });
 });
 
 describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot binary resolution", () => {
