@@ -1387,7 +1387,7 @@ function operatorTwinRestoreNote(restore: OperatorTwinRestoreReport): string {
   return (
     "The operator-side agent LaunchAgent this run stood down could NOT be fully restored: " +
     (restore.problems.length > 0 ? restore.problems.join("; ") : "no detail returned") +
-    ". Check the operator LaunchAgent plist and launchd disabled state before re-running."
+    ". Check the operator LaunchAgent plist and launchd disabled state before re-running; after inspection, retry with launchctl enable gui/<uid>/<label>, then bootstrap the plist."
   );
 }
 

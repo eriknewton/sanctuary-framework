@@ -78,6 +78,7 @@ import {
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
+  type OperatorTwinStandDownOps,
   type OperatorTwinStandDownSnapshot,
   HERMES_ENDPOINT_SET,
   publishProvisionedEgressRules,
@@ -176,6 +177,10 @@ const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
 export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
+// 1 = one directory entry names the operator plist; extra links fail restore verification.
+const OPERATOR_TWIN_PLIST_SINGLE_LINK_COUNT = 1;
+// Chosen 64 KiB ceiling: generated LaunchAgent plists are small, and restore/stand-down only need one bounded snapshot read.
+export const OPERATOR_TWIN_PLIST_MAX_BYTES = 64 * 1024;
 
 export class HarnessLogDirectoryCustodyError extends Error {
   constructor(harnessLogDir: string, message?: string) {
@@ -407,6 +412,132 @@ export function resolveWallFortressPath(
     return override;
   }
   return `${stripTrailingSlashes(operatorHome)}/.sanctuary`;
+}
+
+type OperatorTwinPlistReadResult =
+  | { ok: true; content: string }
+  | { ok: false; absent: boolean; problem: string };
+
+type OperatorTwinPlistStats = {
+  isFile(): boolean;
+  uid: number;
+  nlink: number;
+  size: number;
+};
+
+type OperatorTwinPlistReadOps = {
+  statFile?: (handle: Awaited<ReturnType<typeof open>>) => Promise<OperatorTwinPlistStats>;
+};
+
+async function readOperatorTwinPlistNoFollow(
+  path: string,
+  operatorUid: number,
+  problemLabel: "restore_problem" | "stand_down_problem",
+  ops: OperatorTwinPlistReadOps = {},
+): Promise<OperatorTwinPlistReadResult> {
+  const problem = (message: string) => `${problemLabel}: ${message}`;
+  const noFollow =
+    typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : undefined;
+  if (noFollow === undefined) {
+    return {
+      ok: false,
+      absent: false,
+      problem: problem("this platform cannot no-follow verify the operator plist"),
+    };
+  }
+  const nonBlock = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    // Restore reloads the existing plist only after a no-follow check that it still matches the snapshot; it does not create, replace or remove that file.
+    handle = await open(path, fsConstants.O_RDONLY | noFollow | nonBlock);
+    // Owner acceptance is decided from the opened descriptor's stat; tests inject this seam to model uid-0 ownership without host custody changes.
+    const stats = await (ops.statFile ?? ((opened) => opened.stat()))(handle);
+    if (!stats.isFile()) {
+      return { ok: false, absent: false, problem: problem("operator plist is not a regular file") };
+    }
+    if (stats.uid !== operatorUid && stats.uid !== 0) {
+      return {
+        ok: false,
+        absent: false,
+        problem: problem("operator plist is not owned by the operator uid or root"),
+      };
+    }
+    if (stats.nlink !== OPERATOR_TWIN_PLIST_SINGLE_LINK_COUNT) {
+      return {
+        ok: false,
+        absent: false,
+        problem: problem("operator plist must have exactly one directory entry"),
+      };
+    }
+    if (stats.size > OPERATOR_TWIN_PLIST_MAX_BYTES) {
+      return { ok: false, absent: false, problem: problem("operator plist exceeds the snapshot read bound") };
+    }
+    const buffer = Buffer.alloc(stats.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const oneExtraByte = Buffer.alloc(1);
+    const extra = await handle.read(oneExtraByte, 0, oneExtraByte.length, offset);
+    if (extra.bytesRead > 0) {
+      return { ok: false, absent: false, problem: problem("operator plist changed while being read") };
+    }
+    return { ok: true, content: buffer.subarray(0, offset).toString("utf8") };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: false, absent: true, problem: problem("operator plist is absent") };
+    }
+    return {
+      ok: false,
+      absent: false,
+      problem: problem(`could not no-follow verify operator plist: ${describeUntrusted(err)}`),
+    };
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+export async function readOperatorTwinPlistSnapshotForStandDown(
+  path: string,
+  operatorUid: number,
+): Promise<string | undefined> {
+  const read = await readOperatorTwinPlistNoFollow(path, operatorUid, "stand_down_problem");
+  if (read.ok) return read.content;
+  if (read.absent) return undefined;
+  throw new Error(read.problem);
+}
+
+export async function verifyOperatorTwinPlistForRestore(
+  path: string,
+  expectedContent: string,
+  operatorUid: number,
+  ops: OperatorTwinPlistReadOps = {},
+): Promise<{ ok: true } | { ok: false; problem: string }> {
+  const read = await readOperatorTwinPlistNoFollow(path, operatorUid, "restore_problem", ops);
+  if (!read.ok) return { ok: false, problem: read.problem };
+  if (read.content !== expectedContent) {
+    return { ok: false, problem: "restore_problem: operator plist bytes changed before restore" };
+  }
+  return { ok: true };
+}
+
+export function operatorTwinStandDownOpsForProvision(input: {
+  consoleOwnerUid: number;
+  runLaunchctl?: OperatorTwinStandDownOps["runLaunchctl"];
+  sleepMs?: OperatorTwinStandDownOps["sleepMs"];
+  notify?: OperatorTwinStandDownOps["notify"];
+}): OperatorTwinStandDownOps {
+  return {
+    readFile: async (path) => {
+      return await readOperatorTwinPlistSnapshotForStandDown(path, input.consoleOwnerUid);
+    },
+    verifyPlistForRestore: verifyOperatorTwinPlistForRestore,
+    runLaunchctl: input.runLaunchctl ?? ((args) => runLaunchctlWithTimeout(args)),
+    sleepMs: input.sleepMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    notify: input.notify ?? (() => undefined),
+  };
 }
 
 /**
@@ -1168,6 +1299,7 @@ export interface RunAutoProvisionForWrapOptions {
 export interface AutoProvisionSummary {
   ran: boolean;
   outcome?: ProvisionFlowOutcome;
+  custodyNormalize?: NormalizeFortressCustodyOutcome;
 }
 
 export function policyDaemonInstallBootArgs(
@@ -1372,15 +1504,6 @@ export async function runAutoProvisionForWrap(
   // F-GATEWAY-TWIN: the per-user operator LaunchAgent superseded by this run.
   // Distinct from `harnessStandDownSnapshot`, which is the SYSTEM LaunchDaemon.
   let operatorTwinStandDownSnapshot: OperatorTwinStandDownSnapshot | undefined;
-  // A twin plist this run (re)writes must stay the OPERATOR's file. Protect
-  // runs under sudo, so a plain write leaves a root-owned plist in the
-  // operator's LaunchAgents: the operator loses custody of their own agent
-  // config, and launchd can refuse to bootstrap a gui-domain plist with the
-  // wrong owner -- the restore would then fail exactly when it is owed.
-  const handOperatorTwinPlistBack = async (path: string): Promise<void> => {
-    if (process.getuid?.() !== 0) return;
-    await lchown(path, operatorIdentity.uid, operatorIdentity.gid);
-  };
 
   // The ONE best-effort CLI audit closure for this flow's fortress. Hoisted
   // out of `buildExclusiveWiringInput` so the mode-independent residue gate
@@ -1995,26 +2118,13 @@ export async function runAutoProvisionForWrap(
         operatorUid: consoleOwnerUid,
       });
       try {
-        const snapshot = await standDownOperatorTwinLaunchAgent(descriptor, {
-          readFile: async (path) => {
-            try {
-              return await readFile(path, "utf8");
-            } catch (err) {
-              if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-              throw err;
-            }
-          },
-          writeFile: async (path, content, mode) => {
-            await writeFile(path, content, { mode });
-            await handOperatorTwinPlistBack(path);
-          },
-          removeFile: async (path) => {
-            await rm(path, { force: true });
-          },
-          runLaunchctl: (args) => runLaunchctlWithTimeout(args),
-          sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-          notify: (message) => print(message),
-        });
+        const snapshot = await standDownOperatorTwinLaunchAgent(
+          descriptor,
+          operatorTwinStandDownOpsForProvision({
+            consoleOwnerUid,
+            notify: (message) => print(message),
+          }),
+        );
         operatorTwinStandDownSnapshot = snapshot;
         return { ok: true as const, snapshot };
       } catch (err) {
@@ -2023,21 +2133,7 @@ export async function runAutoProvisionForWrap(
     },
     restoreOperatorTwinStandDown: async (snapshot) => {
       const restored = await restoreOperatorTwinStandDown(snapshot, {
-        readFile: async (path) => {
-          try {
-            return await readFile(path, "utf8");
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-            throw err;
-          }
-        },
-        writeFile: async (path, content, mode) => {
-          await writeFile(path, content, { mode });
-          await handOperatorTwinPlistBack(path);
-        },
-        removeFile: async (path) => {
-          await rm(path, { force: true });
-        },
+        verifyPlistForRestore: verifyOperatorTwinPlistForRestore,
         runLaunchctl: (args) => runLaunchctlWithTimeout(args),
         sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
         notify: (message) => print(message),
@@ -2224,12 +2320,12 @@ export async function finishProvisionOutcomeWithCustodyNormalize(input: {
   ) => Promise<NormalizeFortressCustodyOutcome>;
 }): Promise<AutoProvisionSummary> {
   const normalize = input.normalize ?? normalizeFortressCustody;
-  await normalize({
+  const custodyNormalize = await normalize({
     fortressPath: input.wallFortressPath,
     operator: input.operator,
     log: input.print,
   });
-  return { ran: true, outcome: input.outcome };
+  return { ran: true, outcome: input.outcome, custodyNormalize };
 }
 
 // ── Real op implementations (drill-only side effects; never exercised by CI) ──
