@@ -604,6 +604,129 @@ pub enum PolicySnapshotError {
          refused, never admitted with nothing confined."
     )]
     AgentOriginUnusable { detail: String },
+    #[error("manifest rejected: {0}")]
+    ConfinedAgentScope(ConfinedAgentScopeError),
+}
+
+const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
+// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
+// `server/src/castle-wall/allowlist/bounded-diagnostic-text.ts`.
+const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let original_len = value.chars().count();
+    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+    format!("{prefix}... (original length {original_len})")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfinedAgentScopeError {
+    /// Must match `validateLinuxInstallAgentIdScopes` in
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    MalformedAgentScope {
+        rule_id: String,
+        agent_id: String,
+        expected_form: &'static str,
+    },
+    /// Must match `validateLinuxInstallAgentIdScopes` in
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    AgentScopeOutsideAdmission {
+        rule_id: String,
+        agent_id: String,
+        admitted_uid: u32,
+    },
+}
+
+impl std::fmt::Display for ConfinedAgentScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedAgentScope {
+                rule_id,
+                agent_id,
+                expected_form,
+            } => {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                let rule_id_display = bounded_diagnostic_text(rule_id);
+                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                write!(
+                    f,
+                    "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
+                )
+            }
+            Self::AgentScopeOutsideAdmission {
+                rule_id,
+                agent_id,
+                admitted_uid,
+            } => {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                let rule_id_display = bounded_diagnostic_text(rule_id);
+                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                write!(
+                    f,
+                    "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}; scope agent rules to uid-{admitted_uid}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfinedAgentScopeError {}
+
+impl ConfinedAgentScopeError {
+    pub(crate) fn rule_id(&self) -> &str {
+        match self {
+            Self::MalformedAgentScope { rule_id, .. }
+            | Self::AgentScopeOutsideAdmission { rule_id, .. } => rule_id,
+        }
+    }
+}
+
+pub(crate) fn collect_confined_agent_scope_errors(
+    rules: &[AllowlistRule],
+    admitted_uid: u32,
+) -> Vec<ConfinedAgentScopeError> {
+    let mut errors = Vec::new();
+    for rule in rules {
+        // The reserved distress lane is code-derived and shape-checked here; operator-authored agent scopes use confined ids.
+        if crate::habeas::is_derived_habeas_rule(rule) {
+            continue;
+        }
+        for agent_id in &rule.scope.agent_ids {
+            let Some(uid) = crate::nftables::parse_confined_agent_id(agent_id) else {
+                errors.push(ConfinedAgentScopeError::MalformedAgentScope {
+                    rule_id: rule.id.clone(),
+                    agent_id: agent_id.clone(),
+                    expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
+                });
+                continue;
+            };
+            // The Linux daemon binds and queues only the admitted agent uid, so a different uid form cannot match.
+            if uid != admitted_uid {
+                errors.push(ConfinedAgentScopeError::AgentScopeOutsideAdmission {
+                    rule_id: rule.id.clone(),
+                    agent_id: agent_id.clone(),
+                    admitted_uid,
+                });
+            }
+        }
+    }
+    errors
+}
+
+pub(crate) fn validate_confined_agent_id_scopes(
+    rules: &[AllowlistRule],
+    admitted_uid: u32,
+) -> std::result::Result<(), ConfinedAgentScopeError> {
+    match collect_confined_agent_scope_errors(rules, admitted_uid)
+        .into_iter()
+        .next()
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 impl PolicySnapshot {
@@ -1483,6 +1606,11 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
 
+    // Fixture UIDs are above the test ceilings and below sentinel values, so
+    // they exercise ordinary mapped principals without depending on the host.
+    const TEST_AGENT_UID: u32 = 60_123;
+    const TEST_GATE_UID: u32 = 60_124;
+
     fn rule(
         id: &str,
         match_clause: RuleMatch,
@@ -1766,6 +1894,67 @@ mod tests {
         assert!(s.applies_to("agent-other", "claude-code"));
         // neither
         assert!(!s.applies_to("agent-other", "other-template"));
+    }
+
+    #[test]
+    fn confined_scope_validator_admits_only_the_agent_uid_form() {
+        let allowed = rule(
+            "uid-scope",
+            RuleMatch::default(),
+            RuleScope {
+                agent_ids: vec![format!("uid-{TEST_AGENT_UID}")],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        );
+        assert!(validate_confined_agent_id_scopes(&[allowed], TEST_AGENT_UID).is_ok());
+
+        let malformed = rule(
+            "legacy-scope",
+            RuleMatch::default(),
+            RuleScope {
+                agent_ids: vec![format!("agent-{TEST_AGENT_UID}")],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        );
+        let err = validate_confined_agent_id_scopes(&[malformed], TEST_AGENT_UID).unwrap_err();
+        assert!(
+            format!("{err}").contains("rule legacy-scope")
+                && format!("{err}").contains("uid-<uid>")
+        );
+
+        let gate_uid = rule(
+            "gate-scope",
+            RuleMatch::default(),
+            RuleScope {
+                agent_ids: vec![format!("uid-{TEST_GATE_UID}")],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        );
+        let err = validate_confined_agent_id_scopes(&[gate_uid], TEST_AGENT_UID).unwrap_err();
+        let expected = format!("uid-{TEST_AGENT_UID}");
+        assert!(
+            format!("{err}").contains("rule gate-scope") && format!("{err}").contains(&expected)
+        );
+    }
+
+    #[test]
+    fn confined_scope_validator_keeps_the_derived_distress_exemption_narrow() {
+        let derived = habeas_local_rule();
+        let forged = rule(
+            crate::habeas::HABEAS_LOCAL_RULE_ID,
+            RuleMatch::default(),
+            RuleScope {
+                agent_ids: vec!["sanctuary:habeas-distress-emitter".to_string()],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        );
+
+        assert!(validate_confined_agent_id_scopes(&[derived], TEST_AGENT_UID).is_ok());
+        assert!(validate_confined_agent_id_scopes(&[forged], TEST_AGENT_UID).is_err());
     }
 
     // ---- PolicySnapshot::evaluate -----------------------------------------
