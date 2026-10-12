@@ -41,6 +41,7 @@ import {
   getOrCreatePassphrase,
   observeStoredPassphrase,
 } from "../wrap/passphrase.js";
+import { resolveHarnessDaemonLogDir } from "../wrap/auto-provision.js";
 import {
   custodyCredentialRefusal,
   resolveFortressCustodyCredential,
@@ -3153,7 +3154,7 @@ export async function runSafeModeDaemon(
           // FIX F-HARNESSENV: the boot release re-renders the harness plist, so
           // it carries the WHOLE launch (argv + environment), never a bare argv.
           harnessLaunch: resolved.launch,
-          harnessLogDir: `${agentHome}/logs`,
+          harnessLogDir: resolveHarnessDaemonLogDir(agentHome),
           gateAccount,
           gateHomeDirectory,
           gateUid: marker.gate_uid,

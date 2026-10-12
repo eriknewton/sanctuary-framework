@@ -27,7 +27,7 @@
  */
 
 import { platform as osPlatform } from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { constants as fsConstants, unlinkSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -181,18 +181,27 @@ export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
 
 export class HarnessLogDirectoryCustodyError extends Error {
   constructor(
-    message = "Harness log directory custody check failed; inspect the dedicated account home and re-run protect.",
+    harnessLogDir: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(
+      `Harness log directory custody check failed for ${harnessLogDir}; inspect the dedicated account home and re-run protect.`,
+      options,
+    );
     this.name = "HarnessLogDirectoryCustodyError";
   }
 }
 
 const HARNESS_LOG_DIR_MODE = 0o700;
-// 2 = the minimum POSIX directory link count for "." plus its parent entry.
-const MIN_DIRECTORY_NLINK = 2;
+const HARNESS_LOG_DIR_MODE_MASK = 0o7777;
+// 1 = the minimum directory link count APFS and POSIX filesystems report for a live directory.
+const MIN_DIRECTORY_NLINK_SANITY = 1;
+// 3 = the first child stdio fd; stdin/stdout/stderr occupy 0, 1, and 2.
+const INHERITED_DIRECTORY_FD = 3;
 
 export interface HarnessLogDirectoryStats {
+  dev: number;
+  ino: number;
   uid: number;
   gid: number;
   mode: number;
@@ -202,6 +211,7 @@ export interface HarnessLogDirectoryStats {
 }
 
 export interface HarnessLogDirectoryHandle {
+  readonly fd?: number;
   chown(uid: number, gid: number): Promise<void>;
   chmod(mode: number): Promise<void>;
   stat(): Promise<HarnessLogDirectoryStats>;
@@ -210,20 +220,122 @@ export interface HarnessLogDirectoryHandle {
 
 export interface HarnessLogDirectoryOps {
   lstat(path: string): Promise<HarnessLogDirectoryStats>;
-  mkdir(path: string, options: { recursive: true; mode: number }): Promise<string | undefined>;
+  mkdir(path: string, options: { recursive: false; mode: number }): Promise<string | undefined>;
   openDirectoryNoFollow(path: string): Promise<HarnessLogDirectoryHandle>;
 }
 
-function assertHarnessLogDirectoryCustody(
+function harnessLogCustodyError(harnessLogDir: string, cause?: unknown): HarnessLogDirectoryCustodyError {
+  return cause === undefined
+    ? new HarnessLogDirectoryCustodyError(harnessLogDir)
+    : new HarnessLogDirectoryCustodyError(harnessLogDir, { cause });
+}
+
+function sameHarnessLogDirectoryIdentity(
+  left: HarnessLogDirectoryStats,
+  right: HarnessLogDirectoryStats,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function harnessLogDirectoryMode(stats: HarnessLogDirectoryStats): number {
+  return stats.mode & HARNESS_LOG_DIR_MODE_MASK;
+}
+
+function assertHarnessLogDirectoryShape(
+  harnessLogDir: string,
   stats: HarnessLogDirectoryStats,
-  expected: { uid: number; gid: number },
-  requireExpectedOwner: boolean,
 ): void {
-  if (!stats.isDirectory() || stats.isSymbolicLink() || stats.nlink < MIN_DIRECTORY_NLINK) {
-    throw new HarnessLogDirectoryCustodyError();
+  if (!stats.isDirectory() || stats.isSymbolicLink() || stats.nlink < MIN_DIRECTORY_NLINK_SANITY) {
+    throw harnessLogCustodyError(harnessLogDir);
   }
-  if (requireExpectedOwner && (stats.uid !== expected.uid || stats.gid !== expected.gid)) {
-    throw new HarnessLogDirectoryCustodyError();
+}
+
+function assertHarnessLogDirectoryOwner(
+  harnessLogDir: string,
+  stats: HarnessLogDirectoryStats,
+  allowedOwners: readonly { uid: number; gid: number }[],
+): void {
+  if (!allowedOwners.some((owner) => stats.uid === owner.uid && stats.gid === owner.gid)) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+function harnessLogDirectoryOwnerIs(stats: HarnessLogDirectoryStats, owner: { uid: number; gid: number }): boolean {
+  return stats.uid === owner.uid && stats.gid === owner.gid;
+}
+
+function assertHarnessLogDirectoryMode(
+  harnessLogDir: string,
+  stats: HarnessLogDirectoryStats,
+  mode: number,
+): void {
+  if (harnessLogDirectoryMode(stats) !== mode) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+function assertHarnessLogDirectoryIdentity(
+  harnessLogDir: string,
+  expected: HarnessLogDirectoryStats,
+  actual: HarnessLogDirectoryStats,
+): void {
+  if (!sameHarnessLogDirectoryIdentity(expected, actual)) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+function runCommandWithInheritedDirectoryFd(
+  command: string,
+  args: readonly string[],
+  fd: number,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe", fd],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+async function clearHarnessLogDirectoryAcl(
+  harnessLogDir: string,
+  handle: HarnessLogDirectoryHandle,
+): Promise<void> {
+  if (osPlatform() !== "darwin") return;
+  if (handle.fd === undefined) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+  const inheritedPath = `/dev/fd/${INHERITED_DIRECTORY_FD}`;
+  const result = await runCommandWithInheritedDirectoryFd("/bin/chmod", ["-N", inheritedPath], handle.fd);
+  if (result.code !== 0) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+}
+
+async function assertHarnessLogDirectoryAclClear(
+  harnessLogDir: string,
+  handle: HarnessLogDirectoryHandle,
+): Promise<void> {
+  if (osPlatform() !== "darwin") return;
+  if (handle.fd === undefined) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+  const inheritedPath = `/dev/fd/${INHERITED_DIRECTORY_FD}`;
+  const result = await runCommandWithInheritedDirectoryFd("/bin/ls", ["-lde", inheritedPath], handle.fd);
+  if (result.code !== 0) {
+    throw harnessLogCustodyError(harnessLogDir);
+  }
+  if (/^\s*\d+:/m.test(result.stdout)) {
+    throw harnessLogCustodyError(harnessLogDir);
   }
 }
 
@@ -238,42 +350,112 @@ export async function ensureHarnessDaemonLogDir(
       open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
   },
 ): Promise<void> {
+  const parent = dirname(harnessLogDir);
+  let parentStats: HarnessLogDirectoryStats;
+  try {
+    parentStats = await ops.lstat(parent);
+  } catch (err) {
+    throw harnessLogCustodyError(harnessLogDir, err);
+  }
+  assertHarnessLogDirectoryShape(harnessLogDir, parentStats);
+  assertHarnessLogDirectoryOwner(harnessLogDir, parentStats, [{ uid, gid }]);
+
   let stats: HarnessLogDirectoryStats | undefined;
   try {
     stats = await ops.lstat(harnessLogDir);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw new HarnessLogDirectoryCustodyError();
+      throw harnessLogCustodyError(harnessLogDir, err);
     }
   }
 
+  const processOwner = {
+    uid: process.geteuid?.() ?? 0,
+    gid: process.getegid?.() ?? 0,
+  };
   if (stats === undefined) {
-    await ops.mkdir(harnessLogDir, { recursive: true, mode: HARNESS_LOG_DIR_MODE });
+    try {
+      await ops.mkdir(harnessLogDir, { recursive: false, mode: HARNESS_LOG_DIR_MODE });
+    } catch (err) {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    }
     try {
       stats = await ops.lstat(harnessLogDir);
-    } catch {
-      throw new HarnessLogDirectoryCustodyError();
+    } catch (err) {
+      throw harnessLogCustodyError(harnessLogDir, err);
     }
-    assertHarnessLogDirectoryCustody(stats, { uid, gid }, false);
-  } else {
-    assertHarnessLogDirectoryCustody(stats, { uid, gid }, true);
+  }
+  assertHarnessLogDirectoryShape(harnessLogDir, stats);
+  assertHarnessLogDirectoryOwner(harnessLogDir, stats, [
+    { uid, gid },
+    processOwner,
+  ]);
+  if (!harnessLogDirectoryOwnerIs(stats, { uid, gid }) && harnessLogDirectoryOwnerIs(stats, processOwner)) {
+    assertHarnessLogDirectoryMode(harnessLogDir, stats, HARNESS_LOG_DIR_MODE);
   }
 
-  // The log directory is re-opened with no-follow directory flags before
-  // ownership or mode changes, so a final path component cannot redirect the
-  // privileged repair to some other filesystem object.
+  // O_NOFOLLOW only rejects a final symlink; fd-vs-lstat identity checks are
+  // the guard that prevents this privileged repair from adopting a renamed
+  // directory. Node has no openat parent-fd API here, so a rename after the
+  // final pre-mutation path check is detected by the post-mutation recheck
+  // rather than made unrepresentable.
   let handle: HarnessLogDirectoryHandle;
   try {
     handle = await ops.openDirectoryNoFollow(harnessLogDir);
-  } catch {
-    throw new HarnessLogDirectoryCustodyError();
+  } catch (err) {
+    throw harnessLogCustodyError(harnessLogDir, err);
   }
+  let mutationCompleted = false;
+  let closeError: unknown;
   try {
-    await handle.chown(uid, gid);
-    await handle.chmod(HARNESS_LOG_DIR_MODE);
-    assertHarnessLogDirectoryCustody(await handle.stat(), { uid, gid }, true);
+    const handleStats = await handle.stat().catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    assertHarnessLogDirectoryShape(harnessLogDir, handleStats);
+    assertHarnessLogDirectoryIdentity(harnessLogDir, stats, handleStats);
+    assertHarnessLogDirectoryOwner(harnessLogDir, handleStats, [
+      { uid, gid },
+      processOwner,
+    ]);
+    if (!harnessLogDirectoryOwnerIs(handleStats, { uid, gid }) && harnessLogDirectoryOwnerIs(handleStats, processOwner)) {
+      assertHarnessLogDirectoryMode(harnessLogDir, handleStats, HARNESS_LOG_DIR_MODE);
+    }
+    const preMutationPathStats = await ops.lstat(harnessLogDir).catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    assertHarnessLogDirectoryIdentity(harnessLogDir, handleStats, preMutationPathStats);
+    await clearHarnessLogDirectoryAcl(harnessLogDir, handle).catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    await handle.chown(uid, gid).catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    await handle.chmod(HARNESS_LOG_DIR_MODE).catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    const repairedStats = await handle.stat().catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    assertHarnessLogDirectoryShape(harnessLogDir, repairedStats);
+    assertHarnessLogDirectoryOwner(harnessLogDir, repairedStats, [{ uid, gid }]);
+    assertHarnessLogDirectoryMode(harnessLogDir, repairedStats, HARNESS_LOG_DIR_MODE);
+    await assertHarnessLogDirectoryAclClear(harnessLogDir, handle);
+    const finalPathStats = await ops.lstat(harnessLogDir).catch((err) => {
+      throw harnessLogCustodyError(harnessLogDir, err);
+    });
+    assertHarnessLogDirectoryIdentity(harnessLogDir, repairedStats, finalPathStats);
+    mutationCompleted = true;
   } finally {
-    await handle.close();
+    try {
+      await handle.close();
+    } catch (caughtCloseError) {
+      if (mutationCompleted) {
+        closeError = caughtCloseError;
+      }
+    }
+  }
+  if (closeError !== undefined) {
+    throw harnessLogCustodyError(harnessLogDir, closeError);
   }
 }
 

@@ -34,9 +34,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink, readdir, rename, open } from "node:fs/promises";
+import { tmpdir, platform as osPlatform, userInfo } from "node:os";
 import { join, dirname, basename } from "node:path";
+import { promisify } from "node:util";
 
 import {
   credentialReadableAsUidDecision,
@@ -67,6 +70,7 @@ import {
   buildHermesExclusiveCliWiring,
   describeRepairCoarseComposition,
   resolveGateDaemonArgvPrefix,
+  type HarnessLogDirectoryStats,
 } from "../../src/wrap/auto-provision.js";
 import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
 import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
@@ -80,6 +84,8 @@ import {
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
 import { parseBootArgs } from "../../src/cli/castle-wall-boot.js";
+
+const execFileAsync = promisify(execFile);
 
 describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
   it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
@@ -1478,6 +1484,62 @@ describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", 
 });
 
 describe("wrap/auto-provision real-ops chokepoint: harness log directory custody", () => {
+  const currentUid = process.getuid?.() ?? 501;
+  const currentGid = process.getgid?.() ?? 20;
+
+  async function makeHarnessLogFixture(prefix = "sanctuary-harness-log-custody-"): Promise<{
+    tmpRoot: string;
+    agentHome: string;
+    logDir: string;
+  }> {
+    const tmpRoot = await mkdtemp(join(tmpdir(), prefix));
+    const agentHome = join(tmpRoot, "agent-home");
+    const logDir = join(agentHome, "logs");
+    await mkdir(agentHome, { mode: 0o700 });
+    return { tmpRoot, agentHome, logDir };
+  }
+
+  async function fileIdentity(path: string): Promise<{
+    dev: number;
+    ino: number;
+    uid: number;
+    gid: number;
+    mode: number;
+  }> {
+    const stats = await stat(path);
+    return {
+      dev: stats.dev,
+      ino: stats.ino,
+      uid: stats.uid,
+      gid: stats.gid,
+      mode: stats.mode & 0o7777,
+    };
+  }
+
+  async function expectCustodyRefusal(action: Promise<unknown>, path: string): Promise<void> {
+    await expect(action).rejects.toMatchObject({
+      name: "HarnessLogDirectoryCustodyError",
+      message: expect.stringContaining(path),
+    });
+  }
+
+  function statsWithOwner(
+    stats: Awaited<ReturnType<typeof lstat>>,
+    uid: number,
+    gid: number,
+  ): HarnessLogDirectoryStats {
+    return {
+      dev: Number(stats.dev),
+      ino: Number(stats.ino),
+      uid,
+      gid,
+      mode: Number(stats.mode),
+      nlink: Number(stats.nlink),
+      isDirectory: () => stats.isDirectory(),
+      isSymbolicLink: () => stats.isSymbolicLink(),
+    };
+  }
+
   it("AGENT-HOME-LOGS-SYMLINK-01: refuses an unsafe pre-existing harness log entry before ownership repair", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-harness-log-custody-"));
     let openedForMutation = false;
@@ -1504,6 +1566,250 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
 
       expect(openedForMutation).toBe(false);
       expect(await readlink(logDir)).toBe(outside);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("creates an absent harness log directory with the expected owner and exact mode", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    try {
+      await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid);
+
+      const logStats = await lstat(logDir);
+      expect(logStats.isDirectory()).toBe(true);
+      expect(logStats.uid).toBe(currentUid);
+      expect(logStats.gid).toBe(currentGid);
+      expect(logStats.mode & 0o7777).toBe(0o700);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an existing agent-owned harness log directory and normalizes its exact mode", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    try {
+      await mkdir(logDir, { mode: 0o755 });
+      await chmod(logDir, 0o755);
+
+      await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid);
+
+      const logStats = await lstat(logDir);
+      expect(logStats.uid).toBe(currentUid);
+      expect(logStats.gid).toBe(currentGid);
+      expect(logStats.mode & 0o7777).toBe(0o700);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a real APFS directory inside the nlink sanity boundary", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture("sanctuary-harness-log-apfs-");
+    try {
+      await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid);
+
+      const logStats = await lstat(logDir);
+      expect(logStats.isDirectory()).toBe(true);
+      expect(logStats.nlink).toBeGreaterThanOrEqual(1);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a harness log directory whose parent is not the dedicated account home shape", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-harness-log-parent-"));
+    const parentLink = join(tmpRoot, "agent-home");
+    const outsideHome = join(tmpRoot, "outside-home");
+    try {
+      await mkdir(outsideHome);
+      await symlink(outsideHome, parentLink);
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(join(parentLink, "logs"), currentUid, currentGid),
+        join(parentLink, "logs"),
+      );
+
+      expect(await readlink(parentLink)).toBe(outsideHome);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an existing harness log directory with the wrong owner before opening it", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    let openedForMutation = false;
+    try {
+      await mkdir(logDir);
+      const parentStats = await lstat(dirname(logDir));
+      const logStats = await lstat(logDir);
+      const expectedUid = currentUid + 1;
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, expectedUid, currentGid, {
+          lstat: async (path) => {
+            if (path === dirname(logDir)) {
+              return statsWithOwner(parentStats, expectedUid, currentGid);
+            }
+            return statsWithOwner(logStats, currentUid, currentGid);
+          },
+          mkdir,
+          openDirectoryNoFollow: async () => {
+            openedForMutation = true;
+            throw new Error("open must not run for an owner mismatch");
+          },
+        }),
+        logDir,
+      );
+
+      expect(openedForMutation).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a regular file at the harness log path", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    try {
+      await writeFile(logDir, "not a directory");
+
+      await expectCustodyRefusal(ensureHarnessDaemonLogDir(logDir, currentUid, currentGid), logDir);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a dangling symlink at the harness log path", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    const missingTarget = join(tmpRoot, "missing-target");
+    try {
+      await symlink(missingTarget, logDir);
+
+      await expectCustodyRefusal(ensureHarnessDaemonLogDir(logDir, currentUid, currentGid), logDir);
+
+      expect(await readlink(logDir)).toBe(missingTarget);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlink swapped in after inspection while the outside target stays unchanged", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    const oldLogDir = join(tmpRoot, "old-logs");
+    const outside = join(tmpRoot, "outside");
+    let swapped = false;
+    try {
+      await mkdir(logDir);
+      await mkdir(outside, { mode: 0o755 });
+      await chmod(outside, 0o755);
+      const beforeOutside = await fileIdentity(outside);
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async (path) => {
+            const stats = await lstat(path);
+            if (path === logDir && !swapped) {
+              swapped = true;
+              await rename(logDir, oldLogDir);
+              await symlink(outside, logDir);
+            }
+            return stats;
+          },
+          mkdir,
+          openDirectoryNoFollow: (path) =>
+            open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
+        }),
+        logDir,
+      );
+
+      expect(await readlink(logDir)).toBe(outside);
+      expect(await fileIdentity(outside)).toEqual(beforeOutside);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a different directory renamed into place between inspection and open", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    const oldLogDir = join(tmpRoot, "old-logs");
+    const replacement = join(tmpRoot, "replacement");
+    let swapped = false;
+    try {
+      await mkdir(logDir);
+      await mkdir(replacement, { mode: 0o755 });
+      await chmod(replacement, 0o755);
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async (path) => {
+            const stats = await lstat(path);
+            if (path === logDir && !swapped) {
+              swapped = true;
+              await rename(logDir, oldLogDir);
+              await rename(replacement, logDir);
+            }
+            return stats;
+          },
+          mkdir,
+          openDirectoryNoFollow: (path) =>
+            open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY),
+        }),
+        logDir,
+      );
+
+      const pathStats = await lstat(logDir);
+      expect(pathStats.mode & 0o7777).toBe(0o755);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a replacement after open before reporting the repair complete", async () => {
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    const oldLogDir = join(tmpRoot, "old-logs");
+    try {
+      await mkdir(logDir);
+
+      await expectCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat,
+          mkdir,
+          openDirectoryNoFollow: async (path) => {
+            const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+            await rename(logDir, oldLogDir);
+            await mkdir(logDir, { mode: 0o755 });
+            await chmod(logDir, 0o755);
+            return handle;
+          },
+        }),
+        logDir,
+      );
+
+      const replacementStats = await lstat(logDir);
+      expect(replacementStats.mode & 0o7777).toBe(0o755);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("clears extended ACLs from the harness log directory on macOS", async () => {
+    if (osPlatform() !== "darwin") return;
+    const { tmpRoot, logDir } = await makeHarnessLogFixture();
+    try {
+      await mkdir(logDir, { mode: 0o755 });
+      await execFileAsync("/bin/chmod", [
+        "+a",
+        `${userInfo().username} allow list,search,readattr`,
+        logDir,
+      ]);
+      const before = await execFileAsync("/bin/ls", ["-lde", logDir]);
+      expect(before.stdout).toMatch(/^\s*\d+:/m);
+
+      await ensureHarnessDaemonLogDir(logDir, currentUid, currentGid);
+
+      const after = await execFileAsync("/bin/ls", ["-lde", logDir]);
+      expect(after.stdout).not.toMatch(/^\s*\d+:/m);
+      const logStats = await lstat(logDir);
+      expect(logStats.mode & 0o7777).toBe(0o700);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
