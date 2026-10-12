@@ -8,7 +8,7 @@
       "agent_id": "0123456789abcdef/uid-60123",
       "admitted_uid": 60123,
       "expected": {
-        "shared": "rule linux-explicit-ip scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
       }
     },
     {
@@ -18,7 +18,7 @@
       "agent_id": "uid-60124",
       "admitted_uid": 60123,
       "expected": {
-        "shared": "rule linux-explicit-ip scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
       }
     },
     {
@@ -28,19 +28,87 @@
       "agent_id": "agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "admitted_uid": 60123,
       "expected": {
-        "shared": "rule rule-rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr... (original length 70) scope.agent_ids entry \"agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa... (original length 73): expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+        "shared": "rule \"rule-rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr... (original length 72) scope.agent_ids entry \"agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa... (original length 73): expected uid-<decimal uid>; re-sign with the uid-<uid> form"
       }
     },
     {
-      "name": "control_and_unusual_id",
+      "name": "wrong_uid_long_rule_id",
+      "kind": "wrong_uid",
+      "rule_id": "rule-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+      "agent_id": "uid-60124",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"rule-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww... (original length 72) scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
+      }
+    },
+    {
+      "name": "rlo_id",
       "kind": "malformed",
       "rule_id": "linux-explicit-ip",
-      "agent_id": "uid-\u0001-\u2028",
+      "agent_id": "uid-\u202e",
       "admitted_uid": 60123,
-      "note": "TypeScript uses JSON.stringify while Rust uses Debug formatting for the displayed agent id, so this case carries language-specific expected strings.",
       "expected": {
-        "typescript": "rule linux-explicit-ip scope.agent_ids entry \"uid-\\u0001-\u2028\": expected uid-<decimal uid>; re-sign with the uid-<uid> form",
-        "rust": "rule linux-explicit-ip scope.agent_ids entry \"uid-\\u{1}-\\u{2028}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{202E}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "zero_width_space_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u200b",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{200B}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "line_separator_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u2028",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{2028}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "del_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u007f",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{007F}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "nul_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u0000",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{0000}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "astral_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\ud83d\ude00",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{1F600}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "long_escaped_id_truncates_after_escape",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u202e\u202e\u202e\u202e\u202e\u202e\u202e\u202e\u202e\u202e\u202e\u202e",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule \"linux-explicit-ip\" scope.agent_ids entry \"uid-\\u{202E}\\u{202E}\\u{202E}\\u{202E}\\u{202E}\\u{202E}\\u{202E}\\u{... (original length 102): expected uid-<decimal uid>; re-sign with the uid-<uid> form"
       }
     }
   ]

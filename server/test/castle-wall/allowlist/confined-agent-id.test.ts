@@ -32,9 +32,22 @@ type RefusalVector = {
   rule_id: string;
   agent_id: string;
   admitted_uid: number;
-  note?: string;
-  expected: { shared?: string; typescript?: string; rust?: string };
+  expected: { shared: string };
 };
+
+const EXPECTED_REFUSAL_CASE_IDS = [
+  "malformed_id",
+  "wrong_uid",
+  "long_rule_and_agent_id",
+  "wrong_uid_long_rule_id",
+  "rlo_id",
+  "zero_width_space_id",
+  "line_separator_id",
+  "del_id",
+  "nul_id",
+  "astral_id",
+  "long_escaped_id_truncates_after_escape",
+] as const;
 
 const refusalVectors = JSON.parse(
   readFileSync(
@@ -70,6 +83,9 @@ describe("confined agent id form", () => {
   });
 
   it("matches the shared full-refusal message vector set", () => {
+    expect(refusalVectors.cases.map((vector) => vector.name)).toEqual([
+      ...EXPECTED_REFUSAL_CASE_IDS,
+    ]);
     for (const vector of refusalVectors.cases) {
       let message = "";
       try {
@@ -80,7 +96,7 @@ describe("confined agent id form", () => {
       } catch (error) {
         message = (error as Error).message;
       }
-      expect(message, vector.name).toBe(vector.expected.typescript ?? vector.expected.shared);
+      expect(message, vector.name).toBe(vector.expected.shared);
     }
   });
 
