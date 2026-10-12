@@ -13,6 +13,7 @@
 //! policy authority and deliberately carries no kernel mutation capability.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -612,27 +613,54 @@ const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
 // Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
 // `server/src/castle-wall/allowlist/bounded-diagnostic-text.ts`.
 const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
+const DIAGNOSTIC_PRINTABLE_ASCII_MIN: u32 = 0x20;
+const DIAGNOSTIC_PRINTABLE_ASCII_MAX: u32 = 0x7e;
+const DIAGNOSTIC_QUOTE_CHAR_COUNT: usize = 2;
 
 fn bounded_diagnostic_text(value: &str) -> String {
-    let original_len = value.chars().count();
-    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
-        return value.to_string();
+    let mut escaped = String::with_capacity(value.len() + DIAGNOSTIC_QUOTE_CHAR_COUNT);
+    escaped.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            c if (DIAGNOSTIC_PRINTABLE_ASCII_MIN..=DIAGNOSTIC_PRINTABLE_ASCII_MAX)
+                .contains(&(c as u32)) =>
+            {
+                escaped.push(c);
+            }
+            c => {
+                // Safety: fmt::Write for String is infallible; it only grows the buffer.
+                write!(&mut escaped, "\\u{{{:04X}}}", c as u32)
+                    .expect("writing to a String cannot fail");
+            }
+        }
     }
-    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+    escaped.push('"');
+    // INVARIANT: diagnostics quote echoed operator text, escape `"`/`\`, render non-printable-ASCII as `\u{XXXX}`,
+    // and then truncate; must match `formatBoundedDiagnosticValue` in
+    // `server/src/castle-wall/allowlist/bounded-diagnostic-text.ts`.
+    let original_len = escaped.chars().count();
+    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
+        return escaped;
+    }
+    let prefix: String = escaped.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
     format!("{prefix}... (original length {original_len})")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfinedAgentScopeError {
     /// Must match `validateLinuxInstallAgentIdScopes` in
-    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts` and
+    /// `castle-wall-daemon/test-vectors/confined-agent-id-refusals-v1.json`.
     MalformedAgentScope {
         rule_id: String,
         agent_id: String,
         expected_form: &'static str,
     },
     /// Must match `validateLinuxInstallAgentIdScopes` in
-    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts` and
+    /// `castle-wall-daemon/test-vectors/confined-agent-id-refusals-v1.json`.
     AgentScopeOutsideAdmission {
         rule_id: String,
         agent_id: String,
@@ -648,9 +676,9 @@ impl std::fmt::Display for ConfinedAgentScopeError {
                 agent_id,
                 expected_form,
             } => {
-                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                // Refusal diagnostics include local rule text, so each echoed value gets one quoted escape rule and display budget.
                 let rule_id_display = bounded_diagnostic_text(rule_id);
-                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                let agent_id_display = bounded_diagnostic_text(agent_id);
                 write!(
                     f,
                     "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
@@ -661,9 +689,9 @@ impl std::fmt::Display for ConfinedAgentScopeError {
                 agent_id,
                 admitted_uid,
             } => {
-                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                // Refusal diagnostics include local rule text, so each echoed value gets one quoted escape rule and display budget.
                 let rule_id_display = bounded_diagnostic_text(rule_id);
-                let agent_id_display = bounded_diagnostic_text(&format!("{agent_id:?}"));
+                let agent_id_display = bounded_diagnostic_text(agent_id);
                 write!(
                     f,
                     "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}; scope agent rules to uid-{admitted_uid}"
@@ -1920,7 +1948,7 @@ mod tests {
         );
         let err = validate_confined_agent_id_scopes(&[malformed], TEST_AGENT_UID).unwrap_err();
         assert!(
-            format!("{err}").contains("rule legacy-scope")
+            format!("{err}").contains("rule \"legacy-scope\"")
                 && format!("{err}").contains("uid-<uid>")
         );
 
@@ -1936,8 +1964,89 @@ mod tests {
         let err = validate_confined_agent_id_scopes(&[gate_uid], TEST_AGENT_UID).unwrap_err();
         let expected = format!("uid-{TEST_AGENT_UID}");
         assert!(
-            format!("{err}").contains("rule gate-scope") && format!("{err}").contains(&expected)
+            format!("{err}").contains("rule \"gate-scope\"")
+                && format!("{err}").contains(&expected)
         );
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ConfinedAgentIdRefusalVectors {
+        version: u32,
+        cases: Vec<ConfinedAgentIdRefusalCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ConfinedAgentIdRefusalCase {
+        name: String,
+        kind: String,
+        rule_id: String,
+        agent_id: String,
+        admitted_uid: u32,
+        expected: ConfinedAgentIdRefusalExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ConfinedAgentIdRefusalExpected {
+        shared: String,
+    }
+
+    const EXPECTED_REFUSAL_CASE_IDS: &[&str] = &[
+        "malformed_id",
+        "wrong_uid",
+        "malformed_quote_rule_and_agent_id",
+        "malformed_backslash_rule_and_agent_id",
+        "wrong_uid_quote_rule_id",
+        "wrong_uid_backslash_rule_id",
+        "long_rule_and_agent_id",
+        "wrong_uid_long_rule_id",
+        "rlo_id",
+        "zero_width_space_id",
+        "line_separator_id",
+        "del_id",
+        "nul_id",
+        "astral_id",
+        "long_escaped_id_truncates_after_escape",
+    ];
+
+    #[test]
+    fn confined_scope_refusals_match_the_shared_message_vector_set() {
+        let vectors: ConfinedAgentIdRefusalVectors = serde_json::from_str(include_str!(
+            "../test-vectors/confined-agent-id-refusals-v1.json"
+        ))
+        .unwrap();
+
+        assert_eq!(vectors.version, 1);
+        let case_ids: Vec<&str> = vectors
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect();
+        assert_eq!(case_ids, EXPECTED_REFUSAL_CASE_IDS);
+        for case in vectors.cases {
+            let rule = rule(
+                &case.rule_id,
+                RuleMatch::default(),
+                RuleScope {
+                    agent_ids: vec![case.agent_id.clone()],
+                    template_ids: Vec::new(),
+                },
+                RuleDisposition::Allow,
+            );
+            let error = validate_confined_agent_id_scopes(&[rule], case.admitted_uid)
+                .expect_err("the vector case must refuse");
+            match (case.kind.as_str(), &error) {
+                ("malformed", ConfinedAgentScopeError::MalformedAgentScope { .. })
+                | ("wrong_uid", ConfinedAgentScopeError::AgentScopeOutsideAdmission { .. }) => {}
+                (other, error) => panic!(
+                    "{} classified as {error:?}, not expected kind {other}",
+                    case.name
+                ),
+            }
+            assert_eq!(error.to_string(), case.expected.shared, "{}", case.name);
+        }
     }
 
     #[test]

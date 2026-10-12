@@ -14,6 +14,38 @@ use castle_wall_daemon::{
     },
 };
 use ed25519_dalek::{Signer, SigningKey};
+
+#[derive(serde::Deserialize)]
+struct ConfinedAgentIdRefusalVectors {
+    version: u32,
+    cases: Vec<ConfinedAgentIdRefusalCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct ConfinedAgentIdRefusalCase {
+    name: String,
+    expected: ConfinedAgentIdRefusalExpected,
+}
+
+#[derive(serde::Deserialize)]
+struct ConfinedAgentIdRefusalExpected {
+    shared: String,
+}
+
+fn shared_confined_refusal_expected(case_name: &str) -> String {
+    let vectors: ConfinedAgentIdRefusalVectors = serde_json::from_str(include_str!(
+        "../test-vectors/confined-agent-id-refusals-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(vectors.version, 1);
+    vectors
+        .cases
+        .into_iter()
+        .find(|case| case.name == case_name)
+        .map(|case| case.expected.shared)
+        .unwrap_or_else(|| panic!("missing confined-agent refusal vector case {case_name}"))
+}
+
 fn rule_body(scope: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "id": "linux-explicit-ip",
@@ -434,10 +466,7 @@ fn launch_refuses_existing_install_with_non_confined_scope_before_start() {
         Ok(_) => panic!("non-confined installed scope was admitted for launch"),
         Err(err) => err.to_string(),
     };
-    assert_eq!(
-        err,
-        "rule linux-explicit-ip scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
-    );
+    assert_eq!(err, shared_confined_refusal_expected("malformed_id"));
     // No state assertion here: `read_installed` takes the transaction by shared reference. The start and
     // enable paths call it before any systemctl invocation (linux_install/command.rs and arch/command.rs
     // `manager_action`), so a refusal leaves running units under their current confinement.
