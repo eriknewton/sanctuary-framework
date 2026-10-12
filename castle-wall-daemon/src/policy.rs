@@ -343,8 +343,10 @@ fn matches_suffix_pattern(pattern: &str, host_lower: &str) -> bool {
 ///
 /// `deny_unknown_fields`: scope fields carry enforcement semantics too — an
 /// ignored (unmodeled) scope axis would apply a rule to MORE agents than the
-/// operator intended. The TS scope surface (agent_ids / template_ids) is
-/// fully modeled, so unknown fields are rejected (fail closed).
+/// operator intended. Must match `LINUX_DAEMON_RULE_SCOPE_AXES` in
+/// server/src/castle-wall/runtime/linux-policy-compatibility.ts. The TS
+/// Linux signing subset may be narrower while an axis is modeled but not yet
+/// attestable; unknown fields are rejected (fail closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuleScope {
