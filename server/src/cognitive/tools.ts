@@ -1792,12 +1792,22 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        return args;
+      },
       handler: async (args) => {
-        // THE NAMESPACE FIREWALL IS NOT APPLIED HERE. It lives inside
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        // The reserved/opaque namespace firewall lives inside
         // `discloseUnattributedState` with the rest of this operation's
         // obligations, so the CLI verb cannot ship without it; this handler
-        // only RENDERS the two refusals it can return. Applying it here as
-        // well would recreate the divergence that move closed.
+        // only renders the two refusal shapes it can return.
         //
         // FAIL CLOSED ON A MISSING AUDIT LOG. `auditLog` is optional on this
         // factory, and the shared `recordCriticalAudit` helper above silently

@@ -124,7 +124,7 @@ describe("storage namespace names", () => {
       const filesystem = new FilesystemStorage(basePath);
       const memory = new MemoryStorage();
       for (const storage of [filesystem, memory]) {
-        for (const namespace of ["notes", "a.b", ".visible"]) {
+        for (const namespace of ["notes", "a.b", ".visible", "..notes", "..visible"]) {
           await storage.write(namespace, "k", new Uint8Array([namespace.length]));
           expect(await storage.read(namespace, "k")).toEqual(
             new Uint8Array([namespace.length])

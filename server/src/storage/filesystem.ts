@@ -380,6 +380,8 @@ interface BoundStorageContext {
   darwinNamespaceClient?: DarwinDirectoryCapabilityClient;
 }
 
+// Must match DARWIN_BOUND_NAMESPACE_TOKEN in directory-capability-worker.ts:
+// this is an internal capability token, not a caller-supplied namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
 export class FilesystemStorage implements StorageBackend, FilesystemStorageCapabilities, NamespaceLockStorageCapabilities {
@@ -444,7 +446,13 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   private activeNamespacePath(namespace: string): string {
-    if (this.allowDirectoryCapabilityRootNamespace && namespace === ".") {
+    // The Darwin worker's locked-namespace client uses an internal token to
+    // address its cwd; a literal "." from a caller must still take the normal
+    // namespace path and be refused by the shared component predicate.
+    if (
+      this.allowDirectoryCapabilityRootNamespace &&
+      namespace === DARWIN_BOUND_NAMESPACE_TOKEN
+    ) {
       return this.activeBasePath();
     }
     const bound = this.boundBasePath.getStore();
@@ -1255,12 +1263,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
           total += fileStat.size;
         }
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        // If base path doesn't exist yet, total is 0
-        return 0;
-      }
-      throw error;
+    } catch {
+      // If base path doesn't exist yet, total is 0
+      return 0;
     }
 
     return total;

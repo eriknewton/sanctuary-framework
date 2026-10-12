@@ -628,6 +628,49 @@ describe("withCrossProcessLock", () => {
   );
 
   it.runIf(process.platform === "darwin")(
+    "keeps non-locked namespace mutations on the acquired root inode and refuses the root namespace string",
+    async () => {
+      // NAMESPACE-DOT-PATH-ESCAPE-01
+      const statePath = join(base, "state");
+      const displaced = join(base, "state.displaced");
+      const otherNamespace = "other";
+      const operation = withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async (lease) => {
+          await expect(
+            storage.write(".", "root-string-write", new Uint8Array([3])),
+          ).rejects.toThrow(/namespace/);
+
+          await storage.write(otherNamespace, "before-swap", new Uint8Array([1]));
+          renameSync(statePath, displaced);
+          mkdirSync(join(statePath, otherNamespace), { recursive: true });
+          await storage.write(otherNamespace, "after-swap", new Uint8Array([2]));
+          lease.assertHeld();
+        },
+        {
+          kernelBacked: true,
+        },
+      );
+
+      const outcome = await operation.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (outcome !== undefined) {
+        expect(outcome).toMatchObject({ kind: "holder-lost" });
+      }
+      await expect(
+        new FilesystemStorage(statePath).read(otherNamespace, "after-swap"),
+      ).resolves.toBeNull();
+      await expect(
+        new FilesystemStorage(displaced).read(otherNamespace, "after-swap"),
+      ).resolves.toEqual(new Uint8Array([2]));
+    },
+  );
+
+  it.runIf(process.platform === "darwin")(
     "bounds a stuck directory worker and leaves the target absent",
     async () => {
       let capabilityPid = 0;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -62,6 +62,13 @@ async function snapshotNames(path: string): Promise<string[]> {
   }
 }
 
+async function snapshotSentinel(path: string): Promise<{ names: string[]; bytes: Buffer }> {
+  return {
+    names: await snapshotNames(path),
+    bytes: await readFile(join(path, "k.enc")),
+  };
+}
+
 function parseToolPayload(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
   const content = result.content;
   if (!Array.isArray(content) || content[0]?.type !== "text") {
@@ -104,8 +111,16 @@ describe("state tool namespace names", () => {
         }),
         auditLog
       );
+      await mkdir(fortressPath, { recursive: true, mode: 0o700 });
+      await writeFile(join(fortressPath, "k.enc"), Buffer.from("operator-sentinel"));
+
       const server = createServer(
-        selectedTools(tools, ["identity_create", "state_write", "state_delete"]),
+        selectedTools(tools, [
+          "identity_create",
+          "state_write",
+          "state_delete",
+          "state_disclose_unattributed",
+        ]),
         { gate, auditLog }
       );
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -124,7 +139,7 @@ describe("state tool namespace names", () => {
         approvalRequests = 0;
 
         for (const namespace of INVALID_NAMESPACES) {
-          const beforeParent = await snapshotNames(fortressPath);
+          const beforeParent = await snapshotSentinel(fortressPath);
           const write = parseToolPayload(
             await client.callTool({
               name: "state_write",
@@ -145,8 +160,16 @@ describe("state tool namespace names", () => {
             })
           );
           expect(deleteResult.denied).toBe(true);
+
+          const disclosure = parseToolPayload(
+            await client.callTool({
+              name: "state_disclose_unattributed",
+              arguments: { namespace, key: "k" },
+            })
+          );
+          expect(disclosure.denied).toBe(true);
           expect(approvalRequests).toBe(0);
-          expect(await snapshotNames(fortressPath)).toEqual(beforeParent);
+          expect(await snapshotSentinel(fortressPath)).toEqual(beforeParent);
         }
       } finally {
         await client.close().catch(() => {});
@@ -162,13 +185,17 @@ describe("state tool namespace names", () => {
     const storage = new MemoryStorage();
     const stateStore = new StateStore(storage, masterKey);
     const bundle = legacyBundleForNamespace(".");
+    await storage.write("safe", "keep", new Uint8Array([8, 9]));
 
     await expect(
       stateStore.import(bundle, "overwrite", () => null, {
         allowUnverifiedLegacy: true,
       })
     ).rejects.toThrow(/namespace/);
-    expect(await storage.listNamespaces()).toEqual([]);
+    expect(await storage.read("safe", "keep")).toEqual(new Uint8Array([8, 9]));
+    expect((await storage.listNamespaces()).filter((name) => !name.startsWith("_"))).toEqual([
+      "safe",
+    ]);
   });
 
   it("refuses state_import bundles naming a namespace that is not a single path component before approval is requested", async () => {
@@ -176,6 +203,7 @@ describe("state tool namespace names", () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, masterKey);
     const stateStore = new StateStore(storage, masterKey);
+    await storage.write("safe", "keep", new Uint8Array([1, 3]));
     const { tools, identityManager } = createCognitiveTools(
       stateStore,
       storage,
@@ -223,7 +251,10 @@ describe("state tool namespace names", () => {
       );
       expect(payload.denied).toBe(true);
       expect(approvalRequests).toBe(0);
-      expect(await storage.listNamespaces()).toEqual([]);
+      expect(await storage.read("safe", "keep")).toEqual(new Uint8Array([1, 3]));
+      expect((await storage.listNamespaces()).filter((name) => !name.startsWith("_"))).toEqual([
+        "safe",
+      ]);
     } finally {
       await client.close().catch(() => {});
       await server.close().catch(() => {});
@@ -252,7 +283,7 @@ describe("state tool namespace names", () => {
     const identityResult = await identityTool.handler({ label: "ordinary-names" });
     const identity = JSON.parse(identityResult.content[0]!.text) as { identity_id: string };
 
-    for (const namespace of ["notes", "a.b", ".visible"]) {
+    for (const namespace of ["notes", "a.b", ".visible", "..notes", "..visible"]) {
       const write = JSON.parse(
         (await writeTool.handler({
           namespace,

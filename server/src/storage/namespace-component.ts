@@ -75,13 +75,13 @@ export function resolveStorageNamespacePath(
   // A namespace is a single directory under the storage base; any other shape would let a caller address files outside the namespace tree.
   if (
     baseRelative === "" ||
-    baseRelative.startsWith("..") ||
+    baseRelative === ".." ||
     isAbsolute(baseRelative) ||
     baseRelative.includes(sep)
   ) {
     throw new InvalidStorageNamespaceError(namespace);
   }
-  return resolved;
+  return join(basePath, component);
 }
 
 export function resolveEncodedStorageNamespacePath(

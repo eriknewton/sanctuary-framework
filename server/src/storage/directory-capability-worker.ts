@@ -30,11 +30,15 @@ interface Request {
   args: unknown[];
 }
 
+// Must match DARWIN_BOUND_NAMESPACE_TOKEN in filesystem.ts: only the parent
+// storage backend sends this internal token for the worker's bound namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
 function namespaceArg(value: unknown): string {
   const namespace = String(value);
-  return namespace === DARWIN_BOUND_NAMESPACE_TOKEN ? "." : namespace;
+  return namespace === DARWIN_BOUND_NAMESPACE_TOKEN
+    ? DARWIN_BOUND_NAMESPACE_TOKEN
+    : namespace;
 }
 
 function bytes(value: unknown): Uint8Array {
