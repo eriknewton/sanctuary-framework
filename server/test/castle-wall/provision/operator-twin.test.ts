@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { link, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -165,6 +165,18 @@ function installFsOps(host: TwinHost): void {
   };
 }
 
+
+/** Reads content and owner through one descriptor, so both describe the same file. */
+async function readContentAndOwner(path: string): Promise<{ content: string; uid: number }> {
+  const handle = await open(path, "r");
+  try {
+    const info = await handle.stat();
+    return { content: await handle.readFile("utf8"), uid: info.uid };
+  } finally {
+    await handle.close();
+  }
+}
+
 describe("operator twin stand-down", () => {
   it("snapshots the operator LaunchAgent and disables before bootout", async () => {
     const host = makeTwinHost();
@@ -270,14 +282,15 @@ describe("operator twin stand-down", () => {
     const outside = join(dirnameForTest(descriptor.plistPath), "outside.plist");
     await writeFile(outside, "<plist>outside</plist>", { mode: 0o644 });
     await symlink(outside, descriptor.plistPath);
-    const ownerBefore = await stat(outside);
+    const ownerBefore = await readContentAndOwner(outside);
 
     const report = await restoreOperatorTwinStandDown(snapshotFor(descriptor), host.ops);
 
     expect(report.restored).toBe(false);
     expect(report.problems.some((problem) => problem.includes("restore_problem"))).toBe(true);
-    expect(await readFile(outside, "utf8")).toBe("<plist>outside</plist>");
-    expect((await stat(outside)).uid).toBe(ownerBefore.uid);
+    const outsideAfter = await readContentAndOwner(outside);
+    expect(outsideAfter.content).toBe("<plist>outside</plist>");
+    expect(outsideAfter.uid).toBe(ownerBefore.uid);
     expect(host.disabled).toBe(true);
     expect(host.loaded).toBe(false);
     expect(host.running).toBe(false);
@@ -294,14 +307,15 @@ describe("operator twin stand-down", () => {
     await writeFile(outside, "<plist>outside</plist>", { mode: 0o644 });
     await link(outside, descriptor.plistPath);
     expect((await lstat(descriptor.plistPath)).nlink).toBe(MULTI_ENTRY_LINK_COUNT);
-    const ownerBefore = await stat(outside);
+    const ownerBefore = await readContentAndOwner(outside);
 
     const report = await restoreOperatorTwinStandDown(snapshotFor(descriptor), host.ops);
 
     expect(report.restored).toBe(false);
     expect(report.problems.some((problem) => problem.includes("restore_problem"))).toBe(true);
-    expect(await readFile(outside, "utf8")).toBe("<plist>outside</plist>");
-    expect((await stat(outside)).uid).toBe(ownerBefore.uid);
+    const outsideAfter = await readContentAndOwner(outside);
+    expect(outsideAfter.content).toBe("<plist>outside</plist>");
+    expect(outsideAfter.uid).toBe(ownerBefore.uid);
     expect(host.disabled).toBe(true);
     expect(host.loaded).toBe(false);
     expect(host.running).toBe(false);
