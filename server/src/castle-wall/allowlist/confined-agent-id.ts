@@ -7,6 +7,7 @@
 
 import type { AllowlistRule } from "./schema.js";
 import { isGenuineDerivedHabeasRule } from "./habeas-port.js";
+import { formatBoundedDiagnosticValue } from "./bounded-diagnostic-text.js";
 
 // Must match `CONFINED_AGENT_ID_PREFIX` in `castle-wall-daemon/src/nftables.rs`.
 export const CONFINED_AGENT_ID_PREFIX = "uid-";
@@ -61,16 +62,18 @@ export function validateLinuxInstallAgentIdScopes(
     for (const agentId of rule.scope.agent_ids ?? []) {
       const uid = parseConfinedAgentId(agentId);
       if (uid === null) {
+        // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
         throw new LinuxInstallAgentIdScopeError(
-          `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
+          `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
       }
       // The Linux daemon binds and queues only the agent uid (enforced by nftables.rs `binding_set_rule`), so a scope naming
       // any other uid, including a gate uid, can never match; the admitted confined-id set is the agent uid
       // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
+        // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
         throw new LinuxInstallAgentIdScopeError(
-          `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected admitted uid ${admittedUid}`,
+          `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected admitted uid ${admittedUid}`,
         );
       }
     }

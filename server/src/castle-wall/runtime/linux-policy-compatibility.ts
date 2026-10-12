@@ -15,21 +15,39 @@ import {
   validateLinuxInstallAgentIdScopes,
 } from "../allowlist/confined-agent-id.js";
 import {
+  formatBoundedDiagnosticList,
+  formatBoundedDiagnosticValue,
+} from "../allowlist/bounded-diagnostic-text.js";
+import {
   publishSignedManifest,
   type BuildSignedManifestInput,
   type ManifestStorage,
 } from "./manifest-publisher.js";
 import { RuntimeLinuxActivationError } from "./errors.js";
 
+// Must match `RuleScope` in castle-wall-daemon/src/policy.rs.
+export const LINUX_DAEMON_RULE_SCOPE_AXES = Object.freeze([
+  "agent_ids",
+  "template_ids",
+] as const);
+
+const LINUX_DAEMON_RULE_SCOPE_AXIS_SET = new Set<string>(LINUX_DAEMON_RULE_SCOPE_AXES);
+
+export const LINUX_SIGNABLE_SCOPE_AXES = Object.freeze(["agent_ids"] as const);
+
 export const LINUX_IP_CIDR_POLICY_PROFILE = Object.freeze({
   id: "linux-ip-cidr-v1",
   destination_axes: Object.freeze(["ip", "cidr"] as const),
   optional_match_axes: Object.freeze(["port", "protocol"] as const),
-  supported_scope_axes: Object.freeze(["agent_ids", "uids"] as const),
+  daemon_modeled_scope_axes: LINUX_DAEMON_RULE_SCOPE_AXES,
+  supported_scope_axes: LINUX_SIGNABLE_SCOPE_AXES,
+  scope_axis_subset_reason:
+    "template_ids is modeled by the daemon RuleScope but is not signable until template attestation is available; uids is macOS-only and is not modeled by the Linux daemon.",
   refused_axes: Object.freeze([
     "host",
     "host_pattern",
     "template_ids",
+    "uids",
     "time_window",
   ] as const),
 });
@@ -38,6 +56,7 @@ export type LinuxPolicyCompatibilityAxis =
   | "match.host"
   | "match.host_pattern"
   | "match.destination"
+  | `scope.${string}`
   | "scope.template_ids"
   | "time_window";
 
@@ -78,6 +97,19 @@ export function inspectLinuxPolicyCompatibility(
         reason: "authenticated DNS/SNI binding is unavailable",
       });
     }
+    for (const axis of Object.keys(rule.scope ?? {})) {
+      if (LINUX_DAEMON_RULE_SCOPE_AXIS_SET.has(axis)) continue;
+      // The Linux signer must refuse a scope axis before signing because the
+      // Rust loader rejects unmodeled scope fields at parse time.
+      issues.push({
+        ruleId: rule.id,
+        axis: `scope.${axis}`,
+        reason:
+          axis === "uids"
+            ? "macOS-only scope axis is not modeled by the Linux daemon"
+            : "scope axis is not modeled by the Linux daemon",
+      });
+    }
     if ((rule.scope.template_ids?.length ?? 0) > 0) {
       issues.push({
         ruleId: rule.id,
@@ -99,9 +131,12 @@ export function inspectLinuxPolicyCompatibility(
 export function assertLinuxPolicyCompatibility(rules: readonly AllowlistRule[]): void {
   const issues = inspectLinuxPolicyCompatibility(rules);
   if (issues.length === 0) return;
-  const summary = issues
-    .map((issue) => `${issue.ruleId}:${issue.axis} (${issue.reason})`)
-    .join("; ");
+  const summary = formatBoundedDiagnosticList(
+    issues,
+    (issue) =>
+      // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+      `${formatBoundedDiagnosticValue(issue.ruleId)}:${formatBoundedDiagnosticValue(issue.axis)} (${issue.reason})`,
+  );
   throw new RuntimeLinuxActivationError(
     `Castle Wall Linux policy is incompatible with ${LINUX_IP_CIDR_POLICY_PROFILE.id}: ${summary}`,
     "policy_incompatible"
