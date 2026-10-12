@@ -248,9 +248,8 @@ describe("the unattributed-disclosure MCP tool", () => {
   });
 
   it("refuses an opaque memory handle owned by another session", async () => {
-    const { tool, namespaceRegistry, auditLog } = await makeRig();
-    const someoneElsesHandle =
-      namespaceRegistry.issueMemoryHandle("another-identity");
+    const { tool, auditLog } = await makeRig();
+    const someoneElsesHandle = "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     const payload = parseToolResult(
       await tool!.handler({ namespace: someoneElsesHandle, key: "anything" })
