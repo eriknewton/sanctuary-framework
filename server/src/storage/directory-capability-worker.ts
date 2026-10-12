@@ -120,6 +120,9 @@ async function perform(
   switch (request.op) {
     case "write": {
       const { namespace, args } = requestNamespaceArg(request);
+      // This child is only the cwd-bound executor for FilesystemStorage.write;
+      // StateStore provenance is minted by the parent before export-eligible
+      // state reaches this backend, and the child only preserves that write.
       await storage.write(namespace, String(args[0]), bytes(args[1]));
       return null;
     }
