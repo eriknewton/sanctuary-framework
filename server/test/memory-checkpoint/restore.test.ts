@@ -16,7 +16,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
-  type StateExportCompletenessManifest,
+  StateImportPartialApplyError,
+  StateVerificationError,
   type StateStore,
 } from "../../src/cognitive/state-store.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -29,15 +30,16 @@ import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 import { StateStore as RealStateStore } from "../../src/cognitive/state-store.js";
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
-import { MemoryStorage } from "../../src/storage/memory.js";
-import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   CheckpointRestoreAgentNotParkedError,
   CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
   CheckpointRestoreBundleHashMismatchError,
   CheckpointRestoreForensicSourceError,
   CheckpointRestoreReconstructError,
+  CheckpointRestoreVersionFloorError,
   MemoryCheckpointStore,
   buildMemoryCheckpointId,
   createCheckpoint,
@@ -62,6 +64,15 @@ interface Fixture {
   audit: ReturnType<typeof makeAuditLog>;
 }
 
+class HookedMemoryStorage extends MemoryStorage {
+  beforeWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
+
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    await this.beforeWrite?.(namespace, key);
+    await super.write(namespace, key, data);
+  }
+}
+
 interface ExportEntry {
   key: string;
   entry: {
@@ -73,7 +84,11 @@ interface ExportEntry {
 interface DecodedExportBundle {
   namespaces: string[];
   data: Record<string, ExportEntry[]>;
+  completeness_manifest?: unknown;
+  bundle_integrity?: unknown;
 }
+
+const HMAC_SHA256_BYTE_LENGTH = 32;
 
 const tempDirs: string[] = [];
 
@@ -89,9 +104,11 @@ async function makeTempFortress(): Promise<string> {
   return dir;
 }
 
-async function makeFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
+async function makeFixture(
+  now = "2026-08-03T12:00:00.000Z",
+  storage: StorageBackend = new MemoryStorage(),
+): Promise<Fixture> {
   const fortressPath = await makeTempFortress();
-  const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new RealStateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -113,7 +130,9 @@ async function makeFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
   };
 }
 
-async function makeFilesystemFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
+async function makeFilesystemFixture(
+  now = "2026-08-03T12:00:00.000Z",
+): Promise<Fixture> {
   const fortressPath = await makeTempFortress();
   const statePath = join(fortressPath, "state");
   await mkdir(statePath, { recursive: true, mode: 0o700 });
@@ -129,8 +148,8 @@ async function makeFilesystemFixture(now = "2026-08-03T12:00:00.000Z"): Promise<
   });
   return {
     fortressPath,
-    statePath,
     storage,
+    statePath,
     stateStore,
     checkpointStore,
     masterKey,
@@ -211,6 +230,29 @@ function decodeBundle(bundle: string): DecodedExportBundle {
   return JSON.parse(bytesToString(fromBase64url(bundle))) as DecodedExportBundle;
 }
 
+function encodeBundle(bundle: DecodedExportBundle): string {
+  return toBase64url(stringToBytes(JSON.stringify(bundle)));
+}
+
+function stripCompleteness(bundle: string): string {
+  const decoded = decodeBundle(bundle);
+  delete decoded.completeness_manifest;
+  delete decoded.bundle_integrity;
+  return encodeBundle(decoded);
+}
+
+function replaceBundleIntegrityMac(bundle: string): string {
+  const decoded = decodeBundle(bundle);
+  const integrity = decoded.bundle_integrity;
+  if (!integrity || typeof integrity !== "object" || Array.isArray(integrity)) {
+    throw new Error("missing bundle integrity");
+  }
+  (integrity as Record<string, unknown>).mac = toBase64url(
+    new Uint8Array(HMAC_SHA256_BYTE_LENGTH),
+  );
+  return encodeBundle(decoded);
+}
+
 function entriesByPath(bundle: DecodedExportBundle): Map<string, ExportEntry["entry"]> {
   const out = new Map<string, ExportEntry["entry"]>();
   for (const [namespace, entries] of Object.entries(bundle.data)) {
@@ -224,6 +266,45 @@ function entriesByPath(bundle: DecodedExportBundle): Map<string, ExportEntry["en
 async function exportEntries(stateStore: RealStateStore): Promise<Map<string, ExportEntry["entry"]>> {
   const exported = await stateStore.exportNamespaces(undefined);
   return entriesByPath(decodeBundle(exported.bundle));
+}
+
+async function createCheckpointFromBundle(
+  fixture: Fixture,
+  bundle: string,
+  createdAt: string,
+): Promise<string> {
+  const decoded = decodeBundle(bundle);
+  const bundleHash = hashToString(fromBase64url(bundle));
+  const id = buildMemoryCheckpointId(createdAt, bundleHash);
+  const perNamespace: Record<string, { item_count: number; content_sha256: string }> = {};
+  let totalKeys = 0;
+  for (const [namespace, entries] of Object.entries(decoded.data)) {
+    perNamespace[namespace] = {
+      item_count: entries.length,
+      content_sha256: hashToString(stringToBytes(JSON.stringify(entries))),
+    };
+    totalKeys += entries.length;
+  }
+  await fixture.checkpointStore.create({
+    record: {
+      id,
+      created_at: createdAt,
+      source: "on_demand",
+      namespaces: decoded.namespaces,
+      total_keys: totalKeys,
+      bundle_hash: bundleHash,
+      completeness_summary: {
+        namespace_count: decoded.namespaces.length,
+        total_keys: totalKeys,
+        per_namespace: perNamespace,
+      },
+      retention_expires_at: null,
+      format_version: 1,
+    },
+    bundle,
+    masterKey: fixture.masterKey,
+  });
+  return id;
 }
 
 function expectPoisonSummary(
@@ -412,7 +493,7 @@ describe("restoreCheckpoint", () => {
     expectPoisonSummary(critical!, restored.poison_map);
   });
 
-  it.each(["below floor", "anchor I/O failure"])("refuses warm restore on %s before any write or deletion", async (failure) => {
+  it.each(["below floor", "anchor I/O failure"])("handles warm restore preflight %s before any write or deletion", async (failure) => {
     const fixture = await makeFixture();
     await writeEntry(fixture, "alpha", "Q", "eligible");
     await writeEntry(fixture, "beta", "Q", "original");
@@ -438,7 +519,7 @@ describe("restoreCheckpoint", () => {
     const deleteSpy = vi.spyOn(fixture.storage, "delete");
     const auditCount = fixture.audit.criticalCalls.length;
     try {
-      await expect(restoreCheckpoint({
+      const restore = restoreCheckpoint({
         stateStore: fixture.stateStore,
         checkpointStore: fixture.checkpointStore,
         masterKey: fixture.masterKey,
@@ -447,10 +528,24 @@ describe("restoreCheckpoint", () => {
         checkpointId: checkpoint.id,
         assessParked: parkedClaim,
         publicKeyResolver: publicKeyResolver(fixture),
-      })).rejects.toThrow(CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL);
+      });
+      if (failure === "below floor") {
+        await expect(restore).rejects.toThrow(CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL);
+        expect(fixture.audit.criticalCalls).toHaveLength(auditCount);
+      } else {
+        await expect(restore).rejects.toThrow("injected anchor read failure");
+        expect(fixture.audit.criticalCalls).toHaveLength(auditCount + 1);
+        expect(fixture.audit.criticalCalls.at(-1)).toMatchObject({
+          operation: "memory_checkpoint_restore",
+          result: "failure",
+          details: {
+            checkpoint_id: checkpoint.id,
+            error_reason: "restore_failed",
+          },
+        });
+      }
       expect(writeSpy).not.toHaveBeenCalled();
       expect(deleteSpy).not.toHaveBeenCalled();
-      expect(fixture.audit.criticalCalls).toHaveLength(auditCount);
       expect(await fixture.checkpointStore.list()).toHaveLength(1);
     } finally {
       readSpy.mockRestore();
@@ -459,16 +554,14 @@ describe("restoreCheckpoint", () => {
     }
   });
 
-  it.each(["below", "above"] as const)("refuses a legacy checkpoint %s its anchor before mutation", async (position) => {
+  it("refuses a legacy checkpoint below its anchor before mutation", async () => {
     const fixture = await makeFixture();
     const namespace = "legacy";
     const key = "note";
     const plaintext = stringToBytes("legacy value");
     const payload = encrypt(plaintext, deriveNamespaceKey(fixture.masterKey, namespace));
-    // Two versions distinguish the legacy ceiling from the ordinary lower floor.
-    const legacyVersion = position === "above" ? 2 : 1;
     await fixture.storage.write(namespace, key, stringToBytes(JSON.stringify({
-      v: 1, payload, ver: legacyVersion,
+      v: 1, payload, ver: 1,
       sig: toBase64url(sign(fromBase64url(payload.ct),
         fixture.identity.storedIdentity.encrypted_private_key, fixture.identityEncKey)),
       kid: fixture.identity.storedIdentity.identity_id,
@@ -483,7 +576,7 @@ describe("restoreCheckpoint", () => {
     });
     await fixture.stateStore.delete(namespace, key);
     await writeEntry(fixture, namespace, key, "recreated");
-    if (position === "below") await writeEntry(fixture, namespace, key, "advanced");
+    await writeEntry(fixture, namespace, key, "advanced");
     await writeEntry(fixture, "added", "preserve", "post-checkpoint");
     const writeSpy = vi.spyOn(fixture.storage, "write");
     const deleteSpy = vi.spyOn(fixture.storage, "delete");
@@ -503,6 +596,120 @@ describe("restoreCheckpoint", () => {
       writeSpy.mockRestore();
       deleteSpy.mockRestore();
     }
+  });
+
+  it.each([
+    {
+      name: "missing completeness",
+      mutate: stripCompleteness,
+      reason: "integrity_hash_mismatch",
+      message: "allow_unverified_legacy",
+    },
+    {
+      name: "bundle integrity MAC",
+      mutate: replaceBundleIntegrityMac,
+      reason: "integrity_hash_mismatch",
+      message: "integrity",
+    },
+  ])("keeps $name restore preflight classification and writes the critical audit", async ({ mutate, reason, message }) => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "checkpoint");
+    const exported = await fixture.stateStore.exportNamespaces(["mem"]);
+    const checkpointId = await createCheckpointFromBundle(
+      fixture,
+      mutate(exported.bundle),
+      "2026-08-03T12:08:00.000Z",
+    );
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(StateVerificationError);
+    expect(thrown).not.toBeInstanceOf(CheckpointRestoreVersionFloorError);
+    expect((thrown as StateVerificationError).classification).toBe(reason);
+    expect((thrown as Error).message).toContain(message);
+    expect(fixture.audit.criticalCalls.at(-1)).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        checkpoint_id: checkpointId,
+        error_reason: reason,
+      },
+    });
+  });
+
+  it("keeps a legacy checkpoint ceiling classification and writes the critical audit", async () => {
+    const fixture = await makeFixture();
+    const namespace = "legacy";
+    const key = "above-anchor";
+    const plaintext = stringToBytes("legacy value");
+    const payload = encrypt(plaintext, deriveNamespaceKey(fixture.masterKey, namespace));
+    await fixture.storage.write(namespace, key, stringToBytes(JSON.stringify({
+      v: 1,
+      payload,
+      ver: 2,
+      sig: toBase64url(sign(
+        fromBase64url(payload.ct),
+        fixture.identity.storedIdentity.encrypted_private_key,
+        fixture.identityEncKey,
+      )),
+      kid: fixture.identity.storedIdentity.identity_id,
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-10-02T12:00:00.000Z" },
+    })));
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+    });
+    await fixture.stateStore.delete(namespace, key);
+    await writeEntry(fixture, namespace, key, "recreated");
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(StateVerificationError);
+    expect(thrown).not.toBeInstanceOf(CheckpointRestoreVersionFloorError);
+    expect((thrown as StateVerificationError).classification).toBe("rollback_detected");
+    expect((thrown as Error).message).toContain("legacy (v1)");
+    expect(fixture.audit.criticalCalls.at(-1)).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        checkpoint_id: checkpoint.id,
+        error_reason: "rollback_detected",
+      },
+    });
   });
 
   it("refuses to restore from a forensic quarantine checkpoint", async () => {
@@ -561,8 +768,15 @@ describe("restoreCheckpoint", () => {
       | "preflightImportStorageNames"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
-      assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
-      preflightImportStorageNames: (bundle) => fixture.stateStore.preflightImportStorageNames(bundle),
+      preflightImportStorageNames: (bundle) =>
+        fixture.stateStore.preflightImportStorageNames(bundle),
+      assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
+        fixture.stateStore.assertImportVersionFloors(
+          bundle,
+          conflictResolution,
+          resolver,
+          options
+        ),
       delete: async () => {
         throw new Error("injected reconstruct failure");
       },
@@ -710,6 +924,216 @@ describe("restoreCheckpoint", () => {
     ).rejects.toThrow(/storage name this version cannot address/);
 
     expect(await exportEntries(fixture.stateStore)).toEqual(liveBefore);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
+  it("records partial checkpoint import progress when reconstruct import partially applies", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:09:00.000Z"),
+    });
+    const partial = new StateImportPartialApplyError(
+      new StateVerificationError(
+        "rollback_detected",
+        "injected checkpoint import refusal",
+        "version_below_floor",
+      ),
+      [{ namespace: "mem", key: "Q" }],
+      { namespace: "mem", key: "R" },
+    );
+    const failingStateStore: Pick<
+      StateStore,
+      | "exportNamespaces"
+      | "delete"
+      | "import"
+      | "assertImportVersionFloors"
+      | "preflightImportStorageNames"
+    > = {
+      exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
+      preflightImportStorageNames: (bundle) =>
+        fixture.stateStore.preflightImportStorageNames(bundle),
+      assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
+        fixture.stateStore.assertImportVersionFloors(
+          bundle,
+          conflictResolution,
+          resolver,
+          options,
+        ),
+      delete: (namespace, key) => fixture.stateStore.delete(namespace, key),
+      import: async () => {
+        throw partial;
+      },
+    };
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: failingStateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+        now: new Date("2026-08-03T12:10:00.000Z"),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CheckpointRestoreReconstructError);
+    expect((thrown as CheckpointRestoreReconstructError).progress).toEqual({
+      deleted_added: [],
+      delete_remaining: [],
+      import_applied: true,
+      written_keys: [{ namespace: "mem", key: "Q" }],
+      in_flight_key: { namespace: "mem", key: "R" },
+      in_flight_key_may_have_landed: true,
+    });
+    const failureAudit = fixture.audit.criticalCalls.at(-1);
+    expect(failureAudit).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        reconstruct_progress: {
+          import_applied: true,
+          written_keys: [{ namespace: "mem", key: "Q" }],
+          in_flight_key: { namespace: "mem", key: "R" },
+          in_flight_key_may_have_landed: true,
+        },
+      },
+    });
+  });
+
+  it("records a first in-flight checkpoint key as not applied when storage refuses before bytes land", async () => {
+    const storage = new HookedMemoryStorage();
+    const fixture = await makeFixture("2026-08-03T12:09:00.000Z", storage);
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:09:00.000Z"),
+    });
+    await fixture.stateStore.delete("mem", "Q");
+    storage.beforeWrite = async (namespace, key) => {
+      if (namespace === "mem" && key === "Q") {
+        throw new Error("injected before-write refusal");
+      }
+    };
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+        now: new Date("2026-08-03T12:10:00.000Z"),
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      storage.beforeWrite = undefined;
+    }
+
+    expect(thrown).toBeInstanceOf(CheckpointRestoreReconstructError);
+    expect((thrown as CheckpointRestoreReconstructError).progress).toEqual({
+      deleted_added: [],
+      delete_remaining: [],
+      import_applied: false,
+      written_keys: [],
+      in_flight_key: { namespace: "mem", key: "Q" },
+      in_flight_key_may_have_landed: true,
+    });
+    expect((await exportEntries(fixture.stateStore)).has("mem/Q")).toBe(false);
+    const failureAudit = fixture.audit.criticalCalls.at(-1);
+    expect(failureAudit).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        reconstruct_progress: {
+          import_applied: false,
+          written_keys: [],
+          in_flight_key: { namespace: "mem", key: "Q" },
+          in_flight_key_may_have_landed: true,
+        },
+      },
+    });
+  });
+
+  it("refuses checkpoints with skipped entries before reconstructing state", async () => {
+    const fixture = await makeFixture();
+    const otherIdentity = createIdentity(
+      "unknown-checkpoint-signer",
+      fixture.identityEncKey,
+      "recovery-key",
+    );
+    const sourceStorage = new MemoryStorage();
+    const sourceStore = new RealStateStore(sourceStorage, fixture.masterKey);
+    await sourceStore.write(
+      "mem",
+      "Q",
+      "checkpoint-from-unknown-signer",
+      otherIdentity.storedIdentity.identity_id,
+      otherIdentity.storedIdentity.encrypted_private_key,
+      fixture.identityEncKey,
+    );
+    const checkpointId = await createCheckpointFromBundle(
+      fixture,
+      (await sourceStore.exportNamespaces(["mem"])).bundle,
+      "2026-08-03T12:11:00.000Z",
+    );
+    await writeEntry(fixture, "mem", "P", "post-checkpoint");
+    const deleteSpy = vi.spyOn(fixture.stateStore, "delete");
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    expect(thrown).toMatchObject({
+      name: "CheckpointRestoreSkippedEntriesError",
+      reason: "checkpoint_skipped_entries_refused",
+    });
+    expect((thrown as Error).message).toBe(
+      "memory checkpoint restore refused: 1 checkpoint entry is signed by an identity this fortress does not hold and 0 checkpoint entries do not verify. No override exists; state is unchanged",
+    );
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);
     const forensic = (await fixture.checkpointStore.list()).find(
       (record) => record.source === "forensic_quarantine",
     );

@@ -14,10 +14,11 @@ import { Writable } from "node:stream";
 import { runCheckpointCommand } from "../../src/cli/checkpoint.js";
 import { StateStore, STATE_ENVELOPE_VERSION_ANCHORS_KEY } from "../../src/cognitive/state-store.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { createIdentity } from "../../src/core/identity.js";
-import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { createIdentity, sign } from "../../src/core/identity.js";
+import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { encrypt } from "../../src/core/encryption.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -41,6 +42,7 @@ vi.mock("../../src/egress-gate/harness-daemon.js", async (original) => ({
 
 // Must match CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL in memory-checkpoint/restore.ts.
 const refusal = "memory checkpoint restore refused: checkpoint versions cannot be safely restored (CHECKPOINT-RESTORE-COLD-VERSION-FLOOR-01). State is unchanged.";
+const HMAC_SHA256_BYTE_LENGTH = 32;
 const tempDirs: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -96,6 +98,87 @@ async function durableBytes(root: string): Promise<Record<string, string>> {
   }
   await walk(root, "");
   return result;
+}
+
+function withoutAuditAndPolicy(bytes: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(bytes).filter(([path]) =>
+      path !== "principal-policy.yaml" &&
+      !path.startsWith("state/_audit/") &&
+      !path.startsWith("state/_audit_checkpoints/")
+    ),
+  );
+}
+
+function decodeBundle(bundle: string): Record<string, unknown> {
+  return JSON.parse(bytesToString(fromBase64url(bundle))) as Record<string, unknown>;
+}
+
+function encodeBundle(bundle: Record<string, unknown>): string {
+  return toBase64url(stringToBytes(JSON.stringify(bundle)));
+}
+
+function stripCompleteness(bundle: string): string {
+  const decoded = decodeBundle(bundle);
+  delete decoded.completeness_manifest;
+  delete decoded.bundle_integrity;
+  return encodeBundle(decoded);
+}
+
+function replaceBundleIntegrityMac(bundle: string): string {
+  const decoded = decodeBundle(bundle);
+  const integrity = decoded.bundle_integrity;
+  if (!integrity || typeof integrity !== "object" || Array.isArray(integrity)) {
+    throw new Error("missing bundle integrity");
+  }
+  (integrity as Record<string, unknown>).mac = toBase64url(
+    new Uint8Array(HMAC_SHA256_BYTE_LENGTH),
+  );
+  return encodeBundle(decoded);
+}
+
+async function createCheckpointFromBundle(
+  f: Awaited<ReturnType<typeof fixture>>,
+  bundle: string,
+  createdAt: string,
+): Promise<string> {
+  const decoded = decodeBundle(bundle);
+  const data = decoded.data as Record<string, Array<{ key: string }>>;
+  const namespaces = Array.isArray(decoded.namespaces)
+    ? decoded.namespaces.filter((item): item is string => typeof item === "string")
+    : Object.keys(data);
+  const bundleHash = hashToString(fromBase64url(bundle));
+  const id = buildMemoryCheckpointId(createdAt, bundleHash);
+  const perNamespace: Record<string, { item_count: number; content_sha256: string }> = {};
+  let totalKeys = 0;
+  for (const namespace of namespaces) {
+    const entries = Array.isArray(data[namespace]) ? data[namespace] : [];
+    perNamespace[namespace] = {
+      item_count: entries.length,
+      content_sha256: hashToString(stringToBytes(JSON.stringify(entries))),
+    };
+    totalKeys += entries.length;
+  }
+  await f.checkpoints.create({
+    record: {
+      id,
+      created_at: createdAt,
+      source: "on_demand",
+      namespaces,
+      total_keys: totalKeys,
+      bundle_hash: bundleHash,
+      completeness_summary: {
+        namespace_count: namespaces.length,
+        total_keys: totalKeys,
+        per_namespace: perNamespace,
+      },
+      retention_expires_at: null,
+      format_version: 1,
+    },
+    bundle,
+    masterKey: f.masterKey,
+  });
+  return id;
 }
 
 async function coldRestore(f: Awaited<ReturnType<typeof fixture>>, id: string) {
@@ -189,8 +272,94 @@ describe("cold checkpoint CLI", () => {
     const before = await durableBytes(f.path);
     const result = await coldRestore(f, checkpoint!.id);
     expect(result.code, JSON.stringify(result)).toBe(1);
-    expect(result.stderr).toContain(refusal);
-    expect(await durableBytes(f.path)).toEqual(before);
+    if (failure === "read failure") {
+      expect(result.stderr).toContain("State metadata record is corrupted");
+    } else {
+      expect(result.stderr).toContain("Version-anchor record failed authentication");
+    }
+    expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(
+      withoutAuditAndPolicy(before),
+    );
+    const audit = new AuditLog(f.storage, f.masterKey);
+    const { entries } = await audit.query({ operation_type: "memory_checkpoint_restore" });
+    expect(entries).toEqual(expect.arrayContaining([expect.objectContaining({
+      result: "failure",
+      details: expect.objectContaining({
+        checkpoint_id: checkpoint!.id,
+        error_reason: failure === "read failure" ? "schema_mismatch" : "integrity_hash_mismatch",
+      }),
+    })]));
+  });
+
+  it.each([
+    {
+      name: "missing completeness",
+      mutate: stripCompleteness,
+      reason: "integrity_hash_mismatch",
+      message: "allow_unverified_legacy",
+      createdAt: "2026-10-02T12:01:00.000Z",
+    },
+    {
+      name: "bundle integrity MAC",
+      mutate: replaceBundleIntegrityMac,
+      reason: "integrity_hash_mismatch",
+      message: "integrity",
+      createdAt: "2026-10-02T12:02:00.000Z",
+    },
+  ])("writes a critical failure audit for a cold restore with $name", async ({ mutate, reason, message, createdAt }) => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const bundle = await f.checkpoints.readBundle(checkpoint!.id, f.masterKey);
+    const id = await createCheckpointFromBundle(f, mutate(bundle), createdAt);
+    const result = await coldRestore(f, id);
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain(message);
+    expect(result.stderr).not.toContain(refusal);
+    const audit = new AuditLog(f.storage, f.masterKey);
+    const { entries } = await audit.query({ operation_type: "memory_checkpoint_restore" });
+    expect(entries).toEqual(expect.arrayContaining([expect.objectContaining({
+      result: "failure",
+      details: expect.objectContaining({ checkpoint_id: id, error_reason: reason }),
+    })]));
+  });
+
+  it("writes a critical failure audit for a cold restore with a legacy ceiling refusal", async () => {
+    const f = await fixture();
+    const namespace = "legacy";
+    const key = "above-anchor";
+    const plaintext = stringToBytes("legacy value");
+    const payload = encrypt(plaintext, deriveNamespaceKey(f.masterKey, namespace));
+    await f.storage.write(namespace, key, stringToBytes(JSON.stringify({
+      v: 1,
+      payload,
+      ver: 2,
+      sig: toBase64url(sign(
+        fromBase64url(payload.ct),
+        f.identity.encrypted_private_key,
+        derivePurposeKey(f.masterKey, "identity-encryption"),
+      )),
+      kid: f.identity.identity_id,
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-10-02T12:00:00.000Z" },
+    })));
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    await f.stateStore.delete(namespace, key);
+    await f.write(namespace, "recreated", key);
+    const result = await coldRestore(f, checkpoint!.id);
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain("legacy (v1)");
+    expect(result.stderr).not.toContain(refusal);
+    const audit = new AuditLog(f.storage, f.masterKey);
+    const { entries } = await audit.query({ operation_type: "memory_checkpoint_restore" });
+    expect(entries).toEqual(expect.arrayContaining([expect.objectContaining({
+      result: "failure",
+      details: expect.objectContaining({
+        checkpoint_id: checkpoint!.id,
+        error_reason: "rollback_detected",
+      }),
+    })]));
   });
 
 });

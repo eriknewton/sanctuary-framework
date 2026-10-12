@@ -7,14 +7,11 @@
 
 import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
 import { withRequiredCrossProcessLock } from "../storage/cross-process-lock.js";
-import {
-  assertFilesystemStorageNameAddressable,
-  isFilesystemStorageNameError,
-} from "../storage/filesystem-name-codec.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
+  getStateImportPartialApplyDetails,
   getReservedNamespaceViolation,
   StateStore,
   StateVerificationError,
@@ -43,6 +40,10 @@ import {
   stringToBytes,
 } from "../core/encoding.js";
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  assertFilesystemStorageNameAddressable,
+  isFilesystemStorageNameError,
+} from "../storage/filesystem-name-codec.js";
 import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
@@ -1143,7 +1144,12 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
-  async function denyStorageNameAccess(operation: string, namespace: string, error?: unknown) {
+  async function denyStorageNameAccess(
+    operation: string,
+    namespace: string,
+    error?: unknown,
+    extraDetails: Record<string, unknown> = {}
+  ) {
     const storageName = isFilesystemStorageNameError(error)
       ? {
           ...(typeof error.kind === "string" ? { storage_name_kind: error.kind } : {}),
@@ -1157,8 +1163,48 @@ export function createCognitiveTools(
       namespace,
       denial_class: "namespace_unavailable",
       ...storageName,
+      ...extraDetails,
     }, "failure");
     return toolResult(fixedDenial(`audit:${operation}`));
+  }
+
+  async function denyStateImportVerification(
+    error: StateVerificationError,
+    namespaces: string[]
+  ) {
+    const partialDetails = getStateImportPartialApplyDetails(error);
+    const partial = stateImportPartialAuditDetails(partialDetails);
+    await recordCriticalAudit(
+      auditLog,
+      "l1",
+      "state_import_verification_failed",
+      "state-store",
+      {
+        namespaces,
+        classification: error.classification,
+        reason: error.message,
+        ...partial,
+      },
+      "failure"
+    );
+    return toolResult(fixedDenial("audit:state_import"));
+  }
+
+  function stateImportPartialAuditDetails(
+    partialDetails: ReturnType<typeof getStateImportPartialApplyDetails>
+  ): Record<string, unknown> {
+    if (!partialDetails) return {};
+    return {
+      partial: true,
+      imported_before_refusal: partialDetails.importedBeforeRefusal,
+      written_keys: partialDetails.writtenKeys,
+      ...(partialDetails.inFlightKey
+        ? {
+            in_flight_key: partialDetails.inFlightKey,
+            in_flight_key_may_have_landed: true,
+          }
+        : {}),
+    };
   }
 
   async function assertOpaqueNamespaceOwned(namespace: string): Promise<void> {
@@ -2269,18 +2315,43 @@ export function createCognitiveTools(
           return fromBase64url(identity.public_key);
         };
 
+        try {
+          // Storage-name refusal intentionally precedes version-floor planning:
+          // when both would refuse, addressability wins before success-audit
+          // staging and neither preflight path writes state.
+          await stateStore.preflightImportStorageNames(args.bundle as string);
+          // Must match StateStore.import and memory-checkpoint/restore.ts:
+          // the tool denies before a success audit when the shared write-set
+          // preflight says the bundle cannot become readable state.
+          await stateStore.assertImportVersionFloors(
+            args.bundle as string,
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+              "skip",
+            publicKeyResolver,
+            { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
+          );
+        } catch (err) {
+          if (err instanceof StateVerificationError) {
+            return denyStateImportVerification(err, targetNamespaces);
+          }
+          if (isFilesystemStorageNameError(err)) {
+            return denyStorageNameAccess("state_import", "state_import", err);
+          }
+          throw err;
+        }
+
+        await recordCriticalAudit(auditLog, "l1", "state_import_attempt", "principal", {
+          conflict_resolution:
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+            "skip",
+          namespaces: targetNamespaces,
+        });
+
         // N4 (coordinator gate, 2026-08-22): StateStore.import refuses
         // while an exit-import journal exists; catch that SPECIFIC error
         // to audit the refusal and return a clean tool-result error.
         let result;
         try {
-          await stateStore.preflightImportStorageNames(args.bundle as string);
-          await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
-            conflict_resolution:
-              (args.conflict_resolution as "skip" | "overwrite" | "version") ??
-              "skip",
-            namespaces: targetNamespaces,
-          });
           result = await stateStore.import(
             args.bundle as string,
             (args.conflict_resolution as "skip" | "overwrite" | "version") ??
@@ -2290,12 +2361,18 @@ export function createCognitiveTools(
           );
         } catch (err) {
           if (err instanceof InterruptedExitImportPendingError) {
+            const partialDetails = getStateImportPartialApplyDetails(err);
             await recordCriticalAudit(
               auditLog,
               "l1",
               "state_import_refused_pending_exit_import_recovery",
               "principal",
-              { namespaces: targetNamespaces },
+              {
+                namespaces: targetNamespaces,
+                ...(partialDetails
+                  ? stateImportPartialAuditDetails(partialDetails)
+                  : {}),
+              },
               "failure"
             );
             return toolResult({
@@ -2303,11 +2380,43 @@ export function createCognitiveTools(
               message: err.message,
             });
           }
+          if (err instanceof StateVerificationError) {
+            return denyStateImportVerification(err, targetNamespaces);
+          }
           if (isFilesystemStorageNameError(err)) {
-            return denyStorageNameAccess("state_import", "state_import", err);
+            return denyStorageNameAccess(
+              "state_import",
+              "state_import",
+              err,
+              stateImportPartialAuditDetails(getStateImportPartialApplyDetails(err))
+            );
+          }
+          const genericPartialDetails = getStateImportPartialApplyDetails(err);
+          if (genericPartialDetails) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_import_failed",
+              "state-store",
+              {
+                namespaces: targetNamespaces,
+                error_name: err instanceof Error ? err.name : typeof err,
+                error_message: err instanceof Error ? err.message : String(err),
+                ...stateImportPartialAuditDetails(genericPartialDetails),
+              },
+              "failure"
+            );
+            return toolResult(fixedDenial("audit:state_import"));
           }
           throw err;
         }
+
+        await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
+          conflict_resolution:
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+            "skip",
+          namespaces: targetNamespaces,
+        });
 
         return toolResult(result);
       },

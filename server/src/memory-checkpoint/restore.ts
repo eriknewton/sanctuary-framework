@@ -8,7 +8,12 @@
  * namespaces are asserted out of the diff and are never deleted here.
  */
 
-import type { StateStore } from "../cognitive/state-store.js";
+import {
+  getStateImportPartialApplyDetails,
+  isStateVersionFloorRefusal,
+  StateVerificationError,
+  type StateStore,
+} from "../cognitive/state-store.js";
 import { bytesToString, fromBase64url } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import type { AuditLog } from "../operational/audit-log.js";
@@ -30,6 +35,9 @@ export interface CheckpointRestoreReconstructProgress {
   deleted_added: string[];
   delete_remaining: string[];
   import_applied: boolean;
+  written_keys?: Array<{ namespace: string; key: string }>;
+  in_flight_key?: { namespace: string; key: string };
+  in_flight_key_may_have_landed?: true;
 }
 
 export interface RestoreCheckpointResult {
@@ -87,6 +95,8 @@ export const CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL =
 
 export class CheckpointRestoreVersionFloorError extends MemoryCheckpointError {}
 
+export class CheckpointRestoreSkippedEntriesError extends MemoryCheckpointError {}
+
 export class CheckpointRestoreExportError extends MemoryCheckpointError {}
 
 export class CheckpointRestoreReconstructError extends MemoryCheckpointError {
@@ -104,6 +114,20 @@ export class CheckpointRestoreReconstructError extends MemoryCheckpointError {
 }
 
 export class CheckpointRestoreAuditError extends MemoryCheckpointError {}
+
+const SINGULAR_CHECKPOINT_ENTRY_COUNT = 1;
+
+function formatCheckpointEntryCount(
+  count: number,
+  singularVerb: string,
+  pluralVerb: string,
+): string {
+  return `${count} checkpoint ${
+    count === SINGULAR_CHECKPOINT_ENTRY_COUNT
+      ? `entry ${singularVerb}`
+      : `entries ${pluralVerb}`
+  }`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -257,6 +281,11 @@ function restoreAuditDetails(input: {
       : {}),
     ...(input.error instanceof MemoryCheckpointError
       ? { error_reason: input.error.reason, error_message: input.error.message }
+      : input.error instanceof StateVerificationError
+        ? {
+            error_reason: input.error.classification,
+            error_message: input.error.message,
+          }
       : input.error !== undefined
         ? { error_reason: "restore_failed", error_message: String(input.error) }
         : {}),
@@ -291,9 +320,18 @@ function forensicSource(record: MemoryCheckpointRecord): CheckpointRestoreForens
   );
 }
 
+function isCheckpointRestoreVersionFloorRefusal(error: unknown): boolean {
+  // The typed reason is set at the StateStore enforcement site; checkpoint
+  // restore must not infer audit semantics from human-facing error text.
+  return isStateVersionFloorRefusal(error);
+}
+
 /** Read and validate a restore source without writing state or audit records. */
 export async function preflightCheckpointRestore(
-  deps: Pick<RestoreCheckpointDeps, "checkpointStore" | "checkpointId" | "masterKey" | "stateStore">,
+  deps: Pick<
+    RestoreCheckpointDeps,
+    "checkpointStore" | "checkpointId" | "masterKey" | "stateStore" | "publicKeyResolver"
+  >,
 ): Promise<string> {
   const record = await deps.checkpointStore.get(deps.checkpointId);
   if (!record) throw checkpointNotFound(deps.checkpointId);
@@ -332,12 +370,38 @@ export async function preflightCheckpointRestore(
   }
 
   parseExportBundleData(checkpointBundle, "checkpoint");
+  // Storage-name refusal intentionally runs before version-floor planning:
+  // when both would refuse, addressability wins and neither preflight path has
+  // sealed a forensic checkpoint, deleted live state, or written restore bytes.
   await deps.stateStore.preflightImportStorageNames(checkpointBundle);
   try {
-    // Every entry must clear the durable reader's floor before forensic writes
-    // or deletions; a failed anchor read cannot authorize reconstruction.
-    await deps.stateStore.assertImportVersionFloors(checkpointBundle);
+    // Must match StateStore.import and cognitive/tools.ts: checkpoint restore
+    // uses overwrite semantics, so every verified non-reserved checkpoint entry
+    // is a write candidate and must clear the durable reader's floor before
+    // forensic writes or deletions.
+    const preflight = await deps.stateStore.assertImportVersionFloors(
+      checkpointBundle,
+      "overwrite",
+      deps.publicKeyResolver,
+    );
+    if (preflight.skippedKeys > 0) {
+      const unknownSignerCount = formatCheckpointEntryCount(
+        preflight.skippedUnknownKid,
+        "is",
+        "are",
+      );
+      const badSignatureCount = formatCheckpointEntryCount(
+        preflight.skippedInvalidSig,
+        "does",
+        "do",
+      );
+      throw new CheckpointRestoreSkippedEntriesError(
+        `memory checkpoint restore refused: ${unknownSignerCount} signed by an identity this fortress does not hold and ${badSignatureCount} not verify. No override exists; state is unchanged`,
+        "checkpoint_skipped_entries_refused",
+      );
+    }
   } catch (err) {
+    if (!isCheckpointRestoreVersionFloorRefusal(err)) throw err;
     throw new CheckpointRestoreVersionFloorError(
       CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
       "checkpoint_version_floor_refused",
@@ -434,6 +498,8 @@ export async function restoreCheckpoint(
         deps.publicKeyResolver,
       );
     } catch (err) {
+      const partialDetails = getStateImportPartialApplyDetails(err);
+      const writtenKeys = partialDetails?.writtenKeys ?? [];
       throw new CheckpointRestoreReconstructError(
         `memory checkpoint restore failed while importing checkpoint ${deps.checkpointId}: ${
           err instanceof Error ? err.message : String(err)
@@ -442,7 +508,18 @@ export async function restoreCheckpoint(
         {
           deleted_added: deletedAdded,
           delete_remaining: [],
-          import_applied: false,
+          import_applied: writtenKeys.length > 0,
+          ...(partialDetails
+            ? {
+                written_keys: writtenKeys,
+                ...(partialDetails.inFlightKey
+                  ? {
+                      in_flight_key: partialDetails.inFlightKey,
+                      in_flight_key_may_have_landed: true as const,
+                    }
+                  : {}),
+              }
+            : {}),
         },
         err,
       );
