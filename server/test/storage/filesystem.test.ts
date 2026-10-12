@@ -207,9 +207,7 @@ describe("FilesystemStorage", () => {
       );
 
       await expect(storage.listNamespaces()).rejects.toMatchObject({
-        code: expect.stringMatching(
-          /^(FILESYSTEM_STORAGE_NAME_UNADDRESSABLE|INVALID_STORAGE_NAMESPACE)$/,
-        ),
+        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
       });
       await expect(storage.list("plain")).rejects.toThrow(
         /storage name this version cannot address/,
@@ -247,9 +245,7 @@ describe("FilesystemStorage", () => {
             code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
           });
           await expect(storage.listNamespaces()).rejects.toMatchObject({
-            code: expect.stringMatching(
-              /^(FILESYSTEM_STORAGE_NAME_UNADDRESSABLE|INVALID_STORAGE_NAMESPACE)$/,
-            ),
+            code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
           });
         },
         { kernelBacked: true },
@@ -361,7 +357,7 @@ describe("FilesystemStorage", () => {
       }
 
       await expect(tool.approvalTargetArgs({})).rejects.toThrow(
-        /namespace_ownership_ambiguous/,
+        /storage name this version cannot address/,
       );
     });
 

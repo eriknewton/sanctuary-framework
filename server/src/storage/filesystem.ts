@@ -83,7 +83,6 @@ import {
   restoreFreshFortressLockScaffold,
 } from "./fresh-fortress.js";
 import {
-  decodeStoragePathComponent,
   InvalidStorageNamespaceError,
   resolveStorageNamespacePath,
   storageNamespacePathComponent,
@@ -95,8 +94,6 @@ import {
 // message, but gives process startup a bounded window distinct from the much
 // shorter per-operation deadline used after admission.
 export const DIRECTORY_CAPABILITY_READY_TIMEOUT_MS = 15_000;
-
-const bijectiveDecode = decodeStoragePathComponent;
 
 // Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
@@ -1321,7 +1318,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
       // Empty non-canonical directories are root noise, but a directory with
       // entries is state-bearing; fail closed before a full export can omit it.
-      const namespace = bijectiveDecode(dir.name);
+      // Raw stored directory names are classified before P13 canonicality so
+      // operators see the on-disk segment they can actually recover or move.
+      const namespace = decodeRawFilesystemStorageName(dir.name, "namespace");
       // The directory must be the canonical encoding of the name it decodes to;
       // otherwise the listed name addresses a different (absent) directory and a
       // full export would silently omit this one's data.

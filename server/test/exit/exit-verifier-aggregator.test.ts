@@ -1053,6 +1053,37 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  it("EXIT-STRUCT-02: an entries element whose key is outside the storage-addressable domain fails verify closed", async () => {
+    const source = await makeSource("aggregator-struct02-key-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      artifact.entries = [{ ...entries[0]!, key: "key-\u4E2D" }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
   it("EXIT-STRUCT-02: an entries element missing `entry.sig` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
     const source = await makeSource("aggregator-struct02-entrysig-source");
     const bundleDir = await newBundleDir();

@@ -49,6 +49,8 @@ export function isFilesystemStorageNameError(
 }
 
 export function encodeFilesystemStorageName(name: string): string {
+  // namespace-component.ts re-exports this implementation; changing this
+  // changes both namespace directories and key file names.
   return name.replace(SAFE_CHARS, (ch) =>
     "!" +
     ch

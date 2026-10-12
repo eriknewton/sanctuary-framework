@@ -51,6 +51,7 @@ import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
 import { isStorageNamespacePathComponent } from "../storage/namespace-component.js";
+import { filesystemStorageNameRoundTrips } from "../storage/filesystem-name-codec.js";
 import {
   verifyRotationChain,
   type RotationChainInvalidReason,
@@ -679,6 +680,9 @@ export function isWellFormedExitStateEntryElement(
   if (typeof record.namespace !== "string") return false;
   if (!isStorageNamespacePathComponent(record.namespace)) return false;
   if (typeof record.key !== "string") return false;
+  // Must match assertFilesystemStorageNameAddressable in storage/filesystem-name-codec.ts:
+  // verify and import refuse the same key round-trip boundary before staging.
+  if (!filesystemStorageNameRoundTrips(record.key)) return false;
   const entry = record.entry;
   if (entry === null || typeof entry !== "object") return false;
   const entryRecord = entry as Record<string, unknown>;
