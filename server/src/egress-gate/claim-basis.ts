@@ -1995,7 +1995,11 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   // override and matched it. Nothing here asserts the agent is protected or
   // live; liveness stays `cos_liveness_unverified` unless a real round-trip
   // reports it (rendered in orchestrate/cli, classified there).
-  [`${CW}/operator-twin.ts`]: 9,
+  // +2 (restore leaves the plist untouched): the truthy `ok` tag in the
+  // `verifyPlistForRestore` result union is a discriminant, not a claim; and
+  // the `plistRestored` flag is OBSERVED: it becomes true only after the no-follow re-read
+  // of the existing plist matched the stand-down snapshot bytes.
+  [`${CW}/operator-twin.ts`]: 11,
   // orchestrate.ts +1 (F-GATEWAY-TWIN): the truthy `ok` tag in the
   // `standDownOperatorTwin` result union (~:270) — the discriminated-union
   // success tag of the stand-down OPERATION result, whose truth is

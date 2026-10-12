@@ -2859,7 +2859,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       fortressOwnerUidProbe: async () => 501,
       normalizeFortressCustody: async (input) => {
         normalizeCalls.push({ fortressPath: input.fortressPath, operator: input.operator });
-        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
       },
     });
 
@@ -2887,7 +2887,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
         hostAppInvoke: makeInvoker(responses).invoke,
         normalizeFortressCustody: async (input) => {
           sudoCalls.push(input.fortressPath);
-          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+          return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
         },
       }),
     ).toBe(0);
@@ -2908,7 +2908,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
         hostAppInvoke: makeInvoker(responses).invoke,
         normalizeFortressCustody: async (input) => {
           nonRootCalls.push(input.fortressPath);
-          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+          return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
         },
       }),
     ).toBe(0);
@@ -2940,7 +2940,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
         egressAllowRuleCountProbe: async () => 0,
         normalizeFortressCustody: async (input) => {
           noEgressCalls.push(input.fortressPath);
-          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+          return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
         },
       },
     );
@@ -2961,7 +2961,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       }).invoke,
       normalizeFortressCustody: async (input) => {
         disableCalls.push(input.fortressPath);
-        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
       },
     });
     expect(failed).toBe(1);
@@ -2980,7 +2980,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       fortressOwnerUidProbe: async () => 0,
       normalizeFortressCustody: async (input) => {
         refusalCalls.push(input.fortressPath);
-        return { status: "changed", repaired: ["."], skips: [], vanished: [], failed: [] };
+        return { status: "changed", repaired: ["."], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
       },
     });
     expect(refused).toBe(1);
@@ -3008,7 +3008,7 @@ describe("fortress-ownership guards on arm/disarm (spec 2026-07-30)", () => {
       hostAppInvoke: invoke,
       normalizeFortressCustody: async (input) => {
         calls.push(input.fortressPath);
-        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
       },
     });
 

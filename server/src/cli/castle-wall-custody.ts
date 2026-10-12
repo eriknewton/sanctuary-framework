@@ -43,6 +43,8 @@ import {
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_DIR,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  POST_CHANGE_CUSTODY_INSPECTION_MESSAGE,
+  custodySkipOperatorMessage,
   manifestCarriesPrivilegeBits,
   parseCustodyRepairManifest,
   planFortressCustodyRepairs,
@@ -51,6 +53,7 @@ import {
   walkFortressCustody,
   writeCustodyRepairManifest,
   type CustodyApplyResult,
+  type CustodySkip,
   type CustodyRepairManifest,
   type FortressCustodyFsOps,
   type FortressWalkResult,
@@ -180,7 +183,25 @@ export function parseRepairCustodyArgs(argv: string[]): ParsedRepairCustodyArgs 
   return parsed;
 }
 
-function describeApply(result: CustodyApplyResult, out: Writable): void {
+function custodyRollbackSkipOperatorMessage(skip: CustodySkip): string {
+  if (skip.reason === "multiple_names") {
+    return `fortress entry ${skip.path} has more than one name and was left untouched. Inspect it as root, remove any stale same-fortress staging alias, then retry rollback.`;
+  }
+  return custodySkipOperatorMessage(skip);
+}
+
+function describeApply(
+  result: CustodyApplyResult,
+  out: Writable,
+  options: { rollback?: boolean } = {},
+): void {
+  for (const skip of result.skipped) {
+    const message =
+      options.rollback === true
+        ? custodyRollbackSkipOperatorMessage(skip)
+        : custodySkipOperatorMessage(skip);
+    write(out, `  skipped: ${message}\n`);
+  }
   for (const path of result.vanished) {
     write(out, `  note: ${path} vanished mid-repair (live daemon churn); skipped.\n`);
   }
@@ -190,9 +211,25 @@ function describeApply(result: CustodyApplyResult, out: Writable): void {
       `  note: ${path} changed identity between observe and apply; skipped (re-run to repair it).\n`,
     );
   }
+  for (const path of result.changedAfterOperation) {
+    write(out, `  FAILED: ${path}: ${POST_CHANGE_CUSTODY_INSPECTION_MESSAGE}.\n`);
+  }
   for (const failure of result.failed) {
     write(out, `  FAILED: ${failure.path}: ${failure.reason}\n`);
   }
+}
+
+async function runPostAuditCustodySweep(input: {
+  fortressPath: string;
+  ops: FortressCustodyFsOps;
+  operator: { uid: number; gid: number };
+}): Promise<CustodyApplyResult | undefined> {
+  const sweepWalk = await walkFortressCustody(input.fortressPath, input.ops);
+  const sweepPlan = planFortressCustodyRepairs(sweepWalk.entries, input.operator);
+  if (sweepPlan.actions.length === 0) {
+    return undefined;
+  }
+  return applyFortressCustodyRepairs(input.fortressPath, sweepPlan, input.ops);
 }
 
 /**
@@ -362,13 +399,40 @@ export async function runRepairCustody(
       return REPAIR_CUSTODY_EXIT_REFUSED;
     }
     const result = await applyCustodyRollback(fortressPath, manifest, ops);
-    describeApply(result, out);
-    if (result.failed.length > 0 || result.identityChanged.length > 0) {
+    describeApply(result, out, { rollback: true });
+    if (
+      result.failed.length > 0 ||
+      result.changedAfterOperation.length > 0 ||
+      result.identityChanged.length > 0 ||
+      result.skipped.length > 0
+    ) {
+      const unrestoredCount =
+        result.failed.length +
+        result.changedAfterOperation.length +
+        result.identityChanged.length +
+        result.skipped.length;
+      await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+        "fortress_custody_rollback",
+        {
+          source: "castle-wall-cli",
+          manifest_path: parsed.rollback,
+          restored: result.repaired.length,
+          skipped_multiple_names: result.skipped.filter(
+            (skip) => skip.reason === "multiple_names",
+          ).length,
+          vanished: result.vanished.length,
+          identity_changed: result.identityChanged.length,
+          changed_after_operation: result.changedAfterOperation.length,
+        },
+        fortressPath,
+        env,
+        err,
+      );
       write(
         err,
-        `Rollback incomplete: ${
-          result.failed.length + result.identityChanged.length
-        } entries could not be restored (see above).\n`,
+        `Rollback incomplete: ${unrestoredCount} entr${
+          unrestoredCount === 1 ? "y could" : "ies could"
+        } not be restored (see above).\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
     }
@@ -387,6 +451,7 @@ export async function runRepairCustody(
         restored: result.repaired.length,
         vanished: result.vanished.length,
         identity_changed: result.identityChanged.length,
+        changed_after_operation: result.changedAfterOperation.length,
       },
       fortressPath,
       env,
@@ -453,10 +518,7 @@ export async function runRepairCustody(
     gid: identity.gid,
   });
   for (const skip of plan.skips) {
-    write(
-      out,
-      `  skipped: ${skip.path} is owned by uid ${skip.uid} (neither root nor operator ${identity.uid}); left untouched.\n`,
-    );
+    write(out, `  skipped: ${custodySkipOperatorMessage(skip)}\n`);
   }
   for (const path of walk.vanished) {
     write(out, `  note: ${path} vanished mid-walk (live daemon churn); skipped.\n`);
@@ -473,6 +535,15 @@ export async function runRepairCustody(
     // 2026-07-31 gate round 3 (MED): "every entry is operator-owned" was an
     // OVERCLAIM whenever entries were skipped for foreign ownership or a
     // socket mode deviated. State exactly what was and was not done.
+    if (plan.skips.some((skip) => skip.reason === "unsupported_type")) {
+      write(
+        err,
+        `Repair incomplete: ${plan.skips.length} entr${
+          plan.skips.length === 1 ? "y was" : "ies were"
+        } left untouched (see above).\n`,
+      );
+      return REPAIR_CUSTODY_EXIT_FAILED;
+    }
     const caveats = plan.skips.length + plan.socketModeDeviations.length;
     write(
       out,
@@ -487,10 +558,96 @@ export async function runRepairCustody(
 
   const applied = await applyFortressCustodyRepairs(fortressPath, plan, ops);
   describeApply(applied, out);
+  const unsupportedPlanSkips = plan.skips.filter(
+    (skip) => skip.reason === "unsupported_type",
+  );
+  if (applied.skipped.length > 0 || unsupportedPlanSkips.length > 0) {
+    await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+      "fortress_custody_repaired",
+      {
+        source: "castle-wall-cli",
+        manifest_path: manifestPath,
+        repaired: applied.repaired.length,
+        skipped_foreign_owner: plan.skips.filter((skip) => skip.reason === "foreign_owner").length,
+        skipped_multiple_names: applied.skipped.filter(
+          (skip) => skip.reason === "multiple_names",
+        ).length,
+        skipped_unsupported_type:
+          unsupportedPlanSkips.length +
+          applied.skipped.filter((skip) => skip.reason === "unsupported_type").length,
+        vanished: walk.vanished.length + applied.vanished.length,
+        identity_changed: applied.identityChanged.length,
+        changed_after_operation: applied.changedAfterOperation.length,
+        operator_uid: identity.uid,
+      },
+      fortressPath,
+      env,
+      err,
+    );
+    try {
+      const swept = await runPostAuditCustodySweep({
+        fortressPath,
+        ops,
+        operator: { uid: identity.uid, gid: identity.gid },
+      });
+      if (
+        swept !== undefined &&
+        (swept.failed.length > 0 ||
+          swept.changedAfterOperation.length > 0 ||
+          swept.identityChanged.length > 0 ||
+          swept.skipped.length > 0)
+      ) {
+        describeApply(swept, out);
+      }
+    } catch (error) {
+      write(
+        err,
+        `Warning: the skipped-run custody sweep failed (${error instanceof Error ? error.message : String(error)}); re-run repair-custody if operator surfaces still report EACCES.\n`,
+      );
+    }
+    write(
+      err,
+      `Repair incomplete: ${applied.skipped.length + unsupportedPlanSkips.length} entr${
+        applied.skipped.length + unsupportedPlanSkips.length === 1 ? "y was" : "ies were"
+      } left untouched (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+    );
+    return REPAIR_CUSTODY_EXIT_FAILED;
+  }
   if (applied.failed.length > 0) {
     write(
       err,
       `Repair incomplete: ${applied.failed.length} entries failed (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+    );
+    return REPAIR_CUSTODY_EXIT_FAILED;
+  }
+  if (applied.changedAfterOperation.length > 0) {
+    await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+      "fortress_custody_repaired",
+      {
+        source: "castle-wall-cli",
+        manifest_path: manifestPath,
+        repaired: applied.repaired.length,
+        skipped_foreign_owner: plan.skips.filter((skip) => skip.reason === "foreign_owner").length,
+        skipped_multiple_names: applied.skipped.filter(
+          (skip) => skip.reason === "multiple_names",
+        ).length,
+        skipped_unsupported_type:
+          unsupportedPlanSkips.length +
+          applied.skipped.filter((skip) => skip.reason === "unsupported_type").length,
+        vanished: walk.vanished.length + applied.vanished.length,
+        identity_changed: applied.identityChanged.length,
+        changed_after_operation: applied.changedAfterOperation.length,
+        operator_uid: identity.uid,
+      },
+      fortressPath,
+      env,
+      err,
+    );
+    write(
+      err,
+      `Repair incomplete: ${applied.changedAfterOperation.length} entr${
+        applied.changedAfterOperation.length === 1 ? "y requires" : "ies require"
+      } root inspection after ownership repair (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
     );
     return REPAIR_CUSTODY_EXIT_FAILED;
   }
@@ -518,9 +675,13 @@ export async function runRepairCustody(
       source: "castle-wall-cli",
       manifest_path: manifestPath,
       repaired: applied.repaired.length,
-      skipped_foreign_owner: plan.skips.length,
+      skipped_foreign_owner: plan.skips.filter((skip) => skip.reason === "foreign_owner").length,
+      skipped_multiple_names: applied.skipped.filter(
+        (skip) => skip.reason === "multiple_names",
+      ).length,
       vanished: walk.vanished.length + applied.vanished.length,
       identity_changed: applied.identityChanged.length,
+      changed_after_operation: applied.changedAfterOperation.length,
       operator_uid: identity.uid,
     },
     fortressPath,
@@ -528,18 +689,25 @@ export async function runRepairCustody(
     err,
   );
   try {
-    const sweepWalk = await walkFortressCustody(fortressPath, ops);
-    const sweepPlan = planFortressCustodyRepairs(sweepWalk.entries, {
-      uid: identity.uid,
-      gid: identity.gid,
+    const swept = await runPostAuditCustodySweep({
+      fortressPath,
+      ops,
+      operator: {
+        uid: identity.uid,
+        gid: identity.gid,
+      },
     });
-    if (sweepPlan.actions.length > 0) {
-      const swept = await applyFortressCustodyRepairs(fortressPath, sweepPlan, ops);
+    if (swept !== undefined) {
       // 2026-07-31 re-gate LOW: the sweep's own failures used to be dropped
       // on the floor, so an audit write that minted root-owned state the
       // sweep could not repair still exited success. Surface it and downgrade
       // the exit code -- never report a clean repair over known residue.
-      if (swept.failed.length > 0 || swept.identityChanged.length > 0) {
+      if (
+        swept.failed.length > 0 ||
+        swept.changedAfterOperation.length > 0 ||
+        swept.identityChanged.length > 0 ||
+        swept.skipped.length > 0
+      ) {
         describeApply(swept, out);
         write(
           err,
