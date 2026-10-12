@@ -28,9 +28,9 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
 
-`protect` backs up the harness configuration to `~/.sanctuary/backup/`, rewrites it so every tool call routes through Sanctuary, generates a passphrase that lives only in the macOS Keychain or Linux Secret Service, and starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501). `doctor --json` is a read-only diagnostic of the state directory, identity, principal policy, audit-chain integrity, runtime versions, and Castle Wall status. `uninstall` removes the installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. `protect --unwrap` restores the original harness configuration from the backup. Every verb and flag in this section is on v1.8.4, the npm `latest` channel.
+`protect` backs up the harness configuration to `~/.sanctuary/backup/`, rewrites it (the MCP server entries in the config are rewritten to point at Sanctuary; the harness's own built-in tools are not MCP calls and are not touched; the rewrite is tested on representative harness paths and is not proven for every harness version, per the Assurance Matrix "Agent wrapping" row), generates a passphrase that lives only in the macOS Keychain or Linux Secret Service, and, without `--no-dashboard`, starts the Sovereignty Dashboard on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501). `doctor --json` is a read-only diagnostic of the state directory, identity, principal policy, audit-chain integrity, runtime versions, and Castle Wall status. `uninstall` removes the installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. `protect --unwrap` restores the original harness configuration from the backup. Every verb and flag in this section is on v1.8.4, the npm `latest` channel.
 
 That one command puts the keys, audit trail, policy gates, and dashboard around the agent you already use. The operating-system wall is a separate privileged arming step on macOS through the signed app and extension path; see the [Castle Wall macOS install and arm guide](https://github.com/eriknewton/sanctuary-framework/blob/main/docs/castle-wall-macos-install.md).
 
@@ -70,7 +70,7 @@ The `memory` profile is the sovereign encrypted-memory and cooperative-policy ru
 
 ## Useful `protect` flags
 
-All on v1.8.4 unless marked. `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps. `--fortress <path>` keeps multiple fortresses isolated on one host (honors `SANCTUARY_FORTRESS_PATH` when the flag is absent). `--port <port>` and `--dashboard-port <port>` choose the dashboard port. `--unwrap` restores the original harness configuration. `--passphrase-stdin` reads the fortress passphrase from piped stdin (from 1.8.6; not in 1.8.6-rc.5). Run `sanctuary protect --help` for the full list on your installed version.
+All on v1.8.4 unless marked. `--dry-run` previews changes without touching anything. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal. `--fortress <path>` keeps multiple fortresses isolated on one host (honors `SANCTUARY_FORTRESS_PATH` when the flag is absent). `--port <port>` and `--dashboard-port <port>` choose the dashboard port. `--unwrap` restores the original harness configuration. `--passphrase-stdin` reads the fortress passphrase from piped stdin (from 1.8.6; not in 1.8.6-rc.5). Run `sanctuary protect --help` for the full list on your installed version.
 
 **Back up your passphrase:** `sanctuary export-passphrase` prints it to stdout after a confirmation prompt. Store it in a password manager. If you lose it, encrypted state cannot be recovered. An agent never runs this command on an operator's behalf.
 
@@ -79,8 +79,6 @@ All on v1.8.4 unless marked. `--dry-run` previews changes without touching anyth
 `sanctuary protect` preserves the harness's existing tool configuration and routes configured MCP servers through Sanctuary's cooperative gateway. Merely adding Sanctuary as an independent parallel MCP server (for example a bare `npx -y @sanctuary-framework/mcp-server` entry) starts a stdio server but does not apply cooperative policy gates to calls made directly to another server. Castle Wall enforcement, when installed and armed on a patched macOS host, operates at the OS level regardless of MCP routing; the wall sees egress, not MCP tool calls.
 
 For the full setup guide (installation options, passphrase management, service managers, bootstrap, rollback), see [DEPLOYMENT.md](https://github.com/eriknewton/sanctuary-framework/blob/main/server/docs/DEPLOYMENT.md). For the deliberately ungated parallel shape, see the caveats in [docs/examples](https://github.com/eriknewton/sanctuary-framework/blob/main/server/docs/examples/README.md). Prefer `sanctuary protect`.
-
-For always-on agents with latency constraints, use the `persistent-agent` Principal Policy template, which auto-allows routine operations and gates only destructive actions. See [persistent-agent.yaml](https://github.com/eriknewton/sanctuary-framework/blob/main/server/src/principal-policy/templates/persistent-agent.yaml).
 
 ## Key protection modes
 
@@ -106,7 +104,7 @@ See [RFC-0002](https://github.com/eriknewton/sanctuary-framework/blob/main/rfcs/
 
 ## MCP tools
 
-Once connected, your agent has access to these selected foundational tools, organized by capability surface within the cooperative MCP layer (Charter). The MCP protocol advertises bare tool names such as `identity_create`; clients may display them with the configured server namespace, for example `sanctuary/identity_create`. Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human; the opt-in `persistent-agent` template relaxes that set for always-on agents.
+Once connected, your agent has access to these selected foundational tools, organized by capability surface within the cooperative MCP layer (Charter). The MCP protocol advertises bare tool names such as `identity_create`; clients may display them with the configured server namespace, for example `sanctuary/identity_create`. Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human.
 
 ### Cognitive Sovereignty
 | Tool | Description |
@@ -226,7 +224,7 @@ Sanctuary's security claims are structural, not cooperative-only, and each trace
 - 3-pass secure deletion (random overwrite before unlink)
 - Private keys never appear in any MCP tool response
 - Monotonic version numbers prevent state rollback
-- Principal Policy gates every tool call (three-tier approval)
+- Principal Policy gates every MCP call routed through Sanctuary (three-tier approval)
 - Behavioral baseline detects anomalous agent behavior
 - Stderr is informational and deny-only; decision-ready Tier 1 approval requires an authenticated configured approval channel
 

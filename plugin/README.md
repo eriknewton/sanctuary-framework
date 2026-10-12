@@ -8,7 +8,7 @@ Gives your agent encrypted state storage, self-custodied cryptographic identity,
 
 ## Install, verify, uninstall
 
-This plugin's `.mcp.json` starts the Sanctuary MCP server with a bare `npx -y @sanctuary-framework/mcp-server` entry. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once and let it rewrite the harness configuration so every tool call routes through Sanctuary:
+This plugin's `.mcp.json` starts the Sanctuary MCP server with a bare `npx -y @sanctuary-framework/mcp-server` entry. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
@@ -16,13 +16,13 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal; `--no-dashboard` skips the per-call dashboard so one persistent `sanctuary dashboard` serves many wraps.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
 
 `protect` backs up the existing configuration to `~/.sanctuary/backup/` and generates a passphrase that lives only in the macOS Keychain or Linux Secret Service. `doctor --json` is a read-only health check. `uninstall` removes the enforcement footprint and keeps keys, state, and the audit log; `protect --unwrap` restores the original configuration. Never put a passphrase or recovery key in a harness configuration or an environment block. Details: the [npm page](https://www.npmjs.com/package/@sanctuary-framework/mcp-server) and the [repository README](https://github.com/eriknewton/sanctuary-framework#readme).
 
 ## Featured tools
 
-Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human; the opt-in `persistent-agent` template relaxes that set for always-on agents.
+Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, applied when no policy file exists) sends to a human.
 
 - **`sanctuary/sovereignty_audit`**: Audit your protection posture. Scores your environment (0-100) across security, isolation, and privacy, detects OpenClaw configurations, identifies gaps, and provides prioritized recommendations.
 - **`sanctuary/identity_create`**: Establish a cryptographic Ed25519 identity for signing and verification.
