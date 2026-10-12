@@ -1230,16 +1230,18 @@ function isLinuxPolicyCompatibilityRefusal(error: unknown): error is RuntimeLinu
   );
 }
 
-function linuxObservePromoteRemedy(message: string): string {
-  if (message.includes("scope.uids")) {
+function linuxObservePromoteRemedy(routingMode: PromoteRouting["mode"]): string {
+  if (routingMode === "exclusive") {
     return (
-      "On Linux, exclusive observe promote uses scope.uids, which the Linux profile refuses. " +
-      "Promote a uid-mode IP/CIDR rule scoped as scope.agent_ids=uid-<uid>, or author one with `sanctuary linux-policy sign`."
+      "Exclusive (gate) routing is macOS-only: its promoted rules use the macOS-only scope.uids axis, " +
+      "which the Linux profile refuses, and Linux has no gate principal. To allow a destination on Linux, " +
+      "author an IP/CIDR rule scoped as scope.agent_ids=uid-<agent uid> with `sanctuary linux-policy sign`."
     );
   }
   return (
-    "On Linux, promote IP/CIDR-only rules scoped as scope.agent_ids=uid-<uid> for uid-mode walls, " +
-    "or author a Linux-compatible policy with `sanctuary linux-policy sign`."
+    "On Linux, a signable rule is IP/CIDR-only and scoped as scope.agent_ids=uid-<agent uid>; " +
+    "observe promote does not yet synthesize that shape from observed traffic. " +
+    "Author it with `sanctuary linux-policy sign`."
   );
 }
 
@@ -1914,7 +1916,7 @@ export async function runObservePromote(
         err,
         `Aborted: observe promote cannot publish this ruleset on Linux: ${message}. ` +
           "Nothing changed; no manifest was re-signed. " +
-          `${linuxObservePromoteRemedy(message)}\n`,
+          `${linuxObservePromoteRemedy(routing.mode)}\n`,
       );
       return 1;
     }

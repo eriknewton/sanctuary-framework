@@ -156,6 +156,7 @@ export async function publishLinuxCompatiblePolicy(
       validateLinuxInstallAgentIdScopes(input.rules, origin.agent_uid);
     } catch (error) {
       if (error instanceof LinuxInstallAgentIdScopeError) {
+        // The CLI consumes this typed refusal as policy_incompatible so Linux publish attempts stop before signing.
         throw new RuntimeLinuxActivationError(
           `Castle Wall Linux policy is incompatible with ${LINUX_IP_CIDR_POLICY_PROFILE.id}: ${error.message}`,
           "policy_incompatible",

@@ -91,6 +91,7 @@ import {
   HABEAS_LOCAL_RULE_ID,
   isGenuineDerivedHabeasRule,
 } from "../../../src/castle-wall/allowlist/habeas-port.js";
+import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import {
   publishProvisionedEgressRules,
   readEgressRulesFromDisk,
@@ -143,6 +144,15 @@ function linuxUidIpOnlyCandidate(): CandidateObservation {
   return {
     ...ipOnlyCandidate(),
     agent_id: `uid-${AGENT_UID}`,
+  };
+}
+
+function linuxProtectionSubjectIpOnlyCandidate(): CandidateObservation {
+  const agentId = protectionSubjectForUid("fortress-test", AGENT_UID);
+  if (agentId === null) throw new Error("test fixture uid must form a protection subject");
+  return {
+    ...ipOnlyCandidate(),
+    agent_id: agentId,
   };
 }
 
@@ -1147,7 +1157,14 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     const fortress = await makeCliFortress({
       exclusive: false,
       candidates: [candidate("api.newlyapproved.example")],
+      initialAgentOrigin: {
+        mode: "uid",
+        agent_uid: AGENT_UID,
+        system_uid_allow_ceiling: AGENT_UID - 1,
+      },
     });
+    const manifestPath = join(fortress.fortressPath, "policy", "egress", "manifest.json");
+    const beforeManifest = await readFile(manifestPath, "utf8");
     const out = new Capture();
     const err = new Capture();
     const code = await runObservePromote(["--all", "--fortress", fortress.fortressPath], {
@@ -1162,8 +1179,11 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(err.text()).toContain("cannot publish this ruleset on Linux");
     expect(err.text()).toContain("match.host");
     expect(err.text()).toContain("sanctuary linux-policy sign");
+    expect(err.text()).toContain("observe promote does not yet synthesize that shape from observed traffic");
+    expect(err.text()).not.toContain("Exclusive (gate) routing is macOS-only");
     expect(await fortress.listStoredCandidates()).toBe(1);
-    await expect(readFile(join(fortress.fortressPath, "policy", "egress", "manifest.json"))).rejects.toMatchObject({
+    expect(await readFile(manifestPath, "utf8")).toBe(beforeManifest);
+    await expect(readdir(join(fortress.fortressPath, "policy", "egress", "rules"))).rejects.toMatchObject({
       code: "ENOENT",
     });
   });
@@ -1204,6 +1224,8 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(err.text()).toContain("cannot publish this ruleset on Linux");
     expect(err.text()).toContain("scope.agent_ids");
     expect(err.text()).toContain("Nothing changed; no manifest was re-signed.");
+    expect(err.text()).toContain("observe promote does not yet synthesize that shape from observed traffic");
+    expect(err.text()).not.toContain("Exclusive (gate) routing is macOS-only");
     expect(out.text()).not.toContain("Promote complete");
     expect(await fortress.listStoredCandidates()).toBe(1);
     expect(await readFile(manifestPath, "utf8")).toBe(beforeManifest);
@@ -1212,7 +1234,7 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     });
   });
 
-  it("Linux-compatible promote publishes an ip-scoped rule and verifies the signed manifest", async () => {
+  it("Linux publisher compatible arm publishes a hand-built uid-confined ip-scoped rule", async () => {
     const fortress = await makeCliFortress({
       exclusive: false,
       candidates: [linuxUidIpOnlyCandidate()],
@@ -1222,6 +1244,8 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
         system_uid_allow_ceiling: AGENT_UID - 1,
       },
     });
+    // Real Linux refresh records the protection subject "<fortress>/uid-N"; this candidate is hand-built to
+    // exercise the publisher's compatible continuing path for an already-confined uid-<uid> id.
     const out = new Capture();
     const err = new Capture();
     const code = await runObservePromote(
@@ -1259,6 +1283,50 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(await fortress.listStoredCandidates()).toBe(0);
   });
 
+  it("Linux promote refuses a protection-subject uid candidate before policy state changes", async () => {
+    const fortress = await makeCliFortress({
+      exclusive: false,
+      candidates: [linuxProtectionSubjectIpOnlyCandidate()],
+      initialAgentOrigin: {
+        mode: "uid",
+        agent_uid: AGENT_UID,
+        system_uid_allow_ceiling: AGENT_UID - 1,
+      },
+    });
+    const manifestPath = join(fortress.fortressPath, "policy", "egress", "manifest.json");
+    const beforeManifest = await readFile(manifestPath, "utf8");
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runObservePromote(
+      [
+        "--destination",
+        "93.184.216.34:443",
+        "--granularity",
+        "per_instance_domain",
+        "--fortress",
+        fortress.fortressPath,
+      ],
+      {
+        out,
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+        approvalChannel: new AutoApproveChannel(),
+        platform: "linux",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("cannot publish this ruleset on Linux");
+    expect(err.text()).toContain("scope.agent_ids");
+    expect(err.text()).toContain("Nothing changed; no manifest was re-signed.");
+    expect(out.text()).not.toContain("Promote complete");
+    expect(await fortress.listStoredCandidates()).toBe(1);
+    expect(await readFile(manifestPath, "utf8")).toBe(beforeManifest);
+    await expect(readdir(join(fortress.fortressPath, "policy", "egress", "rules"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("Linux exclusive promote refuses the macOS-only gate scope without policy state changes", async () => {
     const fortress = await makeCliFortress({
       exclusive: true,
@@ -1277,7 +1345,8 @@ describe("round-3 R4/R5: the REAL CLI promote path (approved end to end)", () =>
     expect(code).toBe(1);
     expect(err.text()).toContain("cannot publish this ruleset on Linux");
     expect(err.text()).toContain("scope.uids");
-    expect(err.text()).toContain("exclusive observe promote uses scope.uids");
+    expect(err.text()).toContain("Exclusive (gate) routing is macOS-only");
+    expect(err.text()).toContain("Linux has no gate principal");
     expect(err.text()).toContain("sanctuary linux-policy sign");
     expect(err.text()).toContain("Nothing changed; no manifest was re-signed.");
     expect(out.text()).not.toContain("Promote complete");

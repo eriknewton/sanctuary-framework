@@ -19,6 +19,7 @@ const UINT32_BIT_COUNT = 32;
 const UINT32_MAX = 2 ** UINT32_BIT_COUNT - 1;
 
 export class LinuxInstallAgentIdScopeError extends Error {
+  // Consumed by `publishLinuxCompatiblePolicy` to turn Linux uid-scope mismatches into a no-write policy refusal.
   constructor(message: string) {
     super(message);
     this.name = "LinuxInstallAgentIdScopeError";
