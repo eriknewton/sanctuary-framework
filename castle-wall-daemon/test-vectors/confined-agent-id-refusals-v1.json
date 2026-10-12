@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "malformed_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "0123456789abcdef/uid-60123",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule linux-explicit-ip scope.agent_ids entry \"0123456789abcdef/uid-60123\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "wrong_uid",
+      "kind": "wrong_uid",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-60124",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule linux-explicit-ip scope.agent_ids entry \"uid-60124\": expected admitted uid 60123; scope agent rules to uid-60123"
+      }
+    },
+    {
+      "name": "long_rule_and_agent_id",
+      "kind": "malformed",
+      "rule_id": "rule-rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "agent_id": "agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "admitted_uid": 60123,
+      "expected": {
+        "shared": "rule rule-rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr... (original length 70) scope.agent_ids entry \"agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa... (original length 73): expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    },
+    {
+      "name": "control_and_unusual_id",
+      "kind": "malformed",
+      "rule_id": "linux-explicit-ip",
+      "agent_id": "uid-\u0001-\u2028",
+      "admitted_uid": 60123,
+      "note": "TypeScript uses JSON.stringify while Rust uses Debug formatting for the displayed agent id, so this case carries language-specific expected strings.",
+      "expected": {
+        "typescript": "rule linux-explicit-ip scope.agent_ids entry \"uid-\\u0001-\u2028\": expected uid-<decimal uid>; re-sign with the uid-<uid> form",
+        "rust": "rule linux-explicit-ip scope.agent_ids entry \"uid-\\u{1}-\\u{2028}\": expected uid-<decimal uid>; re-sign with the uid-<uid> form"
+      }
+    }
+  ]
+}

@@ -26,9 +26,31 @@ const vectors = JSON.parse(
   ),
 ) as { valid: string[]; invalid: string[] };
 
-function rule(agentIds: string[]): AllowlistRule {
+type RefusalVector = {
+  name: string;
+  kind: "malformed" | "wrong_uid";
+  rule_id: string;
+  agent_id: string;
+  admitted_uid: number;
+  note?: string;
+  expected: { shared?: string; typescript?: string; rust?: string };
+};
+
+const refusalVectors = JSON.parse(
+  readFileSync(
+    fileURLToPath(
+      new URL(
+        "../../../../castle-wall-daemon/test-vectors/confined-agent-id-refusals-v1.json",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  ),
+) as { version: 1; cases: RefusalVector[] };
+
+function rule(agentIds: string[], id = "linux-explicit-ip"): AllowlistRule {
   return {
-    id: "linux-explicit-ip",
+    id,
     schema_version: 1,
     created_at: "2026-10-01T00:00:00Z",
     match: { ip: ["203.0.113.10"], port: [443], protocol: "tcp" },
@@ -45,6 +67,21 @@ describe("confined agent id form", () => {
     expect(vectors.invalid.map((id) => [id, parseConfinedAgentId(id) !== null])).toEqual(
       vectors.invalid.map((id) => [id, false]),
     );
+  });
+
+  it("matches the shared full-refusal message vector set", () => {
+    for (const vector of refusalVectors.cases) {
+      let message = "";
+      try {
+        validateLinuxInstallAgentIdScopes(
+          [rule([vector.agent_id], vector.rule_id)],
+          vector.admitted_uid,
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message, vector.name).toBe(vector.expected.typescript ?? vector.expected.shared);
+    }
   });
 
   it("refuses malformed install scopes before signing", () => {

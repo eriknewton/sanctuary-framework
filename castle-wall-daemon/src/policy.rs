@@ -625,14 +625,16 @@ fn bounded_diagnostic_text(value: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfinedAgentScopeError {
     /// Must match `validateLinuxInstallAgentIdScopes` in
-    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts` and
+    /// `castle-wall-daemon/test-vectors/confined-agent-id-refusals-v1.json`.
     MalformedAgentScope {
         rule_id: String,
         agent_id: String,
         expected_form: &'static str,
     },
     /// Must match `validateLinuxInstallAgentIdScopes` in
-    /// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+    /// `server/src/castle-wall/allowlist/confined-agent-id.ts` and
+    /// `castle-wall-daemon/test-vectors/confined-agent-id-refusals-v1.json`.
     AgentScopeOutsideAdmission {
         rule_id: String,
         agent_id: String,
@@ -1938,6 +1940,53 @@ mod tests {
         assert!(
             format!("{err}").contains("rule gate-scope") && format!("{err}").contains(&expected)
         );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ConfinedAgentIdRefusalVectors {
+        cases: Vec<ConfinedAgentIdRefusalCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ConfinedAgentIdRefusalCase {
+        name: String,
+        kind: String,
+        rule_id: String,
+        agent_id: String,
+        admitted_uid: u32,
+        expected: ConfinedAgentIdRefusalExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ConfinedAgentIdRefusalExpected {
+        shared: Option<String>,
+        rust: Option<String>,
+    }
+
+    #[test]
+    fn confined_scope_refusals_match_the_shared_message_vector_set() {
+        let vectors: ConfinedAgentIdRefusalVectors = serde_json::from_str(include_str!(
+            "../test-vectors/confined-agent-id-refusals-v1.json"
+        ))
+        .unwrap();
+
+        for case in vectors.cases {
+            let error = match case.kind.as_str() {
+                "malformed" => ConfinedAgentScopeError::MalformedAgentScope {
+                    rule_id: case.rule_id,
+                    agent_id: case.agent_id,
+                    expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
+                },
+                "wrong_uid" => ConfinedAgentScopeError::AgentScopeOutsideAdmission {
+                    rule_id: case.rule_id,
+                    agent_id: case.agent_id,
+                    admitted_uid: case.admitted_uid,
+                },
+                other => panic!("unknown confined-agent-id refusal kind {other}"),
+            };
+            let expected = case.expected.rust.or(case.expected.shared).unwrap();
+            assert_eq!(error.to_string(), expected, "{}", case.name);
+        }
     }
 
     #[test]
