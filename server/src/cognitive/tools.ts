@@ -1636,10 +1636,10 @@ export function createCognitiveTools(
         try {
           // Continuing paths (AGENTS rule 13): requested-key and same-namespace
           // stored-name refusals are checked before the success audit; only a
-          // namespace whose existing keys can be addressed proceeds to the
-          // audit-before-commit path below.
+          // namespace whose existing keys can be addressed through StateStore's
+          // cached listing proceeds to the audit-before-commit path below.
           assertFilesystemStorageNameAddressable(args.key as string, "key");
-          await storage.list(args.namespace as string);
+          await stateStore.assertNamespaceStorageNamesAddressable(args.namespace as string);
         } catch (err) {
           if (isFilesystemStorageNameError(err)) {
             return denyStorageNameAccess("state_write", args.namespace as string, err);
@@ -2032,10 +2032,10 @@ export function createCognitiveTools(
         try {
           // Continuing paths (AGENTS rule 13): requested-key and same-namespace
           // stored-name refusals are checked before the success audit; only a
-          // namespace whose existing keys can be addressed proceeds to the
-          // audit-before-delete path below.
+          // namespace whose existing keys can be addressed through StateStore's
+          // cached listing proceeds to the audit-before-delete path below.
           assertFilesystemStorageNameAddressable(args.key as string, "key");
-          await storage.list(args.namespace as string);
+          await stateStore.assertNamespaceStorageNamesAddressable(args.namespace as string);
         } catch (err) {
           if (isFilesystemStorageNameError(err)) {
             return denyStorageNameAccess("state_delete", args.namespace as string, err);

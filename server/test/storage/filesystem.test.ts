@@ -285,20 +285,18 @@ describe("FilesystemStorage", () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
       const stateStore = new StateStore(storage, masterKey);
-      let active: SessionBinding | undefined;
       const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
         stateStore,
         storage,
         masterKey,
         "recovery-key",
         auditLog,
-        { currentSessionBinding: () => active },
       );
       await identityManager.load();
       const identity = await callTool(l1Tools, "identity_create", {
         label: "cooperative-roundtrip-agent",
       });
-      active = session(identity.identity_id as string);
+      const active = session(identity.identity_id as string);
       const { tools: facadeTools } = createAgentNativeCooperativeTools({
         identityManager,
         namespaceRegistry,
@@ -337,6 +335,73 @@ describe("FilesystemStorage", () => {
       expect(result.denied).toBe(true);
       expect(JSON.stringify(result)).not.toContain("round-trip");
       expect(JSON.stringify(result)).not.toContain("stored name");
+    });
+
+    it("state_write refuses an addressable key when cached namespace scan finds an unavailable stored entry", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const identity = await callTool(tools, "identity_create", {
+        label: "write-stored-name-agent",
+      });
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(basePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+
+      const result = await callTool(tools, "state_write", {
+        namespace: "plain",
+        key: "good",
+        value: "blocked",
+        identity_id: identity.identity_id,
+      });
+      expect(result.denied).toBe(true);
+      expect(await storage.read("plain", "good")).toBeNull();
+      const audit = await auditLog.query({ operation_type: "state_write" });
+      expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
+    });
+
+    it("state_write reuses StateStore namespace scanning across writes", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const identity = await callTool(tools, "identity_create", {
+        label: "write-cache-agent",
+      });
+      const originalList = storage.list.bind(storage);
+      let plainLists = 0;
+      storage.list = async (namespace, prefix) => {
+        if (namespace === "plain") plainLists++;
+        return originalList(namespace, prefix);
+      };
+
+      for (const key of ["one", "two"] as const) {
+        await callTool(tools, "state_write", {
+          namespace: "plain",
+          key,
+          value: key,
+          identity_id: identity.identity_id,
+        });
+      }
+
+      expect(plainLists).toBe(1);
     });
 
     it("keeps state_export approval discovery classified as storage-name refusal", async () => {
@@ -410,6 +475,32 @@ describe("FilesystemStorage", () => {
       expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
     });
 
+    it("state_delete refuses a requested key that cannot be addressed before unlinking", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      await callTool(tools, "identity_create", {
+        label: "delete-requested-name-agent",
+      });
+
+      const result = await callTool(tools, "state_delete", {
+        namespace: "plain",
+        key: "key-\u4E2D",
+        reason: "test",
+      });
+      expect(result.denied).toBe(true);
+      const audit = await auditLog.query({ operation_type: "state_delete" });
+      expect(audit.entries.map((entry) => entry.result)).toEqual(["failure"]);
+    });
+
     it("state_import refuses before writing into an unavailable namespace", async () => {
       const masterKey = generateRandomKey();
       const auditLog = new AuditLog(storage, masterKey);
@@ -463,7 +554,7 @@ describe("FilesystemStorage", () => {
 
   // ── Legacy on-disk fallback (forward compat) ─────────────────────────
   //
-  // Existing fortresses written before #41 used the non-bijective whitelist
+  // Existing fortresses written before #41 used the pre-supported-range whitelist
   // sanitizer. read(), exists(), and delete() try the new bijective path
   // first; on ENOENT they fall back to the legacy path so operators do not
   // lose data on upgrade. write() always uses the new path.

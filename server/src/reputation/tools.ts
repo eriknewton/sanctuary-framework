@@ -728,6 +728,13 @@ export function createReputationTools(
             });
           }
           if (isFilesystemStorageNameError(err)) {
+            const storageName = {
+              ...(typeof err.kind === "string" ? { storage_name_kind: err.kind } : {}),
+              ...(typeof err.rawName === "string" ? { raw_stored_entry: err.rawName } : {}),
+              ...(typeof err.rawNamespace === "string"
+                ? { raw_namespace_directory: err.rawNamespace }
+                : {}),
+            };
             await auditLog.appendCritical({
               layer: "l4",
               operation: "reputation_import",
@@ -739,7 +746,7 @@ export function createReputationTools(
                 contexts: [],
                 completeness_verification: "failed",
                 denial_class: "namespace_unavailable",
-                storage_name_kind: err.kind,
+                ...storageName,
               },
             });
             return toolResult(fixedDenial("audit:reputation_import"));
@@ -761,6 +768,21 @@ export function createReputationTools(
           // completeness failure, both of which land in this same catch.
           const quotaRefuseReason =
             err instanceof ReputationStoreQuotaError ? err.reason : undefined;
+          const storageName =
+            err instanceof ReputationStoreQuotaError &&
+            isFilesystemStorageNameError(err.cause)
+              ? {
+                  ...(typeof err.cause.kind === "string"
+                    ? { storage_name_kind: err.cause.kind }
+                    : {}),
+                  ...(typeof err.cause.rawName === "string"
+                    ? { raw_stored_entry: err.cause.rawName }
+                    : {}),
+                  ...(typeof err.cause.rawNamespace === "string"
+                    ? { raw_namespace_directory: err.cause.rawNamespace }
+                    : {}),
+                }
+              : {};
 
           await auditLog.appendCritical({
             layer: "l4",
@@ -775,6 +797,7 @@ export function createReputationTools(
               ...(quotaRefuseReason !== undefined
                 ? { quota_refuse_reason: quotaRefuseReason }
                 : {}),
+              ...storageName,
             },
           });
 

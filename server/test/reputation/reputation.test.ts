@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1555,6 +1555,90 @@ describe("L4 Reputation Store", () => {
         await expect(storage.list("_reputation")).resolves.toHaveLength(0);
         const audit = await auditLog.query({ operation_type: "reputation_import" });
         expect(audit.entries.at(-1)?.result).toBe("failure");
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reputation_import audit records the stored entry segment when quota scan refuses", async () => {
+      const masterKey = generateRandomKey();
+      const { identity, encryptionKey } = setupIdentity(
+        masterKey,
+        "tool-stored-name-exporter"
+      );
+      const exporterStore = new ReputationStore(new MemoryStorage(), masterKey);
+      await exporterStore.record(
+        "tool-stored-name-1",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "general",
+        identity,
+        encryptionKey
+      );
+      const bundle = await exporterStore.exportBundle(identity, encryptionKey);
+
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-rep-tool-stored-"));
+      try {
+        const storage = new FilesystemStorage(dir);
+        await mkdir(join(dir, "_reputation"), { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(dir, "_reputation", "att-!4E2D.enc"),
+          new Uint8Array([1]),
+        );
+        const identityManager = new IdentityManager(storage, masterKey);
+        await identityManager.save(identity);
+        await identityManager.setPrimary(identity.identity_id);
+        const auditLog = new AuditLog(storage, masterKey);
+        const { tools } = createReputationTools(
+          storage,
+          masterKey,
+          identityManager,
+          auditLog
+        );
+        const importTool = tools.find((tool) => tool.name === "reputation_import");
+        expect(importTool).toBeDefined();
+
+        const result = parseToolResult(
+          await importTool!.handler({
+            bundle: toBase64url(stringToBytes(JSON.stringify(bundle))),
+          })
+        );
+
+        expect(result.imported_attestations).toBe(0);
+        const audit = await auditLog.query({ operation_type: "reputation_import" });
+        expect(audit.entries.at(-1)?.details).toMatchObject({
+          storage_name_kind: "key",
+          raw_stored_entry: "att-!4E2D",
+        });
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reputation export refuses when stored attestation names cannot be addressed", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-rep-export-stored-"));
+      try {
+        const storage = new FilesystemStorage(dir);
+        const masterKey = generateRandomKey();
+        const store = new ReputationStore(storage, masterKey);
+        const { identity, encryptionKey } = setupIdentity(masterKey);
+        await store.record(
+          "export-stored-name-1",
+          "did:key:cp1",
+          { type: "transaction", result: "completed" },
+          "general",
+          identity,
+          encryptionKey
+        );
+        await mkdir(join(dir, "_reputation"), { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(dir, "_reputation", "att-!4E2D.enc"),
+          new Uint8Array([1]),
+        );
+
+        await expect(store.exportBundle(identity, encryptionKey)).rejects.toMatchObject({
+          code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+        });
       } finally {
         await rm(dir, { recursive: true, force: true });
       }

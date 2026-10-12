@@ -966,7 +966,8 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
 
     const verified = await verifyExitBundle(bundleDir);
     expect(verified.passed).toBe(false);
-    expect(verified.failure_class).toBe("reputation_attestation_signature_invalid");
+    expect(verified.failure_class).toBe("reputation_attestation_storage_name_invalid");
+    expect(verified.warnings.join("\n")).toContain("storage names");
   });
 
   it("encrypted_state artifact whose JSON root is not an object: verify FAILS closed, import throws the NAMED error, never a crash", async () => {

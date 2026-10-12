@@ -986,6 +986,17 @@ async function preflightExitStateStorageNames(
     // export audit append can create residue.
     await opts.storage.list(namespace);
   }
+  const reservedExportNamespaces = [
+    "_reputation",
+    KNOWN_SIGNERS_NAMESPACE,
+    "_identities",
+  ] as const;
+  for (const namespace of reservedExportNamespaces) {
+    // These reserved namespaces are exported after the state artifact; proving
+    // them here keeps every storage-name refusal before mkdir, artifact writes,
+    // and the fire-and-forget exit audit append.
+    await opts.storage.list(namespace);
+  }
 }
 
 /**

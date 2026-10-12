@@ -1044,8 +1044,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const buf = await this.readAtPath(this.entryPath(namespace, key));
     if (buf !== null) return buf;
-    // Legacy fallback: fortresses written before #41 used a non-bijective
-    // sanitizer; if the new-form path is missing, try the legacy form.
+    // Legacy fallback: fortresses written before #41 used the pre-supported-
+    // range sanitizer; if the new-form path is missing, try the legacy form.
     const legacy = this.legacyEntryPath(namespace, key);
     if (legacy === this.entryPath(namespace, key)) return null;
     return this.readAtPath(legacy);

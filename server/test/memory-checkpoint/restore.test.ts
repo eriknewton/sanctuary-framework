@@ -660,6 +660,62 @@ describe("restoreCheckpoint", () => {
     expect(forensic).toBeUndefined();
   });
 
+  it("refuses a checkpoint bundle with an unaddressable key before reconstruction effects", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const exported = await fixture.stateStore.exportNamespaces(["mem"]);
+    const bundle = decodeBundle(exported.bundle) as DecodedExportBundle & {
+      sanctuary_export_version?: number;
+      format?: string;
+      exported_at?: string;
+      completeness_manifest?: unknown;
+      bundle_integrity?: unknown;
+    };
+    const firstMemEntry = bundle.data.mem?.[0];
+    if (!firstMemEntry) throw new Error("harness setup: exported mem entry missing");
+    firstMemEntry.key = "key-\u4E2D";
+    const mutatedBundle = toBase64url(stringToBytes(JSON.stringify(bundle)));
+    const mutatedHash = hashToString(fromBase64url(mutatedBundle));
+    const createdAt = "2026-08-03T12:06:45.000Z";
+    const id = buildMemoryCheckpointId(createdAt, mutatedHash);
+    await fixture.checkpointStore.create({
+      record: {
+        id,
+        created_at: createdAt,
+        source: "on_demand",
+        namespaces: ["mem"],
+        total_keys: 1,
+        bundle_hash: mutatedHash,
+        completeness_summary: { namespace_count: 1, total_keys: 1, per_namespace: {} },
+        retention_expires_at: null,
+        format_version: 1,
+      },
+      bundle: mutatedBundle,
+      masterKey: fixture.masterKey,
+    });
+    await writeEntry(fixture, "added", "preserve", "live-state");
+    const liveBefore = await exportEntries(fixture.stateStore);
+
+    await expect(
+      restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      }),
+    ).rejects.toThrow(/storage name this version cannot address/);
+
+    expect(await exportEntries(fixture.stateStore)).toEqual(liveBefore);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
   it("refuses (before any state change) when the decrypted bundle hash does not match the recorded bundle_hash", async () => {
     const fixture = await makeFixture();
     await writeEntry(fixture, "mem", "Q", "live-state");

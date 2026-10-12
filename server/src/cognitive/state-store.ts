@@ -1810,6 +1810,14 @@ export class StateStore {
     return hashMap;
   }
 
+  async assertNamespaceStorageNamesAddressable(namespace: string): Promise<void> {
+    // Continuing paths (AGENTS rule 13): tool-side audit gates must prove the
+    // same namespace listing StateStore.write/delete will consume, through this
+    // memoized chokepoint, so a stored-name refusal cannot be swallowed and a
+    // clean namespace is scanned only once per process.
+    await this.getNamespaceHashes(namespace);
+  }
+
   /**
    * Write encrypted state.
    *
