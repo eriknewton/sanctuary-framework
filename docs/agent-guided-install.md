@@ -55,6 +55,98 @@ rerun the planner only after exit zero, or transition to `on_nonzero` after a
 failure. This makes interruption and handoff safe: a fresh agent resumes from
 observed state, not from a transcript or a claimed prior step.
 
+## Response shape
+
+One response, as the planner returns it on a macOS host whose fortress already
+holds custody, so the next step is the single-shot agent action with its
+`on_nonzero` fallback attached:
+
+<!-- Source: AgentInstallPlan and AgentInstallAction in server/src/cli/install.ts; values from a `sanctuary install --profile memory --harness claude-code --json` run on @sanctuary-framework/mcp-server 1.8.4 (macOS, 2026-10-12) with paths shortened, and the agent_action branch with its on_nonzero text as install.ts on the v1.8.4 tag returns them once the fortress already holds custody. notes is emptied here; v1.8.4 puts one reminder string in it on every response (rerun the planner after each action). Keep this block identical to the one in README.md; re-derive both from the tag you ship when the field set changes. -->
+```json
+{
+  "contract": "sanctuary.agent-install.v1",
+  "status": "agent_action",
+  "profile": "memory",
+  "harness": "claude-code",
+  "fortress": "/Users/operator/.sanctuary",
+  "observations": {
+    "cooperative_wrap": "absent",
+    "persistent_cli": "present",
+    "persistent_cli_path": "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+    "persistent_cli_version": "1.8.4",
+    "package_manager_path": "/usr/local/lib/node_modules/npm/bin/npm-cli.js",
+    "existing_custody": "present",
+    "custody_access": "usable",
+    "custody_mutation": "available",
+    "recovery_factor": "present",
+    "castle_wall_app": "not-applicable",
+    "castle_wall_build_sha": null,
+    "system_extension": "not-applicable",
+    "boot_service": "not-applicable",
+    "content_filter": "not-applicable",
+    "enforcement": "not-applicable",
+    "trust_anchor": "not-applicable",
+    "operator_twin": "not-applicable"
+  },
+  "next_action": {
+    "id": "install_cooperative_surface",
+    "actor": "agent",
+    "description": "Run Sanctuary's idempotent protect flow for the selected harness.",
+    "argv": [
+      "/usr/local/bin/node",
+      "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+      "--fortress",
+      "/Users/operator/.sanctuary",
+      "protect",
+      "--claude-code",
+      "--no-open",
+      "--agent-guided",
+      "--no-provision-agent-account"
+    ],
+    "completion": "A rerun observes cooperative_wrap=present.",
+    "secret_boundary": "Do not add --passphrase or --write-passphrase-backup; default custody does not disclose the generated passphrase.",
+    "on_nonzero": {
+      "id": "complete_cooperative_surface_locally",
+      "actor": "human",
+      "description": "The agent-run protect command failed. In a private local desktop Terminal, unlock the login Keychain if prompted, then run this exact signed protect command once.",
+      "argv": [
+        "/usr/local/bin/node",
+        "/usr/local/lib/node_modules/@sanctuary-framework/mcp-server/dist/cli.js",
+        "--fortress",
+        "/Users/operator/.sanctuary",
+        "protect",
+        "--claude-code",
+        "--no-open",
+        "--agent-guided",
+        "--operator-custody",
+        "--no-provision-agent-account"
+      ],
+      "completion": "A planner rerun observes cooperative_wrap=present.",
+      "secret_boundary": "Do not paste a login password, passphrase, recovery key, Keychain contents, or command output into chat. Do not let the agent retry this action."
+    }
+  },
+  "operator_actions": [],
+  "notes": []
+}
+```
+
+The branch rule over that shape: execute `next_action.argv` only when
+`next_action.actor` is `agent`, exactly once, and rerun the planner after exit
+zero. On a nonzero exit, hand the operator `next_action.on_nonzero`, always a
+`human` action with its own `argv`, `description`, and `secret_boundary`, and
+do not rerun the planner until the operator reports that action done. On
+`human_action`, show the operator `description` and `argv` and wait. On
+`blocked`, report `notes` and stop. On `complete`, `operator_actions` lists
+what the operator still does in private. `observations.*` is the evidence the
+status was derived from, and `notes` is prose for the operator (v1.8.4 puts one
+reminder string there on every response: rerun the planner after each action).
+The `argv` the planner returns carries `--no-open`,
+which switches `protect` to its non-interactive custody confirmation and skips
+opening the dashboard in a browser, and `--agent-guided`, described under
+Secret boundary below. Three observations are absent from v1.8.4:
+`tier1_approval` and `staged_recovery_file` arrive from 1.8.6 (present on the
+`next` channel), and `vault_provision` exists on `main` only.
+
 ## Secret boundary
 
 The planner never returns a passphrase, recovery key, dashboard bearer token, or

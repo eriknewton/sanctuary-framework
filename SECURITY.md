@@ -24,7 +24,7 @@ into a private advisory as soon as practical.
 
 Please include, to the extent you can:
 
-- the affected component and version (for example `@sanctuary-framework/mcp-server@1.4.0`, the Castle Wall daemon, or the macOS system extension),
+- the affected component and version (for example `@sanctuary-framework/mcp-server@1.8.4`, the Castle Wall daemon, or the macOS system extension),
 - a description of the vulnerability and its impact,
 - step-by-step reproduction instructions or a proof-of-concept,
 - any relevant logs, configuration, or environment details, and
@@ -54,13 +54,13 @@ reporting an issue you cannot reproduce on it.
 
 | Version | Supported |
 |---|---|
-| `1.4.x` | :white_check_mark: |
-| `1.3.x` | :warning: critical fixes only, best effort |
-| `< 1.3` | :x: |
+| `1.8.x` (npm `latest`, currently `1.8.4`) | :white_check_mark: |
+| `1.8.6-rc.*` (npm `next`, currently `1.8.6-rc.5`) | :warning: pre-release; a fix lands in the next `1.8.x` release, and no rc is patched in place |
+| `< 1.8` | :x: |
 
 The npm `latest` dist-tag is the authoritative pointer to the currently
 supported release. Pre-release (`-rc`) and `next`-tagged builds are not covered
-by this policy.
+by this policy beyond the note above.
 
 ## What NOT To Do
 
@@ -93,6 +93,48 @@ This safe harbor applies to the code and infrastructure in this repository.
 It does not authorize testing against third-party services (for example a
 reputation endpoint or an upstream MCP provider) that Sanctuary may compose
 with; those are governed by their own policies.
+
+## Verify Before You Trust
+
+Each release of `@sanctuary-framework/mcp-server` can be checked before it is
+installed, with no account and no network beyond the npm registry and GitHub.
+The commands below are written against `1.8.4`; substitute the release you are
+checking.
+
+- **npm provenance.** `npm view @sanctuary-framework/mcp-server@1.8.4 dist.attestations`
+  prints the SLSA v1 provenance attestation (`predicateType:
+  https://slsa.dev/provenance/v1`). The package is published from
+  [`.github/workflows/publish-on-tag.yml`](.github/workflows/publish-on-tag.yml)
+  with `npm publish --provenance` through npm Trusted Publishing; no static
+  publish token exists. `npm audit signatures` verifies registry signatures
+  and provenance for every package installed in a project, so run it where the
+  package is installed; an empty directory reports nothing to audit, which is
+  not a pass.
+- **Signed release manifest.** Every release attaches `release-manifest.json`
+  and the tarball to the GitHub release, and the manifest is signed with a
+  pinned Ed25519 key. From a clone of this repository at the tag:
+
+  ```bash
+  gh release download v1.8.4 --pattern release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz
+  node scripts/verify-release-artifact.mjs --tarball sanctuary-framework-mcp-server-1.8.4.tgz --manifest release-manifest.json --version 1.8.4 --expected-public-key 61YBfiq_zlbTP5rl_r_msbPk40IXJL-_PuAxlpBVeF0
+  ```
+
+  The expected public key is `PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL` in
+  [`server/src/release-manifest.ts`](server/src/release-manifest.ts); read it
+  from the tag you are verifying if it ever differs from this page. Success
+  prints `Verified sanctuary-framework-mcp-server-1.8.4.tgz for release 1.8.4.`
+  and exits 0; any mismatch exits 1 with `Release verification refused:` and
+  the reason. The private half of the key is custodied by the maintainer
+  outside this repository.
+- **macOS app.** `Sanctuary-CastleWall.app.zip` is Developer-ID-signed and
+  notarized; compare `shasum -a 256 Sanctuary-CastleWall.app.zip` with the
+  SHA-256 published in [`README.md`](README.md) under Release status for the
+  release you downloaded.
+- **Linux package.** Checksum only today. The
+  [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1)
+  pre-release ships a `.sha256` beside the `.deb`, with no signature and no apt
+  repository, so `sha256sum -c sanctuary-castle-wall_0.1.0-1_amd64.deb.sha256`
+  is the whole check.
 
 ## Static Analysis and Supply Chain
 
