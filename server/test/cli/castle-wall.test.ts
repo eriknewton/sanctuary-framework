@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,11 +16,14 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   AuditLog,
+  type AuditEntry,
   type PersistedAuditEnvelopeV2,
 } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import {
   CUSTODY_WRITE_LOCK_NAMESPACE,
   MASTER_ROTATION_BARRIER_NAME,
@@ -32,6 +35,7 @@ import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encodi
 import {
   formatEnforcementAvailabilityStatus,
   parseCastleWallArgs,
+  appendCastleWallCliAuditBestEffort,
   runDaemon,
   runProvisionPin,
   runProvisionPinAlreadyLocked,
@@ -52,6 +56,7 @@ import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report
 import { runInit } from "../../src/wrap/init.js";
 import {
   CrossProcessLockError,
+  __testListMasterBarrierReaderSockets,
   withExclusiveMasterRotationBarrier,
 } from "../../src/storage/cross-process-lock.js";
 
@@ -106,6 +111,30 @@ const LOCK_ORDER_PROBE_TIMEOUT_MS =
 const BARRIER_CONTENTION_DEADLINE_MULTIPLIER = 10;
 const BARRIER_CONTENTION_DEADLINE_MS =
   LOCK_ORDER_PROBE_TIMEOUT_MS * BARRIER_CONTENTION_DEADLINE_MULTIPLIER;
+const SHORT_SOCKET_TMP_PARENT =
+  process.platform === "darwin" ? "/private/tmp" : tmpdir();
+
+let previousCustodyLockRoot: string | undefined;
+let castleWallTestLockRoot: string | undefined;
+
+beforeAll(async () => {
+  previousCustodyLockRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  // macOS `sun_path` is 104 bytes including the terminator; the resolver's
+  // reviewed 100-byte cap leaves room only when the test root is short.
+  castleWallTestLockRoot = await mkdtemp(join(SHORT_SOCKET_TMP_PARENT, "cwlk-"));
+  process.env.SANCTUARY_CUSTODY_LOCK_ROOT = castleWallTestLockRoot;
+});
+
+afterAll(async () => {
+  if (previousCustodyLockRoot === undefined) {
+    delete process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
+  } else {
+    process.env.SANCTUARY_CUSTODY_LOCK_ROOT = previousCustodyLockRoot;
+  }
+  if (castleWallTestLockRoot !== undefined) {
+    await rm(castleWallTestLockRoot, { recursive: true, force: true });
+  }
+});
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -118,10 +147,29 @@ class CaptureStream extends Writable {
   }
 }
 
+async function assertNoMasterBarrierReadersForTempDirs(
+  dirs: readonly string[],
+): Promise<void> {
+  const leaked: string[] = [];
+  for (const dir of dirs) {
+    const lockDir = join(dir, "state", CUSTODY_WRITE_LOCK_NAMESPACE);
+    const stats = await stat(lockDir).catch(() => null);
+    if (stats === null || !stats.isDirectory()) continue;
+    const sockets = await __testListMasterBarrierReaderSockets(
+      new FilesystemStorage(join(dir, "state")),
+      CUSTODY_WRITE_LOCK_NAMESPACE,
+      MASTER_ROTATION_BARRIER_NAME,
+    );
+    leaked.push(...sockets);
+  }
+  expect(leaked).toEqual([]);
+}
+
 describe("castle-wall CLI verbs", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -168,9 +216,37 @@ describe("castle-wall CLI verbs", () => {
     }
   }
 
-  async function waitForTurn(): Promise<void> {
+  async function waitForTurn(): Promise<void> { // eslint-disable-line @typescript-eslint/no-unused-vars
     await new Promise((resolve) => setTimeout(resolve, ONE_EVENT_LOOP_TURN_MS));
   }
+
+  it("holds the resolved master reader through a CLI audit append", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const err = new CaptureStream();
+    let observedLiveReader = false;
+
+    await appendCastleWallCliAuditBestEffort(
+      "castle_wall_test_append",
+      { source: "unit" },
+      fortressPath,
+      { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      err,
+      {
+        __testBeforeAuditAppend: async () => {
+          const sockets = await __testListMasterBarrierReaderSockets(
+            new FilesystemStorage(join(fortressPath, "state")),
+            CUSTODY_WRITE_LOCK_NAMESPACE,
+            MASTER_ROTATION_BARRIER_NAME,
+          );
+          observedLiveReader = sockets.length > 0;
+        },
+      },
+    );
+
+    expect(err.text()).toBe("");
+    expect(observedLiveReader).toBe(true);
+    await assertNoMasterBarrierReadersForTempDirs([fortressPath]);
+  });
 
   async function waitForProvisionPinBarrierContention(
     signal: Promise<void>,
@@ -983,6 +1059,34 @@ describe("castle-wall CLI verbs", () => {
     expect(JSON.parse(lines[0]!).operation).toBe("egress_allowed");
   });
 
+  it("audit-findings keeps its master session through compatibility anchor establishment", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const auditKey = derivePurposeKey(masterKey, "audit-log");
+    const entry: AuditEntry = {
+      timestamp: "2026-10-11T00:00:00.000Z",
+      layer: "l1",
+      operation: "castle_wall_compatibility_read",
+      identity_id: "unit",
+      result: "success",
+    };
+    const encrypted = encrypt(stringToBytes(JSON.stringify(entry)), auditKey);
+    await storage.write("_audit", "legacy-compatibility-entry", stringToBytes(JSON.stringify(encrypted)));
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runAuditFindings(["--fortress", fortressPath], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+    expect(code, err.text()).toBe(0);
+    expect(out.text()).toContain("No audit integrity findings");
+  });
+
   /** Seed a fortress with flows decided by several distinct rules + default-deny. */
   async function seedRuleAttributedFlows() {
     const fortress = await makeFortress();
@@ -1560,6 +1664,7 @@ describe("castle-wall audit-chain operator override", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -1585,6 +1690,7 @@ describe("castle-wall audit-chain operator override", () => {
       recoveryKey,
       storagePathHint: fortressPath,
     });
+    await custody.masterWriteBarrier?.release();
     custody.masterKey.fill(0);
     return { fortressPath, masterKey, recoveryKey };
   }
@@ -2082,6 +2188,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    await assertNoMasterBarrierReadersForTempDirs(tempDirs);
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
@@ -2529,6 +2636,42 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
   // ── FIX 3 (codex HIGH): the daemon entrypoint ROUTES opt-in Linux to the
   //    producer-signed gate, and everything else to the macOS/channel path. ──
   describe("runDaemon routing (FIX 3)", () => {
+    async function schedulerAbortHarness() {
+      const {
+        TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
+        startTransparencyScheduler,
+      } = await import("../../src/transparency/scheduler.js");
+      let state:
+        | import("../../src/transparency/scheduler.js").TransparencySchedulerAbortState
+        | undefined;
+      let releaseScheduler: (() => void) | undefined;
+      const scheduler = startTransparencyScheduler({
+        intervalMs: 1_000,
+        emit: async (abortState) => {
+          state = abortState;
+          await new Promise<void>((resolvePromise) => {
+            releaseScheduler = resolvePromise;
+          });
+        },
+        onError: () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      if (state === undefined || releaseScheduler === undefined) {
+        throw new Error("scheduler did not start a transparency emission");
+      }
+      return {
+        state,
+        async abort() {
+          const stopped = scheduler.stop();
+          await vi.advanceTimersByTimeAsync(TRANSPARENCY_STOP_DRAIN_DEADLINE_MS);
+          await stopped;
+        },
+        release() {
+          releaseScheduler?.();
+        },
+      };
+    }
+
     it("the direct Linux daemon entrypoint restores the local chain anchor before activation", async () => {
       const source = await readFile(
         new URL("../../src/cli/castle-wall.ts", import.meta.url),
@@ -2570,6 +2713,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         err,
         env: {
           SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_CASTLE_LOCAL_SIGN: "1",
           [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
         },
         platform: "linux",
@@ -2591,21 +2735,329 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         err,
         env: {
           SANCTUARY_STORAGE_PATH: "/nonexistent/fortress",
+          SANCTUARY_CASTLE_LOCAL_SIGN: "1",
           [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
         },
         platform: "darwin",
       });
       expect(code).toBe(1);
       // The macOS path: it did NOT bail as "macOS-only" and did NOT enter the
-      // Linux producer-signed gate. The specific downstream failure (pin read /
-      // passphrase / establishMaster) depends on host Keychain state, so we
-      // assert the ROUTING (no Linux-gate involvement), not the exact failure.
+      // Linux producer-signed gate. Local signing keeps the downstream failure
+      // on the fixture fortress path, so this asserts routing without reading
+      // any host credential store.
       expect(err.text()).not.toMatch(/macOS-only/);
       expect(err.text()).not.toMatch(/Linux producer-signed/);
       expect(err.text()).not.toMatch(/fail-closed.*not armed/i);
       // It reached the real macOS daemon flow (a pin / credential failure).
       expect(err.text()).toMatch(/No pinned key found|Refusing to start/i);
     });
+
+    it("scheduled transparency emit carries the live abort state into checkpoint emission", async () => {
+      vi.useFakeTimers();
+      const abort = await schedulerAbortHarness();
+      try {
+        const { createTransparencyDaemonScheduledEmit } = await import(
+          "../../src/cli/castle-wall.js"
+        );
+        const { MemoryStorage } = await import("../../src/storage/memory.js");
+        const {
+          TRANSPARENCY_CHECKPOINT_NAMESPACE,
+          TRANSPARENCY_FLOOR_META_KEY,
+        } = await import("../../src/transparency/emitter.js");
+        const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
+        tempDirs.push(fortressPath);
+        const rulesDir = join(fortressPath, "policy", "egress", "rules");
+        await mkdir(rulesDir, { recursive: true });
+        await writeFile(
+          join(rulesDir, "allow-helper.json"),
+          JSON.stringify({ rule_id: "allow-helper", host: "helper.example" }),
+        );
+        const binaryPath = join(fortressPath, "daemon.js");
+        await writeFile(binaryPath, "console.log('daemon');");
+
+        const backing = new MemoryStorage();
+        const masterKey = generateRandomKey();
+        const auditLog = new AuditLog(backing, masterKey);
+        await auditLog.appendCritical({
+          layer: "l1",
+          operation: "egress_allowed",
+          identity_id: "fortress-test",
+          result: "success",
+          details: { rule_id: "allow-helper" },
+        });
+        const storage = new (class extends MemoryStorage {
+          override async read(namespace: string, key: string) {
+            const value = await backing.read(namespace, key);
+            if (namespace === "_meta" && key === TRANSPARENCY_FLOOR_META_KEY) {
+              await abort.abort();
+            }
+            return value;
+          }
+          override write(namespace: string, key: string, data: Uint8Array) {
+            return backing.write(namespace, key, data);
+          }
+          override delete(namespace: string, key: string, secureOverwrite?: boolean) {
+            return backing.delete(namespace, key, secureOverwrite);
+          }
+          override list(namespace: string, prefix?: string) {
+            return backing.list(namespace, prefix);
+          }
+        })();
+        const privateKey = generateRandomKey();
+        const publicKey = ed25519.getPublicKey(privateKey);
+        let signCalls = 0;
+        const signerClientInvoke: ShimInvoker = async (args, stdin) => {
+          if (args[0] === "get-pubkey") {
+            return { stdout: `${toBase64url(publicKey)}\n`, stderr: "", code: 0 };
+          }
+          if (args[0] === "sign-manifest" && stdin !== null) {
+            signCalls += 1;
+            return {
+              stdout: `${toBase64url(ed25519.sign(stdin, privateKey))}\n`,
+              stderr: "",
+              code: 0,
+            };
+          }
+          return { stdout: "", stderr: "unexpected signer request", code: 1 };
+        };
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const scheduledEmit = createTransparencyDaemonScheduledEmit({
+          storage,
+          auditLog,
+          storagePath: fortressPath,
+          masterKey,
+          env: {},
+          localSign: false,
+          signerClientInvoke,
+          globalPinnedPublicKeyPath: join(fortressPath, "absent-global-pin.bin"),
+          binaryPath,
+          version: "0.0.0-test",
+          out,
+          err,
+        });
+
+        const emitted = scheduledEmit(abort.state);
+        await expect(emitted).rejects.toThrow(/checkpoint signing/);
+        expect(signCalls).toBe(0);
+        expect(await backing.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)).toHaveLength(0);
+        expect(await backing.read("_meta", TRANSPARENCY_FLOOR_META_KEY)).toBeNull();
+        expect(out.text()).toBe("");
+      } finally {
+        abort.release();
+        vi.useRealTimers();
+      }
+    });
+
+    it("scheduled transparency emit forwards the live abort state through every daemon checkpoint site", async () => {
+      vi.useFakeTimers();
+      const abort = await schedulerAbortHarness();
+      try {
+        const { createTransparencyDaemonScheduledEmit } = await import(
+          "../../src/cli/castle-wall.js"
+        );
+        const { MemoryStorage } = await import("../../src/storage/memory.js");
+        const { enableAnchoring } = await import(
+          "../../src/transparency/anchoring.js"
+        );
+        const { recordTransparencyAbortStateChecks } = await import(
+          "../helpers/transparency-abort-checks.js"
+        );
+        const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
+        tempDirs.push(fortressPath);
+        const rulesDir = join(fortressPath, "policy", "egress", "rules");
+        await mkdir(rulesDir, { recursive: true });
+        await writeFile(
+          join(rulesDir, "allow-helper.json"),
+          JSON.stringify({ rule_id: "allow-helper", host: "helper.example" }),
+        );
+        const binaryPath = join(fortressPath, "daemon.js");
+        await writeFile(binaryPath, "console.log('daemon');");
+
+        const storage = new MemoryStorage();
+        const masterKey = generateRandomKey();
+        const auditLog = new AuditLog(storage, masterKey);
+        await auditLog.appendCritical({
+          layer: "l1",
+          operation: "egress_allowed",
+          identity_id: "fortress-test",
+          result: "success",
+          details: { rule_id: "allow-helper" },
+        });
+        await enableAnchoring({
+          storage,
+          masterKey,
+          auditLog,
+          fortressId: "fortress-test",
+          abortState: abort.state,
+        });
+        const privateKey = generateRandomKey();
+        const publicKey = ed25519.getPublicKey(privateKey);
+        await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), publicKey);
+        await writeFile(
+          join(fortressPath, "castle-pinned-privkey.enc"),
+          JSON.stringify(encrypt(privateKey, masterKey)),
+        );
+        vi.stubGlobal("fetch", async () => ({
+          status: 201,
+          headers: { get: () => null },
+          text: async () =>
+            JSON.stringify({
+              "uuid-daemon": {
+                body: "ZHVtbXk=",
+                integratedTime: 1_760_000_000,
+                logID: "c0ffee".padEnd(64, "0"),
+                logIndex: 1,
+                verification: {
+                  inclusionProof: {
+                    checkpoint: "rekor.sigstore.dev - 1234\n",
+                    hashes: ["ab".repeat(32)],
+                    logIndex: 1,
+                    rootHash: "cd".repeat(32),
+                    treeSize: 2,
+                  },
+                  signedEntryTimestamp: "c2V0LXNpZw==",
+                },
+              },
+            }),
+        }));
+        const scheduledEmit = createTransparencyDaemonScheduledEmit({
+          storage,
+          auditLog,
+          storagePath: fortressPath,
+          masterKey,
+          env: {},
+          localSign: true,
+          globalPinnedPublicKeyPath: join(fortressPath, "absent-global-pin.bin"),
+          binaryPath,
+          version: "0.0.0-test",
+          out: new CaptureStream(),
+          err: new CaptureStream(),
+        });
+
+        const checks = recordTransparencyAbortStateChecks();
+        try {
+          await scheduledEmit(abort.state);
+          for (const [phase, expectedCount] of [
+            ["transparency signer resolution", 1],
+            ["local transparency signer decrypt", 1],
+            ["counter-floor key derivation", 1],
+            ["anchoring config key derivation", 2],
+            ["anchor key derivation", 1],
+          ] as const) {
+            expect(
+              checks.calls.filter(
+                (call) =>
+                  call.state === abort.state && call.phase === phase,
+              ),
+            ).toHaveLength(expectedCount);
+          }
+        } finally {
+          checks.stop();
+        }
+      } finally {
+        vi.unstubAllGlobals();
+        abort.release();
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      ["spread-forged", "spread"],
+      ["cast-forged", "cast"],
+    ] as const)(
+      "scheduled transparency emit refuses a %s abort state before signer use",
+      async (_label, forgeKind) => {
+        vi.useFakeTimers();
+        const abort = await schedulerAbortHarness();
+        try {
+          const { createTransparencyDaemonScheduledEmit } = await import(
+            "../../src/cli/castle-wall.js"
+          );
+          const { MemoryStorage } = await import("../../src/storage/memory.js");
+          const {
+            TRANSPARENCY_CHECKPOINT_NAMESPACE,
+            TRANSPARENCY_FLOOR_META_KEY,
+          } = await import("../../src/transparency/emitter.js");
+          const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-transparency-"));
+          tempDirs.push(fortressPath);
+          const rulesDir = join(fortressPath, "policy", "egress", "rules");
+          await mkdir(rulesDir, { recursive: true });
+          await writeFile(
+            join(rulesDir, "allow-helper.json"),
+            JSON.stringify({ rule_id: "allow-helper", host: "helper.example" }),
+          );
+          const binaryPath = join(fortressPath, "daemon.js");
+          await writeFile(binaryPath, "console.log('daemon');");
+
+          const storage = new MemoryStorage();
+          const masterKey = generateRandomKey();
+          const auditLog = new AuditLog(storage, masterKey);
+          await auditLog.appendCritical({
+            layer: "l1",
+            operation: "egress_allowed",
+            identity_id: "fortress-test",
+            result: "success",
+            details: { rule_id: "allow-helper" },
+          });
+          const privateKey = generateRandomKey();
+          const publicKey = ed25519.getPublicKey(privateKey);
+          let signCalls = 0;
+          const signerClientInvoke: ShimInvoker = async (args, stdin) => {
+            if (args[0] === "get-pubkey") {
+              return { stdout: `${toBase64url(publicKey)}\n`, stderr: "", code: 0 };
+            }
+            if (args[0] === "sign-manifest" && stdin !== null) {
+              signCalls += 1;
+              return {
+                stdout: `${toBase64url(ed25519.sign(stdin, privateKey))}\n`,
+                stderr: "",
+                code: 0,
+              };
+            }
+            return { stdout: "", stderr: "unexpected signer request", code: 1 };
+          };
+          const out = new CaptureStream();
+          const err = new CaptureStream();
+          const scheduledEmit = createTransparencyDaemonScheduledEmit({
+            storage,
+            auditLog,
+            storagePath: fortressPath,
+            masterKey,
+            env: {},
+            localSign: false,
+            signerClientInvoke,
+            globalPinnedPublicKeyPath: join(fortressPath, "absent-global-pin.bin"),
+            binaryPath,
+            version: "0.0.0-test",
+            out,
+            err,
+          });
+
+          const forged =
+            forgeKind === "spread"
+              ? ({
+                  ...abort.state,
+                  assertNotAborted(): void {},
+                } as unknown as import("../../src/transparency/scheduler.js").TransparencySchedulerAbortState)
+              : ({
+                  aborted: false,
+                  assertNotAborted(): void {},
+                } as unknown as import("../../src/transparency/scheduler.js").TransparencySchedulerAbortState);
+
+          await expect(scheduledEmit(forged)).rejects.toThrow(
+            /transparency signer resolution/,
+          );
+          expect(signCalls).toBe(0);
+          expect(await storage.list(TRANSPARENCY_CHECKPOINT_NAMESPACE)).toHaveLength(0);
+          expect(await storage.read("_meta", TRANSPARENCY_FLOOR_META_KEY)).toBeNull();
+          expect(out.text()).toBe("");
+        } finally {
+          abort.release();
+          vi.useRealTimers();
+        }
+      },
+    );
   });
 
   /**
@@ -2647,6 +3099,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
         firstRun: { installMode: "headless", mintRecoveryKey: false },
         storagePathHint: fortressPath,
       });
+      await custody.masterWriteBarrier?.release();
       custody.masterKey.fill(0);
       // The daemon only fingerprints this key; 32 = ED25519_PUBLIC_KEY_BYTES,
       // the length its own length check enforces before fingerprinting.

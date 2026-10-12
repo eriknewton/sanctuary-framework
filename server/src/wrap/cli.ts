@@ -33,6 +33,7 @@ import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
 import { platform, homedir } from "node:os";
+import { TRANSPARENCY_NEVER_ABORTED } from "../transparency/scheduler.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { get as httpsGet } from "node:https";
@@ -5037,6 +5038,7 @@ export async function runWrap(
       masterKey: masterKeyForWrap,
       auditLog: auditLogForWrap,
       fortressId: fortressIdFromStoragePath(storagePath),
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     anchorTransparencyEnabled = true;
     process.stderr.write(
