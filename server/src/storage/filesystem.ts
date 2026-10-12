@@ -18,16 +18,17 @@
  * - Directory creation uses restrictive permissions (0o700)
  * - File creation uses restrictive permissions (0o600)
  *
- * Path encoding (bijective, full-sweep #41):
- *   Distinct (namespace, key) inputs MUST produce distinct on-disk paths;
+ * Path encoding (byte-addressable domain, full-sweep #41):
+ *   Distinct byte-addressable (namespace, key) inputs produce distinct on-disk paths;
  *   otherwise an agent that can choose namespace/key strings within a tenant
  *   could overwrite or read another namespace by colliding on the sanitized
  *   form (multi-tenant isolation invariant). The encoder retains the safe
  *   set [A-Za-z0-9_.-] (so internal namespaces such as `_audit`, `_bridge`,
  *   etc. preserve their on-disk paths verbatim) and `!`-escapes every other
- *   character as `!XX` where XX is the upper-hex byte. The escape character
+ *   character as the legacy byte escape `!XX`. The escape character
  *   `!` itself is NOT in the safe set, so a literal `!` in input encodes as
- *   `!21` and decoding remains unambiguous.
+ *   `!21`. Names stored by older builds outside the supported range are
+ *   refused on write and may not round-trip when enumerated.
  *
  * Legacy fallback (forward compatibility):
  *   Pre-fix code used `replace(/[^a-zA-Z0-9_-]/g, "_")` for namespaces and
@@ -71,12 +72,17 @@ import {
 } from "./cross-process-lock.js";
 import { isBenignDirectoryFsyncError } from "./directory-fsync.js";
 import {
+  assertFilesystemStorageNameAddressable,
+  decodeRawFilesystemStorageName,
+  encodeFilesystemStorageName,
+  FilesystemStorageNameError,
+  isFilesystemStorageNameError,
+} from "./filesystem-name-codec.js";
+import {
   cleanupFreshInitRecoveryResidue,
   restoreFreshFortressLockScaffold,
 } from "./fresh-fortress.js";
 import {
-  decodeStoragePathComponent,
-  encodeStoragePathComponent,
   InvalidStorageNamespaceError,
   resolveStorageNamespacePath,
   storageNamespacePathComponent,
@@ -88,9 +94,6 @@ import {
 // message, but gives process startup a bounded window distinct from the much
 // shorter per-operation deadline used after admission.
 export const DIRECTORY_CAPABILITY_READY_TIMEOUT_MS = 15_000;
-
-const bijectiveEncode = encodeStoragePathComponent;
-const bijectiveDecode = decodeStoragePathComponent;
 
 // Legacy whitelist sanitizers, used ONLY for read-fallback against fortresses
 // written before full-sweep #41. write() never produces these paths.
@@ -172,7 +175,13 @@ interface CapabilityResponse {
   ready?: boolean;
   ok?: boolean;
   value?: unknown;
-  error?: { message?: string; code?: string };
+  error?: {
+    message?: string;
+    code?: string;
+    kind?: string;
+    rawName?: string;
+    rawNamespace?: string;
+  };
 }
 
 class DarwinDirectoryCapabilityClient {
@@ -199,8 +208,15 @@ class DarwinDirectoryCapabilityClient {
       } else {
         const error = new Error(
           raw.error?.message ?? "directory-capability worker operation failed",
-        ) as NodeJS.ErrnoException;
+        ) as NodeJS.ErrnoException & {
+          kind?: string;
+          rawName?: string;
+          rawNamespace?: string;
+        };
         if (raw.error?.code) error.code = raw.error.code;
+        if (raw.error?.kind) error.kind = raw.error.kind;
+        if (raw.error?.rawName) error.rawName = raw.error.rawName;
+        if (raw.error?.rawNamespace) error.rawNamespace = raw.error.rawNamespace;
         waiter.reject(error);
       }
     });
@@ -474,6 +490,18 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     return capability.client.call<T>(op, [capability.namespace, ...args]);
   }
 
+  private assertCallerNamespace(namespace: string): void {
+    // The Darwin worker's bound-namespace token is an internal capability
+    // marker; only this worker-mode storage instance may resolve it to cwd.
+    if (
+      this.allowDirectoryCapabilityRootNamespace &&
+      namespace === DARWIN_BOUND_NAMESPACE_TOKEN
+    ) {
+      return;
+    }
+    storageNamespacePathComponent(namespace);
+  }
+
   private activeNamespacePath(namespace: string): string {
     // The Darwin worker maps only parent-flagged bound requests to cwd; caller
     // namespaces still pass through the shared component predicate first.
@@ -485,14 +513,15 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const bound = this.boundBasePath.getStore();
     if (bound?.lockedNamespace === namespace && bound.namespaceBasePath) {
-      storageNamespacePathComponent(namespace);
+      this.assertCallerNamespace(namespace);
       return bound.namespaceBasePath;
     }
     return encodedNamespacePath(this.activeBasePath(), namespace);
   }
 
   private entryPath(namespace: string, key: string): string {
-    const safeKey = bijectiveEncode(key);
+    assertFilesystemStorageNameAddressable(key, "key");
+    const safeKey = encodeFilesystemStorageName(key);
     return join(this.activeNamespacePath(namespace), `${safeKey}.enc`);
   }
 
@@ -822,6 +851,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
@@ -842,6 +873,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array,
   ): Promise<boolean> {
     assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
@@ -900,6 +933,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array,
   ): Promise<boolean> {
     assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
@@ -938,6 +973,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array
   ): Promise<void> {
     assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
@@ -994,6 +1031,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const capability = this.darwinCapability(namespace);
     if (capability) {
       const encoded = await this.callDarwinNamespace<string | null>(
@@ -1005,8 +1044,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
     const buf = await this.readAtPath(this.entryPath(namespace, key));
     if (buf !== null) return buf;
-    // Legacy fallback: fortresses written before #41 used a non-bijective
-    // sanitizer; if the new-form path is missing, try the legacy form.
+    // Legacy fallback: fortresses written before #41 used the pre-supported-
+    // range sanitizer; if the new-form path is missing, try the legacy form.
     const legacy = this.legacyEntryPath(namespace, key);
     if (legacy === this.entryPath(namespace, key)) return null;
     return this.readAtPath(legacy);
@@ -1034,6 +1073,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     secureOverwrite = true
   ): Promise<boolean> {
     assertStorageMasterWriteBarrierHeld(this);
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const capability = this.darwinCapability(namespace);
     if (capability) {
       return this.callDarwinNamespace(capability, "delete", [
@@ -1144,6 +1185,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+    this.assertCallerNamespace(namespace);
     const capability = this.darwinCapability(namespace);
     if (capability) {
       // Node's IPC serializer turns an `undefined` array element into `null`.
@@ -1170,7 +1212,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         if (!file.endsWith(".enc")) continue;
 
         const encodedKey = file.slice(0, -4); // Remove .enc extension
-        const key = bijectiveDecode(encodedKey);
+        const key = decodeRawFilesystemStorageName(encodedKey, "key");
         if (prefix && !key.startsWith(prefix)) continue;
 
         const filePath = join(dirPath, file);
@@ -1198,6 +1240,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   }
 
   async exists(namespace: string, key: string): Promise<boolean> {
+    this.assertCallerNamespace(namespace);
+    assertFilesystemStorageNameAddressable(key, "key");
     const capability = this.darwinCapability(namespace);
     if (capability) {
       return this.callDarwinNamespace(capability, "exists", [key]);
@@ -1251,6 +1295,19 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       for await (const entry of await opendir(rootEntryPath)) {
         chargeEntry();
         if (entry.name.endsWith(".enc")) {
+          // Discovery proves the namespace directory and first stored entry;
+          // every consumer lists the namespace itself before acting on entries.
+          try {
+            decodeRawFilesystemStorageName(entry.name.slice(0, -4), "key");
+          } catch (error) {
+            if (isFilesystemStorageNameError(error)) {
+              throw new FilesystemStorageNameError("key", {
+                rawName: error.rawName,
+                rawNamespace: dir.name,
+              });
+            }
+            throw error;
+          }
           hasEntries = true;
           break;
         }
@@ -1261,7 +1318,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
       // Empty non-canonical directories are root noise, but a directory with
       // entries is state-bearing; fail closed before a full export can omit it.
-      const namespace = bijectiveDecode(dir.name);
+      // Raw stored directory names are classified before P13 canonicality so
+      // operators see the on-disk segment they can actually recover or move.
+      const namespace = decodeRawFilesystemStorageName(dir.name, "namespace");
       // The directory must be the canonical encoding of the name it decodes to;
       // otherwise the listed name addresses a different (absent) directory and a
       // full export would silently omit this one's data.

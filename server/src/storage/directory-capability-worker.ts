@@ -326,6 +326,18 @@ async function main(): Promise<void> {
               error instanceof Error && "code" in error
                 ? String((error as NodeJS.ErrnoException).code)
                 : undefined,
+            kind:
+              error instanceof Error && "kind" in error
+                ? String((error as { kind?: unknown }).kind)
+                : undefined,
+            rawName:
+              error instanceof Error && "rawName" in error && typeof (error as { rawName?: unknown }).rawName === "string"
+                ? (error as { rawName: string }).rawName
+                : undefined,
+            rawNamespace:
+              error instanceof Error && "rawNamespace" in error && typeof (error as { rawNamespace?: unknown }).rawNamespace === "string"
+                ? (error as { rawNamespace: string }).rawNamespace
+                : undefined,
           },
         });
       }

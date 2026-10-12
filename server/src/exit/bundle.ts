@@ -18,6 +18,7 @@ import {
   isNamespaceDiscoveryLimitError,
   NAMESPACE_DISCOVERY_LIMIT_REMEDIATION,
 } from "../storage/interface.js";
+import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
 import type {
   CrossProcessLockLease,
   CrossProcessLockOptions,
@@ -188,7 +189,19 @@ const EXIT_AUDIT_RECEIPTS_NAMESPACE = "_exit_audit_receipts";
 const EXIT_POLICY_SETS_NAMESPACE = "_exit_policy_sets";
 const EXIT_COMMITMENTS_NAMESPACE = "_exit_commitments";
 const EXIT_PLACEHOLDER_METADATA_NAMESPACE = "_exit_placeholder_metadata";
+const COMMITMENTS_NAMESPACE = "_commitments";
 const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
+
+const EXIT_RESERVED_EXPORT_PREFLIGHT_NAMESPACES = [
+  "_reputation",
+  KNOWN_SIGNERS_NAMESPACE,
+  "_identities",
+  COMMITMENTS_NAMESPACE,
+  PRIVACY_PLACEHOLDER_NAMESPACE,
+] as const;
+// RESERVED-EXPORT-PREFLIGHT-01: must match RESERVED_EXPORT_PREFLIGHT_NAMESPACES in
+// test/exit/exit-export-namespace-discovery.test.ts so removing one reserved
+// export reader from this preflight fails a full-set witness.
 
 /**
  * MEDIUM-C (Codex gate, 2026-08-22): caps how many journal-set locations a
@@ -936,12 +949,16 @@ export class ExitNamespaceDiscoveryError extends Error {
   readonly code = "EXIT_NAMESPACE_DISCOVERY_FAILED";
 
   constructor(cause: unknown) {
+    const storageNameMessage =
+      isFilesystemStorageNameError(cause) && cause instanceof Error
+        ? ` ${cause.message}`
+        : "";
     super(
       "exit-bundle: namespace discovery failed; export refused before writing " +
         "bundle artifacts." +
         (isNamespaceDiscoveryLimitError(cause)
           ? ` ${NAMESPACE_DISCOVERY_LIMIT_REMEDIATION}`
-          : ""),
+          : storageNameMessage),
       { cause },
     );
     this.name = "ExitNamespaceDiscoveryError";
@@ -967,6 +984,25 @@ async function resolveExportStateNamespaces(
     return await opts.storage.listNamespaces();
   } catch (error) {
     throw new ExitNamespaceDiscoveryError(error);
+  }
+}
+
+async function preflightExitStateStorageNames(
+  opts: ExportExitBundleOptions,
+  stateNamespaces: readonly string[],
+): Promise<void> {
+  for (const namespace of [...new Set(stateNamespaces)].sort()) {
+    if (isReservedNamespace(namespace)) continue;
+    // Discovery names the namespace set; listing each exported namespace here
+    // proves its stored child names before mkdir, artifact writes, or the
+    // export audit append can create residue.
+    await opts.storage.list(namespace);
+  }
+  for (const namespace of EXIT_RESERVED_EXPORT_PREFLIGHT_NAMESPACES) {
+    // These reserved namespaces are exported after the state artifact; proving
+    // them here keeps every storage-name refusal before mkdir, artifact writes,
+    // and the fire-and-forget exit audit append.
+    await opts.storage.list(namespace);
   }
 }
 
@@ -1275,8 +1311,8 @@ async function exportCommitments(
   const encryptionKey = derivePurposeKey(masterKey, "l3-commitments");
   const publicCommitments: ExitCommitmentsArtifact["public_commitments"] = [];
   let unreadable = 0;
-  for (const meta of await storage.list("_commitments")) {
-    const raw = await storage.read("_commitments", meta.key);
+  for (const meta of await storage.list(COMMITMENTS_NAMESPACE)) {
+    const raw = await storage.read(COMMITMENTS_NAMESPACE, meta.key);
     if (!raw) continue;
     try {
       const encrypted = JSON.parse(bytesToString(raw)) as EncryptedPayload;
@@ -1470,6 +1506,7 @@ export async function exportExitBundle(
   // directory or audit entry is written. An enumeration fault cannot be turned
   // into an incomplete export or a partial artifact tree.
   const stateNamespaces = await resolveExportStateNamespaces(opts);
+  await preflightExitStateStorageNames(opts, stateNamespaces);
   const bundleDir = resolve(opts.bundleDir);
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
   await mkdir(join(bundleDir, ARTIFACT_DIR), { recursive: true, mode: 0o700 });

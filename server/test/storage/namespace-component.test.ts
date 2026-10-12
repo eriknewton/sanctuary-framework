@@ -7,7 +7,13 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 
-const INVALID_NAMESPACES = ["", ".", "..", "\0sanctuary-bound-namespace\0"];
+const INVALID_NAMESPACES = [
+  "",
+  ".",
+  "..",
+  "\0sanctuary-bound-namespace\0",
+  "ns-\u4E2D",
+];
 
 const selfOwner = () => ({
   uid: process.getuid?.() ?? 0,
@@ -60,7 +66,7 @@ async function expectStorageOperationsRefuse(
 }
 
 describe("storage namespace names", () => {
-  it("refuses namespace names that are not a single path component in filesystem and memory backends", async () => {
+  it("refuses namespace names that are not valid storage directory components in filesystem and memory backends", async () => {
     const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-component-"));
     try {
       const backends: Array<[string, StorageBackend]> = [
@@ -81,7 +87,7 @@ describe("storage namespace names", () => {
     }
   });
 
-  it("refuses namespace names that are not a single path component in owner and non-owner filesystem modes", async () => {
+  it("refuses namespace names that are not valid storage directory components in owner and non-owner filesystem modes", async () => {
     const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-owner-"));
     try {
       const plain = new FilesystemStorage(join(basePath, "plain"));
