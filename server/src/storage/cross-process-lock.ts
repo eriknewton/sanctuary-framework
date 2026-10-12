@@ -253,6 +253,8 @@ export interface CrossProcessLockOptions {
   timeoutMs?: number;
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
   retryMs?: number;
+  /** Optional caller-owned cancellation for the bounded wait before acquisition. */
+  abortSignal?: AbortSignal;
   /**
    * HIGH-B (Codex gate, 2026-08-22): merged into the lockfile's own JSON
    * alongside `pid`/`acquired_at`, purely for a human reading the file
@@ -600,6 +602,7 @@ export async function withPathLock<T>(
   let contentions = 0;
 
   for (;;) {
+    assertLockWaitNotAborted(options.abortSignal, lockPath);
     try {
       const handle = await open(lockPath, "wx", 0o600);
       // MEDIUM (Codex gate, 2026-08-22 / 2026-08-23): the O_EXCL create
@@ -683,6 +686,7 @@ export async function withPathLock<T>(
       // hint. A genuinely-dead holder is cleared by a one-time operator `rm`.
       contentions += 1;
       options.onContended?.(contentions);
+      assertLockWaitNotAborted(options.abortSignal, lockPath);
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `cross-process lock ${lockPath} held >${timeoutMs}ms; refusing to proceed ` +
@@ -701,6 +705,14 @@ export async function withPathLock<T>(
   } finally {
     await rm(lockPath, { force: true });
   }
+}
+
+function assertLockWaitNotAborted(signal: AbortSignal | undefined, lockPath: string): void {
+  if (signal?.aborted !== true) return;
+  throw new CrossProcessLockError(
+    `cross-process lock wait aborted before acquiring ${lockPath}`,
+    "contention",
+  );
 }
 
 interface KernelDirectoryIdentity {

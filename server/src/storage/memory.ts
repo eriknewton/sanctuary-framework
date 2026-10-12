@@ -31,7 +31,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     namespace: string,
     lockFileName: string,
     operation: (lease: CrossProcessLockLease) => Promise<T>,
-    _options: CrossProcessLockOptions = {},
+    options: CrossProcessLockOptions = {},
   ): Promise<T> {
     assertStorageNamespacePathComponent(namespace);
     const identity = `${namespace.length}:${namespace}${lockFileName}`;
@@ -40,7 +40,7 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = predecessor.catch(() => undefined).then(() => gate);
     this.namespaceLockTails.set(identity, tail);
-    await predecessor.catch(() => undefined);
+    await waitForNamespaceLockTurn(predecessor.catch(() => undefined), options.abortSignal);
     const controller = new AbortController();
     try {
       return await operation({ signal: controller.signal, assertHeld: () => undefined });
@@ -188,4 +188,23 @@ export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabi
     this.store.clear();
     this.namespaceCounts.clear();
   }
+}
+
+async function waitForNamespaceLockTurn(
+  predecessor: Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal?.aborted === true) throw new Error("namespace lock wait aborted");
+  if (signal === undefined) {
+    await predecessor;
+    return;
+  }
+  await Promise.race([
+    predecessor,
+    new Promise<never>((_resolve, reject) => {
+      const abort = () => reject(new Error("namespace lock wait aborted"));
+      signal.addEventListener("abort", abort, { once: true });
+      void predecessor.finally(() => signal.removeEventListener("abort", abort));
+    }),
+  ]);
 }

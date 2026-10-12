@@ -1,4 +1,8 @@
 import type { StorageBackend } from "../storage/interface.js";
+import type {
+  CreateSdwMemoryAdapterOptions,
+  HermesBridgeCommitCheck,
+} from "../index.js";
 import {
   SDW_CATALOG_NAMESPACE,
   type SdwCatalogRecord,
@@ -11,6 +15,8 @@ declare const key: Uint8Array;
 declare const catalogRecord: SdwCatalogRecord;
 declare const persistable: Persistable<SdwCatalogRecord>;
 declare const fortressId: string;
+declare const hermesAdapterBase: Omit<CreateSdwMemoryAdapterOptions, "mode" | "commitCheck">;
+declare const hermesCommitCheck: HermesBridgeCommitCheck;
 
 void sdwBackendWrite(backend, persistable, key, fortressId);
 
@@ -28,3 +34,21 @@ export const forgedPersistable: Persistable<SdwCatalogRecord> = {
 
 // @ts-expect-error The closed SdwRecord union has no unknown/raw payload member.
 export const rawUnknownRecord: SdwRecord = { kind: "raw", version: 1, payload: {} };
+
+void ({
+  ...hermesAdapterBase,
+  mode: "standard",
+} satisfies CreateSdwMemoryAdapterOptions);
+
+void ({
+  ...hermesAdapterBase,
+  mode: "hermes-bridge",
+  commitCheck: hermesCommitCheck,
+} satisfies CreateSdwMemoryAdapterOptions);
+
+// @ts-expect-error Hermes bridge mode must supply the live commit check.
+const missingHermesCommitCheck: CreateSdwMemoryAdapterOptions = {
+  ...hermesAdapterBase,
+  mode: "hermes-bridge",
+};
+void missingHermesCommitCheck;

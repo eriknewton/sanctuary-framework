@@ -94,6 +94,7 @@ const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
 export const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
 export const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
 export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
+export const SDW_MEMORY_CORPUS_LOCK_ABORT_POLL_MS = 100;
 
 // Exported: `sdw/memory-tools.ts` derives the memory_search needle byte cap
 // from this so the tool boundary and the store agree on "one chunk of text".
@@ -228,6 +229,32 @@ interface DeletePreimage {
 /** One process-local corpus mutation chain per shared backend object. */
 const corpusMutationTails = new WeakMap<StorageBackend, Promise<void>>();
 
+export interface HermesBridgeCommitContext {
+  readonly passageId: string;
+  readonly documentId: string;
+  /** UTF-8 bytes of the exact passage text approved for this insert. */
+  readonly passageTextUtf8: Uint8Array;
+  /** Plain SHA-256 over passageTextUtf8, base64url encoded. */
+  readonly passageTextSha256: string;
+  /** UTF-8 byte length of the memory_get success result for this passage. */
+  readonly getFrameUtf8Bytes: number;
+}
+
+export interface HermesBridgeCommitCheck {
+  /** Shutdown, relay EOF, or equivalent bridge cancellation while waiting on the corpus lock. */
+  readonly abortSignal?: AbortSignal;
+  assertAllowedToCommit(context: HermesBridgeCommitContext): Promise<void>;
+}
+
+export type SdwMemoryBackendAdapterModeOptions =
+  | { readonly mode?: "standard"; readonly commitCheck?: never }
+  | { readonly mode: "hermes-bridge"; readonly commitCheck: HermesBridgeCommitCheck };
+
+export interface SdwMemoryCorpusMutationLockOptions {
+  readonly abortSignal?: AbortSignal;
+  readonly pollIntervalMs?: number;
+}
+
 /** Must match every C2 writer and the C3 migration lock acquisition. */
 export function sdwMemoryCorpusBatchLockFile(): string {
   return `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.corpus.${MEMORY_BATCH_LOCK_FILE}`;
@@ -237,12 +264,16 @@ export function sdwMemoryCorpusBatchLockFile(): string {
 export async function withSdwMemoryCorpusMutationLock<T>(
   storage: StorageBackend,
   fn: () => Promise<T>,
+  options: SdwMemoryCorpusMutationLockOptions = {},
 ): Promise<T> {
   if (typeof (storage as StorageBackend & { namespacePath?: unknown }).namespacePath === "function") {
     return fn();
   }
   const previous = corpusMutationTails.get(storage) ?? Promise.resolve();
-  const run = previous.catch(() => {}).then(fn);
+  const run = (async () => {
+    await waitForSdwMemoryCorpusTurn(previous.catch(() => {}), options);
+    return fn();
+  })();
   const tail = run.then(() => undefined, () => undefined);
   corpusMutationTails.set(storage, tail);
   try {
@@ -252,7 +283,7 @@ export async function withSdwMemoryCorpusMutationLock<T>(
   }
 }
 
-export interface SdwMemoryBackendAdapterOptions {
+interface SdwMemoryBackendAdapterBaseOptions {
   readonly storage: StorageBackend;
   readonly masterKey: Uint8Array;
   readonly fortressId: string;
@@ -290,6 +321,9 @@ export interface SdwMemoryBackendAdapterOptions {
   readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
 }
 
+export type SdwMemoryBackendAdapterOptions =
+  SdwMemoryBackendAdapterBaseOptions & SdwMemoryBackendAdapterModeOptions;
+
 export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly storage: StorageBackend;
   private readonly corpus: SdwDocumentCorpusStore;
@@ -306,6 +340,9 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly testOnlyDefaultProvenanceContext: MemoryProvenanceIngressContext | undefined;
   private readonly resolveMemoryIntegrityState: () => Promise<SdwMemoryIntegrityState>;
   private readonly badSignerAuthority: MemoryProvenanceBadSignerAuthority | undefined;
+  readonly mode: "standard" | "hermes-bridge";
+  private readonly hermesBridgeCommitCheck: HermesBridgeCommitCheck | undefined;
+  private hermesBridgeLatchReason: string | null = null;
   /**
    * Process-local duplicate-insert guard for non-transactional backends. This
    * does not coordinate with another Sanctuary process pointed at the same
@@ -396,21 +433,34 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     this.testOnlyDefaultProvenanceContext = options.testOnlyDefaultProvenanceContext;
     this.resolveMemoryIntegrityState = options.resolveMemoryIntegrityState;
     this.badSignerAuthority = options.badSignerAuthority;
+    this.mode = options.mode ?? "standard";
+    if (this.mode === "hermes-bridge" && options.commitCheck === undefined) {
+      throw new Error("Hermes bridge SDW memory adapter requires a commit check");
+    }
+    this.hermesBridgeCommitCheck = options.commitCheck;
   }
 
   async insertPassage(
     input: MemoryPassageInput,
     taint: PersistableTaint,
   ): Promise<MemoryPassage> {
+    this.assertHermesBridgeInsertAllowed();
     const prepared = this.preparePassage(input, false, this.resolvePrimarySigningHandle());
     const { documentId, documentRecord, chunkRecords } = prepared;
 
     const transactional = asSdwTransactional(this.storage);
     if (transactional !== null) {
       await transactional.sdwTransaction(async (txn) => {
-        this.assertSignerStillPrimary(prepared);
-        await this.assertCandidateCapacity([prepared], txn);
-        await this.assertDocumentAbsent(documentId, txn);
+        if (this.mode === "hermes-bridge") {
+          await this.assertDocumentAbsent(documentId, txn);
+          await this.assertCandidateCapacity([prepared], txn);
+          this.assertSignerStillPrimary(prepared);
+          await this.assertHermesBridgeCommitAllowed(prepared);
+        } else {
+          this.assertSignerStillPrimary(prepared);
+          await this.assertCandidateCapacity([prepared], txn);
+          await this.assertDocumentAbsent(documentId, txn);
+        }
         for (const [index, chunkRecord] of chunkRecords.entries()) {
           await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(prepared, index));
         }
@@ -429,6 +479,8 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
           const writtenChunkKeys: string[] = [];
           try {
             this.assertSignerStillPrimary(prepared);
+            // Hermes mode linearizes owner approval inside the corpus lock; a refusal here precedes every storage write.
+            await this.assertHermesBridgeCommitAllowed(prepared);
             for (const [index, chunkRecord] of chunkRecords.entries()) {
               writtenChunkKeys.push(documentChunkStorageKey(chunkRecord));
               await this.corpus.putChunk(
@@ -448,12 +500,23 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
               documentMintOptions(prepared),
             );
           } catch (error) {
-            await this.rollbackInsert(documentId, writtenChunkKeys);
+            if (this.mode !== "hermes-bridge" || writtenChunkKeys.length > 0) {
+              try {
+                await this.rollbackInsert(documentId, writtenChunkKeys);
+              } catch (rollbackError) {
+                this.latchHermesBridgeOnPartialScope(rollbackError);
+                throw rollbackError;
+              }
+            }
+            this.latchHermesBridgeOnPartialScope(error);
             throw error;
           }
         },
-        { timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS },
-      ));
+        {
+          timeoutMs: MEMORY_BATCH_LOCK_TIMEOUT_MS,
+          abortSignal: this.hermesBridgeCommitCheck?.abortSignal,
+        },
+      ), { abortSignal: this.hermesBridgeCommitCheck?.abortSignal });
     }
     return this.toPassage(documentRecord, prepared.text, "verified");
   }
@@ -506,6 +569,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     taint: PersistableTaint,
     applyBareCredentialFallback = false,
   ): Promise<readonly MemoryPassage[]> {
+    this.assertHermesBridgeContentMutatorRefused("putPassages");
     if (inputs.length === 0) return [];
     for (const input of inputs) {
       if (input.passage_id === undefined) {
@@ -609,6 +673,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     inputs: readonly MemoryPassageInput[],
     taint: PersistableTaint,
   ): Promise<readonly MemoryPassage[] | null> {
+    this.assertHermesBridgeContentMutatorRefused("putPassagesIfAbsent");
     if (inputs.length === 0) return [];
     for (const input of inputs) {
       if (input.passage_id === undefined) {
@@ -746,6 +811,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return this.resolveMemoryIntegrityState();
   }
 
+  getHermesBridgeLatchReason(): string | null {
+    return this.hermesBridgeLatchReason;
+  }
+
   derivePassageId(domain: string, label: string): string {
     assertSdwIdentifier(domain, "passage_id_domain");
     const mac = hmacSha256(
@@ -842,6 +911,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   async deletePassage(passageId: string): Promise<boolean> {
+    this.assertHermesBridgeContentMutatorRefused("deletePassage");
     assertSdwIdentifier(passageId, "passage_id");
     const documentId = this.documentId(passageId);
     return this.withDocumentLock(documentId, async () => {
@@ -1608,8 +1678,15 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     }
   }
 
-  private async withDocumentLock<T>(documentId: string, fn: () => Promise<T>): Promise<T> {
-    return this.withCorpusMutationLock(() => this.withSpecificDocumentLock(documentId, fn));
+  private async withDocumentLock<T>(
+    documentId: string,
+    fn: () => Promise<T>,
+    options: SdwMemoryCorpusMutationLockOptions = {},
+  ): Promise<T> {
+    return this.withCorpusMutationLock(
+      () => this.withSpecificDocumentLock(documentId, fn),
+      options,
+    );
   }
 
   private async withSpecificDocumentLock<T>(documentId: string, fn: () => Promise<T>): Promise<T> {
@@ -1635,12 +1712,15 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
    * this chain provides the same exclusion for non-filesystem backends and for
    * multiple adapters sharing one backend object in this process.
    */
-  private async withCorpusMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+  private async withCorpusMutationLock<T>(
+    fn: () => Promise<T>,
+    options: SdwMemoryCorpusMutationLockOptions = {},
+  ): Promise<T> {
     // Filesystem backends already serialize this exact corpus boundary with
     // the nested O_EXCL lock. Let contenders reach that bounded fail-closed
     // primitive (and its operator-visible timeout) instead of queueing them
     // indefinitely behind an in-process promise chain.
-    return withSdwMemoryCorpusMutationLock(this.storage, fn);
+    return withSdwMemoryCorpusMutationLock(this.storage, fn, options);
   }
 
   private async rollbackInsert(documentId: string, writtenChunkKeys: readonly string[]): Promise<void> {
@@ -1880,6 +1960,92 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       provenance_status: provenanceStatus,
     };
   }
+
+  private assertHermesBridgeInsertAllowed(): void {
+    if (this.mode !== "hermes-bridge" || this.hermesBridgeLatchReason === null) return;
+    throw new SdwValidationError(
+      "operation_refused",
+      "SDW memory Hermes bridge insert is latched pending operator recovery",
+    );
+  }
+
+  private assertHermesBridgeContentMutatorRefused(operation: string): void {
+    if (this.mode !== "hermes-bridge") return;
+    throw new SdwValidationError(
+      "operation_refused",
+      `SDW memory Hermes bridge adapter refuses ${operation}`,
+    );
+  }
+
+  private async assertHermesBridgeCommitAllowed(prepared: PreparedPassage): Promise<void> {
+    if (this.hermesBridgeCommitCheck === undefined) return;
+    await this.hermesBridgeCommitCheck.assertAllowedToCommit(
+      this.hermesBridgeCommitContext(prepared),
+    );
+  }
+
+  private hermesBridgeCommitContext(prepared: PreparedPassage): HermesBridgeCommitContext {
+    const passage = this.toPassage(prepared.documentRecord, prepared.text, "verified");
+    const passageTextUtf8 = stringToBytes(prepared.text);
+    return {
+      passageId: passage.passage_id,
+      documentId: prepared.documentId,
+      passageTextUtf8,
+      passageTextSha256: toBase64url(hash(passageTextUtf8)),
+      getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(passage),
+    };
+  }
+
+  private latchHermesBridgeOnPartialScope(error: unknown): void {
+    if (this.mode !== "hermes-bridge" || !isSdwPartialScopeError(error)) return;
+    this.hermesBridgeLatchReason =
+      `partial_scope while committing ${SDW_DOCUMENT_CORPUS_NAMESPACE}; operator recovery required`;
+  }
+}
+
+async function waitForSdwMemoryCorpusTurn(
+  previous: Promise<void>,
+  options: SdwMemoryCorpusMutationLockOptions,
+): Promise<void> {
+  const signal = options.abortSignal;
+  const pollIntervalMs = options.pollIntervalMs ?? SDW_MEMORY_CORPUS_LOCK_ABORT_POLL_MS;
+  for (;;) {
+    if (signal?.aborted === true) {
+      throw new SdwValidationError("operation_aborted", "SDW memory corpus mutation wait aborted");
+    }
+    const result = await Promise.race([
+      previous.then(() => "ready" as const),
+      sleep(pollIntervalMs).then(() => "poll" as const),
+    ]);
+    if (result === "ready") return;
+  }
+}
+
+function memoryGetSuccessFrameUtf8Bytes(passage: MemoryPassage): number {
+  // Must match publicFullPassage/toolResult in sdw/memory-tools.ts; the bridge compares this size to its frame cap.
+  const publicPassage = {
+    passage_id: passage.passage_id,
+    owner_ref: passage.owner_ref,
+    text: passage.text,
+    tags: [...passage.tags],
+    metadata: passage.metadata.map((entry) => ({ ...entry })),
+    created_at: passage.created_at,
+    chunk_count: passage.chunk_count,
+    content_hash: passage.content_hash,
+  };
+  const toolPayload = { found: true, passage: publicPassage };
+  const toolResponse = {
+    content: [{ type: "text" as const, text: JSON.stringify(toolPayload, null, 2) }],
+  };
+  return Buffer.byteLength(JSON.stringify(toolResponse), "utf8");
+}
+
+function isSdwPartialScopeError(error: unknown): boolean {
+  return error instanceof SdwValidationError && error.category === "partial_scope";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function chunkText(text: string, maxChunkChars: number): readonly string[] {

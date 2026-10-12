@@ -122,7 +122,11 @@ import {
   wrappedAgentIdentityFromEnv,
 } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
-import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
+import {
+  SdwMemoryBackendAdapter,
+  type HermesBridgeCommitCheck,
+  type SdwMemoryBackendAdapterOptions,
+} from "./sdw/adapters/sdw-memory-backend.js";
 import { createSdwTools } from "./sdw/tools.js";
 import { SdwMemoryProvenanceMigration } from "./sdw/memory-provenance-migration.js";
 import { createSdwMemoryProvenanceMigrationTools } from "./sdw/memory-provenance-migration-tools.js";
@@ -222,6 +226,43 @@ type HandsFreeBootCredential =
   | { kind: "keychain-key"; key: Uint8Array }
   | { kind: "virgin" }
   | { kind: "fail-closed"; message: string };
+
+export type { HermesBridgeCommitCheck };
+
+type CreateSdwMemoryAdapterBaseOptions = Pick<
+  SdwMemoryBackendAdapterOptions,
+  | "storage"
+  | "masterKey"
+  | "fortressId"
+  | "ownerRef"
+  | "resolvePrimarySigningHandle"
+  | "resolveSignerPublicKey"
+  | "resolveMemoryIntegrityState"
+  | "badSignerAuthority"
+>;
+
+export type CreateSdwMemoryAdapterOptions = CreateSdwMemoryAdapterBaseOptions & (
+  | { readonly mode: "standard" }
+  | { readonly mode: "hermes-bridge"; readonly commitCheck: HermesBridgeCommitCheck }
+);
+
+export function createSdwMemoryAdapter(
+  options: CreateSdwMemoryAdapterOptions,
+): SdwMemoryBackendAdapter {
+  return new SdwMemoryBackendAdapter({
+    storage: options.storage,
+    masterKey: options.masterKey,
+    fortressId: options.fortressId,
+    ownerRef: options.ownerRef,
+    resolvePrimarySigningHandle: options.resolvePrimarySigningHandle,
+    resolveSignerPublicKey: options.resolveSignerPublicKey,
+    resolveMemoryIntegrityState: options.resolveMemoryIntegrityState,
+    badSignerAuthority: options.badSignerAuthority,
+    ...(options.mode === "hermes-bridge"
+      ? { mode: "hermes-bridge" as const, commitCheck: options.commitCheck }
+      : { mode: "standard" as const }),
+  });
+}
 
 /**
  * Resolve the exact-fortress credential for a hands-free MCP boot (H1),
@@ -1848,7 +1889,8 @@ export async function createSanctuaryServer(options?: {
     scanForeignDependencies: (did, fingerprint) =>
       sdwMemoryAdapter.scanForeignSignerDependencies(did, fingerprint),
   });
-  const sdwMemoryAdapter: SdwMemoryBackendAdapter = new SdwMemoryBackendAdapter({
+  const sdwMemoryAdapter: SdwMemoryBackendAdapter = createSdwMemoryAdapter({
+    mode: "standard",
     storage,
     masterKey,
     fortressId: sdwFortressId,

@@ -850,6 +850,48 @@ describe("withCrossProcessLock", () => {
     await holder;
   });
 
+  it("aborts a contended wait before the operation can write", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const holder = track(
+      withCrossProcessLock(storage, NS, LOCK, async () => {
+        await held;
+      }),
+      release,
+    );
+    await sleep(20);
+
+    const controller = new AbortController();
+    let ran = false;
+    const contender = track(
+      withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => {
+          ran = true;
+          await storage.write(NS, "must-not-land", new Uint8Array([1]));
+        },
+        {
+          timeoutMs: 500,
+          retryMs: 10,
+          abortSignal: controller.signal,
+        },
+      ),
+    );
+    controller.abort();
+
+    await expect(contender).rejects.toMatchObject({
+      kind: "contention",
+      message: expect.stringContaining("wait aborted"),
+    });
+    expect(ran).toBe(false);
+    await expect(storage.read(NS, "must-not-land")).resolves.toBeNull();
+
+    release();
+    await holder;
+  });
+
   it("FIX 4: does NOT auto-break a stale lock (no read-then-unlink TOCTOU); fails CLOSED with a manual-rm hint", async () => {
     // Write a lockfile whose holder PID cannot exist (a never-allocated high PID),
     // simulating a crashed process that never released its lock. The OLD code
