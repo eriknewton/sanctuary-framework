@@ -766,3 +766,87 @@ describe("agent-guided auto-provision exit code", () => {
     expect(exitCode({ ran: false }, true, false)).toBeUndefined();
   });
 });
+
+describe("wrap/cli custody normalize summary", () => {
+  it("armed plus non-clean custody normalize names entries left untouched", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: ["ok.enc"],
+        skips: [{ path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" }],
+        vanished: [],
+        changedAfterOperation: [],
+        failed: [],
+      },
+    });
+    expect(out.join("\n")).toContain("custody normalize repaired 1");
+    expect(out.join("\n")).toContain("left 1 entry untouched");
+    expect(out.join("\n")).toContain("multi.enc");
+  });
+
+  it("uses the foreign-owner remedy for foreign-owner custody skips", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [{ path: "foreign.enc", uid: 502, gid: 20, reason: "foreign_owner" }],
+        vanished: [],
+        changedAfterOperation: [],
+        failed: [],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain("foreign.enc");
+    expect(rendered).toContain("owned by uid 502");
+    expect(rendered).not.toContain("extra names");
+  });
+
+  it("uses root-inspection wording for post-change custody entries", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [],
+        vanished: [],
+        changedAfterOperation: ["castle.sock"],
+        failed: [],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain(
+      "castle.sock: ownership was already changed and the entry needs inspecting as root",
+    );
+    expect(rendered).not.toContain("run 'sudo sanctuary castle-wall repair-custody'");
+  });
+
+  it("uses root-inspection wording for failed custody entries with the inspection reason", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [],
+        vanished: [],
+        changedAfterOperation: [],
+        failed: [
+          {
+            path: "castle.sock",
+            reason: "ownership was already changed and the entry needs inspecting as root",
+          },
+        ],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain(
+      "castle.sock: ownership was already changed and the entry needs inspecting as root",
+    );
+    expect(rendered).not.toContain("run 'sudo sanctuary castle-wall repair-custody'");
+  });
+});

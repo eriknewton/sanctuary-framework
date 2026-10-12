@@ -32,11 +32,11 @@ class CaptureStream extends Writable {
 }
 
 interface FakeNode {
-  type: "dir" | "file" | "socket" | "symlink";
+  type: "dir" | "file" | "socket" | "symlink" | "other";
   uid: number;
   gid: number;
   mode: number;
-  ino: number;
+  ino: number; nlink?: number;
 }
 
 function fakeStats(node: FakeNode): Stats {
@@ -49,7 +49,7 @@ function fakeStats(node: FakeNode): Stats {
     gid: node.gid,
     mode: node.mode,
     dev: 1,
-    ino: node.ino,
+    ino: node.ino, nlink: node.nlink ?? 1,
   } as unknown as Stats;
 }
 
@@ -166,6 +166,26 @@ function baseCtx(
   };
 }
 
+function withOpenStatNlink(
+  fake: { ops: FortressCustodyFsOps },
+  path: string,
+  nlink: number,
+): void {
+  const originalOpen = fake.ops.open.bind(fake.ops);
+  fake.ops.open = async (openedPath, flags) => {
+    const handle = await originalOpen(openedPath, flags);
+    if (openedPath !== path) return handle;
+    return {
+      ...handle,
+      stat: async () =>
+        ({
+          ...(await handle.stat()),
+          nlink,
+        }) as Stats,
+    };
+  };
+}
+
 describe("castle-wall repair-custody", () => {
   it("refuses when not running as root", async () => {
     const fake = rootOwnedFortress();
@@ -216,7 +236,7 @@ describe("castle-wall repair-custody", () => {
       expect(fake.nodes.get("/Users/mini2/.sanctuary")!.uid).toBe(501);
       expect(fake.nodes.get("/Users/mini2/.sanctuary/castle.sock")!.uid).toBe(501);
       expect(fake.nodes.get("/Users/mini2/.sanctuary/state/other.enc")!.uid).toBe(502);
-      expect(ctx.out.text()).toContain("skipped: state/other.enc");
+      expect(ctx.out.text()).toContain("state/other.enc is owned by uid 502");
       expect(ctx.out.text()).toContain("Rollback");
 
       // CLI-mutator audit rule: the repair writes a metadata-only audit entry.
@@ -338,6 +358,228 @@ describe("castle-wall repair-custody", () => {
       expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
       expect(ctx.out.text()).toContain("state changed identity");
       expect(ctx.err.text()).toContain("Rollback incomplete");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rollback exits failed and leaves a multi-name entry untouched", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const manifestPath = join(dir, "custody-x.json");
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          kind: CUSTODY_REPAIR_MANIFEST_KIND,
+          generated_at: "2026-10-12T00:00:00.000Z",
+          fortress_path: "/Users/mini2/.sanctuary",
+          operator: { uid: 501, gid: 20 },
+          entries: [
+            { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+            { path: "restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+          ],
+          vanished: [],
+        }),
+      );
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/restore.enc": {
+            type: "file",
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+            nlink: 1,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["restore.enc"] },
+      );
+      withOpenStatNlink(fake, "/Users/mini2/.sanctuary/restore.enc", 2);
+
+      const ctx = baseCtx(fake, dir);
+      const code = await runRepairCustody(["--rollback", manifestPath], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/restore.enc")!.uid).toBe(501);
+      expect(ctx.out.text()).toContain("fortress entry restore.enc has more than one name");
+      expect(ctx.out.text()).not.toContain("repair-custody");
+      expect(ctx.err.text()).toContain("Rollback incomplete");
+      expect(ctx.out.text()).not.toContain("Rollback complete");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rollback exits failed when ownership restore needs root inspection", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const manifestPath = join(dir, "custody-x.json");
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          kind: CUSTODY_REPAIR_MANIFEST_KIND,
+          generated_at: "2026-10-12T00:00:00.000Z",
+          fortress_path: "/Users/mini2/.sanctuary",
+          operator: { uid: 501, gid: 20 },
+          entries: [
+            { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+            { path: "castle.sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+          ],
+          vanished: [],
+        }),
+      );
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/castle.sock": {
+            type: "socket",
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+            nlink: 1,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["castle.sock"] },
+      );
+      let afterRestore = false;
+      const originalLstat = fake.ops.lstat.bind(fake.ops);
+      const originalLchown = fake.ops.lchown.bind(fake.ops);
+      fake.ops.lchown = async (path, uid, gid) => {
+        await originalLchown(path, uid, gid);
+        if (path === "/Users/mini2/.sanctuary/castle.sock") afterRestore = true;
+      };
+      fake.ops.lstat = async (path) => {
+        const stats = await originalLstat(path);
+        if (path === "/Users/mini2/.sanctuary/castle.sock" && afterRestore) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+        return stats;
+      };
+      const ctx = baseCtx(fake, dir);
+
+      const code = await runRepairCustody(["--rollback", manifestPath], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain(
+        "FAILED: castle.sock: ownership was already changed and the entry needs inspecting as root.",
+      );
+      expect(ctx.err.text()).toContain("Rollback incomplete: 1 entry could not be restored");
+      expect(ctx.auditOps[0]?.details).toMatchObject({ changed_after_operation: 1 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits failed and audits when a forward ownership repair needs root inspection", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/castle.sock": {
+            type: "socket",
+            uid: 0,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+            nlink: 1,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["castle.sock"] },
+      );
+      let afterRepair = false;
+      const originalLstat = fake.ops.lstat.bind(fake.ops);
+      const originalLchown = fake.ops.lchown.bind(fake.ops);
+      fake.ops.lchown = async (path, uid, gid) => {
+        await originalLchown(path, uid, gid);
+        if (path === "/Users/mini2/.sanctuary/castle.sock") afterRepair = true;
+      };
+      fake.ops.lstat = async (path) => {
+        const stats = await originalLstat(path);
+        if (path === "/Users/mini2/.sanctuary/castle.sock" && afterRepair) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+        return stats;
+      };
+      const ctx = baseCtx(fake, manifestDir);
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain(
+        "FAILED: castle.sock: ownership was already changed and the entry needs inspecting as root.",
+      );
+      expect(ctx.err.text()).toContain("1 entry requires root inspection");
+      expect(ctx.out.text()).not.toContain("Repaired 1 entries");
+      expect(ctx.auditOps[0]?.details).toMatchObject({ changed_after_operation: 1 });
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits failed when the post-audit sweep reports root-inspection work", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/ok.enc": {
+            type: "file",
+            uid: 0,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+            nlink: 1,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["ok.enc"] },
+      );
+      let auditSocketAfterRepair = false;
+      const originalLstat = fake.ops.lstat.bind(fake.ops);
+      const originalLchown = fake.ops.lchown.bind(fake.ops);
+      fake.ops.lchown = async (path, uid, gid) => {
+        await originalLchown(path, uid, gid);
+        if (path === "/Users/mini2/.sanctuary/audit.sock") auditSocketAfterRepair = true;
+      };
+      fake.ops.lstat = async (path) => {
+        const stats = await originalLstat(path);
+        if (path === "/Users/mini2/.sanctuary/audit.sock" && auditSocketAfterRepair) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+        return stats;
+      };
+      const ctx = baseCtx(fake, manifestDir);
+      ctx.appendAudit = async (operation, details) => {
+        ctx.auditOps.push({ operation, details });
+        fake.nodes.set("/Users/mini2/.sanctuary/audit.sock", {
+          type: "socket",
+          uid: 0,
+          gid: 20,
+          mode: 0o600,
+          ino: 3,
+          nlink: 1,
+        });
+      };
+      const originalReaddir = fake.ops.readdir.bind(fake.ops);
+      fake.ops.readdir = async (path) => {
+        const names = await originalReaddir(path);
+        if (path === "/Users/mini2/.sanctuary" && fake.nodes.has(`${path}/audit.sock`)) {
+          return [...new Set([...names, "audit.sock"])];
+        }
+        return names;
+      };
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain(
+        "FAILED: audit.sock: ownership was already changed and the entry needs inspecting as root.",
+      );
+      expect(ctx.err.text()).toContain("post-audit custody sweep");
     } finally {
       await rm(manifestDir, { recursive: true, force: true });
     }
@@ -549,6 +791,119 @@ describe("castle-wall repair-custody", () => {
       expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
       expect(ctx.err.text()).toContain("Repair incomplete");
       expect(ctx.err.text()).toContain("changed identity");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports and leaves a regular entry with more than one name untouched", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/multi.enc": {
+            type: "file",
+            uid: 0,
+            gid: 20,
+            mode: 0o640,
+            ino: 2,
+            nlink: 2,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["multi.enc"] },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/multi.enc")!.uid).toBe(0);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/multi.enc")!.mode).toBe(0o640);
+      expect(ctx.out.text()).toContain(
+        "fortress entry multi.enc has more than one name and was left untouched",
+      );
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits failed when an operator-owned unsupported entry is present", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/node": {
+            type: "other",
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["node"] },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain("unsupported filesystem type");
+      expect(ctx.out.text()).toContain("Inspect it with sudo");
+      expect(ctx.err.text()).toContain("Repair incomplete");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hands back audit state created during a skipped forward run", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/state": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 2 },
+          "/Users/mini2/.sanctuary/state/multi.enc": {
+            type: "file",
+            uid: 0,
+            gid: 20,
+            mode: 0o600,
+            ino: 3,
+            nlink: 2,
+          },
+        },
+        {
+          "/Users/mini2/.sanctuary": ["state"],
+          "/Users/mini2/.sanctuary/state": ["multi.enc"],
+        },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+      ctx.appendAudit = async (operation, details) => {
+        ctx.auditOps.push({ operation, details });
+        fake.nodes.set("/Users/mini2/.sanctuary/state/audit.json", {
+          type: "file",
+          uid: 0,
+          gid: 20,
+          mode: 0o600,
+          ino: 4,
+          nlink: 1,
+        });
+      };
+      const originalReaddir = fake.ops.readdir.bind(fake.ops);
+      fake.ops.readdir = async (path) => {
+        const names = await originalReaddir(path);
+        if (path === "/Users/mini2/.sanctuary/state" && fake.nodes.has(`${path}/audit.json`)) {
+          return [...new Set([...names, "audit.json"])];
+        }
+        return names;
+      };
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.auditOps[0]?.details).toMatchObject({ skipped_multiple_names: 1 });
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/state/audit.json")!.uid).toBe(501);
     } finally {
       await rm(manifestDir, { recursive: true, force: true });
     }
