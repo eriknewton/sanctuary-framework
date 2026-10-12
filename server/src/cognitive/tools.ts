@@ -2167,6 +2167,18 @@ export function createCognitiveTools(
           return fromBase64url(identity.public_key);
         };
 
+        try {
+          // Must match StateStore.import and memory-checkpoint/restore.ts:
+          // the tool denies before a success audit when the shared floor
+          // preflight says the bundle cannot become readable state.
+          await stateStore.assertImportVersionFloors(args.bundle as string);
+        } catch (err) {
+          if (err instanceof StateVerificationError) {
+            return denyNamespaceAccess("state_import", "state_import");
+          }
+          throw err;
+        }
+
         await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
           conflict_resolution:
             (args.conflict_resolution as "skip" | "overwrite" | "version") ??
@@ -2200,6 +2212,9 @@ export function createCognitiveTools(
               error: "exit_import_pending_recovery",
               message: err.message,
             });
+          }
+          if (err instanceof StateVerificationError) {
+            return denyNamespaceAccess("state_import", "state_import");
           }
           throw err;
         }

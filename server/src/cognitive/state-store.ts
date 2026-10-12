@@ -3043,6 +3043,9 @@ export class StateStore {
       data,
       options.allowUnverifiedLegacy === true
     );
+    // The import writer must share checkpoint restore's read-only floor preflight
+    // so an approved bundle cannot install entries the enforcing reader refuses.
+    await this.assertImportVersionFloors(bundleBase64);
 
     let importedKeys = 0;
     let skippedKeys = 0;
