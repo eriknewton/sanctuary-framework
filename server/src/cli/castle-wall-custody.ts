@@ -53,6 +53,7 @@ import {
   walkFortressCustody,
   writeCustodyRepairManifest,
   type CustodyApplyResult,
+  type CustodySkip,
   type CustodyRepairManifest,
   type FortressCustodyFsOps,
   type FortressWalkResult,
@@ -182,9 +183,24 @@ export function parseRepairCustodyArgs(argv: string[]): ParsedRepairCustodyArgs 
   return parsed;
 }
 
-function describeApply(result: CustodyApplyResult, out: Writable): void {
+function custodyRollbackSkipOperatorMessage(skip: CustodySkip): string {
+  if (skip.reason === "multiple_names") {
+    return `fortress entry ${skip.path} has more than one name and was left untouched. Inspect it as root, remove any stale same-fortress staging alias, then retry rollback.`;
+  }
+  return custodySkipOperatorMessage(skip);
+}
+
+function describeApply(
+  result: CustodyApplyResult,
+  out: Writable,
+  options: { rollback?: boolean } = {},
+): void {
   for (const skip of result.skipped) {
-    write(out, `  skipped: ${custodySkipOperatorMessage(skip)}\n`);
+    const message =
+      options.rollback === true
+        ? custodyRollbackSkipOperatorMessage(skip)
+        : custodySkipOperatorMessage(skip);
+    write(out, `  skipped: ${message}\n`);
   }
   for (const path of result.vanished) {
     write(out, `  note: ${path} vanished mid-repair (live daemon churn); skipped.\n`);
@@ -383,13 +399,18 @@ export async function runRepairCustody(
       return REPAIR_CUSTODY_EXIT_REFUSED;
     }
     const result = await applyCustodyRollback(fortressPath, manifest, ops);
-    describeApply(result, out);
+    describeApply(result, out, { rollback: true });
     if (
       result.failed.length > 0 ||
       result.changedAfterOperation.length > 0 ||
       result.identityChanged.length > 0 ||
       result.skipped.length > 0
     ) {
+      const unrestoredCount =
+        result.failed.length +
+        result.changedAfterOperation.length +
+        result.identityChanged.length +
+        result.skipped.length;
       await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
         "fortress_custody_rollback",
         {
@@ -409,12 +430,9 @@ export async function runRepairCustody(
       );
       write(
         err,
-        `Rollback incomplete: ${
-          result.failed.length +
-          result.changedAfterOperation.length +
-          result.identityChanged.length +
-          result.skipped.length
-        } entries could not be restored (see above).\n`,
+        `Rollback incomplete: ${unrestoredCount} entr${
+          unrestoredCount === 1 ? "y could" : "ies could"
+        } not be restored (see above).\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
     }
@@ -603,11 +621,33 @@ export async function runRepairCustody(
     return REPAIR_CUSTODY_EXIT_FAILED;
   }
   if (applied.changedAfterOperation.length > 0) {
+    await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+      "fortress_custody_repaired",
+      {
+        source: "castle-wall-cli",
+        manifest_path: manifestPath,
+        repaired: applied.repaired.length,
+        skipped_foreign_owner: plan.skips.filter((skip) => skip.reason === "foreign_owner").length,
+        skipped_multiple_names: applied.skipped.filter(
+          (skip) => skip.reason === "multiple_names",
+        ).length,
+        skipped_unsupported_type:
+          unsupportedPlanSkips.length +
+          applied.skipped.filter((skip) => skip.reason === "unsupported_type").length,
+        vanished: walk.vanished.length + applied.vanished.length,
+        identity_changed: applied.identityChanged.length,
+        changed_after_operation: applied.changedAfterOperation.length,
+        operator_uid: identity.uid,
+      },
+      fortressPath,
+      env,
+      err,
+    );
     write(
       err,
       `Repair incomplete: ${applied.changedAfterOperation.length} entr${
-        applied.changedAfterOperation.length === 1 ? "y" : "ies"
-      } require root inspection after ownership repair (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+        applied.changedAfterOperation.length === 1 ? "y requires" : "ies require"
+      } root inspection after ownership repair (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
     );
     return REPAIR_CUSTODY_EXIT_FAILED;
   }

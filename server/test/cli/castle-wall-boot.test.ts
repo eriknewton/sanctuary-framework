@@ -531,7 +531,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
         bootTokenPath: tokenPath,
         normalizeFortressCustody: async (input: { fortressPath: string }) => {
           normalizeCalls.push(input.fortressPath);
-          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+          return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
         },
       });
       expect(code).toBe(0);
@@ -579,7 +579,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
         bootTokenPath: tokenPath,
         normalizeFortressCustody: async (input: { fortressPath: string }) => {
           normalizeCalls.push(input.fortressPath);
-          return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+          return { status: "clean", repaired: [], skips: [], vanished: [], changedAfterOperation: [], failed: [] };
         },
       });
 
@@ -855,6 +855,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
             repaired: [],
             skips: [],
             vanished: [],
+            changedAfterOperation: [],
             failed: [],
           };
         },
@@ -911,6 +912,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
             repaired: [],
             skips: [],
             vanished: [],
+            changedAfterOperation: [],
             failed: [],
           };
         },
@@ -935,6 +937,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
             repaired: [],
             skips: [],
             vanished: [],
+            changedAfterOperation: [],
             failed: [],
           };
         },

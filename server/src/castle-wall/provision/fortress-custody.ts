@@ -753,16 +753,15 @@ async function applyOneAction(
       if (!sameIdentity(action.entry, operationFresh)) return { kind: "identity_changed" };
       const unsupported = unsupportedTypeSkip(action.entry, operationFresh);
       if (unsupported !== null) return { kind: "skipped", skip: unsupported };
-      // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): a second name added between this re-check and lchown is detected after the fact and reported, not prevented.
+      // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): sockets and symlinks have no descriptor form, so this post-change check is best-effort detection rather than prevention; the ownership call is never reverted, and a transient second name gone before the post-check is not seen.
       const skip = multiplyNamedNonDirectorySkip(action.entry, operationFresh);
       if (skip !== null) return { kind: "skipped", skip };
       await ops.lchown(join(fortressPath, relPath), action.chownTo.uid, action.chownTo.gid);
       let after: Stats;
       try {
         after = await ops.lstat(join(fortressPath, relPath));
-      } catch (err) {
-        if (isEnoent(err)) return { kind: "changed_after_operation" };
-        throw err;
+      } catch {
+        return { kind: "changed_after_operation" };
       }
       if (!sameIdentityAndLinkCount(action.entry, operationFresh, after)) {
         return { kind: "changed_after_operation" };
@@ -1144,7 +1143,7 @@ export async function applyCustodyRollback(
               result.identityChanged.push(entry.path);
               continue;
             }
-            // Socket rollback has the same bounded pathname operation as the forward socket bound above.
+            // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): rollback shares the forward socket/symlink pathname window; detection is best-effort, the ownership call is never reverted, and a transient second name gone before the post-check is not seen.
             const skip = multiplyNamedNonDirectorySkip(entry, operationFresh);
             if (skip !== null) {
               result.skipped.push(skip);
@@ -1160,12 +1159,9 @@ export async function applyCustodyRollback(
               after = await ops.lstat(
                 entry.path === "." ? fortressPath : join(fortressPath, entry.path),
               );
-            } catch (err) {
-              if (isEnoent(err)) {
-                result.changedAfterOperation.push(entry.path);
-                continue;
-              }
-              throw err;
+            } catch {
+              result.changedAfterOperation.push(entry.path);
+              continue;
             }
             if (!sameIdentityAndLinkCount(entry, operationFresh, after)) {
               result.changedAfterOperation.push(entry.path);
@@ -1211,6 +1207,7 @@ export interface NormalizeFortressCustodyOutcome {
   repaired: string[];
   skips: CustodySkip[];
   vanished: string[];
+  changedAfterOperation: string[];
   failed: { path: string; reason: string }[];
 }
 
@@ -1237,6 +1234,7 @@ export async function normalizeFortressCustody(
     repaired: [],
     skips: [],
     vanished: [],
+    changedAfterOperation: [],
     failed: [],
   };
   if (input.operator.uid === 0 || input.operator.gid === 0) {
@@ -1276,7 +1274,8 @@ export async function normalizeFortressCustody(
     outcome.repaired = applied.repaired;
     outcome.skips.push(...applied.skipped);
     outcome.vanished.push(...applied.vanished);
-    outcome.failed = applied.failed;
+    outcome.changedAfterOperation = [...applied.changedAfterOperation];
+    outcome.failed = [...applied.failed];
     outcome.failed.push(
       ...applied.changedAfterOperation.map((path) => ({
         path,

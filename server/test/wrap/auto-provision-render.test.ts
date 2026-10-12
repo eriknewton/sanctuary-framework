@@ -777,6 +777,7 @@ describe("wrap/cli custody normalize summary", () => {
         repaired: ["ok.enc"],
         skips: [{ path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" }],
         vanished: [],
+        changedAfterOperation: [],
         failed: [],
       },
     });
@@ -794,6 +795,7 @@ describe("wrap/cli custody normalize summary", () => {
         repaired: [],
         skips: [{ path: "foreign.enc", uid: 502, gid: 20, reason: "foreign_owner" }],
         vanished: [],
+        changedAfterOperation: [],
         failed: [],
       },
     });
@@ -801,5 +803,50 @@ describe("wrap/cli custody normalize summary", () => {
     expect(rendered).toContain("foreign.enc");
     expect(rendered).toContain("owned by uid 502");
     expect(rendered).not.toContain("extra names");
+  });
+
+  it("uses root-inspection wording for post-change custody entries", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [],
+        vanished: [],
+        changedAfterOperation: ["castle.sock"],
+        failed: [],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain(
+      "castle.sock: ownership was already changed and the entry needs inspecting as root",
+    );
+    expect(rendered).not.toContain("run 'sudo sanctuary castle-wall repair-custody'");
+  });
+
+  it("uses root-inspection wording for failed custody entries with the inspection reason", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: [],
+        skips: [],
+        vanished: [],
+        changedAfterOperation: [],
+        failed: [
+          {
+            path: "castle.sock",
+            reason: "ownership was already changed and the entry needs inspecting as root",
+          },
+        ],
+      },
+    });
+    const rendered = out.join("\n");
+    expect(rendered).toContain(
+      "castle.sock: ownership was already changed and the entry needs inspecting as root",
+    );
+    expect(rendered).not.toContain("run 'sudo sanctuary castle-wall repair-custody'");
   });
 });

@@ -100,7 +100,10 @@ import {
   castleWallNotYetWalledSentence,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
-import { custodySkipOperatorMessage } from "../castle-wall/provision/fortress-custody.js";
+import {
+  POST_CHANGE_CUSTODY_INSPECTION_MESSAGE,
+  custodySkipOperatorMessage,
+} from "../castle-wall/provision/fortress-custody.js";
 import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
@@ -2904,6 +2907,22 @@ function renderCustodyNormalizeLines(summary: AutoProvisionSummary): string[] {
     custody.status === "no_fortress"
   ) {
     return [];
+  }
+  const rootInspectionPaths = new Set(custody.changedAfterOperation);
+  for (const failure of custody.failed) {
+    if (failure.reason === POST_CHANGE_CUSTODY_INSPECTION_MESSAGE) {
+      rootInspectionPaths.add(failure.path);
+    }
+  }
+  if (rootInspectionPaths.size > 0) {
+    const details = [...rootInspectionPaths]
+      .map((path) => `${path}: ${POST_CHANGE_CUSTODY_INSPECTION_MESSAGE}`)
+      .join("; ");
+    return [
+      `  Fortress custody normalize ended failed; ${rootInspectionPaths.size} entr${
+        rootInspectionPaths.size === 1 ? "y requires" : "ies require"
+      } root inspection (${details}).`,
+    ];
   }
   if (custody.skips.length > 0) {
     const details = custody.skips.map((skip) => custodySkipOperatorMessage(skip)).join(" ");

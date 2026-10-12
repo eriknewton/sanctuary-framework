@@ -31,7 +31,14 @@ describe("finishProvisionOutcomeWithCustodyNormalize", () => {
       print: () => undefined,
       normalize: async (input: NormalizeFortressCustodyInput) => {
         calls.push({ fortressPath: input.fortressPath, operator: input.operator });
-        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        return {
+          status: "clean",
+          repaired: [],
+          skips: [],
+          vanished: [],
+          changedAfterOperation: [],
+          failed: [],
+        };
       },
     });
     expect(summary.ran).toBe(true);
@@ -56,7 +63,14 @@ describe("finishProvisionOutcomeWithCustodyNormalize", () => {
       print: () => undefined,
       normalize: async (input) => {
         calls.push(input.fortressPath);
-        return { status: "clean", repaired: [], skips: [], vanished: [], failed: [] };
+        return {
+          status: "clean",
+          repaired: [],
+          skips: [],
+          vanished: [],
+          changedAfterOperation: [],
+          failed: [],
+        };
       },
     });
     expect(summary.outcome?.kind).toBe("aborted");
@@ -74,6 +88,7 @@ describe("finishProvisionOutcomeWithCustodyNormalize", () => {
         repaired: ["ok.enc"],
         skips: [{ path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" }],
         vanished: [],
+        changedAfterOperation: [],
         failed: [],
       }),
     });
