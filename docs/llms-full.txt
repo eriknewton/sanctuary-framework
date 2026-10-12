@@ -2,7 +2,7 @@
 
 > The root README's first screen with its Summary for agents, the "What is proven, and what is not" table, the Quickstart (install, verify, uninstall), the section for AI coding agents, the installation reference, the Castle Architecture, the harness list and Troubleshooting, as plain Markdown for agents. Nothing here says more than README.md says; when the two differ, README.md at the current commit wins.
 
-<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 5362575e. The sections below are copied from README.md at that commit, with relative links made absolute; the short index is at https://sanctuaryprotocol.ai/llms.txt -->
+<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 0b374368 (branch docs/readme-mcp-routing-bound, main 5362575e plus PR #1590). The sections below are copied from README.md at that commit, with relative links made absolute; the short index is at https://sanctuaryprotocol.ai/llms.txt -->
 
 **Your agent will know you better than you know yourself. Make sure that data stays between you.**
 
@@ -65,7 +65,7 @@ fortress and its private socket runtime must be on local filesystems; known
 shared/network/FUSE filesystems are refused rather than presenting a local Unix
 socket as cross-host exclusion.
 2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
-3. The config is rewritten so every tool call routes through Sanctuary.
+3. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
 4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port, trying up to twenty ports from 3501) and opens in your browser with a one-click auth token.
 5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity layer on top per the Assurance Matrix: fingerprintable-header stripping is on by default, and an opt-in, consent-gated PII rewrite scrubs query content before it leaves the machine, with the rewrite's internal classifier pinned to local processing so a privacy feature can never become an egress channel. Dangerous operations require your approval.
 
