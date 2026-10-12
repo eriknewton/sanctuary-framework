@@ -1,5 +1,5 @@
 const DIAGNOSTIC_ECHO_CELL_CHARS = 8;
-// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in `castle-wall-daemon/src/linux_install/policy.rs`.
+// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in `castle-wall-daemon/src/policy.rs`.
 export const DIAGNOSTIC_ECHO_MAX_CHARS =
   DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
 const DIAGNOSTIC_LIST_CELL_COUNT = 2;

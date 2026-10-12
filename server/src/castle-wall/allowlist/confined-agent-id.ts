@@ -65,6 +65,7 @@ export function validateLinuxInstallAgentIdScopes(
       if (uid === null) {
         // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
         throw new LinuxInstallAgentIdScopeError(
+          // Must match `MalformedAgentScope` in `castle-wall-daemon/src/policy.rs`.
           `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected ${CONFINED_AGENT_ID_FORM}; re-sign with the uid-<uid> form`,
         );
       }
@@ -74,7 +75,8 @@ export function validateLinuxInstallAgentIdScopes(
       if (uid !== admittedUid) {
         // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
         throw new LinuxInstallAgentIdScopeError(
-          `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected admitted uid ${admittedUid}`,
+          // Must match `AgentScopeOutsideAdmission` in `castle-wall-daemon/src/policy.rs`.
+          `rule ${formatBoundedDiagnosticValue(rule.id)} scope.agent_ids entry ${formatBoundedDiagnosticValue(JSON.stringify(agentId))}: expected admitted uid ${admittedUid}; scope agent rules to uid-${admittedUid}`,
         );
       }
     }
