@@ -67,6 +67,10 @@ import {
   type RotateMasterOptions,
 } from "../../src/core/master-rotation.js";
 import { StateStore, type StateEntry } from "../../src/cognitive/state-store.js";
+import {
+  MEMORY_HANDLE_RECORD_VERSION,
+  MEMORY_HANDLE_REGISTRY_NAMESPACE,
+} from "../../src/agent-native/safety-base.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   deriveNamespaceKey,
@@ -1070,6 +1074,40 @@ describe("master rotation — fail-closed coverage", () => {
         RotationPreflightError
       );
     }
+  });
+
+  it("rotates the persisted cooperative-memory handle registry through the state recipe", async () => {
+    const fortress = await buildFortress();
+    const identityKey = derivePurposeKey(fortress.master, "identity-encryption");
+    const stateStore = new StateStore(fortress.storage, fortress.master);
+    await stateStore.write(
+      MEMORY_HANDLE_REGISTRY_NAMESPACE,
+      KID,
+      JSON.stringify({
+        v: MEMORY_HANDLE_RECORD_VERSION,
+        identity_id: KID,
+        handle: "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      }),
+      KID,
+      fortress.identity.encrypted_private_key,
+      identityKey
+    );
+
+    await rotateMaster(rotateOpts(fortress));
+    const rotated = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const rotatedStore = new StateStore(fortress.storage, rotated.masterKey);
+    const read = await rotatedStore.read(MEMORY_HANDLE_REGISTRY_NAMESPACE, KID, true);
+    expect(read?.signature_verified).toBe(true);
+    expect(read?.value).toBe(
+      JSON.stringify({
+        v: MEMORY_HANDLE_RECORD_VERSION,
+        identity_id: KID,
+        handle: "mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      })
+    );
   });
 
   // F2 BLOCKER-R2 (adversarial re-gate 2026-07-14): the durable `_meta`

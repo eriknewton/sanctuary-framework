@@ -1004,6 +1004,9 @@ async function exportEncryptedState(
     // would silently fail to round-trip. Symmetric with the import guard.
     // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
     // underscore rule on its own, so no separate `startsWith("_")` is needed.
+    // DEBT(MEMORY-HANDLE-EXIT-PORTABILITY): moved opaque memory namespaces are
+    // not rebound to a destination fortress identity because the reserved
+    // owner registry is intentionally not portable state.
     if (isReservedNamespace(namespace)) continue;
     const metas = await opts.storage.list(namespace);
     for (const meta of metas) {

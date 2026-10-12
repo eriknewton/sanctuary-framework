@@ -231,7 +231,7 @@ export async function discloseUnattributedState(
   }
 
   try {
-    request.namespaceRegistry.assertOwned(
+    await request.namespaceRegistry.assertOwnedPersisted(
       request.namespace,
       request.sessionBinding,
     );
