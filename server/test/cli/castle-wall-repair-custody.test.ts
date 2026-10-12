@@ -166,6 +166,26 @@ function baseCtx(
   };
 }
 
+function withOpenStatNlink(
+  fake: { ops: FortressCustodyFsOps },
+  path: string,
+  nlink: number,
+): void {
+  const originalOpen = fake.ops.open.bind(fake.ops);
+  fake.ops.open = async (openedPath, flags) => {
+    const handle = await originalOpen(openedPath, flags);
+    if (openedPath !== path) return handle;
+    return {
+      ...handle,
+      stat: async () =>
+        ({
+          ...(await handle.stat()),
+          nlink,
+        }) as Stats,
+    };
+  };
+}
+
 describe("castle-wall repair-custody", () => {
   it("refuses when not running as root", async () => {
     const fake = rootOwnedFortress();
@@ -340,6 +360,54 @@ describe("castle-wall repair-custody", () => {
       expect(ctx.err.text()).toContain("Rollback incomplete");
     } finally {
       await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rollback exits failed and leaves a multi-name entry untouched", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const manifestPath = join(dir, "custody-x.json");
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          kind: CUSTODY_REPAIR_MANIFEST_KIND,
+          generated_at: "2026-10-12T00:00:00.000Z",
+          fortress_path: "/Users/mini2/.sanctuary",
+          operator: { uid: 501, gid: 20 },
+          entries: [
+            { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+            { path: "restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+          ],
+          vanished: [],
+        }),
+      );
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/restore.enc": {
+            type: "file",
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+            nlink: 1,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["restore.enc"] },
+      );
+      withOpenStatNlink(fake, "/Users/mini2/.sanctuary/restore.enc", 2);
+
+      const ctx = baseCtx(fake, dir);
+      const code = await runRepairCustody(["--rollback", manifestPath], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/restore.enc")!.uid).toBe(501);
+      expect(ctx.out.text()).toContain("fortress entry restore.enc has more than one name");
+      expect(ctx.err.text()).toContain("Rollback incomplete");
+      expect(ctx.out.text()).not.toContain("Rollback complete");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 
@@ -554,13 +622,13 @@ describe("castle-wall repair-custody", () => {
     }
   });
 
-  it("reports and leaves a root-owned file with more than one name untouched", async () => {
+  it("reports and leaves a regular entry with more than one name untouched", async () => {
     const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
     try {
       const fake = makeFakeOps(
         {
           "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
-          "/Users/mini2/.sanctuary/shared.enc": {
+          "/Users/mini2/.sanctuary/multi.enc": {
             type: "file",
             uid: 0,
             gid: 20,
@@ -568,19 +636,18 @@ describe("castle-wall repair-custody", () => {
             ino: 2,
             nlink: 2,
           },
-          "/outside/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
         },
-        { "/Users/mini2/.sanctuary": ["shared.enc"] },
+        { "/Users/mini2/.sanctuary": ["multi.enc"] },
       );
       const ctx = baseCtx(fake, manifestDir);
 
       const code = await runRepairCustody([], ctx);
 
       expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
-      expect(fake.nodes.get("/Users/mini2/.sanctuary/shared.enc")!.uid).toBe(0);
-      expect(fake.nodes.get("/Users/mini2/.sanctuary/shared.enc")!.mode).toBe(0o640);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/multi.enc")!.uid).toBe(0);
+      expect(fake.nodes.get("/Users/mini2/.sanctuary/multi.enc")!.mode).toBe(0o640);
       expect(ctx.out.text()).toContain(
-        "fortress entry shared.enc has more than one name and was left untouched",
+        "fortress entry multi.enc has more than one name and was left untouched",
       );
     } finally {
       await rm(manifestDir, { recursive: true, force: true });

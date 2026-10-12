@@ -766,3 +766,22 @@ describe("agent-guided auto-provision exit code", () => {
     expect(exitCode({ ran: false }, true, false)).toBeUndefined();
   });
 });
+
+describe("wrap/cli custody normalize summary", () => {
+  it("armed plus non-clean custody normalize names entries left untouched", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "armed", uid: { value: 502, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      custodyNormalize: {
+        status: "failed",
+        repaired: ["ok.enc"],
+        skips: [{ path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" }],
+        vanished: [],
+        failed: [],
+      },
+    });
+    expect(out.join("\n")).toContain("custody normalize repaired 1");
+    expect(out.join("\n")).toContain("left 1 entry untouched");
+    expect(out.join("\n")).toContain("multi.enc");
+  });
+});

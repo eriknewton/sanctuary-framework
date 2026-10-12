@@ -63,6 +63,28 @@ describe("finishProvisionOutcomeWithCustodyNormalize", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("carries non-clean custody status in the protect summary", async () => {
+    const summary = await finishProvisionOutcomeWithCustodyNormalize({
+      outcome: { kind: "armed", uid: { value: 550, observedVia: "test" } as never, liveness: UNVERIFIED_NO_CHANNEL },
+      wallFortressPath: "/Users/operator/.sanctuary",
+      operator: { uid: 501, gid: 20 },
+      print: () => undefined,
+      normalize: async () => ({
+        status: "failed",
+        repaired: ["ok.enc"],
+        skips: [{ path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" }],
+        vanished: [],
+        failed: [],
+      }),
+    });
+
+    expect(summary.custodyNormalize).toMatchObject({
+      status: "failed",
+      repaired: ["ok.enc"],
+      skips: [{ path: "multi.enc", reason: "multiple_names" }],
+    });
+  });
+
   it("uses the REAL normalize by default and repairs a deviant fortress mode end to end", async () => {
     const fortress = await mkdtemp(join(tmpdir(), "protect-normalize-"));
     try {

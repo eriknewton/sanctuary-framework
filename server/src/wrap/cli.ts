@@ -2721,42 +2721,46 @@ async function exitAfterDeferredAutoProvisionSignal(
  * render being untested is exactly how R2-2/R2-3 survived; this closes that.
  */
 export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): string[] {
-  if (!summary.ran || summary.outcome === undefined) return [];
+  if (!summary.ran) return [];
+  const custodyLines = renderCustodyNormalizeLines(summary);
+  const appendCustody = (lines: string[]): string[] =>
+    custodyLines.length === 0 ? lines : [...lines, ...custodyLines];
+  if (summary.outcome === undefined) return custodyLines;
   const outcome = summary.outcome;
   switch (outcome.kind) {
     case "armed":
-      return [
+      return appendCustody([
         `  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`,
         ...renderCosLivenessOutcome(outcome.liveness),
-      ];
+      ]);
     case "skipped-already-dedicated":
       // The orchestrator already printed the "already a verified dedicated
       // account ..." line via `print` at plan-and-print time; nothing to add.
-      return [];
+      return custodyLines;
     case "skipped-non-tty-cooperative-only":
       // FIX (round 5 / R2-3): the orchestrator printed only the forward-looking
       // Plan line, NOT this outcome's reason, so the "re-run interactively to
       // provision the account and arm the wall" guidance was silently dropped.
       // Surface the reason here.
-      return [`  ${outcome.reason}`];
+      return appendCustody([`  ${outcome.reason}`]);
     case "declined-by-operator":
-      return ["  Account provisioning declined; the cooperative wrap above still applies."];
+      return appendCustody(["  Account provisioning declined; the cooperative wrap above still applies."]);
     case "armed-then-rolled-back":
-      return [
+      return appendCustody([
         `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
           `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
           // FIX (round 5, item N5): honest -- the post-arm re-check proves
           // DNS-resolvability + credential readability, not allow-list
           // correctness, so do not tell the operator to "fix the allow-list".
           `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes (see the reason above).`,
-      ];
+      ]);
     case "armed-rollback-failed":
-      return [
+      return appendCustody([
         `  WARNING: Castle Wall is ARMED (uid ${outcome.uid}) and the automatic rollback FAILED (${outcome.reason}). ` +
           `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
           `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
           `then investigate before re-running 'sanctuary protect --hermes'.`,
-      ];
+      ]);
     case "egress-unprovisioned-rolled-back":
       // Confined-agent egress (design section 5): the wall armed but the
       // post-arm AS-UID egress verification failed (an endpoint unreachable
@@ -2768,20 +2772,20 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
       // which on a first run means removed and on a re-run means a previous
       // run's grants survived -- the old "were scrubbed" wording asserted
       // removal on both, and on a re-run that was the agent-strangling case.
-      return [
+      return appendCustody([
         `  Note: Castle Wall armed, then was fast-disarmed because the as-agent-uid egress verification failed ` +
           `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
           `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
           `Re-run 'sanctuary protect --hermes' once the per-endpoint failures above are resolved.`,
-      ];
+      ]);
     case "armed-exclusive":
       // S5-6: the full fine-grained outcome. Honest wording: wired + live,
       // drill-owed (no "audited per-rule per-flow"-class overclaim).
-      return [
+      return appendCustody([
         `  Dedicated agent account provisioned, Castle Wall armed, and the exclusive-egress gate is LIVE ` +
           `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
         ...renderCosLivenessOutcome(outcome.liveness),
-      ];
+      ]);
     case "armed-exclusive-repark-failed":
       // FIX-ROUND 5. This used to say "the agent is running confined" -- a
       // positive run-state assertion composed at the RENDER layer, which is
@@ -2791,13 +2795,13 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
       // What IS observed here is the gate: a committed generation, live, with
       // the agent's egress scoped to it. Say that, and leave run state to the
       // one surface that reads it.
-      return [
+      return appendCustody([
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
           `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
           `(${outcome.reparkError}). ` +
           `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) now.`,
         ...renderCosLivenessOutcome(outcome.liveness),
-      ];
+      ]);
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
       // renders coarse-only amber (S5-P). Never softened into a success line.
@@ -2815,15 +2819,15 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         : "The manifest could NOT be restored to coarse scope.";
       const cleanupNote =
         outcome.cleanupErrors.length > 0 ? ` Cleanup problems: ${outcome.cleanupErrors.join("; ")}.` : "";
-      return [
+      return appendCustody([
         `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
           `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
           `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
           `Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
-      ];
+      ]);
     }
     case "aborted":
-      return abortedProvisionLines(outcome);
+      return appendCustody(abortedProvisionLines(outcome));
     default:
       return assertNeverProvisionFlowOutcome(outcome);
   }
@@ -2887,6 +2891,31 @@ function renderCosLivenessOutcome(liveness: CosLivenessOutcome | undefined): str
   return [
     `  CoS liveness unverified (${liveness.reason}${subreason}${detail}); ` +
       `no brain-routing or provider-chain claim was made.`,
+  ];
+}
+
+function renderCustodyNormalizeLines(summary: AutoProvisionSummary): string[] {
+  const custody = summary.custodyNormalize;
+  if (
+    custody === undefined ||
+    custody.status === "clean" ||
+    custody.status === "changed" ||
+    custody.status === "no_fortress"
+  ) {
+    return [];
+  }
+  if (custody.skips.length > 0) {
+    const paths = custody.skips.map((skip) => skip.path).join(", ");
+    return [
+      `  Fortress custody normalize repaired ${custody.repaired.length} entr${
+        custody.repaired.length === 1 ? "y" : "ies"
+      } and left ${custody.skips.length} entr${
+        custody.skips.length === 1 ? "y" : "ies"
+      } untouched (${paths}). Run \`sanctuary castle-wall repair-custody\` after removing the extra names, or inspect as root.`,
+    ];
+  }
+  return [
+    `  Fortress custody normalize ended ${custody.status}; run 'sudo sanctuary castle-wall repair-custody' if operator surfaces report EACCES.`,
   ];
 }
 

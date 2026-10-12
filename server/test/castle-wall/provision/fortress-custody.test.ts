@@ -28,7 +28,7 @@ import {
 //    files without root, so ownership states are simulated through the seam). ──
 
 interface FakeNode {
-  type: "dir" | "file" | "socket" | "symlink";
+  type: "dir" | "file" | "socket" | "symlink" | "other";
   uid: number;
   gid: number;
   mode: number;
@@ -143,6 +143,22 @@ function makeFakeFs(
     },
   };
   return fake;
+}
+
+function withOpenStatNlink(fake: FakeFs, path: string, nlink: number): void {
+  const originalOpen = fake.ops.open.bind(fake.ops);
+  fake.ops.open = async (openedPath, flags) => {
+    const handle = await originalOpen(openedPath, flags);
+    if (openedPath !== path) return handle;
+    return {
+      ...handle,
+      stat: async () =>
+        ({
+          ...(await handle.stat()),
+          nlink,
+        }) as Stats,
+    };
+  };
 }
 
 /** The Mini2 shape: root-owned fortress, root-owned socket + key file, one operator file, one foreign file. */
@@ -334,14 +350,13 @@ describe("fortress-custody: apply", () => {
     expect(applied.repaired).toContain(".");
   });
 
-  it("records a typed skip and leaves a root-owned file with more than one name untouched", async () => {
+  it("records a typed skip and leaves a regular entry with more than one name untouched", async () => {
     const fake = makeFakeFs(
       {
         "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
-        "/f/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
-        "/outside/shared.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
+        "/f/multi.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
       },
-      { "/f": ["shared.enc"] },
+      { "/f": ["multi.enc"] },
     );
     const lines: string[] = [];
 
@@ -354,14 +369,14 @@ describe("fortress-custody: apply", () => {
 
     expect(outcome.status).not.toBe("clean");
     expect(outcome.skips).toEqual([
-      { path: "shared.enc", uid: 0, gid: 20, reason: "multiple_names" },
+      { path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" },
     ]);
-    expect(fake.nodes.get("/f/shared.enc")!.uid).toBe(0);
-    expect(fake.nodes.get("/f/shared.enc")!.mode).toBe(0o640);
-    expect(fake.fchowns.some((call) => call.path === "/f/shared.enc")).toBe(false);
-    expect(fake.fchmods.some((call) => call.path === "/f/shared.enc")).toBe(false);
+    expect(fake.nodes.get("/f/multi.enc")!.uid).toBe(0);
+    expect(fake.nodes.get("/f/multi.enc")!.mode).toBe(0o640);
+    expect(fake.fchowns.some((call) => call.path === "/f/multi.enc")).toBe(false);
+    expect(fake.fchmods.some((call) => call.path === "/f/multi.enc")).toBe(false);
     expect(lines.join("\n")).toContain(
-      "fortress entry shared.enc has more than one name and was left untouched",
+      "fortress entry multi.enc has more than one name and was left untouched",
     );
   });
 
@@ -378,13 +393,75 @@ describe("fortress-custody: apply", () => {
     fake.nodes.get("/f/late.enc")!.nlink = 2;
 
     const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
-    const skipped = (applied as unknown as { skipped?: unknown[] }).skipped;
-
-    expect(skipped).toEqual([
+    expect(applied.skipped).toEqual([
       { path: "late.enc", uid: 0, gid: 20, reason: "multiple_names" },
     ]);
     expect(fake.nodes.get("/f/late.enc")!.uid).toBe(0);
     expect(fake.fchowns.some((call) => call.path === "/f/late.enc")).toBe(false);
+  });
+
+  it("uses the opened descriptor link count for a regular entry skip", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/fd-owned.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["fd-owned.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/fd-owned.enc", 2);
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([
+      { path: "fd-owned.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/fd-owned.enc")!.uid).toBe(0);
+    expect(fake.fchowns.some((call) => call.path === "/f/fd-owned.enc")).toBe(false);
+  });
+
+  it("does not use the path link count when the opened descriptor has one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/path-owned.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["path-owned.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/path-owned.enc", 1);
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([]);
+    expect(applied.repaired).toContain("path-owned.enc");
+    expect(fake.nodes.get("/f/path-owned.enc")!.uid).toBe(501);
+  });
+
+  it.each([
+    ["socket" as const, "sock"],
+    ["other" as const, "node"],
+  ])("leaves a %s entry with more than one name untouched", async (type, name) => {
+    const path = `/f/${name}`;
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        [path]: { type, uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": [name] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([
+      { path: name, uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get(path)!.uid).toBe(0);
+    expect(fake.lchowns.some((call) => call.path === path)).toBe(false);
   });
 
   it("still repairs a root-owned file with one name", async () => {
@@ -424,9 +501,8 @@ describe("fortress-custody: ancestor containment (2026-07-31 gate BLOCKER-1)", (
     const walk = await walkFortressCustody("/f", fake.ops);
     const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
 
-    // The attack: swap the observed ancestor dir for a symlink pointing
-    // outside the fortress. Without ancestor verification, O_NOFOLLOW on the
-    // FINAL component alone would let root chown /outside/a.enc.
+    // The observed ancestor must still be the same directory immediately before
+    // the metadata change; final-component O_NOFOLLOW is not an ancestor proof.
     fake.nodes.set("/f/state", { type: "symlink", uid: 502, gid: 20, mode: 0o777, ino: 99 });
 
     const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
@@ -678,11 +754,9 @@ describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", (
     };
   }
 
-  it("REFUSES the codex exploit: a symlinked parent cannot carry a root chown/chmod outside the fortress", async () => {
-    // Exactly the reported attack: `escape -> /Users/operator` inside the
-    // fortress, plus a crafted manifest entry `escape/payload` recording
-    // uid 0 / gid 0 / mode 04755. Pre-fix this chowned an attacker file to
-    // root and set it setuid.
+  it("REFUSES when a symlinked parent cannot verify the rollback ancestor", async () => {
+    // Rollback trusts only ancestor directories whose observed identity still
+    // matches; a manifest entry under a changed parent is left untouched.
     const fake = makeFakeFs(
       {
         "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
@@ -772,6 +846,81 @@ describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", (
     expect(fake.fchowns.some((c) => c.path === "/f/a.enc")).toBe(true);
   });
 
+  it("uses the opened descriptor link count for a regular rollback skip", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/restore.enc": { type: "file", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["restore.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/restore.enc", 2);
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "restore.enc", uid: 501, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/restore.enc")!.uid).toBe(501);
+    expect(fake.fchowns.some((call) => call.path === "/f/restore.enc")).toBe(false);
+  });
+
+  it("does not use the path link count when rollback has a single-name descriptor", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/path-restore.enc": { type: "file", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["path-restore.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/path-restore.enc", 1);
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "path-restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([]);
+    expect(result.repaired).toContain("path-restore.enc");
+    expect(fake.nodes.get("/f/path-restore.enc")!.uid).toBe(0);
+  });
+
+  it("leaves a non-regular rollback entry with more than one name untouched", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["sock"] },
+    );
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "sock", uid: 501, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(501);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
   it("REFUSES a symlinked fortress root (repair already did; rollback used to skip this)", async () => {
     const fake = makeFakeFs(
       { "/f": { type: "symlink", uid: 501, gid: 20, mode: 0o777, ino: 1 } },
@@ -798,6 +947,38 @@ describe("fortress-custody: normalize chokepoint", () => {
     expect(fake.nodes.get("/f")!.uid).toBe(501);
     expect(lines.join("\n")).toContain("Fortress custody normalized");
     expect(lines.join("\n")).toContain("state/foreign.enc");
+  });
+
+  it("reports repaired and untouched counts without a normalized success line on a failed outcome", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/ok.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+        "/f/multi.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 3, nlink: 2 },
+      },
+      { "/f": ["ok.enc", "multi.enc"] },
+    );
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    const log = lines.join("\n");
+    expect(outcome.status).toBe("failed");
+    expect(outcome.repaired).toEqual(["ok.enc"]);
+    expect(outcome.skips).toEqual([
+      { path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(log).toContain("repaired 1");
+    expect(log).toContain("left 1 entry untouched");
+    expect(log).toContain(
+      "Run `sanctuary castle-wall repair-custody` after removing the extra names, or inspect as root.",
+    );
+    expect(log).not.toContain("Fortress custody normalized");
   });
 
   it("is clean + quiet on an already-operator-owned fortress", async () => {

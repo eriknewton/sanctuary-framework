@@ -367,11 +367,31 @@ export async function runRepairCustody(
     }
     const result = await applyCustodyRollback(fortressPath, manifest, ops);
     describeApply(result, out);
-    if (result.failed.length > 0 || result.identityChanged.length > 0) {
+    if (
+      result.failed.length > 0 ||
+      result.identityChanged.length > 0 ||
+      result.skipped.length > 0
+    ) {
+      await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+        "fortress_custody_rollback",
+        {
+          source: "castle-wall-cli",
+          manifest_path: parsed.rollback,
+          restored: result.repaired.length,
+          skipped_multiple_names: result.skipped.filter(
+            (skip) => skip.reason === "multiple_names",
+          ).length,
+          vanished: result.vanished.length,
+          identity_changed: result.identityChanged.length,
+        },
+        fortressPath,
+        env,
+        err,
+      );
       write(
         err,
         `Rollback incomplete: ${
-          result.failed.length + result.identityChanged.length
+          result.failed.length + result.identityChanged.length + result.skipped.length
         } entries could not be restored (see above).\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
@@ -492,6 +512,24 @@ export async function runRepairCustody(
   const applied = await applyFortressCustodyRepairs(fortressPath, plan, ops);
   describeApply(applied, out);
   if (applied.skipped.length > 0) {
+    await (ctx.appendAudit ?? appendCastleWallCliAuditBestEffort)(
+      "fortress_custody_repaired",
+      {
+        source: "castle-wall-cli",
+        manifest_path: manifestPath,
+        repaired: applied.repaired.length,
+        skipped_foreign_owner: plan.skips.length,
+        skipped_multiple_names: applied.skipped.filter(
+          (skip) => skip.reason === "multiple_names",
+        ).length,
+        vanished: walk.vanished.length + applied.vanished.length,
+        identity_changed: applied.identityChanged.length,
+        operator_uid: identity.uid,
+      },
+      fortressPath,
+      env,
+      err,
+    );
     write(
       err,
       `Repair incomplete: ${applied.skipped.length} entr${
