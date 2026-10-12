@@ -291,6 +291,31 @@ describe("cold checkpoint CLI", () => {
     expect(await f.storage.read("gamma", "note")).toBeNull();
   });
 
+  it("refuses a cold restore of entries signed only by a declared-compromise retired key", async () => {
+    const f = await fixture();
+    await f.call(["create"]);
+    const [checkpoint] = await f.checkpoints.list();
+    const identityEncKey = derivePurposeKey(f.masterKey, "identity-encryption");
+    const { updatedIdentity } = rotateKeys(
+      f.identity,
+      identityEncKey,
+      "key compromised",
+    );
+    await persistStoredIdentity(f.storage, f.masterKey, updatedIdentity);
+    await f.stateStore.delete("alpha", "note");
+    await f.write("gamma", "post-checkpoint");
+    const before = withoutAuditAndPolicy(await durableBytes(f.path));
+
+    const result = await coldRestore(f, checkpoint!.id);
+
+    expect(result.code, JSON.stringify(result)).toBe(1);
+    expect(result.stderr).toContain(
+      "0 checkpoint entries are signed by an identity this fortress does not hold and 2 checkpoint entries do not verify",
+    );
+    expect(result.stdout).not.toContain("Checkpoint restored:");
+    expect(withoutAuditAndPolicy(await durableBytes(f.path))).toEqual(before);
+  });
+
   it("refuses a cold restore when the local rotation chain is not verified", async () => {
     const f = await fixture();
     await f.call(["create"]);
