@@ -28,13 +28,29 @@ interface Request {
   id: number;
   op: string;
   args: unknown[];
+  boundNamespace?: true;
 }
 
+// Must match DARWIN_BOUND_NAMESPACE_TOKEN in filesystem.ts: only the parent
+// storage backend sends this internal token for the worker's bound namespace.
 const DARWIN_BOUND_NAMESPACE_TOKEN = "\0sanctuary-bound-namespace\0";
 
 function namespaceArg(value: unknown): string {
   const namespace = String(value);
-  return namespace === DARWIN_BOUND_NAMESPACE_TOKEN ? "." : namespace;
+  // The cwd authority is selected only by the typed request flag, never by a
+  // caller-supplied namespace string.
+  if (namespace === DARWIN_BOUND_NAMESPACE_TOKEN) {
+    throw new Error("directory-capability bound namespace is not a caller namespace");
+  }
+  return namespace;
+}
+
+function requestNamespaceArg(request: Request): { namespace: string; args: unknown[] } {
+  if (request.boundNamespace === true) {
+    return { namespace: DARWIN_BOUND_NAMESPACE_TOKEN, args: request.args };
+  }
+  const [namespace, ...args] = request.args;
+  return { namespace: namespaceArg(namespace), args };
 }
 
 function bytes(value: unknown): Uint8Array {
@@ -102,31 +118,49 @@ async function perform(
 ): Promise<unknown> {
   const a = request.args;
   switch (request.op) {
-    case "write":
-      await storage.write(namespaceArg(a[0]), String(a[1]), bytes(a[2]));
+    case "write": {
+      const { namespace, args } = requestNamespaceArg(request);
+      // This child is only the cwd-bound executor for FilesystemStorage.write;
+      // StateStore provenance is minted by the parent before export-eligible
+      // state reaches this backend, and the child only preserves that write.
+      await storage.write(namespace, String(args[0]), bytes(args[1]));
       return null;
-    case "writeDurable":
-      await storage.writeDurable(namespaceArg(a[0]), String(a[1]), bytes(a[2]));
+    }
+    case "writeDurable": {
+      const { namespace, args } = requestNamespaceArg(request);
+      await storage.writeDurable(namespace, String(args[0]), bytes(args[1]));
       return null;
-    case "writeIfAbsent":
-      return storage.writeIfAbsent(namespaceArg(a[0]), String(a[1]), bytes(a[2]));
-    case "replaceIfEquals":
+    }
+    case "writeIfAbsent": {
+      const { namespace, args } = requestNamespaceArg(request);
+      return storage.writeIfAbsent(namespace, String(args[0]), bytes(args[1]));
+    }
+    case "replaceIfEquals": {
+      const { namespace, args } = requestNamespaceArg(request);
       return storage.replaceIfEquals(
-        namespaceArg(a[0]),
-        String(a[1]),
-        bytes(a[2]),
-        bytes(a[3]),
+        namespace,
+        String(args[0]),
+        bytes(args[1]),
+        bytes(args[2]),
       );
+    }
     case "read": {
-      const value = await storage.read(namespaceArg(a[0]), String(a[1]));
+      const { namespace, args } = requestNamespaceArg(request);
+      const value = await storage.read(namespace, String(args[0]));
       return value === null ? null : Buffer.from(value).toString("base64");
     }
-    case "delete":
-      return storage.delete(namespaceArg(a[0]), String(a[1]), Boolean(a[2]));
-    case "list":
-      return storage.list(namespaceArg(a[0]), a[1] === undefined ? undefined : String(a[1]));
-    case "exists":
-      return storage.exists(namespaceArg(a[0]), String(a[1]));
+    case "delete": {
+      const { namespace, args } = requestNamespaceArg(request);
+      return storage.delete(namespace, String(args[0]), Boolean(args[1]));
+    }
+    case "list": {
+      const { namespace, args } = requestNamespaceArg(request);
+      return storage.list(namespace, args[0] === undefined ? undefined : String(args[0]));
+    }
+    case "exists": {
+      const { namespace, args } = requestNamespaceArg(request);
+      return storage.exists(namespace, String(args[0]));
+    }
     case "listNamespaces":
       return storage.listNamespaces();
     case "totalSize":
@@ -273,7 +307,10 @@ async function main(): Promise<void> {
   if (owner && (!Number.isSafeInteger(owner.uid) || !Number.isSafeInteger(owner.gid))) {
     throw new Error("invalid directory-capability owner identity");
   }
-  const storage = new FilesystemStorage(".", owner ? { owner } : {});
+  const storage = new FilesystemStorage(".", {
+    ...(owner ? { owner } : {}),
+    allowDirectoryCapabilityRootNamespace: true,
+  });
   process.on("message", (raw: Request) => {
     void (async () => {
       try {
