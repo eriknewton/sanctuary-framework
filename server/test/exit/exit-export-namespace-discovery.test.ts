@@ -350,7 +350,9 @@ describe("sanctuary exit export: state-namespace resolution", () => {
         stateStoragePath,
         keySource: "recovery-key",
       }),
-    ).rejects.toThrow(/storage name this version cannot address/);
+    ).rejects.toThrow(
+      /exit-bundle: namespace discovery failed; export refused before writing bundle artifacts/,
+    );
 
     expect(await readdir(bundleDir)).toEqual([]);
     await auditLog.flush();

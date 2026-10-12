@@ -50,6 +50,11 @@ export function storageNamespacePathComponent(namespace: string): string {
     throw new InvalidStorageNamespaceError(namespace);
   }
   const encoded = encodeStoragePathComponent(namespace);
+  // Namespace directory names must be re-addressable by this build; otherwise
+  // discovery could decode bytes that later resolve to a different directory.
+  if (decodeStoragePathComponent(encoded) !== namespace) {
+    throw new InvalidStorageNamespaceError(namespace);
+  }
   if (!isSingleEncodedComponent(encoded)) {
     throw new InvalidStorageNamespaceError(namespace);
   }

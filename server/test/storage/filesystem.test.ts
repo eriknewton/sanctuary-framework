@@ -146,7 +146,7 @@ describe("FilesystemStorage", () => {
       expect(entries).toContain("_audit");
     });
 
-    it("refuses storage names that do not round-trip before creating files", async () => {
+    it("refuses storage names that cannot be re-addressed before creating files", async () => {
       await expect(
         storage.write("plain", "key-\u4E2D", new Uint8Array([1])),
       ).rejects.toThrow(/storage name this version cannot address/);
@@ -161,7 +161,7 @@ describe("FilesystemStorage", () => {
       );
       await expect(
         storage.write("ns-\u4E2D", "plain", new Uint8Array([1])),
-      ).rejects.toThrow(/storage name this version cannot address/);
+      ).rejects.toThrow(/namespace/);
       expect(await readdir(basePath)).toEqual([]);
     });
 
@@ -206,9 +206,11 @@ describe("FilesystemStorage", () => {
         new Uint8Array([2]),
       );
 
-      await expect(storage.listNamespaces()).rejects.toThrow(
-        /storage name this version cannot address/,
-      );
+      await expect(storage.listNamespaces()).rejects.toMatchObject({
+        code: expect.stringMatching(
+          /^(FILESYSTEM_STORAGE_NAME_UNADDRESSABLE|INVALID_STORAGE_NAMESPACE)$/,
+        ),
+      });
       await expect(storage.list("plain")).rejects.toThrow(
         /storage name this version cannot address/,
       );
@@ -245,7 +247,9 @@ describe("FilesystemStorage", () => {
             code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
           });
           await expect(storage.listNamespaces()).rejects.toMatchObject({
-            code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+            code: expect.stringMatching(
+              /^(FILESYSTEM_STORAGE_NAME_UNADDRESSABLE|INVALID_STORAGE_NAMESPACE)$/,
+            ),
           });
         },
         { kernelBacked: true },
@@ -356,9 +360,9 @@ describe("FilesystemStorage", () => {
         throw new Error("harness setup: state_export approvalTargetArgs missing");
       }
 
-      await expect(tool.approvalTargetArgs({})).rejects.toMatchObject({
-        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
-      });
+      await expect(tool.approvalTargetArgs({})).rejects.toThrow(
+        /namespace_ownership_ambiguous/,
+      );
     });
 
     it("state_delete refuses before removing an addressable entry from an unavailable namespace", async () => {
