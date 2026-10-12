@@ -105,6 +105,8 @@ const UNUSED_BARRIER_SCAFFOLD_SWEEP_LIMIT =
 // The whole sweep pass gets one helper deadline, not one deadline per candidate:
 // STALE_REAPER_TIMEOUT_MS is already the maximum useful wait for one serialized
 // authority attempt, so spending more in one acquire would only delay admission.
+// The cap stops new spawns; a helper started just before it expires keeps its own
+// STALE_REAPER_TIMEOUT_MS, so one acquire's worst case is about two helper deadlines.
 const UNUSED_BARRIER_SCAFFOLD_SWEEP_PASS_TIMEOUT_MS = STALE_REAPER_TIMEOUT_MS;
 // The sweep is amortized by identity; the interval is derived from the
 // stale-reaper deadline so the in-process cache avoids repeated local scans

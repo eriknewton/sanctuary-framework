@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
+import { isMainThread } from "node:worker_threads";
 
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -40,7 +41,9 @@ import {
 
 const NS = "_lock_test";
 const LOCK = ".unit.lock";
-const DISTINCT_BARRIER_FORTRESS_COUNT = 32;
+// 8 old pairs: enough that a missing sweep leaves far more than the bound, few enough that one
+// capped sweep pass clears them on a slow runner (measured ~37 ms per helper at load 10).
+const DISTINCT_BARRIER_FORTRESS_COUNT = 8;
 const OVER_CEILING_IGNORED_ENTRY_COUNT = 3_500;
 const OVER_CEILING_SCAFFOLD_PAIR_COUNT = 300;
 const OVER_CEILING_CUSTODY_REAPER_COUNT = 4;
@@ -539,7 +542,9 @@ describe("withCrossProcessLock", () => {
     },
   );
 
-  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+  // process.umask() cannot be set inside a worker thread (the Stryker thread pool); the
+  // child-process umask tests below are the load-bearing witnesses, this one is main-thread coverage.
+  it.runIf((process.platform === "darwin" || process.platform === "linux") && isMainThread)(
     "keeps scaffold modes secure under a restrictive process umask",
     async () => {
       const previousRoot = process.env.SANCTUARY_CUSTODY_LOCK_ROOT;
