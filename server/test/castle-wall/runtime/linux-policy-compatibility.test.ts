@@ -168,8 +168,10 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
       message = String((error as Error).message);
     }
 
-    expect(message).toContain(`original length ${longRuleId.length}`);
-    expect(message).toContain(`original length ${`scope.${longAxis}`.length}`);
+    // formatBoundedDiagnosticValue measures after adding diagnostic quotes; JSON.stringify
+    // derives those boundary characters without duplicating the escape rule here.
+    expect(message).toContain(`original length ${JSON.stringify(longRuleId).length}`);
+    expect(message).toContain(`original length ${JSON.stringify(`scope.${longAxis}`).length}`);
     expect(message).toContain(`and ${TEST_OFFENDER_COUNT - TEST_MAX_LISTED_OFFENDERS} more`);
     expect(message).not.toContain(longRuleId);
     expect(message).not.toContain(`scope.${longAxis}`);
@@ -265,7 +267,9 @@ describe("Linux IP/CIDR policy compatibility preflight", () => {
       message = String((error as Error).message);
     }
 
-    expect(message).toContain(`original length ${longRuleId.length}`);
+    // formatBoundedDiagnosticValue measures after adding diagnostic quotes; JSON.stringify
+    // derives those boundary characters without duplicating the escape rule here.
+    expect(message).toContain(`original length ${JSON.stringify(longRuleId).length}`);
     expect(message).toContain(`original length ${JSON.stringify(longAgentId).length}`);
     expect(message).not.toContain(longRuleId);
     expect(message).not.toContain(longAgentId);

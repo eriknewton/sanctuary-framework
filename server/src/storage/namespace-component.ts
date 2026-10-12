@@ -1,9 +1,14 @@
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  decodeFilesystemStorageName,
+  encodeFilesystemStorageName,
+  filesystemStorageNameRoundTrips,
+} from "./filesystem-name-codec.js";
 
-const SAFE_PATH_COMPONENT_CHARS = /[^A-Za-z0-9_.-]/g;
-const HEX_RADIX = 16;
-const HEX_BYTE_WIDTH = 2;
-const FIRST_CODE_UNIT_INDEX = 0;
+// Must match filesystem-name-codec.ts: namespace components and storage keys
+// share one on-disk encoder so P13 cannot drift from raw storage enumeration.
+export const encodeStoragePathComponent = encodeFilesystemStorageName;
+export const decodeStoragePathComponent = decodeFilesystemStorageName;
 
 export class InvalidStorageNamespaceError extends Error {
   readonly code = "INVALID_STORAGE_NAMESPACE";
@@ -14,23 +19,6 @@ export class InvalidStorageNamespaceError extends Error {
     );
     this.name = "InvalidStorageNamespaceError";
   }
-}
-
-export function encodeStoragePathComponent(name: string): string {
-  return name.replace(SAFE_PATH_COMPONENT_CHARS, (ch) =>
-    "!" +
-    ch
-      .charCodeAt(FIRST_CODE_UNIT_INDEX)
-      .toString(HEX_RADIX)
-      .padStart(HEX_BYTE_WIDTH, "0")
-      .toUpperCase()
-  );
-}
-
-export function decodeStoragePathComponent(encoded: string): string {
-  return encoded.replace(/!([0-9A-Fa-f]{2})/g, (_match, hex) =>
-    String.fromCharCode(parseInt(hex, HEX_RADIX))
-  );
 }
 
 function isSingleEncodedComponent(component: string): boolean {
@@ -50,6 +38,11 @@ export function storageNamespacePathComponent(namespace: string): string {
     throw new InvalidStorageNamespaceError(namespace);
   }
   const encoded = encodeStoragePathComponent(namespace);
+  // Namespace directory names must be re-addressable by this build; otherwise
+  // discovery could decode bytes that later resolve to a different directory.
+  if (!filesystemStorageNameRoundTrips(namespace)) {
+    throw new InvalidStorageNamespaceError(namespace);
+  }
   if (!isSingleEncodedComponent(encoded)) {
     throw new InvalidStorageNamespaceError(namespace);
   }

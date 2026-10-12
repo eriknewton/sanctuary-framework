@@ -937,6 +937,39 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  it("reputation artifact storage keys must pass the shared key predicate at verify time", async () => {
+    const source = await makeSource("aggregator-repkey-source");
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "aggregator-repkey-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: { type: "transaction", result: "completed", metrics: { score: 100 } },
+      context: "aggregator-test",
+      identity_id: source.identityId,
+    });
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir);
+
+    await tamperReputationBundleAndResignInner(bundleDir, source, (bundle) => {
+      const attestations = bundle.attestations.map((attestation, index) =>
+        index === 0
+          ? { ...attestation, attestation_id: "att-\u4E2D" }
+          : attestation
+      );
+      return {
+        ...bundle,
+        attestations,
+        completeness_manifest: bundle.completeness_manifest
+          ? buildReputationCompletenessManifest(bundle.exported_at, attestations)
+          : bundle.completeness_manifest,
+      };
+    });
+
+    const verified = await verifyExitBundle(bundleDir);
+    expect(verified.passed).toBe(false);
+    expect(verified.failure_class).toBe("reputation_attestation_storage_name_invalid");
+    expect(verified.warnings.join("\n")).toContain("storage names");
+  });
+
   it("encrypted_state artifact whose JSON root is not an object: verify FAILS closed, import throws the NAMED error, never a crash", async () => {
     const source = await makeSource("aggregator-nullroot-source");
     const bundleDir = await newBundleDir();
@@ -1029,6 +1062,37 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       // check runs - a missing `namespace` throws there first.
       const { namespace: _namespace, ...withoutNamespace } = entries[0]!;
       artifact.entries = [withoutNamespace];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("EXIT-STRUCT-02: an entries element whose key is outside the storage-addressable domain fails verify closed", async () => {
+    const source = await makeSource("aggregator-struct02-key-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      artifact.entries = [{ ...entries[0]!, key: "key-\u4E2D" }];
     });
     const destination = await makeDestination();
 

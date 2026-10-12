@@ -501,6 +501,7 @@ mod tests {
     fn install_scope_refusals_keep_operator_text_within_display_budget() {
         const TEST_DIAGNOSTIC_TEXT_CAP: usize = 8 * 8;
         const TEST_LONG_TEXT_LENGTH: usize = TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP;
+        const TEST_DIAGNOSTIC_QUOTE_CHAR_COUNT: usize = 2;
         let long_rule_id = format!("rule-{}", "r".repeat(TEST_LONG_TEXT_LENGTH));
         let long_agent_id = format!("agent-{}", "a".repeat(TEST_LONG_TEXT_LENGTH));
         let malformed_rule: crate::policy::AllowlistRule =
@@ -518,11 +519,17 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(
-            malformed.contains(&format!("original length {}", long_rule_id.len())),
+            malformed.contains(&format!(
+                "original length {}",
+                long_rule_id.len() + TEST_DIAGNOSTIC_QUOTE_CHAR_COUNT
+            )),
             "{malformed}"
         );
         assert!(
-            malformed.contains(&format!("original length {}", long_agent_id.len() + 2)),
+            malformed.contains(&format!(
+                "original length {}",
+                long_agent_id.len() + TEST_DIAGNOSTIC_QUOTE_CHAR_COUNT
+            )),
             "{malformed}"
         );
         assert!(!malformed.contains(&long_rule_id), "{malformed}");
@@ -547,7 +554,10 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(
-            outside.contains(&format!("original length {}", long_rule_id.len())),
+            outside.contains(&format!(
+                "original length {}",
+                long_rule_id.len() + TEST_DIAGNOSTIC_QUOTE_CHAR_COUNT
+            )),
             "{outside}"
         );
         assert!(!outside.contains(&long_rule_id), "{outside}");

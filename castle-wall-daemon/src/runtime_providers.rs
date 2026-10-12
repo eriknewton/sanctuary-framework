@@ -6452,7 +6452,7 @@ mod tests {
         assert_eq!(event_json["operation"], "manifest_verify_failed_kept_prior");
         let detail = event_json["detail"].as_str().expect("audit detail text");
         assert!(detail.contains("policy snapshot construction failed"));
-        assert!(detail.contains("rule rule-new scope.agent_ids"));
+        assert!(detail.contains("rule \"rule-new\" scope.agent_ids"));
         assert!(detail.contains(&format!("agent-{agent_uid}")));
         assert!(detail.contains("uid-<decimal uid>"));
         assert!(

@@ -17,6 +17,7 @@
 
 import type { StorageBackend } from "../storage/interface.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
+import { assertFilesystemStorageNameAddressable } from "../storage/filesystem-name-codec.js";
 import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import {
   hasInterruptedExitImport,
@@ -1809,6 +1810,14 @@ export class StateStore {
     return hashMap;
   }
 
+  async assertNamespaceStorageNamesAddressable(namespace: string): Promise<void> {
+    // Continuing paths (AGENTS rule 13): tool-side audit gates must prove the
+    // same namespace listing StateStore.write/delete will consume, through this
+    // memoized chokepoint, so a stored-name refusal cannot be swallowed and a
+    // clean namespace is scanned only once per process.
+    await this.getNamespaceHashes(namespace);
+  }
+
   /**
    * Write encrypted state.
    *
@@ -2822,12 +2831,15 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError(`state_delete:${namespace}/${key}`);
     }
+    // A delete reports and audits a refusal only if no irreversible file
+    // mutation has happened; warm the namespace hash map first because that
+    // listing is required for the post-delete Merkle root.
+    const nsHashes = await this.getNamespaceHashes(namespace);
     const deleted = await this.storage.delete(namespace, key, true);
 
     // Update caches
     const vk = this.versionKey(namespace, key);
     this.versionCache.delete(vk);
-    const nsHashes = await this.getNamespaceHashes(namespace);
     nsHashes.delete(key);
     const merkleRoot = computeMerkleRoot(nsHashes);
 
@@ -2979,6 +2991,42 @@ export class StateStore {
     };
   }
 
+  async preflightImportStorageNames(bundleBase64: string): Promise<void> {
+    // Must match import below: parse the exact bundle shape that import will
+    // consume, then prove every target namespace can be listed before any
+    // import audit or write treats the call as underway.
+    const bundle = parseExportBundleObject(bundleBase64);
+    assertSupportedExportBundleSchema(bundle);
+    const data = readExportData(bundle);
+    assertBundleNamespaceMetadataMatches(bundle, data);
+    for (const [namespace, entries] of Object.entries(data)) {
+      assertStorageNamespacePathComponent(namespace);
+      if (isReservedNamespace(namespace)) continue;
+      await this.storage.list(namespace);
+      for (const { key } of entries) {
+        assertFilesystemStorageNameAddressable(key, "key");
+      }
+    }
+    if (Array.isArray(bundle.facade_hidden_markers)) {
+      for (const item of bundle.facade_hidden_markers) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        if (typeof record.key === "string") {
+          assertFilesystemStorageNameAddressable(record.key, "key");
+        }
+        const marker = record.marker;
+        if (!marker || typeof marker !== "object" || Array.isArray(marker)) continue;
+        const markerRecord = marker as Record<string, unknown>;
+        if (typeof markerRecord.namespace === "string") {
+          assertStorageNamespacePathComponent(markerRecord.namespace);
+        }
+        if (typeof markerRecord.key === "string") {
+          assertFilesystemStorageNameAddressable(markerRecord.key, "key");
+        }
+      }
+    }
+  }
+
   /**
    * Before checkpoint reconstruction deletes or writes anything, check the entire
    * import bundle against the same durable floors enforced by state reads.
@@ -3033,6 +3081,10 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError("state_import");
     }
+    // Must match the import loop below: storage-name refusal is the first
+    // bundle-dependent gate so a direct StateStore caller gets the same
+    // before-write guarantee as the MCP tool path.
+    await this.preflightImportStorageNames(bundleBase64);
     // Must match assertImportVersionFloors above: reconstruction preflights this parser.
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
@@ -3043,7 +3095,6 @@ export class StateStore {
       data,
       options.allowUnverifiedLegacy === true
     );
-
     let importedKeys = 0;
     let skippedKeys = 0;
     let skippedInvalidSig = 0;

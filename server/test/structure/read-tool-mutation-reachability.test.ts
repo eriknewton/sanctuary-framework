@@ -193,6 +193,16 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
           site: "saveVersionAnchors@src/cognitive/state-store.ts",
           through: "observeVersion@src/cognitive/state-store.ts",
         },
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "handler@src/cognitive/tools.ts",
+          through: "state_read handler@src/cognitive/tools.ts",
+        },
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "denyStorageNameAccess@src/cognitive/tools.ts",
+          through: "state_read handler@src/cognitive/tools.ts",
+        },
       ],
       why:
         "Reading a v1 entry rewrites it into the current signed envelope and " +
@@ -207,7 +217,9 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
         "make rollback detectable on its own (STATE-READ-MIGRATE-01, " +
         "STATE-READ-ANCHOR-01). The generic `_meta` writer is pinned only as " +
         "reached from the writer-key remembrance function, so it does not " +
-        "pre-approve future `_meta` writes through the same helper.",
+        "pre-approve future `_meta` writes through the same helper. The storage " +
+        "name classifier entries are pure refusal routing for an already-failed " +
+        "read; they write no durable state themselves.",
     },
   ],
   [
@@ -238,6 +250,16 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
           site: "saveVersionAnchors@src/cognitive/state-store.ts",
           through: "observeVersion@src/cognitive/state-store.ts",
         },
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "handler@src/cognitive/tools.ts",
+          through: "state_read handler@src/cognitive/tools.ts",
+        },
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "denyStorageNameAccess@src/cognitive/tools.ts",
+          through: "state_read handler@src/cognitive/tools.ts",
+        },
       ],
       why:
         "Recall drops the hide marker for the key it was asked about once that " +
@@ -246,7 +268,29 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
         "recalling caller, and it removes bookkeeping rather than stored content. " +
         "Recall then reads through the state-read primitive by runtime dispatch, " +
         "so everything reviewed for `state_read` above is reachable from here " +
-        "too and is listed rather than left implicit.",
+        "too and is listed rather than left implicit. The storage name classifier " +
+        "entries are pure refusal routing inherited from that read path.",
+    },
+  ],
+  [
+    "state_list",
+    {
+      sites: [
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "handler@src/cognitive/tools.ts",
+          through: "state_list handler@src/cognitive/tools.ts",
+        },
+        {
+          primitive: "storage.isFilesystemStorageNameError",
+          site: "denyStorageNameAccess@src/cognitive/tools.ts",
+          through: "state_list handler@src/cognitive/tools.ts",
+        },
+      ],
+      why:
+        "Listing refuses unavailable storage names through the same fixed-denial " +
+        "classifier as reads. These classifier calls are pure error routing; " +
+        "they write no durable state themselves.",
     },
   ],
   [

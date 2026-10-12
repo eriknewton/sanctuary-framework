@@ -50,6 +50,7 @@ import {
   MAX_PENDING_ADMISSION_WAITERS,
   ON_EVICT_AUDIT_TIMEOUT_MS,
 } from "../core/bounded-map.js";
+import { assertFilesystemStorageNameAddressable } from "../storage/filesystem-name-codec.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -651,7 +652,8 @@ export type ReputationStoreRefuseReason =
  */
 export class ReputationStoreQuotaError extends Error {
   readonly reason: ReputationStoreRefuseReason;
-  constructor(reason: ReputationStoreRefuseReason) {
+  override readonly cause?: unknown;
+  constructor(reason: ReputationStoreRefuseReason, cause?: unknown) {
     super(
       reason === "origin_quota"
         ? "Reputation store: origin per-write quota exceeded"
@@ -665,6 +667,7 @@ export class ReputationStoreQuotaError extends Error {
     );
     this.name = "ReputationStoreQuotaError";
     this.reason = reason;
+    this.cause = cause;
   }
 }
 
@@ -1159,8 +1162,8 @@ export class ReputationStore {
     let entries: Array<{ key: string }>;
     try {
       entries = await this.storage.list("_reputation");
-    } catch {
-      throw new ReputationStoreQuotaError("scan_unavailable");
+    } catch (error) {
+      throw new ReputationStoreQuotaError("scan_unavailable", error);
     }
 
     if (entries.length + additionalCount > this.maxRecords) {
@@ -1172,8 +1175,8 @@ export class ReputationStore {
       let raw: Uint8Array | null;
       try {
         raw = await this.storage.read("_reputation", meta.key);
-      } catch {
-        throw new ReputationStoreQuotaError("scan_unavailable");
+      } catch (error) {
+        throw new ReputationStoreQuotaError("scan_unavailable", error);
       }
       if (!raw) continue;
       try {
@@ -1181,8 +1184,8 @@ export class ReputationStore {
         const decrypted = decrypt(encrypted, this.encryptionKey);
         const record = JSON.parse(bytesToString(decrypted)) as { origin?: string };
         if (record.origin === origin) originCount++;
-      } catch {
-        throw new ReputationStoreQuotaError("scan_unavailable");
+      } catch (error) {
+        throw new ReputationStoreQuotaError("scan_unavailable", error);
       }
     }
 
@@ -2097,6 +2100,14 @@ export class ReputationStore {
     const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     const contexts = new Set<string>();
 
+    // Continuing paths (AGENTS rule 13): verified bundle + addressable ids +
+    // quota headroom is the only path that reaches writes; storage-key,
+    // verification, quota, and exit-journal refusals all throw before the
+    // first `_reputation` write, so import remains all-or-nothing.
+    for (const attestation of bundle.attestations) {
+      assertFilesystemStorageNameAddressable(attestation.attestation_id, "key");
+    }
+
     // MUST-FIX 1: quota check + every write for this bundle run inside ONE
     // admission-locked, deadline-bounded section (runAdmissionExclusiveBounded
     // — the same primitive record() uses), so a concurrent record(),
@@ -2877,12 +2888,10 @@ export class ReputationStore {
   async *loadAllPaginated(
     pageSize = 100
   ): AsyncGenerator<StoredAttestation[]> {
-    let entries: Array<{ key: string }>;
-    try {
-      entries = await this.storage.list("_reputation");
-    } catch {
-      return; // Storage not available
-    }
+    // INVARIANT: reputation reads feed signed export artifacts and tier
+    // scoring, so namespace listing errors must refuse the read rather than
+    // masquerade as an empty reputation set.
+    const entries = await this.storage.list("_reputation");
 
     for (let i = 0; i < entries.length; i += pageSize) {
       const page: StoredAttestation[] = [];

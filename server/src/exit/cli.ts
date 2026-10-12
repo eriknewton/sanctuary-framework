@@ -141,6 +141,8 @@ const FAILURE_CLASS_EXPLANATIONS: Record<
     "The reputation data's signature does not verify.",
   reputation_completeness_mismatch:
     "The reputation data does not account for the number of attestations the manifest claims.",
+  reputation_attestation_storage_name_invalid:
+    "At least one reputation attestation names a storage key this Sanctuary build cannot address.",
   reputation_attestation_signature_invalid:
     "At least one reputation attestation's signature does not verify.",
   reputation_unverifiable_attestations:
