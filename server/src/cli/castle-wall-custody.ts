@@ -43,6 +43,7 @@ import {
   applyFortressCustodyRepairs,
   CUSTODY_REPAIR_MANIFEST_DIR,
   CUSTODY_REPAIR_MANIFEST_KIND,
+  POST_CHANGE_CUSTODY_INSPECTION_MESSAGE,
   custodySkipOperatorMessage,
   manifestCarriesPrivilegeBits,
   parseCustodyRepairManifest,
@@ -193,6 +194,9 @@ function describeApply(result: CustodyApplyResult, out: Writable): void {
       out,
       `  note: ${path} changed identity between observe and apply; skipped (re-run to repair it).\n`,
     );
+  }
+  for (const path of result.changedAfterOperation) {
+    write(out, `  FAILED: ${path}: ${POST_CHANGE_CUSTODY_INSPECTION_MESSAGE}.\n`);
   }
   for (const failure of result.failed) {
     write(out, `  FAILED: ${failure.path}: ${failure.reason}\n`);
@@ -382,6 +386,7 @@ export async function runRepairCustody(
     describeApply(result, out);
     if (
       result.failed.length > 0 ||
+      result.changedAfterOperation.length > 0 ||
       result.identityChanged.length > 0 ||
       result.skipped.length > 0
     ) {
@@ -396,6 +401,7 @@ export async function runRepairCustody(
           ).length,
           vanished: result.vanished.length,
           identity_changed: result.identityChanged.length,
+          changed_after_operation: result.changedAfterOperation.length,
         },
         fortressPath,
         env,
@@ -404,7 +410,10 @@ export async function runRepairCustody(
       write(
         err,
         `Rollback incomplete: ${
-          result.failed.length + result.identityChanged.length + result.skipped.length
+          result.failed.length +
+          result.changedAfterOperation.length +
+          result.identityChanged.length +
+          result.skipped.length
         } entries could not be restored (see above).\n`,
       );
       return REPAIR_CUSTODY_EXIT_FAILED;
@@ -424,6 +433,7 @@ export async function runRepairCustody(
         restored: result.repaired.length,
         vanished: result.vanished.length,
         identity_changed: result.identityChanged.length,
+        changed_after_operation: result.changedAfterOperation.length,
       },
       fortressPath,
       env,
@@ -549,6 +559,7 @@ export async function runRepairCustody(
           applied.skipped.filter((skip) => skip.reason === "unsupported_type").length,
         vanished: walk.vanished.length + applied.vanished.length,
         identity_changed: applied.identityChanged.length,
+        changed_after_operation: applied.changedAfterOperation.length,
         operator_uid: identity.uid,
       },
       fortressPath,
@@ -564,6 +575,7 @@ export async function runRepairCustody(
       if (
         swept !== undefined &&
         (swept.failed.length > 0 ||
+          swept.changedAfterOperation.length > 0 ||
           swept.identityChanged.length > 0 ||
           swept.skipped.length > 0)
       ) {
@@ -587,6 +599,15 @@ export async function runRepairCustody(
     write(
       err,
       `Repair incomplete: ${applied.failed.length} entries failed (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
+    );
+    return REPAIR_CUSTODY_EXIT_FAILED;
+  }
+  if (applied.changedAfterOperation.length > 0) {
+    write(
+      err,
+      `Repair incomplete: ${applied.changedAfterOperation.length} entr${
+        applied.changedAfterOperation.length === 1 ? "y" : "ies"
+      } require root inspection after ownership repair (see above). Rollback: sudo sanctuary castle-wall repair-custody --rollback ${manifestPath}\n`,
     );
     return REPAIR_CUSTODY_EXIT_FAILED;
   }
@@ -620,6 +641,7 @@ export async function runRepairCustody(
       ).length,
       vanished: walk.vanished.length + applied.vanished.length,
       identity_changed: applied.identityChanged.length,
+      changed_after_operation: applied.changedAfterOperation.length,
       operator_uid: identity.uid,
     },
     fortressPath,
@@ -642,6 +664,7 @@ export async function runRepairCustody(
       // the exit code -- never report a clean repair over known residue.
       if (
         swept.failed.length > 0 ||
+        swept.changedAfterOperation.length > 0 ||
         swept.identityChanged.length > 0 ||
         swept.skipped.length > 0
       ) {

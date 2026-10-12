@@ -654,6 +654,35 @@ describe("castle-wall repair-custody", () => {
     }
   });
 
+  it("exits failed when an operator-owned unsupported entry is present", async () => {
+    const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
+    try {
+      const fake = makeFakeOps(
+        {
+          "/Users/mini2/.sanctuary": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+          "/Users/mini2/.sanctuary/node": {
+            type: "other",
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            ino: 2,
+          },
+        },
+        { "/Users/mini2/.sanctuary": ["node"] },
+      );
+      const ctx = baseCtx(fake, manifestDir);
+
+      const code = await runRepairCustody([], ctx);
+
+      expect(code).toBe(REPAIR_CUSTODY_EXIT_FAILED);
+      expect(ctx.out.text()).toContain("unsupported filesystem type");
+      expect(ctx.out.text()).toContain("Inspect it with sudo");
+      expect(ctx.err.text()).toContain("Repair incomplete");
+    } finally {
+      await rm(manifestDir, { recursive: true, force: true });
+    }
+  });
+
   it("hands back audit state created during a skipped forward run", async () => {
     const manifestDir = await mkdtemp(join(tmpdir(), "repair-manifests-"));
     try {

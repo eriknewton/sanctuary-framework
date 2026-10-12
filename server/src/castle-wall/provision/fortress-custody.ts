@@ -255,8 +255,13 @@ export interface CustodyApplyResult {
   vanished: string[];
   /** Entries whose on-disk identity changed since observation (skipped, reported). */
   identityChanged: string[];
+  /** Entries whose pathname proof changed after ownership was already applied. */
+  changedAfterOperation: string[];
   failed: { path: string; reason: string }[];
 }
+
+export const POST_CHANGE_CUSTODY_INSPECTION_MESSAGE =
+  "ownership was already changed and the entry needs inspecting as root";
 
 export function custodySkipOperatorMessage(skip: CustodySkip): string {
   if (skip.reason === "multiple_names") {
@@ -491,6 +496,14 @@ function sameIdentity(entry: FortressCustodyEntry, stats: Stats): boolean {
   );
 }
 
+function sameIdentityAndLinkCount(
+  entry: FortressCustodyEntry,
+  before: Stats,
+  after: Stats,
+): boolean {
+  return sameIdentity(entry, after) && after.nlink === before.nlink;
+}
+
 const SINGLE_NAME_LINK_COUNT = 1;
 
 function multiplyNamedNonDirectorySkip(
@@ -665,6 +678,7 @@ async function applyOneAction(
   | { kind: "repaired" }
   | { kind: "vanished" }
   | { kind: "identity_changed" }
+  | { kind: "changed_after_operation" }
   | { kind: "ancestor_changed" }
   | { kind: "skipped"; skip: CustodySkip }
 > {
@@ -739,12 +753,20 @@ async function applyOneAction(
       if (!sameIdentity(action.entry, operationFresh)) return { kind: "identity_changed" };
       const unsupported = unsupportedTypeSkip(action.entry, operationFresh);
       if (unsupported !== null) return { kind: "skipped", skip: unsupported };
-      // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): Node has no fchownat-style descriptor form for sockets, so the last enforceable observation is the lstat immediately before lchown plus a post-change identity check.
+      // DEBT(CUSTODY-SOCKET-LCHOWN-WINDOW): a second name added between this re-check and lchown is detected after the fact and reported, not prevented.
       const skip = multiplyNamedNonDirectorySkip(action.entry, operationFresh);
       if (skip !== null) return { kind: "skipped", skip };
       await ops.lchown(join(fortressPath, relPath), action.chownTo.uid, action.chownTo.gid);
-      const after = await ops.lstat(join(fortressPath, relPath));
-      if (!sameIdentity(action.entry, after)) return { kind: "identity_changed" };
+      let after: Stats;
+      try {
+        after = await ops.lstat(join(fortressPath, relPath));
+      } catch (err) {
+        if (isEnoent(err)) return { kind: "changed_after_operation" };
+        throw err;
+      }
+      if (!sameIdentityAndLinkCount(action.entry, operationFresh, after)) {
+        return { kind: "changed_after_operation" };
+      }
     }
     // NOTE (2026-07-31 gate round 3): sockets and symlinks cannot be opened,
     // so a mode restore here could only be a PATHNAME chmod -- and a pathname
@@ -778,6 +800,7 @@ export async function applyFortressCustodyRepairs(
     skipped: [],
     vanished: [],
     identityChanged: [],
+    changedAfterOperation: [],
     failed: [],
   };
   const observed = new Map<string, FortressCustodyEntry>(
@@ -791,6 +814,8 @@ export async function applyFortressCustodyRepairs(
         result.vanished.push(relPath);
       } else if (disposition.kind === "identity_changed") {
         result.identityChanged.push(relPath);
+      } else if (disposition.kind === "changed_after_operation") {
+        result.changedAfterOperation.push(relPath);
       } else if (disposition.kind === "ancestor_changed") {
         // Reported, never silently dropped: a changed ancestor is the
         // symlink-escape attack shape, so it is surfaced distinctly.
@@ -975,10 +1000,11 @@ export function manifestCarriesPrivilegeBits(
 /**
  * Replay the recorded ownership (and modes) of a manifest exactly. Entries
  * already matching are untouched; vanished entries are noted; type changes
- * are reported as identityChanged (dev/ino is deliberately NOT required to
- * match here: legitimate rewrites via tmp+rename change the inode, and
- * rollback replays METADATA onto the path's current occupant of the same
- * type). Symlinks are never chmod'd.
+ * are reported as identityChanged. Regular files and directories may be
+ * restored onto a same-type rewritten occupant; socket and symlink ownership
+ * rollback requires the manifest identity to still match immediately before
+ * lchown because those entries cannot be opened by descriptor. Symlinks are
+ * never chmod'd.
  *
  * SECURITY (2026-07-31 gate BLOCKER-2): rollback is a root chown/chmod
  * primitive driven by file contents, so it carries the SAME containment as
@@ -1004,6 +1030,7 @@ export async function applyCustodyRollback(
     skipped: [],
     vanished: [],
     identityChanged: [],
+    changedAfterOperation: [],
     failed: [],
   };
   const rootStats = await ops.lstat(fortressPath);
@@ -1101,11 +1128,10 @@ export async function applyCustodyRollback(
             await handle.close().catch(() => undefined);
           }
         } else {
-          // Sockets/symlinks cannot be opened. lchown never follows, so
-          // ownership is safe; a pathname CHMOD is not, so rollback does not
-          // restore modes for these types. Stated bound, not a silent skip:
-          // the socket's 0600 is re-established by the daemon that binds it,
-          // and symlink modes are meaningless.
+          // Sockets/symlinks cannot be opened. Rollback re-checks the manifest
+          // identity and link count immediately before lchown, then reports a
+          // post-change mismatch as root-inspection work; pathname chmod remains
+          // disallowed for these types.
           if (needsChown) {
             if (!(await revalidateHeldAncestors(ancestors, ops))) {
               result.identityChanged.push(`${entry.path} (ancestor changed)`);
@@ -1129,11 +1155,20 @@ export async function applyCustodyRollback(
               entry.uid,
               entry.gid,
             );
-            const after = await ops.lstat(
-              entry.path === "." ? fortressPath : join(fortressPath, entry.path),
-            );
-            if (!sameIdentity(entry, after)) {
-              result.identityChanged.push(entry.path);
+            let after: Stats;
+            try {
+              after = await ops.lstat(
+                entry.path === "." ? fortressPath : join(fortressPath, entry.path),
+              );
+            } catch (err) {
+              if (isEnoent(err)) {
+                result.changedAfterOperation.push(entry.path);
+                continue;
+              }
+              throw err;
+            }
+            if (!sameIdentityAndLinkCount(entry, operationFresh, after)) {
+              result.changedAfterOperation.push(entry.path);
               continue;
             }
           }
@@ -1242,10 +1277,17 @@ export async function normalizeFortressCustody(
     outcome.skips.push(...applied.skipped);
     outcome.vanished.push(...applied.vanished);
     outcome.failed = applied.failed;
+    outcome.failed.push(
+      ...applied.changedAfterOperation.map((path) => ({
+        path,
+        reason: POST_CHANGE_CUSTODY_INSPECTION_MESSAGE,
+      })),
+    );
     const finalFailed =
       hasUnsupportedTypeSkip(plan.skips) ||
       applied.skipped.length > 0 ||
       applied.identityChanged.length > 0 ||
+      applied.changedAfterOperation.length > 0 ||
       applied.failed.length > 0;
     if (finalFailed) {
       outcome.status = "failed";
@@ -1266,8 +1308,15 @@ export async function normalizeFortressCustody(
           applied.repaired.length === 1 ? "y" : "ies"
         } and left ${applied.skipped.length} entr${
           applied.skipped.length === 1 ? "y" : "ies"
-        } untouched under ${input.fortressPath}. Run \`sanctuary castle-wall repair-custody\` after removing the extra names, or inspect as root.`,
+        } untouched under ${input.fortressPath}. Review the per-entry warning above, then run \`sudo sanctuary castle-wall repair-custody\`, or inspect as root.`,
       );
+    }
+    if (applied.changedAfterOperation.length > 0) {
+      for (const path of applied.changedAfterOperation) {
+        input.log(
+          `Warning: fortress entry ${path}: ${POST_CHANGE_CUSTODY_INSPECTION_MESSAGE}.`,
+        );
+      }
     }
     // 2026-07-31 gate round 3 (LOW): identity/ancestor changes were dropped
     // here, so a race could leave root-owned residue behind a "clean"
