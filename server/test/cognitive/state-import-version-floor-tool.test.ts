@@ -7,6 +7,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
 import {
@@ -32,6 +35,8 @@ import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { createServer, type ToolDefinition } from "../../src/router.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../../src/storage/exit-import-journal.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 type ToolPayload = Record<string, unknown>;
@@ -48,6 +53,15 @@ class HookedMemoryStorage extends MemoryStorage {
 
   async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
     await this.beforeWrite?.(namespace, key);
+    await super.write(namespace, key, data);
+    await this.onWrite?.(namespace, key);
+  }
+}
+
+class HookedFilesystemStorage extends FilesystemStorage {
+  onWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
+
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
     await super.write(namespace, key, data);
     await this.onWrite?.(namespace, key);
   }
@@ -90,12 +104,12 @@ interface ToolRig {
   identityManager: ReturnType<typeof createCognitiveTools>["identityManager"];
   auditLog: AuditLog;
   stateStore: StateStore;
-  storage: MemoryStorage;
+  storage: StorageBackend;
   masterKey: Uint8Array;
   identityEncKey: Uint8Array;
 }
 
-async function makeToolRig(storage: MemoryStorage = new MemoryStorage()): Promise<ToolRig> {
+async function makeToolRig(storage: StorageBackend = new MemoryStorage()): Promise<ToolRig> {
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
   const stateStore = new StateStore(storage, masterKey);
@@ -227,7 +241,7 @@ function replaceBundleIntegrityMac(bundleBase64: string): string {
   return encodeBundle(decoded);
 }
 
-async function versionAnchorBytes(storage: MemoryStorage): Promise<string | null> {
+async function versionAnchorBytes(storage: StorageBackend): Promise<string | null> {
   const raw = await storage.read("_meta", STATE_META_VERSION_ANCHORS_KEY);
   return raw ? bytesToString(raw) : null;
 }
@@ -1042,6 +1056,65 @@ describe("state_import version floor tool path", () => {
     } finally {
       storage.onWrite = undefined;
       await rig.close();
+    }
+  });
+
+  it("audits partial import progress when a stored name refuses after an earlier key", async () => {
+    const basePath = await mkdtemp(join(tmpdir(), "sanctuary-import-name-"));
+    const storage = new HookedFilesystemStorage(basePath);
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "stored-name-first", value: "imported" },
+          { key: "stored-name-second", value: "imported" },
+        ],
+      });
+
+      let planted = false;
+      storage.onWrite = async (namespace, key) => {
+        if (namespace !== "notes" || key !== "stored-name-first" || planted) {
+          return;
+        }
+        planted = true;
+        await writeFile(join(basePath, "notes", "key-!4E2D.enc"), stringToBytes("{}"));
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused).toMatchObject({
+        denied: true,
+        audit_ref: "audit:state_import",
+      });
+      expect(JSON.stringify(refused)).not.toContain("key-!4E2D");
+      expect(await storage.exists("notes", "stored-name-first")).toBe(true);
+
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.result).toBe("failure");
+      expect(audit.entries[0]?.details).toMatchObject({
+        denial_class: "namespace_unavailable",
+        storage_name_kind: "key",
+        raw_stored_entry: "key-!4E2D",
+        partial: true,
+        imported_before_refusal: 1,
+        written_keys: [{ namespace: "notes", key: "stored-name-first" }],
+      });
+    } finally {
+      storage.onWrite = undefined;
+      await rig.close();
+      await rm(basePath, { recursive: true, force: true });
     }
   });
 

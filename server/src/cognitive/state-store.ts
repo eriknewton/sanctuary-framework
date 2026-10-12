@@ -3466,11 +3466,13 @@ export class StateStore {
       options
     );
     // Continuing-path table (rule 13), shared with assertImportVersionFloors:
+    // storage-name preflight: stored namespace/key names refuse before any import write.
     // skip: existing entries are skipped and not floor-checked; absent entries write.
     // version: non-newer entries are skipped and not floor-checked; newer entries write.
     // overwrite: every verified non-reserved entry writes and is floor-checked.
     // journal, per-write floor, post-write anchor/cache, storage, and
     // facade-marker refusals after earlier writes leave those writes applied;
+    // post-write stored-name refusals during namespace hash refresh do the same;
     // storage refusals additionally name the in-flight key because the backend
     // may have landed it before reporting, including when it is the first key.
     await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);

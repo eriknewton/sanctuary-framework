@@ -1144,7 +1144,12 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
-  async function denyStorageNameAccess(operation: string, namespace: string, error?: unknown) {
+  async function denyStorageNameAccess(
+    operation: string,
+    namespace: string,
+    error?: unknown,
+    extraDetails: Record<string, unknown> = {}
+  ) {
     const storageName = isFilesystemStorageNameError(error)
       ? {
           ...(typeof error.kind === "string" ? { storage_name_kind: error.kind } : {}),
@@ -1158,6 +1163,7 @@ export function createCognitiveTools(
       namespace,
       denial_class: "namespace_unavailable",
       ...storageName,
+      ...extraDetails,
     }, "failure");
     return toolResult(fixedDenial(`audit:${operation}`));
   }
@@ -2378,7 +2384,12 @@ export function createCognitiveTools(
             return denyStateImportVerification(err, targetNamespaces);
           }
           if (isFilesystemStorageNameError(err)) {
-            return denyStorageNameAccess("state_import", "state_import", err);
+            return denyStorageNameAccess(
+              "state_import",
+              "state_import",
+              err,
+              stateImportPartialAuditDetails(getStateImportPartialApplyDetails(err))
+            );
           }
           const genericPartialDetails = getStateImportPartialApplyDetails(err);
           if (genericPartialDetails) {
