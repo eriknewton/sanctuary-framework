@@ -315,7 +315,11 @@ class DarwinDirectoryCapabilityClient {
     return this.child.pid;
   }
 
-  call<T>(op: string, args: unknown[] = []): Promise<T> {
+  call<T>(
+    op: string,
+    args: unknown[] = [],
+    options: { boundNamespace?: true } = {},
+  ): Promise<T> {
     const run = async (): Promise<T> => {
       this.assertAlive();
       const id = this.nextId++;
@@ -339,12 +343,20 @@ class DarwinDirectoryCapabilityClient {
             reject(error);
           },
         });
-        this.child.send({ id, op, args }, (error) => {
-          if (!error) return;
-          this.pending.delete(id);
-          clearTimeout(timeout);
-          reject(error);
-        });
+        this.child.send(
+          {
+            id,
+            op,
+            args,
+            ...(options.boundNamespace ? { boundNamespace: true } : {}),
+          },
+          (error) => {
+            if (!error) return;
+            this.pending.delete(id);
+            clearTimeout(timeout);
+            reject(error);
+          },
+        );
       });
     };
     const result = this.chain.then(run, run);
@@ -429,6 +441,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   private darwinCapability(namespace?: string): {
     client: DarwinDirectoryCapabilityClient;
     namespace?: string;
+    boundNamespace?: true;
   } | undefined {
     const bound = this.boundBasePath.getStore();
     if (!bound) return undefined;
@@ -439,16 +452,31 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     ) {
       return {
         client: bound.darwinNamespaceClient,
-        namespace: DARWIN_BOUND_NAMESPACE_TOKEN,
+        boundNamespace: true,
       };
     }
+    if (namespace !== undefined) storageNamespacePathComponent(namespace);
     return bound.darwinClient ? { client: bound.darwinClient, namespace } : undefined;
   }
 
+  private callDarwinNamespace<T>(
+    capability: {
+      client: DarwinDirectoryCapabilityClient;
+      namespace?: string;
+      boundNamespace?: true;
+    },
+    op: string,
+    args: unknown[] = [],
+  ): Promise<T> {
+    if (capability.boundNamespace) {
+      return capability.client.call<T>(op, args, { boundNamespace: true });
+    }
+    return capability.client.call<T>(op, [capability.namespace, ...args]);
+  }
+
   private activeNamespacePath(namespace: string): string {
-    // The Darwin worker's locked-namespace client uses an internal token to
-    // address its cwd; a literal "." from a caller must still take the normal
-    // namespace path and be refused by the shared component predicate.
+    // The Darwin worker maps only parent-flagged bound requests to cwd; caller
+    // namespaces still pass through the shared component predicate first.
     if (
       this.allowDirectoryCapabilityRootNamespace &&
       namespace === DARWIN_BOUND_NAMESPACE_TOKEN
@@ -797,8 +825,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      await capability.client.call("write", [
-        capability.namespace,
+      await this.callDarwinNamespace(capability, "write", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -818,8 +845,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("writeIfAbsent", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "writeIfAbsent", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -877,8 +903,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("replaceIfEquals", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "replaceIfEquals", [
         key,
         Buffer.from(expected).toString("base64"),
         Buffer.from(checkedData).toString("base64"),
@@ -916,8 +941,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      await capability.client.call("writeDurable", [
-        capability.namespace,
+      await this.callDarwinNamespace(capability, "writeDurable", [
         key,
         Buffer.from(checkedData).toString("base64"),
       ]);
@@ -972,10 +996,11 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      const encoded = await capability.client.call<string | null>("read", [
-        capability.namespace,
-        key,
-      ]);
+      const encoded = await this.callDarwinNamespace<string | null>(
+        capability,
+        "read",
+        [key],
+      );
       return encoded === null ? null : new Uint8Array(Buffer.from(encoded, "base64"));
     }
     const buf = await this.readAtPath(this.entryPath(namespace, key));
@@ -1011,8 +1036,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     assertStorageMasterWriteBarrierHeld(this);
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("delete", [
-        capability.namespace,
+      return this.callDarwinNamespace(capability, "delete", [
         key,
         secureOverwrite,
       ]);
@@ -1128,11 +1152,12 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       // every entry from callers such as the master-rotation namespace walk.
       // Omit the optional argument entirely so the worker preserves the local
       // FilesystemStorage `list(namespace)` contract.
-      return capability.client.call(
+      return this.callDarwinNamespace(
+        capability,
         "list",
         prefix === undefined
-          ? [capability.namespace]
-          : [capability.namespace, prefix],
+          ? []
+          : [prefix],
       );
     }
     const dirPath = this.activeNamespacePath(namespace);
@@ -1175,7 +1200,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
   async exists(namespace: string, key: string): Promise<boolean> {
     const capability = this.darwinCapability(namespace);
     if (capability) {
-      return capability.client.call("exists", [capability.namespace, key]);
+      return this.callDarwinNamespace(capability, "exists", [key]);
     }
     const newPath = this.entryPath(namespace, key);
     try {
@@ -1217,6 +1242,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     };
     for await (const dir of root) {
       chargeEntry();
+      const rootEntryPath = join(this.activeBasePath(), dir.name);
+      const rootEntryStat = await stat(rootEntryPath);
+      if (!rootEntryStat.isDirectory()) continue;
       const path = resolveEncodedStorageNamespacePath(this.activeBasePath(), dir.name);
       if (!(await stat(path)).isDirectory()) continue;
       let hasEntries = false;
@@ -1252,9 +1280,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     try {
       const namespaces = await readdir(this.activeBasePath());
       for (const ns of namespaces) {
+        const rootEntryPath = join(this.activeBasePath(), ns);
+        const rootEntryStat = await stat(rootEntryPath);
+        if (!rootEntryStat.isDirectory()) continue;
         const nsPath = resolveEncodedStorageNamespacePath(this.activeBasePath(), ns);
-        const nsStat = await stat(nsPath);
-        if (!nsStat.isDirectory()) continue;
 
         const files = await readdir(nsPath);
         for (const file of files) {
@@ -1265,7 +1294,6 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       }
     } catch {
       // If base path doesn't exist yet, total is 0
-      return 0;
     }
 
     return total;

@@ -7,7 +7,7 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
 
-const INVALID_NAMESPACES = ["", ".", ".."];
+const INVALID_NAMESPACES = ["", ".", "..", "\0sanctuary-bound-namespace\0"];
 
 const selfOwner = () => ({
   uid: process.getuid?.() ?? 0,
@@ -113,6 +113,21 @@ describe("storage namespace names", () => {
       await expect(new FilesystemStorage(basePath).listNamespaces()).rejects.toThrow(
         /namespace/
       );
+    } finally {
+      await rm(basePath, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-directory root entries before validating namespace directory names", async () => {
+    const basePath = await mkdtemp(join(tmpdir(), "sanctuary-ns-stray-file-"));
+    try {
+      const storage = new FilesystemStorage(basePath);
+      const payload = new Uint8Array([1, 2, 3, 4]);
+      await storage.write("notes", "k", payload);
+      await writeFile(join(basePath, "Icon\r"), new Uint8Array([9, 9]));
+
+      await expect(storage.listNamespaces()).resolves.toEqual(["notes"]);
+      await expect(storage.totalSize()).resolves.toBe(payload.byteLength);
     } finally {
       await rm(basePath, { recursive: true, force: true });
     }

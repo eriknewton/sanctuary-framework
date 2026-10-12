@@ -44,6 +44,11 @@ function isSingleEncodedComponent(component: string): boolean {
 }
 
 export function storageNamespacePathComponent(namespace: string): string {
+  // NUL is reserved for private worker control markers; caller namespaces must
+  // never collide with out-of-band storage authority.
+  if (namespace.includes("\0")) {
+    throw new InvalidStorageNamespaceError(namespace);
+  }
   const encoded = encodeStoragePathComponent(namespace);
   if (!isSingleEncodedComponent(encoded)) {
     throw new InvalidStorageNamespaceError(namespace);
