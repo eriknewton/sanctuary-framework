@@ -15,7 +15,10 @@
  * - Secure deletion overwrites before unlinking
  */
 
-import type { StorageBackend } from "../storage/interface.js";
+import type {
+  NamespaceLockStorageCapabilities,
+  StorageBackend,
+} from "../storage/interface.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
 import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import {
@@ -102,6 +105,8 @@ const STATE_EXPORT_BUNDLE_MAC_COVERAGE =
   "sanctuary-v1-body-and-completeness-manifest";
 const STATE_EXPORT_LEGACY_REJECT_MESSAGE =
   "export predates completeness verification; re-export, or re-run with allow_unverified_legacy to import without completeness guarantees";
+const STATE_STORE_MUTATION_LOCK_NAMESPACE = "_meta";
+const STATE_STORE_MUTATION_LOCK_FILE = ".state-store-mutation.lock";
 const ISO_8601_TIMESTAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 
@@ -214,6 +219,7 @@ function readExportData(bundle: StateExportBundle): StateExportData {
   }
 
   const result: StateExportData = {};
+  const seen = new Set<string>();
   for (const [namespace, entries] of Object.entries(data)) {
     if (!Array.isArray(entries)) {
       throw new Error("export bundle namespace entries are malformed");
@@ -231,6 +237,14 @@ function readExportData(bundle: StateExportBundle): StateExportData {
       ) {
         throw new Error("export bundle entry is malformed");
       }
+      const pair = `${namespace.length}:${namespace}${record.key}`;
+      if (seen.has(pair)) {
+        throw new StateVerificationError(
+          "schema_mismatch",
+          "export bundle contains duplicate namespace/key entries"
+        );
+      }
+      seen.add(pair);
       return {
         key: record.key,
         entry: record.entry as StateEntry,
@@ -1149,6 +1163,7 @@ function normalizePersistedProvenanceStamp(value: unknown): ProvenanceStamp | nu
 export class StateStore {
   private storage: StorageBackend;
   private masterKey: Uint8Array;
+  private mutationTail: Promise<void> = Promise.resolve();
 
   // Cache of version numbers per namespace/key for anti-rollback
   private versionCache = new Map<string, number>();
@@ -1164,6 +1179,38 @@ export class StateStore {
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
     this.storage = storage;
     this.masterKey = masterKey;
+  }
+
+  private async withStateMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const storageWithLock = this.storage as StorageBackend &
+      Partial<NamespaceLockStorageCapabilities>;
+    if (typeof storageWithLock.withNamespaceLock === "function") {
+      // Import floor checks and ordinary writes share this existing storage
+      // serialization point; otherwise a local write could raise the durable
+      // floor between an import's check and its write.
+      return storageWithLock.withNamespaceLock(
+        STATE_STORE_MUTATION_LOCK_NAMESPACE,
+        STATE_STORE_MUTATION_LOCK_FILE,
+        async () => operation()
+      );
+    }
+
+    // Test and decorator backends can omit the cross-process capability; keep
+    // one StateStore instance serialized instead of falling through unlocked.
+    const predecessor = this.mutationTail;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = predecessor.catch(() => undefined).then(() => gate);
+    this.mutationTail = tail;
+    await predecessor.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.mutationTail === tail) {
+        this.mutationTail = Promise.resolve();
+      }
+    }
   }
 
   private exportBundleMacBytes(bundle: StateExportBundle): Uint8Array {
@@ -1846,6 +1893,7 @@ export class StateStore {
     identityEncryptionKey: Uint8Array,
     options: WriteOptions = {}
   ): Promise<WriteResult> {
+    return this.withStateMutationLock(async () => {
     // N4 (coordinator gate, 2026-08-22): while a durable exit-import
     // journal exists, refuse THIS write - F6 (coordinator gate,
     // 2026-08-22): restore is now post-image-confirmed, not unconditional
@@ -2012,6 +2060,7 @@ export class StateStore {
       size_bytes: serialized.length,
       integrity_hash: integrityHash,
     };
+    });
   }
 
   /**
@@ -3203,6 +3252,7 @@ export class StateStore {
     imported_at: string;
     completeness_verification: StateExportCompletenessVerification;
   }> {
+    return this.withStateMutationLock(async () => {
     // N4-STATE-IMPORT (coordinator gate, 2026-08-22): this state-bundle
     // import feature writes directly via `this.storage.write` below,
     // outside the write() chokepoint above - a distinct entry point from
@@ -3298,6 +3348,7 @@ export class StateStore {
       imported_at: new Date().toISOString(),
       completeness_verification: plan.completenessVerification,
     };
+    });
   }
 }
 

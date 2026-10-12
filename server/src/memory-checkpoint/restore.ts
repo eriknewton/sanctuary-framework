@@ -8,7 +8,10 @@
  * namespaces are asserted out of the diff and are never deleted here.
  */
 
-import type { StateStore } from "../cognitive/state-store.js";
+import {
+  StateVerificationError,
+  type StateStore,
+} from "../cognitive/state-store.js";
 import { bytesToString, fromBase64url } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import type { AuditLog } from "../operational/audit-log.js";
@@ -253,6 +256,11 @@ function restoreAuditDetails(input: {
       : {}),
     ...(input.error instanceof MemoryCheckpointError
       ? { error_reason: input.error.reason, error_message: input.error.message }
+      : input.error instanceof StateVerificationError
+        ? {
+            error_reason: input.error.classification,
+            error_message: input.error.message,
+          }
       : input.error !== undefined
         ? { error_reason: "restore_failed", error_message: String(input.error) }
         : {}),
@@ -285,6 +293,15 @@ function forensicSource(record: MemoryCheckpointRecord): CheckpointRestoreForens
     `memory checkpoint restore refused: checkpoint ${record.id} is a forensic quarantine artifact and cannot be used as a restore source`,
     "forensic_source_refused",
   );
+}
+
+function isCheckpointRestoreVersionFloorRefusal(error: unknown): boolean {
+  if (!(error instanceof StateVerificationError)) return false;
+  if (error.classification !== "rollback_detected") return false;
+  // Legacy v1 ceiling refusals are a distinct verification classification for
+  // checkpoint restore: only an entry below the durable floor earns the
+  // read-only no-audit floor refusal promised to the CLI.
+  return !error.message.includes("legacy (v1)");
 }
 
 /** Read and validate a restore source without writing state or audit records. */
@@ -342,6 +359,7 @@ export async function preflightCheckpointRestore(
       deps.publicKeyResolver,
     );
   } catch (err) {
+    if (!isCheckpointRestoreVersionFloorRefusal(err)) throw err;
     throw new CheckpointRestoreVersionFloorError(
       CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
       "checkpoint_version_floor_refused",

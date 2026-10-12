@@ -33,30 +33,15 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 type ToolPayload = Record<string, unknown>;
 
 const READ_TOOLS = new Set(["state_read"]);
-const SECOND_ANCHOR_READ_AFTER_PREFLIGHT = 2;
 const HMAC_SHA256_BYTE_LENGTH = 32;
+const CONCURRENT_WRITE_BLOCKED_PROBE_MS = 25;
 
-class RaisingFloorStorage extends MemoryStorage {
-  private anchorReads = 0;
-  private raised = false;
-  raiseBeforeSecondAnchorRead: (() => Promise<void>) | null = null;
+class HookedMemoryStorage extends MemoryStorage {
+  onWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
 
-  async read(namespace: string, key: string): Promise<Uint8Array | null> {
-    if (
-      namespace === "_meta" &&
-      key === STATE_META_VERSION_ANCHORS_KEY &&
-      this.raiseBeforeSecondAnchorRead &&
-      !this.raised
-    ) {
-      this.anchorReads += 1;
-      // 2 = import-wide preflight read, then per-write recheck read.
-      // Raising here proves the per-write recheck observes the current floor.
-      if (this.anchorReads === SECOND_ANCHOR_READ_AFTER_PREFLIGHT) {
-        this.raised = true;
-        await this.raiseBeforeSecondAnchorRead();
-      }
-    }
-    return super.read(namespace, key);
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    await super.write(namespace, key, data);
+    await this.onWrite?.(namespace, key);
   }
 }
 
@@ -178,6 +163,26 @@ function stripCompleteness(bundleBase64: string): string {
   delete decoded.completeness_manifest;
   delete decoded.bundle_integrity;
   return encodeBundle(decoded);
+}
+
+function duplicateFirstEntry(bundleBase64: string): string {
+  const decoded = decodeBundle(bundleBase64);
+  const data = decoded.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("missing bundle data");
+  }
+  const entries = (data as Record<string, unknown>).notes;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("missing notes entry");
+  }
+  entries.push(JSON.parse(JSON.stringify(entries[0])));
+  delete decoded.completeness_manifest;
+  delete decoded.bundle_integrity;
+  return encodeBundle(decoded);
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function replaceBundleIntegrityMac(bundleBase64: string): string {
@@ -587,40 +592,115 @@ describe("state_import version floor tool path", () => {
     }
   });
 
-  it("StateStore.import rechecks the stored floor immediately before each write", async () => {
-    const storage = new RaisingFloorStorage();
+  it("StateStore.import refuses a mixed bundle before writing earlier valid candidates", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      await writeValue(rig.client, identityId, "direct-low", "first");
+      await writeValue(rig.client, identityId, "direct-low", "second");
+      const mixedBundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "direct-good", value: "first" },
+          { key: "direct-good", value: "second" },
+          { key: "direct-low", value: "first" },
+        ],
+      });
+
+      await expect(
+        rig.stateStore.import(
+          mixedBundle,
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null
+        )
+      ).rejects.toMatchObject({ classification: "rollback_detected" });
+
+      const missingGood = await readValue(rig.client, "direct-good");
+      expect(missingGood.denied).toBe(true);
+      const currentLow = await readValue(rig.client, "direct-low");
+      expect(currentLow.value).toBe("second");
+      expect(currentLow.version).toBe(2);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("readExportData refuses duplicate keys before planning writes", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "duplicated", value: "first" }],
+      });
+
+      await expect(
+        rig.stateStore.import(
+          duplicateFirstEntry(bundle),
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null,
+          { allowUnverifiedLegacy: true }
+        )
+      ).rejects.toMatchObject({ classification: "schema_mismatch" });
+
+      const missing = await readValue(rig.client, "duplicated");
+      expect(missing.denied).toBe(true);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("StateStore.import serializes a two-key import against a concurrent local write", async () => {
+    const storage = new HookedMemoryStorage();
     const rig = await makeToolRig(storage);
     try {
       const identityId = await createIdentity(rig.client);
       const identity = rig.identityManager.get(identityId);
       if (!identity) throw new Error("missing identity");
-      await writeValue(rig.client, identityId, "direct-race", "first");
+      await writeValue(rig.client, identityId, "race-second", "first");
       const bundle = await sourceBundle({
         masterKey: rig.masterKey,
         identityEncKey: rig.identityEncKey,
         identity,
         values: [
-          { key: "direct-race", value: "first" },
-          { key: "direct-race", value: "second" },
+          { key: "race-first", value: "imported" },
+          { key: "race-second", value: "first" },
+          { key: "race-second", value: "second" },
         ],
       });
-      storage.raiseBeforeSecondAnchorRead = async () => {
-        await rig.stateStore.write(
-          "notes",
-          "direct-race",
-          "second",
-          identity.identity_id,
-          identity.encrypted_private_key,
-          rig.identityEncKey
-        );
-        await rig.stateStore.write(
-          "notes",
-          "direct-race",
-          "third",
-          identity.identity_id,
-          identity.encrypted_private_key,
-          rig.identityEncKey
-        );
+
+      let concurrentWrite: Promise<unknown> | undefined;
+      let anchorRaised = false;
+      storage.onWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "race-first" && !concurrentWrite) {
+          concurrentWrite = rig.stateStore.write(
+            "notes",
+            "race-second",
+            "concurrent",
+            identity.identity_id,
+            identity.encrypted_private_key,
+            rig.identityEncKey
+          );
+          const settled = await Promise.race([
+            concurrentWrite.then(() => "settled" as const),
+            wait(CONCURRENT_WRITE_BLOCKED_PROBE_MS).then(() => "blocked" as const),
+          ]);
+          anchorRaised = settled === "settled";
+        }
       };
 
       await expect(
@@ -632,11 +712,16 @@ describe("state_import version floor tool path", () => {
               ? fromBase64url(identity.public_key)
               : null
         )
-      ).rejects.toMatchObject({ classification: "rollback_detected" });
+      ).resolves.toMatchObject({ imported_keys: 2 });
+      expect(anchorRaised).toBe(false);
+      expect(concurrentWrite).toBeDefined();
+      await concurrentWrite!;
 
-      const current = await readValue(rig.client, "direct-race");
-      expect(current.value).toBe("third");
-      expect(current.version).toBe(3);
+      const first = await readValue(rig.client, "race-first");
+      expect(first.value).toBe("imported");
+      const second = await readValue(rig.client, "race-second");
+      expect(second.value).toBe("concurrent");
+      expect(second.version).toBe(3);
     } finally {
       await rig.close();
     }
