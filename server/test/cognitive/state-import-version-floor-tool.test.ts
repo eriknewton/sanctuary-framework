@@ -9,10 +9,19 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { createCognitiveTools } from "../../src/cognitive/tools.js";
-import { StateStore } from "../../src/cognitive/state-store.js";
+import {
+  STATE_META_VERSION_ANCHORS_KEY,
+  StateStore,
+} from "../../src/cognitive/state-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import {
+  bytesToString,
+  fromBase64url,
+  stringToBytes,
+  toBase64url,
+} from "../../src/core/encoding.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
@@ -24,6 +33,32 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 type ToolPayload = Record<string, unknown>;
 
 const READ_TOOLS = new Set(["state_read"]);
+const SECOND_ANCHOR_READ_AFTER_PREFLIGHT = 2;
+const HMAC_SHA256_BYTE_LENGTH = 32;
+
+class RaisingFloorStorage extends MemoryStorage {
+  private anchorReads = 0;
+  private raised = false;
+  raiseBeforeSecondAnchorRead: (() => Promise<void>) | null = null;
+
+  async read(namespace: string, key: string): Promise<Uint8Array | null> {
+    if (
+      namespace === "_meta" &&
+      key === STATE_META_VERSION_ANCHORS_KEY &&
+      this.raiseBeforeSecondAnchorRead &&
+      !this.raised
+    ) {
+      this.anchorReads += 1;
+      // 2 = import-wide preflight read, then per-write recheck read.
+      // Raising here proves the per-write recheck observes the current floor.
+      if (this.anchorReads === SECOND_ANCHOR_READ_AFTER_PREFLIGHT) {
+        this.raised = true;
+        await this.raiseBeforeSecondAnchorRead();
+      }
+    }
+    return super.read(namespace, key);
+  }
+}
 
 function selectedTools(
   tools: ToolDefinition[],
@@ -60,13 +95,15 @@ interface ToolRig {
   client: Client;
   close: () => Promise<void>;
   identityManager: ReturnType<typeof createCognitiveTools>["identityManager"];
+  auditLog: AuditLog;
+  stateStore: StateStore;
+  storage: MemoryStorage;
   masterKey: Uint8Array;
   identityEncKey: Uint8Array;
 }
 
-async function makeToolRig(): Promise<ToolRig> {
+async function makeToolRig(storage: MemoryStorage = new MemoryStorage()): Promise<ToolRig> {
   const masterKey = generateRandomKey();
-  const storage = new MemoryStorage();
   const auditLog = new AuditLog(storage, masterKey);
   const stateStore = new StateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -113,6 +150,9 @@ async function makeToolRig(): Promise<ToolRig> {
   return {
     client,
     identityManager,
+    auditLog,
+    stateStore,
+    storage,
     masterKey,
     identityEncKey,
     close: async () => {
@@ -120,6 +160,41 @@ async function makeToolRig(): Promise<ToolRig> {
       await server.close().catch(() => {});
     },
   };
+}
+
+function decodeBundle(bundleBase64: string): Record<string, unknown> {
+  return JSON.parse(bytesToString(fromBase64url(bundleBase64))) as Record<
+    string,
+    unknown
+  >;
+}
+
+function encodeBundle(bundle: Record<string, unknown>): string {
+  return toBase64url(stringToBytes(JSON.stringify(bundle)));
+}
+
+function stripCompleteness(bundleBase64: string): string {
+  const decoded = decodeBundle(bundleBase64);
+  delete decoded.completeness_manifest;
+  delete decoded.bundle_integrity;
+  return encodeBundle(decoded);
+}
+
+function replaceBundleIntegrityMac(bundleBase64: string): string {
+  const decoded = decodeBundle(bundleBase64);
+  const integrity = decoded.bundle_integrity;
+  if (!integrity || typeof integrity !== "object" || Array.isArray(integrity)) {
+    throw new Error("missing bundle integrity");
+  }
+  (integrity as Record<string, unknown>).mac = toBase64url(
+    new Uint8Array(HMAC_SHA256_BYTE_LENGTH)
+  );
+  return encodeBundle(decoded);
+}
+
+async function versionAnchorBytes(storage: MemoryStorage): Promise<string | null> {
+  const raw = await storage.read("_meta", STATE_META_VERSION_ANCHORS_KEY);
+  return raw ? bytesToString(raw) : null;
 }
 
 async function createIdentity(client: Client): Promise<string> {
@@ -312,6 +387,256 @@ describe("state_import version floor tool path", () => {
       const missingB = await readValue(rig.client, "mixed-b");
       expect(missingB.denied).toBe(true);
       expect(missingB.value).toBeUndefined();
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("skip mode restores write candidates without checking skipped entries", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "kept", "first");
+      await writeValue(rig.client, identityId, "restore-me", "first");
+      const oldExport = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+
+      await writeValue(rig.client, identityId, "kept", "second");
+      await rig.stateStore.delete("notes", "restore-me");
+      const floorBefore = await versionAnchorBytes(rig.storage);
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: oldExport.bundle,
+        conflict_resolution: "skip",
+      });
+      expect(imported.denied).toBeUndefined();
+      expect(imported.imported_keys).toBe(1);
+      expect(imported.skipped_keys).toBe(1);
+
+      const kept = await readValue(rig.client, "kept");
+      expect(kept.value).toBe("second");
+      expect(kept.version).toBe(2);
+      const restored = await readValue(rig.client, "restore-me");
+      expect(restored.value).toBe("first");
+      expect(restored.version).toBe(1);
+      await expect(versionAnchorBytes(rig.storage)).resolves.toBe(floorBefore);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("version mode restores write candidates without checking entries that are not newer", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "kept-version", "first");
+      await writeValue(rig.client, identityId, "restore-version", "first");
+      const oldExport = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+
+      await writeValue(rig.client, identityId, "kept-version", "second");
+      await rig.stateStore.delete("notes", "restore-version");
+      const floorBefore = await versionAnchorBytes(rig.storage);
+
+      const imported = await callTool(rig.client, "state_import", {
+        bundle: oldExport.bundle,
+        conflict_resolution: "version",
+      });
+      expect(imported.denied).toBeUndefined();
+      expect(imported.imported_keys).toBe(1);
+      expect(imported.skipped_keys).toBe(1);
+
+      const kept = await readValue(rig.client, "kept-version");
+      expect(kept.value).toBe("second");
+      expect(kept.version).toBe(2);
+      const restored = await readValue(rig.client, "restore-version");
+      expect(restored.value).toBe("first");
+      expect(restored.version).toBe(1);
+      await expect(versionAnchorBytes(rig.storage)).resolves.toBe(floorBefore);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("records the operator-side reason when import verification refuses", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "audit-floor", "first");
+      const oldExport = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      await writeValue(rig.client, identityId, "audit-floor", "second");
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle: oldExport.bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      expect(refused.classification).toBeUndefined();
+
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_verification_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.result).toBe("failure");
+      expect(audit.entries[0]?.details?.classification).toBe(
+        "rollback_detected"
+      );
+      expect(typeof audit.entries[0]?.details?.reason).toBe("string");
+
+      const success = await rig.auditLog.query({
+        operation_type: "state_import",
+        limit: 10,
+      });
+      expect(success.entries).toHaveLength(0);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("keeps the legacy-bundle operator hint while returning a generic denial", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "legacy-audit", "first");
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle: stripCompleteness(exported.bundle as string),
+      });
+      expect(refused.denied).toBe(true);
+      expect(JSON.stringify(refused)).not.toContain("allow_unverified_legacy");
+
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_verification_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(typeof audit.entries[0]?.details?.classification).toBe("string");
+      expect(audit.entries[0]?.details?.reason).toContain(
+        "allow_unverified_legacy"
+      );
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("keeps the bundle-integrity operator reason while returning a generic denial", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      await writeValue(rig.client, identityId, "integrity-audit", "first");
+      const exported = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle: replaceBundleIntegrityMac(exported.bundle as string),
+      });
+      expect(refused.denied).toBe(true);
+      expect(JSON.stringify(refused)).not.toContain("integrity");
+
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_verification_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details?.classification).toBe(
+        "integrity_hash_mismatch"
+      );
+      expect(audit.entries[0]?.details?.reason).toContain("integrity");
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("StateStore.import directly refuses entries below the stored floor", async () => {
+    const rig = await makeToolRig();
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      await writeValue(rig.client, identityId, "direct-floor", "first");
+      const oldExport = await callTool(rig.client, "state_export", {
+        namespace: "notes",
+      });
+      await writeValue(rig.client, identityId, "direct-floor", "second");
+
+      await expect(
+        rig.stateStore.import(
+          oldExport.bundle as string,
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null
+        )
+      ).rejects.toMatchObject({ classification: "rollback_detected" });
+
+      const current = await readValue(rig.client, "direct-floor");
+      expect(current.value).toBe("second");
+      expect(current.version).toBe(2);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("StateStore.import rechecks the stored floor immediately before each write", async () => {
+    const storage = new RaisingFloorStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      await writeValue(rig.client, identityId, "direct-race", "first");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [
+          { key: "direct-race", value: "first" },
+          { key: "direct-race", value: "second" },
+        ],
+      });
+      storage.raiseBeforeSecondAnchorRead = async () => {
+        await rig.stateStore.write(
+          "notes",
+          "direct-race",
+          "second",
+          identity.identity_id,
+          identity.encrypted_private_key,
+          rig.identityEncKey
+        );
+        await rig.stateStore.write(
+          "notes",
+          "direct-race",
+          "third",
+          identity.identity_id,
+          identity.encrypted_private_key,
+          rig.identityEncKey
+        );
+      };
+
+      await expect(
+        rig.stateStore.import(
+          bundle,
+          "overwrite",
+          (kid) =>
+            kid === identity.identity_id
+              ? fromBase64url(identity.public_key)
+              : null
+        )
+      ).rejects.toMatchObject({ classification: "rollback_detected" });
+
+      const current = await readValue(rig.client, "direct-race");
+      expect(current.value).toBe("third");
+      expect(current.version).toBe(3);
     } finally {
       await rig.close();
     }

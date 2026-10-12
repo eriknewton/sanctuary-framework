@@ -131,6 +131,23 @@ interface ExportedStateItem {
 
 type StateExportData = Record<string, ExportedStateItem[]>;
 type StateExportBundle = Record<string, unknown>;
+type ImportConflictResolution = "skip" | "overwrite" | "version";
+
+interface ImportWriteCandidate {
+  namespace: string;
+  key: string;
+  entry: StateEntry;
+}
+
+interface ImportPlan {
+  completenessVerification: StateExportCompletenessVerification;
+  writeCandidates: ImportWriteCandidate[];
+  skippedKeys: number;
+  skippedInvalidSig: number;
+  skippedUnknownKid: number;
+  conflicts: number;
+  namespaces: string[];
+}
 
 export type StateVerificationClassification =
   | "signature_mismatch"
@@ -2979,30 +2996,193 @@ export class StateStore {
     };
   }
 
-  /**
-   * Before checkpoint reconstruction deletes or writes anything, check the entire
-   * import bundle against the same durable floors enforced by state reads.
-   * This is read-only: it neither warms versionCache nor raises an anchor.
-   */
-  async assertImportVersionFloors(bundleBase64: string): Promise<void> {
-    // Must match import below: use its parser, never a checkpoint-only schema.
+  private async verifyImportEntrySignature(
+    namespace: string,
+    key: string,
+    entry: StateEntry,
+    publicKeyResolver: (kid: string) => Uint8Array | null
+  ): Promise<"valid" | "unknown-kid" | "invalid-sig"> {
+    const signerPublicKey = publicKeyResolver(entry.kid);
+    if (!signerPublicKey) return "unknown-kid";
+
+    try {
+      if (
+        entry.v !== 1 &&
+        entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
+        entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
+      ) {
+        return "invalid-sig";
+      }
+      const signaturePayload =
+        entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
+        entry.v === STATE_ENVELOPE_SCHEMA_VERSION
+          ? stateEnvelopeSigningBytes(
+              this.validateSignedEnvelope(entry, namespace, key)
+            )
+          : fromBase64url(entry.payload.ct);
+      const signature =
+        entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
+        entry.v === STATE_ENVELOPE_SCHEMA_VERSION
+          ? entry.envelope_sig
+          : entry.sig;
+      if (!signature) return "invalid-sig";
+      const sigValid = verify(
+        signaturePayload,
+        fromBase64url(signature),
+        signerPublicKey
+      );
+      if (!sigValid) return "invalid-sig";
+      if (
+        entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
+        entry.v === STATE_ENVELOPE_SCHEMA_VERSION
+      ) {
+        const legacySigValid = verify(
+          fromBase64url(entry.payload.ct),
+          fromBase64url(entry.sig),
+          signerPublicKey
+        );
+        if (!legacySigValid) return "invalid-sig";
+      }
+    } catch {
+      return "invalid-sig";
+    }
+
+    return "valid";
+  }
+
+  private assertImportEntryVersionShape(entry: Pick<StateEntry, "ver">): void {
+    if (!Number.isSafeInteger(entry.ver) || entry.ver < 1) {
+      throw new StateVerificationError("schema_mismatch", "Invalid imported state version");
+    }
+  }
+
+  private async buildImportPlan(
+    bundleBase64: string,
+    conflictResolution: ImportConflictResolution,
+    publicKeyResolver: (kid: string) => Uint8Array | null,
+    options: { allowUnverifiedLegacy?: boolean } = {}
+  ): Promise<ImportPlan> {
+    // Must match assertImportVersionFloors, StateStore.import, and
+    // memory-checkpoint/restore.ts: all three consume this one write-candidate
+    // planner so conflict-resolution arms cannot drift from the floor preflight.
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
     const data = readExportData(bundle);
     assertBundleNamespaceMetadataMatches(bundle, data);
-    const cache: VersionAnchorsCache = { anchors: null, dirty: false };
-    for (const [namespace, entries] of Object.entries(data)) {
+    const completenessVerification = this.verifyExportBundleCompleteness(
+      bundle,
+      data,
+      options.allowUnverifiedLegacy === true
+    );
+    const writeCandidates: ImportWriteCandidate[] = [];
+    let skippedKeys = 0;
+    let skippedInvalidSig = 0;
+    let skippedUnknownKid = 0;
+    let conflicts = 0;
+    const namespaces: string[] = [];
+
+    for (const [ns, entries] of Object.entries(data)) {
+      if (isReservedNamespace(ns)) {
+        skippedKeys += entries.length;
+        continue;
+      }
+      namespaces.push(ns);
+
       for (const { key, entry } of entries) {
-        if (!Number.isSafeInteger(entry.ver) || entry.ver < 1) {
-          throw new StateVerificationError("schema_mismatch", "Invalid imported state version");
+        const signatureState = await this.verifyImportEntrySignature(
+          ns,
+          key,
+          entry,
+          publicKeyResolver
+        );
+        if (signatureState === "unknown-kid") {
+          skippedUnknownKid++;
+          skippedKeys++;
+          continue;
         }
-        // An import must not install bytes the enforcing reader will reject;
-        // reuse its MAC-authenticated floor check, including read failures.
-        // Must match readInternal: legacy envelopes also cannot exceed an anchor.
-        await this.assertLegacyEntryVersionCeiling(namespace, key, entry, cache);
-        await this.assertNotBelowVersionFloor(namespace, key, entry.ver, cache);
+        if (signatureState === "invalid-sig") {
+          skippedInvalidSig++;
+          skippedKeys++;
+          continue;
+        }
+
+        const exists = await this.storage.exists(ns, key);
+
+        if (exists) {
+          conflicts++;
+          if (conflictResolution === "skip") {
+            skippedKeys++;
+            continue;
+          }
+          if (conflictResolution === "version") {
+            this.assertImportEntryVersionShape(entry);
+            const raw = await this.storage.read(ns, key);
+            if (raw) {
+              try {
+                const existingEntry: StateEntry = JSON.parse(
+                  bytesToString(raw)
+                );
+                if (entry.ver <= existingEntry.ver) {
+                  skippedKeys++;
+                  continue;
+                }
+              } catch {
+                // Corrupted existing entry - overwrite
+              }
+            }
+          }
+          // conflictResolution === "overwrite" falls through
+        }
+
+        this.assertImportEntryVersionShape(entry);
+        writeCandidates.push({ namespace: ns, key, entry });
       }
     }
+
+    return {
+      completenessVerification,
+      writeCandidates,
+      skippedKeys,
+      skippedInvalidSig,
+      skippedUnknownKid,
+      conflicts,
+      namespaces,
+    };
+  }
+
+  private async assertImportWriteCandidateVersionFloors(
+    writeCandidates: ImportWriteCandidate[],
+    cache?: VersionAnchorsCache
+  ): Promise<void> {
+    const versionCache = cache ?? { anchors: null, dirty: false };
+    for (const { namespace, key, entry } of writeCandidates) {
+      // An import must not install bytes the enforcing reader will reject;
+      // reuse its MAC-authenticated floor check, including read failures.
+      // Must match readInternal: legacy envelopes also cannot exceed an anchor.
+      await this.assertLegacyEntryVersionCeiling(namespace, key, entry, versionCache);
+      await this.assertNotBelowVersionFloor(namespace, key, entry.ver, versionCache);
+    }
+  }
+
+  /**
+   * Before checkpoint reconstruction or the MCP handler records an import as
+   * accepted, check only the entries the chosen mode will write against the same
+   * durable floors enforced by state reads. This is read-only: it neither warms
+   * versionCache nor raises an anchor.
+   */
+  async assertImportVersionFloors(
+    bundleBase64: string,
+    conflictResolution: ImportConflictResolution,
+    publicKeyResolver: (kid: string) => Uint8Array | null,
+    options: { allowUnverifiedLegacy?: boolean } = {}
+  ): Promise<void> {
+    const plan = await this.buildImportPlan(
+      bundleBase64,
+      conflictResolution,
+      publicKeyResolver,
+      options
+    );
+    await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
   }
 
   /**
@@ -3010,7 +3190,7 @@ export class StateStore {
    */
   async import(
     bundleBase64: string,
-    conflictResolution: "skip" | "overwrite" | "version" = "skip",
+    conflictResolution: ImportConflictResolution = "skip",
     publicKeyResolver: (kid: string) => Uint8Array | null,
     options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<{
@@ -3033,137 +3213,20 @@ export class StateStore {
     if (await hasInterruptedExitImport(this.storage)) {
       throw new InterruptedExitImportPendingError("state_import");
     }
-    // Must match assertImportVersionFloors above: reconstruction preflights this parser.
-    const bundle = parseExportBundleObject(bundleBase64);
-    assertSupportedExportBundleSchema(bundle);
-    const data = readExportData(bundle);
-    assertBundleNamespaceMetadataMatches(bundle, data);
-    const completenessVerification = this.verifyExportBundleCompleteness(
-      bundle,
-      data,
-      options.allowUnverifiedLegacy === true
+    const plan = await this.buildImportPlan(
+      bundleBase64,
+      conflictResolution,
+      publicKeyResolver,
+      options
     );
-    // The import writer must share checkpoint restore's read-only floor preflight
-    // so an approved bundle cannot install entries the enforcing reader refuses.
-    await this.assertImportVersionFloors(bundleBase64);
+    // Continuing-path table (rule 13), shared with assertImportVersionFloors:
+    // skip: existing entries are skipped and not floor-checked; absent entries write.
+    // version: non-newer entries are skipped and not floor-checked; newer entries write.
+    // overwrite: every verified non-reserved entry writes and is floor-checked.
+    await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
 
     let importedKeys = 0;
-    let skippedKeys = 0;
-    let skippedInvalidSig = 0;
-    let skippedUnknownKid = 0;
-    let conflicts = 0;
-    const namespaces: string[] = [];
-
-    for (const [ns, entries] of Object.entries(data)) {
-      // Namespace firewall: skip reserved namespaces during import.
-      // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
-      // underscore rule itself, so this check can't miss a newer internal
-      // `_`-namespace the curated list hasn't caught up with yet. Export
-      // never emits a `_`-prefixed namespace, so any in a bundle is crafted.
-      if (isReservedNamespace(ns)) {
-        skippedKeys += entries.length;
-        continue;
-      }
-      namespaces.push(ns);
-
-      for (const { key, entry } of entries) {
-        // Signature verification: mandatory for all imported entries
-        // Resolve the signing identity
-        const signerPublicKey = publicKeyResolver(entry.kid);
-        if (!signerPublicKey) {
-          skippedUnknownKid++;
-          skippedKeys++;
-          continue;
-        }
-
-        // Verify the signature against the signed envelope or legacy ciphertext.
-        try {
-          if (
-            entry.v !== 1 &&
-            entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
-            entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
-          ) {
-            skippedInvalidSig++;
-            skippedKeys++;
-            continue;
-          }
-          const signaturePayload =
-            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
-            entry.v === STATE_ENVELOPE_SCHEMA_VERSION
-              ? stateEnvelopeSigningBytes(
-                  this.validateSignedEnvelope(entry, ns, key)
-                )
-              : fromBase64url(entry.payload.ct);
-          const signature =
-            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
-            entry.v === STATE_ENVELOPE_SCHEMA_VERSION
-              ? entry.envelope_sig
-              : entry.sig;
-          if (!signature) {
-            skippedInvalidSig++;
-            skippedKeys++;
-            continue;
-          }
-          const sigValid = verify(
-            signaturePayload,
-            fromBase64url(signature),
-            signerPublicKey
-          );
-          if (!sigValid) {
-            skippedInvalidSig++;
-            skippedKeys++;
-            continue;
-          }
-          if (
-            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
-            entry.v === STATE_ENVELOPE_SCHEMA_VERSION
-          ) {
-            const legacySigValid = verify(
-              fromBase64url(entry.payload.ct),
-              fromBase64url(entry.sig),
-              signerPublicKey
-            );
-            if (!legacySigValid) {
-              skippedInvalidSig++;
-              skippedKeys++;
-              continue;
-            }
-          }
-        } catch {
-          // Malformed signature or ciphertext - reject
-          skippedInvalidSig++;
-          skippedKeys++;
-          continue;
-        }
-
-        const exists = await this.storage.exists(ns, key);
-
-        if (exists) {
-          conflicts++;
-          if (conflictResolution === "skip") {
-            skippedKeys++;
-            continue;
-          }
-          if (conflictResolution === "version") {
-            // Only overwrite if imported version is higher
-            const raw = await this.storage.read(ns, key);
-            if (raw) {
-              try {
-                const existingEntry: StateEntry = JSON.parse(
-                  bytesToString(raw)
-                );
-                if (entry.ver <= existingEntry.ver) {
-                  skippedKeys++;
-                  continue;
-                }
-              } catch {
-                // Corrupted existing entry - overwrite
-              }
-            }
-          }
-          // conflictResolution === "overwrite" falls through
-        }
-
+    for (const { namespace: ns, key, entry } of plan.writeCandidates) {
         // Codex gate finding (2026-08-22): re-check per write, not once at
         // the top of import() for the whole loop - a bulk import can run
         // long enough for a journal to appear after the top-level check
@@ -3177,6 +3240,12 @@ export class StateStore {
         if (await hasInterruptedExitImport(this.storage)) {
           throw new InterruptedExitImportPendingError(`state_import:${ns}/${key}`);
         }
+        // Must match assertImportVersionFloors and memory-checkpoint/restore.ts:
+        // re-read the authenticated floor immediately before each write so a
+        // later local write cannot make the planned entry unreadable.
+        await this.assertImportWriteCandidateVersionFloors([
+          { namespace: ns, key, entry },
+        ]);
         // Write the entry
         const serialized = stringToBytes(JSON.stringify(entry));
         await this.storage.write(ns, key, serialized);
@@ -3187,11 +3256,11 @@ export class StateStore {
         this.versionCache.set(vk, entry.ver);
         const nsHashes = await this.getNamespaceHashes(ns);
         nsHashes.set(key, entry.integrity_hash);
-      }
     }
 
+    const bundle = parseExportBundleObject(bundleBase64);
     if (Array.isArray(bundle.facade_hidden_markers)) {
-      const importedNamespaceSet = new Set(namespaces);
+      const importedNamespaceSet = new Set(plan.namespaces);
       for (const item of bundle.facade_hidden_markers) {
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const record = item as Record<string, unknown>;
@@ -3221,13 +3290,13 @@ export class StateStore {
 
     return {
       imported_keys: importedKeys,
-      skipped_keys: skippedKeys,
-      skipped_invalid_sig: skippedInvalidSig,
-      skipped_unknown_kid: skippedUnknownKid,
-      conflicts,
-      namespaces,
+      skipped_keys: plan.skippedKeys,
+      skipped_invalid_sig: plan.skippedInvalidSig,
+      skipped_unknown_kid: plan.skippedUnknownKid,
+      conflicts: plan.conflicts,
+      namespaces: plan.namespaces,
       imported_at: new Date().toISOString(),
-      completeness_verification: completenessVerification,
+      completeness_verification: plan.completenessVerification,
     };
   }
 }

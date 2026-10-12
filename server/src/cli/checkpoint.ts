@@ -543,6 +543,11 @@ async function cmdRestore(
 
   const boot = await bootstrap(argv, err, env);
   if (typeof boot === "number") return boot;
+  const publicKeyResolver = (kid: string): Uint8Array | null => {
+    const identity = boot.identityManager.get(kid);
+    if (!identity) return null;
+    return fromBase64url(identity.public_key);
+  };
 
   // Check before approval auditing writes reserved state; restore repeats this
   // read-only preflight at its own boundary before any reconstruction writes.
@@ -552,6 +557,7 @@ async function cmdRestore(
       checkpointStore: boot.checkpointStore,
       masterKey: boot.masterKey,
       checkpointId: id,
+      publicKeyResolver,
     });
   } catch (restoreErr) {
     // Only version-floor refusals promise unchanged audit bytes; other failures
@@ -594,12 +600,6 @@ async function cmdRestore(
     write(err, "Denied: checkpoint restore was not approved.\n");
     return 1;
   }
-
-  const publicKeyResolver = (kid: string): Uint8Array | null => {
-    const identity = boot.identityManager.get(kid);
-    if (!identity) return null;
-    return fromBase64url(identity.public_key);
-  };
 
   try {
     const result = await restoreCheckpoint({

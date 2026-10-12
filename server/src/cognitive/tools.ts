@@ -1139,6 +1139,25 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
+  async function denyStateImportVerification(
+    error: StateVerificationError,
+    namespaces: string[]
+  ) {
+    await recordCriticalAudit(
+      auditLog,
+      "l1",
+      "state_import_verification_failed",
+      "state-store",
+      {
+        namespaces,
+        classification: error.classification,
+        reason: error.message,
+      },
+      "failure"
+    );
+    return toolResult(fixedDenial("audit:state_import"));
+  }
+
   async function assertOpaqueNamespaceOwned(namespace: string): Promise<void> {
     await namespaceRegistry.assertOwnedPersisted(namespace, options?.currentSessionBinding?.());
   }
@@ -2169,12 +2188,18 @@ export function createCognitiveTools(
 
         try {
           // Must match StateStore.import and memory-checkpoint/restore.ts:
-          // the tool denies before a success audit when the shared floor
+          // the tool denies before a success audit when the shared write-set
           // preflight says the bundle cannot become readable state.
-          await stateStore.assertImportVersionFloors(args.bundle as string);
+          await stateStore.assertImportVersionFloors(
+            args.bundle as string,
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+              "skip",
+            publicKeyResolver,
+            { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
+          );
         } catch (err) {
           if (err instanceof StateVerificationError) {
-            return denyNamespaceAccess("state_import", "state_import");
+            return denyStateImportVerification(err, targetNamespaces);
           }
           throw err;
         }
@@ -2214,7 +2239,7 @@ export function createCognitiveTools(
             });
           }
           if (err instanceof StateVerificationError) {
-            return denyNamespaceAccess("state_import", "state_import");
+            return denyStateImportVerification(err, targetNamespaces);
           }
           throw err;
         }

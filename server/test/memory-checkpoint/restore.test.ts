@@ -527,7 +527,13 @@ describe("restoreCheckpoint", () => {
       "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
-      assertImportVersionFloors: (bundle) => fixture.stateStore.assertImportVersionFloors(bundle),
+      assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
+        fixture.stateStore.assertImportVersionFloors(
+          bundle,
+          conflictResolution,
+          resolver,
+          options
+        ),
       delete: async () => {
         throw new Error("injected reconstruct failure");
       },

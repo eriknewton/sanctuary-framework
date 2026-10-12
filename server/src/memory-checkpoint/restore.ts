@@ -289,7 +289,10 @@ function forensicSource(record: MemoryCheckpointRecord): CheckpointRestoreForens
 
 /** Read and validate a restore source without writing state or audit records. */
 export async function preflightCheckpointRestore(
-  deps: Pick<RestoreCheckpointDeps, "checkpointStore" | "checkpointId" | "masterKey" | "stateStore">,
+  deps: Pick<
+    RestoreCheckpointDeps,
+    "checkpointStore" | "checkpointId" | "masterKey" | "stateStore" | "publicKeyResolver"
+  >,
 ): Promise<string> {
   const record = await deps.checkpointStore.get(deps.checkpointId);
   if (!record) throw checkpointNotFound(deps.checkpointId);
@@ -329,9 +332,15 @@ export async function preflightCheckpointRestore(
 
   parseExportBundleData(checkpointBundle, "checkpoint");
   try {
-    // Every entry must clear the durable reader's floor before forensic writes
-    // or deletions; a failed anchor read cannot authorize reconstruction.
-    await deps.stateStore.assertImportVersionFloors(checkpointBundle);
+    // Must match StateStore.import and cognitive/tools.ts: checkpoint restore
+    // uses overwrite semantics, so every verified non-reserved checkpoint entry
+    // is a write candidate and must clear the durable reader's floor before
+    // forensic writes or deletions.
+    await deps.stateStore.assertImportVersionFloors(
+      checkpointBundle,
+      "overwrite",
+      deps.publicKeyResolver,
+    );
   } catch (err) {
     throw new CheckpointRestoreVersionFloorError(
       CHECKPOINT_RESTORE_VERSION_FLOOR_REFUSAL,
