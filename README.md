@@ -8,7 +8,7 @@
 
 An AI agent running on your machine can do anything your account can do. It holds your credentials, reads your files, and talks to the whole internet, and a single poisoned web page can turn that into exfiltration. Every sandbox on offer today is one the agent, or its vendor, chooses to run inside. That is not a wall. That is a request.
 
-Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, one agent per fortress; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
+Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any MCP-compatible agent, on your own machine today, any number of wrapped harnesses behind one persistent dashboard; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --claude-code
@@ -21,7 +21,7 @@ That one command puts the keys, audit trail, policy gates, and dashboard around 
 Quote the block below to your operator. It was written against v1.8.4, the npm `latest` release; `main` can be ahead of it, and every sentence traces to a line of this README or a row of the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
 ```text
-What Sanctuary is: the wall under the agent, imposed by the operating system under a policy you sign, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read.
+What Sanctuary is: the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read.
 What it is not: no Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail. Windows enforcement is roadmapped; nothing enforces on Windows today. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven.
 Platforms and runtime: Node.js >= 22.0.0 and npm >= 10.0.0. macOS: proven, on a patched host. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Windows: roadmapped.
 Install:   npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
@@ -36,7 +36,7 @@ Every capability claim in this repository traces to a row in the [Assurance Matr
 
 | What you get | Status today |
 |---|---|
-| **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only.** On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
+| **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven, on a patched host.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host.** On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
 | **Custody.** Keys and state under your passphrase, on your hardware | **Proven.** Ed25519 identity, Argon2id unlock, per-purpose derived subkeys, encrypted state at rest. The passphrase lives in the macOS Keychain or Linux Secret Service and generation fails closed without it. |
 | **The gate.** Policy you set, frozen at startup, the agent cannot read or infer; three approval tiers with a human on the irreversible ones | **Proven.** Cooperative gates on every MCP call. The wall is what makes the gate more than a request. |
 | **The record.** Append-only, hash-chained audit of what the agent did | **Partial.** The chain is live; production call sites sign checkpoints when the fortress holds an identity. Fortresses with no identity and the root daemon split audit store write honest unsigned checkpoints. The row stays partial pending the IC-05 external-verifier drill and the remaining local tamper-evidence follow-up. |
@@ -44,7 +44,7 @@ Every capability claim in this repository traces to a row in the [Assurance Matr
 
 ## Why this shape
 
-Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator and does not depend on the agent's cooperation. The problem underneath is ambient authority, the fact that code can act with every permission its process has. Language-level answers (capabilities, information-flow typing, functional runtimes) are real and we welcome them, and every one of them still needs something outside the interpreter that holds the credentials, checks the policy and decides what actually leaves the machine. Sanctuary is that something, for whatever runtime you choose. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
+Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator, on a patched host, and does not depend on the agent's cooperation. The problem underneath is ambient authority, the fact that code can act with every permission its process has. Language-level answers (capabilities, information-flow typing, functional runtimes) are real and we welcome them, and every one of them still needs something outside the interpreter that holds the credentials, checks the policy and decides what actually leaves the machine. Sanctuary is that something, for whatever runtime you choose. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
 
 Why this exists: [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html).
 
@@ -64,7 +64,7 @@ Harness column sources, each fetched 2026-10-12 (none of the three pages shows a
 
 - [Claude Code: Configure the sandboxed Bash tool](https://code.claude.com/docs/en/sandboxing). The sandbox covers shell commands only and is off by default; it uses Seatbelt on macOS and `bubblewrap` plus `socat` on Linux and WSL2; network goes through a local proxy checked against an allowed-domain list; on native Windows commands run unsandboxed; MCP servers, hooks, and the built-in file and web tools run outside it; Claude can ask to retry a failed command unsandboxed.
 - [Codex: Sandboxing](https://learn.chatgpt.com/docs/sandboxing). The sandbox constrains which files the agent can modify and whether commands can use the network; Seatbelt on macOS, `bubblewrap` on Linux and WSL2, a native Windows sandbox in PowerShell; `workspace-write` is the default mode and `danger-full-access` removes the filesystem and network boundaries.
-- [Cursor: Run modes](https://cursor.com/docs/agent/run-modes). Sandboxed commands read and write inside the workspace; network is blocked by default and then opened per `sandbox.json`; Seatbelt through `sandbox-exec` on macOS, Landlock plus seccomp on Linux kernel 6.2 or later with a Bubblewrap fallback; no Windows sandbox is described; a command that fails on a sandbox restriction can be rerun outside it after classifier review.
+- [Cursor: Run modes](https://cursor.com/docs/agent/security/run-modes). Sandboxed commands read and write inside the workspace; network is blocked by default and then opened per `sandbox.json`; Seatbelt through `sandbox-exec` on macOS, Landlock plus seccomp on Linux kernel 6.2 or later with a Bubblewrap fallback; no Windows sandbox is described; a command that fails on a sandbox restriction can be rerun outside it after classifier review.
 
 The argument for why the two layers are different problems: [Containment is an isolation problem](docs/_posts/2026-10-10-containment-is-an-isolation-problem.md).
 
@@ -93,7 +93,7 @@ npx -y @sanctuary-framework/mcp-server doctor --json
 npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness, so start it later with `sanctuary dashboard`.
+`-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`.
 
 After `npm install -g @sanctuary-framework/mcp-server`, the `sanctuary` command replaces the `npx -y @sanctuary-framework/mcp-server` prefix, and the rest of this README writes `sanctuary`. Already running OpenClaw, Hermes, Cursor, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded)? Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for `--claude-code`. Config rewriting and bootstrap behavior for the named harnesses are proven by tests on representative harness paths; those tests do not prove interception for every listed harness version or non-MCP agent surface, and the Assurance Matrix "Agent wrapping" row is partial and states that bound. Mastra coverage is fixture-tested only, with no live Mastra-agent drill recorded. Other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
 
@@ -307,9 +307,8 @@ machine; `operator_actions` then lists what the operator still does in
 private, such as moving a staged recovery file into a password manager.
 `observations.*` is the evidence the status was derived from, and `notes` is
 prose for the operator (v1.8.4 puts one reminder string there on every
-response: rerun the planner after each action). Two observations arrive from 1.8.6 (present on the
-`next` channel, absent from v1.8.4): `tier1_approval` and
-`staged_recovery_file`; `vault_provision` arrives from 1.8.6-rc.5 (npm `next`) and is absent on v1.8.4.
+response: rerun the planner after each action). Three observations arrive from 1.8.6-rc.5 (npm `next`) and are absent
+on v1.8.4: `tier1_approval`, `staged_recovery_file`, and `vault_provision`.
 
 The operator, not the agent, performs three things: Apple consent, bounded
 privilege authorization, and private recovery custody. In particular, never read

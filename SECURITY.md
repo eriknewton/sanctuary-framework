@@ -112,8 +112,8 @@ checking.
   package is installed; an empty directory reports nothing to audit, which is
   not a pass.
 - **Signed release manifest.** Every `1.8.x` release attaches
-  `release-manifest.json` and the tarball to the GitHub release (earlier
-  releases such as v1.7.0 carry neither), and the manifest is signed with a
+  `release-manifest.json` and the tarball to the GitHub release (v1.7.0
+  attaches the manifest but no tarball), and the manifest is signed with a
   pinned Ed25519 key. From a clone of this repository at the tag, with the two
   assets fetched by `curl` (or by `gh release download v1.8.4 --pattern
   release-manifest.json --pattern sanctuary-framework-mcp-server-1.8.4.tgz`

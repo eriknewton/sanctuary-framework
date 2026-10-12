@@ -143,10 +143,8 @@ reminder string there on every response: rerun the planner after each action).
 The `argv` the planner returns carries `--no-open`,
 which switches `protect` to its non-interactive custody confirmation and skips
 opening the dashboard in a browser, and `--agent-guided`, described under
-Secret boundary below. Three observations are absent from v1.8.4:
-`tier1_approval` and `staged_recovery_file` arrive from 1.8.6 (present on the
-`next` channel), and `vault_provision` arrives from 1.8.6-rc.5 (npm `next`)
-and is absent on v1.8.4.
+Secret boundary below. Three observations are absent from v1.8.4 and arrive from 1.8.6-rc.5 (npm
+`next`): `tier1_approval`, `staged_recovery_file`, and `vault_provision`.
 
 ## Secret boundary
 
