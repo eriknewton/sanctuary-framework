@@ -9,6 +9,8 @@
  */
 
 import type { AllowlistRule } from "../allowlist/schema.js";
+import { validateAgentOrigin } from "../allowlist/agent-origin.js";
+import { validateLinuxInstallAgentIdScopes } from "../allowlist/confined-agent-id.js";
 import {
   publishSignedManifest,
   type BuildSignedManifestInput,
@@ -109,5 +111,10 @@ export async function publishLinuxCompatiblePolicy(
   storage: ManifestStorage
 ): Promise<Awaited<ReturnType<typeof publishSignedManifest>>> {
   assertLinuxPolicyCompatibility(input.rules);
+  const origin = validateAgentOrigin(input.agentOrigin);
+  if (origin?.mode === "uid" && origin.agent_uid !== undefined) {
+    // The broker and installer publish through this producer gate, so uid-mode scopes are refused before signing.
+    validateLinuxInstallAgentIdScopes(input.rules, origin.agent_uid);
+  }
   return publishSignedManifest(input, storage);
 }
