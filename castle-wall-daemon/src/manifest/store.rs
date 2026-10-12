@@ -93,9 +93,10 @@ enum ScopeAdmissionMode {
 type ScopeAdmissionWarningSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
 fn default_scope_admission_warning_sink(message: &str) {
-    // SAFETY: stderr is the operator channel for boot-time scope warnings on a
-    // committed generation; the daemon keeps enforcing it, so this line is the
-    // only place an operator learns a rule must be re-signed with the uid-<uid> form.
+    // SAFETY: stderr is the operator channel for scope warnings when the exact
+    // committed generation is reclaimed (at boot or on a same-generation reload);
+    // that generation keeps enforcing, so this line is the only place an operator
+    // learns a rule must be re-signed with the uid-<uid> form.
     eprintln!("{message}");
 }
 
