@@ -45,17 +45,27 @@ export interface OperatorTwinStandDownSnapshot {
   preexistingTwinModified: boolean;
 }
 
-export interface OperatorTwinStandDownOps {
-  readFile(path: string): Promise<string | undefined>;
-  writeFile(path: string, content: string, mode: number): Promise<void>;
-  removeFile(path: string): Promise<void>;
+export interface OperatorTwinRestoreOps {
+  verifyPlistForRestore(
+    path: string,
+    expectedContent: string,
+    operatorUid: number,
+  ): Promise<{ ok: true } | { ok: false; problem: string }>;
   runLaunchctl(args: readonly string[]): Promise<LaunchctlResult>;
   sleepMs?: (ms: number) => Promise<void>;
   notify(message: string): void;
 }
 
+export interface OperatorTwinStandDownOps extends OperatorTwinRestoreOps {
+  readFile(path: string): Promise<string | undefined>;
+}
+
 export interface OperatorTwinRestoreReport {
   restored: boolean;
+  /**
+   * True when no plist was owed, or when the existing plist was verified to
+   * still match the stand-down snapshot. Restore does not create or replace it.
+   */
   plistRestored: boolean;
   disabledStateRestored: boolean;
   loadedStateRestored: boolean;
@@ -164,20 +174,15 @@ async function setOperatorTwinDisabled(
   }
 }
 
-async function confirmPlistBytes(
-  ops: Pick<OperatorTwinStandDownOps, "readFile">,
-  path: string,
-  expected: string | undefined,
-): Promise<boolean> {
-  try {
-    return (await ops.readFile(path)) === expected;
-  } catch {
-    return false;
-  }
-}
-
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function operatorUidFromLaunchdDomain(domain: string): number | undefined {
+  const match = /^gui\/(\d+)$/.exec(domain);
+  if (match === null) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 /**
@@ -275,7 +280,7 @@ export async function standDownOperatorTwinLaunchAgent(
  */
 export async function restoreOperatorTwinStandDown(
   snapshot: OperatorTwinStandDownSnapshot,
-  ops: OperatorTwinStandDownOps,
+  ops: OperatorTwinRestoreOps,
 ): Promise<OperatorTwinRestoreReport> {
   const problems: string[] = [];
   const descriptor: OperatorTwinDescriptor = {
@@ -284,25 +289,41 @@ export async function restoreOperatorTwinStandDown(
     plistPath: snapshot.plistPath,
   };
 
-  let plistRestored = false;
-  try {
-    if (snapshot.priorPlistBytes !== undefined) {
-      await ops.writeFile(snapshot.plistPath, snapshot.priorPlistBytes, 0o644);
+  let plistRestored = snapshot.priorPlistBytes === undefined && !snapshot.wasLoaded && !snapshot.wasRunning;
+  let plistVerifiedForLaunchd = plistRestored;
+  if (snapshot.priorPlistBytes !== undefined) {
+    const operatorUid = operatorUidFromLaunchdDomain(snapshot.domain);
+    if (operatorUid === undefined) {
+      problems.push(`restore_problem: launchd domain ${snapshot.domain} does not identify an operator uid`);
     } else {
-      await ops.removeFile(snapshot.plistPath);
+      try {
+        // Restore reloads the existing plist only after a no-follow check that it still matches the snapshot; it does not create, replace or remove that file.
+        const verification = await ops.verifyPlistForRestore(
+          snapshot.plistPath,
+          snapshot.priorPlistBytes,
+          operatorUid,
+        );
+        if (verification.ok) {
+          plistRestored = true;
+          plistVerifiedForLaunchd = true;
+        } else {
+          problems.push(verification.problem);
+        }
+      } catch (err) {
+        problems.push(`restore_problem: could not verify plist ${snapshot.plistPath}: ${describeError(err)}`);
+      }
     }
-    plistRestored = await confirmPlistBytes(ops, snapshot.plistPath, snapshot.priorPlistBytes);
-    if (!plistRestored) {
-      problems.push(`plist ${snapshot.plistPath} did not read back as the pre-run bytes`);
-    }
-  } catch (err) {
-    problems.push(`could not restore plist ${snapshot.plistPath}: ${describeError(err)}`);
+  } else if (snapshot.wasLoaded || snapshot.wasRunning) {
+    problems.push(
+      `restore_problem: launchd state was not restored because no operator plist snapshot was available`,
+    );
   }
 
   let loadedStateRestored = !snapshot.wasLoaded;
   let runningStateRestored = !snapshot.wasRunning;
-  if ((snapshot.wasLoaded || snapshot.wasRunning) && snapshot.priorPlistBytes !== undefined) {
+  if ((snapshot.wasLoaded || snapshot.wasRunning) && snapshot.priorPlistBytes !== undefined && plistVerifiedForLaunchd) {
     try {
+      // Restore reloads the existing plist only after a no-follow check that it still matches the snapshot; it does not create, replace or remove that file.
       await setOperatorTwinDisabled(descriptor, ops, false);
       const bootstrap = await ops.runLaunchctl(["bootstrap", snapshot.domain, snapshot.plistPath]);
       if (bootstrap.code !== 0 && !/already bootstrapped/i.test(bootstrap.stderr)) {
@@ -331,12 +352,20 @@ export async function restoreOperatorTwinStandDown(
     } catch (err) {
       problems.push(`could not reload restored operator LaunchAgent ${snapshot.serviceName}: ${describeError(err)}`);
     }
+  } else if ((snapshot.wasLoaded || snapshot.wasRunning) && snapshot.priorPlistBytes !== undefined) {
+    problems.push(`restore_problem: launchd state was not restored because the operator plist was not verified`);
   }
 
   let disabledStateRestored = false;
   try {
-    await setOperatorTwinDisabled(descriptor, ops, snapshot.disabledBefore);
-    disabledStateRestored = true;
+    if (!plistVerifiedForLaunchd && !snapshot.disabledBefore) {
+      problems.push(
+        `restore_problem: leaving ${snapshot.serviceName} disabled until its operator plist can be verified`,
+      );
+    } else {
+      await setOperatorTwinDisabled(descriptor, ops, snapshot.disabledBefore);
+      disabledStateRestored = true;
+    }
   } catch (err) {
     problems.push(
       `could not restore launchd disabled state for ${snapshot.serviceName} to ` +

@@ -28,11 +28,12 @@ import {
 //    files without root, so ownership states are simulated through the seam). ──
 
 interface FakeNode {
-  type: "dir" | "file" | "socket" | "symlink";
+  type: "dir" | "file" | "socket" | "symlink" | "other";
   uid: number;
   gid: number;
   mode: number;
   ino: number;
+  nlink?: number;
 }
 
 function fakeStats(node: FakeNode): Stats {
@@ -46,6 +47,7 @@ function fakeStats(node: FakeNode): Stats {
     mode: node.mode | (node.type === "dir" ? 0o040000 : 0),
     dev: 1,
     ino: node.ino,
+    nlink: node.nlink ?? 1,
   } as unknown as Stats;
 }
 
@@ -141,6 +143,22 @@ function makeFakeFs(
     },
   };
   return fake;
+}
+
+function withOpenStatNlink(fake: FakeFs, path: string, nlink: number): void {
+  const originalOpen = fake.ops.open.bind(fake.ops);
+  fake.ops.open = async (openedPath, flags) => {
+    const handle = await originalOpen(openedPath, flags);
+    if (openedPath !== path) return handle;
+    return {
+      ...handle,
+      stat: async () =>
+        ({
+          ...(await handle.stat()),
+          nlink,
+        }) as Stats,
+    };
+  };
 }
 
 /** The Mini2 shape: root-owned fortress, root-owned socket + key file, one operator file, one foreign file. */
@@ -331,6 +349,313 @@ describe("fortress-custody: apply", () => {
     expect(applied.failed).toEqual([]);
     expect(applied.repaired).toContain(".");
   });
+
+  it("records a typed skip and leaves a regular entry with more than one name untouched", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/multi.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 2, nlink: 2 },
+      },
+      { "/f": ["multi.enc"] },
+    );
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.skips).toEqual([
+      { path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/multi.enc")!.uid).toBe(0);
+    expect(fake.nodes.get("/f/multi.enc")!.mode).toBe(0o640);
+    expect(fake.fchowns.some((call) => call.path === "/f/multi.enc")).toBe(false);
+    expect(fake.fchmods.some((call) => call.path === "/f/multi.enc")).toBe(false);
+    expect(lines.join("\n")).toContain(
+      "fortress entry multi.enc has more than one name and was left untouched",
+    );
+  });
+
+  it("refuses when an opened file gains another name after the observe walk", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/late.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["late.enc"] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    fake.nodes.get("/f/late.enc")!.nlink = 2;
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+    expect(applied.skipped).toEqual([
+      { path: "late.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/late.enc")!.uid).toBe(0);
+    expect(fake.fchowns.some((call) => call.path === "/f/late.enc")).toBe(false);
+  });
+
+  it("uses the opened descriptor link count for a regular entry skip", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/fd-owned.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["fd-owned.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/fd-owned.enc", 2);
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([
+      { path: "fd-owned.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/fd-owned.enc")!.uid).toBe(0);
+    expect(fake.fchowns.some((call) => call.path === "/f/fd-owned.enc")).toBe(false);
+  });
+
+  it("does not use the path link count when the opened descriptor has one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/path-owned.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["path-owned.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/path-owned.enc", 1);
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([]);
+    expect(applied.repaired).toContain("path-owned.enc");
+    expect(fake.nodes.get("/f/path-owned.enc")!.uid).toBe(501);
+  });
+
+  it("leaves a socket entry with more than one name untouched", async () => {
+    const name = "sock";
+    const path = `/f/${name}`;
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        [path]: { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": [name] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([
+      { path: name, uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get(path)!.uid).toBe(0);
+    expect(fake.lchowns.some((call) => call.path === path)).toBe(false);
+  });
+
+  it("refuses an unsupported entry type even when it has one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/node": { type: "other", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["node"] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+    expect(plan.skips).toEqual([
+      { path: "node", uid: 0, gid: 20, reason: "unsupported_type" },
+    ]);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([]);
+    expect(fake.nodes.get("/f/node")!.uid).toBe(0);
+    expect(fake.lchowns.some((call) => call.path === "/f/node")).toBe(false);
+  });
+
+  it("uses the final socket link count immediately before ownership repair", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 2) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+      }
+      return stats;
+    };
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.skipped).toEqual([
+      { path: "sock", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(0);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
+  it("reports a socket link-count change observed after ownership repair as failed", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 3) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+      }
+      return stats;
+    };
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.changedAfterOperation).toEqual(["sock"]);
+    expect(applied.identityChanged).toEqual([]);
+    expect(applied.vanished).toEqual([]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(501);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("reports a socket that vanishes after ownership repair as failed", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let afterRepair = false;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    const originalLchown = fake.ops.lchown.bind(fake.ops);
+    fake.ops.lchown = async (path, uid, gid) => {
+      await originalLchown(path, uid, gid);
+      if (path === "/f/sock") afterRepair = true;
+    };
+    fake.ops.lstat = async (path) => {
+      if (path === "/f/sock" && afterRepair) throw enoent();
+      return originalLstat(path);
+    };
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.changedAfterOperation).toEqual(["sock"]);
+    expect(applied.vanished).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("reports a socket post-check error after ownership repair as root-inspection work", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let afterRepair = false;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    const originalLchown = fake.ops.lchown.bind(fake.ops);
+    fake.ops.lchown = async (path, uid, gid) => {
+      await originalLchown(path, uid, gid);
+      if (path === "/f/sock") afterRepair = true;
+    };
+    fake.ops.lstat = async (path) => {
+      if (path === "/f/sock" && afterRepair) {
+        const err = new Error("post-check unavailable") as NodeJS.ErrnoException;
+        err.code = "EIO";
+        throw err;
+      }
+      return originalLstat(path);
+    };
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.changedAfterOperation).toEqual(["sock"]);
+    expect(applied.failed).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("re-checks socket identity immediately before ownership repair", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 2) {
+          return { ...stats, ino: 99 } as Stats;
+        }
+      }
+      return stats;
+    };
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.identityChanged).toEqual(["sock"]);
+    expect(applied.changedAfterOperation).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
+  it("still repairs a root-owned file with one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/single.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["single.enc"] },
+    );
+    const walk = await walkFortressCustody("/f", fake.ops);
+    const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
+
+    const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
+
+    expect(applied.repaired).toContain("single.enc");
+    expect(fake.nodes.get("/f/single.enc")!.uid).toBe(501);
+    expect(fake.fchowns.some((call) => call.path === "/f/single.enc")).toBe(true);
+  });
 });
 
 describe("fortress-custody: ancestor containment (2026-07-31 gate BLOCKER-1)", () => {
@@ -351,9 +676,8 @@ describe("fortress-custody: ancestor containment (2026-07-31 gate BLOCKER-1)", (
     const walk = await walkFortressCustody("/f", fake.ops);
     const plan = planFortressCustodyRepairs(walk.entries, OPERATOR);
 
-    // The attack: swap the observed ancestor dir for a symlink pointing
-    // outside the fortress. Without ancestor verification, O_NOFOLLOW on the
-    // FINAL component alone would let root chown /outside/a.enc.
+    // The observed ancestor must still be the same directory immediately before
+    // the metadata change; final-component O_NOFOLLOW is not an ancestor proof.
     fake.nodes.set("/f/state", { type: "symlink", uid: 502, gid: 20, mode: 0o777, ino: 99 });
 
     const applied = await applyFortressCustodyRepairs("/f", plan, fake.ops);
@@ -605,11 +929,9 @@ describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", (
     };
   }
 
-  it("REFUSES the codex exploit: a symlinked parent cannot carry a root chown/chmod outside the fortress", async () => {
-    // Exactly the reported attack: `escape -> /Users/operator` inside the
-    // fortress, plus a crafted manifest entry `escape/payload` recording
-    // uid 0 / gid 0 / mode 04755. Pre-fix this chowned an attacker file to
-    // root and set it setuid.
+  it("REFUSES when a symlinked parent cannot verify the rollback ancestor", async () => {
+    // Rollback trusts only ancestor directories whose observed identity still
+    // matches; a manifest entry under a changed parent is left untouched.
     const fake = makeFakeFs(
       {
         "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
@@ -699,6 +1021,287 @@ describe("fortress-custody: rollback containment (2026-07-31 gate BLOCKER-2)", (
     expect(fake.fchowns.some((c) => c.path === "/f/a.enc")).toBe(true);
   });
 
+  it("uses the opened descriptor link count for a regular rollback skip", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/restore.enc": { type: "file", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["restore.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/restore.enc", 2);
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "restore.enc", uid: 501, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/restore.enc")!.uid).toBe(501);
+    expect(fake.fchowns.some((call) => call.path === "/f/restore.enc")).toBe(false);
+  });
+
+  it("does not use the path link count when rollback has a single-name descriptor", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/path-restore.enc": { type: "file", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["path-restore.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/path-restore.enc", 1);
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "path-restore.enc", type: "file", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([]);
+    expect(result.repaired).toContain("path-restore.enc");
+    expect(fake.nodes.get("/f/path-restore.enc")!.uid).toBe(0);
+  });
+
+  it("leaves a non-regular rollback entry with more than one name untouched", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 2 },
+      },
+      { "/f": ["sock"] },
+    );
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "sock", uid: 501, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(501);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
+  it("uses the final rollback socket link count immediately before ownership repair", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 1) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+      }
+      return stats;
+    };
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "sock", uid: 501, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(501);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
+  it("reports a rollback socket link-count change observed after ownership repair as failed", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 2) {
+          return { ...stats, nlink: 2 } as Stats;
+        }
+      }
+      return stats;
+    };
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.changedAfterOperation).toEqual(["sock"]);
+    expect(result.identityChanged).toEqual([]);
+    expect(result.vanished).toEqual([]);
+    expect(fake.nodes.get("/f/sock")!.uid).toBe(0);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("reports a rollback socket that vanishes after ownership repair as failed", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let afterRepair = false;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    const originalLchown = fake.ops.lchown.bind(fake.ops);
+    fake.ops.lchown = async (path, uid, gid) => {
+      await originalLchown(path, uid, gid);
+      if (path === "/f/sock") afterRepair = true;
+    };
+    fake.ops.lstat = async (path) => {
+      if (path === "/f/sock" && afterRepair) throw enoent();
+      return originalLstat(path);
+    };
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.changedAfterOperation).toEqual(["sock"]);
+    expect(result.vanished).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("reports a rollback socket post-check error after ownership repair as root-inspection work", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let afterRepair = false;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    const originalLchown = fake.ops.lchown.bind(fake.ops);
+    fake.ops.lchown = async (path, uid, gid) => {
+      await originalLchown(path, uid, gid);
+      if (path === "/f/sock") afterRepair = true;
+    };
+    fake.ops.lstat = async (path) => {
+      if (path === "/f/sock" && afterRepair) {
+        const err = new Error("post-check unavailable") as NodeJS.ErrnoException;
+        err.code = "EIO";
+        throw err;
+      }
+      return originalLstat(path);
+    };
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.changedAfterOperation).toEqual(["sock"]);
+    expect(result.failed).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(true);
+  });
+
+  it("re-checks rollback socket identity immediately before ownership repair", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let socketStats = 0;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock") {
+        socketStats += 1;
+        if (socketStats > 1) {
+          return { ...stats, ino: 99 } as Stats;
+        }
+      }
+      return stats;
+    };
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "sock", type: "socket", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.identityChanged).toEqual(["sock"]);
+    expect(result.changedAfterOperation).toEqual([]);
+    expect(fake.lchowns.some((call) => call.path === "/f/sock")).toBe(false);
+  });
+
+  it("refuses an unsupported rollback entry type even when it has one name", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/node": { type: "other", uid: 501, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["node"] },
+    );
+
+    const result = await applyCustodyRollback(
+      "/f",
+      manifestOf([
+        { path: ".", type: "dir", uid: 501, gid: 20, mode: 0o700, dev: 1, ino: 1 },
+        { path: "node", type: "other", uid: 0, gid: 20, mode: 0o600, dev: 1, ino: 2 },
+      ]),
+      fake.ops,
+    );
+
+    expect(result.skipped).toEqual([
+      { path: "node", uid: 501, gid: 20, reason: "unsupported_type" },
+    ]);
+    expect(fake.nodes.get("/f/node")!.uid).toBe(501);
+    expect(fake.lchowns.some((call) => call.path === "/f/node")).toBe(false);
+  });
+
   it("REFUSES a symlinked fortress root (repair already did; rollback used to skip this)", async () => {
     const fake = makeFakeFs(
       { "/f": { type: "symlink", uid: 501, gid: 20, mode: 0o777, ino: 1 } },
@@ -725,6 +1328,132 @@ describe("fortress-custody: normalize chokepoint", () => {
     expect(fake.nodes.get("/f")!.uid).toBe(501);
     expect(lines.join("\n")).toContain("Fortress custody normalized");
     expect(lines.join("\n")).toContain("state/foreign.enc");
+  });
+
+  it("fails when an operator-owned unsupported entry is present", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/node": { type: "other", uid: 501, gid: 20, mode: 0o600, ino: 2 },
+      },
+      { "/f": ["node"] },
+    );
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.skips).toEqual([
+      { path: "node", uid: 501, gid: 20, reason: "unsupported_type" },
+    ]);
+    expect(lines.join("\n")).toContain("Inspect it with sudo");
+  });
+
+  it("uses a sudo repair remedy without assuming the skip kind", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/ok.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+        "/f/late.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 3, nlink: 1 },
+      },
+      { "/f": ["ok.enc", "late.enc"] },
+    );
+    withOpenStatNlink(fake, "/f/late.enc", 2);
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.repaired).toContain("ok.enc");
+    expect(outcome.skips).toEqual([
+      { path: "late.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    const text = lines.join("\n");
+    expect(text).toContain("sudo sanctuary castle-wall repair-custody");
+    expect(text).not.toContain("after removing the extra names");
+  });
+
+  it("reports repaired and untouched counts without a normalized success line on a failed outcome", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/ok.enc": { type: "file", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+        "/f/multi.enc": { type: "file", uid: 0, gid: 20, mode: 0o640, ino: 3, nlink: 2 },
+      },
+      { "/f": ["ok.enc", "multi.enc"] },
+    );
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    const log = lines.join("\n");
+    expect(outcome.status).toBe("failed");
+    expect(outcome.repaired).toEqual(["ok.enc"]);
+    expect(outcome.skips).toEqual([
+      { path: "multi.enc", uid: 0, gid: 20, reason: "multiple_names" },
+    ]);
+    expect(log).toContain("repaired 1");
+    expect(log).toContain("left 1 entry untouched");
+    expect(log).toContain(
+      "Review the per-entry warning above, then run `sudo sanctuary castle-wall repair-custody`, or inspect as root.",
+    );
+    expect(log).not.toContain("Fortress custody normalized");
+  });
+
+  it("reports post-change custody work once with root-inspection wording", async () => {
+    const fake = makeFakeFs(
+      {
+        "/f": { type: "dir", uid: 501, gid: 20, mode: 0o700, ino: 1 },
+        "/f/sock": { type: "socket", uid: 0, gid: 20, mode: 0o600, ino: 2, nlink: 1 },
+      },
+      { "/f": ["sock"] },
+    );
+    let afterRepair = false;
+    const originalLstat = fake.ops.lstat.bind(fake.ops);
+    const originalLchown = fake.ops.lchown.bind(fake.ops);
+    fake.ops.lchown = async (path, uid, gid) => {
+      await originalLchown(path, uid, gid);
+      if (path === "/f/sock") afterRepair = true;
+    };
+    fake.ops.lstat = async (path) => {
+      const stats = await originalLstat(path);
+      if (path === "/f/sock" && afterRepair) {
+        return { ...stats, nlink: 2 } as Stats;
+      }
+      return stats;
+    };
+    const lines: string[] = [];
+
+    const outcome = await normalizeFortressCustody({
+      fortressPath: "/f",
+      operator: OPERATOR,
+      log: (line) => lines.push(line),
+      ops: fake.ops,
+    });
+
+    const log = lines.join("\n");
+    expect(outcome.status).toBe("failed");
+    expect(outcome.failed).toEqual([
+      { path: "sock", reason: "ownership was already changed and the entry needs inspecting as root" },
+    ]);
+    expect(log).toContain("sock: ownership was already changed and the entry needs inspecting as root");
+    expect(log).not.toContain("finish the repair");
+    expect(log).not.toContain("Fortress custody normalized");
   });
 
   it("is clean + quiet on an already-operator-owned fortress", async () => {

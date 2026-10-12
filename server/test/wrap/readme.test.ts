@@ -19,7 +19,12 @@ const README_PATH = join(__dirname, "..", "..", "..", "README.md");
 describe("README", () => {
   it("advertises the one-command protect install path", async () => {
     const readme = await readFile(README_PATH, "utf-8");
-    expect(readme).toContain("npx @sanctuary-framework/mcp-server protect --openclaw");
+    // must match the Quickstart install line in README.md: the agent-run form
+    // carries -y (no npm install prompt), --no-open and --no-dashboard (the
+    // process returns instead of serving the dashboard in the foreground).
+    expect(readme).toContain(
+      "npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard",
+    );
     expect(readme).toContain("What happens when you run protect");
   });
 
