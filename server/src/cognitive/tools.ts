@@ -1139,10 +1139,17 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
-  async function denyStorageNameAccess(operation: string, namespace: string) {
+  async function denyStorageNameAccess(operation: string, namespace: string, error?: unknown) {
+    const storageName = isFilesystemStorageNameError(error)
+      ? {
+          ...(typeof error.kind === "string" ? { storage_name_kind: error.kind } : {}),
+          ...(typeof error.rawName === "string" ? { raw_stored_entry: error.rawName } : {}),
+        }
+      : {};
     await recordCriticalAudit(auditLog, "l1", operation, "system", {
       namespace,
       denial_class: "namespace_unavailable",
+      ...storageName,
     }, "failure");
     return toolResult(fixedDenial(`audit:${operation}`));
   }
@@ -1629,7 +1636,7 @@ export function createCognitiveTools(
             });
           }
           if (isFilesystemStorageNameError(err)) {
-            return denyStorageNameAccess("state_write", args.namespace as string);
+            return denyStorageNameAccess("state_write", args.namespace as string, err);
           }
           throw err;
         }
@@ -1699,7 +1706,7 @@ export function createCognitiveTools(
             });
           }
           if (isFilesystemStorageNameError(error)) {
-            return denyStorageNameAccess("state_read", args.namespace as string);
+            return denyStorageNameAccess("state_read", args.namespace as string, error);
           }
           throw error;
         }
@@ -1793,17 +1800,29 @@ export function createCognitiveTools(
           });
         }
 
-        const outcome = await discloseUnattributedState({
-          auditLog,
-          stateStore,
-          namespaceRegistry,
-          ...(options?.currentSessionBinding?.()
-            ? { sessionBinding: options.currentSessionBinding()! }
-            : {}),
-          namespace: args.namespace as string,
-          key: args.key as string,
-          identityId: "principal",
-        });
+        let outcome;
+        try {
+          outcome = await discloseUnattributedState({
+            auditLog,
+            stateStore,
+            namespaceRegistry,
+            ...(options?.currentSessionBinding?.()
+              ? { sessionBinding: options.currentSessionBinding()! }
+              : {}),
+            namespace: args.namespace as string,
+            key: args.key as string,
+            identityId: "principal",
+          });
+        } catch (error) {
+          if (isFilesystemStorageNameError(error)) {
+            return denyStorageNameAccess(
+              UNATTRIBUTED_DISCLOSURE_OPERATION,
+              args.namespace as string,
+              error,
+            );
+          }
+          throw error;
+        }
 
         if (outcome.status === "refused_namespace_reserved") {
           return toolResult({
@@ -1890,7 +1909,7 @@ export function createCognitiveTools(
           );
         } catch (error) {
           if (isFilesystemStorageNameError(error)) {
-            return denyStorageNameAccess("state_list", args.namespace as string);
+            return denyStorageNameAccess("state_list", args.namespace as string, error);
           }
           throw error;
         }
@@ -1962,7 +1981,7 @@ export function createCognitiveTools(
             });
           }
           if (isFilesystemStorageNameError(err)) {
-            return denyStorageNameAccess("state_delete", args.namespace as string);
+            return denyStorageNameAccess("state_delete", args.namespace as string, err);
           }
           throw err;
         }
@@ -2017,6 +2036,10 @@ export function createCognitiveTools(
           try {
             namespaces = await sessionOwnedExportNamespaces();
           } catch (error) {
+            if (isFilesystemStorageNameError(error)) {
+              await denyStorageNameAccess("state_export", "state_export", error);
+              throw error;
+            }
             // Discovery caps are capacity refusals, not ownership decisions;
             // preserve the fixed remediation that router.ts may safely surface.
             if (isNamespaceDiscoveryLimitError(error)) throw error;
@@ -2025,7 +2048,14 @@ export function createCognitiveTools(
             throw new Error("namespace_ownership_ambiguous", { cause: error });
           }
         } else {
-          namespaces = await sessionOwnedExportNamespaces();
+          try {
+            namespaces = await sessionOwnedExportNamespaces();
+          } catch (error) {
+            if (isFilesystemStorageNameError(error)) {
+              await denyStorageNameAccess("state_export", "state_export", error);
+            }
+            throw error;
+          }
         }
         attachStateExportApprovalBinding(args, {
           toolName: "state_export",
@@ -2084,6 +2114,7 @@ export function createCognitiveTools(
             return denyStorageNameAccess(
               "state_export",
               typeof args.namespace === "string" ? args.namespace : "state_export",
+              error,
             );
           }
           throw error;
@@ -2138,18 +2169,18 @@ export function createCognitiveTools(
           return fromBase64url(identity.public_key);
         };
 
-        await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
-          conflict_resolution:
-            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
-            "skip",
-          namespaces: targetNamespaces,
-        });
-
         // N4 (coordinator gate, 2026-08-22): StateStore.import refuses
         // while an exit-import journal exists; catch that SPECIFIC error
         // to audit the refusal and return a clean tool-result error.
         let result;
         try {
+          await stateStore.preflightImportStorageNames(args.bundle as string);
+          await recordCriticalAudit(auditLog, "l1", "state_import", "principal", {
+            conflict_resolution:
+              (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+              "skip",
+            namespaces: targetNamespaces,
+          });
           result = await stateStore.import(
             args.bundle as string,
             (args.conflict_resolution as "skip" | "overwrite" | "version") ??
@@ -2173,7 +2204,7 @@ export function createCognitiveTools(
             });
           }
           if (isFilesystemStorageNameError(err)) {
-            return denyStorageNameAccess("state_import", "state_import");
+            return denyStorageNameAccess("state_import", "state_import", err);
           }
           throw err;
         }

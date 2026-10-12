@@ -18,16 +18,17 @@
  * - Directory creation uses restrictive permissions (0o700)
  * - File creation uses restrictive permissions (0o600)
  *
- * Path encoding (bijective, full-sweep #41):
- *   Distinct (namespace, key) inputs MUST produce distinct on-disk paths;
+ * Path encoding (byte-addressable domain, full-sweep #41):
+ *   Distinct byte-addressable (namespace, key) inputs produce distinct on-disk paths;
  *   otherwise an agent that can choose namespace/key strings within a tenant
  *   could overwrite or read another namespace by colliding on the sanitized
  *   form (multi-tenant isolation invariant). The encoder retains the safe
  *   set [A-Za-z0-9_.-] (so internal namespaces such as `_audit`, `_bridge`,
  *   etc. preserve their on-disk paths verbatim) and `!`-escapes every other
- *   character as `!XX` where XX is the upper-hex byte. The escape character
+ *   character as the legacy byte escape `!XX`. The escape character
  *   `!` itself is NOT in the safe set, so a literal `!` in input encodes as
- *   `!21` and decoding remains unambiguous.
+ *   `!21`. Older raw segments outside that byte-sized domain can still
+ *   enumerate under an alias until envelope-level name checks are wired.
  *
  * Legacy fallback (forward compatibility):
  *   Pre-fix code used `replace(/[^a-zA-Z0-9_-]/g, "_")` for namespaces and
@@ -168,7 +169,7 @@ interface CapabilityResponse {
   ready?: boolean;
   ok?: boolean;
   value?: unknown;
-  error?: { message?: string; code?: string };
+  error?: { message?: string; code?: string; kind?: string; rawName?: string };
 }
 
 class DarwinDirectoryCapabilityClient {
@@ -195,8 +196,10 @@ class DarwinDirectoryCapabilityClient {
       } else {
         const error = new Error(
           raw.error?.message ?? "directory-capability worker operation failed",
-        ) as NodeJS.ErrnoException;
+        ) as NodeJS.ErrnoException & { kind?: string; rawName?: string };
         if (raw.error?.code) error.code = raw.error.code;
+        if (raw.error?.kind) error.kind = raw.error.kind;
+        if (raw.error?.rawName) error.rawName = raw.error.rawName;
         waiter.reject(error);
       }
     });
@@ -1216,6 +1219,10 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       for await (const entry of await opendir(path)) {
         chargeEntry();
         if (entry.name.endsWith(".enc")) {
+          // Discovery must prove a namespace's child entries are also
+          // byte-addressable; otherwise a later list(namespace) refusal would
+          // arrive after callers treated discovery as a complete custody set.
+          decodeRawFilesystemStorageName(entry.name.slice(0, -4), "key");
           hasEntries = true;
           break;
         }
@@ -1224,9 +1231,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
       if (namespaces.length >= MAX_DISCOVERED_NAMESPACES) {
         throw new Error(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION);
       }
-      // A raw directory that cannot re-encode to the same segment is refused
-      // here; otherwise rotation/export/checkpoint could treat a partial
-      // namespace set as complete and strand stored entries outside custody work.
+      // A raw directory that cannot re-encode to the same bytes is refused
+      // here; this proves coverage of stored bytes, not original spelling.
       namespaces.push(decodeRawFilesystemStorageName(dir.name, "namespace"));
     }
     return namespaces.sort();

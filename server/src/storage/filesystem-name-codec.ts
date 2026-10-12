@@ -7,14 +7,27 @@ const HEX_RADIX = 16;
 export type FilesystemStorageNameKind = "namespace" | "key";
 
 export const FILESYSTEM_STORAGE_NAME_REMEDIATION =
-  "the fortress holds a stored name this version cannot address; export the affected data with the previous version or contact support";
+  "storage name this version cannot address";
 
 export class FilesystemStorageNameError extends Error {
   readonly code = "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE";
+  readonly rawName?: string;
+  readonly requestedName?: string;
 
-  constructor(readonly kind: FilesystemStorageNameKind) {
-    super(`Storage refused: ${FILESYSTEM_STORAGE_NAME_REMEDIATION}.`);
+  constructor(
+    readonly kind: FilesystemStorageNameKind,
+    options: { rawName?: string; requestedName?: string } = {},
+  ) {
+    const detail = options.rawName === undefined
+      ? `requested ${kind} ${FILESYSTEM_STORAGE_NAME_REMEDIATION}`
+      : `stored ${kind} raw entry ${JSON.stringify(options.rawName)} ${FILESYSTEM_STORAGE_NAME_REMEDIATION}`;
+    const recovery = options.rawName === undefined
+      ? "choose a byte-addressable storage name"
+      : "if the original logical name is known, use an older build to read it and rewrite it under a byte-addressable storage name before upgrading; otherwise restore the entry from backup";
+    super(`Storage refused: ${detail}; ${recovery}.`);
     this.name = "FilesystemStorageNameError";
+    this.rawName = options.rawName;
+    this.requestedName = options.requestedName;
   }
 }
 
@@ -55,7 +68,7 @@ export function assertFilesystemStorageNameAddressable(
   kind: FilesystemStorageNameKind,
 ): void {
   if (!filesystemStorageNameRoundTrips(name)) {
-    throw new FilesystemStorageNameError(kind);
+    throw new FilesystemStorageNameError(kind, { requestedName: name });
   }
 }
 
@@ -64,11 +77,10 @@ export function decodeRawFilesystemStorageName(
   kind: FilesystemStorageNameKind,
 ): string {
   const decoded = decodeFilesystemStorageName(rawName);
-  // Enumeration must refuse a raw segment it cannot re-address exactly; a
-  // partial logical set would let custody operations report complete coverage
-  // while leaving a stored entry outside the operation.
+  // Enumeration must refuse a raw segment it cannot re-address to the same
+  // bytes; this proves byte coverage only, not the original logical spelling.
   if (encodeFilesystemStorageName(decoded) !== rawName) {
-    throw new FilesystemStorageNameError(kind);
+    throw new FilesystemStorageNameError(kind, { rawName });
   }
   return decoded;
 }

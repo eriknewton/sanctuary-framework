@@ -149,19 +149,19 @@ describe("FilesystemStorage", () => {
     it("refuses storage names that do not round-trip before creating files", async () => {
       await expect(
         storage.write("plain", "key-\u4E2D", new Uint8Array([1])),
-      ).rejects.toThrow(/stored name this version cannot address/);
+      ).rejects.toThrow(/storage name this version cannot address/);
       await expect(storage.read("plain", "key-\u4E2D")).rejects.toThrow(
-        /stored name this version cannot address/,
+        /storage name this version cannot address/,
       );
       await expect(storage.delete("plain", "key-\u4E2D", false)).rejects.toThrow(
-        /stored name this version cannot address/,
+        /storage name this version cannot address/,
       );
       await expect(storage.exists("plain", "key-\u4E2D")).rejects.toThrow(
-        /stored name this version cannot address/,
+        /storage name this version cannot address/,
       );
       await expect(
         storage.write("ns-\u4E2D", "plain", new Uint8Array([1])),
-      ).rejects.toThrow(/stored name this version cannot address/);
+      ).rejects.toThrow(/storage name this version cannot address/);
       expect(await readdir(basePath)).toEqual([]);
     });
 
@@ -186,10 +186,63 @@ describe("FilesystemStorage", () => {
       );
 
       await expect(storage.listNamespaces()).rejects.toThrow(
-        /stored name this version cannot address/,
+        /storage name this version cannot address/,
       );
       await expect(storage.list("plain")).rejects.toThrow(
-        /stored name this version cannot address/,
+        /storage name this version cannot address/,
+      );
+    });
+
+    it("refuses namespace discovery when a child entry cannot be re-addressed", async () => {
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(basePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+
+      await expect(storage.listNamespaces()).rejects.toMatchObject({
+        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+      });
+    });
+
+    it("pins the residual alias class without rewriting stored bytes", async () => {
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      const rawName = "key-!3B1.enc";
+      const bytes = new Uint8Array([9, 8, 7]);
+      await writeFile(join(basePath, "plain", rawName), bytes);
+
+      const listed = await storage.list("plain");
+      // NAMESPACE-WIDE-NAME-ALIAS-01: this interim check proves byte
+      // re-addressability only; some older raw segments still enumerate under
+      // an alias name until envelope-level name verification is wired.
+      expect(listed.map((entry) => entry.key)).toEqual(["key-;1"]);
+      expect(await storage.read("plain", "key-;1")).toEqual(bytes);
+      expect(await readdir(join(basePath, "plain"))).toEqual([rawName]);
+    });
+
+    const darwinIt = process.platform === "darwin" ? it : it.skip;
+
+    darwinIt("refuses raw stored names through the Darwin directory capability", async () => {
+      await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });
+      await writeFile(join(basePath, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
+      await mkdir(join(basePath, "plain"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(basePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+
+      await storage.withNamespaceLock(
+        "plain",
+        ".darwin-name-check.lock",
+        async () => {
+          await expect(storage.list("plain")).rejects.toMatchObject({
+            code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+          });
+          await expect(storage.listNamespaces()).rejects.toMatchObject({
+            code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+          });
+        },
+        { kernelBacked: true },
       );
     });
 
@@ -255,6 +308,146 @@ describe("FilesystemStorage", () => {
       expect(result.denied).toBe(true);
       expect(JSON.stringify(result)).not.toContain("round-trip");
       expect(JSON.stringify(result)).not.toContain("stored name");
+    });
+
+    it("returns generic disclosure denials for storage names that do not round-trip", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+
+      const result = await callTool(tools, "state_disclose_unattributed", {
+        namespace: "plain",
+        key: "key-\u4E2D",
+      });
+      expect(result.denied).toBe(true);
+      expect(JSON.stringify(result)).not.toContain("round-trip");
+      expect(JSON.stringify(result)).not.toContain("stored name");
+    });
+
+    it("keeps state_export approval discovery classified as storage-name refusal", async () => {
+      await mkdir(join(basePath, "ns-!4E2D"), { recursive: true, mode: 0o700 });
+      await writeFile(join(basePath, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+        { currentSessionBinding: () => session("session-agent") },
+      );
+      const tool = tools.find((candidate) => candidate.name === "state_export");
+      if (!tool?.approvalTargetArgs) {
+        throw new Error("harness setup: state_export approvalTargetArgs missing");
+      }
+
+      await expect(tool.approvalTargetArgs({})).rejects.toMatchObject({
+        code: "FILESYSTEM_STORAGE_NAME_UNADDRESSABLE",
+      });
+    });
+
+    it("state_delete refuses before removing an addressable entry from an unavailable namespace", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const identity = await callTool(tools, "identity_create", {
+        label: "delete-roundtrip-agent",
+      });
+      await callTool(tools, "state_write", {
+        namespace: "plain",
+        key: "good",
+        value: "keep",
+        identity_id: identity.identity_id,
+      });
+      const before = await storage.read("plain", "good");
+      await writeFile(
+        join(basePath, "plain", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+      const coldStateStore = new StateStore(storage, masterKey);
+      const { tools: coldTools } = createL1Tools(
+        coldStateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+
+      const result = await callTool(coldTools, "state_delete", {
+        namespace: "plain",
+        key: "good",
+        reason: "test",
+      });
+      expect(result.denied).toBe(true);
+      expect(await storage.read("plain", "good")).toEqual(before);
+      expect(JSON.stringify(result)).not.toContain("key-!4E2D");
+    });
+
+    it("state_import refuses before writing into an unavailable namespace", async () => {
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createL1Tools(
+        stateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await identityManager.load();
+      const identity = await callTool(tools, "identity_create", {
+        label: "import-roundtrip-agent",
+      });
+      for (const [key, value] of [["a", "alpha"], ["b", "bravo"]] as const) {
+        await callTool(tools, "state_write", {
+          namespace: "bundle",
+          key,
+          value,
+          identity_id: identity.identity_id,
+        });
+      }
+      const exported = await stateStore.exportNamespaces(["bundle"]);
+      await storage.delete("bundle", "a", false);
+      await storage.delete("bundle", "b", false);
+      await writeFile(
+        join(basePath, "bundle", "key-!4E2D.enc"),
+        new Uint8Array([2]),
+      );
+      const coldStateStore = new StateStore(storage, masterKey);
+      const { tools: coldTools, identityManager: coldIdentityManager } = createL1Tools(
+        coldStateStore,
+        storage,
+        masterKey,
+        "recovery-key",
+        auditLog,
+      );
+      await coldIdentityManager.load();
+
+      const result = await callTool(coldTools, "state_import", {
+        bundle: exported.bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(result.denied).toBe(true);
+      expect(await storage.exists("bundle", "a")).toBe(false);
+      expect(await storage.exists("bundle", "b")).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("key-!4E2D");
     });
   });
 

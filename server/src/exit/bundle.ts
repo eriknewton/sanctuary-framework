@@ -975,6 +975,19 @@ async function resolveExportStateNamespaces(
   }
 }
 
+async function preflightExitStateStorageNames(
+  opts: ExportExitBundleOptions,
+  stateNamespaces: readonly string[],
+): Promise<void> {
+  for (const namespace of [...new Set(stateNamespaces)].sort()) {
+    if (isReservedNamespace(namespace)) continue;
+    // Discovery names the namespace set; listing each exported namespace here
+    // proves its stored child names before mkdir, artifact writes, or the
+    // export audit append can create residue.
+    await opts.storage.list(namespace);
+  }
+}
+
 /**
  * Every option-SHAPE refusal for an export, in one place, so it can run before
  * the first side effect (see the A9 invariant at the `exportExitBundle` call
@@ -1475,6 +1488,7 @@ export async function exportExitBundle(
   // directory or audit entry is written. An enumeration fault cannot be turned
   // into an incomplete export or a partial artifact tree.
   const stateNamespaces = await resolveExportStateNamespaces(opts);
+  await preflightExitStateStorageNames(opts, stateNamespaces);
   const bundleDir = resolve(opts.bundleDir);
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
   await mkdir(join(bundleDir, ARTIFACT_DIR), { recursive: true, mode: 0o700 });

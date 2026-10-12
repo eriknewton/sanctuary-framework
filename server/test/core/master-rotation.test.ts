@@ -858,7 +858,7 @@ describe("master rotation — storage namespace discovery", () => {
           approve: async () => true,
           captureRecoveryKey: async (recoveryKey, verify) => verify(recoveryKey),
         }),
-      ).rejects.toThrow(/stored name this version cannot address/);
+      ).rejects.toThrow(/storage name this version cannot address/);
 
       const stillOld = await establishMaster({
         storage,

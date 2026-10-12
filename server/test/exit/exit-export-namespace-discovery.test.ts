@@ -42,7 +42,7 @@
 // change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
@@ -350,7 +350,12 @@ describe("sanctuary exit export: state-namespace resolution", () => {
         stateStoragePath,
         keySource: "recovery-key",
       }),
-    ).rejects.toThrow(/stored name this version cannot address/);
+    ).rejects.toThrow(/storage name this version cannot address/);
+
+    expect(await readdir(bundleDir)).toEqual([]);
+    await auditLog.flush();
+    const audit = await auditLog.query({ operation_type: "exit_bundle_export" });
+    expect(audit.entries).toEqual([]);
   });
 
   it("still restricts the export to the namespaces --state-namespace names", async () => {
