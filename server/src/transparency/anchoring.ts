@@ -79,6 +79,10 @@ import {
   type FetchLike,
   type RekorClient,
 } from "./rekor-client.js";
+import {
+  TransparencySchedulerAbortedError,
+  TransparencySchedulerAbortState,
+} from "./scheduler.js";
 
 export const TRANSPARENCY_ANCHOR_NAMESPACE = "_transparency_anchors";
 export const TRANSPARENCY_ANCHOR_RECEIPT_PREFIX = "anchor-";
@@ -124,6 +128,7 @@ export type AnchorConfigState =
 interface AnchorKeyInput {
   storage: StorageBackend;
   masterKey: Uint8Array;
+  abortState: TransparencySchedulerAbortState;
 }
 
 /**
@@ -162,6 +167,12 @@ export async function readAnchorConfig(
   if (!isAnchorConfigData(data) || typeof mac !== "string") {
     throw tamperError();
   }
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from deriving the anchoring-config MAC key from the daemon master key.
+  TransparencySchedulerAbortState.assertNotAborted(
+    input.abortState,
+    "anchoring config key derivation"
+  );
   const macKey = derivePurposeKey(
     input.masterKey,
     TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE
@@ -173,6 +184,12 @@ export async function readAnchorConfig(
     } catch {
       throw tamperError();
     }
+    // INVARIANT (shutdown/key custody): no await may separate this abort check
+    // from authenticating the anchoring config with master-derived key material.
+    TransparencySchedulerAbortState.assertNotAborted(
+      input.abortState,
+      "anchoring config MAC verification"
+    );
     if (!constantTimeEqual(provided, hmacSha256(macKey, anchorConfigMacInput(data)))) {
       throw tamperError();
     }
@@ -196,6 +213,12 @@ async function writeAnchorConfig(
   input: AnchorKeyInput,
   data: AnchorConfigData
 ): Promise<void> {
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from deriving the anchoring-config MAC key from the supplied master key.
+  TransparencySchedulerAbortState.assertNotAborted(
+    input.abortState,
+    "anchoring config key write"
+  );
   const macKey = derivePurposeKey(
     input.masterKey,
     TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE
@@ -668,9 +691,21 @@ export async function anchorCheckpoint(
   };
 
   try {
+    // INVARIANT (shutdown/key custody): no await may separate this abort check
+    // from deriving the anchoring key from the daemon master key.
+    TransparencySchedulerAbortState.assertNotAborted(
+      input.abortState,
+      "anchor key derivation"
+    );
     const key = deriveAnchorSigningKey(input.masterKey);
     let proposal;
     try {
+      // INVARIANT (shutdown/key custody): no await may separate this abort
+      // check from signing the anchor preimage with derived key material.
+      TransparencySchedulerAbortState.assertNotAborted(
+        input.abortState,
+        "anchor preimage signing"
+      );
       proposal = buildHashedRekordProposal({
         digestHex,
         signatureDer: signAnchorPreimage(key.privateKey, preimage),
@@ -703,7 +738,12 @@ export async function anchorCheckpoint(
     });
     return { status: "anchored", receipt, duplicate: result.duplicate };
   } catch (err) {
-    if (err instanceof TransparencyAnchorError) throw err;
+    if (
+      err instanceof TransparencyAnchorError ||
+      err instanceof TransparencySchedulerAbortedError
+    ) {
+      throw err;
+    }
     const message = errorMessage(err);
     const receipt: FailedAnchorReceipt = {
       ...base,
@@ -803,6 +843,12 @@ export async function buildAnchorsExport(
     );
   }
   const receipts = await readAnchorReceipts(input.storage);
+  // INVARIANT (shutdown/key custody): no await may separate this abort check
+  // from deriving the export-time anchoring public key from the daemon master.
+  TransparencySchedulerAbortState.assertNotAborted(
+    input.abortState,
+    "anchor export key derivation"
+  );
   const key = deriveAnchorSigningKey(input.masterKey);
   let publicKeyPem: string;
   try {

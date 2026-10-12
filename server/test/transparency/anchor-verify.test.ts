@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * PR-3 anchor verification properties. The contracts under test:
  *
@@ -64,6 +65,7 @@ import {
   type VerifierCheckpointRecord,
 } from "../../src/transparency/verify.js";
 import { FakeRekorLog, inclusionProof, merkleRoot } from "./fake-rekor-log.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../../src/transparency/scheduler.js";
 
 const FORTRESS_ID = "fortress-anchor-verify-test";
 const REKOR_URL = "https://rekor.fixture.test";
@@ -122,6 +124,7 @@ async function buildScenario(n: number): Promise<Scenario> {
     auditLog,
     fortressId: FORTRESS_ID,
     rekorUrl: REKOR_URL,
+    abortState: TRANSPARENCY_NEVER_ABORTED,
   });
   const records: EnforcementCheckpointRecord[] = [];
   for (let i = 0; i < n; i++) {
@@ -141,6 +144,7 @@ async function buildScenario(n: number): Promise<Scenario> {
       signer,
       binaryPath,
       version: "0.0.0-test",
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     records.push(record);
     const outcome = await anchorCheckpoint({
@@ -149,6 +153,7 @@ async function buildScenario(n: number): Promise<Scenario> {
       auditLog,
       record,
       fetchFn: log.fetchLike(),
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(outcome.status).toBe("anchored");
     log.appendNoise(`foreign-after-${i}`);
@@ -159,6 +164,7 @@ async function buildScenario(n: number): Promise<Scenario> {
     storage,
     masterKey,
     fortressId: FORTRESS_ID,
+    abortState: TRANSPARENCY_NEVER_ABORTED,
   });
   return { records, anchorsDoc, log };
 }

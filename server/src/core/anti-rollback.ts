@@ -147,6 +147,7 @@ import {
   bytesToString,
   constantTimeEqual,
 } from "./encoding.js";
+import { TRANSPARENCY_NEVER_ABORTED } from "../transparency/scheduler.js";
 // the epoch witness is read back from storage and JSON-parsed, so its fields
 // are attacker-influenced; diagnostics go through the untrusted-diagnostic
 // chokepoint (STATE-STORE-ERRMSG-INTERP-01).
@@ -1396,7 +1397,11 @@ async function rebaselineStage2FloorBestEffort(
     // Only re-baseline when Stage 2 applies (config enabled OR receipts present).
     let applies = false;
     try {
-      const state = await readAnchorConfig({ storage, masterKey: master });
+      const state = await readAnchorConfig({
+        storage,
+        masterKey: master,
+        abortState: TRANSPARENCY_NEVER_ABORTED,
+      });
       applies = state.status === "enabled";
     } catch {
       applies = true; // tampered/unreadable config → treat as applies
@@ -1413,6 +1418,7 @@ async function rebaselineStage2FloorBestEffort(
       storage,
       masterKey: master,
       fortressId: resolvedFortressId,
+      abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     if (anchored.highestAnchoredCounter <= 0) return;
     const { rebaselineTransparencyCounterFloor } = await import(
@@ -1746,6 +1752,7 @@ function defaultRekorFloorDeps(args: {
         const state = await readAnchorConfig({
           storage: args.storage,
           masterKey: args.master,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
         });
         configEnabled = state.status === "enabled";
       } catch {
@@ -1778,6 +1785,7 @@ function defaultRekorFloorDeps(args: {
           storage: args.storage,
           masterKey: args.master,
           fortressId: args.fortressId,
+          abortState: TRANSPARENCY_NEVER_ABORTED,
         });
         return {
           highestAnchoredCounter: result.highestAnchoredCounter,
