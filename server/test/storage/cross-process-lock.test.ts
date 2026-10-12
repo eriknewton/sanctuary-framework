@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { linkSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, renameSync } from "node:fs";
 import {
   chmod,
   mkdtemp,
@@ -30,6 +30,10 @@ import { isMainThread } from "node:worker_threads";
 
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { createCognitiveTools } from "../../src/cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   acquireMasterWriteBarrier,
   withCrossProcessLock,
@@ -1244,6 +1248,105 @@ describe("withCrossProcessLock", () => {
       await expect(
         new FilesystemStorage(displaced).read(NS, "bound-write"),
       ).resolves.toEqual(new Uint8Array([7, 8, 9]));
+    },
+  );
+
+  it.runIf(process.platform === "darwin")(
+    "keeps non-locked namespace mutations on the acquired root inode and refuses the root namespace string",
+    async () => {
+      // NAMESPACE-DOT-PATH-ESCAPE-01
+      const statePath = join(base, "state");
+      const displaced = join(base, "state.displaced");
+      const otherNamespace = "other";
+      const operation = withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async (lease) => {
+          await expect(
+            storage.write(".", "root-string-write", new Uint8Array([3])),
+          ).rejects.toThrow(/namespace/);
+
+          await storage.write(otherNamespace, "before-swap", new Uint8Array([1]));
+          renameSync(statePath, displaced);
+          mkdirSync(join(statePath, otherNamespace), { recursive: true });
+          await storage.write(otherNamespace, "after-swap", new Uint8Array([2]));
+          lease.assertHeld();
+        },
+        {
+          kernelBacked: true,
+        },
+      );
+
+      const outcome = await operation.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (outcome !== undefined) {
+        expect(outcome).toMatchObject({ kind: "holder-lost" });
+      }
+      await expect(
+        new FilesystemStorage(statePath).read(otherNamespace, "after-swap"),
+      ).resolves.toBeNull();
+      await expect(
+        new FilesystemStorage(displaced).read(otherNamespace, "after-swap"),
+      ).resolves.toEqual(new Uint8Array([2]));
+    },
+  );
+
+  it.runIf(process.platform === "darwin")(
+    "keeps the worker-bound namespace marker unavailable to caller namespaces",
+    async () => {
+      const statePath = join(base, "state");
+      const formerInternalNamespace = "\0sanctuary-bound-namespace\0";
+      const masterKey = generateRandomKey();
+      const auditLog = new AuditLog(storage, masterKey);
+      const stateStore = new StateStore(storage, masterKey);
+      const { tools, identityManager } = createCognitiveTools(
+        stateStore,
+        storage,
+        masterKey,
+        "passphrase",
+        auditLog,
+      );
+      await identityManager.load();
+      const identityTool = tools.find((tool) => tool.name === "identity_create");
+      const writeTool = tools.find((tool) => tool.name === "state_write");
+      if (!identityTool || !writeTool) throw new Error("test harness missing state tools");
+      const identity = JSON.parse(
+        (await identityTool.handler({ label: "worker-bound-marker" })).content[0]!.text,
+      ) as { identity_id: string };
+
+      await withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async (lease) => {
+          await expect(
+            storage.write(formerInternalNamespace, "direct", new Uint8Array([3])),
+          ).rejects.toThrow(/namespace/);
+          await expect(
+            writeTool.handler({
+              namespace: formerInternalNamespace,
+              key: "tool",
+              value: "value",
+              identity_id: identity.identity_id,
+            }),
+          ).rejects.toThrow(/namespace/);
+          lease.assertHeld();
+        },
+        {
+          kernelBacked: true,
+        },
+      );
+
+      await expect(new FilesystemStorage(statePath).read(NS, "direct")).resolves.toBeNull();
+      await expect(new FilesystemStorage(statePath).read(NS, "tool")).resolves.toBeNull();
+      expect(existsSync(join(statePath, "direct.enc"))).toBe(false);
+      expect(existsSync(join(statePath, "tool.enc"))).toBe(false);
+      await expect(
+        new FilesystemStorage(statePath).read(formerInternalNamespace, "direct"),
+      ).rejects.toThrow(/namespace/);
     },
   );
 

@@ -79,25 +79,67 @@ interface ParsedArgs {
   help: boolean;
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+const ROTATE_MASTER_FORTRESS_FLAG = "--fortress";
+const ROTATE_MASTER_STORAGE_FLAG = "--storage";
+const ROTATE_MASTER_STORAGE_VALUE_FLAGS = [
+  ROTATE_MASTER_FORTRESS_FLAG,
+  ROTATE_MASTER_STORAGE_FLAG,
+] as const;
+
+const ROTATE_MASTER_INLINE_FLAG_DEFINITIONS = [
+  { flag: "--help", kind: "help" },
+  { flag: "-h", kind: "help" },
+  { flag: "--resume", kind: "resume" },
+  { flag: "--recovery-out", kind: "path" },
+] as const;
+
+export function rotateMasterAcceptedLongFlags(): readonly string[] {
+  return [
+    ...ROTATE_MASTER_STORAGE_VALUE_FLAGS,
+    ...ROTATE_MASTER_INLINE_FLAG_DEFINITIONS
+      .map((definition) => definition.flag)
+      .filter((flag) => flag.startsWith("--")),
+  ];
+}
+
+export function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = { resume: false, help: false };
   // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--storage value must refuse, never silently resolve the default fortress; wrong-fortress custody operations are a constraint-5 violation.
-  const fortress = consumeFlagValue(argv, "--fortress");
+  const fortress = consumeFlagValue(argv, ROTATE_MASTER_FORTRESS_FLAG);
   if (fortress.error !== undefined) throw new Error(fortress.error);
-  const storage = consumeFlagValue(fortress.argv, "--storage");
+  const storage = consumeFlagValue(fortress.argv, ROTATE_MASTER_STORAGE_FLAG);
   if (storage.error !== undefined) throw new Error(storage.error);
   const storageValue = storage.value ?? fortress.value;
   if (storageValue !== undefined) out.storage = storageValue;
 
   for (let i = 0; i < storage.argv.length; i++) {
     const a = storage.argv[i];
-    if (a === "--help" || a === "-h") out.help = true;
-    else if (a === "--resume") out.resume = true;
-    else if (a === "--recovery-out") {
-      out.recoveryOut = readRequiredPathArg(storage.argv, i, "--recovery-out");
-      i++;
-    } else if (a && a.startsWith("--")) {
-      throw new Error(`Unknown flag: ${argvTokenForDisplay(a)}`);
+    const definition = ROTATE_MASTER_INLINE_FLAG_DEFINITIONS.find(
+      (candidate) => candidate.flag === a,
+    );
+    if (definition === undefined) {
+      if (a && a.startsWith("--")) {
+        throw new Error(`Unknown flag: ${argvTokenForDisplay(a)}`);
+      }
+      continue;
+    }
+    switch (definition.kind) {
+      case "help":
+        out.help = true;
+        break;
+      case "resume":
+        out.resume = true;
+        break;
+      case "path":
+        out.recoveryOut = readRequiredPathArg(storage.argv, i, definition.flag);
+        i++;
+        break;
+      default: {
+        const exhaustive: never = definition;
+        throw new Error(
+          `Unhandled rotate-master flag definition: ${JSON.stringify(exhaustive)}`,
+        );
+      }
     }
   }
   return out;

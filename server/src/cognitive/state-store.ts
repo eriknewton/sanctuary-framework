@@ -17,6 +17,7 @@
 
 import type { StorageBackend } from "../storage/interface.js";
 import { NAMESPACE_DISCOVERY_LIMIT_REMEDIATION, MAX_DISCOVERED_NAMESPACES } from "../storage/interface.js";
+import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import {
   hasInterruptedExitImport,
   InterruptedExitImportPendingError,
@@ -227,6 +228,9 @@ function assertBundleNamespaceMetadataMatches(
   data: StateExportData
 ): string[] {
   const actualNamespaces = Object.keys(data).sort();
+  for (const namespace of actualNamespaces) {
+    assertStorageNamespacePathComponent(namespace);
+  }
   if (Array.isArray(bundle.namespaces)) {
     if (!bundle.namespaces.every((namespace) => typeof namespace === "string")) {
       throw new Error("export bundle namespace metadata is invalid");
@@ -1290,6 +1294,7 @@ export class StateStore {
    * the cache exceeds 128 entries.
    */
   private getNamespaceKey(namespace: string): Uint8Array {
+    assertStorageNamespacePathComponent(namespace);
     const now = Date.now();
     const cached = this.namespaceKeyCache.get(namespace);
     if (cached && cached.expiresAt > now) {

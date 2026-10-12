@@ -162,9 +162,10 @@ export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
  * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
  * Its PRESENCE means a rotation is in flight: some fortress data may be under
  * the old master and some under the new. Every establishment path refuses to
- * proceed until the rotation is resumed to completion (or rolled back from
- * the staging phase) — booting half-keyed is exactly the split-state lockout
- * the custody work exists to kill.
+ * proceed until the rotation is resumed to completion, because booting
+ * half-keyed is exactly the split-state lockout the custody work exists to
+ * kill. The staging phase writes no rotation journal, so this refusal never
+ * fires during staging.
  */
 export const ROTATION_JOURNAL_KEY = "rotation-journal";
 
@@ -673,8 +674,8 @@ export class CustodyRotationInProgressError extends Error {
         "Some data may still be encrypted under the previous master. Refusing to\n" +
         "start until the rotation completes. Run:\n" +
         "  sanctuary rotate-master --resume\n" +
-        "to finish it (or `sanctuary rotate-master --abort` if it never left the\n" +
-        "staging phase). Both require the fortress passphrase."
+        "to continue the journaled rotation forward to completion. This requires\n" +
+        "the fortress passphrase (add --fortress <path> for a non-default fortress)."
     );
     this.name = "CustodyRotationInProgressError";
   }
@@ -1292,6 +1293,55 @@ interface CustodyPairRecoveryResult {
   };
 }
 
+async function recoveredCustodyPairAllowsPublish(
+  storage: StorageBackend,
+  lease: CrossProcessLockLease,
+  recovery: CustodyPairRecoveryResult,
+  requested: {
+    envelopeBytes: Uint8Array;
+    envelopeKey: string;
+    sentinelKey: string;
+    master: Uint8Array;
+  },
+): Promise<boolean> {
+  lease.assertHeld();
+  if (!recovery.changedPair) {
+    // The custody write lock is held from replay recovery through the publish
+    // below, so a continue decision cannot straddle another custody writer.
+    lease.assertHeld();
+    return true;
+  }
+  const recoveredEnvelopeMatchesRequestedEnvelope =
+    recovery.recoveredPair !== undefined &&
+    constantTimeEqual(recovery.recoveredPair.envelopeBytes, requested.envelopeBytes);
+  if (!recoveredEnvelopeMatchesRequestedEnvelope) return false;
+  // Continuing and refusal table (AGENTS.md rule 13):
+  // - no journal or a journal that vanished under the lock: recovery returns
+  //   `changedPair:false`; continue because this writer has no replay to judge;
+  // - unchanged replay: recovery returns `changedPair:false`; continue because
+  //   the publish sees the same pair it read;
+  // - unusable or mismatched-target journal with a target pair that
+  //   authenticates under this writer's master: recovery quarantines the
+  //   journal and returns `changedPair:false`; continue because recovery has
+  //   proven the live pair is already coherent for this writer;
+  // - unusable or mismatched-target journal without that proof: recovery
+  //   refuses before this predicate, preserving the operator recovery path;
+  // - changed replay with exact requested envelope bytes and a sentinel that
+  //   authenticates under this writer's master: continue because the replay
+  //   immediately before this check may itself have rewritten disk, and this
+  //   writer's locked publish leaves the same envelope bytes on disk;
+  // - changed replay with no recovered pair, different envelope bytes, same
+  //   parsed content in different bytes, or a pair
+  //   authenticating only under another master: refuse with the stale-snapshot
+  //   message and preserve the caller's retry boundary.
+  const recoveredPairAuthenticates = await verifyCustodyPairAuthenticates(storage, requested.master, {
+    envelopeKey: requested.envelopeKey,
+    sentinelKey: requested.sentinelKey,
+  });
+  if (recoveredPairAuthenticates) lease.assertHeld();
+  return recoveredPairAuthenticates;
+}
+
 export type CustodyEnvelopeCommitConsistencyCheck = (
   storage: StorageBackend,
   master: Uint8Array,
@@ -1647,20 +1697,12 @@ async function writeCustodyEnvelopeLocked(
         master,
       },
     );
-    const recoveredEnvelopeMatchesRequestedEnvelope =
-      recovery.recoveredPair !== undefined &&
-      constantTimeEqual(recovery.recoveredPair.envelopeBytes, envelopeBytes);
-    const recoveredPairAuthenticates =
-      recoveredEnvelopeMatchesRequestedEnvelope &&
-      await verifyCustodyPairAuthenticates(storage, master, {
-        envelopeKey,
-        sentinelKey: sentinelTargetKey,
-      });
-    // The custody write lock is held from this check through the publish below:
-    // continuing is safe only when disk already holds the exact envelope bytes
-    // this writer is publishing and the sentinel authenticates under this
-    // writer's master, so no other actor's custody update is overwritten.
-    if (recovery.changedPair && !recoveredPairAuthenticates) {
+    if (!(await recoveredCustodyPairAllowsPublish(storage, lease, recovery, {
+      envelopeBytes,
+      envelopeKey,
+      sentinelKey: sentinelTargetKey,
+      master,
+    }))) {
       throw new CustodySnapshotChangedError();
     }
   }
@@ -1724,7 +1766,12 @@ export async function writeCustodyEnvelopeBytes(
             master,
           },
         );
-        if (recovery.changedPair) {
+        if (!(await recoveredCustodyPairAllowsPublish(storage, lease, recovery, {
+          envelopeBytes,
+          envelopeKey: CUSTODY_ENVELOPE_KEY,
+          sentinelKey: CUSTODY_SENTINEL_KEY,
+          master,
+        }))) {
           throw new CustodySnapshotChangedError();
         }
       }

@@ -101,9 +101,13 @@ export class SdwDocumentCorpusStore {
     );
   }
 
-  mintProvenance(record: SdwMemoryProvenanceRecord, taint: Taint): Persistable<SdwMemoryProvenanceRecord> {
+  mintProvenance(
+    record: SdwMemoryProvenanceRecord,
+    taint: Taint,
+    options?: MintPersistableOptions,
+  ): Persistable<SdwMemoryProvenanceRecord> {
     return mintPersistable({ value: record, taint }, SDW_DOCUMENT_CORPUS_NAMESPACE,
-      documentProvenanceKey(record.document_id), this.fortressId);
+      documentProvenanceKey(record.document_id), this.fortressId, options);
   }
 
   mintProvenanceStatus(record: SdwMemoryProvenanceStatusRecord, taint: Taint): Persistable<SdwMemoryProvenanceStatusRecord> {
@@ -139,13 +143,18 @@ export class SdwDocumentCorpusStore {
     await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
   }
 
-  async putProvenance(record: SdwMemoryProvenanceRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
-    const persistable = this.mintProvenance(record, taint);
+  async putProvenance(
+    record: SdwMemoryProvenanceRecord,
+    taint: Taint,
+    txn?: SdwCorpusTxn,
+    options?: MintPersistableOptions,
+  ): Promise<void> {
+    const persistable = this.mintProvenance(record, taint, options);
     if (txn !== undefined) {
-      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId, options);
       return;
     }
-    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
   }
 
   async putProvenanceStatus(record: SdwMemoryProvenanceStatusRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {

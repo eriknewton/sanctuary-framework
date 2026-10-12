@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { stringToBytes } from "../../src/core/encoding.js";
+import { publicKeyToDid } from "../../src/core/identity.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
   documentKey,
   stateKey,
@@ -9,13 +11,16 @@ import {
 import {
   SDW_DOCUMENT_CORPUS_HKDF_INFO,
   SDW_DOCUMENT_CORPUS_NAMESPACE,
+  SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS,
   SDW_META_NAMESPACE,
   SDW_REPLAY_ANCHOR_KEY,
   SDW_WORKING_STATE_HKDF_INFO,
   SDW_WORKING_STATE_NAMESPACE,
   type SdwDocumentRecord,
+  type SdwMemoryProvenanceRecord,
   type SdwWorkingStateRecord,
 } from "../../src/sdw/records.js";
+import { SdwDocumentCorpusStore } from "../../src/sdw/document-corpus-store.js";
 import {
   assertSdwRawWriteAuthorized,
   combineTaint,
@@ -24,6 +29,14 @@ import {
   prepareReplayAnchorWrite,
   sdwBackendWrite,
 } from "../../src/sdw/write-gate.js";
+import {
+  createMemoryProvenanceCompanion,
+  isVerifiedProvenanceSignature,
+  publicKeyFromMemoryProvenanceDid,
+  signMemoryOrigin,
+  verifyMemoryProvenanceCompanion,
+  type MemoryProvenanceSigningHandle,
+} from "../../src/sdw/memory-provenance-contract.js";
 import { emptyReplayAnchorData } from "../../src/sdw/replay-anchor.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 
@@ -248,6 +261,96 @@ describe("SDW secret-persistence adversarial fixtures", () => {
       ),
     ).toThrow(SdwValidationError);
   });
+
+  it("keeps verifier-registered product provenance signatures out of user-content token classification", () => {
+    const storage = new MemoryStorage();
+    const corpus = new SdwDocumentCorpusStore({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    const record = productSignedProvenanceRecord("prov-product-signature-token-shaped");
+    const verifiedRecord = verifyProvenanceRecord(record);
+
+    expect(record.companion.origin.signature.startsWith("sk-")).toBe(true);
+    expect(() =>
+      corpus.mintProvenance(verifiedRecord, "system_generated"),
+    ).not.toThrow();
+  });
+
+  it("rejects unregistered or copied provenance signature owners", () => {
+    const corpus = new SdwDocumentCorpusStore({
+      storage: new MemoryStorage(),
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    const record = productSignedProvenanceRecord("prov-product-signature-unregistered");
+    const verifiedRecord = verifyProvenanceRecord(record);
+    const clonedOriginRecord: SdwMemoryProvenanceRecord = {
+      ...verifiedRecord,
+      companion: {
+        ...verifiedRecord.companion,
+        origin: { ...verifiedRecord.companion.origin },
+      },
+    };
+    const changedSignatureRecord: SdwMemoryProvenanceRecord = {
+      ...verifiedRecord,
+      companion: {
+        ...verifiedRecord.companion,
+        origin: {
+          ...verifiedRecord.companion.origin,
+          signature: tokenShapedSignature(),
+        },
+      },
+    };
+
+    expectSdwThrow(() => corpus.mintProvenance(record, "system_generated"), "classifier_reject");
+    expectSdwThrow(() => corpus.mintProvenance(clonedOriginRecord, "system_generated"), "classifier_reject");
+    expectSdwThrow(() => corpus.mintProvenance(changedSignatureRecord, "system_generated"), "classifier_reject");
+    expect(
+      isVerifiedProvenanceSignature(
+        verifiedRecord.companion.admission,
+        verifiedRecord.companion.origin.signature,
+      ),
+    ).toBe(false);
+    expect(isVerifiedProvenanceSignature(verifiedRecord.companion.origin, tokenShapedSignature())).toBe(false);
+  });
+
+  it("rejects token-shaped provenance signature fields without verified provenance references", () => {
+    const storage = new MemoryStorage();
+    const corpus = new SdwDocumentCorpusStore({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+
+    expectSdwThrow(() =>
+      corpus.mintProvenance(provenanceRecordWithSignature("prov-signature-token-shaped"), "system_generated"),
+    "classifier_reject");
+  });
+
+  it("rejects token-shaped non-signature fields on the same provenance record", () => {
+    const storage = new MemoryStorage();
+    const corpus = new SdwDocumentCorpusStore({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+    });
+    const record = productSignedProvenanceRecord(identifierTokenShapedSignature());
+    const verifiedRecord = verifyProvenanceRecord(record);
+
+    expectSdwThrow(() =>
+      corpus.mintProvenance(verifiedRecord, "system_generated"),
+    "classifier_reject");
+  });
+
+  it("pins the provenance classifier signature paths to the companion schema", () => {
+    const record = productSignedProvenanceRecord("prov-signature-paths");
+
+    expect(collectSignaturePaths(record.companion).sort()).toEqual(
+      [...SDW_MEMORY_PROVENANCE_SIGNATURE_PATHS].sort(),
+    );
+  });
 });
 
 function expectSdwThrow(fn: () => unknown, category: string): void {
@@ -304,6 +407,155 @@ function documentRecord(
     tags: ["tag-1"],
     metadata,
   };
+}
+
+function provenanceRecordWithSignature(documentId: string): SdwMemoryProvenanceRecord {
+  const tokenShapedGeneratedSignature = tokenShapedSignature();
+  const ordinaryGeneratedSignature = signatureShapedString("sig");
+  return {
+    kind: "memory_provenance",
+    version: 1,
+    document_id: documentId,
+    companion: {
+      format: "SANCTUARY_SDW_MEMORY_PROVENANCE_V1",
+      origin_provenance_digest: "sha256:" + "a".repeat(64),
+      origin: {
+        body: {
+          format: "SANCTUARY_SDW_MEMORY_ORIGIN_V1",
+          origin_fortress_id: FORTRESS_ID,
+          owner_ref: "owner-a",
+          passage_id: "passage-a",
+          content_hash: "sha256:" + "b".repeat(64),
+          chunk_count: 1,
+          recorded_at: NOW,
+          signer_identity_id: "identity-a",
+          signer_did: "did:key:zSignerDidForFixture",
+          signature_scheme: "ed25519-v1",
+          author_agent_id: "system:memory-transcode",
+          ingress_channel: "memory_transcode",
+          source_class: "transcode_manifest",
+        },
+        signature: tokenShapedGeneratedSignature,
+      },
+      admission: {
+        body: {
+          format: "SANCTUARY_SDW_MEMORY_ADMISSION_V1",
+          origin_provenance_digest: "sha256:" + "a".repeat(64),
+          destination_fortress_id: FORTRESS_ID,
+          destination_owner_ref: "owner-a",
+          passage_id: "passage-a",
+          admission_channel: "local_write",
+          origin_trust_tier: "local_attested",
+          verification_basis: "local_primary_identity",
+          admitted_at: NOW,
+          signer_identity_id: "identity-a",
+          signer_did: "did:key:zSignerDidForFixture",
+          signature_scheme: "ed25519-v1",
+        },
+        signature: ordinaryGeneratedSignature,
+      },
+    },
+  };
+}
+
+function productSignedProvenanceRecord(documentId: string): SdwMemoryProvenanceRecord {
+  const originSigner = provenanceSigner("origin-signer", new Uint8Array(32).fill(1));
+  const admissionSigner = provenanceSigner("admission-signer", new Uint8Array(32).fill(2));
+  const contentHash = toBase64url(new Uint8Array(32).fill(3));
+  const origin = signMemoryOrigin(
+    {
+      origin_fortress_id: "fortress-destination",
+      owner_ref: "owner-destination",
+      passage_id: "passage-token-481664",
+      content_hash: contentHash,
+      chunk_count: 2,
+      recorded_at: "2026-08-24T12:34:56.789-06:00",
+      author_agent_id: "agent-claude",
+      ingress_channel: "memory_insert",
+      source_class: "user_content",
+    },
+    originSigner,
+  );
+  if (!origin.ok) throw new Error(`origin signing failed: ${origin.error.code}`);
+  const companion = createMemoryProvenanceCompanion(
+    origin.value,
+    {
+      destination_fortress_id: "fortress-destination",
+      destination_owner_ref: "owner-destination",
+      passage_id: "passage-token-481664",
+      admission_channel: "local_write",
+      origin_trust_tier: "local_attested",
+      verification_basis: "local_primary_identity",
+      admitted_at: "2026-08-24T12:35:01.123-06:00",
+    },
+    admissionSigner,
+  );
+  if (!companion.ok) throw new Error(`admission signing failed: ${companion.error.code}`);
+  return {
+    kind: "memory_provenance",
+    version: 1,
+    document_id: documentId,
+    companion: companion.value,
+  };
+}
+
+function provenanceSigner(
+  identityId: string,
+  seed: Uint8Array,
+): MemoryProvenanceSigningHandle {
+  const publicKey = ed25519.getPublicKey(seed);
+  return {
+    identity_id: identityId,
+    did: publicKeyToDid(publicKey),
+    public_key: publicKey,
+    sign: (bytes) => ed25519.sign(bytes, seed),
+  };
+}
+
+function verifyProvenanceRecord(record: SdwMemoryProvenanceRecord): SdwMemoryProvenanceRecord {
+  const verified = verifyMemoryProvenanceCompanion(record.companion, {
+    size: 2,
+    resolve: (_identityId, did) => publicKeyFromMemoryProvenanceDid(did),
+  }, {
+    origin: {
+      origin_fortress_id: record.companion.origin.body.origin_fortress_id,
+      owner_ref: record.companion.origin.body.owner_ref,
+      passage_id: record.companion.origin.body.passage_id,
+      content_hash: record.companion.origin.body.content_hash,
+      chunk_count: record.companion.origin.body.chunk_count,
+    },
+    destination: {
+      destination_fortress_id: record.companion.admission.body.destination_fortress_id,
+      destination_owner_ref: record.companion.admission.body.destination_owner_ref,
+      passage_id: record.companion.admission.body.passage_id,
+    },
+  });
+  if (!verified.ok) throw new Error(`provenance verification failed: ${verified.error.code}`);
+  return { ...record, companion: verified.value };
+}
+
+function tokenShapedSignature(): string {
+  return signatureShapedString("sk-");
+}
+
+function identifierTokenShapedSignature(): string {
+  const ed25519SignatureBase64urlChars = 86; // 86 = ceil(64 Ed25519 signature bytes * 8 / 6), no padding.
+  return "sk-" + "A".repeat(ed25519SignatureBase64urlChars - "sk-".length);
+}
+
+function signatureShapedString(prefix: string): string {
+  const ed25519SignatureBase64urlChars = 86; // 86 = ceil(64 Ed25519 signature bytes * 8 / 6), no padding.
+  return prefix + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-".repeat(2)
+    .slice(0, ed25519SignatureBase64urlChars - prefix.length);
+}
+
+function collectSignaturePaths(value: unknown, keyPath = "companion"): string[] {
+  if (value === null || typeof value !== "object") return [];
+  const object = value as { readonly [key: string]: unknown };
+  return Object.keys(object).flatMap((key) => {
+    const childPath = `${keyPath}.${key}`;
+    return key === "signature" ? [childPath] : collectSignaturePaths(object[key], childPath);
+  });
 }
 
 class MemoryStorage implements StorageBackend {

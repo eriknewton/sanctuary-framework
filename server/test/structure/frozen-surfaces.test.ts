@@ -236,6 +236,7 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "_query_anonymity_tier_b",
   "_query_anonymity_reverse_map",
   "_facade/hidden",
+  "_facade/memory_handles",
   // federation rotate-root at-rest keys (Slice 3a; renaming orphans an
   // in-progress rotation's staged record / journal):
   "trust-root-v1-next",

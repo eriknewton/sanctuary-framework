@@ -43,6 +43,82 @@ pub struct Admitted {
     pub loaded: LoadedManifest,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum InstallPolicyAdmissionError {
+    #[error(
+        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected {expected_form}; re-sign with the uid-<uid> form"
+    )]
+    MalformedAgentScope {
+        rule_id_display: String,
+        agent_id_display: String,
+        expected_form: &'static str,
+    },
+    #[error(
+        "rule {rule_id_display} scope.agent_ids entry {agent_id_display}: expected admitted uid {admitted_uid}"
+    )]
+    AgentScopeOutsideAdmission {
+        rule_id_display: String,
+        agent_id_display: String,
+        admitted_uid: u32,
+    },
+}
+
+const DIAGNOSTIC_ECHO_CELL_CHARS: usize = 8;
+// Must match `DIAGNOSTIC_ECHO_MAX_CHARS` in
+// server/src/castle-wall/allowlist/bounded-diagnostic-text.ts.
+const DIAGNOSTIC_ECHO_MAX_CHARS: usize = DIAGNOSTIC_ECHO_CELL_CHARS * DIAGNOSTIC_ECHO_CELL_CHARS;
+
+fn bounded_diagnostic_text(value: &str) -> String {
+    let original_len = value.chars().count();
+    if original_len <= DIAGNOSTIC_ECHO_MAX_CHARS {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+    format!("{prefix}... (original length {original_len})")
+}
+
+fn validate_install_agent_id_scopes(
+    rules: &[crate::policy::AllowlistRule],
+    admitted_uid: u32,
+) -> std::result::Result<(), InstallPolicyAdmissionError> {
+    for rule in rules {
+        // The reserved distress lane is code-derived and shape-checked here; operator-authored agent scopes use confined ids.
+        if crate::habeas::is_derived_habeas_rule(rule) {
+            continue;
+        }
+        for agent_id in &rule.scope.agent_ids {
+            let Some(uid) = crate::nftables::parse_confined_agent_id(agent_id) else {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                return Err(InstallPolicyAdmissionError::MalformedAgentScope {
+                    rule_id_display: bounded_diagnostic_text(&rule.id),
+                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
+                    expected_form: crate::nftables::CONFINED_AGENT_ID_FORM,
+                });
+            };
+            // The install profile rejects gate_uid above, so its admitted confined-id set is the agent uid singleton.
+            if uid != admitted_uid {
+                // Refusal diagnostics include local rule text, so each echoed value gets a fixed display budget.
+                return Err(InstallPolicyAdmissionError::AgentScopeOutsideAdmission {
+                    rule_id_display: bounded_diagnostic_text(&rule.id),
+                    agent_id_display: bounded_diagnostic_text(&format!("{agent_id:?}")),
+                    admitted_uid,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_loaded_install_agent_id_scopes(
+    loaded: &LoadedManifest,
+    admitted_uid: u32,
+) -> Result<PolicySnapshot> {
+    let snapshot = PolicySnapshot::from_loaded_manifest(loaded)?;
+    // The scope check consumes the exact typed rules the daemon will install; unreadable bytes cannot be skipped.
+    validate_install_agent_id_scopes(&snapshot.rules, admitted_uid)?;
+    Ok(snapshot)
+}
+
 pub fn admit_bundle(
     bytes: &[u8],
     pin: &str,
@@ -115,7 +191,7 @@ pub fn admit_bundle(
         signed,
         rule_files,
     };
-    PolicySnapshot::from_loaded_manifest(&loaded)?;
+    let _snapshot = validate_loaded_install_agent_id_scopes(&loaded, identity.agent_uid)?;
     Ok(Admitted {
         key,
         manifest_bytes,
@@ -367,4 +443,181 @@ pub fn read_installed(root: &Root, t: &Transaction, marker: &ConfiguredV1) -> Re
         return Err("installed policy differs from Configured or high-water".into());
     }
     Ok(admitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        constants::SIGNATURE_SCHEME_V1,
+        manifest::verify::{
+            AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+        },
+    };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    const TEST_FILE: &str = "linux-explicit-ip.json";
+    const TEST_RULE_ID: &str = "linux-explicit-ip";
+    const TEST_FORTRESS_ID: &str = "0123456789abcdef";
+    const TEST_ADMITTED_UID: u32 = 60123;
+
+    fn rule_body(rule_id: &str, agent_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": rule_id,
+            "schema_version": 1,
+            "created_at": "2026-10-01T00:00:00Z",
+            "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+            "scope": { "agent_ids": [agent_id] },
+            "disposition": "allow"
+        }))
+        .unwrap()
+    }
+
+    fn loaded_with_body(rule_id: &str, body: Option<Vec<u8>>) -> LoadedManifest {
+        let mut rule_files = HashMap::new();
+        let sha = body
+            .as_ref()
+            .map(|bytes| sha256(bytes))
+            .unwrap_or_else(|| "0".repeat(64));
+        if let Some(body) = body {
+            rule_files.insert(TEST_FILE.to_string(), body);
+        }
+        LoadedManifest {
+            manifest_signature_b64url: URL_SAFE_NO_PAD.encode([0; 64]),
+            rule_count: 1,
+            signed: SignedManifest {
+                manifest: AllowlistManifest {
+                    schema_version: 1,
+                    fortress_id: TEST_FORTRESS_ID.to_string(),
+                    issued_at: "2026-10-01T00:00:00Z".to_string(),
+                    generation: 1,
+                    agent_origin: None,
+                    operator_baseline: None,
+                    rules: vec![ManifestRuleEntry {
+                        rule_id: rule_id.to_string(),
+                        file: TEST_FILE.to_string(),
+                        sha256: sha,
+                    }],
+                },
+                signature: ManifestSignature {
+                    signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
+                    signing_key_id: "sha256:placeholder".to_string(),
+                    signature_b64url: URL_SAFE_NO_PAD.encode([0; 64]),
+                },
+            },
+            rule_files,
+        }
+    }
+
+    #[test]
+    fn install_scope_check_refuses_loaded_manifest_shapes_it_cannot_check() {
+        let missing = validate_loaded_install_agent_id_scopes(
+            &loaded_with_body(TEST_RULE_ID, None),
+            TEST_ADMITTED_UID,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("not present"), "{missing}");
+
+        let malformed = validate_loaded_install_agent_id_scopes(
+            &loaded_with_body(TEST_RULE_ID, Some(b"{}".to_vec())),
+            TEST_ADMITTED_UID,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(malformed.contains("could not be parsed"), "{malformed}");
+
+        let mismatched = validate_loaded_install_agent_id_scopes(
+            &loaded_with_body(
+                TEST_RULE_ID,
+                Some(rule_body(
+                    "body-id",
+                    &format!("{TEST_FORTRESS_ID}/uid-60123"),
+                )),
+            ),
+            TEST_ADMITTED_UID,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            mismatched.contains("declares rule_id body-id"),
+            "{mismatched}"
+        );
+    }
+
+    #[test]
+    fn install_scope_check_does_not_exempt_operator_authored_habeas_shape() {
+        let rule: crate::policy::AllowlistRule = serde_json::from_value(serde_json::json!({
+            "id": crate::habeas::HABEAS_LOCAL_RULE_ID,
+            "schema_version": 1,
+            "created_at": "2026-10-01T00:00:00Z",
+            "match": { "ip": ["127.0.0.1", "::1"], "port": [crate::habeas::HABEAS_DISTRESS_PORT], "protocol": "tcp" },
+            "scope": { "agent_ids": ["uid-60124"] },
+            "disposition": "allow"
+        }))
+        .unwrap();
+        assert!(!crate::habeas::is_derived_habeas_rule(&rule));
+        let err = validate_install_agent_id_scopes(&[rule], TEST_ADMITTED_UID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("admitted uid 60123"), "{err}");
+    }
+
+    #[test]
+    fn install_scope_refusals_keep_operator_text_within_display_budget() {
+        const TEST_DIAGNOSTIC_TEXT_CAP: usize = 8 * 8;
+        const TEST_LONG_TEXT_LENGTH: usize = TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP;
+        let long_rule_id = format!("rule-{}", "r".repeat(TEST_LONG_TEXT_LENGTH));
+        let long_agent_id = format!("agent-{}", "a".repeat(TEST_LONG_TEXT_LENGTH));
+        let malformed_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": [long_agent_id] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let malformed = validate_install_agent_id_scopes(&[malformed_rule], TEST_ADMITTED_UID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            malformed.contains(&format!("original length {}", long_rule_id.len())),
+            "{malformed}"
+        );
+        assert!(
+            malformed.contains(&format!("original length {}", long_agent_id.len() + 2)),
+            "{malformed}"
+        );
+        assert!(!malformed.contains(&long_rule_id), "{malformed}");
+        assert!(!malformed.contains(&long_agent_id), "{malformed}");
+        assert!(
+            malformed.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{malformed}"
+        );
+
+        let outside_rule: crate::policy::AllowlistRule =
+            serde_json::from_value(serde_json::json!({
+                "id": long_rule_id,
+                "schema_version": 1,
+                "created_at": "2026-10-01T00:00:00Z",
+                "match": { "ip": ["203.0.113.10"], "port": [443], "protocol": "tcp" },
+                "scope": { "agent_ids": ["uid-60124"] },
+                "disposition": "allow"
+            }))
+            .unwrap();
+        let outside = validate_install_agent_id_scopes(&[outside_rule], TEST_ADMITTED_UID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            outside.contains(&format!("original length {}", long_rule_id.len())),
+            "{outside}"
+        );
+        assert!(!outside.contains(&long_rule_id), "{outside}");
+        assert!(
+            outside.len() < TEST_DIAGNOSTIC_TEXT_CAP * TEST_DIAGNOSTIC_TEXT_CAP,
+            "{outside}"
+        );
+    }
 }

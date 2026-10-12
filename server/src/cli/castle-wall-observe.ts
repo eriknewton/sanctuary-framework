@@ -57,9 +57,12 @@ import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   localManifestSigner,
   publishSignedManifest,
+  type BuildSignedManifestInput,
   type ManifestSigner,
   type ManifestStorage,
 } from "../castle-wall/runtime/manifest-publisher.js";
+import { publishLinuxCompatiblePolicy } from "../castle-wall/runtime/linux-policy-compatibility.js";
+import { RuntimeLinuxActivationError } from "../castle-wall/runtime/errors.js";
 import type { SignedManifest } from "../castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import {
@@ -80,6 +83,7 @@ import {
   type ObserveGranularity,
   type ObserveQuarantinedSourceState,
   type PromoteRouting,
+  type PromoteOutcome,
   type PromoteSelectionRow,
   type RefreshAuditSourceDescriptor,
   type RefreshAllowlistRead,
@@ -127,6 +131,8 @@ export interface ObserveCommandContext {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Test seam for platform-specific publish selection. Production uses process.platform. */
+  platform?: NodeJS.Platform;
   /** Test seam for the root-owned boot-token path. Production uses the default custody path. */
   bootTokenPath?: string;
   /**
@@ -1203,6 +1209,42 @@ export function observePromoteFileLock(
   return egressPolicyWriterLock(fortressPath, onContention);
 }
 
+type ObservePromotePublisher = (
+  input: BuildSignedManifestInput,
+  storage: ManifestStorage,
+) => ReturnType<typeof publishSignedManifest>;
+
+export function selectObservePromotePublisher(platform: NodeJS.Platform): ObservePromotePublisher {
+  // Continuing-path table, AGENTS rule 13:
+  // darwin: use the existing signed-manifest publisher; macOS composition remains the re-arm gate.
+  // linux compatible: use the shared Linux compatibility publisher, then publish.
+  // linux incompatible: the shared Linux compatibility publisher refuses before signing or storage writes.
+  // unknown: use the existing signed-manifest publisher because no Linux platform claim was made.
+  return platform === "linux" ? publishLinuxCompatiblePolicy : publishSignedManifest;
+}
+
+function isLinuxPolicyCompatibilityRefusal(error: unknown): error is RuntimeLinuxActivationError {
+  return (
+    error instanceof RuntimeLinuxActivationError &&
+    error.reason === "policy_incompatible"
+  );
+}
+
+function linuxObservePromoteRemedy(routingMode: PromoteRouting["mode"]): string {
+  if (routingMode === "exclusive") {
+    return (
+      "Exclusive (gate) routing is macOS-only: its promoted rules use the macOS-only scope.uids axis, " +
+      "which the Linux profile refuses, and Linux has no gate principal. To allow a destination on Linux, " +
+      "author an IP/CIDR rule scoped as scope.agent_ids=uid-<agent uid> with `sanctuary linux-policy sign`."
+    );
+  }
+  return (
+    "On Linux, a signable rule is IP/CIDR-only and scoped as scope.agent_ids=uid-<agent uid>; " +
+    "observe promote does not yet synthesize that shape from observed traffic. " +
+    "Author it with `sanctuary linux-policy sign`."
+  );
+}
+
 /** Shared O_EXCL fortress lockfile implementation behind both locks above. */
 function fortressExclusiveFileLock(
   lockPath: string,
@@ -1819,51 +1861,67 @@ export async function runObservePromote(
   const publishLock = observePromoteFileLock(boot.fortressPath, (holder) => {
     promoteLockHolder = holder;
   });
+  const publishManifest = selectObservePromotePublisher(ctx.platform ?? process.platform);
 
-  const outcome = await promoteCandidates(selection, candidatesByKey, {
-    readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
-    approve: (operation, context) => gate.evaluate(operation, context),
-    publish: (rules, descriptors) =>
-      publishSignedManifest(
-        {
-          fortressId,
-          issuedAt: new Date().toISOString(),
-          rules,
-          signer,
-          // Carry the VERIFIED manifest-level descriptors through so a re-sign
-          // preserves operator_baseline + agent_origin (#897 P1). buildSignedManifest
-          // re-runs each through its fail-closed validator (idempotent for an
-          // already-signed descriptor), so a carried-forward value is emitted
-          // faithfully and a malformed one would still be dropped.
-          ...(descriptors.agentOrigin !== undefined ? { agentOrigin: descriptors.agentOrigin } : {}),
-          ...(descriptors.operatorBaseline !== undefined
-            ? { operatorBaseline: descriptors.operatorBaseline }
-            : {}),
-        },
-        manifestStorage,
-      ),
-    auditPromotedCandidate: async (row) => {
-      await boot.auditLog.appendCritical({
-        layer: "l1",
-        operation: "castle_wall_observe_promote",
-        identity_id: boot.primary.identity_id,
-        result: "success",
-        details: {
-          candidate_key: row.key,
-          rule_id: row.rule_id,
-          destination: destinationLabel(row.candidate),
-          routing_mode: routing.mode,
-        },
-      });
-    },
-    now: new Date(),
-    routing,
-    // Fix-round F5: the Tier-1 approval can block on a human; re-resolve the
-    // marker after it returns so a mode flip in that window aborts instead of
-    // signing rules scoped for the fortress as it no longer is.
-    reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
-    publishLock,
-  });
+  let outcome: PromoteOutcome;
+  try {
+    outcome = await promoteCandidates(selection, candidatesByKey, {
+      readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
+      approve: (operation, context) => gate.evaluate(operation, context),
+      publish: (rules, descriptors) =>
+        publishManifest(
+          {
+            fortressId,
+            issuedAt: new Date().toISOString(),
+            rules,
+            signer,
+            // Carry the VERIFIED manifest-level descriptors through so a re-sign
+            // preserves operator_baseline + agent_origin (#897 P1). buildSignedManifest
+            // re-runs each through its fail-closed validator (idempotent for an
+            // already-signed descriptor), so a carried-forward value is emitted
+            // faithfully and a malformed one would still be dropped.
+            ...(descriptors.agentOrigin !== undefined ? { agentOrigin: descriptors.agentOrigin } : {}),
+            ...(descriptors.operatorBaseline !== undefined
+              ? { operatorBaseline: descriptors.operatorBaseline }
+              : {}),
+          },
+          manifestStorage,
+        ),
+      auditPromotedCandidate: async (row) => {
+        await boot.auditLog.appendCritical({
+          layer: "l1",
+          operation: "castle_wall_observe_promote",
+          identity_id: boot.primary.identity_id,
+          result: "success",
+          details: {
+            candidate_key: row.key,
+            rule_id: row.rule_id,
+            destination: destinationLabel(row.candidate),
+            routing_mode: routing.mode,
+          },
+        });
+      },
+      now: new Date(),
+      routing,
+      // Fix-round F5: the Tier-1 approval can block on a human; re-resolve the
+      // marker after it returns so a mode flip in that window aborts instead of
+      // signing rules scoped for the fortress as it no longer is.
+      reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
+      publishLock,
+    });
+  } catch (error) {
+    if (isLinuxPolicyCompatibilityRefusal(error)) {
+      const message = error.message;
+      write(
+        err,
+        `Aborted: observe promote cannot publish this ruleset on Linux: ${message}. ` +
+          "Nothing changed; no manifest was re-signed. " +
+          `${linuxObservePromoteRemedy(routing.mode)}\n`,
+      );
+      return 1;
+    }
+    throw error;
+  }
 
   if (outcome.status === "no_candidates") {
     if (selection.length === 0) {

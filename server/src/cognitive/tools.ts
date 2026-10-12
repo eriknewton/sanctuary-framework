@@ -6,6 +6,7 @@
  */
 
 import { isNamespaceDiscoveryLimitError } from "../storage/interface.js";
+import { withRequiredCrossProcessLock } from "../storage/cross-process-lock.js";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
@@ -38,12 +39,18 @@ import {
   stringToBytes,
 } from "../core/encoding.js";
 import type { StorageBackend } from "../storage/interface.js";
+import { assertStorageNamespacePathComponent } from "../storage/namespace-component.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
+  MemoryHandleOwnershipConflictError,
+  MEMORY_HANDLE_PATTERN,
+  MEMORY_HANDLE_RECORD_VERSION,
+  MEMORY_HANDLE_REGISTRY_LOCK,
+  MEMORY_HANDLE_REGISTRY_NAMESPACE,
   normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
@@ -1005,8 +1012,100 @@ export function createCognitiveTools(
   namespaceRegistry: OpaqueNamespaceRegistry;
 } {
   const identityMgr = new IdentityManager(storage, masterKey);
-  const namespaceRegistry = options?.namespaceRegistry ?? new OpaqueNamespaceRegistry();
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const parseMemoryHandleRecord = (
+    value: string,
+    expectedIdentityId?: string
+  ): string | null => {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (
+      parsed.v !== MEMORY_HANDLE_RECORD_VERSION ||
+      typeof parsed.identity_id !== "string" ||
+      typeof parsed.handle !== "string" ||
+      !MEMORY_HANDLE_PATTERN.test(parsed.handle)
+    ) {
+      throw new Error("invalid memory handle registry record");
+    }
+    if (expectedIdentityId !== undefined && parsed.identity_id !== expectedIdentityId) {
+      throw new Error("memory handle registry identity mismatch");
+    }
+    return parsed.handle;
+  };
+  const loadPersistedMemoryHandle = async (identityId: string): Promise<string | null> => {
+    const read = await stateStore.read(MEMORY_HANDLE_REGISTRY_NAMESPACE, identityId, true);
+    if (!read) return null;
+    return parseMemoryHandleRecord(read.value, identityId);
+  };
+  const namespaceRegistry = options?.namespaceRegistry ?? new OpaqueNamespaceRegistry({
+    loadHandleForIdentity: loadPersistedMemoryHandle,
+    claimHandleForIdentity: async (identityId, mint) =>
+      withRequiredCrossProcessLock(
+        storage,
+        MEMORY_HANDLE_REGISTRY_NAMESPACE,
+        MEMORY_HANDLE_REGISTRY_LOCK,
+        async () => {
+          const existing = await loadPersistedMemoryHandle(identityId);
+          if (existing) return existing;
+          const identity = identityMgr.get(identityId);
+          if (!identity) throw new Error("Identity not found");
+          const handle = mint();
+          await stateStore.write(
+            MEMORY_HANDLE_REGISTRY_NAMESPACE,
+            identityId,
+            JSON.stringify({
+              v: MEMORY_HANDLE_RECORD_VERSION,
+              identity_id: identityId,
+              handle,
+            }),
+            identity.identity_id,
+            identity.encrypted_private_key,
+            identityEncKey,
+            {
+              provenance: {
+                origin_actor: "system",
+                origin_ref: identityId,
+              },
+            }
+          );
+          return handle;
+        },
+        {
+          // Memory-handle first use shares custody's process-owned lock shape:
+          // a crashed claimant must leave no inert file that blocks all later
+          // first-use claims for this fortress.
+          kernelBacked: true,
+          metadata: { operation: "memory_handle_registry_claim" },
+        }
+      ),
+    findOwnerForHandle: async (handle) => {
+      if (!MEMORY_HANDLE_PATTERN.test(handle)) return undefined;
+      // Identity count is operator-created state; scanning this reserved
+      // namespace is bounded by the number of identities in the fortress, not
+      // by attacker-supplied memory keys.
+      const entries = await storage.list(MEMORY_HANDLE_REGISTRY_NAMESPACE);
+      let owner: string | undefined;
+      for (const entry of entries) {
+        const read = await stateStore.read(
+          MEMORY_HANDLE_REGISTRY_NAMESPACE,
+          entry.key,
+          true
+        );
+        if (!read) continue;
+        // The storage key is the principal being trusted; the signed record body
+        // must agree before this scan can use it as ownership evidence.
+        const persisted = parseMemoryHandleRecord(read.value, entry.key);
+        if (persisted === handle) {
+          // More than one verified principal naming the same handle is ambiguous
+          // ownership evidence, so refuse before any list order can decide.
+          if (owner !== undefined && owner !== entry.key) {
+            throw new MemoryHandleOwnershipConflictError();
+          }
+          owner = entry.key;
+        }
+      }
+      return owner;
+    },
+  });
   const internalSigning = createInternalIdentitySigningHelpers(
     identityMgr,
     masterKey,
@@ -1040,13 +1139,41 @@ export function createCognitiveTools(
     return toolResult(fixedDenial(`audit:${operation}`));
   }
 
-  function assertOpaqueNamespaceOwned(namespace: string): void {
-    namespaceRegistry.assertOwned(namespace, options?.currentSessionBinding?.());
+  async function assertOpaqueNamespaceOwned(namespace: string): Promise<void> {
+    await namespaceRegistry.assertOwnedPersisted(namespace, options?.currentSessionBinding?.());
   }
 
-  function assertOpaqueNamespacesOwned(namespaces: string[]): void {
+  async function assertOpaqueNamespacesOwned(namespaces: string[]): Promise<void> {
     for (const namespace of namespaces) {
-      namespaceRegistry.assertOwned(namespace, options?.currentSessionBinding?.());
+      await namespaceRegistry.assertOwnedPersisted(namespace, options?.currentSessionBinding?.());
+    }
+  }
+
+  async function refuseInvalidStorageNamespace(
+    operation: string,
+    namespace: string
+  ): Promise<never> {
+    await denyNamespaceAccess(operation, namespace);
+    throw new Error("namespace_not_single_component");
+  }
+
+  async function assertToolNamespaceReady(
+    operation: string,
+    namespace: string
+  ): Promise<void> {
+    try {
+      assertStorageNamespacePathComponent(namespace);
+    } catch {
+      await refuseInvalidStorageNamespace(operation, namespace);
+    }
+  }
+
+  async function assertToolNamespacesReady(
+    operation: string,
+    namespaces: string[]
+  ): Promise<void> {
+    for (const namespace of namespaces) {
+      await assertToolNamespaceReady(operation, namespace);
     }
   }
 
@@ -1064,11 +1191,10 @@ export function createCognitiveTools(
         exportable.push(namespace);
         continue;
       }
-      const owner = namespaceRegistry.getOwner(namespace);
+      const owner = await namespaceRegistry.getOwner(namespace);
       if (!owner) {
-        // Ownership is process-local: after restart a fresh registry cannot
-        // authenticate durable opaque handles, so session-bound bulk export
-        // refuses while any orphaned handle remains, even for the same identity.
+        // A `mem_*` namespace without a durable owner record cannot be scoped
+        // to this session, so bulk export refuses rather than guessing.
         throw new Error("namespace_ownership_ambiguous");
       }
       if (owner === active.identity_id) {
@@ -1456,7 +1582,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key", "value"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_write", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_write", args.namespace as string);
         // Namespace firewall: reject writes to reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1467,7 +1598,7 @@ export function createCognitiveTools(
         }
 
         try {
-          assertOpaqueNamespaceOwned(args.namespace as string);
+          await assertOpaqueNamespaceOwned(args.namespace as string);
           assertIdentityMatchesSession(args.identity_id as string | undefined, "state_write");
         } catch {
           return denyNamespaceAccess("state_write", args.namespace as string);
@@ -1543,7 +1674,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_read", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_read", args.namespace as string);
         // Namespace firewall: reject reads from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1554,7 +1690,7 @@ export function createCognitiveTools(
         }
 
         try {
-          assertOpaqueNamespaceOwned(args.namespace as string);
+          await assertOpaqueNamespaceOwned(args.namespace as string);
         } catch {
           return denyNamespaceAccess("state_read", args.namespace as string);
         }
@@ -1656,12 +1792,22 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        return args;
+      },
       handler: async (args) => {
-        // THE NAMESPACE FIREWALL IS NOT APPLIED HERE. It lives inside
+        await assertToolNamespaceReady(
+          UNATTRIBUTED_DISCLOSURE_OPERATION,
+          args.namespace as string,
+        );
+        // The reserved/opaque namespace firewall lives inside
         // `discloseUnattributedState` with the rest of this operation's
         // obligations, so the CLI verb cannot ship without it; this handler
-        // only RENDERS the two refusals it can return. Applying it here as
-        // well would recreate the divergence that move closed.
+        // only renders the two refusal shapes it can return.
         //
         // FAIL CLOSED ON A MISSING AUDIT LOG. `auditLog` is optional on this
         // factory, and the shared `recordCriticalAudit` helper above silently
@@ -1751,7 +1897,12 @@ export function createCognitiveTools(
         },
         required: ["namespace"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_list", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_list", args.namespace as string);
         // Namespace firewall: reject listing of reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1762,7 +1913,7 @@ export function createCognitiveTools(
         }
 
         try {
-          assertOpaqueNamespaceOwned(args.namespace as string);
+          await assertOpaqueNamespaceOwned(args.namespace as string);
         } catch {
           return denyNamespaceAccess("state_list", args.namespace as string);
         }
@@ -1795,7 +1946,12 @@ export function createCognitiveTools(
         },
         required: ["namespace", "key"],
       },
+      approvalTargetArgs: async (args) => {
+        await assertToolNamespaceReady("state_delete", args.namespace as string);
+        return args;
+      },
       handler: async (args) => {
+        await assertToolNamespaceReady("state_delete", args.namespace as string);
         // Namespace firewall: reject deletes from reserved internal namespaces
         const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
         if (reservedViolation) {
@@ -1806,7 +1962,7 @@ export function createCognitiveTools(
         }
 
         try {
-          assertOpaqueNamespaceOwned(args.namespace as string);
+          await assertOpaqueNamespaceOwned(args.namespace as string);
         } catch {
           return denyNamespaceAccess("state_delete", args.namespace as string);
         }
@@ -1873,6 +2029,7 @@ export function createCognitiveTools(
       approvalTargetArgs: async (args) => {
         let namespaces: string[];
         if (typeof args.namespace === "string") {
+          await assertToolNamespaceReady("state_export", args.namespace);
           // Reject a reserved namespace BEFORE the human is asked to
           // approve it, rather than after: `exportNamespaces` (state-
           // store.ts F6) filters `_`-prefixed namespaces at execution, so
@@ -1940,10 +2097,11 @@ export function createCognitiveTools(
           );
         }
         const namespaces = [...binding.namespaces];
+        await assertToolNamespacesReady("state_export", namespaces);
 
         if (typeof args.namespace === "string") {
           try {
-            assertOpaqueNamespaceOwned(args.namespace);
+            await assertOpaqueNamespaceOwned(args.namespace);
           } catch {
             return denyNamespaceAccess("state_export", args.namespace);
           }
@@ -1984,15 +2142,20 @@ export function createCognitiveTools(
         },
         required: ["bundle"],
       },
-      approvalTargetArgs: (args) => ({
-        ...args,
-        namespaces: decodeExportBundleNamespaces(args.bundle as string),
-      }),
+      approvalTargetArgs: async (args) => {
+        const namespaces = decodeExportBundleNamespaces(args.bundle as string);
+        await assertToolNamespacesReady("state_import", namespaces);
+        return {
+          ...args,
+          namespaces,
+        };
+      },
       handler: async (args) => {
         let targetNamespaces: string[];
         try {
           targetNamespaces = decodeExportBundleNamespaces(args.bundle as string);
-          assertOpaqueNamespacesOwned(targetNamespaces);
+          await assertToolNamespacesReady("state_import", targetNamespaces);
+          await assertOpaqueNamespacesOwned(targetNamespaces);
         } catch {
           return denyNamespaceAccess("state_import", "state_import");
         }

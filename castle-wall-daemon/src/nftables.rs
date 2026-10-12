@@ -3807,9 +3807,14 @@ fn parse_owned_table_inventory_phases(
 /// installs the binding, the readback that proves it, and the set rule that
 /// health re-applies on every poll. It is also a seal input through
 /// [`AgentRulesetId::agent_id`], so a drift here would make a legitimate rule
-/// fail to verify after a restart. Must match the protection subject
-/// `<fortress>/uid-<U>` the WAL attributes denials to.
+/// fail to verify after a restart. The confined id is `uid-<U>`, while the
+/// protection-subject id used in audit evidence is `<fortress>/uid-<U>`.
 pub const CONFINED_AGENT_ID_PREFIX: &str = "uid-";
+// Must match `CONFINED_AGENT_ID_PREFIX` in
+// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+// Must match `CONFINED_AGENT_ID_FORM` in
+// `server/src/castle-wall/allowlist/confined-agent-id.ts`.
+pub const CONFINED_AGENT_ID_FORM: &str = "uid-<decimal uid>";
 
 /// The agent id for a manifest-admitted uid. See [`CONFINED_AGENT_ID_PREFIX`].
 ///
@@ -3817,9 +3822,28 @@ pub const CONFINED_AGENT_ID_PREFIX: &str = "uid-";
 /// the daemon installs: a test that spelled the id itself would be a
 /// hand-mirrored copy of this derivation, and the first change here would leave
 /// it silently installing a second chain for the same uid.
-#[cfg(any(target_os = "linux", test))]
 pub fn confined_agent_id(agent_uid: u32) -> String {
     format!("{CONFINED_AGENT_ID_PREFIX}{agent_uid}")
+}
+
+/// Parse the canonical confined id form used by Linux policy scopes.
+///
+/// Must match `parseConfinedAgentId` in
+/// `server/src/castle-wall/allowlist/confined-agent-id.ts` and the shared
+/// vector file at `castle-wall-daemon/test-vectors/confined-agent-id-v1.json`.
+pub fn parse_confined_agent_id(agent_id: &str) -> Option<u32> {
+    let raw_uid = agent_id.strip_prefix(CONFINED_AGENT_ID_PREFIX)?;
+    if raw_uid.is_empty() {
+        return None;
+    }
+    if raw_uid.len() > 1 && raw_uid.starts_with('0') {
+        return None;
+    }
+    if !raw_uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let uid = raw_uid.parse::<u32>().ok()?;
+    (confined_agent_id(uid) == agent_id).then_some(uid)
 }
 
 /// Every live `(agent_id, uid)` binding an owned table declares: the set the

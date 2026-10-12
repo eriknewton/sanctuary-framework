@@ -202,8 +202,8 @@ jobs:
           # Question 2 is not implied by question 1: a `required-features` target
           # that is not selected is silently absent from the run, and cargo still
           # exits 0 having tested nothing on that path. Keep this list equal to the
-          # gated set in castle-wall-daemon/Cargo.toml; `tests/test_isolation_gate.rs`
-          # pins that set from the other side.
+          # gated set in castle-wall-daemon/Cargo.toml plus test_isolation_gate;
+          # linux_workflow_suite_ran_loop_matches_the_gated_target_set enforces it.
           # The guard greps PLAIN text. Cargo colours its "Running" banner when
           # CARGO_TERM_COLOR is set (the job env sets it), which puts an escape
           # sequence between "Running" and the path and makes every grep below
@@ -211,10 +211,12 @@ jobs:
           # log showed it ran. Colour is forced off above AND stripped here, so
           # the guard cannot be defeated by a colour setting from either side.
           sed 's/\x1b\[[0-9;]*m//g' cargo-test.log > cargo-test.plain.log
+          # suite-list-begin: list/body through `done` must match castle-wall-daemon/tests/test_isolation_gate.rs
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
-                       test_isolation_gate; do
+                       confined_agent_id test_isolation_gate; do
+          # suite-list-end: body through `done` must match WORKFLOW_SUITE_RAN_LOOP_BODY in castle-wall-daemon/tests/test_isolation_gate.rs
             grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
               exit 1
