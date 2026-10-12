@@ -663,6 +663,11 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
   _handshake: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _shr: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _composition: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
+  // Must match MEMORY_HANDLE_REGISTRY_NAMESPACE in agent-native/safety-base.ts
+  // and the at-rest entry in server/reorg-surface-manifest.md. Unlike
+  // `_facade/hidden`, this namespace is written through StateStore, so master
+  // rotation handles it with the ordinary signed state-entry recipe.
+  "_facade/memory_handles": { kind: "state" },
   "_facade/hidden": { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   "castle-wall": {
     kind: "unsupported",

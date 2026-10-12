@@ -38,7 +38,7 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
   const seed = new StateStore(storage, masterKey);
   const encKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity: identity } = createIdentity("cold-export", encKey, "recovery-key");
-  const registry = new OpaqueNamespaceRegistry();
+  const registry = OpaqueNamespaceRegistry.testOnlyInMemory();
   const owned = registry.issueMemoryHandle(identity.identity_id);
   const foreign = registry.issueMemoryHandle("other-identity");
   const namespaces = ["alpha", "beta", "_internal"];
@@ -53,7 +53,7 @@ async function fixture(sessionScoped = false, ambiguousOwner = false, restart = 
   const baseline = new BaselineTracker(reopened, masterKey);
   await baseline.load();
   const { tools } = createCognitiveTools(cold, reopened, masterKey, "recovery-key", audit, {
-    namespaceRegistry: restart ? new OpaqueNamespaceRegistry() : registry,
+    namespaceRegistry: restart ? OpaqueNamespaceRegistry.testOnlyInMemory() : registry,
     currentSessionBinding: () => sessionScoped ? {
       identity_id: identity.identity_id,
       requester_identity_fingerprint: fingerprintIdentityId(identity.identity_id),
