@@ -660,6 +660,7 @@ describe("withCrossProcessLock", () => {
           const stale = createServer((socket) => socket.destroy());
           await new Promise((resolve, reject) => {
             stale.once("error", reject);
+            // port-discipline: ignore - source is a private Unix-domain socket path, not a TCP port
             stale.listen(source, resolve);
           });
           linkSync(source, socketPath);
