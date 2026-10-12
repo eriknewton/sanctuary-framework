@@ -630,6 +630,7 @@ fn bounded_diagnostic_text(value: &str) -> String {
                 escaped.push(c);
             }
             c => {
+                // Safety: fmt::Write for String is infallible; it only grows the buffer.
                 write!(&mut escaped, "\\u{{{:04X}}}", c as u32)
                     .expect("writing to a String cannot fail");
             }
