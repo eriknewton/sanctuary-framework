@@ -829,6 +829,7 @@ export async function createSanctuaryServer(options?: {
     },
 
     {
+      // Must match EVALUATE_ROUTE_TOOLS.monitorHealth in server/src/agent-native/capabilities-catalog.ts.
       name: "monitor_health",
       // Honesty (audit seam #4): the prior copy promised a "live Castle Wall
       // enforcement state" that no detector feeds. Castle Wall status reflects

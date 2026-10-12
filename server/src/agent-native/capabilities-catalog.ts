@@ -221,11 +221,27 @@ export interface EvaluateRoute {
 }
 
 /**
+ * The evaluate nouns: an intent that carries one of these is a question about
+ * the socket itself, so `classifyIntent` consults EVALUATE_ROUTES before the
+ * ordinary remember/recall verbs ("read the bounds" is a bounds question, not
+ * a memory read). An intent without one ("read my timezone") never reaches
+ * the early evaluate check, which is what keeps the memory routes
+ * byte-identical. Every noun here is matched by at least one route below, so
+ * a noun hit always lands on a question. Never the `g` flag (test() would
+ * keep state).
+ */
+export const EVALUATE_NOUNS =
+  /\b(bounds?|platforms?|install(ing|ed|ation)?|uninstall|verify|verified|verification|protect(s|ed|ion|ions)?|evidence|matrix|tiers?|proven|unproven)\b/;
+
+/**
  * Evaluate-intent routing table, consumed by `classifyIntent` in
  * `cooperative-surface.ts`. Ordered from the most specific question to the
  * broadest so "how do I verify the install" lands on `verify`, not on
  * `install_decision`. Every route is read-only or CLI guidance: nothing here
- * can mutate state, so the help tool may return a runnable example for it.
+ * can mutate state. A runnable example is offered only where the tool runs
+ * unattended (Tier 3 under the default policy); the Tier 1 policy read gets
+ * guidance only, because an example the agent follows would trigger an
+ * operator prompt and audit `runnable_example: true` for a gated call.
  */
 export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
   {
@@ -247,10 +263,13 @@ export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
   {
     question: "tiers",
     matches: /\btiers?\b|\bneeds? a human\b/,
-    tool: EVALUATE_ROUTE_TOOLS.policyStatus,
-    example: {},
-    why_sanctuary: "sanctuary_policy_status is read-only but Tier 1: it waits for operator approval on every call, because reading the policy is never unattended.",
-    guidance: SERVER_BOUNDS.tiers,
+    // No runnable example: sanctuary_policy_status is forced Tier 1 under the
+    // default policy, so an example here would walk the agent into an
+    // operator prompt; the tool stays named in EVALUATE_RELATED_TOOLS.
+    tool: null,
+    example: null,
+    why_sanctuary: "The tier answer is stated here from the README; sanctuary_policy_status lists the active assignments but is itself Tier 1, so no runnable example is offered.",
+    guidance: `${SERVER_BOUNDS.tiers} sanctuary_policy_status returns the active Tier 1 and Tier 3 lists but is itself Tier 1 (waits for operator approval on every call), so call it only when the operator expects the prompt.`,
   },
   {
     question: "protections",
@@ -263,7 +282,7 @@ export const EVALUATE_ROUTES: readonly EvaluateRoute[] = [
   {
     question: "bounds",
     matches:
-      /\bbounds?\b|\blimits?\b|\blimitations?\b|\bunproven\b|\bnot proven\b|\bplatforms?\b|\bmacos\b|\blinux\b|\bwindows\b|\bubuntu\b|\b(not|never|cannot|can't|don't|do not) do\b|\bgaps?\b|\bmissing\b/,
+      /\bbounds?\b|\blimits?\b|\blimitations?\b|\bproven\b|\bunproven\b|\bevidence\b|\bmatrix\b|\bplatforms?\b|\bmacos\b|\blinux\b|\bwindows\b|\bubuntu\b|\b(not|never|cannot|can't|don't|do not) do\b|\bgaps?\b|\bmissing\b/,
     tool: EVALUATE_ROUTE_TOOLS.monitorHealth,
     example: {},
     why_sanctuary: "The bounds are stated here from the README and the Assurance Matrix; monitor_health shows which of them apply to this instance.",

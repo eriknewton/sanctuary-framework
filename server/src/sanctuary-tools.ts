@@ -296,6 +296,7 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_policy_status ───────────────────────────────────────
     {
+      // Must match EVALUATE_ROUTE_TOOLS.policyStatus in server/src/agent-native/capabilities-catalog.ts.
       name: "sanctuary_policy_status",
       description:
         "Return active Principal Policy summary: explicit Tier 1 and Tier 3 operation " +

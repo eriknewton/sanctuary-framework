@@ -9,9 +9,11 @@ import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
   COOPERATIVE_CAPABILITIES,
+  EVALUATE_NOUNS,
   EVALUATE_RELATED_TOOLS,
   EVALUATE_ROUTES,
   type EvaluateQuestion,
+  type EvaluateRoute,
   type EvaluateRouteToolName,
 } from "./capabilities-catalog.js";
 import {
@@ -493,6 +495,33 @@ export function createAgentNativeCooperativeTools(
         probe_key: matchedGated,
       };
     }
+    // State order after the gated routes (gated always wins above):
+    //   state_EVALUATE_NOUN: an evaluate noun (EVALUATE_NOUNS) beats a bare
+    //     read verb, so "read the bounds" is a bounds question, not a recall;
+    //   state_REMEMBER, state_RECALL: the ordinary memory routes, reached only
+    //     by an intent without an evaluate noun, so their responses are
+    //     byte-identical to before the evaluate state existed;
+    //   state_EVALUATE_FALLBACK: a question with no noun and no memory verb
+    //     ("what do you not do") still lands on its route;
+    //   otherwise the ambiguous fallback.
+    // Matched on the lower-cased intent only, not the decoded haystack: the
+    // decoded variants exist to catch obfuscated gated requests, and an
+    // evaluate question has nothing to obfuscate. Routing table, noun list and
+    // tool-name pins: capabilities-catalog.ts.
+    const evaluateRoute = EVALUATE_ROUTES.find((route) => route.matches.test(lower));
+    const evaluateAnswer = (route: EvaluateRoute) => ({
+      safety_class: "ordinary" as const,
+      intent_class: "evaluate" as const,
+      evaluate_question: route.question,
+      tool: route.tool,
+      example: route.example,
+      why_sanctuary: route.why_sanctuary,
+      guidance: route.guidance,
+      related_tools: EVALUATE_RELATED_TOOLS,
+    });
+    if (evaluateRoute && EVALUATE_NOUNS.test(lower)) {
+      return evaluateAnswer(evaluateRoute);
+    }
     if (/\b(remember|store|save)\b/.test(haystack)) {
       return {
         safety_class: "ordinary",
@@ -509,28 +538,9 @@ export function createAgentNativeCooperativeTools(
         why_sanctuary: "Recall preserves verification status in the response.",
       };
     }
-    // state_EVALUATE: an agent deciding whether to install or keep this socket
-    // asks what it protects, what the bounds are, which platforms, how to
-    // verify, which tier waits on a human, or how to uninstall. Checked AFTER
-    // the gated and ordinary routes, so a gated needle still wins and the
-    // remember/recall routes are byte-identical to before this state existed:
-    // only an intent that previously fell to the ambiguous fallback can land
-    // here. Matched on the lower-cased intent only, not the decoded haystack:
-    // the decoded variants exist to catch obfuscated gated requests, and an
-    // evaluate question has nothing to obfuscate. Routing table and tool-name
-    // pins: EVALUATE_ROUTES in capabilities-catalog.ts.
-    const evaluateRoute = EVALUATE_ROUTES.find((route) => route.matches.test(lower));
+    // state_EVALUATE_FALLBACK (see the state order above the memory routes).
     if (evaluateRoute) {
-      return {
-        safety_class: "ordinary",
-        intent_class: "evaluate",
-        evaluate_question: evaluateRoute.question,
-        tool: evaluateRoute.tool,
-        example: evaluateRoute.example,
-        why_sanctuary: evaluateRoute.why_sanctuary,
-        guidance: evaluateRoute.guidance,
-        related_tools: EVALUATE_RELATED_TOOLS,
-      };
+      return evaluateAnswer(evaluateRoute);
     }
     return {
       safety_class: "sensitive",
@@ -818,7 +828,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a read-only posture tool or the CLI command that answers, a guidance string copied from the README bounds, and the related read-only tools with their tiers. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
+      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a guidance string (the README bounds, or the CLI command), a runnable example only where a Tier 3 read-only tool answers unattended, and the related read-only tools with their tiers; an evaluate noun outranks a bare read verb, so \"read the bounds\" is a bounds question, not a memory read. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -831,7 +841,8 @@ export function createAgentNativeCooperativeTools(
           await recordHelpProbe(args.intent as string, classified.probe_key, classified.safety_class);
           const auditRef = await audit("sanctuary_help", {
             safety_class: classified.safety_class,
-            // An evaluate route with no tool (uninstall) has no example to run;
+            // An evaluate route with no example (uninstall; the Tier 1 tiers
+            // route) is audited as not runnable;
             // every pre-existing ordinary route carries one, so this is
             // unchanged for them.
             runnable_example: classified.safety_class === "ordinary" && classified.example !== null,

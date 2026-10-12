@@ -37,6 +37,7 @@ export function createAuditTools(
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
+      // Must match EVALUATE_ROUTE_TOOLS.sovereigntyAudit in server/src/agent-native/capabilities-catalog.ts.
       name: "sovereignty_audit",
       description:
         "Audit your agent's sovereignty posture. Inspects the local environment for " +

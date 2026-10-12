@@ -812,6 +812,64 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(gatedEvaluate.intent_class).toBeUndefined();
   });
 
+  it("routes an evaluate noun before the memory verbs, keeps nounless memory reads on recall, and offers no runnable example on the Tier 1 policy read", async () => {
+    const env = await setup();
+    // state_EVALUATE_NOUN: a bare read verb beside an evaluate noun is a
+    // question about the socket, never a memory read.
+    const readBounds = await callTool(env.facadeTools, "sanctuary_help", { intent: "read the bounds" });
+    expect(readBounds.intent_class).toBe("evaluate");
+    expect(readBounds.evaluate_question).toBe("bounds");
+    expect(readBounds.tool).toBe("monitor_health");
+    const getPlatforms = await callTool(env.facadeTools, "sanctuary_help", { intent: "get the list of platforms" });
+    expect(getPlatforms.intent_class).toBe("evaluate");
+    expect(getPlatforms.evaluate_question).toBe("bounds");
+    expect(getPlatforms.tool).toBe("monitor_health");
+    // state_RECALL: the same verbs without an evaluate noun still reach
+    // recall, with the byte-identical pre-existing response shape.
+    for (const intent of ["read my timezone", "get user_tz"]) {
+      const recall = await callTool(env.facadeTools, "sanctuary_help", { intent });
+      expect(recall, intent).toEqual({
+        safety_class: "ordinary",
+        tool: "sanctuary_recall",
+        example: { key: "user_tz" },
+        why_sanctuary: "Recall preserves verification status in the response.",
+        audit_ref: recall.audit_ref,
+      });
+    }
+    // Gated still outranks the noun: "policy" is a gated needle, so a tier
+    // question that names the policy is sent for review (safety_class gated,
+    // tool null, remediation request_review, the generic placeholder example)
+    // rather than given runnable guidance; the needle that fired stays
+    // server-side as the probe key and is never echoed, so the response does
+    // not reveal which word tripped it. That is the safe order: the gated list
+    // is the operator's veto and nothing downstream may re-route around it.
+    const policyTier = await callTool(env.facadeTools, "sanctuary_help", {
+      intent: "which policy tier waits on a human",
+    });
+    expect(policyTier.safety_class).toBe("gated");
+    expect(policyTier.tool).toBeNull();
+    expect(policyTier.example).toEqual({ args: "<operator-approved placeholders only>" });
+    expect(policyTier.probe_key).toBeUndefined();
+    expect(policyTier.remediation_class).toBe("request_review");
+    expect(policyTier.intent_class).toBeUndefined();
+    // The Tier 1 route names the tool but never hands out an example to run:
+    // following one would trigger an operator prompt and audit it as runnable.
+    const tier = await callTool(env.facadeTools, "sanctuary_help", { intent: "which tier needs a human" });
+    expect(tier.intent_class).toBe("evaluate");
+    expect(tier.evaluate_question).toBe("tiers");
+    expect(tier.tool).toBeNull();
+    expect(tier.example).toBeNull();
+    expect(tier.guidance).toContain("sanctuary_policy_status");
+    expect(tier.guidance).toContain("Tier 1");
+    const related = tier.related_tools as Array<{ tool: string; tier: string }>;
+    expect(related.find((entry) => entry.tool === "sanctuary_policy_status")!.tier).toContain("Tier 1");
+    // The help call above is the latest sanctuary_help audit row.
+    const helpAudits = await env.auditLog.query({ operation_type: "sanctuary_help", limit: 50 });
+    const tierRow = helpAudits.entries.at(-1);
+    expect(tierRow).toBeDefined();
+    expect(tierRow!.details).toMatchObject({ safety_class: "ordinary", runnable_example: false });
+  });
+
   it("returns only disclosable who-am-i fields and positive active protections", async () => {
     const env = await setup();
 
