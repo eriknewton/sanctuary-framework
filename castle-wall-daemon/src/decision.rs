@@ -621,6 +621,30 @@ impl DecisionEngine {
             }
         })?;
         let mut summary = None;
+        let mut authorize_loaded = |loaded: &LoadedManifest,
+                                    enforce_frozen_identity: bool|
+         -> Result<(), ControlAuditError> {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(ControlAuditError::Cancelled);
+            }
+            // The identity comparison runs BEFORE the success audit append:
+            // a refused reload must leave no `..._authorized` row claiming a
+            // policy change this process did not make.
+            if enforce_frozen_identity {
+                self.refuse_identity_change(loaded)?;
+            }
+            let candidate = ManifestReloadSummary {
+                signature_b64url: loaded.manifest_signature_b64url.clone(),
+                rule_count: loaded.rule_count,
+            };
+            let detail = format!(
+                "context={context} signature={} rules={}",
+                candidate.signature_b64url, candidate.rule_count
+            );
+            self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
+            summary = Some(candidate);
+            Ok(())
+        };
         // `map(|_| ())` DROPS the `&LoadedManifest` the store hands back. The
         // borrow is of `guard`, and the boot freeze below has to read
         // `guard.current_snapshot()` while still holding the same guard; keeping
@@ -628,44 +652,11 @@ impl DecisionEngine {
         // releasing the guard first would open the window this whole design
         // closes.
         let outcome = match gate {
-            IdentityGate::Frozen => guard.reload_with_authorization(|loaded| {
-                if shutdown.load(Ordering::SeqCst) {
-                    return Err(ControlAuditError::Cancelled);
-                }
-                // The identity comparison runs BEFORE the success audit append:
-                // a refused reload must leave no `..._authorized` row claiming a
-                // policy change this process did not make.
-                if matches!(gate, IdentityGate::Frozen) {
-                    self.refuse_identity_change(loaded)?;
-                }
-                let candidate = ManifestReloadSummary {
-                    signature_b64url: loaded.manifest_signature_b64url.clone(),
-                    rule_count: loaded.rule_count,
-                };
-                let detail = format!(
-                    "context={context} signature={} rules={}",
-                    candidate.signature_b64url, candidate.rule_count
-                );
-                self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
-                summary = Some(candidate);
-                Ok(())
-            }),
-            IdentityGate::BootFreeze => guard.reload_active_at_boot_with_authorization(|loaded| {
-                if shutdown.load(Ordering::SeqCst) {
-                    return Err(ControlAuditError::Cancelled);
-                }
-                let candidate = ManifestReloadSummary {
-                    signature_b64url: loaded.manifest_signature_b64url.clone(),
-                    rule_count: loaded.rule_count,
-                };
-                let detail = format!(
-                    "context={context} signature={} rules={}",
-                    candidate.signature_b64url, candidate.rule_count
-                );
-                self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
-                summary = Some(candidate);
-                Ok(())
-            }),
+            IdentityGate::Frozen => {
+                guard.reload_with_authorization(|loaded| authorize_loaded(loaded, true))
+            }
+            IdentityGate::BootFreeze => guard
+                .reload_active_at_boot_with_authorization(|loaded| authorize_loaded(loaded, false)),
         }
         .map(|_| ());
         let result = match outcome {
@@ -706,9 +697,12 @@ impl DecisionEngine {
     /// Three outcomes, and each is a different claim about what is live:
     /// * `Ok`  — the snapshot COMMITTED, read back from the store rather than
     ///   from the candidate, so the frozen identity is the one being enforced.
-    /// * `Verify` — nothing committed and the daemon continues deny-by-default
-    ///   with no policy, which confines nobody: `Unconfined`, under this
-    ///   engine's own fortress id.
+    /// * `Verify` with a boot-confined refusal: nothing committed and the
+    ///   daemon continues deny-by-default, but the admitted uid is still armed
+    ///   so kernel activation keeps that agent confined with no operator allows.
+    /// * other `Verify`: nothing committed and the daemon continues
+    ///   deny-by-default with no policy, which confines nobody: `Unconfined`,
+    ///   under this engine's own fortress id.
     /// * anything else — boot aborts, so the cell stays unset and no later
     ///   reader can mistake a half-started process for an armed one.
     fn freeze_at_boot(
@@ -735,10 +729,23 @@ impl DecisionEngine {
                     }
                 }
             }
-            Err(ManifestReloadAuthorizationError::Verify(_)) => AdmittedIdentity {
-                fortress_id: self.fortress_id().to_string(),
-                subject: AdmittedSubject::Unconfined,
-            },
+            Err(ManifestReloadAuthorizationError::Verify(err)) => {
+                if let Some((agent_uid, ceiling, gate_uid)) = err.boot_confined_subject() {
+                    AdmittedIdentity {
+                        fortress_id: self.fortress_id().to_string(),
+                        subject: AdmittedSubject::Confined {
+                            agent_uid,
+                            ceiling,
+                            gate_uid,
+                        },
+                    }
+                } else {
+                    AdmittedIdentity {
+                        fortress_id: self.fortress_id().to_string(),
+                        subject: AdmittedSubject::Unconfined,
+                    }
+                }
+            }
             Err(_) => return result,
         };
         match self.armed_identity.set(identity) {
@@ -1207,6 +1214,9 @@ mod armed_identity_tests {
     /// Named so a test that means to CHANGE the ceiling can, which a hard-coded
     /// literal in the helper quietly prevented.
     const FIXTURE_CEILING: u32 = 500;
+    // Fixture UIDs sit above the policy's system-uid ceiling and below sentinel
+    // values, so they model ordinary mapped principals on every host.
+    const TEST_AGENT_UID: u32 = 60_123;
 
     fn signed_bundle(
         signing: &SigningKey,
@@ -1222,6 +1232,7 @@ mod armed_identity_tests {
             gate_uid,
             FIXTURE_CEILING,
             rule_id,
+            &[],
         )
     }
 
@@ -1233,16 +1244,29 @@ mod armed_identity_tests {
         gate_uid: Option<u32>,
         ceiling: u32,
         rule_id: &str,
+        scope_agent_ids: &[String],
     ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         use crate::manifest::verify::{
             AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
         };
         let rule_file = format!("{rule_id}.json");
-        let rule_body = format!(
-            "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-19T00:00:00Z\",\
-             \"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
-        )
-        .into_bytes();
+        let rule_body = if scope_agent_ids.is_empty() {
+            format!(
+                "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-19T00:00:00Z\",\
+                 \"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
+            )
+            .into_bytes()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "id": rule_id,
+                "schema_version": crate::constants::SCHEMA_VERSION_V1,
+                "created_at": "2026-09-19T00:00:00Z",
+                "match": { "ip": ["203.0.113.7"] },
+                "scope": { "agent_ids": scope_agent_ids },
+                "disposition": "allow"
+            }))
+            .unwrap()
+        };
         let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
         let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
         let manifest = AllowlistManifest {
@@ -1312,6 +1336,7 @@ mod armed_identity_tests {
             gate_uid,
             FIXTURE_CEILING,
             rule_id,
+            &[],
         )
     }
 
@@ -1324,15 +1349,75 @@ mod armed_identity_tests {
         gate_uid: Option<u32>,
         ceiling: u32,
         rule_id: &str,
+        scope_agent_ids: &[String],
     ) {
         use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
-        let (manifest_bytes, rules) =
-            signed_bundle_with_ceiling(signing, generation, agent_uid, gate_uid, ceiling, rule_id);
+        let (manifest_bytes, rules) = signed_bundle_with_ceiling(
+            signing,
+            generation,
+            agent_uid,
+            gate_uid,
+            ceiling,
+            rule_id,
+            scope_agent_ids,
+        );
         std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
         for (name, body) in rules {
             std::fs::write(policy_dir.join(RULES_SUBDIR).join(name), body).unwrap();
         }
         std::fs::write(policy_dir.join(MANIFEST_FILENAME), manifest_bytes).unwrap();
+    }
+
+    fn write_policy_with_scope(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: u32,
+        scope_agent_ids: &[String],
+        rule_id: &str,
+    ) {
+        write_policy_with_ceiling(
+            policy_dir,
+            signing,
+            generation,
+            Some(agent_uid),
+            None,
+            FIXTURE_CEILING,
+            rule_id,
+            scope_agent_ids,
+        )
+    }
+
+    fn manifest_generation_and_signature(policy_dir: &std::path::Path) -> (u64, String) {
+        let manifest_path = policy_dir.join(crate::manifest::MANIFEST_FILENAME);
+        let raw = std::fs::read(&manifest_path).unwrap();
+        let signed: crate::manifest::verify::SignedManifest = serde_json::from_slice(&raw).unwrap();
+        (
+            signed.manifest.generation,
+            signed.signature.signature_b64url,
+        )
+    }
+
+    fn write_high_water_for_current_manifest(policy_dir: &std::path::Path) -> serde_json::Value {
+        let (generation, manifest_signature_b64url) = manifest_generation_and_signature(policy_dir);
+        let high_water = serde_json::json!({
+            "fortress_id": FORTRESS,
+            "generation": generation,
+            "manifest_signature_b64url": manifest_signature_b64url,
+        });
+        std::fs::write(
+            policy_dir.join(crate::manifest::store::MANIFEST_HIGH_WATER_FILENAME),
+            serde_json::to_vec(&high_water).unwrap(),
+        )
+        .unwrap();
+        high_water
+    }
+
+    fn read_high_water_fixture(policy_dir: &std::path::Path) -> serde_json::Value {
+        let raw =
+            std::fs::read(policy_dir.join(crate::manifest::store::MANIFEST_HIGH_WATER_FILENAME))
+                .unwrap();
+        serde_json::from_slice(&raw).unwrap()
     }
 
     fn audit_operations(wal: &Arc<Mutex<WalWriter>>) -> Vec<String> {
@@ -1477,6 +1562,7 @@ mod armed_identity_tests {
                 gate_uid,
                 ceiling,
                 "r2",
+                &[],
             );
             let err = f
                 .engine
@@ -1490,6 +1576,69 @@ mod armed_identity_tests {
                 "uid {agent_uid:?} gate {gate_uid:?} ceiling {ceiling} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn boot_reclaims_an_exact_committed_scoped_generation_without_unconfining() {
+        let f = fixture();
+        let legacy_scope = format!("agent-{TEST_AGENT_UID}");
+        write_policy_with_scope(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            TEST_AGENT_UID,
+            &[legacy_scope],
+            "r1",
+        );
+        write_high_water_for_current_manifest(&f.policy_dir);
+
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+
+        assert!(f.store.lock().unwrap().current_snapshot().is_some());
+        assert!(matches!(
+            f.engine.armed_identity().map(|identity| identity.subject),
+            Some(AdmittedSubject::Confined {
+                agent_uid: TEST_AGENT_UID,
+                ceiling: FIXTURE_CEILING,
+                gate_uid: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn boot_refuses_a_new_scoped_generation_and_keeps_the_agent_confined() {
+        let f = fixture();
+        write_policy_with_scope(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            TEST_AGENT_UID,
+            &[format!("uid-{TEST_AGENT_UID}")],
+            "r1",
+        );
+        let committed_high_water = write_high_water_for_current_manifest(&f.policy_dir);
+        write_policy_with_scope(
+            &f.policy_dir,
+            &f.signing,
+            2,
+            TEST_AGENT_UID,
+            &[format!("agent-{TEST_AGENT_UID}")],
+            "r2",
+        );
+
+        let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
+
+        assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
+        assert_eq!(read_high_water_fixture(&f.policy_dir), committed_high_water);
+        assert!(f.store.lock().unwrap().current_snapshot().is_none());
+        assert!(matches!(
+            f.engine.armed_identity().map(|identity| identity.subject),
+            Some(AdmittedSubject::Confined {
+                agent_uid: TEST_AGENT_UID,
+                ceiling: FIXTURE_CEILING,
+                gate_uid: None,
+            })
+        ));
     }
 
     #[test]
@@ -1862,6 +2011,14 @@ mod armed_identity_tests {
         assert!(
             marker_lines[0] > wrapper_at && marker_lines[0] < next_fn_at,
             "the BootFreeze argument must sit inside reload_manifest_authorized_at_boot"
+        );
+        let boot_reclaim_calls = production
+            .iter()
+            .filter(|line| line.contains("reload_active_at_boot_with_authorization("))
+            .count();
+        assert_eq!(
+            boot_reclaim_calls, 1,
+            "the BootFreeze arm must call the store's boot reclaim entry exactly once"
         );
         for entry in [
             "reload_manifest_authorized_cancellable",

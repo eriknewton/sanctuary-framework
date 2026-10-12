@@ -63,7 +63,8 @@ export function validateLinuxInstallAgentIdScopes(
       // singleton for every caller, and refusing here keeps an allow from silently never matching.
       if (uid !== admittedUid) {
         throw new Error(
-          `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected admitted uid ${admittedUid}`,
+          // Must match `AgentScopeOutsideAdmission` in `castle-wall-daemon/src/policy.rs`.
+          `rule ${rule.id} scope.agent_ids entry ${JSON.stringify(agentId)}: expected admitted uid ${admittedUid}; scope agent rules to uid-${admittedUid}`,
         );
       }
     }

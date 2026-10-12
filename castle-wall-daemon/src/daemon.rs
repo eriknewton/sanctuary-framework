@@ -1724,11 +1724,11 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     match decision_engine.reload_manifest_authorized_at_boot() {
         Ok(_) => {}
         Err(crate::decision::ManifestReloadAuthorizationError::Verify(err)) => {
-            // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot with
-            // no policy is an operator-visible posture change, and this line is emitted
-            // before the audit channel is trusted to carry it.
+            // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot is
+            // an operator-visible posture change, and this line is emitted before the
+            // audit channel is trusted to carry it.
             eprintln!(
-                "castle-wall-daemon: boot-time manifest load failed; running deny-by-default with NO policy until a valid manifest is reloaded: {err}"
+                "castle-wall-daemon: boot-time manifest load failed; running deny-by-default until a valid manifest is reloaded: {err}"
             );
         }
         Err(err) => return Err(DaemonError::ManifestStoreInit(err.to_string())),

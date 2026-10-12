@@ -617,6 +617,8 @@ pub enum ConfinedAgentScopeError {
         expected_form: &'static str,
     },
     #[error(
+        // Must match `validateLinuxInstallAgentIdScopes` in
+        // `server/src/castle-wall/allowlist/confined-agent-id.ts`.
         "rule {rule_id} scope.agent_ids entry {agent_id:?}: expected admitted uid {admitted_uid}; scope agent rules to uid-{admitted_uid}"
     )]
     AgentScopeOutsideAdmission {
@@ -624,6 +626,15 @@ pub enum ConfinedAgentScopeError {
         agent_id: String,
         admitted_uid: u32,
     },
+}
+
+impl ConfinedAgentScopeError {
+    pub(crate) fn rule_id(&self) -> &str {
+        match self {
+            Self::MalformedAgentScope { rule_id, .. }
+            | Self::AgentScopeOutsideAdmission { rule_id, .. } => rule_id,
+        }
+    }
 }
 
 pub(crate) fn collect_confined_agent_scope_errors(
