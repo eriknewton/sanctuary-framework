@@ -8,7 +8,7 @@
  * the checkpoint bundle, and never touches reserved namespaces.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -30,6 +30,8 @@ import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 import { StateStore as RealStateStore } from "../../src/cognitive/state-store.js";
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   CheckpointRestoreAgentNotParkedError,
@@ -52,7 +54,8 @@ type CriticalAuditCall = Parameters<AuditAppendCritical>[0];
 
 interface Fixture {
   fortressPath: string;
-  storage: MemoryStorage;
+  storage: StorageBackend;
+  statePath?: string;
   stateStore: RealStateStore;
   checkpointStore: MemoryCheckpointStore;
   masterKey: Uint8Array;
@@ -103,7 +106,7 @@ async function makeTempFortress(): Promise<string> {
 
 async function makeFixture(
   now = "2026-08-03T12:00:00.000Z",
-  storage: MemoryStorage = new MemoryStorage(),
+  storage: StorageBackend = new MemoryStorage(),
 ): Promise<Fixture> {
   const fortressPath = await makeTempFortress();
   const masterKey = generateRandomKey();
@@ -118,6 +121,35 @@ async function makeFixture(
   return {
     fortressPath,
     storage,
+    stateStore,
+    checkpointStore,
+    masterKey,
+    identity,
+    identityEncKey,
+    audit: makeAuditLog(),
+  };
+}
+
+async function makeFilesystemFixture(
+  now = "2026-08-03T12:00:00.000Z",
+): Promise<Fixture> {
+  const fortressPath = await makeTempFortress();
+  const statePath = join(fortressPath, "state");
+  await mkdir(statePath, { recursive: true, mode: 0o700 });
+  const storage = new FilesystemStorage(statePath);
+  const masterKey = generateRandomKey();
+  const stateStore = new RealStateStore(storage, masterKey);
+  const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+  const identity = createIdentity("restore-test", identityEncKey, "recovery-key");
+  await persistStoredIdentity(storage, masterKey, identity.storedIdentity);
+  const checkpointStore = new MemoryCheckpointStore({
+    fortressPath,
+    clock: { now: () => new Date(now) },
+  });
+  return {
+    fortressPath,
+    storage,
+    statePath,
     stateStore,
     checkpointStore,
     masterKey,
@@ -729,9 +761,15 @@ describe("restoreCheckpoint", () => {
 
     const failingStateStore: Pick<
       StateStore,
-      "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
+      | "exportNamespaces"
+      | "delete"
+      | "import"
+      | "assertImportVersionFloors"
+      | "preflightImportStorageNames"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
+      preflightImportStorageNames: (bundle) =>
+        fixture.stateStore.preflightImportStorageNames(bundle),
       assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
         fixture.stateStore.assertImportVersionFloors(
           bundle,
@@ -798,6 +836,100 @@ describe("restoreCheckpoint", () => {
     });
   });
 
+  it("runs the real import storage-name preflight before reconstruction effects", async () => {
+    const fixture = await makeFilesystemFixture();
+    if (!fixture.statePath) throw new Error("filesystem fixture missing state path");
+    await writeEntry(fixture, "omega", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:06:30.000Z"),
+    });
+    await writeFile(
+      join(fixture.statePath, "omega", "key-!4E2D.enc"),
+      new Uint8Array([1]),
+    );
+
+    await expect(
+      restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      }),
+    ).rejects.toThrow(/storage name this version cannot address/);
+
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
+  it("refuses a checkpoint bundle with an unaddressable key before reconstruction effects", async () => {
+    const fixture = await makeFixture();
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const exported = await fixture.stateStore.exportNamespaces(["mem"]);
+    const bundle = decodeBundle(exported.bundle) as DecodedExportBundle & {
+      sanctuary_export_version?: number;
+      format?: string;
+      exported_at?: string;
+      completeness_manifest?: unknown;
+      bundle_integrity?: unknown;
+    };
+    const firstMemEntry = bundle.data.mem?.[0];
+    if (!firstMemEntry) throw new Error("harness setup: exported mem entry missing");
+    firstMemEntry.key = "key-\u4E2D";
+    const mutatedBundle = toBase64url(stringToBytes(JSON.stringify(bundle)));
+    const mutatedHash = hashToString(fromBase64url(mutatedBundle));
+    const createdAt = "2026-08-03T12:06:45.000Z";
+    const id = buildMemoryCheckpointId(createdAt, mutatedHash);
+    await fixture.checkpointStore.create({
+      record: {
+        id,
+        created_at: createdAt,
+        source: "on_demand",
+        namespaces: ["mem"],
+        total_keys: 1,
+        bundle_hash: mutatedHash,
+        completeness_summary: { namespace_count: 1, total_keys: 1, per_namespace: {} },
+        retention_expires_at: null,
+        format_version: 1,
+      },
+      bundle: mutatedBundle,
+      masterKey: fixture.masterKey,
+    });
+    await writeEntry(fixture, "added", "preserve", "live-state");
+    const liveBefore = await exportEntries(fixture.stateStore);
+
+    await expect(
+      restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+      }),
+    ).rejects.toThrow(/storage name this version cannot address/);
+
+    expect(await exportEntries(fixture.stateStore)).toEqual(liveBefore);
+    const forensic = (await fixture.checkpointStore.list()).find(
+      (record) => record.source === "forensic_quarantine",
+    );
+    expect(forensic).toBeUndefined();
+  });
+
   it("records partial checkpoint import progress when reconstruct import partially applies", async () => {
     const fixture = await makeFixture();
     await writeEntry(fixture, "mem", "Q", "known-good");
@@ -822,9 +954,15 @@ describe("restoreCheckpoint", () => {
     );
     const failingStateStore: Pick<
       StateStore,
-      "exportNamespaces" | "delete" | "import" | "assertImportVersionFloors"
+      | "exportNamespaces"
+      | "delete"
+      | "import"
+      | "assertImportVersionFloors"
+      | "preflightImportStorageNames"
     > = {
       exportNamespaces: (namespaces?: string[]) => fixture.stateStore.exportNamespaces(namespaces),
+      preflightImportStorageNames: (bundle) =>
+        fixture.stateStore.preflightImportStorageNames(bundle),
       assertImportVersionFloors: (bundle, conflictResolution, resolver, options) =>
         fixture.stateStore.assertImportVersionFloors(
           bundle,

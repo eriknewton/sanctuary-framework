@@ -12,13 +12,15 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { MAX_DISCOVERED_NAMESPACES, NAMESPACE_DISCOVERY_LIMIT_REMEDIATION } from "../../src/storage/interface.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { FilesystemStorageNameError } from "../../src/storage/filesystem-name-codec.js";
 import {
   establishMaster,
   readCustodyEnvelope,
@@ -452,7 +454,7 @@ async function verifyRotated(
   expect(toBase64url(ed25519.getPublicKey(seed))).toBe(identity.public_key);
 }
 
-describe("master rotation — happy path", () => {
+describe("master rotation: happy path", () => {
   it("rotates the master end to end: new wraps, re-encrypted data, retired old master, audit chain verifiable across the boundary", async () => {
     const fortress = await buildFortress();
     let disclosedKey = "";
@@ -835,7 +837,45 @@ describe("master rotation — happy path", () => {
   });
 });
 
-describe("master rotation — Tier-1 gate and capture rules", () => {
+describe("master rotation: storage namespace discovery", () => {
+  it("refuses before rotation when stored names cannot be addressed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-rotate-name-"));
+    try {
+      const storage = new FilesystemStorage(dir);
+      const est = await establishMaster({
+        storage,
+        passphrase: PASSPHRASE,
+        firstRun: { installMode: "interactive", mintRecoveryKey: true },
+      });
+      await est.masterWriteBarrier?.release();
+      await mkdir(join(dir, "ns-!4E2D"), { recursive: true, mode: 0o700 });
+      await writeFile(join(dir, "ns-!4E2D", "plain.enc"), new Uint8Array([1]));
+
+      const refusal = rotateMaster({
+          storage,
+          fortressId: FORTRESS_ID,
+          passphrase: PASSPHRASE,
+          approve: async () => true,
+          captureRecoveryKey: async (recoveryKey, verify) => verify(recoveryKey),
+        });
+      await expect(refusal).rejects.toBeInstanceOf(RotationPreflightError);
+      await expect(refusal).rejects.toThrow(
+        /storage name this version cannot address/,
+      );
+
+      const stillOld = await establishMaster({
+        storage,
+        recoveryKey: est.mintedRecoveryKey!,
+      });
+      expect(toBase64url(stillOld.masterKey)).toBe(toBase64url(est.masterKey));
+      await stillOld.masterWriteBarrier?.release();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("master rotation: Tier-1 gate and capture rules", () => {
   it("refuses without operator approval, mutating nothing", async () => {
     const fortress = await buildFortress();
     await expect(
@@ -991,7 +1031,7 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
   });
 });
 
-describe("master rotation — fail-closed coverage", () => {
+describe("master rotation: fail-closed coverage", () => {
   // LEGACY-BUG-001: shared enumeration refuses before rotation changes custody.
   it("surfaces fixed discovery remediation without staging rotation", async () => {
     const fortress = await buildFortress();
@@ -1004,6 +1044,59 @@ describe("master rotation — fail-closed coverage", () => {
     expect(NAMESPACE_DISCOVERY_LIMIT_REMEDIATION).toContain("Remedy:");
     expect(await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toEqual(before);
     expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+  });
+
+  it("reports storage-name refusals as rotation preflight failures", async () => {
+    const fortress = await buildFortress();
+    const before = await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    fortress.storage.listNamespaces = async () => {
+      throw new FilesystemStorageNameError("key", { rawName: "key-!4E2D" });
+    };
+
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+      RotationPreflightError
+    );
+    expect(await fortress.storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toEqual(before);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+  });
+
+  it("keeps storage-name refusals honest after the rotation journal is durable", async () => {
+    const fortress = await buildFortress();
+    const originalListNamespaces = fortress.storage.listNamespaces!.bind(fortress.storage);
+    let refuseAfterJournal = false;
+    fortress.storage.listNamespaces = async () => {
+      if (refuseAfterJournal) {
+        throw new FilesystemStorageNameError("key", { rawName: "key-!4E2D" });
+      }
+      return originalListNamespaces();
+    };
+
+    let convertedError: unknown;
+    try {
+      await rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (point) => {
+            if (point === "journal-converting-written") {
+              refuseAfterJournal = true;
+            }
+          },
+        }),
+      );
+    } catch (error) {
+      convertedError = error;
+    }
+    expect(convertedError).toBeInstanceOf(FilesystemStorageNameError);
+    expect(convertedError).not.toBeInstanceOf(RotationPreflightError);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+
+    await expect(
+      resumeRotation({
+        storage: fortress.storage,
+        fortressPath: undefined,
+        fortressId: FORTRESS_ID,
+        passphrase: PASSPHRASE,
+      }),
+    ).rejects.toBeInstanceOf(FilesystemStorageNameError);
   });
 
   it("aborts (nothing mutated) when an unsupported namespace holds data", async () => {
@@ -2193,7 +2286,7 @@ describe("master rotation — fail-closed coverage", () => {
   });
 });
 
-describe("master rotation — crash safety (journaled two-phase, forward resume)", () => {
+describe("master rotation: crash safety (journaled two-phase, forward resume)", () => {
   const POST_JOURNAL_FAILPOINTS = [
     "journal-converting-written",
     `converted:_identities/${KID}`,
@@ -2764,7 +2857,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
   });
 });
 
-describe("master rotation — custody floor on the rotated fortress", () => {
+describe("master rotation: custody floor on the rotated fortress", () => {
   it("the rotated envelope holds >= 2 verified distinct factors", async () => {
     const fortress = await buildFortress();
     await rotateMaster(rotateOpts(fortress));
@@ -2796,7 +2889,7 @@ describe("master rotation — custody floor on the rotated fortress", () => {
   });
 });
 
-describe("master rotation — anti-rollback epoch advance (Stage 1)", () => {
+describe("master rotation: anti-rollback epoch advance (Stage 1)", () => {
   it("a fresh fortress is epoch 0 with no witness yet", async () => {
     const fortress = await buildFortress();
     expect(await readEnvelopeEpoch(fortress.storage)).toBe(0);

@@ -50,7 +50,11 @@ export interface RestoreCheckpointResult {
 export interface RestoreCheckpointDeps {
   stateStore: Pick<
     StateStore,
-    "exportNamespaces" | "import" | "delete" | "assertImportVersionFloors"
+    | "exportNamespaces"
+    | "import"
+    | "delete"
+    | "assertImportVersionFloors"
+    | "preflightImportStorageNames"
   >;
   checkpointStore: MemoryCheckpointStore;
   masterKey: Uint8Array;
@@ -366,6 +370,10 @@ export async function preflightCheckpointRestore(
   }
 
   parseExportBundleData(checkpointBundle, "checkpoint");
+  // Storage-name refusal intentionally runs before version-floor planning:
+  // when both would refuse, addressability wins and neither preflight path has
+  // sealed a forensic checkpoint, deleted live state, or written restore bytes.
+  await deps.stateStore.preflightImportStorageNames(checkpointBundle);
   try {
     // Must match StateStore.import and cognitive/tools.ts: checkpoint restore
     // uses overwrite semantics, so every verified non-reserved checkpoint entry

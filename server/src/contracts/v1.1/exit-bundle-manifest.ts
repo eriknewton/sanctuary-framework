@@ -312,6 +312,7 @@ export interface ExitBundleVerifierResult {
     | "rotation_chain_invalid"
     | "reputation_bundle_signature_invalid"
     | "reputation_completeness_mismatch"
+    | "reputation_attestation_storage_name_invalid"
     | "reputation_attestation_signature_invalid"
     | "reputation_unverifiable_attestations"
     // Independent gate on #1303 (2026-08-23), item 6: a PRESENT

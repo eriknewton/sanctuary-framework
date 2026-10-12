@@ -69,6 +69,7 @@ import { access } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { StorageBackend } from "../storage/interface.js";
+import { isFilesystemStorageNameError } from "../storage/filesystem-name-codec.js";
 import {
   withExclusiveMasterRotationBarrier,
   type CrossProcessLockLease,
@@ -2020,7 +2021,20 @@ async function walkFortress(
         "prove complete coverage and refuses to guess"
     );
   }
-  const namespaces = await ctx.storage.listNamespaces();
+  let namespaces: string[];
+  try {
+    namespaces = await ctx.storage.listNamespaces();
+  } catch (error) {
+    if (isFilesystemStorageNameError(error)) {
+      if (!verifyOnly) throw error;
+      throw new RotationPreflightError(
+        `storage-name preflight refused during namespace discovery: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    throw error;
+  }
   const plan: RotationPlanSummary["namespaces"] = [];
   let converted = 0;
 
@@ -2032,7 +2046,20 @@ async function walkFortress(
 
   for (const namespace of ordered) {
     const recipe = recipeFor(namespace);
-    const entries = (await ctx.storage.list(namespace)).length;
+    let entries: number;
+    try {
+      entries = (await ctx.storage.list(namespace)).length;
+    } catch (error) {
+      if (isFilesystemStorageNameError(error)) {
+        if (!verifyOnly) throw error;
+        throw new RotationPreflightError(
+          `storage-name preflight refused in namespace "${namespace}": ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      throw error;
+    }
     if (entries === 0) continue;
     plan.push({ namespace, entries, kind: recipe.kind });
     switch (recipe.kind) {
