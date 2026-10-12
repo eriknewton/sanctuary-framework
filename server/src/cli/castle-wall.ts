@@ -47,6 +47,7 @@ import {
   type ResolvedCustodyCredential,
 } from "../wrap/custody-credential.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { StorageBackend } from "../storage/interface.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import {
   AuditLog,
@@ -773,6 +774,130 @@ const EXIT_SYSEXT_DISABLED = 4;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+export interface TransparencyDaemonScheduledEmitInput {
+  storage: StorageBackend;
+  auditLog: AuditLog;
+  storagePath: string;
+  masterKey: Uint8Array;
+  env: NodeJS.ProcessEnv;
+  localSign: boolean;
+  signerClientInvoke?: ShimInvoker;
+  globalPinnedPublicKeyPath?: string;
+  binaryPath: string;
+  version: string;
+  out: Writable;
+  err: Writable;
+}
+
+/**
+ * Builds the exact transparency-emission callback the daemon scheduler runs.
+ * Keeping this as one factory gives tests a wired consumer of the daemon path
+ * without sending process signals through the test runner.
+ */
+export function createTransparencyDaemonScheduledEmit(
+  input: TransparencyDaemonScheduledEmitInput
+) {
+  return async function state_SCHEDULED_TRANSPARENCY_EMIT(
+    abortState: import("../transparency/scheduler.js").TransparencySchedulerAbortState
+  ): Promise<void> {
+    const { emitEnforcementCheckpoint } = await import(
+      "../transparency/emitter.js"
+    );
+    const { resolveTransparencySigner } = await import(
+      "../transparency/signer.js"
+    );
+    const { anchorCheckpoint, readAnchorConfig } = await import(
+      "../transparency/anchoring.js"
+    );
+
+    // INVARIANT (shutdown/key custody): no await may separate this abort
+    // check from entering signer resolution with the daemon master key.
+    abortState.assertNotAborted("transparency signer resolution");
+    const signer = await resolveTransparencySigner({
+      fortressPath: input.storagePath,
+      masterKey: input.masterKey,
+      env: input.env,
+      ...(input.localSign ? { mode: "local" as const } : {}),
+      ...(input.signerClientInvoke ? { signerClientInvoke: input.signerClientInvoke } : {}),
+      ...(input.globalPinnedPublicKeyPath
+        ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+        : {}),
+      abortState,
+    });
+    const record = await emitEnforcementCheckpoint({
+      storage: input.storage,
+      auditLog: input.auditLog,
+      fortressId: fortressIdFromStoragePath(input.storagePath),
+      fortressPath: input.storagePath,
+      masterKey: input.masterKey,
+      signer,
+      binaryPath: input.binaryPath,
+      version: input.version,
+      abortState,
+    });
+    try {
+      await input.auditLog.appendCritical({
+        layer: "l2",
+        operation: "transparency_checkpoint_emitted",
+        identity_id: record.fortress_id,
+        result: "success",
+        details: {
+          counter: record.counter,
+          merkle_root: record.audit.merkle_root,
+          highest_sequence: record.audit.highest_sequence,
+          signer_kid: record.signer_kid,
+        },
+      });
+    } catch (auditError) {
+      write(
+        input.err,
+        `[transparency] checkpoint ${record.counter} emitted and floor recorded, but the audit entry was refused: ${auditError instanceof Error ? auditError.message : String(auditError)}\n`,
+      );
+      return;
+    }
+    write(
+      input.out,
+      `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
+    );
+    // Opt-in external anchoring (PR-2). OFF by default: with no consent record
+    // nothing is transmitted. FAIL LOUD, never blocking: an anchor failure (or
+    // a tampered anchoring config) is reported on the console and in the audit
+    // log, but the emitted checkpoint above stands and enforcement continues.
+    try {
+      const anchorState = await readAnchorConfig({
+        storage: input.storage,
+        masterKey: input.masterKey,
+        abortState,
+      });
+      if (anchorState.status === "enabled") {
+        const outcome = await anchorCheckpoint({
+          storage: input.storage,
+          masterKey: input.masterKey,
+          auditLog: input.auditLog,
+          record,
+          abortState,
+        });
+        if (outcome.status === "anchored") {
+          write(
+            input.out,
+            `[transparency] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`,
+          );
+        } else if (outcome.status === "failed") {
+          write(
+            input.err,
+            `[transparency] checkpoint ${record.counter} ANCHORING FAILED (emission stands; recorded in the audit log): ${outcome.error}. Retry with: sanctuary transparency anchor now\n`,
+          );
+        }
+      }
+    } catch (anchorError) {
+      write(
+        input.err,
+        `[transparency] checkpoint ${record.counter} ANCHORING REFUSED (emission stands): ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`,
+      );
+    }
+  };
 }
 
 /**
@@ -2833,7 +2958,7 @@ export async function runDaemon(
   // SANCTUARY_TRANSPARENCY_INTERVAL accepts "off", ms, or <n>s|m|h|d. A
   // misconfigured cadence refuses to start the daemon (no silent fallback);
   // a failed emission tick is loud on stderr but never crashes enforcement
-  // and never persists a partial checkpoint (the emitter is fail-closed).
+  // and never signs or persists without the authenticated floor path.
   {
     const {
       parseTransparencyInterval,
@@ -2851,103 +2976,31 @@ export async function runDaemon(
       return 1;
     }
     if (intervalMs !== null) {
-      const { emitEnforcementCheckpoint } = await import(
-        "../transparency/emitter.js"
-      );
-      const { resolveTransparencySigner } = await import(
-        "../transparency/signer.js"
-      );
       const { realpathSync } = await import("node:fs");
       // Canonical version source. A bare require("../../package.json") resolves
       // to the repo-root package.json (no `version`) once bundled to
       // server/dist/, which corrupts the persisted checkpoint chain; the helper
       // reads server/package.json from both src/ and dist/.
       const pkgVersion = getSanctuaryVersion();
+      const scheduledEmit = createTransparencyDaemonScheduledEmit({
+        storage,
+        auditLog,
+        storagePath,
+        masterKey: derived.key,
+        env,
+        localSign,
+        binaryPath: realpathSync(process.argv[1] ?? ""),
+        version: pkgVersion,
+        out,
+        err,
+      });
       transparencyScheduler = startTransparencyScheduler({
         intervalMs,
-        emit: async (abortState) => {
-          // INVARIANT (shutdown/key custody): no await may separate this abort
-          // check from entering signer resolution with the daemon master key.
-          abortState.assertNotAborted("transparency signer resolution");
-          const signer = await resolveTransparencySigner({
-            fortressPath: storagePath,
-            masterKey: derived.key,
-            env,
-            ...(localSign ? { mode: "local" as const } : {}),
-            abortState,
-          });
-          const record = await emitEnforcementCheckpoint({
-            storage,
-            auditLog,
-            fortressId: fortressIdFromStoragePath(storagePath),
-            fortressPath: storagePath,
-            masterKey: derived.key,
-            signer,
-            binaryPath: realpathSync(process.argv[1] ?? ""),
-            version: pkgVersion,
-            abortState,
-          });
-          await auditLog.appendCritical({
-            layer: "l2",
-            operation: "transparency_checkpoint_emitted",
-            identity_id: record.fortress_id,
-            result: "success",
-            details: {
-              counter: record.counter,
-              merkle_root: record.audit.merkle_root,
-              highest_sequence: record.audit.highest_sequence,
-              signer_kid: record.signer_kid,
-            },
-          });
-          write(
-            out,
-            `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
-          );
-          // Opt-in external anchoring (PR-2). OFF by default: with no
-          // consent record nothing is transmitted. FAIL LOUD, never
-          // blocking: an anchor failure (or a tampered anchoring config)
-          // is reported on the console and in the audit log, but the
-          // emitted checkpoint above stands and enforcement continues.
-          try {
-            const { anchorCheckpoint, readAnchorConfig } = await import(
-              "../transparency/anchoring.js"
-            );
-            const anchorState = await readAnchorConfig({
-              storage,
-              masterKey: derived.key,
-              abortState,
-            });
-            if (anchorState.status === "enabled") {
-              const outcome = await anchorCheckpoint({
-                storage,
-                masterKey: derived.key,
-                auditLog,
-                record,
-                abortState,
-              });
-              if (outcome.status === "anchored") {
-                write(
-                  out,
-                  `[transparency] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`,
-                );
-              } else if (outcome.status === "failed") {
-                write(
-                  err,
-                  `[transparency] checkpoint ${record.counter} ANCHORING FAILED (emission stands; recorded in the audit log): ${outcome.error}. Retry with: sanctuary transparency anchor now\n`,
-                );
-              }
-            }
-          } catch (anchorError) {
-            write(
-              err,
-              `[transparency] checkpoint ${record.counter} ANCHORING REFUSED (emission stands): ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`,
-            );
-          }
-        },
+        emit: scheduledEmit,
         onError: (error) => {
           write(
             err,
-            `[transparency] checkpoint emission FAILED (no complete checkpoint-and-floor update was recorded): ${error instanceof Error ? error.message : String(error)}\n`,
+            `[transparency] checkpoint emission FAILED before a complete checkpoint-and-floor update was recorded: ${error instanceof Error ? error.message : String(error)}\n`,
           );
         },
       });

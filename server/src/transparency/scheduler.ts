@@ -94,16 +94,36 @@ export class TransparencySchedulerAbortedError extends Error {
   }
 }
 
+const TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND: unique symbol = Symbol(
+  "TransparencySchedulerAbortState"
+);
+
 export interface TransparencySchedulerAbortState {
   readonly aborted: boolean;
   assertNotAborted(phase: string): void;
+  readonly [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true;
 }
 
 export const TRANSPARENCY_NEVER_ABORTED: TransparencySchedulerAbortState =
   Object.freeze({
+    [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true as const,
     aborted: false,
     assertNotAborted(): void {},
   });
+
+function createSchedulerAbortState(
+  isAborted: () => boolean
+): TransparencySchedulerAbortState {
+  return {
+    [TRANSPARENCY_SCHEDULER_ABORT_STATE_BRAND]: true,
+    get aborted() {
+      return isAborted();
+    },
+    assertNotAborted(phase: string): void {
+      if (isAborted()) throw new TransparencySchedulerAbortedError(phase);
+    },
+  };
+}
 
 export function startTransparencyScheduler(
   options: TransparencySchedulerOptions
@@ -113,14 +133,7 @@ export function startTransparencyScheduler(
   let inFlight: Promise<void> | undefined;
   let stopped = false;
   let aborted = false;
-  const abortState: TransparencySchedulerAbortState = {
-    get aborted() {
-      return aborted;
-    },
-    assertNotAborted(phase: string): void {
-      if (aborted) throw new TransparencySchedulerAbortedError(phase);
-    },
-  };
+  const abortState = createSchedulerAbortState(() => aborted);
   const timer = setIntervalFn(() => {
     if (inFlight !== undefined || stopped || aborted) return; // never overlap emissions
     inFlight = options

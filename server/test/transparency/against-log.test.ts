@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * Host-mode (--against-log) verification: the live audit log is the ground
  * truth. Truncated tails, in-window deletions, altered entries, and

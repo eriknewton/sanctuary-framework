@@ -22,7 +22,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -72,7 +72,9 @@ import {
 } from "../../src/transparency/rekor-client.js";
 import {
   TRANSPARENCY_NEVER_ABORTED,
+  TRANSPARENCY_STOP_DRAIN_DEADLINE_MS,
   TransparencySchedulerAbortedError,
+  startTransparencyScheduler,
   type TransparencySchedulerAbortState,
 } from "../../src/transparency/scheduler.js";
 
@@ -219,22 +221,36 @@ async function enable(
   });
 }
 
-function mutableAbortState(): {
+async function schedulerAbortHarness(): Promise<{
   state: TransparencySchedulerAbortState;
-  abort(): void;
-} {
-  let aborted = false;
-  return {
-    state: {
-      get aborted() {
-        return aborted;
-      },
-      assertNotAborted(phase: string): void {
-        if (aborted) throw new TransparencySchedulerAbortedError(phase);
-      },
+  abort(): Promise<void>;
+  release(): void;
+}> {
+  let state: TransparencySchedulerAbortState | undefined;
+  let releaseScheduler: (() => void) | undefined;
+  const scheduler = startTransparencyScheduler({
+    intervalMs: 1_000,
+    emit: async (abortState) => {
+      state = abortState;
+      await new Promise<void>((resolve) => {
+        releaseScheduler = resolve;
+      });
     },
-    abort() {
-      aborted = true;
+    onError: () => undefined,
+  });
+  await vi.advanceTimersByTimeAsync(1_000);
+  if (state === undefined || releaseScheduler === undefined) {
+    throw new Error("scheduler did not start a transparency emission");
+  }
+  return {
+    state,
+    async abort() {
+      const stopped = scheduler.stop();
+      await vi.advanceTimersByTimeAsync(TRANSPARENCY_STOP_DRAIN_DEADLINE_MS);
+      await stopped;
+    },
+    release() {
+      releaseScheduler?.();
     },
   };
 }
@@ -540,46 +556,52 @@ describe("fail loud, never blocking (outage fixture)", () => {
   });
 
   it("a scheduler abort before anchor key derivation records no failed receipt or audit entry", async () => {
-    const env = makeEnv();
-    const record = await emitOne(env);
-    await enable(env);
-    const abort = mutableAbortState();
-    const storage = new (class extends MemoryStorage {
-      override async read(namespace: string, key: string) {
-        const value = await env.storage.read(namespace, key);
-        if (
-          namespace === TRANSPARENCY_ANCHOR_NAMESPACE &&
-          key === anchorReceiptStorageKey(record.counter)
-        ) {
-          abort.abort();
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    try {
+      const env = makeEnv();
+      const record = await emitOne(env);
+      await enable(env);
+      const storage = new (class extends MemoryStorage {
+        override async read(namespace: string, key: string) {
+          const value = await env.storage.read(namespace, key);
+          if (
+            namespace === TRANSPARENCY_ANCHOR_NAMESPACE &&
+            key === anchorReceiptStorageKey(record.counter)
+          ) {
+            await abort.abort();
+          }
+          return value;
         }
-        return value;
-      }
-      override write(namespace: string, key: string, data: Uint8Array) {
-        return env.storage.write(namespace, key, data);
-      }
-      override delete(namespace: string, key: string, secureOverwrite?: boolean) {
-        return env.storage.delete(namespace, key, secureOverwrite);
-      }
-      override list(namespace: string, prefix?: string) {
-        return env.storage.list(namespace, prefix);
-      }
-    })();
-    const fixture = makeFetchFixture();
+        override write(namespace: string, key: string, data: Uint8Array) {
+          return env.storage.write(namespace, key, data);
+        }
+        override delete(namespace: string, key: string, secureOverwrite?: boolean) {
+          return env.storage.delete(namespace, key, secureOverwrite);
+        }
+        override list(namespace: string, prefix?: string) {
+          return env.storage.list(namespace, prefix);
+        }
+      })();
+      const fixture = makeFetchFixture();
 
-    await expect(
-      anchorCheckpoint({
+      const anchored = anchorCheckpoint({
         storage,
         masterKey: env.masterKey,
         auditLog: env.auditLog,
         record,
         fetchFn: fixture.fetch,
         abortState: abort.state,
-      })
-    ).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
-    expect(fixture.calls).toHaveLength(0);
-    expect(await readAnchorReceipts(env.storage)).toHaveLength(0);
-    expect(await auditOps(env, "transparency_anchor_failed")).toHaveLength(0);
+      });
+      await expect(anchored).rejects.toThrow(/anchor key derivation/);
+      await expect(anchored).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
+      expect(fixture.calls).toHaveLength(0);
+      expect(await readAnchorReceipts(env.storage)).toHaveLength(0);
+      expect(await auditOps(env, "transparency_anchor_failed")).toHaveLength(0);
+    } finally {
+      abort.release();
+      vi.useRealTimers();
+    }
   });
 
   it("an HTTP error from Rekor is a failure, not silently skipped", async () => {
@@ -660,6 +682,46 @@ describe("fail loud, never blocking (outage fixture)", () => {
       abortState: TRANSPARENCY_NEVER_ABORTED,
     });
     expect(again.status).toBe("already_anchored");
+  });
+});
+
+describe("scheduler abort custody checks", () => {
+  it("a scheduler abort after reading anchor config stops before config key derivation", async () => {
+    vi.useFakeTimers();
+    const abort = await schedulerAbortHarness();
+    try {
+      const env = makeEnv();
+      await enable(env);
+      const storage = new (class extends MemoryStorage {
+        override async read(namespace: string, key: string) {
+          const value = await env.storage.read(namespace, key);
+          if (namespace === "_meta" && key === TRANSPARENCY_ANCHOR_CONFIG_META_KEY) {
+            await abort.abort();
+          }
+          return value;
+        }
+        override write(namespace: string, key: string, data: Uint8Array) {
+          return env.storage.write(namespace, key, data);
+        }
+        override delete(namespace: string, key: string, secureOverwrite?: boolean) {
+          return env.storage.delete(namespace, key, secureOverwrite);
+        }
+        override list(namespace: string, prefix?: string) {
+          return env.storage.list(namespace, prefix);
+        }
+      })();
+
+      const config = readAnchorConfig({
+        storage,
+        masterKey: env.masterKey,
+        abortState: abort.state,
+      });
+      await expect(config).rejects.toThrow(/anchoring config key derivation/);
+      await expect(config).rejects.toBeInstanceOf(TransparencySchedulerAbortedError);
+    } finally {
+      abort.release();
+      vi.useRealTimers();
+    }
   });
 });
 

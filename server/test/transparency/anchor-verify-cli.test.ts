@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * PR-3 CLI surface + pre-declared drill fixtures for the anchor-verification
  * skeptic loop (synthetic-fixture rule: no network; Rekor is the

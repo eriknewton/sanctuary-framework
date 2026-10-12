@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * PR-3 anchor verification properties. The contracts under test:
  *

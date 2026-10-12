@@ -7,7 +7,7 @@
  *   - audit chain fails integrity        → refuse (AuditIntegrityError)
  *   - no Castle Wall policy on disk      → refuse
  *   - emitting binary unreadable         → refuse
- *   - signer unreachable / bad signature → refuse; NOTHING is persisted
+ *   - signer unreachable / bad signature → refuse before persistence
  *   - checkpoint store rolled back       → refuse (MAC'd counter floor)
  *   - previous checkpoint malformed      → refuse
  *
@@ -164,7 +164,9 @@ export async function readPersistedCheckpoints(
 /**
  * Emit one signed enforcement checkpoint. Returns the persisted record.
  * Throws `TransparencyEmitError` (or `AuditIntegrityError` from the audit
- * layer) on ANY failure; on failure nothing has been persisted.
+ * layer) on ANY failure. A failure before checkpoint persistence leaves no
+ * record; a failure between checkpoint persistence and floor write can leave
+ * the floor at counter-1, which remains a consistent lower bound.
  */
 export async function emitEnforcementCheckpoint(
   input: EmitEnforcementCheckpointInput

@@ -1,3 +1,4 @@
+// fail-before-exempt: call sites updated for the now-required abortState parameter; no assertion changed.
 /**
  * Anti-Rollback Stage 2 — external Rekor counter-floor cross-check.
  *
