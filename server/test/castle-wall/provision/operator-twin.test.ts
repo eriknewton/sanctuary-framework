@@ -10,7 +10,11 @@ import {
   type OperatorTwinStandDownOps,
   type OperatorTwinStandDownSnapshot,
 } from "../../../src/castle-wall/provision/operator-twin.js";
-import { verifyOperatorTwinPlistForRestore } from "../../../src/wrap/auto-provision.js";
+import {
+  OPERATOR_TWIN_PLIST_MAX_BYTES,
+  operatorTwinStandDownOpsForProvision,
+  verifyOperatorTwinPlistForRestore,
+} from "../../../src/wrap/auto-provision.js";
 
 const TEST_OPERATOR_UID = typeof process.getuid === "function" ? process.getuid() : 501;
 
@@ -135,8 +139,17 @@ function snapshotFor(descriptor: OperatorTwinDescriptor): OperatorTwinStandDownS
   };
 }
 
-function installFsOps(host: TwinHost): string[] {
-  const writes: string[] = [];
+async function makeFifo(path: string): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolve, reject) => {
+    execFile("/usr/bin/mkfifo", [path], (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function installFsOps(host: TwinHost): void {
   host.ops.readFile = async (path) => {
     host.calls.push(`read ${path}`);
     try {
@@ -150,7 +163,6 @@ function installFsOps(host: TwinHost): string[] {
     host.calls.push(`verify ${path}`);
     return await verifyOperatorTwinPlistForRestore(path, expectedContent, TEST_OPERATOR_UID);
   };
-  return writes;
 }
 
 describe("operator twin stand-down", () => {
@@ -254,7 +266,7 @@ describe("operator twin stand-down", () => {
   it("reports a restore problem and keeps launchd stopped when the plist leaf is replaced by a non-regular file", async () => {
     const descriptor = await makeTempDescriptor();
     const host = makeTwinHost({ disabled: true, loaded: false, running: false }, descriptor);
-    const writes = installFsOps(host);
+    installFsOps(host);
     const outside = join(dirnameForTest(descriptor.plistPath), "outside.plist");
     await writeFile(outside, "<plist>outside</plist>", { mode: 0o644 });
     await symlink(outside, descriptor.plistPath);
@@ -264,7 +276,6 @@ describe("operator twin stand-down", () => {
 
     expect(report.restored).toBe(false);
     expect(report.problems.some((problem) => problem.includes("restore_problem"))).toBe(true);
-    expect(writes).toEqual([]);
     expect(await readFile(outside, "utf8")).toBe("<plist>outside</plist>");
     expect((await stat(outside)).uid).toBe(ownerBefore.uid);
     expect(host.disabled).toBe(true);
@@ -278,7 +289,7 @@ describe("operator twin stand-down", () => {
   it("reports a restore problem and keeps launchd stopped when the plist leaf has multiple directory entries", async () => {
     const descriptor = await makeTempDescriptor();
     const host = makeTwinHost({ disabled: true, loaded: false, running: false }, descriptor);
-    const writes = installFsOps(host);
+    installFsOps(host);
     const outside = join(dirnameForTest(descriptor.plistPath), "outside-hardlink.plist");
     await writeFile(outside, "<plist>outside</plist>", { mode: 0o644 });
     await link(outside, descriptor.plistPath);
@@ -289,7 +300,6 @@ describe("operator twin stand-down", () => {
 
     expect(report.restored).toBe(false);
     expect(report.problems.some((problem) => problem.includes("restore_problem"))).toBe(true);
-    expect(writes).toEqual([]);
     expect(await readFile(outside, "utf8")).toBe("<plist>outside</plist>");
     expect((await stat(outside)).uid).toBe(ownerBefore.uid);
     expect(host.disabled).toBe(true);
@@ -321,6 +331,85 @@ describe("operator twin stand-down", () => {
     expect(host.running).toBe(false);
     expect(host.calls).not.toContain(`launchctl enable ${descriptor.domain}/${descriptor.label}`);
     expect(host.calls).not.toContain(`launchctl bootstrap ${descriptor.domain} ${descriptor.plistPath}`);
+  });
+
+  it("reports a restore problem when launchd state was owed but no plist snapshot exists", async () => {
+    const host = makeTwinHost({ disabled: true, loaded: false, running: false });
+    const snapshot: OperatorTwinStandDownSnapshot = {
+      plistPath: DESCRIPTOR.plistPath,
+      domain: DESCRIPTOR.domain,
+      label: DESCRIPTOR.label,
+      serviceName: "gui/501/ai.hermes.gateway",
+      disabledBefore: false,
+      wasLoaded: true,
+      wasRunning: false,
+      preexistingTwinModified: true,
+    };
+
+    const report = await restoreOperatorTwinStandDown(snapshot, host.ops);
+
+    expect(report.restored).toBe(false);
+    expect(report.problems).toContain(
+      "restore_problem: launchd state was not restored because no operator plist snapshot was available",
+    );
+    expect(host.calls).not.toContain("launchctl enable gui/501/ai.hermes.gateway");
+    expect(host.calls).not.toContain(`launchctl bootstrap gui/501 ${DESCRIPTOR.plistPath}`);
+  });
+
+  it("refuses a symlinked plist before launchd mutation when stand-down snapshots through the real helper", async () => {
+    const descriptor = await makeTempDescriptor();
+    const host = makeTwinHost({ disabled: false, loaded: true, running: true }, descriptor);
+    const outside = join(dirnameForTest(descriptor.plistPath), "stand-down-linked.plist");
+    await writeFile(outside, "<plist>before</plist>", { mode: 0o644 });
+    await symlink(outside, descriptor.plistPath);
+    host.ops = operatorTwinStandDownOpsForProvision({
+      consoleOwnerUid: TEST_OPERATOR_UID,
+      runLaunchctl: host.ops.runLaunchctl,
+      sleepMs: host.ops.sleepMs,
+      notify: host.ops.notify,
+    });
+
+    await expect(standDownOperatorTwinLaunchAgent(descriptor, host.ops)).rejects.toThrow(/stand_down_problem/);
+
+    expect(host.calls).not.toContain(`launchctl disable ${descriptor.domain}/${descriptor.label}`);
+    expect(host.calls).not.toContain(`launchctl bootout ${descriptor.domain} ${descriptor.plistPath}`);
+  });
+
+  it("refuses non-snapshotable plist shapes before launchd mutation during stand-down", async () => {
+    const cases = [
+      async (descriptor: OperatorTwinDescriptor) => {
+        const outside = join(dirnameForTest(descriptor.plistPath), "snapshot-link-target.plist");
+        await writeFile(outside, "<plist>before</plist>", { mode: 0o644 });
+        await symlink(outside, descriptor.plistPath);
+      },
+      async (descriptor: OperatorTwinDescriptor) => {
+        await makeFifo(descriptor.plistPath);
+      },
+      async (descriptor: OperatorTwinDescriptor) => {
+        const outside = join(dirnameForTest(descriptor.plistPath), "snapshot-hardlink-target.plist");
+        await writeFile(outside, "<plist>before</plist>", { mode: 0o644 });
+        await link(outside, descriptor.plistPath);
+      },
+      async (descriptor: OperatorTwinDescriptor) => {
+        await writeFile(descriptor.plistPath, "a".repeat(OPERATOR_TWIN_PLIST_MAX_BYTES + 1), { mode: 0o644 });
+      },
+    ];
+
+    for (const arrange of cases) {
+      const descriptor = await makeTempDescriptor();
+      const host = makeTwinHost({ disabled: false, loaded: true, running: true }, descriptor);
+      await arrange(descriptor);
+      host.ops = operatorTwinStandDownOpsForProvision({
+        consoleOwnerUid: TEST_OPERATOR_UID,
+        runLaunchctl: host.ops.runLaunchctl,
+        sleepMs: host.ops.sleepMs,
+        notify: host.ops.notify,
+      });
+
+      await expect(standDownOperatorTwinLaunchAgent(descriptor, host.ops)).rejects.toThrow(/stand_down_problem/);
+      expect(host.calls).not.toContain(`launchctl disable ${descriptor.domain}/${descriptor.label}`);
+      expect(host.calls).not.toContain(`launchctl bootout ${descriptor.domain} ${descriptor.plistPath}`);
+    }
   });
 });
 

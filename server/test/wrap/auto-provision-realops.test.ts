@@ -70,6 +70,7 @@ import {
   buildHermesExclusiveCliWiring,
   describeRepairCoarseComposition,
   resolveGateDaemonArgvPrefix,
+  readOperatorTwinPlistSnapshotForStandDown,
   verifyOperatorTwinPlistForRestore,
   OPERATOR_TWIN_PLIST_MAX_BYTES,
   type HarnessLogDirectoryStats,
@@ -2725,6 +2726,26 @@ describe("wrap/auto-provision real-ops chokepoint: operator twin restore custody
     }
   });
 
+  it("accepts an unchanged root-owned operator plist when stat ownership is modeled", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-operator-plist-root-owned-"));
+    try {
+      const plistPath = join(tmpRoot, "ai.hermes.gateway.plist");
+      const content = "<plist>before</plist>";
+      await writeFile(plistPath, content, { mode: 0o600 });
+
+      const result = await verifyOperatorTwinPlistForRestore(plistPath, content, TEST_OPERATOR_UID + 1, {
+        statFile: async (handle) => {
+          const modeled = await handle.stat();
+          return Object.assign(Object.create(Object.getPrototypeOf(modeled)), modeled, { uid: 0 });
+        },
+      });
+
+      expect(result).toEqual({ ok: true });
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it("refuses an existing operator plist above the restore read bound", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-operator-plist-large-"));
     try {
@@ -2741,6 +2762,76 @@ describe("wrap/auto-provision real-ops chokepoint: operator twin restore custody
     }
   });
 
+  it("returns no stand-down snapshot when the operator plist is absent", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-operator-plist-absent-snapshot-"));
+    try {
+      await expect(
+        readOperatorTwinPlistSnapshotForStandDown(join(tmpRoot, "ai.hermes.gateway.plist"), TEST_OPERATOR_UID),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "linked path",
+      async (plistPath: string) => {
+        const target = join(dirname(plistPath), "target.plist");
+        await writeFile(target, "<plist>before</plist>", { mode: 0o600 });
+        await symlink(target, plistPath);
+      },
+    ],
+    [
+      "fifo path",
+      async (plistPath: string) => {
+        await makeFifo(plistPath);
+      },
+    ],
+    [
+      "multi-entry path",
+      async (plistPath: string) => {
+        const target = join(dirname(plistPath), "target.plist");
+        await writeFile(target, "<plist>before</plist>", { mode: 0o600 });
+        await link(target, plistPath);
+      },
+    ],
+    [
+      "oversize path",
+      async (plistPath: string) => {
+        await writeFile(plistPath, "a".repeat(OPERATOR_TWIN_PLIST_MAX_BYTES + 1), { mode: 0o600 });
+      },
+    ],
+  ])("refuses %s while reading a stand-down snapshot", async (_name, arrange) => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-operator-plist-snapshot-refuse-"));
+    try {
+      const plistPath = join(tmpRoot, "ai.hermes.gateway.plist");
+      await arrange(plistPath);
+
+      await expect(readOperatorTwinPlistSnapshotForStandDown(plistPath, TEST_OPERATOR_UID)).rejects.toThrow(
+        /stand_down_problem/,
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a stand-down snapshot with owner mismatch when the host can model one", async () => {
+    const currentUid = TEST_OPERATOR_UID;
+    if (currentUid === 0) return;
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-operator-plist-snapshot-owner-"));
+    try {
+      const plistPath = join(tmpRoot, "ai.hermes.gateway.plist");
+      await writeFile(plistPath, "<plist>before</plist>", { mode: 0o600 });
+
+      await expect(readOperatorTwinPlistSnapshotForStandDown(plistPath, currentUid + 1)).rejects.toThrow(
+        /stand_down_problem/,
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it("routes operator-twin restore through the existing-plist verifier without file mutation ops", async () => {
     const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
     const standDownOps = source.match(/standDownOperatorTwin:\s*async[\s\S]*?return \{ ok: true as const, snapshot \};/)?.[0] ?? "";
@@ -2748,7 +2839,7 @@ describe("wrap/auto-provision real-ops chokepoint: operator twin restore custody
     const verifier = source.match(/type OperatorTwinPlistReadResult[\s\S]*?return \{ ok: true \};\n}/)?.[0] ?? "";
 
     expect(source).toContain("verifyOperatorTwinPlistForRestore");
-    expect(standDownOps).toContain("readOperatorTwinPlistSnapshotForStandDown");
+    expect(standDownOps).toContain("operatorTwinStandDownOpsForProvision");
     expect(restoreOps).toContain("verifyPlistForRestore: verifyOperatorTwinPlistForRestore");
     expect(restoreOps).not.toContain("readFile:");
     expect(restoreOps).not.toContain("writeFile:");

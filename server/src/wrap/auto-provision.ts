@@ -78,6 +78,7 @@ import {
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
+  type OperatorTwinStandDownOps,
   type OperatorTwinStandDownSnapshot,
   HERMES_ENDPOINT_SET,
   publishProvisionedEgressRules,
@@ -178,8 +179,8 @@ export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 // 1 = one directory entry names the operator plist; extra links fail restore verification.
 const OPERATOR_TWIN_PLIST_SINGLE_LINK_COUNT = 1;
-// 64 KiB = 16 x 4 KiB plist pages, comfortably above a generated LaunchAgent while bounding restore reads.
-export const OPERATOR_TWIN_PLIST_MAX_BYTES = 16 * 4 * 1024;
+// Chosen 64 KiB ceiling: generated LaunchAgent plists are small, and restore/stand-down only need one bounded snapshot read.
+export const OPERATOR_TWIN_PLIST_MAX_BYTES = 64 * 1024;
 
 export class HarnessLogDirectoryCustodyError extends Error {
   constructor(harnessLogDir: string, message?: string) {
@@ -417,17 +418,31 @@ type OperatorTwinPlistReadResult =
   | { ok: true; content: string }
   | { ok: false; absent: boolean; problem: string };
 
+type OperatorTwinPlistStats = {
+  isFile(): boolean;
+  uid: number;
+  nlink: number;
+  size: number;
+};
+
+type OperatorTwinPlistReadOps = {
+  statFile?: (handle: Awaited<ReturnType<typeof open>>) => Promise<OperatorTwinPlistStats>;
+};
+
 async function readOperatorTwinPlistNoFollow(
   path: string,
   operatorUid: number,
+  problemLabel: "restore_problem" | "stand_down_problem",
+  ops: OperatorTwinPlistReadOps = {},
 ): Promise<OperatorTwinPlistReadResult> {
+  const problem = (message: string) => `${problemLabel}: ${message}`;
   const noFollow =
     typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : undefined;
   if (noFollow === undefined) {
     return {
       ok: false,
       absent: false,
-      problem: "restore_problem: this platform cannot no-follow verify the operator plist",
+      problem: problem("this platform cannot no-follow verify the operator plist"),
     };
   }
   const nonBlock = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
@@ -435,26 +450,27 @@ async function readOperatorTwinPlistNoFollow(
   try {
     // Restore reloads the existing plist only after a no-follow check that it still matches the snapshot; it does not create, replace or remove that file.
     handle = await open(path, fsConstants.O_RDONLY | noFollow | nonBlock);
-    const stats = await handle.stat();
+    // Owner acceptance is decided from the opened descriptor's stat; tests inject this seam to model uid-0 ownership without host custody changes.
+    const stats = await (ops.statFile ?? ((opened) => opened.stat()))(handle);
     if (!stats.isFile()) {
-      return { ok: false, absent: false, problem: "restore_problem: operator plist is not a regular file" };
+      return { ok: false, absent: false, problem: problem("operator plist is not a regular file") };
     }
     if (stats.uid !== operatorUid && stats.uid !== 0) {
       return {
         ok: false,
         absent: false,
-        problem: "restore_problem: operator plist is not owned by the operator uid or root",
+        problem: problem("operator plist is not owned by the operator uid or root"),
       };
     }
     if (stats.nlink !== OPERATOR_TWIN_PLIST_SINGLE_LINK_COUNT) {
       return {
         ok: false,
         absent: false,
-        problem: "restore_problem: operator plist must have exactly one directory entry",
+        problem: problem("operator plist must have exactly one directory entry"),
       };
     }
     if (stats.size > OPERATOR_TWIN_PLIST_MAX_BYTES) {
-      return { ok: false, absent: false, problem: "restore_problem: operator plist exceeds the restore read bound" };
+      return { ok: false, absent: false, problem: problem("operator plist exceeds the snapshot read bound") };
     }
     const buffer = Buffer.alloc(stats.size);
     let offset = 0;
@@ -466,17 +482,17 @@ async function readOperatorTwinPlistNoFollow(
     const oneExtraByte = Buffer.alloc(1);
     const extra = await handle.read(oneExtraByte, 0, oneExtraByte.length, offset);
     if (extra.bytesRead > 0) {
-      return { ok: false, absent: false, problem: "restore_problem: operator plist changed while being read" };
+      return { ok: false, absent: false, problem: problem("operator plist changed while being read") };
     }
     return { ok: true, content: buffer.subarray(0, offset).toString("utf8") };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return { ok: false, absent: true, problem: "restore_problem: operator plist is absent" };
+      return { ok: false, absent: true, problem: problem("operator plist is absent") };
     }
     return {
       ok: false,
       absent: false,
-      problem: `restore_problem: could not no-follow verify operator plist: ${describeUntrusted(err)}`,
+      problem: problem(`could not no-follow verify operator plist: ${describeUntrusted(err)}`),
     };
   } finally {
     await handle?.close().catch(() => undefined);
@@ -487,7 +503,7 @@ export async function readOperatorTwinPlistSnapshotForStandDown(
   path: string,
   operatorUid: number,
 ): Promise<string | undefined> {
-  const read = await readOperatorTwinPlistNoFollow(path, operatorUid);
+  const read = await readOperatorTwinPlistNoFollow(path, operatorUid, "stand_down_problem");
   if (read.ok) return read.content;
   if (read.absent) return undefined;
   throw new Error(read.problem);
@@ -497,13 +513,31 @@ export async function verifyOperatorTwinPlistForRestore(
   path: string,
   expectedContent: string,
   operatorUid: number,
+  ops: OperatorTwinPlistReadOps = {},
 ): Promise<{ ok: true } | { ok: false; problem: string }> {
-  const read = await readOperatorTwinPlistNoFollow(path, operatorUid);
+  const read = await readOperatorTwinPlistNoFollow(path, operatorUid, "restore_problem", ops);
   if (!read.ok) return { ok: false, problem: read.problem };
   if (read.content !== expectedContent) {
     return { ok: false, problem: "restore_problem: operator plist bytes changed before restore" };
   }
   return { ok: true };
+}
+
+export function operatorTwinStandDownOpsForProvision(input: {
+  consoleOwnerUid: number;
+  runLaunchctl?: OperatorTwinStandDownOps["runLaunchctl"];
+  sleepMs?: OperatorTwinStandDownOps["sleepMs"];
+  notify?: OperatorTwinStandDownOps["notify"];
+}): OperatorTwinStandDownOps {
+  return {
+    readFile: async (path) => {
+      return await readOperatorTwinPlistSnapshotForStandDown(path, input.consoleOwnerUid);
+    },
+    verifyPlistForRestore: verifyOperatorTwinPlistForRestore,
+    runLaunchctl: input.runLaunchctl ?? ((args) => runLaunchctlWithTimeout(args)),
+    sleepMs: input.sleepMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    notify: input.notify ?? (() => undefined),
+  };
 }
 
 /**
@@ -2083,15 +2117,13 @@ export async function runAutoProvisionForWrap(
         operatorUid: consoleOwnerUid,
       });
       try {
-        const snapshot = await standDownOperatorTwinLaunchAgent(descriptor, {
-          readFile: async (path) => {
-            return await readOperatorTwinPlistSnapshotForStandDown(path, consoleOwnerUid);
-          },
-          verifyPlistForRestore: verifyOperatorTwinPlistForRestore,
-          runLaunchctl: (args) => runLaunchctlWithTimeout(args),
-          sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-          notify: (message) => print(message),
-        });
+        const snapshot = await standDownOperatorTwinLaunchAgent(
+          descriptor,
+          operatorTwinStandDownOpsForProvision({
+            consoleOwnerUid,
+            notify: (message) => print(message),
+          }),
+        );
         operatorTwinStandDownSnapshot = snapshot;
         return { ok: true as const, snapshot };
       } catch (err) {
