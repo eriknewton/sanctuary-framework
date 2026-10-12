@@ -23,11 +23,13 @@
 //      the twin can never disagree about what a row says. The guard runs its own
 //      main() on import and exports nothing, so the semantics are mirrored here
 //      and pinned on both sides rather than imported.
-//   3. NO NEW CLAIMS. Every string the JSON carries is a verbatim substring of
+//   3. NO NEW CLAIMS. Every string under `rows` in the twin, and every field of
+//      the product-facts file, is a verbatim substring of
 //      ASSURANCE_MATRIX.md, README.md, or server/package.json (the packet-named
 //      source for the npm fields), or a repo-relative path that exists in the
 //      tree. A string that is none of these is a claim the Markdown does not make,
-//      and the export fails rather than publishing it.
+//      and the export fails rather than publishing it. The twin's `schema` and
+//      `source` fields are this script's own identifiers (pinned above), not claims.
 //   4. STATUS VOCABULARY. A row's status must be one of the values the matrix's
 //      own "Status enum:" line declares; the script never invents one.
 //
@@ -153,9 +155,11 @@ function parseStatusEnum(matrixText) {
   return values;
 }
 
-// Row parsing mirrors main() in scripts/check-assurance-matrix.mjs line for line:
-// only pipe-prefixed lines are table lines, the header row starts the table, the
+// Row parsing mirrors main() in scripts/check-assurance-matrix.mjs: only
+// pipe-prefixed lines are table lines, the header row starts the table, the
 // separator row is skipped, and a row with other than six cells fails loudly.
+// One addition the guard does not make: a second table fails here, because the
+// twin models exactly one.
 function parseMatrix(matrixText) {
   const statusEnum = parseStatusEnum(matrixText);
   const rows = [];
