@@ -1130,6 +1130,7 @@ describe("state_import version floor tool path", () => {
         imported_before_refusal: 0,
         written_keys: [],
         in_flight_key: { namespace: "notes", key: "storage-first-in-flight" },
+        in_flight_key_may_have_landed: true,
       });
     } finally {
       storage.onWrite = undefined;
@@ -1178,9 +1179,55 @@ describe("state_import version floor tool path", () => {
         imported_before_refusal: 1,
         written_keys: [{ namespace: "notes", key: "storage-landed-first" }],
         in_flight_key: { namespace: "notes", key: "storage-landed-second" },
+        in_flight_key_may_have_landed: true,
       });
     } finally {
       storage.onWrite = undefined;
+      await rig.close();
+    }
+  });
+
+  it("labels a first in-flight key when storage refuses before bytes land", async () => {
+    const storage = new HookedMemoryStorage();
+    const rig = await makeToolRig(storage);
+    try {
+      const identityId = await createIdentity(rig.client);
+      const identity = rig.identityManager.get(identityId);
+      if (!identity) throw new Error("missing identity");
+      const bundle = await sourceBundle({
+        masterKey: rig.masterKey,
+        identityEncKey: rig.identityEncKey,
+        identity,
+        values: [{ key: "storage-before-first", value: "imported" }],
+      });
+      storage.beforeWrite = async (namespace, key) => {
+        if (namespace === "notes" && key === "storage-before-first") {
+          throw new Error("injected before-write refusal");
+        }
+      };
+
+      const refused = await callTool(rig.client, "state_import", {
+        bundle,
+        conflict_resolution: "overwrite",
+      });
+      expect(refused.denied).toBe(true);
+      expect(await storage.read("notes", "storage-before-first")).toBeNull();
+      const audit = await rig.auditLog.query({
+        operation_type: "state_import_failed",
+        limit: 10,
+      });
+      expect(audit.entries).toHaveLength(1);
+      expect(audit.entries[0]?.details).toMatchObject({
+        error_name: "Error",
+        error_message: "injected before-write refusal",
+        partial: true,
+        imported_before_refusal: 0,
+        written_keys: [],
+        in_flight_key: { namespace: "notes", key: "storage-before-first" },
+        in_flight_key_may_have_landed: true,
+      });
+    } finally {
+      storage.beforeWrite = undefined;
       await rig.close();
     }
   });

@@ -211,6 +211,7 @@ export interface StateImportPartialApplyDetails {
   importedBeforeRefusal: number;
   writtenKeys: StateImportWrittenKey[];
   inFlightKey?: StateImportWrittenKey;
+  inFlightKeyMayHaveLanded?: true;
 }
 
 function cloneWrittenKey(writtenKey: StateImportWrittenKey): StateImportWrittenKey {
@@ -240,6 +241,13 @@ export function getStateImportPartialApplyDetails(
   ) {
     return undefined;
   }
+  const inFlightKey =
+    candidate.inFlightKey !== null &&
+    typeof candidate.inFlightKey === "object" &&
+    typeof (candidate.inFlightKey as StateImportWrittenKey).namespace === "string" &&
+    typeof (candidate.inFlightKey as StateImportWrittenKey).key === "string"
+      ? cloneWrittenKey(candidate.inFlightKey as StateImportWrittenKey)
+      : undefined;
   return {
     partial: true,
     importedBeforeRefusal: candidate.importedBeforeRefusal,
@@ -253,11 +261,8 @@ export function getStateImportPartialApplyDetails(
         );
       })
     ),
-    ...(candidate.inFlightKey !== null &&
-    typeof candidate.inFlightKey === "object" &&
-    typeof (candidate.inFlightKey as StateImportWrittenKey).namespace === "string" &&
-    typeof (candidate.inFlightKey as StateImportWrittenKey).key === "string"
-      ? { inFlightKey: cloneWrittenKey(candidate.inFlightKey as StateImportWrittenKey) }
+    ...(inFlightKey
+      ? { inFlightKey, inFlightKeyMayHaveLanded: true as const }
       : {}),
   };
 }
@@ -279,6 +284,7 @@ function attachStateImportPartialApplyDetails<T>(
   target.writtenKeys = cloneWrittenKeys(writtenKeys);
   if (inFlightKey) {
     target.inFlightKey = cloneWrittenKey(inFlightKey);
+    target.inFlightKeyMayHaveLanded = true;
   }
   return target;
 }
@@ -288,6 +294,7 @@ export class StateImportPartialApplyError extends StateVerificationError {
   readonly importedBeforeRefusal: number;
   readonly writtenKeys: StateImportWrittenKey[];
   readonly inFlightKey?: StateImportWrittenKey;
+  readonly inFlightKeyMayHaveLanded?: true;
 
   constructor(
     cause: StateVerificationError,
@@ -304,6 +311,7 @@ export class StateImportPartialApplyError extends StateVerificationError {
     this.writtenKeys = cloneWrittenKeys(writtenKeys);
     if (inFlightKey) {
       this.inFlightKey = cloneWrittenKey(inFlightKey);
+      this.inFlightKeyMayHaveLanded = true;
     }
     (this as Error & { cause?: unknown }).cause = cause;
   }
@@ -3409,9 +3417,10 @@ export class StateStore {
     // skip: existing entries are skipped and not floor-checked; absent entries write.
     // version: non-newer entries are skipped and not floor-checked; newer entries write.
     // overwrite: every verified non-reserved entry writes and is floor-checked.
-    // journal, per-write floor, storage, and facade-marker refusals after earlier
-    // writes leave those writes applied; storage refusals additionally name the
-    // in-flight key because the backend may have landed it before reporting.
+    // journal, per-write floor, post-write anchor/cache, storage, and
+    // facade-marker refusals after earlier writes leave those writes applied;
+    // storage refusals additionally name the in-flight key because the backend
+    // may have landed it before reporting, including when it is the first key.
     await this.assertImportWriteCandidateVersionFloors(plan.writeCandidates);
 
     let importedKeys = 0;

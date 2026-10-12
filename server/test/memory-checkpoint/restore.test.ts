@@ -61,6 +61,15 @@ interface Fixture {
   audit: ReturnType<typeof makeAuditLog>;
 }
 
+class HookedMemoryStorage extends MemoryStorage {
+  beforeWrite: ((namespace: string, key: string) => Promise<void>) | undefined;
+
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    await this.beforeWrite?.(namespace, key);
+    await super.write(namespace, key, data);
+  }
+}
+
 interface ExportEntry {
   key: string;
   entry: {
@@ -92,9 +101,11 @@ async function makeTempFortress(): Promise<string> {
   return dir;
 }
 
-async function makeFixture(now = "2026-08-03T12:00:00.000Z"): Promise<Fixture> {
+async function makeFixture(
+  now = "2026-08-03T12:00:00.000Z",
+  storage: MemoryStorage = new MemoryStorage(),
+): Promise<Fixture> {
   const fortressPath = await makeTempFortress();
-  const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const stateStore = new RealStateStore(storage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -851,6 +862,7 @@ describe("restoreCheckpoint", () => {
       import_applied: true,
       written_keys: [{ namespace: "mem", key: "Q" }],
       in_flight_key: { namespace: "mem", key: "R" },
+      in_flight_key_may_have_landed: true,
     });
     const failureAudit = fixture.audit.criticalCalls.at(-1);
     expect(failureAudit).toMatchObject({
@@ -861,6 +873,72 @@ describe("restoreCheckpoint", () => {
           import_applied: true,
           written_keys: [{ namespace: "mem", key: "Q" }],
           in_flight_key: { namespace: "mem", key: "R" },
+          in_flight_key_may_have_landed: true,
+        },
+      },
+    });
+  });
+
+  it("records a first in-flight checkpoint key as not applied when storage refuses before bytes land", async () => {
+    const storage = new HookedMemoryStorage();
+    const fixture = await makeFixture("2026-08-03T12:09:00.000Z", storage);
+    await writeEntry(fixture, "mem", "Q", "known-good");
+    const checkpoint = await createCheckpoint({
+      stateStore: fixture.stateStore,
+      store: fixture.checkpointStore,
+      masterKey: fixture.masterKey,
+      auditLog: fixture.audit.auditLog,
+      identityId: fixture.identity.storedIdentity.identity_id,
+      source: "on_demand",
+      retentionValue: "off",
+      now: new Date("2026-08-03T12:09:00.000Z"),
+    });
+    await fixture.stateStore.delete("mem", "Q");
+    storage.beforeWrite = async (namespace, key) => {
+      if (namespace === "mem" && key === "Q") {
+        throw new Error("injected before-write refusal");
+      }
+    };
+
+    let thrown: unknown;
+    try {
+      await restoreCheckpoint({
+        stateStore: fixture.stateStore,
+        checkpointStore: fixture.checkpointStore,
+        masterKey: fixture.masterKey,
+        auditLog: fixture.audit.auditLog,
+        identityId: fixture.identity.storedIdentity.identity_id,
+        checkpointId: checkpoint.id,
+        assessParked: parkedClaim,
+        publicKeyResolver: publicKeyResolver(fixture),
+        now: new Date("2026-08-03T12:10:00.000Z"),
+      });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      storage.beforeWrite = undefined;
+    }
+
+    expect(thrown).toBeInstanceOf(CheckpointRestoreReconstructError);
+    expect((thrown as CheckpointRestoreReconstructError).progress).toEqual({
+      deleted_added: [],
+      delete_remaining: [],
+      import_applied: false,
+      written_keys: [],
+      in_flight_key: { namespace: "mem", key: "Q" },
+      in_flight_key_may_have_landed: true,
+    });
+    expect((await exportEntries(fixture.stateStore)).has("mem/Q")).toBe(false);
+    const failureAudit = fixture.audit.criticalCalls.at(-1);
+    expect(failureAudit).toMatchObject({
+      operation: "memory_checkpoint_restore",
+      result: "failure",
+      details: {
+        reconstruct_progress: {
+          import_applied: false,
+          written_keys: [],
+          in_flight_key: { namespace: "mem", key: "Q" },
+          in_flight_key_may_have_landed: true,
         },
       },
     });
@@ -914,7 +992,7 @@ describe("restoreCheckpoint", () => {
       reason: "checkpoint_skipped_entries_refused",
     });
     expect((thrown as Error).message).toBe(
-      "memory checkpoint restore refused: 1 checkpoint entry is signed by an identity this fortress does not hold and 0 do not verify against the signer's current key (entries written before an identity key rotation are one cause). No override exists; state is unchanged",
+      "memory checkpoint restore refused: 1 checkpoint entry is signed by an identity this fortress does not hold and 0 checkpoint entries do not verify. No override exists; state is unchanged",
     );
     expect(deleteSpy).not.toHaveBeenCalled();
     expect((await exportEntries(fixture.stateStore)).has("mem/P")).toBe(true);

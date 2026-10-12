@@ -36,6 +36,8 @@ export interface CheckpointRestoreReconstructProgress {
   delete_remaining: string[];
   import_applied: boolean;
   written_keys?: Array<{ namespace: string; key: string }>;
+  in_flight_key?: { namespace: string; key: string };
+  in_flight_key_may_have_landed?: true;
 }
 
 export interface RestoreCheckpointResult {
@@ -108,6 +110,20 @@ export class CheckpointRestoreReconstructError extends MemoryCheckpointError {
 }
 
 export class CheckpointRestoreAuditError extends MemoryCheckpointError {}
+
+const SINGULAR_CHECKPOINT_ENTRY_COUNT = 1;
+
+function formatCheckpointEntryCount(
+  count: number,
+  singularVerb: string,
+  pluralVerb: string,
+): string {
+  return `${count} checkpoint ${
+    count === SINGULAR_CHECKPOINT_ENTRY_COUNT
+      ? `entry ${singularVerb}`
+      : `entries ${pluralVerb}`
+  }`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -361,10 +377,18 @@ export async function preflightCheckpointRestore(
       deps.publicKeyResolver,
     );
     if (preflight.skippedKeys > 0) {
+      const unknownSignerCount = formatCheckpointEntryCount(
+        preflight.skippedUnknownKid,
+        "is",
+        "are",
+      );
+      const badSignatureCount = formatCheckpointEntryCount(
+        preflight.skippedInvalidSig,
+        "does",
+        "do",
+      );
       throw new CheckpointRestoreSkippedEntriesError(
-        `memory checkpoint restore refused: ${preflight.skippedUnknownKid} checkpoint ${
-          preflight.skippedUnknownKid === 1 ? "entry is" : "entries are"
-        } signed by an identity this fortress does not hold and ${preflight.skippedInvalidSig} do not verify against the signer's current key (entries written before an identity key rotation are one cause). No override exists; state is unchanged`,
+        `memory checkpoint restore refused: ${unknownSignerCount} signed by an identity this fortress does not hold and ${badSignatureCount} not verify. No override exists; state is unchanged`,
         "checkpoint_skipped_entries_refused",
       );
     }
@@ -467,6 +491,7 @@ export async function restoreCheckpoint(
       );
     } catch (err) {
       const partialDetails = getStateImportPartialApplyDetails(err);
+      const writtenKeys = partialDetails?.writtenKeys ?? [];
       throw new CheckpointRestoreReconstructError(
         `memory checkpoint restore failed while importing checkpoint ${deps.checkpointId}: ${
           err instanceof Error ? err.message : String(err)
@@ -475,12 +500,15 @@ export async function restoreCheckpoint(
         {
           deleted_added: deletedAdded,
           delete_remaining: [],
-          import_applied: partialDetails ? true : false,
+          import_applied: writtenKeys.length > 0,
           ...(partialDetails
             ? {
-                written_keys: partialDetails.writtenKeys,
+                written_keys: writtenKeys,
                 ...(partialDetails.inFlightKey
-                  ? { in_flight_key: partialDetails.inFlightKey }
+                  ? {
+                      in_flight_key: partialDetails.inFlightKey,
+                      in_flight_key_may_have_landed: true as const,
+                    }
                   : {}),
               }
             : {}),
