@@ -67,6 +67,41 @@ const AUDITED_DYNAMIC_WRITES: AuditedDynamicWrite[] = [
     reason:
       "federation peer-sync security state (Federation 3/3b P0): per-sender accepted high-water + outbound high-water + folded revocation projection, written to the frozen internal _federation namespace under its own AES-GCM purpose key; derived anti-replay/revocation metadata, not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
   },
+  // StateStore.write is the provenance chokepoint; this backend write happens only after the namespace/key are sealed into the signed state envelope.
+  {
+    path: "server/src/cognitive/state-store.ts",
+    callArgs: "namespace, key, serialized",
+    reason:
+      "StateStore.write writes the signed state envelope it just minted for this namespace/key, so the raw backend write is already provenance-bound by the chokepoint",
+  },
+  // Legacy schema migration preserves the verified entry namespace/key while adding the envelope that later reads require.
+  {
+    path: "server/src/cognitive/state-store.ts",
+    callArgs: "namespace, key, stringToBytes(JSON.stringify(migrated))",
+    reason:
+      "StateStore legacy migration writes only the same verified namespace/key after rebuilding the signed envelope from the entry's established writer identity",
+  },
+  // State import admits only validated, non-reserved bundle namespaces before preserving exported entries byte-for-byte.
+  {
+    path: "server/src/cognitive/state-store.ts",
+    callArgs: "ns, key, serialized",
+    reason:
+      "StateStore import writes entries only after bundle namespace metadata, reserved-namespace refusal, signature checks, and version floors prove the imported namespace/key",
+  },
+  // Master rotation handles user-state namespaces through the registered state-namespace recipe and re-signs each rotated entry.
+  {
+    path: "server/src/core/master-rotation.ts",
+    callArgs: "namespace, key, result.bytes",
+    reason:
+      "master rotation writes rotated user-state bytes only after recipeFor classified the namespace as state and rotateStateEntryBytes revalidated and re-signed the entry",
+  },
+  // Master rotation handles purpose-keyed namespaces only through registered recipes with their explicit info/AAD set.
+  {
+    path: "server/src/core/master-rotation.ts",
+    callArgs: "namespace, key, stringToBytes(JSON.stringify(next))",
+    reason:
+      "master rotation writes purpose-keyed bytes only after recipeFor selected a registered namespace recipe and the entry decrypted under one of that recipe's explicit AAD bindings",
+  },
 ];
 
 function tsFiles(dir: string): string[] {
@@ -169,18 +204,6 @@ function isInternalConstant(firstArg: string): boolean {
 }
 
 function isAllowedDynamicWrite(call: WriteCall): boolean {
-  if (
-    call.relativePath === "server/src/cognitive/state-store.ts" &&
-    (call.firstArg === "namespace" || call.firstArg === "ns")
-  ) {
-    return true;
-  }
-  if (
-    call.relativePath === "server/src/core/master-rotation.ts" &&
-    call.firstArg === "namespace"
-  ) {
-    return true;
-  }
   return AUDITED_DYNAMIC_WRITES.some(
     (item) => call.relativePath === item.path && call.callArgs === item.callArgs,
   );
@@ -205,6 +228,28 @@ describe("state provenance write chokepoint", () => {
     });
 
     expect(unsafe.map((call) => call.firstArg)).toEqual(["userNamespace"]);
+  });
+
+  it("binds master rotation dynamic write allowances to exact call text", () => {
+    const fixture = `
+      async function rotate(ctx, namespace, key, result, shadowBytes) {
+        await fenced(ctx, () => ctx.storage.write(namespace, key, result.bytes));
+        await fenced(ctx, () => ctx.storage.write(namespace, key, shadowBytes));
+      }
+    `;
+
+    const unsafe = storageWriteCallsFromSource(
+      "server/src/core/master-rotation.ts",
+      fixture,
+    ).filter((call) => {
+      if (isReservedLiteral(call.firstArg)) return false;
+      if (isInternalConstant(call.firstArg)) return false;
+      return !isAllowedDynamicWrite(call);
+    });
+
+    expect(unsafe.map((call) => call.callArgs)).toEqual([
+      "namespace, key, shadowBytes",
+    ]);
   });
 
   it("keeps every audited dynamic write allowance bound to one call site", () => {
