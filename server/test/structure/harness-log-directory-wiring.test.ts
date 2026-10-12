@@ -39,9 +39,45 @@ function awaitedCalls(source: string): string[] {
   return [...source.matchAll(/\bawait\s+([A-Za-z0-9_.]+)\s*\(/g)].map((match) => match[1]!);
 }
 
-function expectNoRootFilesystemMutation(source: string): void {
+const BANNED_FS_FUNCTIONS = new Set([
+  "chown",
+  "lchown",
+  "fchown",
+  "chmod",
+  "fchmod",
+  "mkdir",
+  "rename",
+  "open",
+  "unlink",
+  "writeFile",
+  "symlink",
+]);
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function importedBannedFsNames(moduleSource: string): string[] {
+  const localNames = new Set<string>();
+  const fsImportPattern = /import\s*{(?<imports>[^}]+)}\s*from\s*"node:fs(?:\/promises)?";/g;
+  for (const match of moduleSource.matchAll(fsImportPattern)) {
+    const importList = match.groups?.imports ?? "";
+    for (const specifier of importList.split(",")) {
+      const parts = specifier.trim().split(/\s+as\s+/);
+      const imported = parts[0]?.trim();
+      if (imported === undefined || !BANNED_FS_FUNCTIONS.has(imported.replace(/Sync$/, ""))) continue;
+      localNames.add(parts.at(-1)!.trim());
+    }
+  }
+  return [...localNames].sort();
+}
+
+function expectNoRootFilesystemMutation(source: string, moduleSource: string): void {
+  for (const localName of importedBannedFsNames(moduleSource)) {
+    expect(source).not.toMatch(new RegExp(`(?:\\b|\\.)${escapeRegex(localName)}\\s*\\(`));
+  }
   expect(source).not.toMatch(
-    /(?:\b|\.)(?:chown|lchown|fchown|chmod|fchmod|mkdir|rename|open|unlink|writeFile|symlink)\s*\(/,
+    /(?:\b|\.)[A-Za-z0-9_]*(?:chown|chmod|mkdir|rename|open|unlink|writefile|symlink)(?:Sync)?\s*\(/i,
   );
   expect(source).not.toMatch(/(?:\b|\.)[A-Za-z0-9_]+Sync\s*\(/);
 }
@@ -72,8 +108,8 @@ describe("structure: harness log directory install wiring", () => {
       "ops.createDirectoryAsAgent",
       "ops.lstat",
     ]);
-    expectNoRootFilesystemMutation(helperSource);
-    expectNoRootFilesystemMutation(creatorSource);
+    expectNoRootFilesystemMutation(helperSource, source);
+    expectNoRootFilesystemMutation(creatorSource, source);
     expect(helperSource).not.toContain("openDirectoryNoFollow");
     expect(helperSource).not.toContain("readEntries");
     expect(helperSource).not.toContain("/dev/fd");

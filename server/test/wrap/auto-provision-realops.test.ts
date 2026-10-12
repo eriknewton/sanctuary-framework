@@ -1534,13 +1534,14 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     stats: Awaited<ReturnType<typeof lstat>>,
     uid: number,
     gid: number,
+    mode = Number(stats.mode),
   ): HarnessLogDirectoryStats {
     return {
       dev: Number(stats.dev),
       ino: Number(stats.ino),
       uid,
       gid,
-      mode: Number(stats.mode),
+      mode,
       nlink: Number(stats.nlink),
       isDirectory: () => stats.isDirectory(),
       isSymbolicLink: () => stats.isSymbolicLink(),
@@ -1735,6 +1736,40 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
     }
   });
 
+  it("AGENT-HOME-LOGS-SYMLINK-01: rejects a mkdir child error when the process handle is already closed", async () => {
+    vi.useFakeTimers();
+    const failingSpawn = (() => {
+      const child = new EventEmitter() as ChildProcess & { _handle: null };
+      Object.defineProperty(child, "pid", { value: FAKE_STARTED_CHILD_PID });
+      Object.defineProperty(child, "_handle", { value: null });
+      child.kill = (() => false) as ChildProcess["kill"];
+      queueMicrotask(() => child.emit("error", new Error("spawn fault")));
+      return child;
+    }) as typeof spawn;
+    const promise = createHarnessLogDirectoryAsAgent(
+      "/tmp/sanctuary-agent-home/logs",
+      currentUid,
+      currentGid,
+      failingSpawn,
+    );
+    const timedOut = Symbol("timed-out");
+
+    try {
+      await Promise.resolve();
+      const result = await Promise.race([
+        promise.then(
+          () => "resolved",
+          (err: unknown) => err,
+        ),
+        vi.advanceTimersByTimeAsync(1).then(() => timedOut),
+      ]);
+      expect(result).toBeInstanceOf(HarnessLogDirectoryCustodyError);
+    } finally {
+      vi.useRealTimers();
+      promise.catch(() => undefined);
+    }
+  });
+
   it("AGENT-HOME-LOGS-SYMLINK-01: waits for close after timing out the mkdir child", async () => {
     vi.useFakeTimers();
     const child = new EventEmitter() as ChildProcess;
@@ -1888,6 +1923,59 @@ describe("wrap/auto-provision real-ops chokepoint: harness log directory custody
       );
 
       expect(await readlink(parentLink)).toBe(outsideHome);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a dedicated account home owned by another account before spawning mkdir", async () => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture("sanctuary-harness-log-parent-owner-");
+    const foreignUid = currentUid + 1000;
+    let createCalled = false;
+    try {
+      await expectParentCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async (path) => {
+            if (path === agentHome) return overlayStats(path, foreignUid, currentGid);
+            return lstat(path);
+          },
+          createDirectoryAsAgent: async () => {
+            createCalled = true;
+          },
+        }),
+        agentHome,
+      );
+
+      expect(createCalled).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["group", 0o020],
+    ["others", 0o002],
+  ])("refuses a dedicated account home writable by %s before spawning mkdir", async (_label, writableBit) => {
+    const { tmpRoot, agentHome, logDir } = await makeHarnessLogFixture("sanctuary-harness-log-parent-mode-");
+    let createCalled = false;
+    try {
+      const parentStats = await lstat(agentHome);
+      await expectParentCustodyRefusal(
+        ensureHarnessDaemonLogDir(logDir, currentUid, currentGid, {
+          lstat: async (path) => {
+            if (path === agentHome) {
+              return statsWithOwner(parentStats, currentUid, currentGid, Number(parentStats.mode) | writableBit);
+            }
+            return lstat(path);
+          },
+          createDirectoryAsAgent: async () => {
+            createCalled = true;
+          },
+        }),
+        agentHome,
+      );
+
+      expect(createCalled).toBe(false);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
