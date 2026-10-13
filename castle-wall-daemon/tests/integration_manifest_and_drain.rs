@@ -464,7 +464,7 @@ fn boot_manifest_is_durably_authorized_before_daemon_started() {
     booted.handle.stop().unwrap();
 }
 
-/// FAIL-BEFORE for the contention-read-as-failure defect (P1).
+/// A contended policy read reports the last known state rather than inventing loss.
 ///
 /// The manifest store lock is genuinely contended in normal operation: verdict
 /// evaluation takes it per packet, and an authorized reload holds it across
@@ -1122,6 +1122,13 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
             .contains("\"final_verdict\":\"drop\""),
         "the superseding record must state what actually happened to the packet"
     );
+    assert!(superseding.event_canonical_json.contains(&format!(
+        "\"identity_id\":\"{}/uid-{}\"",
+        booted.fortress_id, TEST_AGENT_UID
+    )));
+    assert!(superseding
+        .event_canonical_json
+        .contains(&format!("\"fortress_id\":\"{}\"", booted.fortress_id)));
 
     let _ = booted.handle.stop();
 }
@@ -1177,6 +1184,32 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         outcome.verdict(),
         castle_wall_daemon::policy::Verdict::Allow { .. }
     ));
+    let wal = booted.handle.wal_writer().expect("wal");
+    let rows_after_admitted = wal.lock().unwrap().snapshot_after(None, 500).unwrap().len();
+    for mark in [
+        castle_wall_daemon::nftables::confined_agent_id(TEST_GATE_UID),
+        castle_wall_daemon::nftables::confined_agent_id(TEST_AGENT_UID + 1),
+        "agent-x".to_string(),
+    ] {
+        let denied = booted
+            .handle
+            .evaluate_attempt(&EvaluationRequest {
+                agent_id: mark,
+                agent_template: "claude-code".to_string(),
+                dest_host: Some("api.example.com".to_string()),
+                dest_ip: Some("203.0.113.7".to_string()),
+                dest_port: 443,
+                dest_protocol: "tcp".to_string(),
+                opaque: false,
+            })
+            .expect("evaluate");
+        assert!(denied.event_canonical_json().is_none());
+    }
+    assert_eq!(
+        wal.lock().unwrap().snapshot_after(None, 500).unwrap().len(),
+        rows_after_admitted,
+        "unadmitted marks must not append egress rows"
+    );
 
     let mut stream = connect_and_handshake(
         &booted.socket_path,
@@ -1201,8 +1234,10 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
             assert!(events.len() >= 2);
             let approved = events
                 .iter()
-                .find(|e| e.event_canonical_json.contains("\"egress_approved\""))
-                .expect("egress_approved on the wire");
+                .filter(|e| e.event_canonical_json.contains("\"egress_approved\""))
+                .collect::<Vec<_>>();
+            assert_eq!(approved.len(), 1, "the admitted mark writes one egress row");
+            let approved = approved[0];
             assert!(approved.critical, "evaluate_attempt emits critical events");
             assert!(approved.event_canonical_json.contains("\"l1\""));
             assert!(approved.event_canonical_json.contains("\"static_rule\""));

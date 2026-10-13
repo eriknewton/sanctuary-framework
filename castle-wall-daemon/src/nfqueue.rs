@@ -726,11 +726,11 @@ fn supersede_allow_receipt(
         // SAFETY: stderr is the last-resort channel for an audit-trail correction
         // that could not be written; routing it through the audit log is exactly what
         // just failed, so a structured logger would lose the message.
-        eprintln!(
+        decision_engine.emit_diagnostic(&format!(
             "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {wal_seq} \
              recorded an allow, and the superseding record could not be written ({err}); \
              the audit trail for that sequence overstates what happened"
-        );
+        ));
     }
 }
 
@@ -756,7 +756,7 @@ mod tests {
         }
     }
 
-    /// FAIL-BEFORE for the locale defect: an idle poll whose rendered message is
+    /// An idle poll whose rendered message is
     /// NOT the English `strerror` text (the shape produced under a non-English
     /// `LC_MESSAGES`) must still classify transient. The previous substring match
     /// returned `false` here, ending the verdict thread and restart-looping the
@@ -859,6 +859,61 @@ mod tests {
             0,
             "the pre-evaluation fence must return before policy/audit mutation"
         );
+    }
+
+    #[test]
+    fn packet_without_a_source_agent_mark_drops_before_policy_evaluation() {
+        let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "no-source".to_string(),
+            None,
+            None,
+            Arc::clone(&audit),
+        ));
+        let callback = build_verdict_callback(engine);
+        let packet = PendingPacket {
+            packet_id: 1,
+            nfmark: 1,
+            source_agent_id: None,
+            source_cgroup_id: 1,
+            dest_ip: Some("203.0.113.10".to_string()),
+            dest_port: 443,
+            protocol: 6,
+            packet_len: 64,
+        };
+
+        assert_eq!(callback(&packet), NfVerdict::Drop);
+        assert_eq!(audit.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn policy_evaluation_error_maps_to_drop() {
+        let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "unwired".to_string(),
+            None,
+            None,
+            Arc::clone(&audit),
+        ));
+        let callback = build_verdict_callback(engine);
+        let packet = PendingPacket {
+            packet_id: 1,
+            nfmark: 1,
+            source_agent_id: Some("uid-60123".to_string()),
+            source_cgroup_id: 1,
+            dest_ip: Some("203.0.113.10".to_string()),
+            dest_port: 443,
+            protocol: 6,
+            packet_len: 64,
+        };
+
+        assert_eq!(callback(&packet), NfVerdict::Drop);
     }
 
     #[test]

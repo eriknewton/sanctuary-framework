@@ -114,7 +114,7 @@ impl AdmittedIdentity {
     /// or not at all (`PolicySnapshot` states it;
     /// `snapshot_threads_the_whole_admitted_set` asserts it). A uid with no
     /// ceiling would mean sealing a uid into a kernel rule without the floor
-    /// admission accepted it under. A ceiling with NO uid is the same defect seen
+    /// admission accepted it under. A ceiling with NO uid is the same invalid state seen
     /// from the other side: the snapshot carries an admission bound that no
     /// subject was derived from, so reading it as `Unconfined` would silently
     /// discard half of an inconsistent pair and arm a wall that confines nobody
@@ -179,6 +179,7 @@ pub struct DecisionEngine {
     wal_writer: Option<Arc<Mutex<WalWriter>>>,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     mutation_cancel: Arc<AtomicBool>,
+    diagnostic_sink: Arc<dyn Fn(&str) + Send + Sync>,
     unattributed_attempts: Arc<AtomicU64>,
     unattributed_log_lines: Arc<AtomicU64>,
     /// The write-once armed identity, SHARED by every clone of this engine.
@@ -215,12 +216,31 @@ impl DecisionEngine {
         audit_buffer: Arc<Mutex<AuditRingBuffer>>,
         mutation_cancel: Arc<AtomicBool>,
     ) -> Self {
+        Self::new_with_mutation_cancel_and_diagnostic_sink(
+            fortress_id,
+            manifest_store,
+            wal_writer,
+            audit_buffer,
+            mutation_cancel,
+            Arc::new(|line| eprintln!("{line}")),
+        )
+    }
+
+    pub(crate) fn new_with_mutation_cancel_and_diagnostic_sink(
+        fortress_id: String,
+        manifest_store: Option<Arc<Mutex<ManifestStore>>>,
+        wal_writer: Option<Arc<Mutex<WalWriter>>>,
+        audit_buffer: Arc<Mutex<AuditRingBuffer>>,
+        mutation_cancel: Arc<AtomicBool>,
+        diagnostic_sink: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
         Self {
             fortress_id,
             manifest_store,
             wal_writer,
             audit_buffer,
             mutation_cancel,
+            diagnostic_sink,
             armed_identity: Arc::new(OnceLock::new()),
             unattributed_attempts: Arc::new(AtomicU64::new(0)),
             unattributed_log_lines: Arc::new(AtomicU64::new(0)),
@@ -286,6 +306,10 @@ impl DecisionEngine {
         self.unattributed_log_lines.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn emit_diagnostic(&self, line: &str) {
+        (self.diagnostic_sink)(line);
+    }
+
     /// Record that an already-durable verdict was OVERRIDDEN before the packet
     /// was released, so the audit trail cannot end on an `allow` receipt for a
     /// packet the kernel dropped.
@@ -299,14 +323,14 @@ impl DecisionEngine {
     /// wire, but the WAL was left holding a canonical `egress_approved` receipt
     /// for a packet that never went anywhere. The audit log IS the product's
     /// evidence claim, so a receipt that describes an event which did not occur
-    /// is a defect even though the enforcement direction is safe.
+    /// is refused even though the enforcement direction is safe.
     ///
     /// ## Bounded, and never a new hang
     ///
     /// This runs on the NFQUEUE verdict thread DURING teardown, where the WAL
     /// mutex is contended by the shutdown path. It therefore takes the lock
     /// under a short wall-clock deadline and gives up rather than blocking; a
-    /// blocking `lock()` here would be a liveness defect on the exact thread
+    /// blocking `lock()` here would stall the exact thread
     /// teardown is waiting to join. It deliberately does NOT consult
     /// `mutation_cancel`: that flag is SET on every path that reaches here, so
     /// honoring it would make this function a permanent no-op.
@@ -314,8 +338,7 @@ impl DecisionEngine {
     /// Failure mode when the deadline is missed: the superseding record is not
     /// written and the divergence remains for that one packet. The caller still
     /// drops the packet (the wire stays fail-closed) and reports the miss
-    /// loudly, because a silently-absent correction is exactly the shape of the
-    /// original defect.
+    /// loudly, because a silently absent correction leaves the evidence incomplete.
     pub(crate) fn append_superseding_verdict(
         &self,
         superseded_wal_seq: u64,
@@ -769,7 +792,7 @@ impl DecisionEngine {
                     // only the scoped-rule admission failed, so arming this uid means
                     // kernel binding may confine it with no operator allow rules.
                     AdmittedIdentity {
-                        fortress_id: self.fortress_id().to_string(),
+                        fortress_id: guard.expected_fortress_id().to_string(),
                         subject: AdmittedSubject::Confined {
                             agent_uid,
                             ceiling,
@@ -1036,10 +1059,10 @@ impl DecisionEngine {
             // SAFETY: stderr is the bounded operator channel for a denied packet
             // with no attributable confined subject; powers of two in u64 cap
             // this process to 64 lines, and a saturated counter is not a power of two.
-            eprintln!(
+            self.emit_diagnostic(&format!(
                 "castle-wall-daemon: denied packet without an attributable confined subject \
                  count={post_increment}"
-            );
+            ));
         }
         EvaluationOutcome {
             evidence: OutcomeEvidence::Unattributed,
@@ -1214,7 +1237,6 @@ fn cancellable_lock<'a, T>(
 // The daemon binds the uid a signed manifest admits, and holds that identity for
 // as long as the process runs. These tests cover the freeze at boot, the refusal
 // of any later identity change, and the structural facts the two must rest on.
-// Register: defect.linux-readiness-precedes-confinement.
 #[cfg(test)]
 mod armed_identity_tests {
     use super::*;
@@ -1235,6 +1257,10 @@ mod armed_identity_tests {
     const FORTRESS: &str = "deadbeef";
 
     fn fixture() -> Fixture {
+        fixture_with_ids(FORTRESS, FORTRESS)
+    }
+
+    fn fixture_with_ids(engine_fortress: &str, manifest_fortress: &str) -> Fixture {
         let dir = TempDir::new().unwrap();
         let policy_dir = dir.path().join("policy");
         std::fs::create_dir_all(&policy_dir).unwrap();
@@ -1243,7 +1269,7 @@ mod armed_identity_tests {
             policy_dir.clone(),
             dir.path().join("pinned.key"),
             signing.verifying_key().to_bytes(),
-            FORTRESS.to_string(),
+            manifest_fortress.to_string(),
         )));
         let wal = Arc::new(Mutex::new(
             WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
@@ -1258,7 +1284,7 @@ mod armed_identity_tests {
             Duration::from_secs(60),
         )));
         let engine = DecisionEngine::new(
-            FORTRESS.to_string(),
+            engine_fortress.to_string(),
             Some(Arc::clone(&store)),
             Some(Arc::clone(&wal)),
             Arc::clone(&ring),
@@ -1295,7 +1321,8 @@ mod armed_identity_tests {
         gate_uid: Option<u32>,
         rule_id: &str,
     ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
-        signed_bundle_with_ceiling(
+        signed_bundle_with_fortress_ceiling_disposition(
+            FORTRESS,
             signing,
             generation,
             agent_uid,
@@ -1303,6 +1330,7 @@ mod armed_identity_tests {
             FIXTURE_CEILING,
             rule_id,
             &[],
+            "allow",
         )
     }
 
@@ -1316,6 +1344,31 @@ mod armed_identity_tests {
         rule_id: &str,
         scope_agent_ids: &[String],
     ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        signed_bundle_with_fortress_ceiling_disposition(
+            FORTRESS,
+            signing,
+            generation,
+            agent_uid,
+            gate_uid,
+            ceiling,
+            rule_id,
+            scope_agent_ids,
+            "allow",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed_bundle_with_fortress_ceiling_disposition(
+        fortress_id: &str,
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        ceiling: u32,
+        rule_id: &str,
+        scope_agent_ids: &[String],
+        disposition: &str,
+    ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         use crate::manifest::verify::{
             AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
         };
@@ -1323,7 +1376,7 @@ mod armed_identity_tests {
         let rule_body = if scope_agent_ids.is_empty() {
             format!(
                 "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-19T00:00:00Z\",\
-                 \"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
+                 \"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"{disposition}\"}}"
             )
             .into_bytes()
         } else {
@@ -1333,7 +1386,7 @@ mod armed_identity_tests {
                 "created_at": "2026-09-19T00:00:00Z",
                 "match": { "ip": ["203.0.113.7"] },
                 "scope": { "agent_ids": scope_agent_ids },
-                "disposition": "allow"
+                "disposition": disposition
             }))
             .unwrap()
         };
@@ -1341,7 +1394,7 @@ mod armed_identity_tests {
         let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
         let manifest = AllowlistManifest {
             schema_version: crate::constants::SCHEMA_VERSION_V1,
-            fortress_id: FORTRESS.to_string(),
+            fortress_id: fortress_id.to_string(),
             issued_at: "2026-09-19T00:00:00Z".to_string(),
             generation,
             agent_origin: agent_uid.map(|uid| AgentOrigin {
@@ -1410,6 +1463,57 @@ mod armed_identity_tests {
         )
     }
 
+    fn write_policy_with_fortress(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        fortress_id: &str,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        rule_id: &str,
+    ) {
+        write_policy_with_fortress_disposition(
+            policy_dir,
+            signing,
+            fortress_id,
+            generation,
+            agent_uid,
+            gate_uid,
+            rule_id,
+            "allow",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_policy_with_fortress_disposition(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        fortress_id: &str,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        rule_id: &str,
+        disposition: &str,
+    ) {
+        use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+        let (manifest_bytes, rules) = signed_bundle_with_fortress_ceiling_disposition(
+            fortress_id,
+            signing,
+            generation,
+            agent_uid,
+            gate_uid,
+            FIXTURE_CEILING,
+            rule_id,
+            &[],
+            disposition,
+        );
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        for (name, body) in rules {
+            std::fs::write(policy_dir.join(RULES_SUBDIR).join(name), body).unwrap();
+        }
+        std::fs::write(policy_dir.join(MANIFEST_FILENAME), manifest_bytes).unwrap();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn write_policy_with_ceiling(
         policy_dir: &std::path::Path,
@@ -1446,8 +1550,29 @@ mod armed_identity_tests {
         scope_agent_ids: &[String],
         rule_id: &str,
     ) {
-        write_policy_with_ceiling(
+        write_policy_with_fortress_scope(
             policy_dir,
+            signing,
+            FORTRESS,
+            generation,
+            agent_uid,
+            scope_agent_ids,
+            rule_id,
+        )
+    }
+
+    fn write_policy_with_fortress_scope(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        fortress_id: &str,
+        generation: u64,
+        agent_uid: u32,
+        scope_agent_ids: &[String],
+        rule_id: &str,
+    ) {
+        use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+        let (manifest_bytes, rules) = signed_bundle_with_fortress_ceiling_disposition(
+            fortress_id,
             signing,
             generation,
             Some(agent_uid),
@@ -1455,7 +1580,13 @@ mod armed_identity_tests {
             FIXTURE_CEILING,
             rule_id,
             scope_agent_ids,
-        )
+            "allow",
+        );
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        for (name, body) in rules {
+            std::fs::write(policy_dir.join(RULES_SUBDIR).join(name), body).unwrap();
+        }
+        std::fs::write(policy_dir.join(MANIFEST_FILENAME), manifest_bytes).unwrap();
     }
 
     fn manifest_generation_and_signature(policy_dir: &std::path::Path) -> (u64, String) {
@@ -1469,9 +1600,16 @@ mod armed_identity_tests {
     }
 
     fn write_high_water_for_current_manifest(policy_dir: &std::path::Path) -> serde_json::Value {
+        write_high_water_for_current_manifest_with_fortress(policy_dir, FORTRESS)
+    }
+
+    fn write_high_water_for_current_manifest_with_fortress(
+        policy_dir: &std::path::Path,
+        fortress_id: &str,
+    ) -> serde_json::Value {
         let (generation, manifest_signature_b64url) = manifest_generation_and_signature(policy_dir);
         let high_water = serde_json::json!({
-            "fortress_id": FORTRESS,
+            "fortress_id": fortress_id,
             "generation": generation,
             "manifest_signature_b64url": manifest_signature_b64url,
         });
@@ -1525,6 +1663,68 @@ mod armed_identity_tests {
 
     fn ring_len(ring: &Arc<Mutex<AuditRingBuffer>>) -> usize {
         ring.lock().unwrap().len()
+    }
+
+    fn assert_unattributed_without_audit(
+        f: &Fixture,
+        outcome: &EvaluationOutcome,
+        baseline_wal: usize,
+        baseline_ring: usize,
+        baseline_counter: u64,
+    ) {
+        assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
+        assert!(matches!(
+            outcome.verdict(),
+            Verdict::Deny {
+                reason: DeniedReason::DefaultDeny
+            }
+        ));
+        assert!(outcome.wal_seq().is_none());
+        assert!(outcome.event_canonical_json().is_none());
+        assert_eq!(wal_len(&f.wal), baseline_wal);
+        assert_eq!(ring_len(&f.ring), baseline_ring);
+        assert_eq!(
+            f.engine.unattributed_attempts_for_test(),
+            baseline_counter + 1
+        );
+    }
+
+    fn fixture_with_confined_cell_and_no_snapshot(
+        engine_fortress: &str,
+        cell_fortress: &str,
+    ) -> Fixture {
+        let f = fixture_with_ids(engine_fortress, cell_fortress);
+        write_policy_with_fortress(
+            &f.policy_dir,
+            &f.signing,
+            cell_fortress,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        write_high_water_for_current_manifest_with_fortress(&f.policy_dir, cell_fortress);
+        write_policy_with_fortress_scope(
+            &f.policy_dir,
+            &f.signing,
+            cell_fortress,
+            2,
+            TEST_AGENT_UID,
+            &[format!("agent-{TEST_AGENT_UID}")],
+            "r2",
+        );
+        let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
+        assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
+        assert!(f.store.lock().unwrap().current_snapshot().is_none());
+        assert!(matches!(
+            f.engine.armed_identity().map(|identity| identity.subject),
+            Some(AdmittedSubject::Confined {
+                agent_uid: TEST_AGENT_UID,
+                ceiling: FIXTURE_CEILING,
+                gate_uid: None,
+            })
+        ));
+        f
     }
 
     #[test]
@@ -1658,6 +1858,561 @@ mod armed_identity_tests {
         );
         assert_eq!(wal_len(&f.wal), baseline_wal + 1);
         assert_eq!(ring_len(&f.ring), baseline_ring + 1);
+    }
+
+    #[test]
+    fn evaluate_attempt_reports_unwired_dependencies_before_a_verdict() {
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let no_store = DecisionEngine::new("deadbeef".to_string(), None, None, Arc::clone(&ring));
+        let request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        assert!(matches!(
+            no_store.evaluate_attempt(&request),
+            Err(AttemptError::ManifestStoreUnwired)
+        ));
+
+        let f = fixture();
+        let no_wal = DecisionEngine::new(
+            FORTRESS.to_string(),
+            Some(Arc::clone(&f.store)),
+            None,
+            Arc::clone(&f.ring),
+        );
+        assert!(matches!(
+            no_wal.evaluate_attempt(&request),
+            Err(AttemptError::WalUnwired)
+        ));
+    }
+
+    #[test]
+    fn evaluate_attempt_reports_poisoned_store_without_a_row() {
+        let f = fixture();
+        let baseline_wal = wal_len(&f.wal);
+        let poisoned = Arc::clone(&f.store);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison store");
+        })
+        .join();
+        let request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        assert!(matches!(
+            f.engine.evaluate_attempt(&request),
+            Err(AttemptError::ManifestStorePoisoned)
+        ));
+        assert_eq!(wal_len(&f.wal), baseline_wal);
+    }
+
+    #[test]
+    fn recorded_evidence_covers_allow_deny_and_prompt_verdicts() {
+        for (disposition, expected) in [("allow", "allow"), ("allow", "deny")] {
+            let f = fixture();
+            write_policy_with_fortress_disposition(
+                &f.policy_dir,
+                &f.signing,
+                FORTRESS,
+                1,
+                Some(TEST_AGENT_UID),
+                None,
+                "r1",
+                disposition,
+            );
+            f.engine.reload_manifest_authorized_at_boot().unwrap();
+            let ip = if expected == "deny" {
+                "203.0.113.8"
+            } else {
+                "203.0.113.7"
+            };
+            let outcome = f
+                .engine
+                .evaluate_attempt(&evaluation_request(
+                    crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                    ip,
+                ))
+                .expect("evaluate");
+            match expected {
+                "allow" => assert!(matches!(
+                    outcome.evidence,
+                    OutcomeEvidence::Recorded {
+                        verdict: Verdict::Allow { .. },
+                        ..
+                    }
+                )),
+                "deny" => assert!(matches!(
+                    outcome.evidence,
+                    OutcomeEvidence::Recorded {
+                        verdict: Verdict::Deny {
+                            reason: DeniedReason::DefaultDeny
+                        },
+                        ..
+                    }
+                )),
+                _ => unreachable!("covered cases"),
+            }
+            assert_eq!(
+                outcome.subject().expect("subject").as_str(),
+                "deadbeef/uid-60123"
+            );
+            assert!(outcome.wal_seq().is_some());
+            assert!(outcome.event_canonical_json().is_some());
+        }
+    }
+
+    #[test]
+    fn wal_contention_records_a_ring_only_fail_closed_body_with_the_same_subject() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let held = Arc::clone(&f.wal);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
+        });
+        rx.recv().unwrap();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        holder.join().unwrap();
+        assert!(matches!(
+            outcome.evidence,
+            OutcomeEvidence::RingOnlyFailClosed { .. }
+        ));
+        assert_eq!(
+            outcome.subject().expect("subject").as_str(),
+            "deadbeef/uid-60123"
+        );
+        assert!(outcome
+            .event_canonical_json()
+            .expect("fail-closed body")
+            .contains("\"audit_wal_append_failed\""));
+        assert_eq!(wal_len(&f.wal), baseline_wal);
+    }
+
+    #[test]
+    fn poisoned_wal_refuses_after_a_cell_sourced_subject_without_a_body() {
+        let f = fixture_with_confined_cell_and_no_snapshot(FORTRESS, FORTRESS);
+        let baseline_ring = ring_len(&f.ring);
+        let poisoned = Arc::clone(&f.wal);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison wal");
+        })
+        .join();
+        let err = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .unwrap_err();
+        assert!(matches!(err, AttemptError::WalPoisoned));
+        assert_eq!(ring_len(&f.ring), baseline_ring);
+    }
+
+    #[test]
+    fn malformed_and_zero_uid_marks_are_unattributed_through_evaluation() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            Some(TEST_AGENT_UID + 1),
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        for mark in ["agent-x", "uid-01", "uid-", "uid-0"] {
+            let baseline_wal = wal_len(&f.wal);
+            let baseline_ring = ring_len(&f.ring);
+            let baseline_counter = f.engine.unattributed_attempts_for_test();
+            let outcome = f
+                .engine
+                .evaluate_attempt(&evaluation_request(mark.to_string(), "203.0.113.7"))
+                .expect("evaluate");
+            assert_unattributed_without_audit(
+                &f,
+                &outcome,
+                baseline_wal,
+                baseline_ring,
+                baseline_counter,
+            );
+        }
+    }
+
+    #[test]
+    fn inconsistent_snapshot_identity_is_refused_before_subject_resolution() {
+        for snapshot in [
+            PolicySnapshot {
+                fortress_id: FORTRESS.to_string(),
+                confined_agent_uid: Some(TEST_AGENT_UID),
+                confined_agent_uid_ceiling: None,
+                ..PolicySnapshot::default()
+            },
+            PolicySnapshot {
+                fortress_id: FORTRESS.to_string(),
+                confined_agent_uid: None,
+                confined_agent_uid_ceiling: Some(FIXTURE_CEILING),
+                ..PolicySnapshot::default()
+            },
+        ] {
+            assert!(AdmittedIdentity::from_snapshot(&snapshot).is_err());
+        }
+        let decision = source("src/decision.rs");
+        let production = production_lines(&decision).join("\n");
+        assert!(production.contains("AdmittedIdentity::from_snapshot(snapshot)"));
+        assert!(!production.contains("snapshot.confined_agent_uid.unwrap_or"));
+    }
+
+    #[test]
+    fn empty_fortress_admission_is_unattributed_through_evaluation() {
+        let f = fixture_with_ids("", "");
+        write_policy_with_fortress(
+            &f.policy_dir,
+            &f.signing,
+            "",
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let baseline_counter = f.engine.unattributed_attempts_for_test();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        assert_unattributed_without_audit(
+            &f,
+            &outcome,
+            baseline_wal,
+            baseline_ring,
+            baseline_counter,
+        );
+    }
+
+    #[test]
+    fn unconfined_snapshot_that_would_allow_is_unattributed() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, None, None, "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let baseline_counter = f.engine.unattributed_attempts_for_test();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        assert_unattributed_without_audit(
+            &f,
+            &outcome,
+            baseline_wal,
+            baseline_ring,
+            baseline_counter,
+        );
+    }
+
+    #[test]
+    fn cell_sourced_identity_records_default_deny_only_for_the_admitted_mark() {
+        let f = fixture_with_confined_cell_and_no_snapshot(FORTRESS, FORTRESS);
+        let baseline_wal = wal_len(&f.wal);
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        assert!(matches!(
+            outcome.evidence,
+            OutcomeEvidence::Recorded {
+                verdict: Verdict::Deny {
+                    reason: DeniedReason::DefaultDeny
+                },
+                ..
+            }
+        ));
+        assert!(outcome.wal_seq().is_some());
+        assert_eq!(wal_len(&f.wal), baseline_wal + 1);
+
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let baseline_counter = f.engine.unattributed_attempts_for_test();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID + 1),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        assert_unattributed_without_audit(
+            &f,
+            &outcome,
+            baseline_wal,
+            baseline_ring,
+            baseline_counter,
+        );
+    }
+
+    #[test]
+    fn store_timeout_uses_the_frozen_identity_not_the_engine_fortress() {
+        let cell_fortress = "0123456789abcdef";
+        let engine_fortress = "feedface";
+        let f = fixture_with_confined_cell_and_no_snapshot(engine_fortress, cell_fortress);
+        let held = Arc::clone(&f.store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
+        });
+        rx.recv().unwrap();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        holder.join().unwrap();
+        let subject = outcome.subject().expect("subject");
+        assert_eq!(subject.fortress_id(), cell_fortress);
+        assert_ne!(subject.fortress_id(), engine_fortress);
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
+            .contains(&format!(
+                "\"identity_id\":\"{cell_fortress}/uid-{TEST_AGENT_UID}\""
+            )));
+        assert!(matches!(
+            outcome.evidence,
+            OutcomeEvidence::Recorded {
+                verdict: Verdict::Deny {
+                    reason: DeniedReason::DefaultDeny
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn store_timeout_without_an_admitted_cell_subject_is_unattributed() {
+        for identity in [None, Some(AdmittedSubject::Unconfined)] {
+            let f = fixture();
+            if let Some(subject) = identity {
+                write_policy(&f.policy_dir, &f.signing, 1, None, None, "r1");
+                f.engine.reload_manifest_authorized_at_boot().unwrap();
+                assert_eq!(f.engine.armed_identity().unwrap().subject, subject);
+            }
+            let held = Arc::clone(&f.store);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = held.lock().unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
+            });
+            rx.recv().unwrap();
+            let baseline_wal = wal_len(&f.wal);
+            let baseline_ring = ring_len(&f.ring);
+            let baseline_counter = f.engine.unattributed_attempts_for_test();
+            let outcome = f
+                .engine
+                .evaluate_attempt(&evaluation_request(
+                    crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                    "203.0.113.7",
+                ))
+                .expect("evaluate");
+            holder.join().unwrap();
+            assert_unattributed_without_audit(
+                &f,
+                &outcome,
+                baseline_wal,
+                baseline_ring,
+                baseline_counter,
+            );
+        }
+    }
+
+    #[test]
+    fn store_guard_is_released_before_the_verdict_waits_on_the_wal() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let wal_guard = f.wal.lock().unwrap();
+        let store = Arc::clone(&f.store);
+        let engine = f.engine;
+        let request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            engine.evaluate_attempt(&request)
+        });
+        started_rx.recv().unwrap();
+        // 50ms is several bounded-lock poll intervals, enough for the worker to
+        // pass the short store read and wait at the WAL lock this test holds.
+        std::thread::sleep(Duration::from_millis(50));
+        let store_started = Instant::now();
+        let store_guard = store
+            .try_lock()
+            .expect("store guard is not held while the verdict waits on WAL");
+        assert!(
+            store_started.elapsed() < Duration::from_millis(50),
+            "the store guard must be released before WAL acquisition"
+        );
+        drop(store_guard);
+        drop(wal_guard);
+        let outcome = worker.join().unwrap().expect("evaluate");
+        assert!(matches!(
+            outcome.evidence,
+            OutcomeEvidence::Recorded {
+                verdict: Verdict::Allow { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verdict_returns_bounded_when_audit_ring_is_held_past_budget() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let held = Arc::clone(&f.ring);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(500));
+        });
+        rx.recv().unwrap();
+        let started = Instant::now();
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("verdict must return under ring contention");
+        let elapsed = started.elapsed();
+        assert!(outcome.wal_seq().is_some());
+        assert!(
+            elapsed < EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(400),
+            "verdict must return within the bounded budget under ring contention, took {elapsed:?}"
+        );
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn only_recorded_allow_evidence_releases_a_packet() {
+        let subject = ProtectionSubject::new("deadbeef", TEST_AGENT_UID).expect("subject");
+        let cases = [
+            (
+                EvaluationOutcome {
+                    evidence: OutcomeEvidence::Recorded {
+                        verdict: Verdict::Allow {
+                            rule_id: "r1".to_string(),
+                        },
+                        wal_seq: 1,
+                        subject: subject.clone(),
+                        event_canonical_json: "{}".to_string(),
+                    },
+                    timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+                },
+                true,
+            ),
+            (
+                EvaluationOutcome {
+                    evidence: OutcomeEvidence::Recorded {
+                        verdict: Verdict::Deny {
+                            reason: DeniedReason::DefaultDeny,
+                        },
+                        wal_seq: 1,
+                        subject: subject.clone(),
+                        event_canonical_json: "{}".to_string(),
+                    },
+                    timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+                },
+                false,
+            ),
+            (
+                EvaluationOutcome {
+                    evidence: OutcomeEvidence::Recorded {
+                        verdict: Verdict::PromptRequired {
+                            rule_id: "r1".to_string(),
+                        },
+                        wal_seq: 1,
+                        subject: subject.clone(),
+                        event_canonical_json: "{}".to_string(),
+                    },
+                    timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+                },
+                false,
+            ),
+            (
+                EvaluationOutcome {
+                    evidence: OutcomeEvidence::RingOnlyFailClosed {
+                        subject,
+                        event_canonical_json: "{}".to_string(),
+                    },
+                    timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+                },
+                false,
+            ),
+            (
+                EvaluationOutcome {
+                    evidence: OutcomeEvidence::Unattributed,
+                    timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+                },
+                false,
+            ),
+        ];
+        for (outcome, releases) in cases {
+            assert_eq!(outcome.releases(), releases);
+        }
     }
 
     #[test]
@@ -2308,7 +3063,7 @@ mod armed_identity_tests {
         }
     }
 
-    /// Regression fixture for the round-4 P2: a production caller placed
+    /// Regression fixture: a production caller placed
     /// AFTER an earlier top-level `#[cfg(test)]` function (the real shape in
     /// `nfqueue.rs`, where a test-only helper at line 154 is followed by
     /// ordinary production functions) must still be counted. The prior
@@ -2529,80 +3284,6 @@ mod mutation_tests {
             .snapshot_after(None, 10)
             .unwrap()
             .is_empty());
-    }
-
-    // GF3 fault injection: hold the audit ring past the verdict budget during a
-    // verdict. Before the fix the success path took an UNBOUNDED
-    // `audit_buffer.lock()` in the opposite order from `append_control_audit`
-    // (buffer->WAL), so a contended ring could stall the NFQUEUE verdict thread
-    // until the 2s deadline fail-stopped the daemon (or deadlock via ABBA). The
-    // verdict must now still return within the bounded acquisition budget: the
-    // durable WAL receipt lands, the ring insert is skipped, no deadlock.
-    #[test]
-    fn verdict_returns_bounded_when_audit_ring_is_held_past_budget() {
-        use crate::policy::EvaluationRequest;
-        let dir = TempDir::new().unwrap();
-        let wal = Arc::new(Mutex::new(
-            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
-        ));
-        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
-            1024 * 1024,
-            Duration::from_secs(60),
-        )));
-        let store = Arc::new(Mutex::new(crate::manifest::ManifestStore::new(
-            dir.path().to_path_buf(),
-            dir.path().join("pinned.key"),
-            [0u8; 32],
-            "f".to_string(),
-        )));
-        let engine = DecisionEngine::new(
-            "f".to_string(),
-            Some(store),
-            Some(Arc::clone(&wal)),
-            Arc::clone(&ring),
-        );
-        let agent_uid = 60_123;
-        assert!(engine.freeze_armed_identity_for_test(AdmittedIdentity {
-            fortress_id: "f".to_string(),
-            subject: AdmittedSubject::Confined {
-                agent_uid,
-                ceiling: 500,
-                gate_uid: None,
-            },
-        }));
-        // Hold the ring from another thread for longer than the verdict budget.
-        let held = Arc::clone(&ring);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
-            tx.send(()).unwrap();
-            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(500));
-        });
-        rx.recv().unwrap(); // the ring is now provably held before the verdict runs
-        let request = EvaluationRequest {
-            agent_id: crate::nftables::confined_agent_id(agent_uid),
-            agent_template: "t".to_string(),
-            dest_host: None,
-            dest_ip: Some("203.0.113.1".to_string()),
-            dest_port: 443,
-            dest_protocol: "tcp".to_string(),
-            opaque: false,
-        };
-        let started = Instant::now();
-        let outcome = engine
-            .evaluate_attempt(&request)
-            .expect("verdict must return, never block unboundedly on a contended ring");
-        let elapsed = started.elapsed();
-        assert!(
-            outcome.wal_seq().is_some(),
-            "the durable verdict receipt must still be written while the ring is contended"
-        );
-        assert!(
-            elapsed < EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(400),
-            "verdict must return within the bounded budget under ring contention (no stall to the \
-             NFQUEUE deadline, no ABBA deadlock), took {elapsed:?}"
-        );
-        holder.join().unwrap();
     }
 }
 
