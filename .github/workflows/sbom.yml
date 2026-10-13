@@ -44,7 +44,8 @@ jobs:
 
       # anchore/sbom-action wraps Syft and emits CycloneDX. Scanning the
       # checked-out tree captures the declared dependency manifests
-      # (package-lock.json, Cargo.lock, requirements.txt) across the repo.
+      # (npm-shrinkwrap.json, package-lock.json, Cargo.lock, requirements.txt)
+      # across the repo.
       - name: Generate CycloneDX SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
@@ -53,10 +54,30 @@ jobs:
           artifact-name: sanctuary-sbom.cyclonedx.json
           output-file: sanctuary-sbom.cyclonedx.json
 
+      # Syft's JavaScript lockfile cataloger documents package-lock.json as the
+      # npm lock input. This mirrored input keeps the shipped server shrinkwrap
+      # on an explicit SBOM path even if a tree scan treats the file name as
+      # opaque data.
+      - name: Stage server npm lock input for Syft
+        run: |
+          mkdir -p .sbom-syft/server
+          cp server/package.json .sbom-syft/server/package.json
+          cp server/npm-shrinkwrap.json .sbom-syft/server/package-lock.json
+
+      - name: Generate server npm CycloneDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .sbom-syft
+          format: cyclonedx-json
+          artifact-name: sanctuary-server-npm-sbom.cyclonedx.json
+          output-file: sanctuary-server-npm-sbom.cyclonedx.json
+
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanctuary-sbom
-          path: sanctuary-sbom.cyclonedx.json
+          path: |
+            sanctuary-sbom.cyclonedx.json
+            sanctuary-server-npm-sbom.cyclonedx.json
           if-no-files-found: error
           retention-days: 90

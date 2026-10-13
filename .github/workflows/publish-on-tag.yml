@@ -82,7 +82,7 @@ jobs:
         with:
           node-version: 24.14.0
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Validate release metadata
         run: |

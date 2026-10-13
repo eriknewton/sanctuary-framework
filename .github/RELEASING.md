@@ -35,7 +35,7 @@ The workflow checks the release tag against the exact built commit before and af
 Release-critical dependency updates are intentional release inputs, not incidental installer behavior.
 
 1. Refresh only the dependency being updated. Do not run broad upgrades for a release-candidate fix.
-2. For the server package, update `server/package.json` direct `dependencies` and `devDependencies` to exact versions, then run `npm install --package-lock-only` from `server/`.
+2. For the server package, update `server/package.json` direct `dependencies` and `devDependencies` to exact versions, then run `npm install --package-lock-only` from `server/`; npm updates `server/npm-shrinkwrap.json`.
 3. For the menubar approval surface, update `menubar/package.json` direct Tauri/Vite/TypeScript dependencies to exact versions, then run `npm install --package-lock-only` from `menubar/`.
 4. For Rust-side menubar dependencies, update `menubar/src-tauri/Cargo.toml` direct release-critical crates with exact `=` requirements and refresh `menubar/src-tauri/Cargo.lock` only when the resolved version changes.
 5. Run `npm run check:release-dependency-pins`, `npm run check:release-action-pins`, `npm run check:release-key-parity`, `cd server && npm test`, and the menubar build checks available without release signing before opening the release PR.

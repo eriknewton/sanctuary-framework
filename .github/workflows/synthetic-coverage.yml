@@ -31,7 +31,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Install dependencies
         working-directory: server
@@ -97,7 +97,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Install dependencies
         working-directory: server
@@ -154,7 +154,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Install dependencies
         working-directory: server
