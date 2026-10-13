@@ -333,9 +333,10 @@ layout: null
         <span class="eyebrow">Interop</span>
         <h2 id="harnesses-title">Drop it into your MCP harness.</h2>
         <p>
-          Sanctuary speaks standard MCP, with no forks and no adapters. Claude Code and
-          OpenClaw have tested wrapping paths. CrewAI, LangChain and any other MCP client
-          can point their MCP config at the server, without a tested wrapping path.
+          Sanctuary speaks standard MCP over stdio. Claude Code, Cursor, Hermes, OpenClaw
+          and Cline have tested wrapping paths. CrewAI connects through its MCP field and
+          LangChain through the langchain-mcp-adapters package, as shown below; neither
+          has a tested wrapping path.
         </p>
       </div>
 
