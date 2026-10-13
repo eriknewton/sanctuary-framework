@@ -14,9 +14,25 @@
         {
           "label": "server/test/wrap/wrap-claude-code-paths.test.ts",
           "href": "server/test/wrap/wrap-claude-code-paths.test.ts"
+        },
+        {
+          "label": "server/test/wrap/config-reader.test.ts",
+          "href": "server/test/wrap/config-reader.test.ts"
+        },
+        {
+          "label": "server/test/wrap/hermes-yaml-injection.test.ts",
+          "href": "server/test/wrap/hermes-yaml-injection.test.ts"
+        },
+        {
+          "label": "server/test/wrap/generic-mcp-wrap-conformance.test.ts",
+          "href": "server/test/wrap/generic-mcp-wrap-conformance.test.ts"
+        },
+        {
+          "label": "server/test/harness/harness-compatibility.test.ts",
+          "href": "server/test/harness/harness-compatibility.test.ts"
         }
       ],
-      "evidence_text": "[server/test/wrap/wrap-empty-config.test.ts](server/test/wrap/wrap-empty-config.test.ts); [server/test/wrap/wrap-claude-code-paths.test.ts](server/test/wrap/wrap-claude-code-paths.test.ts)",
+      "evidence_text": "[server/test/wrap/wrap-empty-config.test.ts](server/test/wrap/wrap-empty-config.test.ts); [server/test/wrap/wrap-claude-code-paths.test.ts](server/test/wrap/wrap-claude-code-paths.test.ts); [server/test/wrap/config-reader.test.ts](server/test/wrap/config-reader.test.ts); [server/test/wrap/hermes-yaml-injection.test.ts](server/test/wrap/hermes-yaml-injection.test.ts); [server/test/wrap/generic-mcp-wrap-conformance.test.ts](server/test/wrap/generic-mcp-wrap-conformance.test.ts); [server/test/harness/harness-compatibility.test.ts](server/test/harness/harness-compatibility.test.ts)",
       "bounds": "Tests prove config rewrite and bootstrap behavior for representative harness paths. They do not prove interception for every listed harness version or non-MCP agent surface.",
       "next": "Harness compatibility drill that launches each supported harness, verifies the Sanctuary MCP entry is the active route, and proves an upstream tool call is observed through the broker."
     },
