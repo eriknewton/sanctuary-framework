@@ -11,14 +11,24 @@
  *   3. interactive terminal (stdin and stdout are both TTYs) and no `--yes`:
  *      show the exact request and destination, then ask; the default is No.
  *   4. anything else (no TTY, or `--yes`): do not publish, and say how.
- * The local identity is written before this decision on every path.
+ *
+ * Identity: a saved identity at ~/.sanctuary/quickstart-identity.json is
+ * reused and never rewritten, so a declined or repeated run leaves it
+ * byte-identical (it may be the key behind an already published profile).
+ * Only `--new-identity` mints a fresh one, and it first copies the old file
+ * to a backup that is never overwritten. With no saved identity, a new one is
+ * created. Either way the identity exists locally before the publish decision.
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 
-import { generateIdentity, type QuickstartIdentity } from "./identity.js";
+import {
+  generateIdentity,
+  isValidIdentity,
+  type QuickstartIdentity,
+} from "./identity.js";
 import {
   buildPublishRequest,
   sendPublishRequest,
@@ -40,16 +50,18 @@ const CYAN = "\x1b[36m";
 const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 
-export const HELP_TEXT = `Usage: sanctuary-quickstart [--name="Agent Name"] [--publish | --no-publish] [--yes]
+export const HELP_TEXT = `Usage: sanctuary-quickstart [--name="Agent Name"] [--publish | --no-publish] [--new-identity] [--yes]
 
-Creates a local Ed25519 identity at ~/.sanctuary/quickstart-identity.json.
-Publishing a signed profile to Verascore is optional and off unless you
-choose it.
+Creates a local Ed25519 identity at ~/.sanctuary/quickstart-identity.json, or
+reuses the one already saved there. Publishing a signed profile to Verascore
+is optional and off unless you choose it.
 
 Options:
   --name="Agent Name"  Name for the agent profile (default: "${DEFAULT_AGENT_NAME}").
   --publish            Publish to Verascore without asking. For scripts.
-  --no-publish         Never publish. Only the local identity is created.
+  --no-publish         Never publish. Only the local identity is created or reused.
+  --new-identity       Mint a fresh identity even if one is saved. The saved one
+                       is first copied to a backup file next to it.
   --yes, -y            Accept every default without prompting. The publish
                        default is No, so --yes alone does not publish.
   --help, -h           Show this help.
@@ -67,13 +79,19 @@ export type PublishFlag = "publish" | "no-publish" | undefined;
 export interface ParsedArgs {
   name?: string;
   yes: boolean;
+  newIdentity: boolean;
   publish: PublishFlag;
   help: boolean;
   error?: string;
 }
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
-  const parsed: ParsedArgs = { yes: false, publish: undefined, help: false };
+  const parsed: ParsedArgs = {
+    yes: false,
+    newIdentity: false,
+    publish: undefined,
+    help: false,
+  };
   let sawPublish = false;
   let sawNoPublish = false;
   for (const arg of argv) {
@@ -81,6 +99,8 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       parsed.yes = true;
     } else if (arg.startsWith("--name=")) {
       parsed.name = arg.slice("--name=".length);
+    } else if (arg === "--new-identity") {
+      parsed.newIdentity = true;
     } else if (arg === "--publish") {
       sawPublish = true;
     } else if (arg === "--no-publish") {
@@ -203,22 +223,74 @@ function makeAsker(opts: RunOptions): {
   };
 }
 
-async function saveIdentity(
-  identity: QuickstartIdentity,
+/** Raised when a saved identity file exists but cannot be used as-is. */
+export class UnusableIdentityFileError extends Error {}
+
+export interface ResolvedIdentity {
+  identity: QuickstartIdentity;
+  path: string;
+  status: "created" | "reused" | "replaced";
+  /** Where the previous identity was copied, when `status` is "replaced". */
+  backupPath?: string;
+}
+
+/**
+ * Reuse the saved identity, or create one. The saved file is never written
+ * on the reuse path: it may hold the only copy of the key behind a profile
+ * that is already public, so no run that merely declines to publish may
+ * change it. `--new-identity` replaces it only after copying it to a fresh
+ * backup path with an exclusive create, so no earlier backup is clobbered.
+ */
+export async function resolveIdentity(
   homeDir: string,
-): Promise<string> {
+  newIdentity: boolean,
+): Promise<ResolvedIdentity> {
   const identityDir = path.join(homeDir, ".sanctuary");
   const identityPath = path.join(identityDir, "quickstart-identity.json");
-  await fs.mkdir(identityDir, { recursive: true, mode: 0o700 });
-  const json = JSON.stringify(identity, null, 2);
-  await fs.writeFile(identityPath, json, { mode: 0o600 });
-  // Enforce permissions even if file already existed.
+
+  let existing: string | null = null;
   try {
-    await fs.chmod(identityPath, 0o600);
-  } catch {
-    // best-effort
+    existing = await fs.readFile(identityPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
-  return identityPath;
+
+  if (existing !== null && !newIdentity) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(existing);
+    } catch {
+      parsed = null;
+    }
+    if (!isValidIdentity(parsed)) {
+      throw new UnusableIdentityFileError(
+        `${identityPath} exists but is not a valid quickstart identity. It was left ` +
+          `unchanged. Move it aside, or run with --new-identity (which keeps a backup).`,
+      );
+    }
+    return { identity: parsed, path: identityPath, status: "reused" };
+  }
+
+  const identity = generateIdentity();
+  const json = JSON.stringify(identity, null, 2);
+  if (existing !== null) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = path.join(
+      identityDir,
+      `quickstart-identity.backup-${stamp}.json`,
+    );
+    // Exclusive create: fails rather than overwrite an existing backup.
+    await fs.writeFile(backupPath, existing, { mode: 0o600, flag: "wx" });
+    await fs.writeFile(identityPath, json, { mode: 0o600 });
+    await fs.chmod(identityPath, 0o600);
+    return { identity, path: identityPath, status: "replaced", backupPath };
+  }
+
+  await fs.mkdir(identityDir, { recursive: true, mode: 0o700 });
+  // Exclusive create: if another run created the file in the meantime, fail
+  // rather than overwrite it.
+  await fs.writeFile(identityPath, json, { mode: 0o600, flag: "wx" });
+  return { identity, path: identityPath, status: "created" };
 }
 
 /**
@@ -231,7 +303,8 @@ export function describeRequest(request: PublishRequest): string {
     `${BOLD}Publishing is optional.${RESET} If you say yes, quickstart sends one HTTP POST.\n` +
     `  To:       ${request.endpoint}\n` +
     `  Profile:  ${request.profileUrl} (public once published)\n` +
-    `  Body (sent as compact JSON; nothing else is sent and the private key stays local):\n` +
+    `  Body (sent as compact JSON). The request also carries standard connection metadata,\n` +
+    `  such as your IP address and a user agent. The private key stays local.\n` +
     `${JSON.stringify(request.body, null, 2)}\n`
   );
 }
@@ -239,8 +312,8 @@ export function describeRequest(request: PublishRequest): string {
 function printPublishHint(out: NodeJS.WritableStream, savedPath: string): void {
   out.write(
     `${DIM}  Not published. Nothing was sent to Verascore.${RESET}\n` +
-      `${DIM}  To publish, run quickstart again with --publish. A new run creates a new${RESET}\n` +
-      `${DIM}  identity and replaces ${savedPath}.${RESET}\n\n`,
+      `${DIM}  To publish this identity later, run quickstart again with --publish.${RESET}\n` +
+      `${DIM}  The saved identity (${savedPath}) is reused, not replaced.${RESET}\n\n`,
   );
 }
 
@@ -279,17 +352,27 @@ export async function run(opts: RunOptions): Promise<number> {
       out.write("\n");
     }
 
-    // 1. Generate identity. 2. Save locally. Both happen on every path.
-    const identity = generateIdentity();
-    let savedPath = "";
+    // 1. Reuse or create the local identity. This happens on every path,
+    // before the publish decision, and never rewrites a saved identity
+    // unless --new-identity asked for it (with a backup first).
+    let resolved: ResolvedIdentity;
     try {
-      savedPath = await saveIdentity(identity, opts.homeDir);
-      out.write(`${GREEN}✓${RESET} Identity created ${DIM}(${savedPath})${RESET}\n`);
-      out.write(`${DIM}  DID: ${identity.did}${RESET}\n\n`);
+      resolved = await resolveIdentity(opts.homeDir, args.newIdentity);
     } catch (err) {
-      out.write(`${RED}✗${RESET} Failed to save identity: ${(err as Error).message}\n`);
+      out.write(`${RED}✗${RESET} ${(err as Error).message}\n`);
       return 1;
     }
+    const identity = resolved.identity;
+    const savedPath = resolved.path;
+    if (resolved.status === "reused") {
+      out.write(`${GREEN}✓${RESET} Using saved identity ${DIM}(${savedPath})${RESET}\n`);
+    } else if (resolved.status === "replaced") {
+      out.write(`${GREEN}✓${RESET} New identity created ${DIM}(${savedPath})${RESET}\n`);
+      out.write(`${DIM}  Previous identity kept at ${resolved.backupPath}${RESET}\n`);
+    } else {
+      out.write(`${GREEN}✓${RESET} Identity created ${DIM}(${savedPath})${RESET}\n`);
+    }
+    out.write(`${DIM}  DID: ${identity.did}${RESET}\n\n`);
 
     // 3. Decide whether to publish. Only "publish", or "ask" answered yes,
     // reaches the network.

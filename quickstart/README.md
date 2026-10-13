@@ -14,7 +14,7 @@ npx @sanctuary-framework/quickstart
 ## What you get
 
 - An Ed25519 keypair and `did:key` DID: the same format the full Sanctuary MCP server uses.
-- A local identity file at `~/.sanctuary/quickstart-identity.json` (mode `0600`). This is created on every run.
+- A local identity file at `~/.sanctuary/quickstart-identity.json` (mode `0600`). The first run creates it; later runs reuse it and never rewrite it.
 - If you choose to publish: a signed Sovereignty Health Report (SHR) on Verascore and a public profile URL at `verascore.ai/agent/<your-did>`.
 
 There is no account, password or email to set up: your key *is* your identity.
@@ -45,7 +45,8 @@ $ npx @sanctuary-framework/quickstart --name="My Agent"
 Publishing is optional. If you say yes, quickstart sends one HTTP POST.
   To:       https://verascore.ai/api/publish
   Profile:  https://verascore.ai/agent/did%3Akey%3Az7QE64... (public once published)
-  Body (sent as compact JSON; nothing else is sent and the private key stays local):
+  Body (sent as compact JSON). The request also carries standard connection metadata,
+  such as your IP address and a user agent. The private key stays local.
 {
   "agentId": "did-key-z7qe64fkmw97-aou5iwkbmknia5i8cshhwjdrq-wretncwa",
   "signature": "<base64url Ed25519 signature>",
@@ -80,13 +81,19 @@ Local identity only:
 npx @sanctuary-framework/quickstart --name="My Agent" --no-publish
 ```
 
+Replace the saved identity with a new one (the old file is kept as a backup):
+
+```bash
+npx @sanctuary-framework/quickstart --new-identity
+```
+
 `--help` prints every option.
 
 ## How it works
 
 1. Generates an Ed25519 keypair locally.
 2. Derives a `did:key` DID from the public key (multicodec `0xed01`, base64url encoding). Note: this quickstart still emits the legacy base64url `did:key` shape; the full Sanctuary package now uses the canonical base58btc encoding under the `z` multibase prefix (see [`../docs/DID_ENCODING.md`](../docs/DID_ENCODING.md)).
-3. Saves the identity to `~/.sanctuary/quickstart-identity.json` with `0600` permissions. A new run creates a new identity and replaces this file.
+3. Saves the identity to `~/.sanctuary/quickstart-identity.json` with `0600` permissions. If that file already exists, quickstart reuses it and does not write to it, so a run that does not publish leaves it byte-for-byte unchanged. `--new-identity` mints a fresh identity after copying the old file to `quickstart-identity.backup-<timestamp>.json` beside it. A saved file that is not a valid identity is left alone and the run stops.
 4. Builds a minimal Sovereignty Health Report describing the four sovereignty layers and signs it with your private key.
 5. Decides whether to publish (see "Publishing asks first"). If you do not publish, it stops here.
 6. If you publish, POSTs the signed payload to `https://verascore.ai/api/publish`.

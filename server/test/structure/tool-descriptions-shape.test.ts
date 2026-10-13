@@ -8,7 +8,7 @@
  * returns, and its key constraints). Two constraints an agent cannot discover
  * any other way before calling are the approval tier (a Tier 1 call waits on
  * a human) and the typography rule every public artifact in this repository
- * obeys (zero em-dashes). This guard holds three shape properties over the
+ * obeys (zero em-dashes). This guard holds four shape properties over the
  * FULL wire-registered tool set, built from the real composition root
  * (`createSanctuaryServer` + `tools/list`), never from a hand list, so a tool
  * added anywhere in `server/src` is covered the moment it registers:
@@ -18,6 +18,9 @@
  *        own description, in a sentence that also says who approves;
  *   (b2) every tool in NEITHER default list says it requires operator
  *        approval and never calls itself "Tier 1";
+ *   (b3) no tool in the default Tier 3 list claims Tier 1 or operator
+ *        approval (the reverse direction, so a tier moved back to
+ *        auto-allow cannot keep a stale approval sentence);
  *   (c) every description is a non-empty string.
  *
  * WHERE THE TWO SETS COME FROM. The default Principal Policy is
@@ -219,6 +222,27 @@ describe("tool descriptions describe the socket truthfully to an evaluating agen
         "session and Tier 1 afterwards, so a description must not name Tier 1. Use " +
         "\"Requires operator approval under the default policy (not named in a policy " +
         "tier; the gate's safe default).\":\n  " +
+        overclaims.join("\n  "),
+    ).toEqual([]);
+  });
+
+  it("(b3) no tool in the default Tier 3 list claims Tier 1 or operator approval", () => {
+    // The reverse direction of (b1)/(b2). Without it, a tool moved back to
+    // Tier 3 keeps a stale "Tier 1: requires operator approval" sentence and
+    // every guard above stays green, so an agent expects a human check that
+    // never happens.
+    const { tier3 } = partitionRegistry();
+    expect(tier3.length).toBeGreaterThan(0);
+    const overclaims = tier3
+      .filter((tool) => {
+        const description = String(tool.description ?? "");
+        return namesItsTier(description) || OPERATOR_APPROVAL_TOKEN.test(description);
+      })
+      .map((tool) => tool.name);
+    expect(
+      overclaims,
+      "These tools are Tier 3 (auto-allow) under the default policy, but their " +
+        "description says a human approves them. Fix the tier or the copy:\n  " +
         overclaims.join("\n  "),
     ).toEqual([]);
   });

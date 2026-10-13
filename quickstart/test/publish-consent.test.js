@@ -106,6 +106,11 @@ test("interactive: shows the exact request and endpoint, publishes on yes", asyn
       "the destination endpoint was not shown before asking",
     );
     assert.equal(mock.received.length, 1, "expected exactly one publish after yes");
+    assert.match(
+      stdout,
+      /IP address/,
+      "the prompt must say the request also carries connection metadata",
+    );
 
     // What was shown is what was sent: every field of the received request
     // body appears in the disclosure printed before the question.

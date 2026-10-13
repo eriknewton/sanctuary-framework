@@ -1,12 +1,15 @@
 /**
  * Verascore publishing asks the operator first.
  *
- * CAPABILITY. Under the default Principal Policy, `reputation_publish` (the
- * tool that sends a signed sovereignty report to Verascore) is a Tier 1
- * operation: the gate holds every call for operator approval, so data leaves
- * the machine only with explicit, confirmed operator intent (AGENTS.md
- * MUST-NEVER #1). This is a privacy default; the tool's name, schema and
- * signing behavior are unchanged.
+ * CAPABILITY. From 1.9.0, `reputation_publish` (the tool that sends a signed
+ * sovereignty report to Verascore) always requires operator approval: the gate
+ * holds every call until the operator approves, so data leaves the machine
+ * only with explicit, confirmed operator intent (AGENTS.md MUST-NEVER #1). It
+ * is force-pinned (`NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS`), so a
+ * `tier3_always_allow` listing does not relax it: earlier releases wrote that
+ * listing into every fortress's policy file at first setup, so it is not
+ * evidence of operator intent. The tool's name, schema and signing behavior
+ * are unchanged.
  *
  * WHAT THIS FILE PINS (AGENTS.md rule 4, wired consumer):
  *   1. A fresh install: the policy file Sanctuary writes on first boot, read
@@ -17,21 +20,19 @@
  *      a publish is held for operator approval; when the operator declines,
  *      nothing is sent; when the operator approves, exactly one publish goes
  *      out.
- *   3. Operator policy precedence: an existing policy file that explicitly
- *      lists `reputation_publish` under Tier 3 keeps it at Tier 3, because an
- *      explicit operator policy wins over the shipped default.
- *   4. A loaded policy that names `reputation_publish` in neither list no
- *      longer inherits auto-allow from the defaults merge, so every publish
- *      waits for the operator in every session. The tier NUMBER differs by
- *      session (the first session routes it through the Tier 2 anomaly
- *      detector, later sessions through the Tier 1 unclassified safe
- *      default) but the behavior does not: both paths reach the same
- *      operator approval request, and nothing is sent until it is approved.
- *      This is asserted through the real gate (`evaluate`) and the real
- *      composition root, not through the dry-run classifier alone.
+ *   3. An existing policy file in the old-release shape (`reputation_publish`
+ *      under `tier3_always_allow`) still loads without error, and the real
+ *      gate still asks the operator: a decline sends nothing, an approval
+ *      sends exactly one publish. The runtime classifier does the same for a
+ *      policy object that never passed through the loader.
+ *   4. A loaded policy that names `reputation_publish` in neither list also
+ *      asks the operator in every session shape, asserted through the real
+ *      gate (`evaluate`) and the real composition root, not through the
+ *      dry-run classifier alone.
  *
- * Must match the `reputation_publish` entry in
- * `DEFAULT_POLICY.tier1_always_approve` (src/principal-policy/loader.ts).
+ * Must match `NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS` and the
+ * `reputation_publish` entry in `DEFAULT_POLICY.tier1_always_approve`
+ * (src/principal-policy/loader.ts).
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -250,28 +251,57 @@ describe("reputation_publish requires operator approval under the default policy
     expect(published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
   });
 
-  it("an existing operator policy that lists it under Tier 3 keeps it at Tier 3 (operator policy wins)", async () => {
-    // This is the shape of a policy file written by an earlier release, when
-    // the shipped default auto-allowed publishing.
-    await writePolicyFile(moveOpToTier3(generateDefaultPolicyYaml(), OP));
+  it("an existing policy file in the old-release shape (listed under Tier 3) loads, and the real gate still asks the operator", async () => {
+    // The shape every fortress that booted before 1.9.0 carries on disk: the
+    // first-boot writer copied the then-default Tier 3 listing into the file.
+    const oldReleaseShape = moveOpToTier3(generateDefaultPolicyYaml(), OP);
+    // Precondition: on disk it sits under Tier 3 and not under Tier 1.
+    expect(oldReleaseShape).toMatch(new RegExp(`tier3_always_allow:\\n  - ${OP}\\n`));
+    expect(oldReleaseShape.split("tier3_always_allow:")[0]).not.toContain(`  - ${OP}\n`);
 
+    // It loads (no boot failure) and the force-pin moves the operation.
+    await writePolicyFile(oldReleaseShape);
     const loaded = await loadPrincipalPolicy(fortressHome.defaultFortressPath);
-    expect(loaded.tier3_always_allow).toContain(OP);
-    expect(loaded.tier1_always_approve).not.toContain(OP);
-    expect(await classifyBothSessions(loaded, OP)).toEqual({ first: 3, established: 3 });
+    expect(loaded.tier1_always_approve).toContain(OP);
+    expect(loaded.tier3_always_allow).not.toContain(OP);
+
+    const declined = await bootWithOperator("deny", oldReleaseShape);
+    await callServerTool(declined.server, OP, { type: "shr" });
+    expect(declined.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(declined.published, "a declined publish must not reach the network").toEqual([]);
+
+    const approved = await bootWithOperator("approve", oldReleaseShape);
+    await callServerTool(approved.server, OP, { type: "shr" });
+    expect(approved.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(approved.published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
+  });
+
+  it("the runtime gate asks the operator even for a policy object that lists it under Tier 3 and never passed through the loader", async () => {
+    const raw: PrincipalPolicy = {
+      ...parsePolicy(generateDefaultPolicyYaml()),
+      tier1_always_approve: [],
+      tier3_always_allow: [OP],
+    };
+    for (const session of ["first", "established"] as const) {
+      for (const decision of ["deny", "approve"] as const) {
+        const { asked, allowed } = await evaluateWithOperator(raw, session, decision);
+        expect(asked.map((r) => r.operation), `${session}/${decision}`).toEqual([OP]);
+        expect(asked[0]!.tier, `${session}/${decision}`).toBe(1);
+        expect(allowed, `${session}/${decision}`).toBe(decision === "approve");
+      }
+    }
   });
 
   it("a loaded policy that names it in neither list: the first-session publish waits for the operator (real composition root)", async () => {
     const neitherTier = removeOp(generateDefaultPolicyYaml(), OP);
     const loaded = parsePolicy(neitherTier);
-    expect(loaded.tier1_always_approve).not.toContain(OP);
+    expect(loaded.tier1_always_approve, "the force-pin adds it back to Tier 1").toContain(OP);
     expect(
       loaded.tier3_always_allow,
       "the defaults merge must not hand it auto-allow",
     ).not.toContain(OP);
 
-    // A fresh boot is a first session; the gate routes the unlisted publish
-    // through the anomaly tier, which still asks the operator.
+    // A fresh boot is a first session; the publish still waits for the operator.
     const declined = await bootWithOperator("deny", neitherTier);
     await callServerTool(declined.server, OP, { type: "shr" });
     expect(declined.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);

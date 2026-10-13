@@ -198,6 +198,7 @@ Report all three findings and your final audit score.""",
 2. Publish your SHR to Verascore using sanctuary/reputation_publish:
    - target_url: "https://verascore.ai/api/publish"
    - This signs the payload with your Ed25519 key
+   - From Sanctuary 1.9.0 the operator approves this before anything is sent
    - Your agent gets a public reputation page on verascore.ai
 
 3. Check your audit log using sanctuary/monitor_audit_log to see a record
