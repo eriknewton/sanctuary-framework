@@ -8,7 +8,7 @@
 
 An AI agent running on your machine can do anything your account can do. It holds your credentials, reads your files, and talks to the whole internet, and a single poisoned web page can turn that into exfiltration. Every sandbox on offer today is one the agent, or its vendor, chooses to run inside. That is not a wall. That is a request.
 
-Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, Mastra (fixture-tested only; no live Mastra-agent drill is recorded), or any other MCP-compatible harness through its MCP config (wrapping is tested on representative harness paths, not proven for every harness version; Assurance Matrix, Agent wrapping, partial), on your own machine today, any number of wrapped harnesses behind one persistent dashboard; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
+Sanctuary is the wall under the agent, imposed by the operating system under a policy you sign, on a patched host, and it does not depend on the agent's cooperation. The keys never leave hardware you control. What the agent did is written to a hash-chained record you can read. No vendor, including us, sits in the path or can decrypt your state. It works with the harness you already run: Claude Code, Cursor, Hermes, OpenClaw, Cline, or Mastra (fixture-tested only; no live Mastra-agent drill is recorded), on your own machine today, any number of wrapped harnesses behind one persistent dashboard, with wrapping tested on representative harness paths and not proven for every harness version (Assurance Matrix, Agent wrapping, partial); another MCP-compatible harness can point its MCP config at Sanctuary, without a tested wrapping path; the fleet console and operator-cloud deployment are roadmapped (see [Deployment modes](#deployment-modes)).
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code
@@ -463,7 +463,7 @@ Sanctuary wraps MCP-compatible harnesses. For the named harnesses below, tests p
 - **Cline** (`sanctuary protect --cline`)
 - **Mastra** (`sanctuary protect --mastra`; fixture-tested only, no live Mastra-agent drill recorded)
 - **LangGraph** and custom harnesses (`sanctuary protect --wrap <path>`)
-- Any other MCP-compatible harness via direct MCP config
+- Any other MCP-compatible harness via direct MCP config, without a tested wrapping path
 
 ---
 
