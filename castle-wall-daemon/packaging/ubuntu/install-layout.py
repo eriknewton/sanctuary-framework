@@ -18,10 +18,17 @@ BINARIES = {
     'sanctuary-linux': 'usr/sbin/sanctuary-linux',
 }
 MOUNT_NAME = r'var-lib-sanctuary\x2dagent\x2dworkspace.mount'
+# The repo copy of the mount unit has a portable file name (no backslash) so the
+# repository checks out on every OS; it installs under the systemd-escaped name,
+# which systemd requires to match the mount path. Must match the systemd/ source
+# the Arch builder maps for MOUNT_NAME in packaging/arch/build-arch-package.py,
+# and the three castle-wall-daemon tests that read the unit by source path
+# (agent_unit.rs, integration_linux_runtime_activation.rs, linux_agent_launch_manager.rs).
+MOUNT_SOURCE = 'systemd/var-lib-sanctuary-agent-workspace.mount.source'
 SOURCES = {
     'etc/systemd/system/sanctuary-castle-wall.service': 'systemd/sanctuary-castle-wall.service',
     'etc/systemd/system/sanctuary-agent@.service': 'systemd/sanctuary-agent@.service',
-    'etc/systemd/system/' + MOUNT_NAME: 'systemd/' + MOUNT_NAME,
+    'etc/systemd/system/' + MOUNT_NAME: MOUNT_SOURCE,
     DOC + '/schemas/contract.rs': 'src/linux_install/contract.rs',
     DOC + '/operator-guide.md': 'packaging/ubuntu/README.md',
 }
