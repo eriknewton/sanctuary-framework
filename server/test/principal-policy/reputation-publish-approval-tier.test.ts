@@ -21,8 +21,14 @@
  *      lists `reputation_publish` under Tier 3 keeps it at Tier 3, because an
  *      explicit operator policy wins over the shipped default.
  *   4. A loaded policy that names `reputation_publish` in neither list no
- *      longer inherits auto-allow from the defaults merge, so it requires
- *      approval.
+ *      longer inherits auto-allow from the defaults merge, so every publish
+ *      waits for the operator in every session. The tier NUMBER differs by
+ *      session (the first session routes it through the Tier 2 anomaly
+ *      detector, later sessions through the Tier 1 unclassified safe
+ *      default) but the behavior does not: both paths reach the same
+ *      operator approval request, and nothing is sent until it is approved.
+ *      This is asserted through the real gate (`evaluate`) and the real
+ *      composition root, not through the dry-run classifier alone.
  *
  * Must match the `reputation_publish` entry in
  * `DEFAULT_POLICY.tier1_always_approve` (src/principal-policy/loader.ts).
@@ -130,18 +136,55 @@ async function callServerTool(
   );
 }
 
+/** Switch a rendered policy to the embedding-host callback channel, nothing else. */
+function withCallbackChannel(yaml: string): string {
+  return yaml.replace(/approval_channel:\n  type: \w+/, "approval_channel:\n  type: callback");
+}
+
+/**
+ * Drive the REAL gate's `evaluate` (not the dry-run classifier) for one
+ * publish, with a scripted operator. Returns what the operator was asked and
+ * whether the gate let the call through.
+ */
+async function evaluateWithOperator(
+  policy: PrincipalPolicy,
+  session: "first" | "established",
+  decision: ApprovalResponse["decision"],
+): Promise<{ asked: ApprovalRequest[]; allowed: boolean }> {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const auditLog = new AuditLog(storage, masterKey);
+  const asked: ApprovalRequest[] = [];
+  const channel = new CallbackApprovalChannel(async (request) => {
+    asked.push(request);
+    return { decision, decided_at: new Date().toISOString(), decided_by: "human" };
+  });
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+  if (session === "established") {
+    // Persist and reload: the tracker's own definition of a later session.
+    await baseline.save();
+    const established = new BaselineTracker(storage, masterKey);
+    await established.load();
+    expect(established.isFirstSession).toBe(false);
+    const gate = new ApprovalGate(policy, established, channel, auditLog);
+    return { asked, allowed: (await gate.evaluate(OP, { type: "shr" })).allowed };
+  }
+  expect(baseline.isFirstSession).toBe(true);
+  const gate = new ApprovalGate(policy, baseline, channel, auditLog);
+  return { asked, allowed: (await gate.evaluate(OP, { type: "shr" })).allowed };
+}
+
 /**
  * Boot the real server with the shipped default policy, switched only to the
  * embedding-host callback channel so the test can play the operator. Every
  * tier list is the default one, byte for byte.
  */
-async function bootWithOperator(decision: ApprovalResponse["decision"]) {
-  await writePolicyFile(
-    generateDefaultPolicyYaml().replace(
-      /approval_channel:\n  type: \w+/,
-      "approval_channel:\n  type: callback",
-    ),
-  );
+async function bootWithOperator(
+  decision: ApprovalResponse["decision"],
+  policyYaml: string = generateDefaultPolicyYaml(),
+) {
+  await writePolicyFile(withCallbackChannel(policyYaml));
   const requests: ApprovalRequest[] = [];
   const { server } = await createSanctuaryServer({
     storage: new MemoryStorage(),
@@ -218,13 +261,52 @@ describe("reputation_publish requires operator approval under the default policy
     expect(await classifyBothSessions(loaded, OP)).toEqual({ first: 3, established: 3 });
   });
 
-  it("a loaded policy that names it in neither list does not inherit auto-allow from the defaults merge", async () => {
-    await writePolicyFile(removeOp(generateDefaultPolicyYaml(), OP));
+  it("a loaded policy that names it in neither list: the first-session publish waits for the operator (real composition root)", async () => {
+    const neitherTier = removeOp(generateDefaultPolicyYaml(), OP);
+    const loaded = parsePolicy(neitherTier);
+    expect(loaded.tier1_always_approve).not.toContain(OP);
+    expect(
+      loaded.tier3_always_allow,
+      "the defaults merge must not hand it auto-allow",
+    ).not.toContain(OP);
 
-    const loaded = await loadPrincipalPolicy(fortressHome.defaultFortressPath);
-    expect(loaded.tier3_always_allow).not.toContain(OP);
-    const tiers = await classifyBothSessions(loaded, OP);
-    expect(tiers.first, "first session: approval via the anomaly tier").toBe(2);
-    expect(tiers.established, "established session: the unclassified safe default").toBe(1);
+    // A fresh boot is a first session; the gate routes the unlisted publish
+    // through the anomaly tier, which still asks the operator.
+    const declined = await bootWithOperator("deny", neitherTier);
+    await callServerTool(declined.server, OP, { type: "shr" });
+    expect(declined.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(declined.published, "a declined publish must not reach the network").toEqual([]);
+
+    const approved = await bootWithOperator("approve", neitherTier);
+    await callServerTool(approved.server, OP, { type: "shr" });
+    expect(approved.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(approved.published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
+  });
+
+  it("a loaded policy that names it in neither list: the real gate asks the operator in every session shape", async () => {
+    const neitherTier = removeOp(generateDefaultPolicyYaml(), OP);
+    const scenarios: Array<{ label: string; policy: PrincipalPolicy; session: "first" | "established" }> = [
+      { label: "first session", policy: parsePolicy(neitherTier), session: "first" },
+      { label: "established session", policy: parsePolicy(neitherTier), session: "established" },
+      {
+        // An operator who switched first-session approval off must not turn
+        // an unlisted publish into an auto-allow on the first session.
+        label: "first session, first_session_policy: allow",
+        policy: parsePolicy(
+          neitherTier.replace(/first_session_policy: \w+/, "first_session_policy: allow"),
+        ),
+        session: "first",
+      },
+    ];
+    for (const { label, policy, session } of scenarios) {
+      expect(policy.tier3_always_allow, label).not.toContain(OP);
+      for (const decision of ["deny", "approve"] as const) {
+        const { asked, allowed } = await evaluateWithOperator(policy, session, decision);
+        expect(asked.map((r) => r.operation), `${label}/${decision}: operator asked`).toEqual([OP]);
+        expect(allowed, `${label}/${decision}: gate decision follows the operator`).toBe(
+          decision === "approve",
+        );
+      }
+    }
   });
 });
