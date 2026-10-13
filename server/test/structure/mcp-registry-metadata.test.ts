@@ -34,6 +34,12 @@ describe("MCP registry metadata lockstep (server.json <-> package.json)", () => 
   it("manifest name matches package.json mcpName", () => {
     expect(pkg.mcpName, "package.json must declare mcpName").toBeTruthy();
     expect(manifest.name).toBe(pkg.mcpName);
+    // The registry rejects a description over 100 characters at publish time
+    // (schema maxLength, observed as a 422 on 2026-10-12); fail here instead,
+    // on every commit, before a publish attempt does.
+    const REGISTRY_DESCRIPTION_MAX = 100;
+    expect(typeof manifest.description).toBe("string");
+    expect((manifest.description as string).length).toBeLessThanOrEqual(REGISTRY_DESCRIPTION_MAX);
   });
 
   it("manifest version matches package.json version (release-cascade lockstep)", () => {
