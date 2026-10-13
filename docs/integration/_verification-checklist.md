@@ -68,7 +68,8 @@ All operations are logged to an encrypted, tamper-evident hash-chained audit tra
 
 ```
 Call: reputation_publish
-Expect: A Verascore profile URL like https://verascore.ai/agent/{did}
+Expect: An operator approval request first (Tier 1 under the default policy)
+Expect after approval: A Verascore profile URL like https://verascore.ai/agent/{did}
 
 Visit the URL to verify:
   - Agent name and DID are correct

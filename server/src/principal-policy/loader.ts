@@ -573,6 +573,16 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "governor_reset", // Clears all runtime governance state - always requires approval
     "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes - always requires approval
     "sanctuary_export_identity_bundle", // Exports portable identity - always requires approval
+    // Verascore publish sends a signed sovereignty report off this machine to
+    // a third-party service, so it waits for the operator: data leaves the
+    // machine only with explicit, confirmed operator intent (AGENTS.md
+    // MUST-NEVER #1). Default-only, NOT force-pinned: an operator policy file
+    // that lists it under tier3_always_allow keeps auto-allow, because an
+    // explicit operator policy wins over the shipped default. Must match
+    // test/principal-policy/reputation-publish-approval-tier.test.ts and the
+    // "Tier 1" sentence in the reputation_publish description
+    // (src/reputation/tools.ts).
+    "reputation_publish",
     "exit_bundle_export", // Complete portability bundle export. Always requires approval.
     "exit_bundle_import", // External durable-record import. Always requires approval.
     "exit_bundle_import_activate", // Activates imported material. Always requires approval.
@@ -712,7 +722,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sovereignty_profile_get",
     "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
-    "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
+    // reputation_publish is Tier 1 (see tier1_always_approve above): it sends
+    // data off the machine, so it is never auto-allowed by default.
     "identity_set_primary", // One-time set, persists via _meta storage - safe at Tier 3
     "memory_attest", // Read-only audit attestation - records that a memory op happened
     // Rung 1 hands-free restart read (must match the tier pin on

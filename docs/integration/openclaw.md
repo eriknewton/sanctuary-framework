@@ -70,6 +70,8 @@ See the [verification checklist](./_verification-checklist.md) for expected resu
 Call: sanctuary__reputation_publish
 ```
 
+Under the default policy this is a Tier 1 call: Sanctuary holds it until the operator approves, because the signed report leaves the machine.
+
 Visit `https://verascore.ai/agent/{did}` to see the live profile.
 
 ## What You Get

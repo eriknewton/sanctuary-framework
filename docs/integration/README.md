@@ -32,7 +32,7 @@ Every runtime gets the same capabilities:
 3. Call `identity_create` to get a DID
 4. Call `identity_set_primary` to designate the active identity
 5. Call `sovereignty_health_report` to check your status
-6. Call `reputation_publish` to create your Verascore profile
+6. Call `reputation_publish` to create your Verascore profile (Tier 1 by default: the operator approves before anything is sent)
 ```
 
 ## Verification

@@ -160,6 +160,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 | `sanctuary/reputation_query_weighted` | Query reputation with posture-tier weighting |
 | `sanctuary/reputation_export` | Export reputation as portable bundle (Tier 1) |
 | `sanctuary/reputation_import` | Import reputation bundle (verify signatures; Tier 1) |
+| `sanctuary/reputation_publish` | Publish a signed sovereignty report to Verascore (the report leaves this machine; Tier 1) |
 | `sanctuary/bootstrap_create_escrow` | Create escrow for trust bootstrapping |
 | `sanctuary/bootstrap_provide_guarantee` | Principal guarantee certificate (Tier 1) |
 
