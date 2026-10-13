@@ -338,8 +338,9 @@ export function createErc8004Tools(
       description:
         "Request an ERC-8004 Identity Registry registration signature. " +
         "Requires operator approval under the default policy (not named in a policy tier; the gate's safe default). " +
-        "After that approval the request passes the key-17 signing policy: a counterparty " +
-        "pre-approved there skips the second, in-handler check; others wait on the inbox. " +
+        "After that approval the request also passes the key-17 signing policy; a request that policy does not " +
+        "allow returns pending_approval with an inbox entry, and in this release it is not completed from this tool: " +
+        "the operator produces the signature on the CLI with `sanctuary erc8004 register --auto-approve`. " +
         "No on-chain broadcast; the caller submits the returned signature to the registry contract.",
       inputSchema: {
         type: "object",
