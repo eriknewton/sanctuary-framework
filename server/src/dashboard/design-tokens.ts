@@ -46,8 +46,9 @@
  *     sets the neutral border as a per-theme hex directly on
  *     `--color-status-neutral-line`; the server names that value `--ink-line`
  *     so the semantic alias resolves to a physical token like every other
- *     alias (the plain-`var()` rule at the alias layer). Same bytes in both
- *     themes; one extra name here that the design's file does not declare.
+ *     alias (the plain-`var()` rule at the alias layer). The light and dark
+ *     values are the design's two neutral-line values; one extra name here
+ *     that the design's file does not declare.
  *   - `--sev-*`: the severity ramp, reserved for severity marks.
  *   - `--chart-allowed` / `--chart-blocked`: the egress chart pair.
  *

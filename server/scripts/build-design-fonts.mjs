@@ -76,15 +76,18 @@ const OUT_FILE = join(SERVER_DIR, "src", "dashboard", "design-fonts.ts");
  * Roboto Mono does not. None of the three faces carries any of those shapes,
  * nor the four status-pill glyphs in STATUS_PILL_CSS (U+25B2, U+2B22, U+25CB,
  * U+25CC; checked against each pinned source's cmap on 2026-10-12), so every
- * shape renders from the system stack, as it did before the faces were
- * bundled. Adding a code point no face carries changes no subset byte, which
- * is why the status glyphs are not listed. A code point a face lacks falls
- * back per character, never per word: unicode-range only narrows which
- * characters a face is considered for, and the cmap still decides, so a
- * listed shape no face carries draws from the system stack exactly as it
- * would unlisted (confirmed by render on 2026-10-12: the committed CSS, the
- * same CSS with the shapes and arrows trimmed from every range, and no faces
- * at all draw every shape identically, with no .notdef).
+ * shape renders from the system stack. Adding a code point no face carries
+ * changes no subset byte, which is why the status glyphs are not listed. A
+ * code point a face lacks falls back per character, never per word:
+ * unicode-range only narrows which characters a face is considered for, and
+ * the cmap still decides, so a listed shape no face carries draws from the
+ * system stack exactly as it would unlisted (confirmed by render on
+ * 2026-10-12: the committed CSS and the same CSS with the shapes and arrows
+ * trimmed from every range draw every shape identically, with no .notdef).
+ * Which system face the browser picks for a shape can differ from the
+ * no-web-font page (Chrome drew two diamonds from another fallback once a
+ * web font was the primary face); that follows from bundling any face at
+ * all, not from the range.
  * Must match the --unicodes argument used to cut the committed woff2 files.
  */
 export const UNICODE_RANGE =
