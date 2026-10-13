@@ -2142,6 +2142,50 @@ mod armed_identity_tests {
     }
 
     #[test]
+    fn superseding_record_uses_the_receipt_subject_not_the_engine_fortress() {
+        let dir = TempDir::new().unwrap();
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let engine =
+            DecisionEngine::new("feedface".to_string(), None, Some(Arc::clone(&wal)), ring);
+        let subject =
+            ProtectionSubject::new("0123456789abcdef", TEST_AGENT_UID).expect("receipt subject");
+
+        engine
+            .append_control_audit("daemon_started", "test")
+            .unwrap();
+        engine
+            .append_superseding_verdict(
+                0,
+                "drop",
+                "teardown mutation fence dropped the packet after the allow decision was recorded",
+                &subject,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let rows = wal.lock().unwrap().snapshot_after(None, 10).unwrap();
+        let body = &rows.last().expect("superseding row").event_canonical_json;
+        assert!(
+            body.contains("\"identity_id\":\"0123456789abcdef/uid-60123\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"fortress_id\":\"0123456789abcdef\""),
+            "{body}"
+        );
+        assert!(
+            !body.contains("\"fortress_id\":\"feedface\""),
+            "the correction names the receipt subject, never the engine id"
+        );
+    }
+
+    #[test]
     fn poisoned_wal_refuses_after_a_cell_sourced_subject_without_a_body() {
         let f = fixture_with_confined_cell_and_no_snapshot(FORTRESS, FORTRESS);
         let baseline_ring = ring_len(&f.ring);
