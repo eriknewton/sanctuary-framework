@@ -150,24 +150,30 @@ jobs:
       # to main. This is provenance (which workflow built which commit), not a
       # maintainer signature over the package.
       - name: Assert both Arch package files exist before attesting
-        # No event guard: PR CI exercises the assertion so a renamed output fails here, not on main's push run.
-        # The action fails only when every pattern matches nothing; a renamed
-        # output would otherwise attest one file and report success.
+        # No event guard: the attest steps run only on push, so this assertion
+        # gives PR CI the same existence check and a renamed output fails here
+        # rather than on main's push run.
         run: |
           pkg=("$RUNNER_TEMP"/arch-package/*.pkg.tar.zst)
           [[ ${#pkg[@]} == 1 && -f "${pkg[0]}" && -f "$RUNNER_TEMP/arch-package/SHA256SUMS" ]]
-      - name: Attest build provenance for the Arch package files
+      # One attest step per file, each with a single-line subject-path. In a
+      # container job the runner rewrites a host path only at the start of an
+      # input value, so the second and later lines of a multi-line
+      # runner.temp input keep a host path that does not exist inside
+      # the container. Keep every path input in this job single-line.
+      # Failure mode: a step that resolves fewer files than intended still
+      # logs "Attestation created"; after a push run, verify each file with
+      # gh attestation verify, not only the first.
+      - name: Attest build provenance for the Arch package
         if: github.event_name == 'push'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          # Both subjects are globs on purpose: the first push-to-main run
-          # attested the glob subject and skipped the literal SHA256SUMS path
-          # (the Ubuntu workflow's three glob subjects all attested). A
-          # literal path here looks fine in the log and simply yields no
-          # attestation for the checksum file.
-          subject-path: |
-            ${{ runner.temp }}/arch-package/*.pkg.tar.zst
-            ${{ runner.temp }}/arch-package/SHA256SUM*
+          subject-path: ${{ runner.temp }}/arch-package/*.pkg.tar.zst
+      - name: Attest build provenance for the Arch checksum file
+        if: github.event_name == 'push'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/arch-package/SHA256SUMS
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
