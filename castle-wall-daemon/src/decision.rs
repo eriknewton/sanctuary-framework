@@ -2010,6 +2010,85 @@ mod armed_identity_tests {
     }
 
     #[test]
+    fn canonical_audit_input_error_before_wal_leaves_no_receipt() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let mut request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        request.dest_host = Some("api\0example.com".to_string());
+
+        let err = f.engine.evaluate_attempt(&request).unwrap_err();
+
+        assert!(matches!(err, AttemptError::AuditCanonicalize(_)));
+        assert_eq!(
+            wal_len(&f.wal),
+            baseline_wal,
+            "a refused canonical audit body must not append a WAL row"
+        );
+        assert_eq!(
+            ring_len(&f.ring),
+            baseline_ring,
+            "a refused canonical audit body must not synthesize a ring row"
+        );
+    }
+
+    #[test]
+    fn fail_closed_rebuild_canonical_error_leaves_no_substitute_body() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let held = Arc::clone(&f.wal);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
+        });
+        rx.recv().unwrap();
+        let mut request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        request.agent_template = "claude\0code".to_string();
+
+        let err = f.engine.evaluate_attempt(&request).unwrap_err();
+        holder.join().unwrap();
+
+        assert!(matches!(err, AttemptError::AuditCanonicalize(_)));
+        assert_eq!(
+            wal_len(&f.wal),
+            baseline_wal,
+            "a refused fail-closed audit body must not append a WAL row"
+        );
+        assert_eq!(
+            ring_len(&f.ring),
+            baseline_ring,
+            "a refused fail-closed audit body must not synthesize a ring row"
+        );
+    }
+
+    #[test]
     fn poisoned_wal_refuses_after_a_cell_sourced_subject_without_a_body() {
         let f = fixture_with_confined_cell_and_no_snapshot(FORTRESS, FORTRESS);
         let baseline_ring = ring_len(&f.ring);

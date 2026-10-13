@@ -1440,6 +1440,15 @@ fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
     }
 }
 
+fn audit_text(value: &str) -> Result<serde_json::Value, CanonicalJsonError> {
+    if value.contains('\0') {
+        return Err(CanonicalJsonError::UnsupportedKind(
+            "audit text contains NUL",
+        ));
+    }
+    Ok(serde_json::Value::String(value.to_string()))
+}
+
 /// Build the canonical-JSON `AuditEntry` body for a verdict + request.
 ///
 /// The caller supplies a resolved [`ProtectionSubject`], so this builder never
@@ -1459,22 +1468,16 @@ pub fn build_audit_event_canonical_json(
     timestamp_iso8601: &str,
 ) -> Result<String, CanonicalJsonError> {
     let mut details = serde_json::Map::new();
-    details.insert(
-        "agent_id".to_string(),
-        serde_json::Value::String(request.agent_id.clone()),
-    );
+    details.insert("agent_id".to_string(), audit_text(&request.agent_id)?);
     details.insert(
         "agent_template".to_string(),
         serde_json::Value::String(request.agent_template.clone()),
     );
     if let Some(host) = request.dest_host.as_ref() {
-        details.insert(
-            "dest_host".to_string(),
-            serde_json::Value::String(host.clone()),
-        );
+        details.insert("dest_host".to_string(), audit_text(host)?);
     }
     if let Some(ip) = request.dest_ip.as_ref() {
-        details.insert("dest_ip".to_string(), serde_json::Value::String(ip.clone()));
+        details.insert("dest_ip".to_string(), audit_text(ip)?);
     }
     details.insert(
         "dest_port".to_string(),
@@ -1482,7 +1485,7 @@ pub fn build_audit_event_canonical_json(
     );
     details.insert(
         "dest_protocol".to_string(),
-        serde_json::Value::String(request.dest_protocol.clone()),
+        audit_text(&request.dest_protocol)?,
     );
     details.insert(
         "opaque".to_string(),
@@ -1493,10 +1496,18 @@ pub fn build_audit_event_canonical_json(
         serde_json::Value::String(decision_provenance(verdict).to_string()),
     );
     if let Some(rule_id) = matched_rule_id(verdict) {
-        details.insert(
-            "rule_id_matched".to_string(),
-            serde_json::Value::String(rule_id.to_string()),
-        );
+        details.insert("rule_id_matched".to_string(), audit_text(rule_id)?);
+    }
+    if matches!(
+        verdict,
+        Verdict::Deny {
+            reason: DeniedReason::AuditWalAppendFailed
+        }
+    ) {
+        // The fail-closed row is the remaining signed evidence when the durable
+        // allow receipt could not be written, so it refuses non-text template
+        // bytes rather than turning them into a substitute audit body.
+        audit_text(&request.agent_template)?;
     }
 
     let mut entry = serde_json::Map::new();
@@ -3467,8 +3478,12 @@ mod tests {
             assert!(body.contains("subject"), "{body}");
         }
         let decision = std::fs::read_to_string(root.join("src/decision.rs")).unwrap();
+        let decision_production = decision
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production prefix");
         assert!(
-            !decision.contains("\"identity_id\""),
+            !decision_production.contains("\"identity_id\""),
             "decision code must call the shared builder rather than hand-building subject JSON"
         );
         let nfqueue = std::fs::read_to_string(root.join("src/nfqueue.rs")).unwrap();
