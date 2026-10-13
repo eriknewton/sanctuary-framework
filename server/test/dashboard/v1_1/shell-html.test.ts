@@ -107,6 +107,41 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(depth, "unclosed blocks at the end").toBe(0);
   });
 
+  it("the engaged Lock down state keeps the bad text and bad-line border with no fill", () => {
+    // Lock down is the one danger-styled control, and it never paints a red
+    // fill, engaged included: an engaged lockdown is a decision on record,
+    // not an alarm.
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const m = css.match(/(?:^|\n)\.btn\.btn-lockdown\.tier1-engaged(?:, [^{]+)? \{([^}]*)\}/);
+    expect(m, ".btn.btn-lockdown.tier1-engaged rule").toBeTruthy();
+    expect(m![1]).toContain("background: transparent");
+    expect(m![1]).toContain("color: var(--rust)");
+    expect(m![1]).toContain("border-color: var(--rust-line)");
+    expect(m![1]).not.toContain("--rust-bg");
+  });
+
+  it("a folded section carries its own styled head, and the hosted page's eyebrow and h1 do not repeat", () => {
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = (selector: string) => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const m = css.match(new RegExp(`(?:^|\\n)${esc} \\{([^}]*)\\}`));
+      expect(m, selector).toBeTruthy();
+      return m![1]!;
+    };
+    // The fold's eyebrow reads as an eyebrow (mono, uppercase), and its title
+    // is a section heading, not body text.
+    expect(rule(".folded-section > .folded-head .eyebrow")).toContain("text-transform: uppercase");
+    expect(rule(".folded-section > .folded-head h2")).toContain("font-family: var(--display)");
+    // The hosted page's own eyebrow and h1 are hidden inside a fold (the
+    // fold's head carries them), wherever the hosted renderer puts them.
+    const hide = rule(".folded-section > .page-head .eyebrow, .folded-section > .page-head h1, .folded-section > .policy-center > .eyebrow, .folded-section > .policy-center > h1, .folded-section > h1");
+    expect(hide).toContain("display: none");
+    // Both folds name their hosted page in the fold head.
+    const client = getClientScript();
+    expect(client).toContain('renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot"');
+    expect(client).toContain('renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger"');
+  });
+
   it("the theme bootstrap yields dark with empty storage, and an explicit light choice wins", () => {
     const run = (storage: { getItem: (k: string) => string | null }) => {
       const attrs: Record<string, string> = {};

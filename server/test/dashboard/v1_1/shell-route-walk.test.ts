@@ -28,10 +28,15 @@ const INTERNAL_ROUTE_IDS = ["agent-detail"];
 function clientInMinimalDom() {
   const main = { innerHTML: "", querySelector: () => null, querySelectorAll: () => [] };
   const fortress = { innerHTML: "" };
+  const appClasses = new Set<string>();
+  const app = {
+    setAttribute() {},
+    classList: { add: (c: string) => appClasses.add(c), remove: (c: string) => appClasses.delete(c) },
+  };
   const pending = () => new Promise<never>(() => {});
   const context = createContext({
     document: {
-      getElementById: (id: string) => (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: "{}" } : null),
+      getElementById: (id: string) => (id === "main" ? main : id === "fortress" ? fortress : id === "app" ? app : id === "dashboard-config" ? { textContent: "{}" } : null),
       addEventListener() {}, querySelectorAll: () => [],
       documentElement: { setAttribute() {}, removeAttribute() {} },
     },
@@ -43,7 +48,7 @@ function clientInMinimalDom() {
     fetch: pending,
   });
   runInContext(getClientScript(), context);
-  return { main, context };
+  return { main, context, appClasses };
 }
 
 describe("slice 2 shell route walk", () => {
@@ -54,6 +59,18 @@ describe("slice 2 shell route walk", () => {
       runInContext(`state.route = ${JSON.stringify(id)}; renderMain();`, context);
       expect(main.innerHTML.length).toBeGreaterThan(0);
       expect(main.innerHTML).not.toContain("Route not found.");
+    },
+  );
+
+  // The fortress column (the queue and ambient posture beside the concierge)
+  // shows only beside Talk's full page; every other route is route-full, so
+  // sibling screens (the Settings tabs among them) never re-open it.
+  it.each([...FROZEN_ROUTE_IDS, ...NEW_ROUTE_IDS, ...INTERNAL_ROUTE_IDS])(
+    "#%s is route-full unless it is Talk's full page",
+    (id) => {
+      const { context, appClasses } = clientInMinimalDom();
+      runInContext(`setRoute(${JSON.stringify(id)});`, context);
+      expect(appClasses.has("route-full")).toBe(id !== "dashboard");
     },
   );
 

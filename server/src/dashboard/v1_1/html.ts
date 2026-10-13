@@ -132,8 +132,6 @@ body {
   display: flex; align-items: center; gap: var(--space-3); min-width: 0;
   padding: 0 var(--space-4); border-bottom: 1px solid var(--rule); background: var(--surface);
 }
-/* The search is the bar's elastic slot: it gives way down to a floor that fits its
-   placeholder beside the key hint, so the fixed controls never clip. */
 .brand {
   display: flex; align-items: center; gap: var(--space-2); flex: none; min-width: 24px;
   font-family: var(--display); font-weight: 700; font-size: 15px; letter-spacing: 0.01em;
@@ -141,11 +139,14 @@ body {
 }
 /* The one permitted gradient: the product mark, accent to --mark-teal. */
 .brand .mark { width: 24px; height: 24px; flex: none; border-radius: var(--rad); background: linear-gradient(135deg, var(--accent), var(--mark-teal)); display: inline-block; }
-/* 8px: the design's top-bar control radius (radius-lg); the server block
-   carries 6px (--rad) and 10px (--rad-lg) only, so it is written here. */
 /* Shrinks at a fifth of the search's rate: the search gives way to its floor
    first, so the scope keeps its machine and agent names readable. */
 .scope-switcher { position: relative; flex: 0 0.2 auto; min-width: 0; display: flex; }
+/* 8px: the design's top-bar control radius (radius-lg); the server block
+   carries 6px (--rad) and 10px (--rad-lg) only, so it is written here.
+   34px: the TopBar preview's control height (its icon button is the 34px
+   square), shared by the scope, the search, the icon buttons and the seal.
+   360px caps the trigger at the fortress column's width. */
 .scope {
   display: flex; align-items: center; gap: var(--space-2); height: 34px; max-width: min(360px, 100%); min-width: 0;
   padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--rule-2); border-radius: 8px;
@@ -155,10 +156,18 @@ body {
 .scope svg { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
 .scope svg:last-child { width: 14px; height: 14px; }
 .scope .machine-name { flex: none; }
+/* 132px = 20 glyphs of the 11px (--text-xs) Roboto Mono id at its 0.6em
+   advance (6.6px each): enough of the id to tell two fortresses apart; the
+   full id is in the menu head and the title. */
 .scope .id { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; min-width: 0; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
 .scope .scope-sep { width: 1px; height: 16px; background: var(--rule-2); flex: none; }
 /* 44px: room for two letters and the ellipsis, so the agent scope never vanishes. */
 .scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+/* The search is the bar's elastic slot: it gives way down to a floor that
+   fits its placeholder beside the key hint, so the fixed controls never clip.
+   200px basis and the 136px floor are the TopBar README's: 136px fits the
+   placeholder "Search" in full beside the keyboard hint (measured there at
+   1,200px with zero overflow). */
 .search-wrap { position: relative; flex: 1 1 200px; min-width: 136px; }
 .search {
   display: flex; align-items: center; gap: var(--space-2); height: 34px; padding: 0 var(--space-3);
@@ -170,6 +179,9 @@ body {
 .search input::-webkit-search-cancel-button { display: none; }
 /* 4px: the design's small radius (radius-sm), --rad less one 2px step. */
 .search kbd { flex: none; font-family: var(--mono); font-size: var(--text-xs); padding: 2px 6px; border: 1px solid var(--rule-2); border-radius: calc(var(--rad) - 2px); color: var(--ink-3); }
+/* 320px: the results panel keeps this floor when the search shrinks toward
+   its 136px floor; it is the scope menu's width (.agent-switcher-menu), so
+   the two top-bar popovers read as one family. */
 .search-results {
   position: absolute; top: calc(100% + 6px); left: 0; right: 0; min-width: 320px; max-height: 420px; overflow-y: auto;
   background: var(--surface); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
@@ -219,7 +231,10 @@ body {
 .topbar :is(button, select, a):focus-visible, .search:focus-within, .talk-panel :is(button, a):focus-visible, .screen-tabs a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .search input:focus-visible { outline: none; }
 /* Talk: the concierge mounted as a right-hand panel under the top bar, so it
-   opens beside whatever screen is showing instead of replacing it. */
+   opens beside whatever screen is showing instead of replacing it. 460px:
+   at the 1,024px minimum width the panel still leaves the 232px rail and
+   332px of the screen beneath in view (1024 - 232 - 460), so Talk opens
+   beside the screen rather than over it; capped at the viewport. */
 .talk-panel {
   position: fixed; top: 56px; right: 0; bottom: 0; width: min(460px, 100vw); z-index: 45;
   background: var(--paper); border-left: 1px solid var(--rule); display: flex; flex-direction: column;
@@ -240,8 +255,19 @@ body {
 .screen-tabs nav a:hover { color: var(--ink); background: var(--surface-2); }
 .screen-tabs nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
 .folded-section { margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--rule); }
-.folded-section > .folded-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); }
-.folded-section > .folded-head a { font-size: var(--text-sm); color: var(--accent); }
+.folded-section > .folded-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+.folded-section > .folded-head a { flex: none; font-size: var(--text-sm); color: var(--accent); }
+.folded-section > .folded-head .eyebrow { margin: 0 0 var(--space-1); font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.folded-section > .folded-head h2 { margin: 0; font-family: var(--display); font-weight: 600; font-size: var(--text-lg); color: var(--ink); }
+/* The fold's head carries the hosted page's eyebrow and title, so the hosted
+   page's own eyebrow and h1 are hidden inside a fold (its subtitle stays).
+   The selectors name where each hosted renderer puts them: a page head, the
+   policy-center block, or the bare h1 of an unavailable panel. */
+.folded-section > .page-head .eyebrow, .folded-section > .page-head h1, .folded-section > .policy-center > .eyebrow, .folded-section > .policy-center > h1, .folded-section > h1 { display: none; }
+.folded-section > .page-head { border-bottom: 0; padding-bottom: 0; margin-bottom: var(--space-3); }
+/* An absent count inside a sentence: the word Unknown at full weight in the
+   unknown hue, never a 0 the client did not observe. */
+.unknown-value { color: var(--slate); font-weight: 600; }
 .export-group .toolbar { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .export-group .toolbar a.btn { text-decoration: none; }
 .count-age { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; }
@@ -277,6 +303,11 @@ body {
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-partial { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
+/* Engaged, Lock down keeps the one destructive style and still paints no
+   fill: an engaged lockdown is a decision on record, not an alarm. The
+   button is disabled while engaged, so full opacity keeps its text at the
+   bad hue instead of the faded disabled look. */
+.btn.btn-lockdown.tier1-engaged { background: transparent; color: var(--rust); border-color: var(--rust-line); opacity: 1; }
 .btn.btn-icon {
   padding: 4px 6px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -1396,6 +1427,9 @@ body {
 .scope-menu-head .mono { font-size: var(--text-xs); color: var(--ink-3); overflow-wrap: anywhere; flex: 1; min-width: 0; }
 .scope-fleet { display: block; margin-top: 4px; padding: 8px; border-top: 1px solid var(--rule); color: var(--accent); text-decoration: none; font-size: var(--text-sm); }
 .scope-fleet:hover { text-decoration: underline; }
+/* 320px wide, the search results' width too; 320px tall before it scrolls,
+   about seven 36px agent rows (7px padding twice around the 22px glyph)
+   under the menu head. */
 .agent-switcher-menu {
   position: absolute; top: calc(100% + 6px); left: 0;
   width: 320px; max-height: 320px; overflow-y: auto;

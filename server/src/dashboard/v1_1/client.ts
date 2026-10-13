@@ -861,15 +861,16 @@ const MS_PER_HOUR = 60 * 60 * 1000;
 const TIME_RANGE_MS = { "24h": 24 * MS_PER_HOUR, "7d": 7 * 24 * MS_PER_HOUR, "30d": 30 * 24 * MS_PER_HOUR };
 const TIME_RANGE_LABEL = { "all": "all time", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" };
 const TIME_RANGE_ROUTES = ["activity"];
+// Every route but Talk's full page is route-full: the fortress column (the
+// queue and ambient posture beside the concierge) shows only there. The
+// route-walk test asserts this for every hash id but "dashboard".
+const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  // Every route but Talk's full page is route-full: the fortress column
-  // (the queue and ambient posture beside the concierge) shows only there.
-  const fullRoutes = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "enforcement", "findings", "integrations", "settings"];
-  if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
+  if (ROUTE_FULL.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   const railRoute = Object.prototype.hasOwnProperty.call(ROUTE_RAIL_PARENT, route) ? ROUTE_RAIL_PARENT[route] : null;
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -1099,7 +1100,10 @@ function renderPostureSeal() {
     sub = "Protected means Castle Wall enforcement was observed within the freshness window and the Charter still gates risky actions. It does not mean every past action is fully verified here.";
   } else if (seal.tone === "locked") {
     head = "This fortress is locked down.";
-    sub = "Lockdown holds every agent Sanctuary watches. Protected is only shown when Castle Wall enforcement has current evidence.";
+    // Must match the Lock down button title in html.ts and the
+    // approval_pending.tier1.fortress_lockdown template: network access is
+    // revoked for confined agents, and agents keep running and local access.
+    sub = "Lockdown revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
     sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
@@ -1225,7 +1229,7 @@ function renderMain() {
     case "findings": nextHtml = renderFindingsScreen(); break;
     // Policies hosts the auto-trigger ladder as a section; #auto-trigger
     // still renders the ladder on its own.
-    case "policy": nextHtml = renderPolicyCenter() + renderFoldedSection("Auto-trigger ladder", "auto-trigger", renderAutoTriggerPage()); break;
+    case "policy": nextHtml = renderPolicyCenter() + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage(), '<span class="pill tone-info">operator controlled</span>'); break;
     case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
     case "integrations": nextHtml = renderIntegrationsScreen(); break;
     case "settings": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
@@ -3063,7 +3067,11 @@ function renderFortress() {
   const pending = pendingApprovalItems();
   const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
   const countCls = queueCount ? "count" : "count zero";
-  const queueBody = renderApprovalQueueBody();
+  // The Approvals screen renders this same queue body in the main column, and
+  // the fortress column is hidden there (route-full), so the column skips it:
+  // the queue's element ids and its approve/deny controls exist once in the
+  // document. Every other route keeps rendering it here, hidden or shown.
+  const queueBody = state.route === "approvals" ? "" : renderApprovalQueueBody();
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3515,10 +3523,15 @@ function renderPostureScreen() {
 // on their own hashes.
 
 // A folded section: an older screen hosted inside a rail destination, with a
-// link to the same content on its own route (the frozen hash id).
-function renderFoldedSection(title, routeId, html) {
+// link to the same content on its own route (the frozen hash id). The fold's
+// head carries the hosted page's eyebrow and title, and the stylesheet hides
+// the hosted page's own eyebrow and h1 inside a fold, so no heading repeats.
+// titleSuffixHtml is trusted markup from the caller (a status pill the hosted
+// h1 carried), never data.
+function renderFoldedSection(eyebrow, title, routeId, html, titleSuffixHtml) {
   return '<section class="folded-section" data-folded-route="' + escHtml(routeId) + '">' +
-    '<div class="folded-head"><p class="eyebrow">' + escHtml(title) + '</p>' +
+    '<div class="folded-head"><div><p class="eyebrow">' + escHtml(eyebrow) + '</p>' +
+    '<h2>' + escHtml(title) + (titleSuffixHtml ? ' ' + titleSuffixHtml : '') + '</h2></div>' +
     '<a href="#' + escHtml(routeId) + '">Open on its own page</a></div>' +
     html + '</section>';
 }
@@ -3673,6 +3686,9 @@ function searchGroups(needle) {
     {
       label: "Waiting approvals",
       loaded: sourceLoaded(HUB + "/inbox") && !state.inboxRedacted,
+      // Loaded but redacted: the server withheld the items, so a match can be
+      // neither shown nor ruled out until the operator token is pasted.
+      hidden: sourceLoaded(HUB + "/inbox") && !!state.inboxRedacted,
       total: heldApprovalItems(null).length,
       hits: heldApprovalItems(null).filter(function (i) {
         return match(renderTemplate(i.display_template_id, i.display_template_args)) || match(i.agent_id);
@@ -3705,10 +3721,11 @@ function renderSearchResults() {
   if (!open) return;
   const groups = searchGroups(needle);
   const scope = groups.map(function (g) {
-    return g.loaded ? g.total + " " + g.label.toLowerCase() : g.label.toLowerCase() + " not loaded";
+    return g.loaded ? g.total + " " + g.label.toLowerCase() : g.label.toLowerCase() + (g.hidden ? " hidden" : " not loaded");
   }).join(", ");
   let any = false;
   const body = groups.map(function (g) {
+    if (g.hidden) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: hidden until you paste the operator token, so a match cannot be ruled out.</div>';
     if (!g.loaded) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: not loaded yet, so a match cannot be ruled out.</div>';
     if (!g.hits.length) return "";
     any = true;
@@ -3738,13 +3755,14 @@ function renderApprovalsScreen() {
     ? '<span class="count-age">' + escHtml(w.sentence) + '</span>'
     : '<span class="count-age">Unknown until the approval queue loads</span>';
   // The fortress column renders the same queue beside Talk's full page; on
-  // this screen the column is hidden, so the queue's element ids exist once.
+  // this screen it skips the queue body (renderFortress), so the queue's
+  // element ids exist once in the document.
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always writes a standing rule into your signed policy. Every decision is signed with your operator key and appended to the audit chain.</p>',
+        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always writes a standing rule into your signed policy. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
       '</div></div>',
       '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
       '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',
@@ -3785,10 +3803,21 @@ function renderEnforcementScreen() {
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
   }).join("");
   const d = home.digest || {};
-  const connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
-  const egress = (typeof d.kernel_blocks === "number" || typeof d.kernel_allows === "number")
-    ? '<div class="story-line"><strong>' + escHtml(d.kernel_blocks || 0) + '</strong> of ' + escHtml(connTotal) + ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows || 0) + ' allowed.</div>'
-    : '<p class="muted">Outbound connection counts are not in this posture read. This is not a confirmation of zero connections.</p>';
+  // A kernel count the digest does not carry is Unknown, never 0: the total
+  // and the "N of total" sentence need both counts observed.
+  const blocksKnown = typeof d.kernel_blocks === "number";
+  const allowsKnown = typeof d.kernel_allows === "number";
+  const unknownCount = '<strong class="unknown-value">Unknown</strong>';
+  let egress;
+  if (blocksKnown && allowsKnown) {
+    egress = '<div class="story-line"><strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(d.kernel_blocks + d.kernel_allows) + ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.</div>';
+  } else if (blocksKnown || allowsKnown) {
+    egress = '<div class="story-line">' +
+      (blocksKnown ? '<strong>' + escHtml(d.kernel_blocks) + '</strong>' : unknownCount) + ' outbound connections blocked at the kernel; ' +
+      (allowsKnown ? '<strong>' + escHtml(d.kernel_allows) + '</strong>' : unknownCount) + ' allowed. The total is Unknown until both counts are in the posture read.</div>';
+  } else {
+    egress = '<p class="muted">Outbound connection counts are not in this posture read. This is not a confirmation of zero connections.</p>';
+  }
   return [
     '<section class="concierge-wrap">',
       head,
@@ -3829,7 +3858,7 @@ function renderFindingsScreen() {
       '<section class="card"><h3>Anomaly findings ' + countLine + '</h3>',
         renderPostureAnomalies(findings, unknown), renderSourceRead("/api/anomaly/findings"),
       '</section>',
-      renderFoldedSection("Honeypot traps", "honeypot", renderHoneypotPage()),
+      renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()),
     '</section>'
   ].join("");
 }
