@@ -841,8 +841,7 @@ impl DecisionEngine {
             Ok(guard) => match guard.current_snapshot() {
                 Some(snapshot) => (
                     snapshot.evaluate(request),
-                    // The structural pin keeps this arm as the snapshot builder;
-                    // the Err arm below maps a refused snapshot to Unattributed.
+                    // the span is pinned by exact text, so any edit to it fails the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
                     AdmittedIdentity::from_snapshot(snapshot),
                 ),
                 None => (
@@ -873,8 +872,7 @@ impl DecisionEngine {
                 None => return Ok(self.unattributed_outcome()),
             },
             Err(_) => {
-                // Structural tests pin this refused-identity arm to the
-                // Unattributed return and subject resolution to the next statement.
+                // the span is pinned by exact text, so any edit to it fails the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
                 return Ok(self.unattributed_outcome());
             }
         };
@@ -2284,70 +2282,64 @@ mod armed_identity_tests {
         let open = decision[evaluate_at..].find('{').unwrap() + evaluate_at;
         let close = crate::source_scan::matching_brace(&decision, open).unwrap();
         let body = &decision[open..=close];
-        let some_pattern = "Some(snapshot) => (";
-        let some_at = body.find(some_pattern).expect("present snapshot arm");
-        let some_body_start = some_at + some_pattern.len();
-        let some_body_end = body[some_body_start..]
-            .find("                ),\n                None => (")
-            .map(|offset| some_body_start + offset)
-            .expect("present snapshot arm close");
-        let some_body_without_comments = body[some_body_start..some_body_end]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            some_body_without_comments,
-            "snapshot.evaluate(request),\nAdmittedIdentity::from_snapshot(snapshot),",
-            "a present snapshot uses only the snapshot-derived identity"
-        );
-        let err_pattern = "Err(_) => {";
-        let err_at = body.find(err_pattern).expect("from_snapshot Err arm");
-        let err_open = body[err_at..].find('{').unwrap() + err_at;
-        let err_close = crate::source_scan::matching_brace(body, err_open).unwrap();
-        let err_body = &body[err_open + 1..err_close];
-        let err_body_without_comments = err_body
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            err_body_without_comments, "return Ok(self.unattributed_outcome());",
-            "a refused snapshot maps only to the Unattributed outcome"
-        );
-        assert!(
-            !err_body.contains("BootAdmittedIdentity::"),
-            "evaluate_attempt must not recover from from_snapshot Err through boot identity"
-        );
-        assert!(
-            !err_body.contains("armed_identity().cloned().ok_or_else"),
-            "evaluate_attempt must not recover from from_snapshot Err through the frozen cell"
-        );
-        let body_without_comments = body
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let identity_match_at = body_without_comments
+        let identity_match_at = body
             .find("let (verdict, identity) = match bounded_lock_until(store, deadline) {")
             .expect("identity-producing match");
-        let after_identity_match = &body_without_comments[identity_match_at..];
+        let after_identity_match = &body[identity_match_at..];
         let subject_pattern = "let subject = match identity {";
         let subject_at = after_identity_match
             .find(subject_pattern)
             .expect("subject resolution");
-        let before_subject = &after_identity_match[..subject_at];
-        let identity_match_close = before_subject
-            .rfind("        };")
-            .expect("identity-producing match close");
-        let gap = &before_subject[identity_match_close + "        };".len()..];
-        assert!(
-            gap.lines().all(|line| line.trim().is_empty()),
-            "subject resolution follows the identity-producing match without intervening statements"
+        let subject_open = identity_match_at
+            + subject_at
+            + after_identity_match[subject_at..]
+                .find('{')
+                .expect("subject match opens");
+        let subject_close =
+            crate::source_scan::matching_brace(body, subject_open).expect("subject match closes");
+        let subject_semicolon = subject_close
+            + body[subject_close..]
+                .find(';')
+                .expect("subject match statement terminates");
+        let pinned_span = normalize_exact_pin_span(&body[identity_match_at..=subject_semicolon]);
+        assert_eq!(
+            pinned_span,
+            r#"let (verdict, identity) = match bounded_lock_until(store, deadline) {
+            Ok(guard) => match guard.current_snapshot() {
+                Some(snapshot) => (
+                    snapshot.evaluate(request),
+                    AdmittedIdentity::from_snapshot(snapshot),
+                ),
+                None => (
+                    Verdict::Deny {
+                        reason: DeniedReason::DefaultDeny,
+                    },
+                    self.armed_identity()
+                        .cloned()
+                        .ok_or_else(|| "armed identity is unset".to_string()),
+                ),
+            },
+            Err(LockAcquireError::Poisoned) => return Err(AttemptError::ManifestStorePoisoned),
+            Err(_) => (
+                Verdict::Deny {
+                    reason: DeniedReason::DefaultDeny,
+                },
+                self.armed_identity()
+                    .cloned()
+                    .ok_or_else(|| "armed identity is unset".to_string()),
+            ),
+        };
+
+        let subject = match identity {
+            Ok(identity) => match resolve_audit_subject(Some(&identity), &request.agent_id) {
+                Some(subject) => subject,
+                None => return Ok(self.unattributed_outcome()),
+            },
+            Err(_) => {
+                return Ok(self.unattributed_outcome());
+            }
+        };"#,
+            "evaluate_attempt snapshot identity and subject-resolution span changed"
         );
         let production = production_lines(&decision).join("\n");
         let freeze_body = crate::source_scan::fn_body(&production, "freeze_at_boot");
@@ -2584,7 +2576,7 @@ mod armed_identity_tests {
     }
 
     #[test]
-    fn verdict_completes_while_store_lock_is_reacquired_after_store_phase() {
+    fn verdict_does_not_hold_store_lock_while_waiting_on_wal() {
         let f = fixture();
         write_policy(
             &f.policy_dir,
@@ -3104,6 +3096,14 @@ mod armed_identity_tests {
     fn source(relative: &str) -> String {
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative))
             .unwrap_or_else(|err| panic!("read {relative}: {err}"))
+    }
+
+    fn normalize_exact_pin_span(span: &str) -> String {
+        span.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// A top-level (`#[cfg(test)]` at column 0) attribute gates exactly the one

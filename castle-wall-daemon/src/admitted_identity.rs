@@ -90,9 +90,8 @@ impl AdmittedIdentity {
 }
 
 /// Boot-only identity source. Confined fields enter here from the boot-time
-/// scoped-rule refusal; structural tests pin the decision path's snapshot arm
-/// to `from_snapshot`, its refused-identity arm to Unattributed, and subject
-/// resolution to the next statement.
+/// scoped-rule refusal; the span is pinned by exact text, so any edit to it fails
+/// the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
 pub(crate) struct BootAdmittedIdentity {
     fortress_id: String,
     subject: AdmittedSubject,
