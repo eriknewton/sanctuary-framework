@@ -17,7 +17,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "deploy",
   "did-web",
   "distress",
-  "doctor",
+  "doctor", // must match EVALUATE_CLI_GUIDANCE.verify in server/src/agent-native/capabilities-catalog.ts
   "erc8004",
   "evidence-pack",
   "exit",
@@ -58,7 +58,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "task",
   "template",
   "transparency",
-  "uninstall",
+  "uninstall", // must match EVALUATE_CLI_GUIDANCE.uninstall in server/src/agent-native/capabilities-catalog.ts
   "verify-exit-bundle",
   "verify-transparency",
   "wrap",

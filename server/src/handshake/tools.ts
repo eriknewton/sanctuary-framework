@@ -1391,7 +1391,7 @@ export function createHandshakeTools(
       name: "handshake_exchange",
       description:
         "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, " +
-        "generates our SHR, and produces a signed attestation artifact — all in a single call. " +
+        "generates our SHR, and produces a signed attestation artifact, all in a single call. " +
         "Returns a shareable attestation with human-readable summary. " +
         "Use this instead of the 4-step handshake protocol when you want a quick, " +
         "portable sovereignty verification (e.g., for social posting or async exchanges).",

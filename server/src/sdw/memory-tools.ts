@@ -57,6 +57,9 @@ import {
   MEMORY_LIST_MAX_LIMIT,
   MEMORY_SEARCH_DEFAULT_LIMIT,
 } from "./adapters/sdw-memory-backend.js";
+import {
+  memoryGetSuccessToolResult,
+} from "./memory-tool-projection.js";
 
 const MAX_TEXT_BYTES = 1024 * 1024;
 
@@ -125,20 +128,6 @@ export interface SdwMemoryToolsOptions {
   readonly isolationGuard?: MultiAgentIsolationGuard;
   /** Code-owned current-agent resolver used for signed caller attribution. */
   readonly currentAgentId?: () => string | undefined;
-}
-
-/** Full body view, reserved for explicit single-passage retrieval. */
-function publicFullPassage(passage: MemoryPassage): Record<string, unknown> {
-  return {
-    passage_id: passage.passage_id,
-    owner_ref: passage.owner_ref,
-    text: passage.text,
-    tags: [...passage.tags],
-    metadata: passage.metadata.map((entry) => ({ ...entry })),
-    created_at: passage.created_at,
-    chunk_count: passage.chunk_count,
-    content_hash: passage.content_hash,
-  };
 }
 
 function publicPassageMetadata(passage: MemoryPassage): Record<string, unknown> {
@@ -298,7 +287,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       "rest under your operator keys, secret-gated at write time, and audited. " +
       "This is a passage store: flat text plus tags, with no in-place edit " +
       "(insert and delete only). Retrieval IQ (embeddings, ranking) stays in a " +
-      "swappable engine; this is the sovereign custody layer underneath it.",
+      "swappable engine; this is the sovereign custody layer underneath it. " +
+      "Tier 1 under the default policy: requires operator approval for each insert.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -430,7 +420,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           return toolResult({ found: false });
         }
         await auditSuccess("memory_get", { passage_id: passageId, result_count: 1 });
-        return toolResult({ found: true, passage: publicFullPassage(passage) });
+        return memoryGetSuccessToolResult(passage);
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "get_failed";
         await auditFailure("memory_get_denied", { denial_class: category });
@@ -531,7 +521,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     name: "memory_list",
     description:
       "List passages in your sovereign memory vault in stable id order, with optional " +
-      "cursor pagination (pass the last seen passage_id as `after`).",
+      "cursor pagination (pass the last seen passage_id as `after`)." +
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -575,7 +566,9 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
   // -- memory_count (read) ------------------------------------------------------
   const memoryCount: ToolDefinition = {
     name: "memory_count",
-    description: "Count the passages in your sovereign memory vault (this owner scope).",
+    description:
+      "Count the passages in your sovereign memory vault (this owner scope)." +
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {
