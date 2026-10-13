@@ -146,10 +146,12 @@ npm install -g @sanctuary-framework/mcp-server@1.9.0-rc.1
 npx -y @sanctuary-framework/mcp-server@1.9.0-rc.1 protect --claude-code --no-open --no-dashboard
 ```
 
-The [v1.9.0-rc.1 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.9.0-rc.1)
-is where the signed and notarized macOS app for this preview is attached as
-`Sanctuary-CastleWall.app.zip`. Its SHA-256 is recorded here once the attached
-app is verified; until then, use the v1.8.4 app above.
+No signed macOS app is attached for this preview yet. Castle Wall `enable`
+requires an app built from the same commit as the CLI, so macOS wall testing of
+rc.1 waits for `Sanctuary-CastleWall.app.zip` on the
+[v1.9.0-rc.1 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.9.0-rc.1),
+whose SHA-256 will be recorded here once verified. The v1.8.4 app above pairs
+only with the v1.8.4 CLI.
 See the [1.9.0 release notes](docs/releases/v1.9.0.md) for what changed since 1.8.4.
 
 ### Verify before you trust

@@ -30,7 +30,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 *Status: shipped through v1.8.4 (npm `latest`, released 2026-09-05); v1.9.0-rc.1 is the opt-in preview on the `next` channel.*
 
-*`sanctuary protect --passphrase-stdin` (built 2026-10-10; release pending) reads the passphrase from stdin for scripted setup.*
+*`sanctuary protect --passphrase-stdin` (from the 1.9.0-rc.1 preview) reads the passphrase from stdin for scripted setup.*
 
 *Clean uninstall verb (built 2026-08-09; first shipped in v1.8.0): `sanctuary uninstall` removes the reachable installed enforcement footprint by disarming the macOS wall when available, uninstalling the auto-provisioned harness daemon, scrubbing provisioned egress rules, and removing the boot LaunchDaemon when run with the needed root privilege. It preserves operator data by default: fortress state, keys, passphrase custody, recovery material, and the audit log stay in place and are named in the output. Honest bounds: a root-owned boot service requires sudo, the host-wide Castle Wall global pin is left for explicit operator removal, system-extension deactivation still belongs to the Castle Wall host app and may require reboot, and successful re-home replay is not claimed because the current shipped record does not persist a replay manifest for this CLI to consume.*
 
