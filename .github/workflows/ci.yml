@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Provision the root-owned workstation signer interpreter
         # setup-node's tool cache is runner-writable, so its symlink cannot carry key custody.
@@ -161,7 +161,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Install dependencies
         working-directory: server
@@ -176,7 +176,7 @@ jobs:
         # before a malformed workflow can ship unnoticed.
         #
         # js-yaml is a lockfile-pinned devDependency (server/package.json,
-        # server/package-lock.json) rather than a pip install: ubuntu-latest's
+        # server/npm-shrinkwrap.json) rather than a pip install: ubuntu-latest's
         # system Python is PEP 668 externally-managed, so `pip install --user`
         # fails outright, and every other pip site in this repo needs a venv
         # plus --require-hashes plus the retry-with-timeout wrapper after pip

@@ -14,6 +14,7 @@
 /scripts/                           @eriknewton
 **/package.json                     @eriknewton
 **/package-lock.json                @eriknewton
+**/npm-shrinkwrap.json              @eriknewton
 /sidecars/concordia/requirements.txt @eriknewton
 
 # Security-sensitive subsystems (custody, policy, crypto, enforcement)

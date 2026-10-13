@@ -46,7 +46,7 @@ describe("PQC additive guard", () => {
     // from it: a manifest that says one version while the lockfile resolved
     // another ships the other. So the lockfile entry and the installed package
     // must both agree with the pin; a divergence fails here, before boot.
-    const lock = JSON.parse(readRepoFile("server/package-lock.json")) as {
+    const lock = JSON.parse(readRepoFile("server/npm-shrinkwrap.json")) as {
       packages?: Record<string, { version?: string }>;
     };
     expect(lock.packages?.["node_modules/@noble/post-quantum"]?.version).toBe(

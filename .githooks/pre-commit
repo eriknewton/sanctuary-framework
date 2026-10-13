@@ -59,7 +59,7 @@
 #     WHAT THIS GATE COVERS, AND WHAT IT DEFERS (2026-09-26, corrected -
 #     the previous wording claimed deletions were "covered" when in fact a
 #     staged change consisting only of a deleted `*.test.ts` file, or of
-#     `server/package.json`, `server/package-lock.json`,
+#     `server/package.json`, `server/npm-shrinkwrap.json`,
 #     `server/vitest.config*`, `server/tsconfig*.json`,
 #     `server/tsup.config*`, or a plain `.js`/`.mjs` file under server/,
 #     gives `vitest related` nothing to run and this gate falls through to
@@ -251,7 +251,7 @@ done < <(printf '%s\n' "$staged_server_paths" | grep -E '\.tsx?$' || true)
 deleted_test_files=$(git diff --cached --name-only --diff-filter=D -- server \
   | grep -E '\.test\.tsx?$' || true)
 staged_config_files=$(printf '%s\n' "$staged_server_paths" \
-  | grep -E '(^server/package\.json$|^server/package-lock\.json$|^server/vitest\.config\.[cm]?[jt]s$|^server/tsconfig(\..+)?\.json$|^server/tsup\.config\.[cm]?[jt]s$)' || true)
+  | grep -E '(^server/package\.json$|^server/(package-lock|npm-shrinkwrap)\.json$|^server/vitest\.config\.[cm]?[jt]s$|^server/tsconfig(\..+)?\.json$|^server/tsup\.config\.[cm]?[jt]s$)' || true)
 staged_plain_js_files=$(printf '%s\n' "$staged_server_paths" | grep -E '\.m?js$' || true)
 undeferrable_paths=$(printf '%s\n%s\n%s\n' \
   "$deleted_test_files" "$staged_config_files" "$staged_plain_js_files" | grep -v '^$' || true)

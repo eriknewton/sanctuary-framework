@@ -396,7 +396,14 @@ describe("catalog-v3 built and packed consumers", () => {
       files: string[];
       scripts: Record<string, string>;
     };
-    expect(packageJson.files).toEqual(["dist", "bin/sanctuary-linux-policy-sign", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]);
+    expect(packageJson.files).toEqual([
+      "dist",
+      "bin/sanctuary-linux-policy-sign",
+      "npm-shrinkwrap.json",
+      "README.md",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+    ]);
     expect(packageJson.scripts.pretest).toBe("npm run build");
     expect(packageJson.scripts.build.indexOf("node scripts/copy-catalog-v3-assets.mjs --verify-only"))
       .toBeLessThan(packageJson.scripts.build.indexOf("tsup"));
@@ -435,7 +442,7 @@ describe("catalog-v3 built and packed consumers", () => {
       dependencies: Record<string, string>;
       devDependencies: Record<string, string>;
     };
-    const lockfile = JSON.parse(readFileSync(resolve(SERVER_ROOT, "package-lock.json"), "utf8")) as {
+    const lockfile = JSON.parse(readFileSync(resolve(SERVER_ROOT, "npm-shrinkwrap.json"), "utf8")) as {
       packages: Record<string, { version?: string; integrity?: string }>;
     };
     for (const name of ["spdx-license-ids", "spdx-exceptions", "spdx-vir"]) {

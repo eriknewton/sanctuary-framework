@@ -48,7 +48,7 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       - name: Build self-contained Castle Wall and CLI runtimes
         working-directory: server

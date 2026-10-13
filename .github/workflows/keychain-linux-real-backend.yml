@@ -54,7 +54,7 @@ on:
       - "server/test/keychain-linux-secret-service.test.ts"
       - "server/test/setup/keychain-fake.ts"
       - "server/package.json"
-      - "server/package-lock.json"
+      - "server/npm-shrinkwrap.json"
       - ".github/workflows/keychain-linux-real-backend.yml"
   pull_request:
     branches: [main]
@@ -65,7 +65,7 @@ on:
       - "server/test/keychain-linux-secret-service.test.ts"
       - "server/test/setup/keychain-fake.ts"
       - "server/package.json"
-      - "server/package-lock.json"
+      - "server/npm-shrinkwrap.json"
       - ".github/workflows/keychain-linux-real-backend.yml"
   workflow_dispatch:
 
@@ -83,7 +83,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/npm-shrinkwrap.json
 
       # Installs libsecret + pass-secret-service, starts a session bus,
       # and smoke-tests it, exporting DBUS_SESSION_BUS_ADDRESS. It fails

@@ -9,7 +9,7 @@ const npmManifests = [
   {
     path: "server/package.json",
     sections: ["dependencies", "devDependencies"],
-    lockfile: "server/package-lock.json",
+    lockfile: "server/npm-shrinkwrap.json",
   },
   {
     path: "menubar/package.json",
