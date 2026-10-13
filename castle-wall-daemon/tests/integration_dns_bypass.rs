@@ -250,7 +250,7 @@ fn policy_blocks_plain_dns_to_unallowed_resolver_emits_egress_blocked_default_de
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     assert!(outcome
         .event_canonical_json()
         .expect("audit body")
@@ -278,7 +278,7 @@ fn policy_blocks_plain_dns_tcp_to_unallowed_resolver() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -299,7 +299,7 @@ fn policy_blocks_doh_to_unallowed_provider_emits_egress_blocked_default_deny() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     assert!(outcome
         .event_canonical_json()
         .expect("audit body")
@@ -327,7 +327,7 @@ fn policy_blocks_doh_to_cloudflare_provider() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -352,7 +352,7 @@ fn policy_blocks_dot_to_unallowed_resolver_emits_egress_blocked_default_deny() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     assert!(outcome
         .event_canonical_json()
         .expect("audit body")
@@ -376,7 +376,7 @@ fn policy_blocks_dot_to_quad9_resolver() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -399,7 +399,7 @@ fn policy_blocks_raw_ip_https_with_no_dns_resolution() {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json().expect("audit body"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 

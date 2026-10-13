@@ -222,6 +222,9 @@ impl DecisionEngine {
             wal_writer,
             audit_buffer,
             mutation_cancel,
+            // SAFETY: stderr is reached only through bounded operator diagnostics:
+            // unattributed packets log on powers of two, and failed corrections
+            // log once per superseded receipt.
             Arc::new(|line| eprintln!("{line}")),
         )
     }
