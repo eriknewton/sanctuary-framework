@@ -124,7 +124,8 @@ describe("first-class tool surfacing", () => {
       // The bounds paragraph is appended, whole, after the catalog: platforms
       // with the patched-host qualifier on the enforcement sentence, the three
       // tiers with Tier 1 waiting on a human, the never-claimed line, and the
-      // evidence URL. At most four sentences, zero em-dashes.
+      // evidence URL. Four entries, zero em-dashes; the README copy is enforced
+      // by test/structure/server-bounds-copied-from-readme.test.ts.
       expect(instructions.endsWith(buildBoundsParagraph())).toBe(true);
       expect(instructions).toContain("Bounds, tiers and evidence:");
       for (const sentence of Object.values(SERVER_BOUNDS)) {

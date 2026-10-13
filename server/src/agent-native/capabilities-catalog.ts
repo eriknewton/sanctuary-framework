@@ -110,20 +110,22 @@ export const ASSURANCE_MATRIX_URL =
  * this server says about itself: the platforms the wall is proven on, the
  * approval tiers, what is never claimed, and where the evidence lives.
  *
- * Must match README.md "What is proven, and what is not" (the wall row, the
- * gate row) and the Assurance Matrix rows they cite. The wording is COPIED
- * from the README bound, never paraphrased into a stronger claim: a sentence
- * here may say less than the README, never more. Every enforcement sentence
+ * Must match README.md "Summary for agents" ("What it is not" and "Platforms
+ * and runtime") and the Assurance Matrix rows they cite. `platforms` and
+ * `neverClaimed` are COPIED sentence for sentence from the README, never
+ * paraphrased: `server/test/structure/server-bounds-copied-from-readme.test.ts`
+ * asserts each sentence is a README substring, so a stronger claim cannot be
+ * typed here without first landing in the README. Every enforcement sentence
  * carries "on a patched host" because the drills that proved it ran on a
  * patched host and nothing here extends the proof beyond that.
  */
 export const SERVER_BOUNDS = {
   platforms:
-    "The outbound wall is proven on macOS on a patched host (a signed operator policy with a per-uid allow/deny demonstration that survives attended reboot cycles, not an audited per-rule, per-flow trail) and on Linux on Ubuntu 24.04 x86-64 only, on a patched host; every other distribution or architecture is unproven, and Windows enforcement is roadmapped, not shipped.",
+    "macOS: proven, on a patched host. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only, on a patched host; every other distribution or architecture remains unproven. Windows enforcement is roadmapped; nothing enforces on Windows today.",
   tiers:
     "Approval runs in three tiers: Tier 3 auto-allows with an audit record, Tier 2 asks a human on anomaly, and Tier 1 always waits for a human.",
   neverClaimed:
-    "Sanctuary governs what leaves the machine; it claims no filesystem or process isolation of the agent and no per-flow content audit.",
+    "No Assurance Matrix row claims a filesystem or process sandbox for the agent; that is what your harness's own sandbox provides. The record is not an audited per-rule, per-flow trail.",
   evidence:
     `Every claim, its platform and its evidence is a row in the Assurance Matrix at ${ASSURANCE_MATRIX_URL}; to evaluate this install call monitor_health, then sovereignty_audit.`,
 } as const;
@@ -200,7 +202,7 @@ export const EVALUATE_RELATED_TOOLS = [
  */
 export const EVALUATE_CLI_GUIDANCE = {
   verify:
-    "On the CLI, run `sanctuary doctor --json` for a machine-readable end-to-end check of this install; in-session, monitor_health reports what this server can see of its own posture.",
+    "On the CLI, run `sanctuary doctor --json`; it is read-only and prints one JSON object with a `checks` array (healthy: exit code 0 and no check with status FAIL). In-session, monitor_health reports what this server can see of its own posture.",
   uninstall:
     "On the CLI: `sanctuary uninstall` removes the installed enforcement footprint and keeps the fortress state, keys and audit log; `sanctuary protect --unwrap` restores the original harness config and removes nothing else. There is no MCP tool for either.",
 } as const;
