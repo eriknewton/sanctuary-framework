@@ -2,6 +2,7 @@ import {
   PAPER_INK_ROOT_TOKENS_CSS,
   THEME_BOOTSTRAP_SCRIPT,
 } from "../dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../dashboard/design-fonts.js";
 import { ASCII_LABEL_RE_SOURCE } from "../core/token-grammar.js";
 
 // Emit this regex source inside an inline `<script>`. JSON.stringify escapes JS
@@ -27,16 +28,17 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
        comment above that block before touching either.
 
        This page used to hand-copy a light-only subset here; that copy is gone,
-       so the palette cannot drift on the login screen alone. Interpolating the
-       shared constant is additive for this page: the 22 tokens the old copy
-       declared were byte-identical to the canonical values, and none of the
-       tokens the shared block adds are referenced by the CSS below.
+       so the palette cannot drift on the login screen alone. The page moves
+       with the shared constant: when the console palette and faces changed
+       (2026-10-12) the login screen changed with them, and the bundled faces
+       arrive through CONSOLE_FONT_FACE_CSS just above the tokens.
 
        This page intentionally does NOT emit THEME_BOOTSTRAP_SCRIPT, so nothing
        ever sets data-theme and the shared block's dark rules never match: the
        login screen renders light-only, exactly as before. Adding the bootstrap
        here would be a real visual change and belongs in its own change, not
        this one. */
+    ${CONSOLE_FONT_FACE_CSS}
     ${PAPER_INK_ROOT_TOKENS_CSS}
 
     * {
@@ -138,7 +140,9 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     input[type="text"]::placeholder,
     input[type="password"]::placeholder {
-      color: var(--ink-4);
+      /* --ink-4 is disabled labels only; a placeholder is read, so it takes
+         the tertiary text color. */
+      color: var(--ink-3);
     }
 
     input[type="text"]:focus,
@@ -339,7 +343,7 @@ export function generateDashboardHTML(options: {
        --muted), and every rule below is written against these names.
 
        The thirteenth is the trap: --surface exists in BOTH systems at
-       different values (#161b22 here; #fdfcf8 light / #1a1a17 dark there). A
+       different values (#161b22 here; #ffffff light / #121825 dark there). A
        partial merge of the two blocks therefore recolors every card on this
        board and fails no build, so it surfaces as "the approval board went
        pale" with nothing pointing back at the merge. The same collision is
@@ -3350,9 +3354,10 @@ export function generateFleetSwitcherHTML(options: {
   <style>
     /* The shared "paper/ink" design tokens (server/src/dashboard/design-tokens.ts),
        the SAME block the v1.1 board and the posture surfaces interpolate. This
-       page now includes the warm dark theme and follows the dashboard's
+       page now includes the dark theme and follows the dashboard's
        light/dark choice via the head bootstrap above, instead of the old
        light-only scoped mirror that ignored the console theme. */
+    ${CONSOLE_FONT_FACE_CSS}
     ${PAPER_INK_ROOT_TOKENS_CSS}
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -3423,7 +3428,7 @@ export function generateFleetSwitcherHTML(options: {
       font-size: var(--text-md);
     }
     .add-form input#machine-url { font-family: var(--mono); }
-    .add-form input::placeholder { color: var(--ink-4); }
+    .add-form input::placeholder { color: var(--ink-3); } /* --ink-4 is disabled labels only; a placeholder is read */
     .add-form input:focus { outline: 2px solid var(--ink-3); outline-offset: 1px; border-color: var(--ink-3); }
     .add-form input.invalid { border-color: var(--rust); }
     .add-form button {

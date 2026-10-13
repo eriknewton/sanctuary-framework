@@ -45,6 +45,7 @@
  */
 
 import { PAPER_INK_ROOT_TOKENS_CSS } from "./design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "./design-fonts.js";
 
 /** The route prefix the companion (shell, manifest, service worker) serves under. */
 export const MOBILE_COMPANION_ROUTE_PREFIX = "/m";
@@ -54,12 +55,18 @@ export const MOBILE_COMPANION_ROUTE_PREFIX = "/m";
  * Everything is inline and same-origin, so `default-src 'self'` with the
  * narrow inline allowances is sufficient; no external origin is ever needed.
  * `connect-src 'self'` keeps runtime fetches (the `/api/*` calls) same-origin.
+ * `font-src data:` admits only the console faces this page embeds inline
+ * (CONSOLE_FONT_FACE_CSS in design-fonts.ts); without it `default-src 'self'`
+ * blocks them and the page silently falls back to the system stack. It opens
+ * no network origin: a data: font is bytes already in the document, and
+ * `style-src 'unsafe-inline'` already lets inline CSS declare a face.
  */
 export const MOBILE_COMPANION_CSP =
   "default-src 'self'; " +
   "script-src 'self' 'unsafe-inline'; " +
   "style-src 'self' 'unsafe-inline'; " +
   "img-src 'self' data:; " +
+  "font-src 'self' data:; " +
   "connect-src 'self'; " +
   "manifest-src 'self'; " +
   "base-uri 'none'; " +
@@ -321,6 +328,7 @@ export function renderMobileCompanionHTML(): string {
 <link rel="manifest" href="/m/manifest.webmanifest">
 <link rel="apple-touch-icon" href="${SHIELD_ICON_SVG}">
 <style>
+${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); }

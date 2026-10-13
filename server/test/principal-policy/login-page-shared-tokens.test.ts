@@ -70,11 +70,13 @@ describe("login page design tokens - one shared source, no scoped mirror", () =>
     expect(LOGIN_HTML).not.toContain('setAttribute("data-theme"');
   });
 
-  it("keeps every token value the retired scoped mirror declared", () => {
-    // The visual-identity claim, spelled out: all 22 tokens the deleted copy
-    // declared, at the values it declared them (origin/main
-    // principal-policy/dashboard-html.ts:19-42). The page's CSS rules are
-    // written against these names, so any drift here repaints the login screen.
+  it("declares every token the retired scoped mirror declared, at the ratified console values", () => {
+    // The 22 names the deleted copy declared are the names the page's CSS
+    // rules are written against, so each must still resolve on this page. The
+    // VALUES were re-based on 2026-10-12, when the console palette and faces
+    // changed by design (must match PAPER_INK_ROOT_TOKENS_CSS in
+    // server/src/dashboard/design-tokens.ts); an unreviewed drift from these
+    // still repaints the login screen and fails here.
     //
     // The three font stacks matter as much as the colors here and are easy to
     // omit from a list like this because they are not hex values. The page
@@ -82,25 +84,25 @@ describe("login page design tokens - one shared source, no scoped mirror", () =>
     // changed stack restyles every label, input, and title on the screen while
     // every color assertion still passes.
     const RETIRED_MIRROR: Record<string, string> = {
-      "--paper": "#f7f5f0",
-      "--paper-2": "#efece5",
-      "--ink": "#1a1a17",
-      "--ink-2": "#39362f",
-      "--ink-3": "#6a6659",
-      "--ink-4": "#9a9585",
-      "--rule": "#d8d4c8",
-      "--surface": "#fdfcf8",
-      "--surface-2": "#f1eee6",
-      "--rust": "oklch(55% 0.11 35)",
-      "--rust-bg": "oklch(94% 0.03 35)",
+      "--paper": "#f4f6fa",
+      "--paper-2": "#eef1f7",
+      "--ink": "#0f172a",
+      "--ink-2": "#4b5566",
+      "--ink-3": "#5e6879",
+      "--ink-4": "#a3abba",
+      "--rule": "#d9dee9",
+      "--surface": "#ffffff",
+      "--surface-2": "#eef1f7",
+      "--rust": "#c72647",
+      "--rust-bg": "#f8e5e9",
       "--mono":
-        'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+        '"Roboto Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
       "--sans":
-        '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif',
-      "--serif": '"Iowan Old Style", "Charter", "Georgia", serif',
+        '"Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif',
+      "--serif": "var(--display)",
       "--rad": "6px",
       "--rad-lg": "10px",
-      "--shadow": "0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02)",
+      "--shadow": "none",
       "--text-xs": "11px",
       "--text-sm": "12px",
       "--text-md": "14px",

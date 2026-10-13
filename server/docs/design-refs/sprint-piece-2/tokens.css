@@ -9,12 +9,16 @@
    server/src/dashboard/v1_1/html.ts as the source; that file now imports the
    constant and carries no `:root` block of its own.)
 
-   Verified 2026-08-04: value-faithful subset, zero value drift across all 31
-   light and 19 dark tokens present here. Deliberately not mirrored:
-   `--slate`/`--slate-bg` (the unknown-status hue, which these reference
-   surfaces do not render), `--accent`, the `--text-*` scale, and the semantic
-   `--color-*` alias layer. `--space-7` is local to this file and has no
-   canonical counterpart.
+   Re-copied 2026-10-12 to the ratified console values (cool navy palette,
+   bundled faces): value-faithful subset, zero value drift across all 32 light
+   and 19 dark tokens it shares with the constant. `--display` was added because `--serif` now
+   aliases it; this static reference does not bundle the faces, so its stacks
+   fall back to the system faces named after them. `--shadow` is `none` (the
+   console is flat). Deliberately not mirrored: `--slate`/`--slate-bg` (the
+   unknown-status hue, which these reference surfaces do not render), the
+   status `-line`, locked, severity and chart tokens, `--accent` and its
+   family, the `--text-*` scale, and the semantic `--color-*` alias layer.
+   `--space-7` is local to this file and has no canonical counterpart.
 
    Failure mode: a drifted mirror still parses and still renders. It looks
    almost right, so the divergence surfaces as "the prototype and the product
@@ -27,31 +31,32 @@
    a different value is not. */
 
 :root {
-  --paper: #f7f5f0;
-  --paper-2: #efece5;
-  --paper-3: #e6e3da;
-  --ink: #1a1a17;
-  --ink-2: #39362f;
-  --ink-3: #6a6659;
-  --ink-4: #9a9585;
-  --rule: #d8d4c8;
-  --rule-2: #c4bfb0;
-  --surface: #fdfcf8;
-  --surface-2: #f1eee6;
-  --sage: oklch(62% 0.07 145);
-  --sage-bg: oklch(94% 0.02 145);
-  --ochre: oklch(68% 0.09 75);
-  --ochre-bg: oklch(94% 0.03 75);
-  --rust: oklch(55% 0.11 35);
-  --rust-bg: oklch(94% 0.03 35);
-  --indigo: oklch(50% 0.10 260);
-  --indigo-bg: oklch(94% 0.03 260);
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+  --paper: #f4f6fa;
+  --paper-2: #eef1f7;
+  --paper-3: #e6eaf2;
+  --ink: #0f172a;
+  --ink-2: #4b5566;
+  --ink-3: #5e6879;
+  --ink-4: #a3abba;
+  --rule: #d9dee9;
+  --rule-2: #c5ccdc;
+  --surface: #ffffff;
+  --surface-2: #eef1f7;
+  --sage: #037949;
+  --sage-bg: #e1efe9;
+  --ochre: #8b6508;
+  --ochre-bg: #f1ede1;
+  --rust: #c72647;
+  --rust-bg: #f8e5e9;
+  --indigo: #2f63e8;
+  --indigo-bg: #eaeffd;
+  --mono: "Roboto Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --display: "Space Grotesk", "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: var(--display);
   --rad: 6px;
   --rad-lg: 10px;
-  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+  --shadow: none;
 
   /* Spacing scale formalized for v1.2 (PR 1) */
   --space-1: 4px;
@@ -64,25 +69,25 @@
 }
 
 [data-theme="dark"] {
-  --paper: #121210;
-  --paper-2: #171714;
-  --paper-3: #1e1e1b;
-  --ink: #ecebe5;
-  --ink-2: #c7c5bd;
-  --ink-3: #8d8a80;
-  --ink-4: #5e5c55;
-  --rule: #2a2a26;
-  --rule-2: #36352f;
-  --surface: #1a1a17;
-  --surface-2: #1f1e1a;
-  --sage: oklch(72% 0.08 145);
-  --sage-bg: oklch(22% 0.03 145);
-  --ochre: oklch(78% 0.09 75);
-  --ochre-bg: oklch(22% 0.04 75);
-  --rust: oklch(70% 0.11 35);
-  --rust-bg: oklch(22% 0.04 35);
-  --indigo: oklch(72% 0.09 260);
-  --indigo-bg: oklch(22% 0.03 260);
+  --paper: #0b0f17;
+  --paper-2: #0f141e;
+  --paper-3: #121825;
+  --ink: #e8ecf4;
+  --ink-2: #a3adc2;
+  --ink-3: #8791a5;
+  --ink-4: #4e5870;
+  --rule: #243049;
+  --rule-2: #2f3c57;
+  --surface: #121825;
+  --surface-2: #182032;
+  --sage: #2fd08a;
+  --sage-bg: #152e31;
+  --ochre: #f2c14e;
+  --ochre-bg: #2d2c2a;
+  --rust: #ff5c7a;
+  --rust-bg: #2e202f;
+  --indigo: #5b8cff;
+  --indigo-bg: #19243b;
 }
 
 * { box-sizing: border-box; }

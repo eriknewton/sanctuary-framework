@@ -108,8 +108,10 @@ describe("design-token mirrors reconcile with the canonical paper/ink constant",
     // subset assertion below would vacuously pass.
     expect(Object.keys(CANONICAL.light).length).toBeGreaterThan(30);
     expect(Object.keys(CANONICAL.dark).length).toBeGreaterThan(15);
-    expect(CANONICAL.light["--paper"]).toBe("#f7f5f0");
-    expect(CANONICAL.dark["--paper"]).toBe("#121210");
+    // The ratified 2026-10-12 console page grounds. Must match --paper in
+    // PAPER_INK_ROOT_TOKENS_CSS (server/src/dashboard/design-tokens.ts).
+    expect(CANONICAL.light["--paper"]).toBe("#f4f6fa");
+    expect(CANONICAL.dark["--paper"]).toBe("#0b0f17");
   });
 
   for (const relPath of MIRRORS) {
@@ -199,6 +201,55 @@ describe("semantic alias layer", () => {
     expect(CANONICAL.light["--slate"]).toBeDefined();
     expect(CANONICAL.dark["--slate"]).toBeDefined();
     expect(CANONICAL.dark["--slate"]).not.toBe(CANONICAL.light["--slate"]);
+  });
+
+  it("the reserved severity ramp and the chart pair are never a status alias", () => {
+    // The --sev-* ramp is validated as an ordered scale and the --chart-* pair
+    // as a categorical pair, each against the status hues. A status alias that
+    // borrowed one would put two meanings on one hue, and the validation that
+    // kept them distinguishable would no longer describe what renders.
+    const borrowed: string[] = [];
+    for (const [name, value] of Object.entries(CANONICAL.light)) {
+      if (!name.startsWith(ALIAS_PREFIX)) continue;
+      if (/^var\(--(sev|chart)-/.test(value)) borrowed.push(`${name} -> ${value}`);
+    }
+    expect(borrowed).toEqual([]);
+    // The locked status, like unknown, has a hue of its own in both themes.
+    expect(CANONICAL.light["--color-status-locked"]).toBe("var(--locked)");
+    expect(CANONICAL.dark["--locked"]).toBeDefined();
+    expect(CANONICAL.light["--locked"]).not.toBe(CANONICAL.light["--slate"]);
+    expect(CANONICAL.light["--locked"]).not.toBe(CANONICAL.light["--sage"]);
+  });
+
+  it("the design system's component alias block is not declared in the canonical block", () => {
+    // The ratified design ships a second alias layer (--bg, --text, --border,
+    // --font-*, --radius-*, --good/--bad/--warn/--unknown/--neutral ...) for
+    // its component previews. The legacy approval board and the pre-v1.1
+    // dashboard define --bg and --border themselves, so declaring that layer
+    // here would repaint them on any page that carries both blocks. It lands
+    // only after those boards are retired or renamed.
+    const DESIGN_ONLY_ALIASES = [
+      "--bg",
+      "--text",
+      "--text-2",
+      "--border",
+      "--border-2",
+      "--good",
+      "--warn",
+      "--bad",
+      "--unknown",
+      "--neutral",
+      "--font-sans",
+      "--font-display",
+      "--font-mono",
+      "--radius-md",
+      "--radius-xl",
+      "--space-tight",
+    ];
+    const declared = DESIGN_ONLY_ALIASES.filter(
+      (name) => name in CANONICAL.light || name in CANONICAL.dark,
+    );
+    expect(declared).toEqual([]);
   });
 
   it("aliases are declared once and are never redeclared in the dark block", () => {

@@ -20,6 +20,8 @@
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../dashboard/design-tokens.js";
 
 export { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../dashboard/design-tokens.js";
+/** The bundled console faces; each posture page interpolates this beside the tokens. */
+export { CONSOLE_FONT_FACE_CSS } from "../dashboard/design-fonts.js";
 
 /**
  * The agent Standing pill: the most-screenshotted honesty surface (#634).

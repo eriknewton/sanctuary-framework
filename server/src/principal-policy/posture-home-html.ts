@@ -34,6 +34,7 @@ import type { CustodyState } from "./posture.js";
 import {
   AGENT_PILL_FN_SOURCE,
   EVIDENCE_SPINE_CSS,
+  CONSOLE_FONT_FACE_CSS,
   POSTURE_ROOT_TOKENS_CSS,
   REL_TIME_FN_SOURCE,
   STATUS_PILL_CSS,
@@ -148,6 +149,7 @@ export function renderPostureHomeHTML(): string {
 <title>Sanctuary - Security Posture</title>
 <script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
+  ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {

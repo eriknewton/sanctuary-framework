@@ -20,6 +20,7 @@
 import { getClientScript } from "./client.js";
 import { SANCTUARY_VERSION } from "../../config.js";
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../design-fonts.js";
 
 export interface DashboardV11HtmlOptions {
   /** Bearer token for hub API auth, when not running loopback auto-auth. */
@@ -45,7 +46,8 @@ export interface DashboardV11HtmlOptions {
   embedClient?: boolean;
 }
 
-const STYLES = String.raw`${PAPER_INK_ROOT_TOKENS_CSS}
+const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
+${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
@@ -650,7 +652,7 @@ body {
   font-size: var(--text-md);
   outline: none;
 }
-.concierge-composer input::placeholder { color: var(--ink-4); }
+.concierge-composer input::placeholder { color: var(--ink-3); } /* --ink-4 is disabled labels only; a placeholder is read */
 .concierge-composer .composer-meta {
   font-family: var(--mono);
   font-size: 10px;
@@ -1189,8 +1191,7 @@ body {
   .nav-footer, .nav-group-label { display: none; }
   .topbar .idchip { display: none; }
   .template-grid { grid-template-columns: 1fr; }
-  .policy-center h1 { font-size: 30px; }
-  .intel-center h1 { font-size: 30px; }
+  /* center h1s keep --text-display (26px); a 30px override here would grow them. */
   .intel-row { grid-template-columns: 1fr; }
   .intel-grid { grid-template-columns: 1fr; }
   .intel-failure-row { grid-template-columns: 1fr; }
