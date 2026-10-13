@@ -19,7 +19,7 @@ import { isRecord, parseStrictJsonObject } from "./strict-json.js";
 export type PublicFrame =
   | { readonly kind: "hello"; readonly requestId: string; readonly protocolVersion: string; readonly clientName: string }
   | { readonly kind: "tools_list"; readonly requestId: string }
-  | { readonly kind: "tools_call"; readonly requestId: string; readonly name: HermesMemoryToolName; readonly arguments: HermesMemoryToolArguments }
+  | { readonly kind: "tools_call"; readonly requestId: string; readonly name: string; readonly arguments: HermesMemoryToolArguments }
   | { readonly kind: "cancel"; readonly mcpRequestId: string }
   | { readonly kind: "shutdown" };
 
@@ -332,7 +332,17 @@ function parseFrameEnvelope(envelope: Record<string, unknown>): RelayToNodeParse
 
 function parsePublicToolsCall(frame: Record<string, unknown>): PublicFrameParseResult {
   const name = frame.name as string;
-  if (!isHermesMemoryToolName(name)) return rejectPublic("invalid tool name", frame);
+  if (!isHermesMemoryToolName(name)) {
+    return {
+      kind: "ok",
+      frame: {
+        kind: "tools_call",
+        requestId: frame.request_id as string,
+        name,
+        arguments: frame.arguments as HermesMemoryToolArguments,
+      },
+    };
+  }
   const parsedArguments = parseToolArguments(name, frame.arguments as Record<string, unknown>);
   if (parsedArguments === null) return rejectPublic("invalid tool arguments", frame);
   return {

@@ -68,6 +68,8 @@ import {
 
 export type HermesTimerHandle = object;
 
+const BRIDGE_PINNED_MEMORY_TAINT: PersistableTaint = "user_content";
+
 export interface HermesApprovalPromptSummary {
   readonly entryId: string;
   readonly connectionId: string;
@@ -128,7 +130,6 @@ interface InsertSlot {
   readonly requestId: string;
   readonly text: string;
   readonly textSha256: string;
-  readonly taint: PersistableTaint;
   readonly tags: readonly string[];
   readonly passageId?: string;
   deadlineTimer?: HermesTimerHandle;
@@ -159,8 +160,17 @@ export class HermesBridgeCommitRefusedError extends Error {
 
 /**
  * Pure Hermes memory bridge integrator. It composes the wire, lifecycle,
- * probe-waiter, approval-ledger and slice-1 storage hook; it performs no fd,
+ * probe-waiter, approval-ledger and storage commit hook; it performs no fd,
  * child-process, startup, policy-gate or durable storage work itself.
+ *
+ * The bridge core calls the memory adapter directly rather than the router or
+ * CallToolRequestSchema path, so each tool has a local argument allowlist here.
+ * Continuing path: a read still quarantining at stop can leave a batch lock
+ * marker; the later bridge shell refuses readiness on that leftover marker.
+ * Storage residuals: kernel-backed locks are unreachable here, document-lock
+ * contention can only come from same-document quarantine, the hook keys on
+ * allow rather than backend error type, metadata abort cannot happen after lock
+ * acquisition, and the later shell builds exactly one bridge adapter.
  */
 export class HermesBridgeCore {
   private readonly lifecycle = new HermesConnectionLifecycle();
@@ -343,7 +353,9 @@ export class HermesBridgeCore {
     action: Extract<HermesLifecycleAction, { readonly type: "route_call" }>,
     parsed: PublicFrameParseResult | undefined,
   ): void {
-    const admission = this.callWindow.admit(this.ports.nowMs());
+    const nowMs = this.nowMsOrStop();
+    if (nowMs === undefined) return;
+    const admission = this.callWindow.admit(nowMs);
     if (!admission.allowed) {
       this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
       this.releaseRecord(action.recordId);
@@ -367,7 +379,7 @@ export class HermesBridgeCore {
     }
     switch (frame.name) {
       case "memory_get":
-        this.startRead(action, () => this.ports.adapter.getPassage((frame.arguments as { readonly passage_id: string }).passage_id));
+        this.startGet(action, frame.arguments);
         return;
       case "memory_search":
         this.startSearch(action, frame.arguments);
@@ -375,7 +387,24 @@ export class HermesBridgeCore {
       case "memory_insert":
         this.admitInsert(action, frame.arguments);
         return;
+      default:
+        this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+        this.releaseRecord(action.recordId);
+        return;
     }
+  }
+
+  private startGet(
+    action: Extract<HermesLifecycleAction, { readonly type: "route_call" }>,
+    args: HermesMemoryToolArguments,
+  ): void {
+    const passageId = normalizeGetArgs(args);
+    if (passageId === null) {
+      this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
+      this.releaseRecord(action.recordId);
+      return;
+    }
+    this.startRead(action, () => this.ports.adapter.getPassage(passageId));
   }
 
   private startRead(
@@ -383,7 +412,15 @@ export class HermesBridgeCore {
     run: () => Promise<MemoryPassage | null>,
   ): void {
     const operation: ReadOperation = { connectionId: action.connectionId, recordId: action.recordId, requestId: action.requestId };
-    run()
+    let readPromise: Promise<MemoryPassage | null>;
+    try {
+      readPromise = run();
+    } catch {
+      this.stop("write_failure");
+      this.endStep();
+      return;
+    }
+    readPromise
       .then((passage) => {
         this.writeResultOrDenial(
           operation.connectionId,
@@ -412,7 +449,15 @@ export class HermesBridgeCore {
       this.releaseRecord(operation.recordId);
       return;
     }
-    this.ports.adapter.searchPassages(query)
+    let searchPromise: Promise<readonly MemorySearchResult[]>;
+    try {
+      searchPromise = this.ports.adapter.searchPassages(query);
+    } catch {
+      this.stop("write_failure");
+      this.endStep();
+      return;
+    }
+    searchPromise
       .then((results) => {
         this.writeResultOrDenial(
           operation.connectionId,
@@ -449,7 +494,6 @@ export class HermesBridgeCore {
       requestId: action.requestId,
       text: insert.text,
       textSha256,
-      taint: insert.taint,
       tags: insert.tags,
       ...(insert.passageId === undefined ? {} : { passageId: insert.passageId }),
       durability: new Set(),
@@ -459,13 +503,10 @@ export class HermesBridgeCore {
       hookAllowed: false,
       released: false,
     };
-    const timer = this.ports.setTimer(HERMES_APPROVAL_DEADLINE_MS, () => this.fireApprovalDeadline(entryId));
-    slot.deadlineTimer = timer;
-    this.slot = slot;
-    const admitted = this.ledger.admit(entryId, action.connectionId, action.recordId, textSha256, this.ports.nowMs());
+    const nowMs = this.nowMsOrStop();
+    if (nowMs === undefined) return;
+    const admitted = this.ledger.admit(entryId, action.connectionId, action.recordId, textSha256, nowMs);
     if (admitted.refusal !== undefined) {
-      this.clearSlotTimers(slot);
-      this.slot = undefined;
       const message = admitted.refusal === "latched" || admitted.refusal === "stopped"
         ? HERMES_MEMORY_UNAVAILABLE
         : HERMES_MEMORY_DENIAL;
@@ -473,6 +514,10 @@ export class HermesBridgeCore {
       this.releaseRecord(action.recordId);
       return;
     }
+    this.slot = slot;
+    const timer = this.setTimerOrStop(HERMES_APPROVAL_DEADLINE_MS, () => this.fireApprovalDeadline(entryId));
+    if (timer === undefined) return;
+    slot.deadlineTimer = timer;
     this.performLedgerResult(admitted);
   }
 
@@ -496,12 +541,19 @@ export class HermesBridgeCore {
       text: slot.text,
       tags: slot.tags,
       ...(slot.passageId === undefined ? {} : { passage_id: slot.passageId }),
-      provenanceContext: memoryInsertIngress(() => undefined, slot.taint),
+      provenanceContext: memoryInsertIngress(() => undefined, BRIDGE_PINNED_MEMORY_TAINT),
     };
-    const insertPromise = this.asyncContext.run(
-      { entryId },
-      () => this.ports.adapter.insertPassage(input, slot.taint),
-    );
+    let insertPromise: Promise<MemoryPassage>;
+    try {
+      insertPromise = this.asyncContext.run(
+        { entryId },
+        () => this.ports.adapter.insertPassage(input, BRIDGE_PINNED_MEMORY_TAINT),
+      );
+    } catch (error) {
+      this.stop("write_failure");
+      this.finishInsert(slot, "threw", error);
+      return;
+    }
     insertPromise
       .then(() => this.finishInsert(slot, "committed"))
       .catch((error: unknown) => this.finishInsert(slot, "threw", error));
@@ -516,6 +568,7 @@ export class HermesBridgeCore {
         slot.successBytes = success.ok ? success.bytes : checkedError(slot.requestId, HERMES_MEMORY_UNAVAILABLE);
       }
     } else if (slot.hookAllowed) {
+      // Every throw after allow is indeterminate; this core never reports the storage layer's failed outcome.
       if (isPartialScopeError(error)) this.performLedgerResult(this.ledger.latch("partial_scope"));
       this.performLedgerResult(this.ledger.writeFinished(slot.entryId, "indeterminate"));
     }
@@ -536,11 +589,14 @@ export class HermesBridgeCore {
     }
     const entry = this.ledger.snapshot().entry;
     const record = this.recordSnapshot(slot.recordId);
+    // A bridge stop exits the lifecycle record, so the commit check records connection_gone rather than trusting a stale row.
     const recordCurrent = entry?.id === slot.entryId && record?.state === "IN_FLIGHT";
     // No await is allowed between this record snapshot and commitCheck; queued controls must already be reflected in ledger state.
+    const nowMs = this.nowMsOrStop();
+    if (nowMs === undefined) throw new HermesBridgeCommitRefusedError();
     const checked = this.ledger.commitCheck(slot.entryId, {
       probe: verdict,
-      nowMs: this.ports.nowMs(),
+      nowMs,
       recordCurrent,
       passageTextSha256: context.passageTextSha256,
       getFrameUtf8Bytes: context.getFrameUtf8Bytes + PUBLIC_RESULT_ENVELOPE_MAX_BYTES,
@@ -568,12 +624,14 @@ export class HermesBridgeCore {
         this.stop("write_failure");
         return "refused";
       }
-      slot.probeTimer = this.ports.setTimer(PROBE_REPLY_BOUND_MS, () => {
+      const probeTimer = this.setTimerOrStop(PROBE_REPLY_BOUND_MS, () => {
         if (this.slot?.entryId !== slot.entryId || slot.probeTimer === undefined) return;
         slot.probeTimer = undefined;
         this.performWaiterResult(this.waiter.timeout(slot.entryId, action.nonce));
         this.endStep();
       });
+      if (probeTimer === undefined) return "refused";
+      slot.probeTimer = probeTimer;
     }
     return slot.verdict ?? "pending";
   }
@@ -616,9 +674,11 @@ export class HermesBridgeCore {
   private deliverControl(action: Extract<HermesLifecycleAction, { readonly type: "deliver_control" }>): void {
     const entry = this.ledger.snapshot().entry;
     if (entry === undefined || entry.recordId !== action.recordId) return;
-    const result = action.control === "cancel"
-      ? this.ledger.cancel(entry.id)
-      : this.ledger.peerShutdown(entry.id);
+    if (action.control === "shutdown") {
+      this.notifyHookWaiters();
+      return;
+    }
+    const result = this.ledger.cancel(entry.id);
     this.performLedgerResult(result);
     this.notifyHookWaiters();
   }
@@ -722,8 +782,9 @@ export class HermesBridgeCore {
     const slot = this.slot;
     if (slot?.entryId !== action.entryRef) return;
     if (slot.probeTimer !== undefined) {
-      this.ports.clearTimer(slot.probeTimer);
+      const probeTimer = slot.probeTimer;
       slot.probeTimer = undefined;
+      this.clearTimerOrStop(probeTimer);
     }
     if (slot.verdict === undefined) {
       slot.verdict = action.kind === "resolved" ? "resolved" : "refused";
@@ -821,12 +882,43 @@ export class HermesBridgeCore {
 
   private clearSlotTimers(slot: InsertSlot): void {
     if (slot.deadlineTimer !== undefined) {
-      this.ports.clearTimer(slot.deadlineTimer);
+      const deadlineTimer = slot.deadlineTimer;
       slot.deadlineTimer = undefined;
+      this.clearTimerOrStop(deadlineTimer);
     }
     if (slot.probeTimer !== undefined) {
-      this.ports.clearTimer(slot.probeTimer);
+      const probeTimer = slot.probeTimer;
       slot.probeTimer = undefined;
+      this.clearTimerOrStop(probeTimer);
+    }
+  }
+
+  private nowMsOrStop(): number | undefined {
+    try {
+      return this.ports.nowMs();
+    } catch {
+      this.stop("write_failure");
+      this.endStep();
+      return undefined;
+    }
+  }
+
+  private setTimerOrStop(ms: number, fire: () => void): HermesTimerHandle | undefined {
+    try {
+      return this.ports.setTimer(ms, fire);
+    } catch {
+      this.stop("write_failure");
+      this.endStep();
+      return undefined;
+    }
+  }
+
+  private clearTimerOrStop(handle: HermesTimerHandle): void {
+    try {
+      this.ports.clearTimer(handle);
+    } catch {
+      this.stop("write_failure");
+      this.endStep();
     }
   }
 
@@ -886,7 +978,6 @@ function publicSummary(result: PublicFrameParseResult): HermesPublicFrameSummary
 
 function normalizeInsertArgs(args: HermesMemoryToolArguments): {
   readonly text: string;
-  readonly taint: PersistableTaint;
   readonly tags: readonly string[];
   readonly passageId?: string;
 } | null {
@@ -896,10 +987,14 @@ function normalizeInsertArgs(args: HermesMemoryToolArguments): {
   if (args.passage_id !== undefined && !isSdwIdentifier(args.passage_id)) return null;
   return {
     text: args.text,
-    taint: args.taint,
     tags: args.tags ?? [],
     ...(args.passage_id === undefined ? {} : { passageId: args.passage_id }),
   };
+}
+
+function normalizeGetArgs(args: HermesMemoryToolArguments): string | null {
+  if (!("passage_id" in args) || typeof args.passage_id !== "string") return null;
+  return isSdwIdentifier(args.passage_id) ? args.passage_id : null;
 }
 
 function normalizeSearchQuery(args: HermesMemoryToolArguments): MemorySearchQuery | null {
