@@ -1456,8 +1456,9 @@ body {
    that belongs to that slice, not to the value-only token swap. */
 .ambient-seal.tone-locked .as-glyph { color: var(--rust); }
 /* Unknown wears the unknown status hue at full weight, never the disabled
-   --ink-4: "no answer arrived" is a state a person must read, and the hollow
-   ring of the unknown pill tells it apart from the neutral gray. */
+   --ink-4: "no answer arrived" is a state a person must read. The seal glyph
+   is a ring plus a dot for every tone, so the word beside it, not the shape,
+   tells unknown apart from the neutral gray. */
 .ambient-seal.tone-unknown .as-glyph { color: var(--slate); }
 .ambient-seal .as-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .ambient-seal .as-glyph::after { content: ""; position: absolute; inset: 5px; background: currentColor; border-radius: 50%; opacity: 0.9; }

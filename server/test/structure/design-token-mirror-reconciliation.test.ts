@@ -242,6 +242,8 @@ describe("semantic alias layer", () => {
           .filter((n) => RESERVED.test(n))
           .map((n) => resolveLiteral(map, n)),
       );
+      // 7 = the five severity levels plus the two chart tokens; fewer means the
+      // reserved set was not read at all and the borrow check below is vacuous.
       expect(reserved.size).toBeGreaterThanOrEqual(7);
       const borrowed: string[] = [];
       for (const name of Object.keys(CANONICAL.light)) {
@@ -260,6 +262,11 @@ describe("semantic alias layer", () => {
     // The other status hues are read off the alias layer itself, so a status
     // added later joins the comparison without editing this test.
     expect(CANONICAL.light["--color-status-locked"]).toBe("var(--locked)");
+    // The dark block must declare --locked itself: the theme map falls back to
+    // the light value for an undeclared name, so without this line a deleted
+    // dark --locked would ship the light violet in dark mode and the collision
+    // check below would still pass (round-2 closure finding, PR #1596).
+    expect(CANONICAL.dark["--locked"]).toBeDefined();
     const STATUS_HUE = /^--color-status-[a-z]+$/;
     for (const block of ["light", "dark"] as const) {
       const map = themeMap(block);
@@ -267,6 +274,8 @@ describe("semantic alias layer", () => {
       const others = Object.keys(CANONICAL.light).filter(
         (n) => STATUS_HUE.test(n) && n !== "--color-status-locked",
       );
+      // 5 = the other status members (pass, attention, fault, neutral, unknown);
+      // fewer means the alias layer was not read and the collision check is vacuous.
       expect(others.length).toBeGreaterThanOrEqual(5);
       const collisions = others
         .filter((n) => resolveLiteral(map, n) === locked)

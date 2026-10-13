@@ -263,8 +263,9 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      color for want of a token. Five members are wired to .pill classes in
      STATUS_PILL_CSS in principal-policy/posture-html-shared.ts (green, amber,
      red, neutral, unknown). Locked is declared here for the shell restyle and
-     has no pill class or other consumer yet; the v1.1 locked seal still
-     paints the fault red until that slice.
+     has no consumer yet: the v1.1 .pill.tone-locked, .posture-seal.tone-locked
+     and .ambient-seal.tone-locked rules all still paint the fault red until
+     that slice.
 
      Every alias resolves to a physical token declared above, never to a
      literal. var() substitution is computed per element, and the dark palette
