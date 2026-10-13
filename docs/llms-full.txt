@@ -2,7 +2,7 @@
 
 > The root README's first screen with its Summary for agents, the "What is proven, and what is not" table, the Quickstart (install, verify, uninstall), the section for AI coding agents, the installation reference, the Castle Architecture, the harness list and Troubleshooting, as plain Markdown for agents. Nothing here says more than README.md says; when the two differ, README.md at the current commit wins.
 
-<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 0b374368 (branch docs/readme-mcp-routing-bound, main 5362575e plus PR #1590). The sections below are copied from README.md at that commit, with relative links made absolute; the short index is at https://sanctuaryprotocol.ai/llms.txt -->
+<!-- Generated 2026-10-12 from https://github.com/eriknewton/sanctuary-framework at commit 41aa243b (main, after PR #1590 merged; README.md is byte-identical to the 0b374368 branch commit it was first generated from). The sections below are copied from README.md at that commit, with relative links made absolute; the short index is at https://sanctuaryprotocol.ai/llms.txt -->
 
 **Your agent will know you better than you know yourself. Make sure that data stays between you.**
 
