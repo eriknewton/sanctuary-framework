@@ -46,6 +46,7 @@ interface Coverage {
   readonly auditOutcomes: Set<AuditOutcome>;
   readonly adapterOutcomes: Set<AdapterOutcome>;
   readonly interleavings: Set<"shutdown_while_lock_parked" | "shutdown_while_durability_wait">;
+  secondInsertAfterCommit: number;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -113,8 +114,6 @@ function responsePayload(input: NodeToRelayInput): Record<string, unknown> {
 async function runSchedule(seed: number): Promise<{ readonly violations: readonly string[]; readonly coverage: Coverage }> {
   const random = rng(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
-  const adapterOutcomeOrder: readonly AdapterOutcome[] = ["partial", "throw_after_allow", "success"];
-  let adapterOutcomeCursor = seed % adapterOutcomeOrder.length;
   const violations: string[] = [];
   const coverage: Coverage = {
     terminals: new Set(),
@@ -123,6 +122,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     auditOutcomes: new Set(),
     adapterOutcomes: new Set(),
     interleavings: new Set(),
+    secondInsertAfterCommit: 0,
   };
   const timers = new Map<HermesTimerHandle, { readonly ms: number; readonly fire: () => void; readonly entryId?: string }>();
   const store = new Map<string, MemoryPassage>();
@@ -284,8 +284,8 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
           passageTextSha256: hermesBridgePassageTextDigest(input.text),
           getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(inserted),
         });
-        const outcome = adapterOutcomeOrder[adapterOutcomeCursor]!;
-        adapterOutcomeCursor = (adapterOutcomeCursor + 1) % adapterOutcomeOrder.length;
+        const outcomeDraw = random();
+        const outcome: AdapterOutcome = outcomeDraw < 0.60 ? "success" : outcomeDraw < 0.80 ? "partial" : "throw_after_allow";
         coverage.adapterOutcomes.add(outcome);
         if (outcome === "partial") {
           throw new SdwValidationError("partial_scope", "partial");
@@ -293,6 +293,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         if (outcome === "throw_after_allow") {
           throw new Error("after allow");
         }
+        if (store.size > 0) coverage.secondInsertAfterCommit += 1;
         store.set(id, inserted);
         return inserted;
       },
@@ -508,6 +509,46 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (actions.length > 0) pick(actions)();
   };
 
+  const continueAfterCommit = async (): Promise<void> => {
+    if (store.size === 0 || stopped || core.snapshot().ledger.entry !== undefined) return;
+    const connectionId = `c${++nextConnection}`;
+    const requestId = `r${++nextRequest}`;
+    connections.set(connectionId, { id: connectionId, state: "open", answered: new Set() });
+    send({ kind: "accepted", connectionId });
+    const connection = connections.get(connectionId)!;
+    connection.state = "busy";
+    connection.requestId = requestId;
+    send(publicFrame(connectionId, {
+      type: "tools_call",
+      request_id: requestId,
+      name: "memory_insert",
+      arguments: { text: `bridge text ${seed} ${requestId}`, taint: "user_content", passage_id: `p-${seed}-${requestId}` },
+    }));
+    const entry = core.snapshot().ledger.entry;
+    if (entry === undefined) return;
+    entryRequests.set(entry.id, { connectionId, requestId });
+    await flush(4);
+    core.ownerApprove(entry.id, entry.textSha256);
+    observeStop();
+    for (let pass = 0; pass < 20; pass += 1) {
+      await flush(4);
+      for (const lock of locks) {
+        if (!lock.done) lock.resolve();
+      }
+      await flush(4);
+      while (probes.length > 0) {
+        const probe = probes.shift()!;
+        send({ kind: "probe_reply", connectionId: probe.connectionId, nonce: probe.nonce });
+        await flush(4);
+      }
+      for (const audit of audits) {
+        if (!audit.cell.done) audit.cell.resolve();
+      }
+      await flush(4);
+      if (core.snapshot().ledger.entry === undefined) break;
+    }
+  };
+
   for (let index = 0; index < MAX_STEPS_PER_SCHEDULE; index += 1) {
     await randomAwait();
     observeStop();
@@ -565,6 +606,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (!changed) break;
   }
 
+  await continueAfterCommit();
   await flush(30);
   for (const connection of connections.values()) {
     if (connection.state === "busy" && connection.requestId !== undefined && !stopped) {
@@ -616,6 +658,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
       auditOutcomes: new Set(),
       adapterOutcomes: new Set(),
       interleavings: new Set(),
+      secondInsertAfterCommit: 0,
     };
     const failures: string[] = [];
     for (let seed = 1; seed <= SCHEDULE_COUNT; seed += 1) {
@@ -626,6 +669,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
       for (const outcome of result.coverage.auditOutcomes) coverage.auditOutcomes.add(outcome);
       for (const outcome of result.coverage.adapterOutcomes) coverage.adapterOutcomes.add(outcome);
       for (const interleaving of result.coverage.interleavings) coverage.interleavings.add(interleaving);
+      coverage.secondInsertAfterCommit += result.coverage.secondInsertAfterCommit;
       if (result.violations.length > 0) failures.push(`seed ${seed}: ${result.violations.join(", ")}`);
     }
 
@@ -634,6 +678,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
     expect(coverage.stopCauses).toEqual(new Set(["relay_eof", "relay_fatal", "relay_shutdown", "write_failure"]));
     expect(coverage.auditOutcomes).toEqual(new Set(["deferred", "fulfilled", "rejected"]));
     expect(coverage.adapterOutcomes).toEqual(new Set(["partial", "success", "throw_after_allow"]));
+    expect(coverage.secondInsertAfterCommit).toBeGreaterThan(0);
     expect(coverage.dispatchRows).toEqual(new Set([
       "adapter_get",
       "adapter_insert",

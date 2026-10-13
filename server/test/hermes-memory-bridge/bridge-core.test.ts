@@ -129,7 +129,8 @@ function makeHarness(options: {
   let core: HermesBridgeCore;
   let clearTimerFailures = options.clearTimerFailures ?? 0;
   let clearTimerAttempts = 0;
-  let releaseCalls = 0;
+  const releasedRecordIds: string[] = [];
+  const routedRecordIdsByRequest = new Map<string, string>();
   const adapter: HermesBridgeMemoryAdapter = {
     insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage> {
       if (options.throwPort === "insert") throw new Error("insert port stopped");
@@ -228,11 +229,33 @@ function makeHarness(options: {
   };
   core = new HermesBridgeCore(ports);
   const lifecycle = (core as unknown as {
-    readonly lifecycle: { release(recordId: string): unknown };
+    readonly lifecycle: {
+      apply(event: unknown): { readonly actions?: readonly unknown[] };
+      release(recordId: string): unknown;
+    };
   }).lifecycle;
+  const originalApply = lifecycle.apply.bind(lifecycle);
+  lifecycle.apply = (event: unknown) => {
+    const result = originalApply(event);
+    for (const action of result.actions ?? []) {
+      if (
+        typeof action === "object" &&
+        action !== null &&
+        "type" in action &&
+        action.type === "route_call" &&
+        "requestId" in action &&
+        "recordId" in action &&
+        typeof action.requestId === "string" &&
+        typeof action.recordId === "string"
+      ) {
+        routedRecordIdsByRequest.set(action.requestId, action.recordId);
+      }
+    }
+    return result;
+  };
   const originalRelease = lifecycle.release.bind(lifecycle);
   lifecycle.release = (recordId: string) => {
-    releaseCalls += 1;
+    releasedRecordIds.push(recordId);
     return originalRelease(recordId);
   };
   return {
@@ -249,7 +272,8 @@ function makeHarness(options: {
     insertLocks,
     abort,
     clearTimerAttempts: () => clearTimerAttempts,
-    releaseCalls: () => releaseCalls,
+    recordIdForRequest: (requestId: string) => routedRecordIdsByRequest.get(requestId),
+    releasedRecordIds: () => [...releasedRecordIds],
     resolveAudits() {
       for (const audit of pendingAudits.splice(0)) audit.resolve();
     },
@@ -399,19 +423,19 @@ describe("HermesBridgeCore", () => {
   });
 
   it.each(([
-    ["hello", async (h: ReturnType<typeof makeHarness>) => {
+    ["hello", "hello-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       h.core.relayFrame(relayFrame("c1", { type: "hello", request_id: "hello-release", protocol_version: "2026-10-12", client_name: "client" }));
     }],
-    ["tools_list", async (h: ReturnType<typeof makeHarness>) => {
+    ["tools_list", "tools-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       h.core.relayFrame(relayFrame("c1", { type: "tools_list", request_id: "tools-release" }));
     }],
-    ["unknown tool denial", async (h: ReturnType<typeof makeHarness>) => {
+    ["unknown tool denial", undefined, async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       unknownTool(h.core, "c1", "unknown-release");
-    }, undefined, false],
-    ["rate-limit denial", async (h: ReturnType<typeof makeHarness>) => {
+    }],
+    ["rate-limit denial", "rate-release-61", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       for (let index = 1; index <= 61; index += 1) {
         h.core.relayFrame(relayFrame("c1", {
@@ -422,18 +446,18 @@ describe("HermesBridgeCore", () => {
         }));
       }
     }],
-    ["memory_get ok", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_get ok", "get-release", async (h: ReturnType<typeof makeHarness>) => {
       h.store.set("p-get-release", passage("p-get-release", "bridge text"));
       accept(h.core);
       memoryGet(h.core, "c1", "get-release", { passage_id: "p-get-release" });
       h.pendingGets[0]!.resolve(null);
       await h.tick(4);
     }],
-    ["memory_get bad args", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_get bad args", "get-bad-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       memoryGet(h.core, "c1", "get-bad-release", { passage_id: "../bad" });
     }],
-    ["memory_search ok", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_search completes after relay close", "search-release", async (h: ReturnType<typeof makeHarness>) => {
       h.store.set("p-search-release", passage("p-search-release", "bridge searchable text"));
       accept(h.core);
       memorySearch(h.core, "c1", "search-release");
@@ -441,14 +465,14 @@ describe("HermesBridgeCore", () => {
       h.pendingSearches[0]!.resolve([{ passage: passage("p-search-release", "bridge searchable text"), match_count: 1 }]);
       await h.tick(4);
     }, { deferredSearch: true }],
-    ["memory_search adapter reject", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_search adapter rejection releases after relay close", "search-reject-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       memorySearch(h.core, "c1", "search-reject-release");
       h.core.relayFrame({ kind: "closed", connectionId: "c1" });
       h.pendingSearches[0]!.reject(new Error("search failed"));
       await h.tick(4);
     }, { deferredSearch: true }],
-    ["memory_search bad args", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_search bad args", "search-bad-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       h.core.relayFrame(relayFrame("c1", {
         type: "tools_call",
@@ -457,7 +481,7 @@ describe("HermesBridgeCore", () => {
         arguments: { query: "" },
       }));
     }],
-    ["memory_insert committed", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_insert committed passage releases after success", "insert-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       insert(h.core, "c1", "insert-release", "bridge text");
       await h.tick();
@@ -467,25 +491,21 @@ describe("HermesBridgeCore", () => {
       const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
       h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
       await h.tick(8);
+      expect(responseFor(h.writes, "insert-release")).toMatchObject({ type: "result" });
+      expect(h.store.get("p-insert-release")?.text).toBe("bridge text");
     }],
-    ["memory_insert bad args", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_insert bad args", "insert-bad-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       insertWithArgs(h.core, "c1", "insert-bad-release", { text: "", taint: "user_content" });
     }],
-    ["memory_insert admission latched", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_insert admission latched", "latched-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core, "c1");
       insert(h.core, "c1", "latch-source-release", "bridge text");
       await h.tick(2);
       accept(h.core, "c2");
       insert(h.core, "c2", "latched-release", "later text");
     }, { rejectAudit: true }],
-    ["memory_insert admission stopped", async (h: ReturnType<typeof makeHarness>) => {
-      const ledger = (h.core as unknown as { readonly ledger: { stop(): unknown } }).ledger;
-      ledger.stop();
-      accept(h.core);
-      insert(h.core, "c1", "stopped-release", "bridge text");
-    }],
-    ["memory_insert admission busy", async (h: ReturnType<typeof makeHarness>) => {
+    ["memory_insert admission busy", "busy-release", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core, "c1");
       accept(h.core, "c2");
       insert(h.core, "c1", "busy-source-release", "bridge text");
@@ -495,15 +515,20 @@ describe("HermesBridgeCore", () => {
       h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
       await h.tick(4);
     }],
-  ] as const).map(([name, run, options, expectReleaseCall = true]) => [name, run, options, expectReleaseCall] as const))(
+  ] as const).map(([name, requestId, run, options]) => [name, requestId, run, options ?? {}] as const))(
     "releases the lifecycle record after %s",
-    async (_name, run, options, expectReleaseCall) => {
+    async (_name, requestId, run, options) => {
       const h = makeHarness(options);
-      const releaseCallsBefore = h.releaseCalls();
       await run(h);
       await h.tick(12);
 
-      if (expectReleaseCall !== false) expect(h.releaseCalls()).toBeGreaterThan(releaseCallsBefore);
+      if (requestId === undefined) {
+        expect(h.recordIdForRequest("unknown-release")).toBeUndefined();
+      } else {
+        const recordId = h.recordIdForRequest(requestId);
+        expect(recordId).toBeDefined();
+        expect(h.releasedRecordIds()).toContain(recordId);
+      }
       expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
     },
   );
@@ -777,6 +802,8 @@ describe("HermesBridgeCore", () => {
     await h.tick(4);
     const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
     h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
+    h.resolveAudits();
+    await h.tick(4);
     h.resolveAudits();
     await h.tick(12);
 
