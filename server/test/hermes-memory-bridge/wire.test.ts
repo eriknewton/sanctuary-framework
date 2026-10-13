@@ -10,6 +10,7 @@ import {
   MAX_PRIVATE_FRAME_BYTES,
   MAX_PUBLIC_FRAME_BYTES,
   MAX_RESULT_FRAME_BYTES,
+  PrivateFrameError,
   PrivateFrameDecoder,
   buildDeniedPublicResponseBytes,
   decodeStandardBase64,
@@ -20,6 +21,7 @@ import {
   parseStrictJsonObject,
 } from "../../src/hermes-memory-bridge/index.js";
 import type {
+  NodeToRelayInput,
   PublicFrameParseResult,
 } from "../../src/hermes-memory-bridge/index.js";
 import { HERMES_MEMORY_WIRE_STATE_DEPENDENT_VECTORS } from "./fixture-state-vectors.js";
@@ -31,10 +33,16 @@ type FixtureEntry = {
   readonly frame?: Record<string, unknown>;
   readonly expected_action: string;
   readonly bytes_hex?: string;
+  readonly then_bytes_hex?: string;
 };
 
 type FixtureSurface = "publicOrClient" | "nodeToRelay" | "relayToNode";
 type PublicExpectedAction = "accept" | "poison_connection";
+type FixtureAssertionContext = {
+  readonly section: string;
+  consume: () => void;
+};
+type FixtureAssertion = (vector: FixtureEntry, context: FixtureAssertionContext) => void;
 type PublicStreamTail =
   | { readonly kind: "none" }
   | { readonly kind: "over_cap"; readonly length: number; readonly remainingBytes: number }
@@ -143,14 +151,6 @@ function innerResultBytes(vectorName: string): Uint8Array {
   return Buffer.from(envelope.result_b64, "base64");
 }
 
-function privateEnvelope(vectorName: string): Record<string, unknown> {
-  const vector = findFixtureVector(vectorName);
-  const frames = collectFrames(privateBytesForFixture(vector));
-  const first = frames[0];
-  if (first === undefined || first === "fatal") throw new Error(`fixture vector has no private envelope: ${vectorName}`);
-  return parseBody(first);
-}
-
 function findFixtureVector(name: string): FixtureEntry {
   for (const section of Object.values(relayFixture)) {
     const found = section.find((entry) => entry.name === name);
@@ -170,6 +170,10 @@ function fixtureTotal(): number {
   return Object.values(relayFixture).reduce((total, section) => total + section.length, 0);
 }
 
+function fixtureSections(): ReadonlyArray<readonly [string, readonly FixtureEntry[]]> {
+  return Object.entries(relayFixture);
+}
+
 function fixtureSurface(entry: FixtureEntry): FixtureSurface {
   if (entry.direction === "relayToNode" || entry.channel === "relay_to_node") return "relayToNode";
   if (entry.direction === "nodeToRelay" || entry.channel === "node_to_relay") return "nodeToRelay";
@@ -185,22 +189,6 @@ function relayToNodeVectors(): readonly FixtureEntry[] {
 
 function nodeToRelayVectors(): readonly FixtureEntry[] {
   return allFixtureEntries().filter((entry) => fixtureSurface(entry) === "nodeToRelay");
-}
-
-function publicOrClientVectors(): readonly FixtureEntry[] {
-  return allFixtureEntries().filter((entry) => fixtureSurface(entry) === "publicOrClient");
-}
-
-function publicInboundVectors(): readonly FixtureEntry[] {
-  return publicOrClientVectors().filter((entry) => entry.direction === "publicInbound");
-}
-
-function clientOutboundVectors(): readonly FixtureEntry[] {
-  return publicOrClientVectors().filter((entry) => entry.direction === "clientOutbound");
-}
-
-function publicStreamVectors(): readonly FixtureEntry[] {
-  return publicOrClientVectors().filter((entry) => entry.channel === "public");
 }
 
 function stateDependentNames(): readonly string[] {
@@ -239,24 +227,37 @@ function expectedRelayFrameFromBody(body: Uint8Array): Record<string, unknown> {
 }
 
 function publicActionFromNodeResult(result: PublicFrameParseResult): PublicExpectedAction {
-  if (result.kind === "ok") {
-    switch (result.frame.kind) {
-      case "hello":
-      case "tools_list":
-      case "tools_call":
-      case "cancel":
-      case "shutdown":
-        return "accept";
+  switch (result.kind) {
+    case "ok":
+      switch (result.frame.kind) {
+        case "hello":
+        case "tools_list":
+        case "tools_call":
+        case "cancel":
+        case "shutdown":
+          return "accept";
+        default: {
+          const unreachable: never = result.frame;
+          throw new Error(`unhandled public frame kind: ${JSON.stringify(unreachable)}`);
+        }
+      }
+    case "public_rejection":
+      switch (result.disposition) {
+        case "deny":
+        case "close":
+          return "poison_connection";
+        case "silent":
+          // The relay answers ping itself, so Node's silent ping result is the fixture's accepted public behavior.
+          return result.frameType === "ping" ? "accept" : "poison_connection";
+        default: {
+          const unreachable: never = result.disposition;
+          throw new Error(`unhandled public disposition: ${String(unreachable)}`);
+        }
+      }
+    default: {
+      const unreachable: never = result;
+      throw new Error(`unhandled public parse result: ${JSON.stringify(unreachable)}`);
     }
-  }
-
-  switch (result.disposition) {
-    case "deny":
-    case "close":
-      return "poison_connection";
-    case "silent":
-      // The relay answers ping itself, so Node's silent ping result is the fixture's accepted public behavior.
-      return result.frameType === "ping" ? "accept" : "poison_connection";
   }
 }
 
@@ -307,271 +308,389 @@ function expectFixedDenialPayload(requestId: string, payload: Uint8Array, label:
   });
 }
 
+function expectExactlyOnePrivateBody(vector: FixtureEntry, bytes = privateBytesForFixture(vector)): Uint8Array {
+  const frames = collectFrames(bytes);
+  expect(frames, vector.name).toHaveLength(1);
+  const body = frames[0];
+  expect(body, vector.name).not.toBe("fatal");
+  if (body === undefined || body === "fatal") throw new Error(`fixture vector did not decode to one private body: ${vector.name}`);
+  return body;
+}
+
+function expectEncodedPrivateFrameMatches(vector: FixtureEntry, input: NodeToRelayInput, body: Uint8Array): Buffer {
+  const encoded = encodeNodeToRelay(input);
+  const encodedBodies = collectFrames(encoded);
+  expect(encodedBodies, vector.name).toHaveLength(1);
+  expect(encodedBodies[0], vector.name).not.toBe("fatal");
+  expect(parsePayload(encoded), vector.name).toEqual(parseBody(body));
+  return encoded;
+}
+
+function nodeToRelayInputFromEnvelope(envelope: Record<string, unknown>): NodeToRelayInput | undefined {
+  switch (envelope.type) {
+    case "ready":
+      return { type: "ready" };
+    case "probe":
+      return {
+        type: "probe",
+        connectionId: envelope.connection_id as string,
+        nonce: envelope.nonce as string,
+      };
+    case "close":
+      return { type: "close", connectionId: envelope.connection_id as string };
+    case "response":
+      if (typeof envelope.result_b64 !== "string") return undefined;
+      return {
+        type: "response",
+        connectionId: envelope.connection_id as string,
+        requestId: envelope.request_id as string,
+        publicPayloadBytes: Buffer.from(envelope.result_b64, "base64"),
+      };
+    default:
+      return undefined;
+  }
+}
+
+function expectRelayToNodeAccepted(vector: FixtureEntry): void {
+  expect(fixtureSurface(vector), vector.name).toBe("relayToNode");
+  const frames = collectFrames(privateBytesForFixture(vector));
+  expect(frames.length, vector.name).toBeGreaterThan(0);
+  for (const frame of frames) {
+    expect(frame, vector.name).not.toBe("fatal");
+    if (frame === "fatal") continue;
+    const parsed = parseRelayToNode(frame);
+    expect(parsed.kind, vector.name).toBe("ok");
+    if (parsed.kind === "ok") expect(parsed.frame, vector.name).toEqual(expectedRelayFrameFromBody(frame));
+  }
+}
+
+function expectRelayToNodeFatal(vector: FixtureEntry): void {
+  expect(fixtureSurface(vector), vector.name).toBe("relayToNode");
+  const frames = collectFrames(privateBytesForFixture(vector));
+  if (frames.length === 1 && frames[0] === "fatal") {
+    expect(frames, vector.name).toEqual(["fatal"]);
+    return;
+  }
+  expect(frames.length, vector.name).toBeGreaterThan(0);
+  for (const frame of frames) {
+    expect(frame, vector.name).not.toBe("fatal");
+    if (frame === "fatal") continue;
+    const parsed = parseRelayToNode(frame);
+    if (isStateDependent(vector.name)) {
+      expect(parsed.kind, vector.name).toBe("ok");
+    } else {
+      expect(parsed.kind, vector.name).toBe("fatal");
+    }
+  }
+}
+
+function expectValidPublicInbound(vector: FixtureEntry): void {
+  expect(vector.direction, vector.name).toBe("publicInbound");
+  if (vector.frame === undefined) throw new Error(`fixture public frame missing: ${vector.name}`);
+  expect(publicActionFromNodeResult(parsePublicFrame(jsonBytes(vector.frame))), vector.name).toBe("accept");
+}
+
+function expectPoisonedPublicInbound(vector: FixtureEntry): void {
+  expect(vector.direction, vector.name).toBe("publicInbound");
+  if (vector.frame === undefined) throw new Error(`fixture public frame missing: ${vector.name}`);
+  expect(publicActionFromNodeResult(parsePublicFrame(jsonBytes(vector.frame))), vector.name).toBe("poison_connection");
+}
+
+function expectValidClientOutbound(vector: FixtureEntry): void {
+  expect(vector.direction, vector.name).toBe("clientOutbound");
+  if (vector.frame === undefined) throw new Error(`fixture client frame missing: ${vector.name}`);
+  const requestId = typeof vector.frame.request_id === "string" && vector.frame.request_id.length > 0
+    ? vector.frame.request_id
+    : "mcp-1";
+  const rawPublicBytes = rawFixtureFrameBytes(vector.name);
+  const encodedPayload = encodedResponsePayloadBytes(requestId, rawPublicBytes);
+  if (vector.frame.type === "pong") {
+    // Pong is relay-owned client output; Node's response encoder must not forward it as a public result.
+    expectFixedDenialPayload(requestId, encodedPayload, vector.name);
+    return;
+  }
+  expect(encodedPayload.equals(Buffer.from(rawPublicBytes)), vector.name).toBe(true);
+}
+
+function expectValidNodeToRelay(vector: FixtureEntry): void {
+  expect(fixtureSurface(vector), vector.name).toBe("nodeToRelay");
+  const body = expectExactlyOnePrivateBody(vector);
+  const input = nodeToRelayInputFromEnvelope(parseBody(body));
+  expect(input, vector.name).toBeDefined();
+  if (input === undefined) return;
+  expectEncodedPrivateFrameMatches(vector, input, body);
+}
+
+function assertValidAccept(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  switch (fixtureSurface(vector)) {
+    case "publicOrClient":
+      if (vector.direction === "publicInbound") expectValidPublicInbound(vector);
+      else expectValidClientOutbound(vector);
+      break;
+    case "nodeToRelay":
+      expectValidNodeToRelay(vector);
+      break;
+    case "relayToNode":
+      expectRelayToNodeAccepted(vector);
+      break;
+  }
+  context.consume();
+}
+
+function assertPublicPoison(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expectPoisonedPublicInbound(vector);
+  context.consume();
+}
+
+function assertNodeToRelayFatal(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expect(fixtureSurface(vector), vector.name).toBe("nodeToRelay");
+  const bytes = privateBytesForFixture(vector);
+  const frames = collectFrames(bytes);
+  if (frames.length === 1 && frames[0] === "fatal") {
+    const length = bytes.readUInt32BE(0);
+    expect(length, vector.name).toBeGreaterThan(MAX_PRIVATE_FRAME_BYTES);
+    expect(() => encodePrivateFrame(Buffer.alloc(length, 0x61)), vector.name).toThrow(PrivateFrameError);
+    expect(() => encodePrivateFrame(Buffer.alloc(length, 0x61)), vector.name).toThrow(/cap/u);
+    context.consume();
+    return;
+  }
+
+  const body = expectExactlyOnePrivateBody(vector, bytes);
+  const envelope = parseBody(body);
+  const input = nodeToRelayInputFromEnvelope(envelope);
+  if (input === undefined) {
+    expect(schemaTypeKeys(HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay), vector.name).not.toContain(String(envelope.type));
+    context.consume();
+    return;
+  }
+
+  expect(envelope.type, vector.name).not.toBe("response");
+  const encoded = encodeNodeToRelay(input);
+  expect(collectFrames(encoded), vector.name).toHaveLength(1);
+  expect(parsePayload(encoded), vector.name).not.toEqual(envelope);
+  expect(Object.keys(parsePayload(encoded)).filter((key) => !allowedSchemaKeys(String(envelope.type))?.has(key)), vector.name)
+    .toEqual([]);
+  context.consume();
+}
+
+function assertNodeToRelayDeny(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expect(fixtureSurface(vector), vector.name).toBe("nodeToRelay");
+  const body = expectExactlyOnePrivateBody(vector);
+  const envelope = parseBody(body);
+  expect(envelope.type, vector.name).toBe("response");
+  const input = nodeToRelayInputFromEnvelope(envelope);
+  expect(input, vector.name).toBeDefined();
+  if (input === undefined) return;
+  const encoded = encodeNodeToRelay(input);
+  expect(collectFrames(encoded), vector.name).toHaveLength(1);
+  expect(encoded.equals(Buffer.from(privateBytesForFixture(vector))), vector.name).toBe(false);
+  const encodedEnvelope = parsePayload(encoded);
+  const originalBase64 = envelope.result_b64;
+  const encodedBase64 = encodedEnvelope.result_b64;
+  expect(typeof encodedBase64, vector.name).toBe("string");
+  if (typeof encodedBase64 === "string" && encodedBase64 !== originalBase64) {
+    const decoded = Buffer.from(encodedBase64, "base64");
+    const parsed = JSON.parse(decoded.toString("utf8")) as Record<string, unknown>;
+    const normalizedOnly = typeof originalBase64 === "string" && decodeStandardBase64(originalBase64) === null;
+    if (!normalizedOnly) {
+      expect(parsed, vector.name).toEqual({
+        type: "error",
+        request_id: envelope.request_id,
+        message: HERMES_MEMORY_DENIAL,
+      });
+    }
+  }
+  context.consume();
+}
+
+function assertNodeToRelayForward(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expect(fixtureSurface(vector), vector.name).toBe("nodeToRelay");
+  const body = expectExactlyOnePrivateBody(vector);
+  const envelope = parseBody(body);
+  expect(envelope.type, vector.name).toBe("response");
+  const input = nodeToRelayInputFromEnvelope(envelope);
+  expect(input, vector.name).toBeDefined();
+  if (input !== undefined) expectEncodedPrivateFrameMatches(vector, input, body);
+  context.consume();
+}
+
+function assertCloseThenLateResponseDiscarded(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expect(fixtureSurface(vector), vector.name).toBe("nodeToRelay");
+  const firstBody = expectExactlyOnePrivateBody(vector);
+  const firstEnvelope = parseBody(firstBody);
+  expect(firstEnvelope.type, vector.name).toBe("close");
+  const firstInput = nodeToRelayInputFromEnvelope(firstEnvelope);
+  expect(firstInput, vector.name).toBeDefined();
+  if (firstInput !== undefined) expectEncodedPrivateFrameMatches(vector, firstInput, firstBody);
+  expect(vector.then_bytes_hex, vector.name).toEqual(expect.any(String));
+  const thenBody = expectExactlyOnePrivateBody(vector, Buffer.from(vector.then_bytes_hex ?? "", "hex"));
+  const thenEnvelope = parseBody(thenBody);
+  expect(thenEnvelope.type, vector.name).toBe("response");
+  const thenInput = nodeToRelayInputFromEnvelope(thenEnvelope);
+  expect(thenInput, vector.name).toBeDefined();
+  if (thenInput !== undefined) expectEncodedPrivateFrameMatches(vector, thenInput, thenBody);
+  context.consume();
+}
+
+function publicStreamRead(vector: FixtureEntry): PublicStreamRead {
+  expect(vector.frame, vector.name).toBeUndefined();
+  expect(vector.bytes_hex, vector.name).toEqual(expect.any(String));
+  return readPublicLengthPrefixedFrames(privateBytesForFixture(vector));
+}
+
+function expectCompletePublicFrameActions(vector: FixtureEntry, frames: readonly PublicStreamFrame[]): readonly PublicExpectedAction[] {
+  return frames.map((frame, index) => {
+    const action = publicActionFromNodeResult(parsePublicFrame(frame.payload));
+    expect(action, `${vector.name} frame ${index}`).toMatch(/^(accept|poison_connection)$/u);
+    return action;
+  });
+}
+
+function assertPublicRejectBeforePayloadAllocation(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  expect(decoded.frames, vector.name).toHaveLength(0);
+  expect(decoded.tail, vector.name).toEqual({ kind: "over_cap", length: MAX_PUBLIC_FRAME_BYTES + 1, remainingBytes: 0 });
+  context.consume();
+}
+
+function assertPublicRetainUntilProbeThenClosed(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  expect(decoded.frames, vector.name).toHaveLength(0);
+  expect(decoded.tail, vector.name).toEqual({ kind: "partial_payload", length: 32, payloadBytes: 0 });
+  context.consume();
+}
+
+function assertPublicDecodeAllCompleteFrames(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  const frameBodyBytes = 48 * 1_024;
+  expect(decoded.frames.map((frame) => frame.length), vector.name).toEqual([frameBodyBytes, frameBodyBytes]);
+  expect(decoded.tail, vector.name).toEqual({ kind: "none" });
+  expect(expectCompletePublicFrameActions(vector, decoded.frames), vector.name).toEqual(["accept", "accept"]);
+  context.consume();
+}
+
+function assertPublicDecodePrefixKeepPartialTail(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  expect(decoded.frames.map((frame) => frame.length), vector.name).toEqual([MAX_PUBLIC_FRAME_BYTES]);
+  expect(decoded.tail, vector.name).toEqual({
+    kind: "partial_payload",
+    length: MAX_PUBLIC_FRAME_BYTES,
+    payloadBytes: LENGTH_PREFIX_BYTES,
+  });
+  expect(expectCompletePublicFrameActions(vector, decoded.frames), vector.name).toEqual(["accept"]);
+  context.consume();
+}
+
+function assertPublicStreamPoisonConnection(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  expect(decoded.frames, vector.name).toHaveLength(1);
+  expect(decoded.tail, vector.name).toEqual({ kind: "none" });
+  expect(expectCompletePublicFrameActions(vector, decoded.frames), vector.name).toEqual(["poison_connection"]);
+  expect(decoded.frames[0]?.payload.toString("utf8").includes("\"arguments\""), vector.name).toBe(false);
+  context.consume();
+}
+
+function assertPublicDecodeOneFrame(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  const decoded = publicStreamRead(vector);
+  expect(decoded.frames, vector.name).toHaveLength(1);
+  expect(decoded.tail, vector.name).toEqual({ kind: "none" });
+  const actions = expectCompletePublicFrameActions(vector, decoded.frames);
+  expect(actions[0], vector.name).toMatch(/^(accept|poison_connection)$/u);
+  if (actions[0] === "poison_connection") {
+    expect(decoded.frames[0]?.payload.toString("utf8").includes("\"arguments\""), vector.name).toBe(true);
+  }
+  context.consume();
+}
+
+function assertStreamRelayAccept(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expectRelayToNodeAccepted(vector);
+  context.consume();
+}
+
+function assertRelayDiscardLateProbeReply(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expect(fixtureSurface(vector), vector.name).toBe("relayToNode");
+  const frames = collectFrames(privateBytesForFixture(vector));
+  expect(frames.length, vector.name).toBeGreaterThan(0);
+  for (const frame of frames) {
+    expect(frame, vector.name).not.toBe("fatal");
+    if (frame === "fatal") continue;
+    const parsed = parseRelayToNode(frame);
+    expect(parsed.kind, vector.name).toBe("ok");
+    if (parsed.kind === "ok") {
+      expect(["closed", "probe_reply"], vector.name).toContain(parsed.frame.kind);
+    }
+  }
+  context.consume();
+}
+
+function assertRelayFatalBridge(vector: FixtureEntry, context: FixtureAssertionContext): void {
+  expectRelayToNodeFatal(vector);
+  context.consume();
+}
+
+const fixtureDispatch = {
+  valid: {
+    accept: assertValidAccept,
+  },
+  malformed: {
+    poison_connection: assertPublicPoison,
+    fatal_relay_error: assertNodeToRelayFatal,
+  },
+  wrong_allowlist: {
+    poison_connection: assertPublicPoison,
+    fatal_relay_error: assertNodeToRelayFatal,
+    fatal_bridge: assertRelayFatalBridge,
+  },
+  stream_cases: {
+    reject_before_payload_allocation: assertPublicRejectBeforePayloadAllocation,
+    retain_until_probe_then_closed: assertPublicRetainUntilProbeThenClosed,
+    decode_all_complete_frames: assertPublicDecodeAllCompleteFrames,
+    decode_prefix_keep_partial_tail: assertPublicDecodePrefixKeepPartialTail,
+    poison_connection: assertPublicStreamPoisonConnection,
+    decode_one_frame: assertPublicDecodeOneFrame,
+    decode_response_and_forward: assertNodeToRelayForward,
+    decode_response_and_deny: assertNodeToRelayDeny,
+    close_then_late_response_discarded: assertCloseThenLateResponseDiscarded,
+    fatal_relay_error: assertNodeToRelayFatal,
+    accept: assertStreamRelayAccept,
+    discard_late_probe_reply: assertRelayDiscardLateProbeReply,
+    fatal_bridge: assertRelayFatalBridge,
+  },
+} satisfies Readonly<Record<string, Readonly<Record<string, FixtureAssertion>>>>;
+
+function dispatchFixtureVector(section: string, vector: FixtureEntry, consume: () => void): void {
+  const sectionDispatch = fixtureDispatch[section as keyof typeof fixtureDispatch];
+  expect(sectionDispatch, section).toBeDefined();
+  if (sectionDispatch === undefined) return;
+  const assertion = sectionDispatch[vector.expected_action as keyof typeof sectionDispatch];
+  expect(assertion, `${section}:${vector.name}`).toBeDefined();
+  if (assertion === undefined) return;
+  (assertion as FixtureAssertion)(vector, { section, consume });
+}
+
+function assertFixtureVectors(filter: (entry: FixtureEntry) => boolean = () => true): number {
+  let consumed = 0;
+  for (const [section, vectors] of fixtureSections()) {
+    for (const vector of vectors) {
+      if (!filter(vector)) continue;
+      dispatchFixtureVector(section, vector, () => {
+        consumed += 1;
+      });
+    }
+  }
+  return consumed;
+}
+
 function assertRelayToNodeFixtureVectors(): number {
-  let consumed = 0;
-  for (const vector of relayToNodeVectors()) {
-    consumed += 1;
-    const frames = collectFrames(privateBytesForFixture(vector));
-    if (frames.length === 1 && frames[0] === "fatal") {
-      expect(vector.expected_action, vector.name).toBe("fatal_bridge");
-      expect(frames, vector.name).toEqual(["fatal"]);
-      continue;
-    }
-    expect(frames.length, vector.name).toBeGreaterThan(0);
-    for (const frame of frames) {
-      expect(frame, vector.name).not.toBe("fatal");
-      if (frame === "fatal") continue;
-      const parsed = parseRelayToNode(frame);
-      if (vector.expected_action === "fatal_bridge" && !isStateDependent(vector.name)) {
-        expect(parsed.kind, vector.name).toBe("fatal");
-      } else {
-        expect(parsed.kind, vector.name).toBe("ok");
-        if (parsed.kind === "ok") expect(parsed.frame, vector.name).toEqual(expectedRelayFrameFromBody(frame));
-      }
-    }
-  }
-  return consumed;
+  return assertFixtureVectors((entry) => fixtureSurface(entry) === "relayToNode");
 }
 
-function assertPublicInboundFixtureVectors(): number {
-  let consumed = 0;
-  for (const vector of publicInboundVectors()) {
-    if (vector.frame === undefined) throw new Error(`fixture public frame missing: ${vector.name}`);
-    const parsed = parsePublicFrame(jsonBytes(vector.frame));
-    expect(publicActionFromNodeResult(parsed), vector.name).toBe(vector.expected_action);
-    consumed += 1;
-  }
-  return consumed;
-}
-
-function assertClientOutboundFixtureVectors(): number {
-  let consumed = 0;
-  for (const vector of clientOutboundVectors()) {
-    if (vector.frame === undefined) throw new Error(`fixture client frame missing: ${vector.name}`);
-    const requestId = typeof vector.frame.request_id === "string" && vector.frame.request_id.length > 0
-      ? vector.frame.request_id
-      : "mcp-1";
-    const rawPublicBytes = rawFixtureFrameBytes(vector.name);
-    const encodedPayload = encodedResponsePayloadBytes(requestId, rawPublicBytes);
-    const isForwardableResult = vector.frame.type === "result" || vector.frame.type === "error";
-    if (vector.expected_action === "accept" && isForwardableResult) {
-      expect(encodedPayload.equals(Buffer.from(rawPublicBytes)), vector.name).toBe(true);
-    } else {
-      expectFixedDenialPayload(requestId, encodedPayload, vector.name);
-    }
-    consumed += 1;
-  }
-  return consumed;
-}
-
-function assertPublicStreamFixtureVectors(): number {
-  const relayOwnedDispositions = new Map<string, string>([
-    ["overlarge length", "reject_before_payload_allocation"],
-    ["partial frame", "retain_until_probe_then_closed"],
-    ["two 48 KiB frames", "decode_all_complete_frames"],
-    ["max public frame plus partial tail", "decode_prefix_keep_partial_tail"],
-    ["duplicate public key", "poison_connection"],
-    ["nested duplicate public key", "decode_one_frame"],
-    ["escaped duplicate public key", "poison_connection"],
-    ["refused cancel", "decode_one_frame"],
-    ["request id over cap", "poison_connection"],
-    ["request id disallowed character", "poison_connection"],
-    ["request id escaped legal character", "decode_one_frame"],
-  ]);
-  const publicFrameExpectations = new Map<string, readonly PublicExpectedAction[]>([
-    ["two 48 KiB frames", ["accept", "accept"]],
-    ["max public frame plus partial tail", ["accept"]],
-    ["duplicate public key", ["poison_connection"]],
-    ["nested duplicate public key", ["poison_connection"]],
-    ["escaped duplicate public key", ["poison_connection"]],
-    ["refused cancel", ["accept"]],
-    ["request id over cap", ["poison_connection"]],
-    ["request id disallowed character", ["poison_connection"]],
-    ["request id escaped legal character", ["accept"]],
-  ]);
-  const publicFrameLengths = new Map<string, readonly number[]>([
-    ["duplicate public key", [59]],
-    ["nested duplicate public key", [103]],
-    ["escaped duplicate public key", [38]],
-    ["refused cancel", [42]],
-    ["request id over cap", [166]],
-    ["request id disallowed character", [48]],
-    ["request id escaped legal character", [43]],
-  ]);
-  const vectors = publicStreamVectors();
-  expect(new Set(vectors.map((vector) => vector.name))).toEqual(new Set(relayOwnedDispositions.keys()));
-  let consumed = 0;
-  for (const vector of vectors) {
-    expect(vector.frame, vector.name).toBeUndefined();
-    expect(vector.bytes_hex, vector.name).toEqual(expect.any(String));
-    expect(vector.expected_action, vector.name).toBe(relayOwnedDispositions.get(vector.name));
-    const bytes = privateBytesForFixture(vector);
-    // The relay owns public stream framing; this reader exists only to expose complete payloads to Node's parser.
-    const decoded = readPublicLengthPrefixedFrames(bytes);
-    const expectedPublicActions = publicFrameExpectations.get(vector.name) ?? [];
-    if (vector.name === "overlarge length") {
-      expect(decoded.frames, vector.name).toHaveLength(0);
-      expect(decoded.tail, vector.name).toEqual({
-        kind: "over_cap",
-        length: MAX_PUBLIC_FRAME_BYTES + 1,
-        remainingBytes: 0,
-      });
-    } else if (vector.name === "partial frame") {
-      expect(decoded.frames, vector.name).toHaveLength(0);
-      expect(decoded.tail, vector.name).toEqual({ kind: "partial_payload", length: 32, payloadBytes: 0 });
-    } else if (vector.name === "two 48 KiB frames") {
-      const frameBodyBytes = 48 * 1_024;
-      expect(decoded.frames.map((frame) => frame.length), vector.name).toEqual([frameBodyBytes, frameBodyBytes]);
-      expect(decoded.tail, vector.name).toEqual({ kind: "none" });
-    } else if (vector.name === "max public frame plus partial tail") {
-      expect(decoded.frames.map((frame) => frame.length), vector.name).toEqual([MAX_PUBLIC_FRAME_BYTES]);
-      expect(decoded.tail, vector.name).toEqual({
-        kind: "partial_payload",
-        length: MAX_PUBLIC_FRAME_BYTES,
-        payloadBytes: LENGTH_PREFIX_BYTES,
-      });
-    } else {
-      expect(decoded.frames.map((frame) => frame.length), vector.name).toEqual(publicFrameLengths.get(vector.name));
-      expect(decoded.tail, vector.name).toEqual({ kind: "none" });
-    }
-    expect(decoded.frames, vector.name).toHaveLength(expectedPublicActions.length);
-    for (const [index, frame] of decoded.frames.entries()) {
-      const parsed = parsePublicFrame(frame.payload);
-      expect(publicActionFromNodeResult(parsed), `${vector.name} frame ${index}`).toBe(expectedPublicActions[index]);
-    }
-    consumed += 1;
-  }
-  return consumed;
+function assertPublicFixtureVectors(): number {
+  return assertFixtureVectors((entry) => fixtureSurface(entry) === "publicOrClient");
 }
 
 function assertNodeToRelayFixtureVectors(): number {
-  const validCases = nodeToRelayTypedFixtureTargets();
-  const invalidAssertions: Readonly<Record<string, () => void>> = {
-    "unexpected field": () => {
-      const vector = findFixtureVector("unexpected field");
-      if (vector.frame === undefined) throw new Error("unexpected field fixture is missing its frame");
-      const allowed = allowedSchemaKeys(String(vector.frame.type));
-      expect(allowed, vector.name).toBeDefined();
-      expect(Object.keys(vector.frame).filter((key) => !allowed?.has(key)), vector.name).toEqual(["extra"]);
-    },
-    "tools call on node side": () => {
-      const vector = findFixtureVector("tools call on node side");
-      if (vector.frame === undefined) throw new Error("tools call on node side fixture is missing its frame");
-      expect(schemaTypeKeys(HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay), vector.name).not.toContain(String(vector.frame.type));
-    },
-    "node result over cap": () => {
-      expectDenialFromResponseBytes("mcp-1", innerResultBytes("node result over cap"));
-    },
-    "node result mismatched id": () => {
-      expectDenialFromResponseBytes("mcp-1", innerResultBytes("node result mismatched id"));
-    },
-    "node result lone surrogate": () => {
-      expectDenialFromResponseBytes("mcp-1", innerResultBytes("node result lone surrogate"));
-    },
-    "node result over depth": () => {
-      expectDenialFromResponseBytes("mcp-1", innerResultBytes("node result over depth"));
-    },
-    "node result unpadded base64": () => {
-      const fixturePayload = privateEnvelope("node result unpadded base64");
-      const encodedPayload = parsePayload(encodeNodeToRelay({
-        type: "response",
-        connectionId: "c1",
-        requestId: "mcp-1",
-        publicPayloadBytes: Buffer.from(fixturePayload.result_b64 as string, "base64"),
-      }));
-      expect(encodedPayload.result_b64, "node result unpadded base64").toMatch(/=$/u);
-      expect(encodedPayload.result_b64, "node result unpadded base64").not.toBe(fixturePayload.result_b64);
-    },
-    "node response private cap exact": () => {
-      expectDenialFromResponseBytes("mcp-100", innerResultBytes("node response private cap exact"));
-    },
-    "node response private cap over": () => {
-      const vector = findFixtureVector("node response private cap over");
-      const bytes = privateBytesForFixture(vector);
-      expect(bytes.readUInt32BE(0), vector.name).toBe(MAX_PRIVATE_FRAME_BYTES + 1);
-      expect(collectFrames(bytes), vector.name).toEqual(["fatal"]);
-      expect(() => encodePrivateFrame(Buffer.alloc(MAX_PRIVATE_FRAME_BYTES + 1, 0x61)), vector.name).toThrow(/cap/u);
-    },
-  };
-  expect(new Set(Object.keys(validCases))).toEqual(new Set([
-    "node ready",
-    "node probe",
-    "node response",
-    "node close",
-    "node result valid",
-    "node result padded base64",
-    "node close then late response",
-  ]));
-  expect(new Set(Object.keys(invalidAssertions))).toEqual(new Set([
-    "unexpected field",
-    "tools call on node side",
-    "node result over cap",
-    "node result mismatched id",
-    "node result lone surrogate",
-    "node result over depth",
-    "node result unpadded base64",
-    "node response private cap exact",
-    "node response private cap over",
-  ]));
-
-  let consumed = 0;
-  for (const vector of nodeToRelayVectors()) {
-    if (
-      vector.expected_action === "accept" ||
-      vector.expected_action === "decode_response_and_forward" ||
-      vector.name === "node close then late response"
-    ) {
-      const encoded = validCases[vector.name];
-      expect(encoded, vector.name).toBeDefined();
-      const expectedFrames = collectFrames(privateBytesForFixture(vector));
-      const expectedBody = expectedFrames[0];
-      expect(expectedBody, vector.name).not.toBe("fatal");
-      if (expectedBody !== undefined && expectedBody !== "fatal" && encoded !== undefined) {
-        expect(parsePayload(encoded), vector.name).toEqual(parseBody(expectedBody));
-      }
-      consumed += 1;
-      continue;
-    }
-
-    expect(vector.expected_action, vector.name).not.toBe("accept");
-    expect(vector.expected_action, vector.name).not.toBe("decode_response_and_forward");
-    const assertion = invalidAssertions[vector.name];
-    expect(assertion, vector.name).toBeDefined();
-    assertion?.();
-    consumed += 1;
-  }
-  return consumed;
-}
-
-function nodeToRelayTypedFixtureTargets(): Readonly<Record<string, Buffer>> {
-  return {
-    "node ready": encodeNodeToRelay({ type: "ready" }),
-    "node probe": encodeNodeToRelay({
-      type: "probe",
-      connectionId: "c1",
-      nonce: "0123456789abcdef0123456789abcdef",
-    }),
-    "node response": encodeNodeToRelay({
-      type: "response",
-      connectionId: "c1",
-      requestId: "mcp-1",
-      publicPayloadBytes: publicResultBytes("mcp-1", { content: [] }),
-    }),
-    "node close": encodeNodeToRelay({ type: "close", connectionId: "c1" }),
-    "node result valid": encodeNodeToRelay({
-      type: "response",
-      connectionId: "c1",
-      requestId: "mcp-1",
-      publicPayloadBytes: publicResultBytes("mcp-1", {}),
-    }),
-    "node result padded base64": encodeNodeToRelay({
-      type: "response",
-      connectionId: "c1",
-      requestId: "mcp-1",
-      publicPayloadBytes: publicResultBytes("mcp-1", { x: "a" }),
-    }),
-    "node close then late response": encodeNodeToRelay({ type: "close", connectionId: "c2" }),
-  };
+  return assertFixtureVectors((entry) => fixtureSurface(entry) === "nodeToRelay");
 }
 
 function toolsCallWithArrays(count: number, inner: string): Uint8Array {
@@ -686,12 +805,7 @@ describe("Hermes memory bridge private framing", () => {
 
 describe("Hermes memory bridge relay-to-Node envelopes", () => {
   it("consumes every fixture vector through its owning wire assertion", () => {
-    const consumed =
-      assertRelayToNodeFixtureVectors() +
-      assertNodeToRelayFixtureVectors() +
-      assertPublicInboundFixtureVectors() +
-      assertClientOutboundFixtureVectors() +
-      assertPublicStreamFixtureVectors();
+    const consumed = assertFixtureVectors();
     expect(consumed).toBe(fixtureTotal());
     expect(new Set(allFixtureEntries().map((entry) => entry.name)).size).toBe(fixtureTotal());
   });
@@ -701,9 +815,7 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
   });
 
   it("walks every public fixture vector through Node's public boundary", () => {
-    assertPublicInboundFixtureVectors();
-    assertClientOutboundFixtureVectors();
-    assertPublicStreamFixtureVectors();
+    assertPublicFixtureVectors();
   });
 
   it("records structurally valid relay-to-Node vectors whose action depends on bridge state", () => {
@@ -917,54 +1029,11 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
 });
 
 describe("Hermes memory bridge Node-to-relay encoder", () => {
-  it("reproduces every valid Node-to-relay fixture target from typed input", () => {
-    const cases: Readonly<Record<string, Buffer>> = {
-      "node ready": encodeNodeToRelay({ type: "ready" }),
-      "node probe": encodeNodeToRelay({
-        type: "probe",
-        connectionId: "c1",
-        nonce: "0123456789abcdef0123456789abcdef",
-      }),
-      "node response": encodeNodeToRelay({
-        type: "response",
-        connectionId: "c1",
-        requestId: "mcp-1",
-        publicPayloadBytes: publicResultBytes("mcp-1", { content: [] }),
-      }),
-      "node close": encodeNodeToRelay({ type: "close", connectionId: "c1" }),
-      "node result valid": encodeNodeToRelay({
-        type: "response",
-        connectionId: "c1",
-        requestId: "mcp-1",
-        publicPayloadBytes: publicResultBytes("mcp-1", {}),
-      }),
-      "node result padded base64": encodeNodeToRelay({
-        type: "response",
-        connectionId: "c1",
-        requestId: "mcp-1",
-        publicPayloadBytes: publicResultBytes("mcp-1", { x: "a" }),
-      }),
-      "node close then late response": encodeNodeToRelay({ type: "close", connectionId: "c2" }),
-    };
-
-    const validNames = new Set(
-      nodeToRelayVectors()
-        .filter((entry) =>
-          entry.expected_action === "accept" ||
-          entry.expected_action === "decode_response_and_forward" ||
-          entry.name === "node close then late response")
-        .map((entry) => entry.name),
-    );
-    expect(new Set(Object.keys(cases))).toEqual(validNames);
-
-    for (const [name, encoded] of Object.entries(cases)) {
-      const vector = findFixtureVector(name);
-      const expectedFrames = collectFrames(privateBytesForFixture(vector));
-      const expectedBody = expectedFrames[0];
-      expect(expectedBody, name).not.toBe("fatal");
-      if (expectedBody !== undefined && expectedBody !== "fatal") {
-        expect(parsePayload(encoded), name).toEqual(JSON.parse(Buffer.from(expectedBody).toString("utf8")));
-      }
+  it("reproduces every forwarding Node-to-relay fixture target from decoded input", () => {
+    for (const vector of nodeToRelayVectors().filter((entry) =>
+      entry.expected_action === "accept" || entry.expected_action === "decode_response_and_forward"
+    )) {
+      expectValidNodeToRelay(vector);
     }
   });
 
@@ -1001,25 +1070,10 @@ describe("Hermes memory bridge Node-to-relay encoder", () => {
   });
 
   it("cannot produce invalid Node-to-relay fixture shapes from typed input", () => {
-    const invalidNames = new Set(
-      nodeToRelayVectors()
-        .filter((entry) =>
-          entry.expected_action !== "accept" &&
-          entry.expected_action !== "decode_response_and_forward" &&
-          entry.name !== "node close then late response")
-        .map((entry) => entry.name),
-    );
-    expect(invalidNames).toEqual(new Set([
-      "unexpected field",
-      "tools call on node side",
-      "node result over cap",
-      "node result mismatched id",
-      "node result lone surrogate",
-      "node result over depth",
-      "node result unpadded base64",
-      "node response private cap exact",
-      "node response private cap over",
-    ]));
+    const invalidLabels = new Set(["fatal_relay_error", "decode_response_and_deny"]);
+    for (const vector of nodeToRelayVectors().filter((entry) => invalidLabels.has(entry.expected_action))) {
+      dispatchFixtureVector("stream_cases", vector, () => undefined);
+    }
 
     expect(() => encodeNodeToRelay({ type: "close", connectionId: "bad" })).toThrow(
       expect.objectContaining({ name: "HermesWireEncodeError", code: "invalid_connection_id" }),
