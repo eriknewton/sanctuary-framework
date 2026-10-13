@@ -3780,7 +3780,7 @@ function renderApprovalsScreen() {
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and nothing changes. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
       '</div></div>',
       '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
       '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',

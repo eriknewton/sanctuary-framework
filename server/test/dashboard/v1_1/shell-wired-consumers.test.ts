@@ -319,7 +319,7 @@ describe("slice 2 shell wired consumers", () => {
     // nothing is written; the subtitle may say only that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and nothing changes.");
+    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {

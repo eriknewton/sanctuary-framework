@@ -175,7 +175,9 @@ body {
    full id is in the menu head and the title. */
 .scope .id { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; min-width: 0; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
 .scope .scope-sep { width: 1px; height: 16px; background: var(--rule-2); flex: none; }
-/* 44px: room for two letters and the ellipsis, so the agent scope never vanishes. */
+/* 44px: room for two letters and the ellipsis, so the agent scope stays
+   visible at every width above the 1240px step; below it the label is the
+   scope's last give (see that step). */
 /* The agent label and the machine name shrink with equal weight, so each
    gives way in proportion to its width: a long name yields more than the
    label, and a short name sits at its 6ch floor and never shrinks. (A 4:1
@@ -1416,9 +1418,9 @@ body {
    label go (each control keeps its accessible name), and the scope's id and
    agent narrow with an ellipsis whose full text stays in the title.
    The steps are measured, not derived. Stepping the viewport in 10px steps
-   with three fixture states (the default; the boot-time Unknown seal and
-   bell; a 24-character machine name with a 9999-day Attention seal and 140
-   waiting), the bar first clips or spills at 1290px with neither step, and
+   with four fixture states (the default; the boot-time Unknown seal and
+   bell; a 9999-day Attention seal with 140 waiting; the same with a
+   24-character machine name), the bar first clips or spills at 1290px with neither step, and
    at 1230px with only the first. 1360px and 1240px are those two widths
    plus a margin, so each step is in force before the bar needs it; with
    both in force nothing clips from 1000px up. Below 1000px the widest
@@ -1442,8 +1444,7 @@ body {
      otherwise falls below its own text floors at 1024px. */
   .topbar .avatar { display: none; }
   /* Past that, a wider seal or bell can still leave the scope less room
-     than its text floors; the agent label, already ellipsized here, then
-     drops its 44px floor and gives way as far as it must (the menu names
+     than its text floors; the agent label then drops its 44px floor and gives way as far as it must (the menu names
      the agent in full), so the machine name keeps its 6ch floor, a short
      name stays whole, and the caret stays inside the trigger. A floor of
      0 on the name instead lets flexbox shave a fraction of a pixel off it
