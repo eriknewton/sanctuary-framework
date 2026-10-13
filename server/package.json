@@ -2,7 +2,7 @@
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.8.6-rc.1",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
-  "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record. Linux: proven on Ubuntu 24.04 (x86-64) only. Wraps Claude Code, Cursor, Hermes, OpenClaw and Cline.",
+  "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Wraps Claude Code, Cursor, Hermes, OpenClaw and Cline on tested config paths (Assurance Matrix: partial).",
   "homepage": "https://sanctuaryprotocol.ai",
   "bugs": {
     "url": "https://github.com/eriknewton/sanctuary-framework/issues"
