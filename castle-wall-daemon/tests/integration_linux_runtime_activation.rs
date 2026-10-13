@@ -3343,7 +3343,8 @@ mod tb10_agent_unit_against_real_systemd {
                 .expect("escape fixture mount");
             assert!(out.status.success());
             let name = String::from_utf8(out.stdout).unwrap().trim().to_string();
-            let mount = include_str!("../systemd/var-lib-sanctuary\\x2dagent\\x2dworkspace.mount");
+            // Must match MOUNT_SOURCE in packaging/ubuntu/install-layout.py.
+            let mount = include_str!("../systemd/var-lib-sanctuary-agent-workspace.mount.source");
             let mount = substitute(
                 mount,
                 "/var/lib/sanctuary-agent-workspace",
