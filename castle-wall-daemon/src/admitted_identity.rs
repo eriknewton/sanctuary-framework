@@ -89,9 +89,9 @@ impl AdmittedIdentity {
     }
 }
 
-/// Boot-only identity source. Confined fields enter through the verified error
-/// variant, so no caller can feed raw snapshot fields into an admitted identity
-/// after `from_snapshot` has refused them.
+/// Boot-only identity source. Confined fields enter here from the boot-time
+/// scoped-rule refusal; the decision path pins present snapshots to
+/// `from_snapshot` and pins refused snapshots to Unattributed.
 pub(crate) struct BootAdmittedIdentity {
     fortress_id: String,
     subject: AdmittedSubject,

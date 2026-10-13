@@ -1306,6 +1306,19 @@ mod tests {
             crate::decision::EvaluationOutcome {
                 evidence: crate::decision::OutcomeEvidence::Recorded {
                     verdict: crate::policy::Verdict::Deny {
+                        reason: crate::policy::DeniedReason::ExplicitRule {
+                            rule_id: "r-deny".to_string(),
+                        },
+                    },
+                    wal_seq: 1,
+                    subject: subject.clone(),
+                    event_canonical_json: "{}".to_string(),
+                },
+                timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::decision::EvaluationOutcome {
+                evidence: crate::decision::OutcomeEvidence::Recorded {
+                    verdict: crate::policy::Verdict::Deny {
                         reason: crate::policy::DeniedReason::DefaultDeny,
                     },
                     wal_seq: 1,

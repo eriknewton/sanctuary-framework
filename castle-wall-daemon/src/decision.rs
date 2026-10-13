@@ -841,9 +841,8 @@ impl DecisionEngine {
             Ok(guard) => match guard.current_snapshot() {
                 Some(snapshot) => (
                     snapshot.evaluate(request),
-                    // `AdmittedIdentity` has private fields outside this module;
-                    // the Err arm cannot rebuild a subject from raw snapshot
-                    // fields and must map to the Unattributed outcome below.
+                    // The structural pin keeps this arm as the snapshot builder;
+                    // the Err arm below maps a refused snapshot to Unattributed.
                     AdmittedIdentity::from_snapshot(snapshot),
                 ),
                 None => (
@@ -874,8 +873,8 @@ impl DecisionEngine {
                 None => return Ok(self.unattributed_outcome()),
             },
             Err(_) => {
-                // `from_snapshot` is the only snapshot-field identity builder; a
-                // refused snapshot maps to Unattributed instead of rebuilding a subject.
+                // The structural pins keep present snapshots on `from_snapshot`
+                // and make a refused snapshot an Unattributed outcome.
                 return Ok(self.unattributed_outcome());
             }
         };
@@ -2087,6 +2086,18 @@ mod armed_identity_tests {
         let rebuild_statement = &rebuild_suffix[..rebuild_suffix
             .find("// GF3: same bounded")
             .expect("next invariant")];
+        let rebuild_statement_without_comments = rebuild_statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            rebuild_statement_without_comments,
+            "let fail_closed_canonical_json = build_audit_event_canonical_json( &fail_closed_verdict, request, &subject, &timestamp_iso, ) .map_err(AttemptError::AuditCanonicalize)?;",
+            "the fail-closed rebuild propagates the builder result directly"
+        );
         assert!(
             rebuild_statement
                 .contains(")\n                .map_err(AttemptError::AuditCanonicalize)?;"),
@@ -2273,7 +2284,25 @@ mod armed_identity_tests {
         let open = decision[evaluate_at..].find('{').unwrap() + evaluate_at;
         let close = crate::source_scan::matching_brace(&decision, open).unwrap();
         let body = &decision[open..=close];
-        assert!(body.contains("AdmittedIdentity::from_snapshot(snapshot)"));
+        let some_pattern = "Some(snapshot) => (";
+        let some_at = body.find(some_pattern).expect("present snapshot arm");
+        let some_body_start = some_at + some_pattern.len();
+        let some_body_end = body[some_body_start..]
+            .find("                ),\n                None => (")
+            .map(|offset| some_body_start + offset)
+            .expect("present snapshot arm close");
+        let some_body_without_comments = body[some_body_start..some_body_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            some_body_without_comments,
+            "snapshot.evaluate(request),\nAdmittedIdentity::from_snapshot(snapshot),",
+            "a present snapshot uses only the snapshot-derived identity"
+        );
         let err_pattern = "Err(_) => {";
         let err_at = body.find(err_pattern).expect("from_snapshot Err arm");
         let err_open = body[err_at..].find('{').unwrap() + err_at;
@@ -2298,6 +2327,15 @@ mod armed_identity_tests {
             !err_body.contains("armed_identity().cloned().ok_or_else"),
             "evaluate_attempt must not recover from from_snapshot Err through the frozen cell"
         );
+        let production = production_lines(&decision).join("\n");
+        let freeze_body = crate::source_scan::fn_body(&production, "freeze_at_boot");
+        for token in ["AdmittedIdentity::from_boot(", "BootConfinedScopeRefusal {"] {
+            assert_eq!(
+                production.matches(token).count(),
+                freeze_body.matches(token).count(),
+                "{token} is confined to freeze_at_boot in production decision code"
+            );
+        }
     }
 
     #[test]
@@ -2558,10 +2596,10 @@ mod armed_identity_tests {
         let store_started = Instant::now();
         let store_guard = store
             .try_lock()
-            .expect("store guard is not held while the verdict waits on WAL");
+            .expect("store guard is not held after the verdict snapshot read");
         assert!(
             store_started.elapsed() < Duration::from_millis(50),
-            "the store guard must be released before WAL acquisition"
+            "the store guard is reacquired within the bounded verdict path"
         );
         drop(store_guard);
         drop(wal_guard);
