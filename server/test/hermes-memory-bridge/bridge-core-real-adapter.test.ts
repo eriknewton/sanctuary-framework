@@ -319,6 +319,32 @@ describe("HermesBridgeCore with real SDW adapter", () => {
     });
   });
 
+  it("pins stored insert provenance to the bridge class", async () => {
+    await withHarness({}, async (h) => {
+      accept(h.core);
+      h.core.relayFrame(publicFrame("c1", {
+        type: "tools_call",
+        request_id: "insert-system-taint",
+        name: "memory_insert",
+        arguments: {
+          text: "caller selected another class",
+          taint: "system_generated",
+          tags: ["hermes"],
+          passage_id: "passage-system-taint",
+        },
+      }));
+      await flush();
+      await approveAndReply(h);
+      expect(await waitForResponse(h.writes, "insert-system-taint")).toMatchObject({ type: "result" });
+      expect(await documentCount(h.storage)).toBe(1);
+
+      const provenance = await h.adapter.getPassageProvenance("passage-system-taint");
+      expect(provenance.status).toBe("verified");
+      if (provenance.status !== "verified") throw new Error("expected verified provenance");
+      expect(provenance.companion.origin.body.source_class).toBe("user_content");
+    });
+  });
+
   it.each([
     ["cancel before probe reply", "CANCELED", async (h: Awaited<ReturnType<typeof makeHarness>>) => {
       accept(h.core);

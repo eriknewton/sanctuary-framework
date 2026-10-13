@@ -68,6 +68,7 @@ import {
 
 export type HermesTimerHandle = object;
 
+// The bridge pins the class because the client is the untrusted agent; the client's field is accepted for wire compatibility and never consumed.
 const BRIDGE_PINNED_MEMORY_TAINT: PersistableTaint = "user_content";
 
 export interface HermesApprovalPromptSummary {
@@ -354,7 +355,10 @@ export class HermesBridgeCore {
     parsed: PublicFrameParseResult | undefined,
   ): void {
     const nowMs = this.nowMsOrStop();
-    if (nowMs === undefined) return;
+    if (nowMs === undefined) {
+      this.releaseRecord(action.recordId);
+      return;
+    }
     const admission = this.callWindow.admit(nowMs);
     if (!admission.allowed) {
       this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
@@ -388,6 +392,7 @@ export class HermesBridgeCore {
         this.admitInsert(action, frame.arguments);
         return;
       default:
+        frame.name satisfies never;
         this.writeResponse(action.connectionId, action.recordId, checkedError(action.requestId, HERMES_MEMORY_DENIAL));
         this.releaseRecord(action.recordId);
         return;
@@ -417,6 +422,7 @@ export class HermesBridgeCore {
       readPromise = run();
     } catch {
       this.stop("write_failure");
+      this.releaseRecord(operation.recordId);
       this.endStep();
       return;
     }
@@ -454,6 +460,7 @@ export class HermesBridgeCore {
       searchPromise = this.ports.adapter.searchPassages(query);
     } catch {
       this.stop("write_failure");
+      this.releaseRecord(operation.recordId);
       this.endStep();
       return;
     }
@@ -515,10 +522,10 @@ export class HermesBridgeCore {
       return;
     }
     this.slot = slot;
+    this.performLedgerResult(admitted);
     const timer = this.setTimerOrStop(HERMES_APPROVAL_DEADLINE_MS, () => this.fireApprovalDeadline(entryId));
     if (timer === undefined) return;
     slot.deadlineTimer = timer;
-    this.performLedgerResult(admitted);
   }
 
   private fireApprovalDeadline(entryId: string): void {
@@ -674,11 +681,10 @@ export class HermesBridgeCore {
   private deliverControl(action: Extract<HermesLifecycleAction, { readonly type: "deliver_control" }>): void {
     const entry = this.ledger.snapshot().entry;
     if (entry === undefined || entry.recordId !== action.recordId) return;
-    if (action.control === "shutdown") {
-      this.notifyHookWaiters();
-      return;
-    }
-    const result = this.ledger.cancel(entry.id);
+    // The commit decision must see a client's shutdown as a refusal flag, because the lifecycle keeps the record IN_FLIGHT until closed.
+    const result = action.control === "shutdown"
+      ? this.ledger.peerShutdown(entry.id)
+      : this.ledger.cancel(entry.id);
     this.performLedgerResult(result);
     this.notifyHookWaiters();
   }
@@ -782,9 +788,7 @@ export class HermesBridgeCore {
     const slot = this.slot;
     if (slot?.entryId !== action.entryRef) return;
     if (slot.probeTimer !== undefined) {
-      const probeTimer = slot.probeTimer;
-      slot.probeTimer = undefined;
-      this.clearTimerOrStop(probeTimer);
+      this.clearSlotTimer(slot, "probeTimer");
     }
     if (slot.verdict === undefined) {
       slot.verdict = action.kind === "resolved" ? "resolved" : "refused";
@@ -882,14 +886,10 @@ export class HermesBridgeCore {
 
   private clearSlotTimers(slot: InsertSlot): void {
     if (slot.deadlineTimer !== undefined) {
-      const deadlineTimer = slot.deadlineTimer;
-      slot.deadlineTimer = undefined;
-      this.clearTimerOrStop(deadlineTimer);
+      this.clearSlotTimer(slot, "deadlineTimer");
     }
     if (slot.probeTimer !== undefined) {
-      const probeTimer = slot.probeTimer;
-      slot.probeTimer = undefined;
-      this.clearTimerOrStop(probeTimer);
+      this.clearSlotTimer(slot, "probeTimer");
     }
   }
 
@@ -913,12 +913,17 @@ export class HermesBridgeCore {
     }
   }
 
-  private clearTimerOrStop(handle: HermesTimerHandle): void {
+  private clearSlotTimer(slot: InsertSlot, key: "deadlineTimer" | "probeTimer"): void {
+    const handle = slot[key];
+    if (handle === undefined) return;
     try {
       this.ports.clearTimer(handle);
+      slot[key] = undefined;
     } catch {
-      this.stop("write_failure");
-      this.endStep();
+      if (!this.stopped) {
+        this.stop("write_failure");
+        this.endStep();
+      }
     }
   }
 
@@ -993,6 +998,7 @@ function normalizeInsertArgs(args: HermesMemoryToolArguments): {
 }
 
 function normalizeGetArgs(args: HermesMemoryToolArguments): string | null {
+  if (Object.keys(args as Record<string, unknown>).some((key) => key !== "passage_id")) return null;
   if (!("passage_id" in args) || typeof args.passage_id !== "string") return null;
   return isSdwIdentifier(args.passage_id) ? args.passage_id : null;
 }
