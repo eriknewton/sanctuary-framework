@@ -379,7 +379,7 @@ servers:
             <span>python · mcp</span>
           </div>
           <div class="code-card">
-<pre><code><span class="token--dim"># crewai mcps field, local stdio server</span>
+<pre><code><span class="token--dim"># crewai 1.15+ (crewai.mcp), local stdio server</span>
 from crewai import Agent
 from crewai.mcp import MCPServerStdio
 
@@ -402,18 +402,22 @@ agent = Agent(
           </div>
           <div class="code-card">
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
+import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-client = MultiServerMCPClient(
-    {
-        "sanctuary": {
-            "command": "npx",
-            "args": ["-y", "@sanctuary-framework/mcp-server"],
-            "transport": "stdio",
+async def main():
+    client = MultiServerMCPClient(
+        {
+            "sanctuary": {
+                "command": "npx",
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
+                "transport": "stdio",
+            }
         }
-    }
-)
-tools = await client.get_tools()</code></pre>
+    )
+    tools = await client.get_tools()
+
+asyncio.run(main())</code></pre>
           </div>
         </article>
       </div>
