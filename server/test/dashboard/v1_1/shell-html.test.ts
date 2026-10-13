@@ -430,6 +430,11 @@ describe("v1.1 dashboard top bar at narrow widths", () => {
     expect(step).toContain(".app, .app.route-full { grid-template-columns: 220px 1fr;");
   });
 
+  it("the per-agent rules table fits the narrowed main column instead of hiding a column", () => {
+    expect(css).toMatch(/\n\.rules-table \{[^}]*min-width: 760px/);
+    expect(block("max-width: 1100px")).toContain(".rules-table { min-width: 680px; }");
+  });
+
   it("the second step starts at the measured 1240px and sheds the avatar before the scope's text floors give", () => {
     expect(css).not.toContain("@media (max-width: 1180px)");
     const step = block("max-width: 1240px");

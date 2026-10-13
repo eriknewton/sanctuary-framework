@@ -3604,14 +3604,16 @@ function renderApprovalCounts() {
   if (notify) {
     notify.setAttribute("title", w.sentence);
     notify.setAttribute("aria-label", "Approvals: " + w.sentence);
-    // Nothing waits: the bell carries no badge, and its title still states
-    // the zero with its denominator and age.
-    if (w.known && w.n === 0) notify.classList.remove("waiting");
+    // The badge goes only when nothing waits fortress-wide: a zero scoped to
+    // one agent while other agents' holds wait is not an all-clear, so the
+    // badge stays and reads "0 of N". The title states the count with its
+    // denominator and age either way.
+    if (w.known && w.of === 0) notify.classList.remove("waiting");
     else notify.classList.add("waiting");
   }
   const badge = document.getElementById("notify-count");
   if (badge) {
-    badge.hidden = w.known && w.n === 0;
+    badge.hidden = w.known && w.of === 0;
     badge.className = "wait" + (w.known ? "" : " unknown");
     badge.innerHTML = '<i aria-hidden="true"></i>' + escHtml(text);
   }
@@ -3762,9 +3764,16 @@ function renderApprovalQueueBody() {
   const pending = pendingApprovalItems();
   if (!sourceLoaded(HUB + "/inbox")) return renderSourceRead(HUB + "/inbox");
   if (state.inboxRedacted) return '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>';
-  return pending.length
-    ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
-    : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  if (pending.length) return '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>';
+  // The green check is earned only by an empty fortress-wide queue. Scoped
+  // to one agent while other agents' holds wait, the empty state names them
+  // and carries no check.
+  const others = heldApprovalItems(null).length;
+  if (others > 0) {
+    return '<div class="queue-empty" data-scoped-empty="1">Nothing waiting for ' + escHtml(state.agentScope.selectedAgentId || "this agent") +
+      '. ' + others + ' of ' + others + ' held operations wait on other agents; choose All agents in the scope menu to see them.</div>';
+  }
+  return '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
 }
 
 function renderApprovalsScreen() {

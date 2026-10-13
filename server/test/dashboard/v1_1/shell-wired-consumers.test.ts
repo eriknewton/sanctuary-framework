@@ -314,10 +314,9 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Allow always compiles a draft (recorded in the audit log) and then asks
-    // the policy engine to activate it; where the engine is not configured,
-    // activation is refused and the policy is unchanged. The subtitle may
-    // promise no more than that.
+    // Allow always asks the policy engine to compile and activate a standing
+    // rule; where the engine is not configured it is refused and the policy
+    // is unchanged. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
     expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");
@@ -378,7 +377,14 @@ describe("slice 2 shell wired consumers", () => {
       { ...heldItem, item_id: "held-a", agent_id: "fixture-agent-a" },
       { ...heldItem, item_id: "held-b", agent_id: "fixture-agent-b" },
     ];
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    // Both agents are served, so the scope menu's own reconciliation (which
+    // resets a scope naming an unknown agent) runs against a real roster.
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = [{ agent_id: "fixture-agent-a", status: "active", model_provider }, { agent_id: "fixture-agent-b", status: "active", model_provider }];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+    });
     await settle();
     h.navigate("approvals");
     expect(h.el["rail-approvals-count"]!.textContent).toBe("2 of 2");
@@ -390,6 +396,40 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["notify-count"]!.innerHTML).toContain("1 of 2");
     expect(h.el.main!.innerHTML).toContain('data-item-id="held-a"');
     expect(h.el.main!.innerHTML).not.toContain('data-item-id="held-b"');
+  });
+
+  it("a scoped zero while other agents' holds wait keeps the bell badge and earns no green check", async () => {
+    vi.useFakeTimers();
+    const items = [
+      { ...heldItem, item_id: "held-a", agent_id: "fixture-agent-a" },
+      { ...heldItem, item_id: "held-b", agent_id: "fixture-agent-b" },
+    ];
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = ["fixture-agent-a", "fixture-agent-b", "fixture-agent-c"].map((agent_id) => ({ agent_id, status: "active", model_provider }));
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
+    expect(h.el["rail-approvals-count"]!.textContent).toBe("0 of 2");
+    expect(h.el["notify-count"]!.hidden).toBe(false);
+    expect(h.el["notify-count"]!.innerHTML).toContain("0 of 2");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain('data-scoped-empty="1"');
+    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait on other agents");
+    expect(main).not.toContain("qe-check");
+    expect(main).not.toContain("Nothing waiting on you.");
+  });
+
+  it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el["notify-count"]!.hidden).toBe(true);
+    expect(h.el.main!.innerHTML).toContain('<span class="qe-check"></span>Nothing waiting on you.');
   });
 
   it("a search hit for another agent from the agent detail opens that agent and closes the results", async () => {

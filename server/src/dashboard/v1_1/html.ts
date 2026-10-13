@@ -1403,7 +1403,11 @@ body {
    140" lost 3.1px of its label at 200px, and each further digit is one
    6.6px mono glyph (11px at its 0.6em advance), so "1400 of 1400" needs
    3.1 + 2 x 6.6 = 16.3px more, rounded up to the 4px step. The fortress
-   column yields first. */
+   column yields first.
+   680px (the rules table below): the main column narrows here, and the
+   table's 760px floor overran its 714px scroll box at 1024px, hiding the
+   APPROVALS column behind a sideways scroll; 680px fits that box with 34px
+   to spare, so the cells wrap instead. */
 @media (max-width: 1100px) {
   .app, .app.route-full { grid-template-columns: 220px 1fr; grid-template-areas: "topbar topbar" "sidebar main"; }
   .fortress { display: none; }
@@ -1416,6 +1420,7 @@ body {
   .agents-list-head, .agents-list .agent-row { grid-template-columns: minmax(0, 1fr) 90px 90px; }
   .agents-list-head span:nth-child(4), .agents-list .agent-row > .agent-last { display: none; }
   .inspect-pane { position: static; max-height: none; }
+  .rules-table { min-width: 680px; }
 }
 /* The top bar sheds its quiet parts before any control or any evidence age
    clips: the gaps tighten, then the key hint, the brand word and the Talk
