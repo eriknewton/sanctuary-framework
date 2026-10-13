@@ -737,8 +737,91 @@ fn supersede_allow_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditRingBuffer;
+    use crate::audit::{AuditRingBuffer, WalWriter};
     use crate::decision::DecisionEngine;
+    use crate::manifest::canonical_json::canonicalize_to_bytes;
+    use crate::manifest::verify::{
+        AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    };
+    use crate::manifest::{ManifestStore, MANIFEST_FILENAME, RULES_SUBDIR};
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    const TEST_FORTRESS: &str = "0123456789abcdef";
+    const TEST_AGENT_UID: u32 = 60_123;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn write_signed_allow_policy(policy_dir: &std::path::Path, signing: &SigningKey) {
+        let rule_file = "r1.json";
+        let rule_body = br#"{"id":"r1","schema_version":1,"created_at":"2026-09-19T00:00:00Z","match":{"ip":["203.0.113.7"]},"disposition":"allow"}"#.to_vec();
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
+        let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let manifest = AllowlistManifest {
+            schema_version: crate::constants::SCHEMA_VERSION_V1,
+            fortress_id: TEST_FORTRESS.to_string(),
+            issued_at: "2026-09-19T00:00:00Z".to_string(),
+            generation: 1,
+            agent_origin: Some(AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(TEST_AGENT_UID),
+                gate_uid: None,
+                system_uid_allow_ceiling: 500,
+            }),
+            operator_baseline: None,
+            rules: vec![
+                ManifestRuleEntry {
+                    rule_id: "r1".to_string(),
+                    file: rule_file.to_string(),
+                    sha256: sha256_hex(&rule_body),
+                },
+                ManifestRuleEntry {
+                    rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
+                    file: habeas_file.clone(),
+                    sha256: sha256_hex(&habeas_body),
+                },
+            ],
+        };
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+        let signature = signing.sign(&canonical);
+        let signed = SignedManifest {
+            manifest,
+            signature: ManifestSignature {
+                signature_scheme: crate::constants::SIGNATURE_SCHEME_V1.to_string(),
+                signing_key_id: crate::crypto::castle_wall_signing_key_id(
+                    &signing.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+                signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signature.to_bytes()),
+            },
+        };
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(rule_file), rule_body).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(habeas_file), habeas_body).unwrap();
+        std::fs::write(
+            policy_dir.join(MANIFEST_FILENAME),
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn wal_contains_operation(wal: &Arc<Mutex<WalWriter>>, needle: &str) -> bool {
+        wal.lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event_canonical_json.contains(needle))
+    }
 
     /// The two kernel conditions that mean "no packet ready / retry", expressed
     /// as the raw errnos the kernel actually returns, must classify transient.
@@ -914,6 +997,88 @@ mod tests {
         };
 
         assert_eq!(callback(&packet), NfVerdict::Drop);
+    }
+
+    #[test]
+    fn teardown_fence_drops_and_reports_one_line_when_superseding_write_times_out() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        write_signed_allow_policy(&policy_dir, &signing);
+        let store = Arc::new(Mutex::new(ManifestStore::new(
+            policy_dir,
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            TEST_FORTRESS.to_string(),
+        )));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+        let diagnostic_sink = {
+            let diagnostics = Arc::clone(&diagnostics);
+            Arc::new(move |line: &str| diagnostics.lock().unwrap().push(line.to_string()))
+        };
+        let engine = Arc::new(
+            DecisionEngine::new_with_mutation_cancel_and_diagnostic_sink(
+                TEST_FORTRESS.to_string(),
+                Some(Arc::clone(&store)),
+                Some(Arc::clone(&wal)),
+                Arc::clone(&ring),
+                Arc::new(AtomicBool::new(false)),
+                diagnostic_sink,
+            ),
+        );
+        engine.reload_manifest_authorized_at_boot().unwrap();
+
+        let ring_guard = ring.lock().unwrap();
+        let callback = build_verdict_callback(Arc::clone(&engine));
+        let worker = std::thread::spawn(move || {
+            callback(&PendingPacket {
+                packet_id: 1,
+                nfmark: 1,
+                source_agent_id: Some(crate::nftables::confined_agent_id(TEST_AGENT_UID)),
+                source_cgroup_id: 1,
+                dest_ip: Some("203.0.113.7".to_string()),
+                dest_port: 443,
+                protocol: 6,
+                packet_len: 64,
+            })
+        });
+
+        let poll_started = Instant::now();
+        while !wal_contains_operation(&wal, "\"operation\":\"egress_approved\"") {
+            assert!(
+                poll_started.elapsed() < Duration::from_secs(2),
+                "the allow receipt must be durable before the correction is exercised"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wal_guard = wal.lock().unwrap();
+        engine.mutation_cancel_flag().store(true, Ordering::SeqCst);
+        drop(ring_guard);
+
+        assert_eq!(worker.join().unwrap(), NfVerdict::Drop);
+        let lines = diagnostics.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a failed correction emits exactly one operator diagnostic"
+        );
+        assert!(
+            lines[0].contains("superseding record could not be written"),
+            "{lines:?}"
+        );
+        drop(wal_guard);
+        assert!(
+            !wal_contains_operation(&wal, "\"operation\":\"egress_verdict_superseded\""),
+            "the deadline-failed correction must not leave a partial row"
+        );
     }
 
     #[test]
