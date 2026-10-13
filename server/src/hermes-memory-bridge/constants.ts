@@ -1,5 +1,8 @@
+import { MEMORY_BATCH_LOCK_TIMEOUT_MS } from "../sdw/adapters/sdw-memory-backend.js";
+
 // Must match the fixed denial text in hermes-memory-relay/SEAM.md.
 export const HERMES_MEMORY_DENIAL = "Memory request denied.";
+export const HERMES_MEMORY_UNAVAILABLE = "Memory service unavailable.";
 
 // Must match MAX_PUBLIC_CONNECTIONS in hermes-memory-relay/SEAM.md.
 export const HERMES_MAX_PUBLIC_CONNECTIONS = 4;
@@ -12,6 +15,8 @@ export const HERMES_MAX_CALL_RECORDS = HERMES_MAX_PUBLIC_CONNECTIONS + HERMES_SE
 export const MAX_PUBLIC_FRAME_BYTES = 65_536;
 // Must match MAX_RESULT_FRAME_BYTES in hermes-memory-relay/SEAM.md.
 export const MAX_RESULT_FRAME_BYTES = 65_536;
+// Must match PROBE_REPLY_BOUND_MS in hermes-memory-relay/SEAM.md.
+export const PROBE_REPLY_BOUND_MS = 2_000;
 // Must match MAX_REQUEST_ID_BYTES in hermes-memory-relay/SEAM.md.
 export const MAX_REQUEST_ID_BYTES = 128;
 // Must match PROBE_NONCE_BYTES in hermes-memory-relay/SEAM.md: a hex-character length for 16 random bytes, never a byte length.
@@ -39,6 +44,18 @@ export const MAX_JSON_NESTING_DEPTH = 64;
 
 export const MIN_SEARCH_LIMIT = 1; // Node-local; the memory search tool represents no hits with an empty result set.
 export const MAX_SEARCH_LIMIT = 20; // Node-local policy bound; oversized results are handled by the response denial path.
+
+export const HERMES_TOOL_TIMEOUT_MS = 120_000; // Node-local: Hermes client tool timeout budget.
+export const HERMES_RESPONSE_MARGIN_MS = 5_000; // Node-local: room for shim cancel and response delivery.
+export const HERMES_APPROVAL_DEADLINE_MS =
+  HERMES_TOOL_TIMEOUT_MS -
+  MEMORY_BATCH_LOCK_TIMEOUT_MS -
+  PROBE_REPLY_BOUND_MS -
+  HERMES_RESPONSE_MARGIN_MS;
+export const HERMES_RATE_WINDOW_MS = 60_000; // Node-local: one-minute rolling admission window.
+export const HERMES_MAX_CALLS_PER_MINUTE = 60; // 60 = one call per second in HERMES_RATE_WINDOW_MS.
+export const HERMES_MAX_APPROVAL_PROMPTS_PER_MINUTE = 6; // 6 = one owner prompt per ten seconds in HERMES_RATE_WINDOW_MS.
+export const HERMES_MAX_PENDING_APPROVALS = 1; // Node-local: the approval ledger owns one global slot.
 
 // Must match the decoded request_id and cancel.mcp_request_id pattern in hermes-memory-relay/SEAM.md.
 export const REQUEST_ID_PATTERN = new RegExp(`^[A-Za-z0-9._:-]{1,${MAX_REQUEST_ID_BYTES}}$`, "u");
