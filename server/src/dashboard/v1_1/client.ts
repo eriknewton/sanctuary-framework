@@ -3736,6 +3736,10 @@ function renderSearchResults() {
     return g.loaded ? g.total + " " + g.label.toLowerCase() : g.label.toLowerCase() + (g.hidden ? " hidden" : " not loaded");
   }).join(", ");
   let any = false;
+  // A "no match" line is a negative result, so it is earned only when at
+  // least one group actually loaded and none matched; with nothing loaded
+  // the honest answer is that nothing searchable has loaded yet.
+  const anyLoaded = groups.some(function (g) { return g.loaded; });
   const body = groups.map(function (g) {
     if (g.hidden) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: hidden until you paste the operator token, so a match cannot be ruled out.</div>';
     if (!g.loaded) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: not loaded yet, so a match cannot be ruled out.</div>';
@@ -3745,7 +3749,9 @@ function renderSearchResults() {
     return '<div class="sr-group">' + escHtml(g.label) + ' (' + shown.length + ' of ' + g.hits.length + ' matches)</div>' + shown.join("");
   }).join("");
   panel.innerHTML = '<div class="sr-scope">Searching what this page has loaded: ' + escHtml(scope) + '.</div>' +
-    body + (any ? "" : '<div class="sr-empty">No match in what this page has loaded.</div>');
+    body + (any ? "" : anyLoaded
+      ? '<div class="sr-empty" data-search-no-match="1">No match in what this page has loaded.</div>'
+      : '<div class="sr-empty" data-search-nothing-loaded="1">Nothing searchable has loaded yet, so no result is known.</div>');
 }
 
 // The queue body shared by the Approvals screen and the fortress column:
@@ -3774,7 +3780,7 @@ function renderApprovalsScreen() {
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always writes a standing rule into your signed policy. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and nothing changes. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
       '</div></div>',
       '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
       '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',
@@ -4889,9 +4895,12 @@ document.addEventListener("click", function (ev) {
       renderTopbar();
     }
   }
-  // Slice 2: the search results close on any click outside the search box
-  // (a click on a result navigates, and the route change closes them too).
-  if (state.search.open && !rawTgt.closest("[data-search]")) {
+  // Slice 2: the search results close on any click outside the search box,
+  // and on any click on a result. A result that links to the route already
+  // showing (an approval hit from #approvals, an evidence hit from
+  // #activity) assigns an unchanged hash, so no hashchange fires; the close
+  // here is explicit for that reason, not left to the route change.
+  if (state.search.open && (!rawTgt.closest("[data-search]") || rawTgt.closest("#search-results a"))) {
     state.search.open = false;
     renderSearchResults();
   }

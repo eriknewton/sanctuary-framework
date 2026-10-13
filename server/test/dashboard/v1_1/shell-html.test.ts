@@ -404,6 +404,41 @@ describe("v1.1 dashboard shell HTML", () => {
   });
 });
 
+describe("v1.1 dashboard top bar at narrow widths", () => {
+  const html = renderDashboardV11Html({ embedClient: false });
+  // Comments stripped: the stylesheet's prose names these selectors.
+  const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+  const block = (query: string) => {
+    const start = css.indexOf(`@media (${query}) {`);
+    expect(start, query).toBeGreaterThan(-1);
+    let depth = 0;
+    for (let i = css.indexOf("{", start); i < css.length; i++) {
+      if (css[i] === "{") depth++;
+      if (css[i] === "}" && --depth === 0) return css.slice(start, i + 1);
+    }
+    throw new Error("unbalanced " + query);
+  };
+
+  it("the scope trigger clips its own content, so its caret never draws over the search box", () => {
+    const scope = css.match(/\n\.scope \{([^}]*)\}/);
+    expect(scope).toBeTruthy();
+    expect(scope![1]).toContain("overflow: hidden");
+  });
+
+  it("the second step starts at the measured 1240px and sheds the avatar before the scope's text floors give", () => {
+    expect(css).not.toContain("@media (max-width: 1180px)");
+    const step = block("max-width: 1240px");
+    expect(step).toContain(".topbar .avatar { display: none; }");
+    // The agent label is the last give; the machine name keeps its 6ch floor
+    // so a short name is never shaved into an ellipsis.
+    expect(step).toContain(".scope .sw-agent { min-width: 0; }");
+    expect(step).not.toMatch(/\.machine-name \{[^}]*min-width: 0/);
+    expect(css).toMatch(/\n\.scope \.machine-name \{[^}]*min-width: 6ch/);
+    expect(step).toContain(".search-wrap { min-width: 104px; }");
+    expect(step).toContain(".brand .brand-word { display: none; }");
+  });
+});
+
 describe("v1.1 dashboard exit drill verifier-out-of-process", () => {
   it("renders verify and import as CLI commands, not in-process calls", () => {
     const client = getClientScript();

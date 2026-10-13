@@ -308,6 +308,69 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("Nothing pending.");
   });
 
+  it("the Approvals subtitle promises no signed policy and says Allow always is refused when the engine is not configured", async () => {
+    vi.useFakeTimers();
+    const h = boot();
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    // The promote path writes a plain policy through the activator, which no
+    // production composition root binds, so the route answers 503 and
+    // nothing is written; the subtitle may say only that.
+    expect(main).not.toContain("signed policy");
+    expect(main).not.toContain("Allow always writes");
+    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and nothing changes.");
+  });
+
+  it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/agents": never, "/api/hub/inbox": never, "/api/hub/activity": never });
+    await settle();
+    h.type("zzz");
+    const html = h.el["search-results"]!.innerHTML;
+    expect(html).toContain('data-search-nothing-loaded="1"');
+    expect(html).toContain("Nothing searchable has loaded yet, so no result is known.");
+    expect(html).not.toContain("No match in what this page has loaded");
+  });
+
+  it("search says no match only when a group loaded and none matched", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [{ agent_id: "fixture-agent", status: "active" }] } })),
+      "/api/hub/inbox": never, "/api/hub/activity": never,
+    });
+    await settle();
+    h.type("zzz");
+    const html = h.el["search-results"]!.innerHTML;
+    expect(html).toContain('data-search-no-match="1"');
+    expect(html).toContain("No match in what this page has loaded.");
+    expect(html).not.toContain("Nothing searchable has loaded yet");
+  });
+
+  it("a search hit that links to the route already showing closes the results", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    await settle();
+    h.navigate("approvals");
+    h.type("fixture-agent");
+    expect(h.el["search-results"]!.innerHTML).toContain('<a href="#approvals">');
+    expect(h.el["search-results"]!.hidden).toBe(false);
+    // A plain link to #approvals while on #approvals: the hash does not
+    // change, so no hashchange fires; the click itself must close the panel.
+    h.click({ href: "#approvals" }, ["[data-search]", "#search-results a"]);
+    expect(h.el["search-results"]!.hidden).toBe(true);
+    expect(runInContext("state.search.open", h.context)).toBe(false);
+  });
+
+  it("a click inside the search box that is not on a result leaves the results open", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    await settle();
+    h.type("fixture-agent");
+    h.click({}, ["[data-search]"]);
+    expect(h.el["search-results"]!.hidden).toBe(false);
+  });
+
   it("a search hit for another agent from the agent detail opens that agent and closes the results", async () => {
     vi.useFakeTimers();
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };

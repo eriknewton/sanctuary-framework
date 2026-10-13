@@ -152,9 +152,13 @@ body {
    carries 6px (--rad) and 10px (--rad-lg) only, so it is written here.
    34px: the TopBar preview's control height (its icon button is the 34px
    square), shared by the scope, the search, the icon buttons and the seal.
-   360px caps the trigger at the fortress column's width. */
+   360px caps the trigger at the fortress column's width.
+   overflow: hidden keeps every part of the trigger inside its own border:
+   flex can shrink the trigger past its children's floors when a wide seal
+   or bell leaves it no room, and without the clip its caret would draw over
+   the search box beside it. */
 .scope {
-  display: flex; align-items: center; gap: var(--space-2); height: 34px; max-width: min(360px, 100%); min-width: 0;
+  display: flex; align-items: center; gap: var(--space-2); height: 34px; max-width: min(360px, 100%); min-width: 0; overflow: hidden;
   padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--rule-2); border-radius: 8px;
   background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
 }
@@ -172,9 +176,11 @@ body {
 .scope .id { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; min-width: 0; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
 .scope .scope-sep { width: 1px; height: 16px; background: var(--rule-2); flex: none; }
 /* 44px: room for two letters and the ellipsis, so the agent scope never vanishes. */
-/* flex-shrink 4: inside the scope the agent label gives way before the
-   machine name (shrink 1). */
-.scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; flex-shrink: 4; }
+/* The agent label and the machine name shrink with equal weight, so each
+   gives way in proportion to its width: a long name yields more than the
+   label, and a short name sits at its 6ch floor and never shrinks. (A 4:1
+   weight let the label collapse to nothing beside a 24-character name.) */
+.scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; }
 /* The search is the bar's elastic slot: it gives way down to a floor that
    fits its placeholder beside the key hint, so the fixed controls never clip.
    200px basis and the 136px floor are the TopBar README's: 136px fits the
@@ -195,6 +201,11 @@ body {
    its 136px floor; it is the scope menu's width (.agent-switcher-menu), so
    the two top-bar popovers read as one family. */
 .search-results {
+  /* 420px: about half of a 900px-tall viewport below the 56px bar
+     ((900 - 56) / 2 = 422, down to a 4px step), so the page behind the
+     panel stays in view and a longer list scrolls inside it. A layout
+     choice of this slice, not a design token: the TopBar preview has no
+     results panel. */
   position: absolute; top: calc(100% + 6px); left: 0; right: 0; min-width: 320px; max-height: 420px; overflow-y: auto;
   background: var(--surface); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
   padding: var(--space-2); z-index: 50;
@@ -207,6 +218,10 @@ body {
 .search-results a:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .search-results a .sr-meta { margin-left: auto; flex: none; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
 .search-results .sr-empty { padding: 6px; color: var(--ink-3); font-size: var(--text-cell); }
+/* 32px: the TopBar preview's .btn height, 2px under the 34px primary
+   controls, shared by the range and the bar's text buttons. 7px: the
+   design's radius-control (buttons, rail items, filter chips), written here
+   because the server block carries 6px (--rad) and 10px (--rad-lg) only. */
 .range {
   height: 32px; padding: 0 var(--space-2); border: 1px solid var(--rule-2); border-radius: 7px;
   background: transparent; color: var(--ink); font: inherit; font-weight: 600; font-size: var(--text-sm); cursor: pointer; flex: none;
@@ -234,6 +249,7 @@ body {
 .iconbtn .wait i { width: 8px; height: 8px; background: var(--paper); clip-path: polygon(50% 0, 100% 100%, 0 100%); display: inline-block; }
 .iconbtn .wait.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate-line); font-weight: 500; }
 .iconbtn .wait.unknown i { background: transparent; clip-path: none; border: 1.5px dotted var(--slate); border-radius: 50%; }
+/* 30px: the TopBar preview's .avatar size. */
 .avatar {
   width: 30px; height: 30px; border-radius: 50%; flex: none; background: var(--surface-2); border: 1px solid var(--rule-2);
   display: inline-flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2);
@@ -1398,18 +1414,41 @@ body {
 /* The top bar sheds its quiet parts before any control or any evidence age
    clips: the gaps tighten, then the key hint, the brand word and the Talk
    label go (each control keeps its accessible name), and the scope's id and
-   agent narrow with an ellipsis whose full text stays in the title. */
+   agent narrow with an ellipsis whose full text stays in the title.
+   The steps are measured, not derived. Stepping the viewport in 10px steps
+   with three fixture states (the default; the boot-time Unknown seal and
+   bell; a 24-character machine name with a 9999-day Attention seal and 140
+   waiting), the bar first clips or spills at 1290px with neither step, and
+   at 1230px with only the first. 1360px and 1240px are those two widths
+   plus a margin, so each step is in force before the bar needs it; with
+   both in force nothing clips from 1000px up. Below 1000px the widest
+   states still squeeze the scope past its floors (its own clip keeps the
+   caret off the search box); that range is the narrow layout's to solve. */
 @media (max-width: 1360px) {
   .topbar { gap: var(--space-2); padding: 0 var(--space-3); }
   .search kbd { display: none; }
   .scope .id { display: none; }
   .scope .sw-agent { max-width: 120px; }
 }
-@media (max-width: 1180px) {
+@media (max-width: 1240px) {
   .brand .brand-word { display: none; }
   .topbar .btn.btn-talk .btn-label { display: none; }
   .topbar .btn.btn-talk { padding: 0 var(--space-2); }
   .scope .sw-agent { max-width: 96px; }
+  /* The operator's initials are the quietest part of the bar (the operator
+     id is in its title only, and nothing is done with it), so they go
+     before the scope's machine name or agent label would ellipsize: in the
+     widest fixture state (a 9999-day Attention seal, 140 waiting) the scope
+     otherwise falls below its own text floors at 1024px. */
+  .topbar .avatar { display: none; }
+  /* Past that, a wider seal or bell can still leave the scope less room
+     than its text floors; the agent label, already ellipsized here, then
+     drops its 44px floor and gives way as far as it must (the menu names
+     the agent in full), so the machine name keeps its 6ch floor, a short
+     name stays whole, and the caret stays inside the trigger. A floor of
+     0 on the name instead lets flexbox shave a fraction of a pixel off it
+     and draw an ellipsis on a five-letter name. */
+  .scope .sw-agent { min-width: 0; }
   /* 104px: the 16px glyph, the 8px gap, 12px padding each side and the 1px
      borders (50px of chrome) plus the placeholder "Search" (about 50px at
      the body size), rounded up to a 4px step, so the placeholder never clips
