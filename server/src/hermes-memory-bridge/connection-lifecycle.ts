@@ -2,10 +2,10 @@ export const HERMES_MEMORY_DENIAL_MESSAGE = "Memory request denied.";
 
 // must match MAX_PUBLIC_CONNECTIONS in hermes-memory-relay/SEAM.md.
 export const HERMES_MAX_PUBLIC_CONNECTIONS = 4;
-// 4 = the settling reserve paired with the four relay-admitted public slots.
-export const HERMES_MAX_SETTLING_CALLS = HERMES_MAX_PUBLIC_CONNECTIONS;
-// 8 = four live connection call records plus four settling call records.
-export const HERMES_MAX_CALL_RECORDS = HERMES_MAX_PUBLIC_CONNECTIONS + HERMES_MAX_SETTLING_CALLS;
+// 4 = the settling reserve paired with the four relay-admitted public slots; no separate settling ceiling is enforced.
+export const HERMES_SETTLING_RESERVE = HERMES_MAX_PUBLIC_CONNECTIONS;
+// 8 = the single total cap enforced at call admission: four live slots plus the settling reserve of four.
+export const HERMES_MAX_CALL_RECORDS = HERMES_MAX_PUBLIC_CONNECTIONS + HERMES_SETTLING_RESERVE;
 
 export type HermesConnectionState =
   | "UNKNOWN"
@@ -38,6 +38,9 @@ export type HermesLifecycleEvent =
   | { type: "node_close"; connectionId: string; reason: HermesNodeCloseReason }
   | { type: "relay_shutdown_or_eof" };
 
+/**
+ * Actions are authorized only by the apply or release step that emitted them; callers write every emitted action in order and never re-check it against later state.
+ */
 export type HermesLifecycleAction =
   | { type: "send_close"; connectionId: string }
   | {
@@ -115,14 +118,12 @@ export type HermesClassifiedPublicFrame =
 
 interface ConnectionRow {
   state: Exclude<HermesConnectionState, "UNKNOWN">;
-  generation: number;
   currentRecordId?: string;
 }
 
 interface CallRecord {
   id: string;
   connectionId: string;
-  generation: number;
   requestId: string;
   kind: HermesCallKind;
   state: HermesCallRecordState;
@@ -157,7 +158,6 @@ export class HermesConnectionLifecycle {
   private readonly rows = new Map<string, ConnectionRow>();
   private readonly records = new Map<string, CallRecord>();
   private nextRecordNumber = 1;
-  private nextRowGeneration = 1;
   private stoppedFlag = false;
 
   get stopped(): boolean {
@@ -180,58 +180,11 @@ export class HermesConnectionLifecycle {
     return [...this.records.values()].map((record) => ({ ...record }));
   }
 
-  canWriteResponse(recordId: string): boolean {
-    if (this.stoppedFlag) return false;
-    const record = this.records.get(recordId);
-    if (record?.state !== "IN_FLIGHT") return false;
-    const row = this.rows.get(record.connectionId);
-    return this.isBusyState(row?.state) && row.currentRecordId === recordId && row.generation === record.generation;
-  }
-
-  canSendClose(connectionId: string): boolean {
-    if (this.stoppedFlag) return false;
-    const state = this.rows.get(connectionId)?.state;
-    return state === "OPEN_IDLE" || state === "OPEN_BUSY" || state === "OPEN_IDLE_PEER_SHUTTING" || state === "OPEN_BUSY_PEER_SHUTTING";
-  }
-
-  canSendLifecycleAction(action: HermesLifecycleAction): boolean {
-    if (this.stoppedFlag) return false;
-    switch (action.type) {
-      case "route_call": {
-        const record = this.records.get(action.recordId);
-        const row = record === undefined ? undefined : this.rows.get(record.connectionId);
-        return (
-          record?.state === "IN_FLIGHT" &&
-          record.connectionId === action.connectionId &&
-          record.requestId === action.requestId &&
-          record.kind === action.kind &&
-          this.isBusyState(row?.state) &&
-          row.currentRecordId === record.id &&
-          row.generation === record.generation
-        );
-      }
-      case "deliver_control": {
-        const record = this.records.get(action.recordId);
-        return (
-          record?.state === "IN_FLIGHT" &&
-          record.connectionId === action.connectionId &&
-          record.requestId === action.requestId &&
-          ((action.control === "cancel" && record.pendingCancel) || (action.control === "shutdown" && record.pendingShutdown))
-        );
-      }
-      case "send_fixed_denial": {
-        const state = this.stateOf(action.connectionId);
-        return !this.records.has(action.recordId) && (state === "OPEN_IDLE" || state === "OPEN_IDLE_PEER_SHUTTING");
-      }
-      case "send_close":
-        return this.canSendClose(action.connectionId);
-    }
-  }
-
   apply(event: HermesLifecycleEvent): HermesLifecycleResult {
     if (event.type === "relay_shutdown_or_eof") {
       return this.applyRelayShutdownOrEof();
     }
+    // The stopped gate is the per-connection lifecycle boundary: after relay shutdown no later row event emits Node output.
     if (this.stoppedFlag) return { actions: [] };
 
     const state = this.stateOf(event.connectionId);
@@ -269,12 +222,12 @@ export class HermesConnectionLifecycle {
   private state_UNKNOWN(event: Exclude<HermesLifecycleEvent, { type: "relay_shutdown_or_eof" }>): HermesLifecycleResult {
     switch (event.type) {
       case "accepted":
-        // A deleted row leaves no tombstone; generations keep any older call record from attaching to the new row.
         if (this.liveCount >= HERMES_MAX_PUBLIC_CONNECTIONS) {
           return this.fatal(event.connectionId, "too_many_live");
         }
         // NODE_CLOSED and peer-shutting rows count as live until relay_closed because the relay still owns their public slot.
-        this.rows.set(event.connectionId, { state: "OPEN_IDLE", generation: this.nextRowGeneration++ });
+        // Record ids are never reused, and only the admitting step sets a row's current record to the record it just minted.
+        this.rows.set(event.connectionId, { state: "OPEN_IDLE" });
         return { actions: [] };
       case "relay_closed":
         return this.fatal(event.connectionId, "closed_for_unknown_or_duplicate");
@@ -302,19 +255,16 @@ export class HermesConnectionLifecycle {
       case "control_invalid":
         return { actions: [] };
       case "public_shutdown":
-        this.requireRow(event.connectionId).state = "OPEN_IDLE_PEER_SHUTTING";
-        return { actions: [] };
+        return this.updateRowState(event.connectionId, "OPEN_IDLE_PEER_SHUTTING");
       case "public_unparseable":
-        this.requireRow(event.connectionId).state = "NODE_CLOSED";
-        return { actions: [{ type: "send_close", connectionId: event.connectionId }] };
+        return this.sendCloseFromIdle(event.connectionId);
       case "relay_closed":
         this.rows.delete(event.connectionId);
         return { actions: [] };
       case "node_response_written":
         return this.refusal(event.connectionId, "no_current_record");
       case "node_close":
-        this.requireRow(event.connectionId).state = "NODE_CLOSED";
-        return { actions: [{ type: "send_close", connectionId: event.connectionId }] };
+        return this.sendCloseFromIdle(event.connectionId);
     }
   }
 
@@ -327,14 +277,13 @@ export class HermesConnectionLifecycle {
       case "cancel":
         return this.deliverCancel(event.connectionId, event.mcpRequestId);
       case "public_shutdown":
-        this.requireRow(event.connectionId).state = "OPEN_BUSY_PEER_SHUTTING";
-        return this.deliverShutdown(event.connectionId);
+        return this.markBusyPeerShuttingAndDeliverShutdown(event.connectionId);
       case "public_unparseable":
         return this.closeBusyConnection(event.connectionId);
       case "control_invalid":
         return { actions: [] };
       case "relay_closed":
-        this.finishCurrentRecord(this.requireRow(event.connectionId), "CONNECTION_GONE");
+        this.finishCurrentRecord(event.connectionId, "CONNECTION_GONE");
         this.rows.delete(event.connectionId);
         return { actions: [] };
       case "node_response_written":
@@ -361,8 +310,7 @@ export class HermesConnectionLifecycle {
       case "node_response_written":
         return this.refusal(event.connectionId, "no_current_record");
       case "node_close":
-        this.requireRow(event.connectionId).state = "NODE_CLOSED";
-        return { actions: [{ type: "send_close", connectionId: event.connectionId }] };
+        return this.sendCloseFromIdle(event.connectionId);
     }
   }
 
@@ -379,7 +327,7 @@ export class HermesConnectionLifecycle {
         return this.fatal(event.connectionId, "event_after_peer_shutdown");
       case "relay_closed":
         // This is the expected arrival after peer shutdown; the call remains only as detached settling work.
-        this.finishCurrentRecord(this.requireRow(event.connectionId), "CONNECTION_GONE");
+        this.finishCurrentRecord(event.connectionId, "CONNECTION_GONE");
         this.rows.delete(event.connectionId);
         return { actions: [] };
       case "node_response_written":
@@ -411,9 +359,10 @@ export class HermesConnectionLifecycle {
   }
 
   private acceptCallFromIdle(event: Extract<HermesLifecycleEvent, { type: "call" }>): HermesLifecycleResult {
-    const row = this.requireRow(event.connectionId);
+    const row = this.rowForKnownConnection(event.connectionId);
+    if (row === undefined) return this.fatal(event.connectionId, "unknown_connection");
     const record = this.newRecord(event);
-    // The record cap is checked before row mutation, so an over-cap call gets exactly one denial and leaves no retained record.
+    // The single total record cap is checked before row mutation, so an over-cap call gets exactly one denial and leaves no retained record.
     if (this.records.size >= HERMES_MAX_CALL_RECORDS) {
       return {
         actions: [this.fixedDenialAction(record, "immediate")],
@@ -427,18 +376,20 @@ export class HermesConnectionLifecycle {
       };
     }
     row.state = "OPEN_BUSY";
+    // The admitting step is the only path that points a row at a current record, and it points only at the record it just minted.
     row.currentRecordId = record.id;
     this.records.set(record.id, record);
     return { actions: [{ type: "route_call", connectionId: record.connectionId, recordId: record.id, requestId: record.requestId, kind: record.kind }] };
   }
 
   private responseWritten(connectionId: string, recordId: string): HermesLifecycleResult {
-    const row = this.requireRow(connectionId);
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return this.refusal(connectionId, "record_not_current");
     const currentRecordId = row.currentRecordId;
     if (currentRecordId === undefined) return this.refusal(connectionId, "no_current_record");
     if (recordId !== currentRecordId) return this.refusal(connectionId, "record_not_current");
     const record = this.records.get(currentRecordId);
-    if (record?.state !== "IN_FLIGHT" || record.generation !== row.generation) return this.refusal(connectionId, "record_not_current");
+    if (record?.state !== "IN_FLIGHT") return this.refusal(connectionId, "record_not_current");
     record.state = "RESPONDED";
     this.records.delete(currentRecordId);
     row.state = row.state === "OPEN_BUSY_PEER_SHUTTING" ? "OPEN_IDLE_PEER_SHUTTING" : "OPEN_IDLE";
@@ -447,17 +398,19 @@ export class HermesConnectionLifecycle {
   }
 
   private deliverCancel(connectionId: string, mcpRequestId: string): HermesLifecycleResult {
-    const row = this.requireRow(connectionId);
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return { actions: [] };
     const record = row.currentRecordId === undefined ? undefined : this.records.get(row.currentRecordId);
     // A cancel carries the caller's request id; mismatches are not authority over the current call.
-    if (record?.state !== "IN_FLIGHT" || record.requestId !== mcpRequestId || record.generation !== row.generation) return { actions: [] };
+    if (record?.state !== "IN_FLIGHT" || record.requestId !== mcpRequestId) return { actions: [] };
     return this.deliverCoalescedControl(record, "cancel", "pendingCancel");
   }
 
   private deliverShutdown(connectionId: string): HermesLifecycleResult {
-    const row = this.requireRow(connectionId);
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return { actions: [] };
     const record = row.currentRecordId === undefined ? undefined : this.records.get(row.currentRecordId);
-    if (record?.state !== "IN_FLIGHT" || record.generation !== row.generation) return { actions: [] };
+    if (record?.state !== "IN_FLIGHT") return { actions: [] };
     return this.deliverCoalescedControl(record, "shutdown", "pendingShutdown");
   }
 
@@ -478,8 +431,9 @@ export class HermesConnectionLifecycle {
   }
 
   private closeBusyConnection(connectionId: string): HermesLifecycleResult {
-    const row = this.requireRow(connectionId);
-    this.finishCurrentRecord(row, "CLOSED_BY_NODE");
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return { actions: [] };
+    this.finishCurrentRecord(connectionId, "CLOSED_BY_NODE");
     row.state = "NODE_CLOSED";
     return { actions: [{ type: "send_close", connectionId }] };
   }
@@ -490,7 +444,7 @@ export class HermesConnectionLifecycle {
     this.stoppedFlag = true;
     const actions: HermesLifecycleAction[] = [];
     for (const record of this.records.values()) {
-      // E9 reaches current and detached records; a prior shutdown delivery is coalesced but the terminal state is unified.
+      // Relay shutdown or EOF reaches current and detached records; a prior shutdown delivery is coalesced but the terminal state is unified.
       if (!record.pendingShutdown) {
         actions.push({
           type: "deliver_control",
@@ -506,21 +460,21 @@ export class HermesConnectionLifecycle {
     return { actions };
   }
 
-  private finishCurrentRecord(row: ConnectionRow, state: "CLOSED_BY_NODE" | "CONNECTION_GONE"): void {
+  private finishCurrentRecord(connectionId: string, state: "CLOSED_BY_NODE" | "CONNECTION_GONE"): void {
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return;
     const recordId = row.currentRecordId;
     if (recordId === undefined) return;
     const record = this.records.get(recordId);
-    if (record?.state === "IN_FLIGHT" && record.generation === row.generation) record.state = state;
+    if (record?.state === "IN_FLIGHT") record.state = state;
     delete row.currentRecordId;
   }
 
   private newRecord(event: Extract<HermesLifecycleEvent, { type: "call" }>): CallRecord {
     const id = `call-${this.nextRecordNumber++}`;
-    const row = this.requireRow(event.connectionId);
     return {
       id,
       connectionId: event.connectionId,
-      generation: row.generation,
       requestId: event.requestId,
       kind: event.kind,
       state: "IN_FLIGHT",
@@ -544,10 +498,29 @@ export class HermesConnectionLifecycle {
     return state === "OPEN_BUSY" || state === "OPEN_BUSY_PEER_SHUTTING";
   }
 
-  private requireRow(connectionId: string): ConnectionRow {
-    const row = this.rows.get(connectionId);
-    if (row === undefined) throw new Error(`missing Hermes lifecycle row for ${connectionId}`);
-    return row;
+  private rowForKnownConnection(connectionId: string): ConnectionRow | undefined {
+    return this.rows.get(connectionId);
+  }
+
+  private updateRowState(connectionId: string, state: ConnectionRow["state"]): HermesLifecycleResult {
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return this.fatal(connectionId, "unknown_connection");
+    row.state = state;
+    return { actions: [] };
+  }
+
+  private sendCloseFromIdle(connectionId: string): HermesLifecycleResult {
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return { actions: [] };
+    row.state = "NODE_CLOSED";
+    return { actions: [{ type: "send_close", connectionId }] };
+  }
+
+  private markBusyPeerShuttingAndDeliverShutdown(connectionId: string): HermesLifecycleResult {
+    const row = this.rowForKnownConnection(connectionId);
+    if (row === undefined) return { actions: [] };
+    row.state = "OPEN_BUSY_PEER_SHUTTING";
+    return this.deliverShutdown(connectionId);
   }
 
   private fatal(connectionId: string, reason: HermesFatalReason): HermesLifecycleResult {

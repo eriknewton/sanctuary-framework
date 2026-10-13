@@ -191,16 +191,18 @@ class NodeModel {
     const work = this.works.get(id);
     if (work === undefined) return;
     this.works.delete(id);
-    if (!viaRelease && this.lc.canWriteResponse(id)) {
-      this.send({ t: "response", c: work.c, rid: work.rid });
-      this.apply({ type: "node_response_written", connectionId: work.c, recordId: id });
+    if (!viaRelease && !this.lc.stopped) {
+      const written = this.lc.apply({ type: "node_response_written", connectionId: work.c, recordId: id });
+      if (written.fatal === undefined && written.refusal === undefined) this.send({ t: "response", c: work.c, rid: work.rid });
+      this.act(written.actions);
     }
     this.act(this.lc.release(id).actions);
   }
 
   nodeClose(connectionId: string): void {
-    if (this.lc.stopped || !this.lc.canSendClose(connectionId)) return;
-    this.apply({ type: "node_close", connectionId, reason: "private_cap_overflow" });
+    if (this.lc.stopped) return;
+    const closed = this.lc.apply({ type: "node_close", connectionId, reason: "private_cap_overflow" });
+    this.act(closed.actions);
   }
 }
 
