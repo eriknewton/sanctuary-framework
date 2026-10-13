@@ -1,6 +1,13 @@
 // Must match the fixed denial text in hermes-memory-relay/SEAM.md.
 export const HERMES_MEMORY_DENIAL = "Memory request denied.";
 
+// Must match MAX_PUBLIC_CONNECTIONS in hermes-memory-relay/SEAM.md.
+export const HERMES_MAX_PUBLIC_CONNECTIONS = 4;
+// 4 = the settling reserve paired with the four relay-admitted public slots; no separate settling ceiling is enforced.
+export const HERMES_SETTLING_RESERVE = HERMES_MAX_PUBLIC_CONNECTIONS;
+// 8 = the single total cap enforced at call admission: four live slots plus the settling reserve of four.
+export const HERMES_MAX_CALL_RECORDS = HERMES_MAX_PUBLIC_CONNECTIONS + HERMES_SETTLING_RESERVE;
+
 // Must match MAX_PUBLIC_FRAME_BYTES in hermes-memory-relay/SEAM.md.
 export const MAX_PUBLIC_FRAME_BYTES = 65_536;
 // Must match MAX_RESULT_FRAME_BYTES in hermes-memory-relay/SEAM.md.
