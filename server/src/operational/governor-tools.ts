@@ -99,7 +99,7 @@ export function createGovernorTools(
         "Reset all Call Governor counters: volume window, per-tool rate " +
         "windows, duplicate cache, and lifetime counter. This clears the " +
         "hard stop if the lifetime limit was reached. " +
-        "This is a Tier 1 operation — requires human approval because it " +
+        "This is a Tier 1 operation: it requires human approval because it " +
         "removes all runtime governance state and could allow previously " +
         "blocked behavior to resume.",
       inputSchema: {

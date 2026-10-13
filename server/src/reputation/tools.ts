@@ -554,7 +554,8 @@ export function createReputationTools(
         "Export a portable reputation bundle (SANCTUARY_REP_V1). " +
         "Includes signed attestations plus a signed completeness manifest for the exported set. " +
         "On reputation_import, the manifest verifies that the bundle body still matches the export scope and rejects dropped or changed attestations within that scope. " +
-        "It does not prove the export is the agent's complete lifetime history or that data outside the chosen export scope should have been included.",
+        "It does not prove the export is the agent's complete lifetime history or that data outside the chosen export scope should have been included. " +
+        "Tier 1: requires operator approval, because the bundle leaves the local store.",
       inputSchema: {
         type: "object",
         properties: {
@@ -636,7 +637,8 @@ export function createReputationTools(
         "Manifest, count, checksum, signature, or newer-schema mismatches are rejected without crediting any attestations. " +
         "The verification proves the bundle body still matches the export scope; it does not prove a complete lifetime history. " +
         "Manifestless legacy bundles are rejected unless allow_unverified_legacy is true, and that import result is flagged unverified-completeness-legacy-bundle. " +
-        "Policy-rated concordia-bridge attestations also require matching local bridge commitments; untagged legacy bridge metrics are rejected.",
+        "Policy-rated concordia-bridge attestations also require matching local bridge commitments; untagged legacy bridge metrics are rejected. " +
+        "Tier 1: requires operator approval, because it injects external trust.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1004,7 +1006,8 @@ export function createReputationTools(
       name: "bootstrap_provide_guarantee",
       description:
         "A principal provides a signed reputation guarantee for a new agent. " +
-        "The guarantee certificate can be presented to counterparties.",
+        "The guarantee certificate can be presented to counterparties. " +
+        "Tier 1: requires operator approval, because the principal is vouching with its signed reputation.",
       inputSchema: {
         type: "object",
         properties: {

@@ -287,7 +287,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       "rest under your operator keys, secret-gated at write time, and audited. " +
       "This is a passage store: flat text plus tags, with no in-place edit " +
       "(insert and delete only). Retrieval IQ (embeddings, ranking) stays in a " +
-      "swappable engine; this is the sovereign custody layer underneath it.",
+      "swappable engine; this is the sovereign custody layer underneath it. " +
+      "Tier 1 under the default policy: requires operator approval for each insert.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -520,7 +521,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     name: "memory_list",
     description:
       "List passages in your sovereign memory vault in stable id order, with optional " +
-      "cursor pagination (pass the last seen passage_id as `after`).",
+      "cursor pagination (pass the last seen passage_id as `after`)." +
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -564,7 +566,9 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
   // -- memory_count (read) ------------------------------------------------------
   const memoryCount: ToolDefinition = {
     name: "memory_count",
-    description: "Count the passages in your sovereign memory vault (this owner scope).",
+    description:
+      "Count the passages in your sovereign memory vault (this owner scope)." +
+      " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
     tool_class: "read",
     inputSchema: { type: "object", properties: {} },
     handler: async () => {

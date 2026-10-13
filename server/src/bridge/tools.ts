@@ -1065,7 +1065,7 @@ export function createBridgeTools(
         "the canonical outcome (hiding + binding), an Ed25519 signature by the " +
         "committer's identity, and an optional Pedersen commitment on the round " +
         "count for zero-knowledge range proofs. This is the Sanctuary side of the " +
-        "Concordia bridge — call this when a Concordia `accept` fires.",
+        "Concordia bridge: call this when a Concordia `accept` fires.",
       inputSchema: {
         type: "object",
         properties: {
