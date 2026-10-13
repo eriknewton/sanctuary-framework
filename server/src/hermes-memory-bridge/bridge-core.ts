@@ -68,8 +68,9 @@ import {
 
 export type HermesTimerHandle = object;
 
-// The bridge pins the class because the client is the untrusted agent; the client's field is accepted for wire compatibility and never consumed.
+// The bridge pins the class because the client is the untrusted agent; the client taint field is validated at the wire and never forwarded to the adapter.
 const BRIDGE_PINNED_MEMORY_TAINT: PersistableTaint = "user_content";
+const TIMER_CLEAR_STOP_RETRY_ATTEMPTS = 2; // Two stop-path retries cover the cleanup pass and one retained-handle confirmation after the first clear failure.
 
 export interface HermesApprovalPromptSummary {
   readonly entryId: string;
@@ -184,6 +185,7 @@ export class HermesBridgeCore {
   private slot: InsertSlot | undefined;
   private nextEntryNumber = 1;
   private stopped = false;
+  private stopCause: HermesBridgeStopCause | undefined;
   private fatalBridgeFlag = false;
   private drainedFlag = false;
   private drainQueued = false;
@@ -276,6 +278,7 @@ export class HermesBridgeCore {
   snapshot() {
     return {
       stopped: this.stopped,
+      stopCause: this.stopCause,
       fatalBridge: this.fatalBridgeFlag,
       drained: this.drainedFlag,
       lifecycle: {
@@ -511,7 +514,10 @@ export class HermesBridgeCore {
       released: false,
     };
     const nowMs = this.nowMsOrStop();
-    if (nowMs === undefined) return;
+    if (nowMs === undefined) {
+      this.releaseRecord(action.recordId);
+      return;
+    }
     const admitted = this.ledger.admit(entryId, action.connectionId, action.recordId, textSha256, nowMs);
     if (admitted.refusal !== undefined) {
       const message = admitted.refusal === "latched" || admitted.refusal === "stopped"
@@ -752,6 +758,10 @@ export class HermesBridgeCore {
       tags: slot.tags,
     };
     queueMicrotask(() => {
+      const liveEntry = this.ledger.snapshot().entry;
+      if (this.stopped || this.slot?.entryId !== entryId || liveEntry?.id !== entryId || liveEntry.state !== "PENDING") {
+        return;
+      }
       try {
         this.ports.ownerSurface.promptOwner(entryId, summary);
       } catch {
@@ -812,6 +822,7 @@ export class HermesBridgeCore {
 
   private stop(_cause: HermesBridgeStopCause): void {
     if (this.stopped) return;
+    this.stopCause = _cause;
     this.stopped = true;
     const lifecycleResult = this.lifecycle.apply({ type: "relay_shutdown_or_eof" });
     this.performWaiterResult(this.waiter.stop());
@@ -874,23 +885,29 @@ export class HermesBridgeCore {
     if (slot === undefined) return;
     const liveEntryId = this.ledger.snapshot().entry?.id;
     if (liveEntryId === slot.entryId || slot.insertInFlight) return;
-    this.clearSlotTimers(slot);
+    const timersCleared = this.clearSlotTimers(slot);
     slot.durability.clear();
     if (!slot.released) {
       slot.released = true;
       this.releaseRecord(slot.recordId);
     }
+    if (!timersCleared) {
+      this.maybeQueueDrained();
+      return;
+    }
     this.slot = undefined;
     this.maybeQueueDrained();
   }
 
-  private clearSlotTimers(slot: InsertSlot): void {
+  private clearSlotTimers(slot: InsertSlot): boolean {
+    let cleared = true;
     if (slot.deadlineTimer !== undefined) {
-      this.clearSlotTimer(slot, "deadlineTimer");
+      cleared = this.clearSlotTimer(slot, "deadlineTimer") && cleared;
     }
     if (slot.probeTimer !== undefined) {
-      this.clearSlotTimer(slot, "probeTimer");
+      cleared = this.clearSlotTimer(slot, "probeTimer") && cleared;
     }
+    return cleared;
   }
 
   private nowMsOrStop(): number | undefined {
@@ -913,18 +930,24 @@ export class HermesBridgeCore {
     }
   }
 
-  private clearSlotTimer(slot: InsertSlot, key: "deadlineTimer" | "probeTimer"): void {
+  private clearSlotTimer(slot: InsertSlot, key: "deadlineTimer" | "probeTimer"): boolean {
     const handle = slot[key];
-    if (handle === undefined) return;
-    try {
-      this.ports.clearTimer(handle);
-      slot[key] = undefined;
-    } catch {
-      if (!this.stopped) {
-        this.stop("write_failure");
-        this.endStep();
+    if (handle === undefined) return true;
+    const attempts = this.stopped ? TIMER_CLEAR_STOP_RETRY_ATTEMPTS : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        this.ports.clearTimer(handle);
+        slot[key] = undefined;
+        return true;
+      } catch {
+        if (!this.stopped) {
+          this.stop("write_failure");
+          this.endStep();
+          return slot[key] === undefined;
+        }
       }
     }
+    return false;
   }
 
   private notifyHookWaiters(): void {
@@ -945,7 +968,7 @@ export class HermesBridgeCore {
 
   private maybeQueueDrained(): void {
     if (!this.stopped || this.drainedFlag || this.drainQueued) return;
-    if (this.ledger.snapshot().entry !== undefined || this.slot?.insertInFlight === true) return;
+    if (this.ledger.snapshot().entry !== undefined || this.slot !== undefined) return;
     this.drainQueued = true;
     queueMicrotask(() => {
       this.drainQueued = false;
@@ -998,7 +1021,6 @@ function normalizeInsertArgs(args: HermesMemoryToolArguments): {
 }
 
 function normalizeGetArgs(args: HermesMemoryToolArguments): string | null {
-  if (Object.keys(args as Record<string, unknown>).some((key) => key !== "passage_id")) return null;
   if (!("passage_id" in args) || typeof args.passage_id !== "string") return null;
   return isSdwIdentifier(args.passage_id) ? args.passage_id : null;
 }

@@ -21,7 +21,7 @@ const SCHEDULE_COUNT = 3_000;
 const MAX_STEPS_PER_SCHEDULE = 80;
 
 type ConnectionState = "open" | "busy" | "shutting" | "nodeclosed" | "closed";
-type StopCause = "relay_shutdown" | "relay_eof" | "relay_fatal";
+type StopCause = "relay_shutdown" | "relay_eof" | "relay_fatal" | "write_failure";
 type AdapterOutcome = "success" | "partial" | "throw_after_allow";
 type AuditOutcome = "fulfilled" | "deferred" | "rejected";
 
@@ -45,6 +45,7 @@ interface Coverage {
   readonly stopCauses: Set<StopCause>;
   readonly auditOutcomes: Set<AuditOutcome>;
   readonly adapterOutcomes: Set<AdapterOutcome>;
+  readonly interleavings: Set<"shutdown_while_lock_parked" | "shutdown_while_durability_wait">;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -119,6 +120,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     stopCauses: new Set(),
     auditOutcomes: new Set(),
     adapterOutcomes: new Set(),
+    interleavings: new Set(),
   };
   const timers = new Map<HermesTimerHandle, { readonly ms: number; readonly fire: () => void; readonly entryId?: string }>();
   const store = new Map<string, MemoryPassage>();
@@ -134,6 +136,16 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   let nextConnection = 0;
   let nextRequest = 0;
   let stopped = false;
+  let now = 1_000;
+
+  const observeStop = (): void => {
+    const snapshot = core.snapshot();
+    if (snapshot.stopped && !stopped) {
+      stopped = true;
+      if (snapshot.stopCause !== undefined) coverage.stopCauses.add(snapshot.stopCause as StopCause);
+      markRefusal(snapshot.slot?.entryId, "stop");
+    }
+  };
 
   const markRefusal = (entryId: string | undefined, reason: string): void => {
     if (entryId === undefined) return;
@@ -147,6 +159,10 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     const request = entryRequests.get(entry.id);
     if (request?.connectionId !== connectionId) return;
     if (requestId !== undefined && request.requestId !== requestId) return;
+    if (reason === "peer_shutdown") {
+      if (locks.some((lock) => !lock.done)) coverage.interleavings.add("shutdown_while_lock_parked");
+      if (audits.some((audit) => audit.entryId === entry.id && !audit.cell.done)) coverage.interleavings.add("shutdown_while_durability_wait");
+    }
     markRefusal(entry.id, reason);
   };
 
@@ -154,6 +170,11 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     writeFrame(input) {
       if (input.type === "probe") {
         coverage.dispatchRows.add("send_probe");
+        if (random() < 0.02) {
+          coverage.stopCauses.add("write_failure");
+          markRefusal(core.snapshot().slot?.entryId, "stop");
+          throw new Error("probe write stopped");
+        }
         probes.push({ connectionId: input.connectionId, nonce: input.nonce, drop: random() < 0.1 });
         return;
       }
@@ -164,12 +185,12 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         return;
       }
       if (input.type === "close") {
-        coverage.dispatchRows.add("send_close");
+        coverage.dispatchRows.add("write_close");
         connection.state = "nodeclosed";
         delete connection.requestId;
         return;
       }
-      coverage.dispatchRows.add("response");
+      coverage.dispatchRows.add("write_response");
       const payload = responsePayload(input);
       if (payload.request_id !== input.requestId) violations.push("response request id mismatch");
       if (connection.state === "closed") violations.push("response after relay closed");
@@ -212,7 +233,10 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       );
       return cell.promise;
     },
-    nowMs: () => 1_000,
+    nowMs: () => {
+      now += 17;
+      return now;
+    },
     setTimer(ms, fire) {
       const handle = {};
       timers.set(handle, {
@@ -230,6 +254,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     },
     adapter: {
       async insertPassage(input: MemoryPassageInput): Promise<MemoryPassage> {
+        coverage.dispatchRows.add("adapter_insert");
         const lock = deferred<void>();
         locks.push(lock);
         const onAbort = () => lock.reject(new SdwValidationError("operation_aborted", "aborted"));
@@ -239,7 +264,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         abort.signal.removeEventListener("abort", onAbort);
         const id = input.passage_id ?? `p-${store.size + 1}`;
         const inserted = passage(id, input.text);
-        const before = core.snapshot();
         await core.commitCheck.assertAllowedToCommit({
           passageId: id,
           documentId: `mem.${id}`,
@@ -247,37 +271,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
           passageTextSha256: hermesBridgePassageTextDigest(input.text),
           getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(inserted),
         });
-        const entryId = before.slot?.entryId;
-        const entry = entryId === undefined ? undefined : before.ledger.entry;
-        if (
-          entryId === undefined ||
-          entry?.id !== entryId ||
-          entry.state !== "APPROVED" ||
-          !entry.started ||
-          entry.seen.cancel ||
-          entry.seen.deadline ||
-          entry.seen.deny ||
-          entry.seen.gone ||
-          entry.seen.stop ||
-          entry.seen.latch ||
-          before.ledger.latched ||
-          before.ledger.stopped ||
-          before.stopped ||
-          dispatchedRefusals.get(entryId)?.size
-        ) {
-          violations.push(`allow outside semantic predicate ${entryId ?? "missing"} ${JSON.stringify({
-            entryState: entry?.state,
-            started: entry?.started,
-            seen: entry?.seen,
-            latched: before.ledger.latched,
-            ledgerStopped: before.ledger.stopped,
-            stopped: before.stopped,
-            dispatched: [...(dispatchedRefusals.get(entryId ?? "") ?? [])],
-          })}`);
-        }
-        if (audits.some((audit) => audit.entryId === entryId && audit.state !== "fulfilled")) {
-          violations.push(`allow before durable audits ${entryId ?? "missing"}`);
-        }
         const outcome = random();
         if (outcome < 0.25) {
           coverage.adapterOutcomes.add("partial");
@@ -292,24 +285,79 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         return inserted;
       },
       getPassage(passageId) {
+        coverage.dispatchRows.add("adapter_get");
         const read = deferred<MemoryPassage | null>();
         reads.push(read);
         return read.promise.then((value) => value ?? store.get(passageId) ?? null);
       },
       async searchPassages(query): Promise<readonly MemorySearchResult[]> {
+        coverage.dispatchRows.add("adapter_search");
         return [...store.values()]
           .filter((entry) => entry.text.includes(query.text))
           .map((entry) => ({ passage: entry, match_count: 1 }));
       },
     },
-    ownerSurface: { promptOwner: () => undefined },
+    ownerSurface: { promptOwner: () => {
+      coverage.dispatchRows.add("prompt_owner");
+    } },
     abort,
   };
   core = new HermesBridgeCore(ports);
+  const ledger = (core as unknown as {
+    ledger: {
+      commitCheck: (entryId: string, input: {
+        readonly nowMs: number;
+        readonly recordCurrent: boolean;
+      }) => { readonly decision?: string };
+    };
+  }).ledger;
+  const originalCommitCheck = ledger.commitCheck.bind(ledger);
+  ledger.commitCheck = (entryId, input) => {
+    const before = core.snapshot();
+    const entry = before.ledger.entry?.id === entryId ? before.ledger.entry : undefined;
+    const dispatched = dispatchedRefusals.get(entryId) ?? new Set<string>();
+    const pendingAudit = audits.some((audit) => audit.entryId === entryId && audit.state !== "fulfilled");
+    const allowedNow = entry !== undefined &&
+      entry.state === "APPROVED" &&
+      entry.started &&
+      !entry.seen.cancel &&
+      !entry.seen.deadline &&
+      !entry.seen.deny &&
+      !entry.seen.gone &&
+      !entry.seen.stop &&
+      !entry.seen.latch &&
+      !before.ledger.latched &&
+      !before.ledger.stopped &&
+      !before.stopped &&
+      input.recordCurrent &&
+      input.nowMs < entry.deadlineAt &&
+      dispatched.size === 0 &&
+      !pendingAudit;
+    const result = originalCommitCheck(entryId, input);
+    if (result.decision === "allow" && !allowedNow) {
+      violations.push(`allow outside semantic predicate ${entryId} ${JSON.stringify({
+        entryState: entry?.state,
+        started: entry?.started,
+        seen: entry?.seen,
+        latched: before.ledger.latched,
+        ledgerStopped: before.ledger.stopped,
+        stopped: before.stopped,
+        recordCurrent: input.recordCurrent,
+        nowMs: input.nowMs,
+        deadlineAt: entry?.deadlineAt,
+        dispatched: [...dispatched],
+        pendingAudit,
+      })}`);
+    }
+    return result;
+  };
 
   const liveConnections = (): ConnectionModel[] => [...connections.values()].filter((connection) => connection.state !== "closed");
   const send = (frame: RelayToNodeFrame): void => {
-    if (!stopped) core.relayFrame(frame);
+    if (!stopped) {
+      core.relayFrame(frame);
+      observeStop();
+    }
   };
   const randomAwait = async (): Promise<void> => flush(Math.floor(random() * 9));
 
@@ -319,7 +367,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       actions.push(() => {
         const id = `c${++nextConnection}`;
         connections.set(id, { id, state: "open", answered: new Set() });
-        coverage.dispatchRows.add("accepted");
         send({ kind: "accepted", connectionId: id });
       });
     }
@@ -332,13 +379,10 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
           const draw = random();
           let payload: Record<string, unknown>;
           if (draw < 0.10) {
-            coverage.dispatchRows.add("route_hello");
             payload = { type: "hello", request_id: requestId, protocol_version: "2026-10-12", client_name: "client" };
           } else if (draw < 0.15) {
-            coverage.dispatchRows.add("route_tools_list");
             payload = { type: "tools_list", request_id: requestId };
           } else if (draw < 0.55) {
-            coverage.dispatchRows.add("route_insert");
             payload = {
               type: "tools_call",
               request_id: requestId,
@@ -346,10 +390,8 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
               arguments: { text: `bridge text ${seed} ${requestId}`, taint: "user_content", passage_id: `p-${seed}-${requestId}` },
             };
           } else if (draw < 0.78) {
-            coverage.dispatchRows.add("route_get");
             payload = { type: "tools_call", request_id: requestId, name: "memory_get", arguments: { passage_id: pick([...store.keys(), "missing"]) } };
           } else {
-            coverage.dispatchRows.add("route_search");
             payload = { type: "tools_call", request_id: requestId, name: "memory_search", arguments: { query: "bridge" } };
           }
           send(publicFrame(connection.id, payload));
@@ -361,33 +403,28 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       }
       if (connection.state === "busy") {
         actions.push(() => {
-          coverage.dispatchRows.add("deliver_cancel");
           markConnectionRefusal(connection.id, "cancel", connection.requestId);
           send(publicFrame(connection.id, { type: "cancel", mcp_request_id: connection.requestId }));
         });
       }
       if (connection.state === "open" || connection.state === "busy") {
         actions.push(() => {
-          coverage.dispatchRows.add("relay_closed");
           markConnectionRefusal(connection.id, "closed");
           connection.state = "closed";
           send({ kind: "closed", connectionId: connection.id });
         });
         actions.push(() => {
-          coverage.dispatchRows.add("deliver_shutdown");
           markConnectionRefusal(connection.id, "peer_shutdown");
           connection.state = "shutting";
           send(publicFrame(connection.id, { type: "shutdown" }));
         });
         actions.push(() => {
-          coverage.dispatchRows.add("public_unparseable");
           markConnectionRefusal(connection.id, "unparseable");
           send(publicFrame(connection.id, "{bad"));
         });
       }
       if (connection.state === "shutting" || connection.state === "nodeclosed") {
         actions.push(() => {
-          coverage.dispatchRows.add("relay_closed");
           connection.state = "closed";
           send({ kind: "closed", connectionId: connection.id });
         });
@@ -397,7 +434,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       actions.push(() => {
         const probe = probes.shift()!;
         if (!probe.drop) {
-          coverage.dispatchRows.add("probe_reply");
           send({ kind: "probe_reply", connectionId: probe.connectionId, nonce: probe.nonce });
         }
       });
@@ -405,13 +441,13 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     const entry = core.snapshot().ledger.entry;
     if (entry !== undefined && !stopped) {
       actions.push(() => {
-        coverage.dispatchRows.add("owner_approve");
         core.ownerApprove(entry.id, entry.textSha256);
+        observeStop();
       });
       actions.push(() => {
-        coverage.dispatchRows.add("owner_deny");
         markRefusal(entry.id, "deny");
         core.ownerDeny(entry.id);
+        observeStop();
       });
     }
     if (timers.size > 0) {
@@ -419,11 +455,14 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         const [handle, timer] = pick([...timers.entries()]);
         timers.delete(handle);
         if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
+          now += HERMES_APPROVAL_DEADLINE_MS + 1;
           coverage.dispatchRows.add("approval_timer_fire");
+          markRefusal(timer.entryId, "deadline");
         } else {
           coverage.dispatchRows.add("probe_timer_fire");
         }
         timer.fire();
+        observeStop();
       });
     }
     if (reads.some((read) => !read.done)) {
@@ -445,8 +484,13 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         coverage.stopCauses.add(cause);
         markRefusal(core.snapshot().slot?.entryId, "stop");
         if (cause === "relay_shutdown") send({ kind: "relay_shutdown" });
-        else if (cause === "relay_eof") core.relayEof();
-        else core.relayFatal("fatal");
+        else if (cause === "relay_eof") {
+          core.relayEof();
+          observeStop();
+        } else {
+          core.relayFatal("fatal");
+          observeStop();
+        }
         stopped = true;
       });
     }
@@ -493,7 +537,15 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     }
     for (const [handle, timer] of [...timers.entries()]) {
       timers.delete(handle);
+      if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
+        now += HERMES_APPROVAL_DEADLINE_MS + 1;
+        coverage.dispatchRows.add("approval_timer_fire");
+        markRefusal(timer.entryId, "deadline");
+      } else {
+        coverage.dispatchRows.add("probe_timer_fire");
+      }
       timer.fire();
+      observeStop();
       changed = true;
       await flush(4);
     }
@@ -517,9 +569,20 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (core.snapshot().lifecycle.recordCount !== 0) violations.push(`records retained ${core.snapshot().lifecycle.recordCount}`);
     coverage.stopCauses.add("relay_shutdown");
     core.relayFrame({ kind: "relay_shutdown" });
+    observeStop();
   }
   await flush(40);
-  for (const [, timer] of [...timers.entries()]) timer.fire();
+  for (const [, timer] of [...timers.entries()]) {
+    if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
+      now += HERMES_APPROVAL_DEADLINE_MS + 1;
+      coverage.dispatchRows.add("approval_timer_fire");
+      markRefusal(timer.entryId, "deadline");
+    } else {
+      coverage.dispatchRows.add("probe_timer_fire");
+    }
+    timer.fire();
+    observeStop();
+  }
   timers.clear();
   await flush(40);
   const snapshot = core.snapshot();
@@ -538,6 +601,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
       stopCauses: new Set(),
       auditOutcomes: new Set(),
       adapterOutcomes: new Set(),
+      interleavings: new Set(),
     };
     const failures: string[] = [];
     for (let seed = 1; seed <= SCHEDULE_COUNT; seed += 1) {
@@ -547,36 +611,29 @@ describe("HermesBridgeCore schedule fuzz", () => {
       for (const cause of result.coverage.stopCauses) coverage.stopCauses.add(cause);
       for (const outcome of result.coverage.auditOutcomes) coverage.auditOutcomes.add(outcome);
       for (const outcome of result.coverage.adapterOutcomes) coverage.adapterOutcomes.add(outcome);
+      for (const interleaving of result.coverage.interleavings) coverage.interleavings.add(interleaving);
       if (result.violations.length > 0) failures.push(`seed ${seed}: ${result.violations.join(", ")}`);
     }
 
     expect(failures).toEqual([]);
     expect(coverage.terminals).toEqual(new Set(["CANCELED", "COMMITTED", "DENIED", "DISCONNECTED", "INDETERMINATE", "REFUSED", "TIMED_OUT"]));
-    expect(coverage.stopCauses).toEqual(new Set(["relay_eof", "relay_fatal", "relay_shutdown"]));
+    expect(coverage.stopCauses).toEqual(new Set(["relay_eof", "relay_fatal", "relay_shutdown", "write_failure"]));
     expect(coverage.auditOutcomes).toEqual(new Set(["deferred", "fulfilled", "rejected"]));
     expect(coverage.adapterOutcomes).toEqual(new Set(["partial", "success", "throw_after_allow"]));
     expect(coverage.dispatchRows).toEqual(new Set([
-      "accepted",
+      "adapter_get",
+      "adapter_insert",
+      "adapter_search",
       "approval_timer_armed",
       "approval_timer_fire",
       "audit",
-      "deliver_cancel",
-      "deliver_shutdown",
-      "owner_approve",
-      "owner_deny",
-      "probe_reply",
+      "prompt_owner",
       "probe_timer_armed",
       "probe_timer_fire",
-      "public_unparseable",
-      "relay_closed",
-      "response",
-      "route_get",
-      "route_hello",
-      "route_insert",
-      "route_search",
-      "route_tools_list",
-      "send_close",
       "send_probe",
+      "write_close",
+      "write_response",
     ]));
+    expect(coverage.interleavings).toEqual(new Set(["shutdown_while_lock_parked", "shutdown_while_durability_wait"]));
   }, 600_000);
 });

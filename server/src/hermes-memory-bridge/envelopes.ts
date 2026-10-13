@@ -168,6 +168,7 @@ export const HERMES_MEMORY_WIRE_SCHEMAS = Object.freeze({
       tags: stringArrayField,
       passage_id: stringField,
     }, ["tags", "passage_id"]),
+    // The closed memory_get schema is the only unknown-key refusal; parseToolArguments forwards only { passage_id } to the core.
     memory_get: schema(["passage_id"], { passage_id: stringField }),
     memory_search: schema([], {
       text: stringField,

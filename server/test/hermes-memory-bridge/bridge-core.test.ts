@@ -108,6 +108,7 @@ function makeHarness(options: {
   readonly ownerPromptApproves?: boolean;
   readonly throwPort?: "insert" | "get" | "search" | "setTimer" | "clearTimer" | "nowMs";
   readonly clearTimerFailures?: number;
+  readonly nowMsFailureCall?: number;
   readonly getExtraField?: boolean;
   readonly parkInsertLock?: boolean;
 } = {}) {
@@ -122,6 +123,7 @@ function makeHarness(options: {
   const insertLocks: Deferred<void>[] = [];
   const abort = new AbortController();
   let now = 1_000;
+  let nowCalls = 0;
   let core: HermesBridgeCore;
   let clearTimerFailures = options.clearTimerFailures ?? 0;
   let clearTimerAttempts = 0;
@@ -185,7 +187,9 @@ function makeHarness(options: {
       return options.stalledAudit === true ? new Promise(() => undefined) : Promise.resolve();
     },
     nowMs: () => {
+      nowCalls += 1;
       if (options.throwPort === "nowMs") throw new Error("clock port stopped");
+      if (options.nowMsFailureCall === nowCalls) throw new Error("clock port stopped");
       return now;
     },
     setTimer: (ms, fire) => {
@@ -193,8 +197,8 @@ function makeHarness(options: {
       return timers.setTimer(ms, fire);
     },
     clearTimer: (handle) => {
-      if (options.throwPort === "clearTimer") throw new Error("timer clear stopped");
       clearTimerAttempts += 1;
+      if (options.throwPort === "clearTimer") throw new Error("timer clear stopped");
       if (clearTimerFailures > 0) {
         clearTimerFailures -= 1;
         throw new Error("timer clear stopped");
@@ -381,16 +385,6 @@ describe("HermesBridgeCore", () => {
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
-  it("denies memory_get arguments with unknown keys before the adapter", () => {
-    const h = makeHarness({ throwPort: "get" });
-    accept(h.core);
-    memoryGet(h.core, "c1", "get-extra-key", { passage_id: "p1", include_text: true });
-
-    expect(responseFor(h.writes, "get-extra-key")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
-    expect(h.core.snapshot().stopped).toBe(false);
-    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
-  });
-
   it("keeps release-demo calls from exhausting the lifecycle record capacity", async () => {
     const h = makeHarness();
     for (let index = 1; index <= 8; index += 1) {
@@ -477,6 +471,20 @@ describe("HermesBridgeCore", () => {
     expect(h.store.size).toBe(0);
     expect(responseFor(h.writes, "big")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
     expect(terminalStates(h.audits)).toContain("REFUSED/commit_binding_mismatch");
+  });
+
+  it("records public shutdown on a waiting insert with the peer shutdown reason", async () => {
+    const h = makeHarness();
+    accept(h.core);
+    insert(h.core, "c1", "shutdown-before-start", "bridge text");
+    await h.tick();
+    h.core.relayFrame(relayFrame("c1", { type: "shutdown" }));
+    await h.tick(6);
+
+    expect(h.store.size).toBe(0);
+    expect(responseFor(h.writes, "shutdown-before-start")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(terminalStates(h.audits)).toContain("CANCELED/peer_shutdown");
+    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
   it("does not let a canceled read feed the live insert ledger", async () => {
@@ -802,12 +810,6 @@ describe("HermesBridgeCore", () => {
       accept(h.core);
       insert(h.core, "c1", "throw-set-timer", "bridge text");
     }],
-    ["clearTimer", async (h: ReturnType<typeof makeHarness>) => {
-      accept(h.core);
-      insert(h.core, "c1", "throw-clear-timer", "bridge text");
-      await h.tick();
-      h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
-    }],
     ["nowMs", async (h: ReturnType<typeof makeHarness>) => {
       accept(h.core);
       h.core.relayFrame(relayFrame("c1", { type: "hello", request_id: "throw-clock", protocol_version: "2026-10-12", client_name: "client" }));
@@ -832,11 +834,23 @@ describe("HermesBridgeCore", () => {
 
     expect(h.audits.map((audit) => audit.kind)).toEqual(["created", "terminal"]);
     expect(terminalStates(h.audits)).toContain("REFUSED/stopped");
+    expect(h.ownerPrompts).toEqual([]);
+    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
+  });
+
+  it("releases the insert record when the admission clock fails", async () => {
+    const h = makeHarness({ nowMsFailureCall: 2 });
+    accept(h.core);
+    insert(h.core, "c1", "clock-admission", "bridge text");
+    await h.tick(8);
+
+    expect(h.core.snapshot().stopped).toBe(true);
+    expect(h.core.drained).toBe(true);
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
   it("retries a timer clear during stop and ignores a late fire after cleanup", async () => {
-    const h = makeHarness({ clearTimerFailures: 1 });
+    const h = makeHarness({ clearTimerFailures: 2 });
     accept(h.core);
     insert(h.core, "c1", "clear-retry", "bridge text");
     await h.tick();
@@ -845,7 +859,7 @@ describe("HermesBridgeCore", () => {
     h.core.ownerDeny(entry.id);
     await h.tick(8);
 
-    expect(h.clearTimerAttempts()).toBe(2);
+    expect(h.clearTimerAttempts()).toBe(3);
     expect(h.timers.live.size).toBe(0);
     expect(h.core.snapshot().stopped).toBe(true);
     expect(h.core.snapshot().slot).toBeUndefined();
@@ -853,6 +867,21 @@ describe("HermesBridgeCore", () => {
     lateFire();
     await h.tick(4);
     expect(h.writes.filter((frame) => frame.type === "response")).toHaveLength(responsesBeforeLateFire);
+  });
+
+  it("retains an uncleared timer when stop cleanup cannot clear it", async () => {
+    const h = makeHarness({ throwPort: "clearTimer" });
+    accept(h.core);
+    insert(h.core, "c1", "clear-retained", "bridge text");
+    await h.tick();
+    h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
+    await h.tick(8);
+
+    expect(h.clearTimerAttempts()).toBeGreaterThan(1);
+    expect(h.core.snapshot().stopCause).toBe("write_failure");
+    expect(h.core.snapshot().slot?.hasDeadlineTimer).toBe(true);
+    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
+    expect(h.core.drained).toBe(false);
   });
 
   it("runs multi-connection schedules against response, allow and drain oracles", async () => {
