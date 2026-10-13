@@ -46,7 +46,8 @@ interface Coverage {
   readonly auditOutcomes: Set<AuditOutcome>;
   readonly adapterOutcomes: Set<AdapterOutcome>;
   readonly interleavings: Set<"shutdown_while_lock_parked" | "shutdown_while_durability_wait">;
-  secondInsertAfterCommit: number;
+  randomPhaseSecondInsertAfterCommit: number;
+  scriptedPhaseSecondInsertAfterCommit: number;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -122,7 +123,8 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     auditOutcomes: new Set(),
     adapterOutcomes: new Set(),
     interleavings: new Set(),
-    secondInsertAfterCommit: 0,
+    randomPhaseSecondInsertAfterCommit: 0,
+    scriptedPhaseSecondInsertAfterCommit: 0,
   };
   const timers = new Map<HermesTimerHandle, { readonly ms: number; readonly fire: () => void; readonly entryId?: string }>();
   const store = new Map<string, MemoryPassage>();
@@ -144,6 +146,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   let nextRequest = 0;
   let stopped = false;
   let now = 1_000;
+  let insertCoveragePhase: "random" | "scripted" = "random";
 
   const observeStop = (): void => {
     const snapshot = core.snapshot();
@@ -293,7 +296,10 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         if (outcome === "throw_after_allow") {
           throw new Error("after allow");
         }
-        if (store.size > 0) coverage.secondInsertAfterCommit += 1;
+        if (store.size > 0) {
+          if (insertCoveragePhase === "scripted") coverage.scriptedPhaseSecondInsertAfterCommit += 1;
+          else coverage.randomPhaseSecondInsertAfterCommit += 1;
+        }
         store.set(id, inserted);
         return inserted;
       },
@@ -511,6 +517,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
 
   const continueAfterCommit = async (): Promise<void> => {
     if (store.size === 0 || stopped || core.snapshot().ledger.entry !== undefined) return;
+    insertCoveragePhase = "scripted";
     const connectionId = `c${++nextConnection}`;
     const requestId = `r${++nextRequest}`;
     connections.set(connectionId, { id: connectionId, state: "open", answered: new Set() });
@@ -607,6 +614,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   }
 
   await continueAfterCommit();
+  insertCoveragePhase = "random";
   await flush(30);
   for (const connection of connections.values()) {
     if (connection.state === "busy" && connection.requestId !== undefined && !stopped) {
@@ -658,7 +666,8 @@ describe("HermesBridgeCore schedule fuzz", () => {
       auditOutcomes: new Set(),
       adapterOutcomes: new Set(),
       interleavings: new Set(),
-      secondInsertAfterCommit: 0,
+      randomPhaseSecondInsertAfterCommit: 0,
+      scriptedPhaseSecondInsertAfterCommit: 0,
     };
     const failures: string[] = [];
     for (let seed = 1; seed <= SCHEDULE_COUNT; seed += 1) {
@@ -669,7 +678,8 @@ describe("HermesBridgeCore schedule fuzz", () => {
       for (const outcome of result.coverage.auditOutcomes) coverage.auditOutcomes.add(outcome);
       for (const outcome of result.coverage.adapterOutcomes) coverage.adapterOutcomes.add(outcome);
       for (const interleaving of result.coverage.interleavings) coverage.interleavings.add(interleaving);
-      coverage.secondInsertAfterCommit += result.coverage.secondInsertAfterCommit;
+      coverage.randomPhaseSecondInsertAfterCommit += result.coverage.randomPhaseSecondInsertAfterCommit;
+      coverage.scriptedPhaseSecondInsertAfterCommit += result.coverage.scriptedPhaseSecondInsertAfterCommit;
       if (result.violations.length > 0) failures.push(`seed ${seed}: ${result.violations.join(", ")}`);
     }
 
@@ -678,7 +688,7 @@ describe("HermesBridgeCore schedule fuzz", () => {
     expect(coverage.stopCauses).toEqual(new Set(["relay_eof", "relay_fatal", "relay_shutdown", "write_failure"]));
     expect(coverage.auditOutcomes).toEqual(new Set(["deferred", "fulfilled", "rejected"]));
     expect(coverage.adapterOutcomes).toEqual(new Set(["partial", "success", "throw_after_allow"]));
-    expect(coverage.secondInsertAfterCommit).toBeGreaterThan(0);
+    expect(coverage.scriptedPhaseSecondInsertAfterCommit).toBeGreaterThan(0);
     expect(coverage.dispatchRows).toEqual(new Set([
       "adapter_get",
       "adapter_insert",

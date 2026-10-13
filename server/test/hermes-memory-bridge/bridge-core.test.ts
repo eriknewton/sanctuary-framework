@@ -355,6 +355,11 @@ function responseFor(writes: readonly NodeToRelayInput[], requestId: string): Re
   return responsePayloads(writes).find((payload) => payload.request_id === requestId);
 }
 
+function toolResultBody(response: Record<string, unknown> | undefined): Record<string, unknown> {
+  const payload = response?.payload as { readonly content?: Array<{ readonly text?: string }> } | undefined;
+  return JSON.parse(payload?.content?.[0]?.text ?? "{}") as Record<string, unknown>;
+}
+
 function terminalStates(audits: readonly HermesBridgeAuditRecord[]): string[] {
   return audits
     .filter((audit) => audit.kind === "terminal" && audit.state !== undefined)
@@ -663,6 +668,62 @@ describe("HermesBridgeCore", () => {
 
     expect(h.store.get("p-insert-live")?.text).toBe("bridge text");
     expect(responseFor(h.writes, "insert-live")).toMatchObject({ type: "result" });
+  });
+
+  it("serves committed reads while a later approved insert waits on durability", async () => {
+    const h = makeHarness({ deferredAudit: true });
+    accept(h.core, "c1");
+    insert(h.core, "c1", "first-visible", "first bridge passage");
+    await h.tick();
+    const firstEntry = h.core.snapshot().ledger.entry!;
+    h.core.ownerApprove(firstEntry.id, firstEntry.textSha256);
+    await h.tick(2);
+    const firstProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
+    h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: firstProbe.nonce });
+    for (let pass = 0; pass < 3; pass += 1) {
+      h.resolveAudits();
+      await h.tick(8);
+    }
+    expect(h.store.get("p-first-visible")?.text).toBe("first bridge passage");
+
+    accept(h.core, "c2");
+    insert(h.core, "c2", "second-visible", "second bridge passage");
+    await h.tick();
+    const secondEntry = h.core.snapshot().ledger.entry!;
+    h.core.ownerApprove(secondEntry.id, secondEntry.textSha256);
+    await h.tick(2);
+    const secondProbe = h.writes
+      .filter((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")
+      .at(-1)!;
+    h.core.relayFrame({ kind: "probe_reply", connectionId: "c2", nonce: secondProbe.nonce });
+    await h.tick(4);
+
+    expect(h.core.snapshot().slot?.durabilityPending).toBeGreaterThan(0);
+    expect(h.store.has("p-second-visible")).toBe(false);
+
+    accept(h.core, "c3");
+    memoryGet(h.core, "c3", "get-first-visible", { passage_id: "p-first-visible" });
+    h.pendingGets[0]?.resolve(null);
+    accept(h.core, "c4");
+    memorySearch(h.core, "c4", "search-first-visible");
+    await h.tick(8);
+
+    expect(toolResultBody(responseFor(h.writes, "get-first-visible"))).toMatchObject({
+      found: true,
+      passage: { passage_id: "p-first-visible", text: "first bridge passage" },
+    });
+    expect(toolResultBody(responseFor(h.writes, "search-first-visible"))).toMatchObject({
+      results: [{ passage: { passage_id: "p-first-visible" }, match_count: 1 }],
+    });
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      h.resolveAudits();
+      await h.tick(8);
+    }
+
+    expect(h.store.get("p-first-visible")?.text).toBe("first bridge passage");
+    expect(h.store.get("p-second-visible")?.text).toBe("second bridge passage");
+    expect(responseFor(h.writes, "second-visible")).toMatchObject({ type: "result" });
   });
 
   it("denies an adapter get result that carries non-public fields", async () => {
