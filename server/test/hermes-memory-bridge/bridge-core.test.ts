@@ -111,6 +111,7 @@ function makeHarness(options: {
   readonly nowMsFailureCall?: number;
   readonly getExtraField?: boolean;
   readonly parkInsertLock?: boolean;
+  readonly deferredSearch?: boolean;
 } = {}) {
   const timers = new ManualTimers();
   const writes: NodeToRelayInput[] = [];
@@ -120,6 +121,7 @@ function makeHarness(options: {
   const insertTaints: PersistableTaint[] = [];
   const store = new Map<string, MemoryPassage>();
   const pendingGets: Deferred<MemoryPassage | null>[] = [];
+  const pendingSearches: Deferred<readonly MemorySearchResult[]>[] = [];
   const insertLocks: Deferred<void>[] = [];
   const abort = new AbortController();
   let now = 1_000;
@@ -127,6 +129,7 @@ function makeHarness(options: {
   let core: HermesBridgeCore;
   let clearTimerFailures = options.clearTimerFailures ?? 0;
   let clearTimerAttempts = 0;
+  let releaseCalls = 0;
   const adapter: HermesBridgeMemoryAdapter = {
     insertPassage(input: MemoryPassageInput, taint: PersistableTaint): Promise<MemoryPassage> {
       if (options.throwPort === "insert") throw new Error("insert port stopped");
@@ -163,10 +166,16 @@ function makeHarness(options: {
     },
     searchPassages(query: MemorySearchQuery): Promise<readonly MemorySearchResult[]> {
       if (options.throwPort === "search") throw new Error("search port stopped");
-      return Promise.resolve([...store.values()]
+      const results = [...store.values()]
         .filter((entry) => entry.text.includes(query.text))
         .slice(0, query.limit ?? 10)
-        .map((entry) => ({ passage: entry, match_count: 1 })));
+        .map((entry) => ({ passage: entry, match_count: 1 }));
+      if (options.deferredSearch === true) {
+        const deferred = new Deferred<readonly MemorySearchResult[]>();
+        pendingSearches.push(deferred);
+        return deferred.promise;
+      }
+      return Promise.resolve(results);
     },
   };
   const ports: HermesBridgeCorePorts = {
@@ -218,6 +227,14 @@ function makeHarness(options: {
     abort,
   };
   core = new HermesBridgeCore(ports);
+  const lifecycle = (core as unknown as {
+    readonly lifecycle: { release(recordId: string): unknown };
+  }).lifecycle;
+  const originalRelease = lifecycle.release.bind(lifecycle);
+  lifecycle.release = (recordId: string) => {
+    releaseCalls += 1;
+    return originalRelease(recordId);
+  };
   return {
     core,
     timers,
@@ -228,9 +245,11 @@ function makeHarness(options: {
     insertTaints,
     store,
     pendingGets,
+    pendingSearches,
     insertLocks,
     abort,
     clearTimerAttempts: () => clearTimerAttempts,
+    releaseCalls: () => releaseCalls,
     resolveAudits() {
       for (const audit of pendingAudits.splice(0)) audit.resolve();
     },
@@ -286,6 +305,22 @@ function memorySearch(core: HermesBridgeCore, connectionId: string, requestId: s
     name: "memory_search",
     arguments: { query: "bridge" },
   }));
+}
+
+function unknownTool(core: HermesBridgeCore, connectionId: string, requestId: string): void {
+  const publicPayload = publicBytes({
+    type: "tools_call",
+    request_id: requestId,
+    name: "memory_delete",
+    arguments: {},
+  });
+  const parsed = parseRelayToNode(publicBytes({
+    type: "frame",
+    connection_id: connectionId,
+    frame_b64: Buffer.from(publicPayload).toString("base64"),
+  }));
+  if (parsed.kind !== "ok") throw new Error("private frame did not parse");
+  core.relayFrame(parsed.frame);
 }
 
 function responsePayloads(writes: readonly NodeToRelayInput[]): Record<string, unknown>[] {
@@ -348,19 +383,7 @@ describe("HermesBridgeCore", () => {
   it("denies non-catalog tool calls and releases the call record", () => {
     const h = makeHarness();
     accept(h.core);
-    const publicPayload = publicBytes({
-      type: "tools_call",
-      request_id: "missing-tool",
-      name: "memory_delete",
-      arguments: {},
-    });
-    const parsed = parseRelayToNode(publicBytes({
-      type: "frame",
-      connection_id: "c1",
-      frame_b64: Buffer.from(publicPayload).toString("base64"),
-    }));
-    if (parsed.kind !== "ok") throw new Error("private frame did not parse");
-    h.core.relayFrame(parsed.frame);
+    unknownTool(h.core, "c1", "missing-tool");
     for (let index = 1; index <= 60; index += 1) {
       h.core.relayFrame(relayFrame("c1", {
         type: "hello",
@@ -374,6 +397,116 @@ describe("HermesBridgeCore", () => {
     expect(responseFor(h.writes, "after-missing-60")).toMatchObject({ type: "result" });
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
+
+  it.each(([
+    ["hello", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      h.core.relayFrame(relayFrame("c1", { type: "hello", request_id: "hello-release", protocol_version: "2026-10-12", client_name: "client" }));
+    }],
+    ["tools_list", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      h.core.relayFrame(relayFrame("c1", { type: "tools_list", request_id: "tools-release" }));
+    }],
+    ["unknown tool denial", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      unknownTool(h.core, "c1", "unknown-release");
+    }, undefined, false],
+    ["rate-limit denial", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      for (let index = 1; index <= 61; index += 1) {
+        h.core.relayFrame(relayFrame("c1", {
+          type: "hello",
+          request_id: `rate-release-${index}`,
+          protocol_version: "2026-10-12",
+          client_name: "client",
+        }));
+      }
+    }],
+    ["memory_get ok", async (h: ReturnType<typeof makeHarness>) => {
+      h.store.set("p-get-release", passage("p-get-release", "bridge text"));
+      accept(h.core);
+      memoryGet(h.core, "c1", "get-release", { passage_id: "p-get-release" });
+      h.pendingGets[0]!.resolve(null);
+      await h.tick(4);
+    }],
+    ["memory_get bad args", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      memoryGet(h.core, "c1", "get-bad-release", { passage_id: "../bad" });
+    }],
+    ["memory_search ok", async (h: ReturnType<typeof makeHarness>) => {
+      h.store.set("p-search-release", passage("p-search-release", "bridge searchable text"));
+      accept(h.core);
+      memorySearch(h.core, "c1", "search-release");
+      h.core.relayFrame({ kind: "closed", connectionId: "c1" });
+      h.pendingSearches[0]!.resolve([{ passage: passage("p-search-release", "bridge searchable text"), match_count: 1 }]);
+      await h.tick(4);
+    }, { deferredSearch: true }],
+    ["memory_search adapter reject", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      memorySearch(h.core, "c1", "search-reject-release");
+      h.core.relayFrame({ kind: "closed", connectionId: "c1" });
+      h.pendingSearches[0]!.reject(new Error("search failed"));
+      await h.tick(4);
+    }, { deferredSearch: true }],
+    ["memory_search bad args", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      h.core.relayFrame(relayFrame("c1", {
+        type: "tools_call",
+        request_id: "search-bad-release",
+        name: "memory_search",
+        arguments: { query: "" },
+      }));
+    }],
+    ["memory_insert committed", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      insert(h.core, "c1", "insert-release", "bridge text");
+      await h.tick();
+      const entry = h.core.snapshot().ledger.entry!;
+      h.core.ownerApprove(entry.id, entry.textSha256);
+      await h.tick(2);
+      const probe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
+      h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: probe.nonce });
+      await h.tick(8);
+    }],
+    ["memory_insert bad args", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core);
+      insertWithArgs(h.core, "c1", "insert-bad-release", { text: "", taint: "user_content" });
+    }],
+    ["memory_insert admission latched", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core, "c1");
+      insert(h.core, "c1", "latch-source-release", "bridge text");
+      await h.tick(2);
+      accept(h.core, "c2");
+      insert(h.core, "c2", "latched-release", "later text");
+    }, { rejectAudit: true }],
+    ["memory_insert admission stopped", async (h: ReturnType<typeof makeHarness>) => {
+      const ledger = (h.core as unknown as { readonly ledger: { stop(): unknown } }).ledger;
+      ledger.stop();
+      accept(h.core);
+      insert(h.core, "c1", "stopped-release", "bridge text");
+    }],
+    ["memory_insert admission busy", async (h: ReturnType<typeof makeHarness>) => {
+      accept(h.core, "c1");
+      accept(h.core, "c2");
+      insert(h.core, "c1", "busy-source-release", "bridge text");
+      await h.tick();
+      insert(h.core, "c2", "busy-release", "later text");
+      await h.tick();
+      h.core.ownerDeny(h.core.snapshot().ledger.entry!.id);
+      await h.tick(4);
+    }],
+  ] as const).map(([name, run, options, expectReleaseCall = true]) => [name, run, options, expectReleaseCall] as const))(
+    "releases the lifecycle record after %s",
+    async (_name, run, options, expectReleaseCall) => {
+      const h = makeHarness(options);
+      const releaseCallsBefore = h.releaseCalls();
+      await run(h);
+      await h.tick(12);
+
+      if (expectReleaseCall !== false) expect(h.releaseCalls()).toBeGreaterThan(releaseCallsBefore);
+      expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
+    },
+  );
 
   it("denies memory_get arguments outside the passage id allowlist before the adapter", () => {
     const h = makeHarness({ throwPort: "get" });
@@ -627,6 +760,30 @@ describe("HermesBridgeCore", () => {
     expect(responseFor(h.writes, "peer-shutdown")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
     expect(h.writes.filter((frame) => frame.type === "probe")).toHaveLength(0);
     expect(terminalStates(h.audits)).toContain("REFUSED/probe_refused");
+  });
+
+  it("denies an insert when approval deadline fires before the clock reaches its boundary", async () => {
+    const h = makeHarness({ deferredAudit: true, parkInsertLock: true });
+    accept(h.core);
+    insert(h.core, "c1", "deadline-before-clock", "bridge text");
+    await h.tick();
+    const entry = h.core.snapshot().ledger.entry!;
+    h.core.ownerApprove(entry.id, entry.textSha256);
+    await h.tick(4);
+
+    expect(h.core.snapshot().slot?.insertInFlight).toBe(true);
+    h.timers.fireFirst();
+    h.insertLocks[0]!.resolve();
+    await h.tick(4);
+    const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
+    h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
+    h.resolveAudits();
+    await h.tick(12);
+
+    expect(h.store.size).toBe(0);
+    expect(responseFor(h.writes, "deadline-before-clock")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(terminalStates(h.audits)).toContain("TIMED_OUT/deadline");
+    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
   it("denies an insert when peer shutdown arrives during the durability wait", async () => {

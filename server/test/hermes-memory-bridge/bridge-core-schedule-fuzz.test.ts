@@ -113,6 +113,8 @@ function responsePayload(input: NodeToRelayInput): Record<string, unknown> {
 async function runSchedule(seed: number): Promise<{ readonly violations: readonly string[]; readonly coverage: Coverage }> {
   const random = rng(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
+  const adapterOutcomeOrder: readonly AdapterOutcome[] = ["partial", "throw_after_allow", "success"];
+  let adapterOutcomeCursor = seed % adapterOutcomeOrder.length;
   const violations: string[] = [];
   const coverage: Coverage = {
     terminals: new Set(),
@@ -128,7 +130,12 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   const probes: Array<{ readonly connectionId: string; readonly nonce: string; readonly drop: boolean }> = [];
   const reads: Array<Deferred<MemoryPassage | null>> = [];
   const locks: Array<Deferred<void>> = [];
-  const audits: Array<{ readonly entryId?: string; readonly cell: Deferred<void>; state: "pending" | "fulfilled" | "rejected" }> = [];
+  const audits: Array<{
+    readonly kind: HermesBridgeAuditRecord["kind"];
+    readonly entryId?: string;
+    readonly cell: Deferred<void>;
+    state: "pending" | "fulfilled" | "rejected";
+  }> = [];
   const entryRequests = new Map<string, { readonly connectionId: string; readonly requestId: string }>();
   const dispatchedRefusals = new Map<string, Set<string>>();
   const abort = new AbortController();
@@ -161,7 +168,9 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (requestId !== undefined && request.requestId !== requestId) return;
     if (reason === "peer_shutdown") {
       if (locks.some((lock) => !lock.done)) coverage.interleavings.add("shutdown_while_lock_parked");
-      if (audits.some((audit) => audit.entryId === entry.id && !audit.cell.done)) coverage.interleavings.add("shutdown_while_durability_wait");
+      if (audits.some((audit) => audit.kind === "commit_intent" && audit.entryId === entry.id && !audit.cell.done)) {
+        coverage.interleavings.add("shutdown_while_durability_wait");
+      }
     }
     markRefusal(entry.id, reason);
   };
@@ -171,8 +180,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       if (input.type === "probe") {
         coverage.dispatchRows.add("send_probe");
         if (random() < 0.02) {
-          coverage.stopCauses.add("write_failure");
-          markRefusal(core.snapshot().slot?.entryId, "stop");
           throw new Error("probe write stopped");
         }
         probes.push({ connectionId: input.connectionId, nonce: input.nonce, drop: random() < 0.1 });
@@ -206,7 +213,13 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
       coverage.dispatchRows.add("audit");
       if (record.kind === "terminal" && record.state !== undefined) coverage.terminals.add(record.state);
       const cell = deferred<void>();
-      const audit: { readonly entryId?: string; readonly cell: Deferred<void>; state: "pending" | "fulfilled" | "rejected" } = {
+      const audit: {
+        readonly kind: HermesBridgeAuditRecord["kind"];
+        readonly entryId?: string;
+        readonly cell: Deferred<void>;
+        state: "pending" | "fulfilled" | "rejected";
+      } = {
+        kind: record.kind,
         entryId: record.entryId,
         cell,
         state: "pending",
@@ -271,16 +284,15 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
           passageTextSha256: hermesBridgePassageTextDigest(input.text),
           getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(inserted),
         });
-        const outcome = random();
-        if (outcome < 0.25) {
-          coverage.adapterOutcomes.add("partial");
+        const outcome = adapterOutcomeOrder[adapterOutcomeCursor]!;
+        adapterOutcomeCursor = (adapterOutcomeCursor + 1) % adapterOutcomeOrder.length;
+        coverage.adapterOutcomes.add(outcome);
+        if (outcome === "partial") {
           throw new SdwValidationError("partial_scope", "partial");
         }
-        if (outcome < 0.40) {
-          coverage.adapterOutcomes.add("throw_after_allow");
+        if (outcome === "throw_after_allow") {
           throw new Error("after allow");
         }
-        coverage.adapterOutcomes.add("success");
         store.set(id, inserted);
         return inserted;
       },
@@ -455,7 +467,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
         const [handle, timer] = pick([...timers.entries()]);
         timers.delete(handle);
         if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-          now += HERMES_APPROVAL_DEADLINE_MS + 1;
+          if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
           coverage.dispatchRows.add("approval_timer_fire");
           markRefusal(timer.entryId, "deadline");
         } else {
@@ -481,7 +493,6 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     if (random() < 0.03) {
       actions.push(() => {
         const cause = random() < 0.34 ? "relay_shutdown" : random() < 0.67 ? "relay_eof" : "relay_fatal";
-        coverage.stopCauses.add(cause);
         markRefusal(core.snapshot().slot?.entryId, "stop");
         if (cause === "relay_shutdown") send({ kind: "relay_shutdown" });
         else if (cause === "relay_eof") {
@@ -499,11 +510,13 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
 
   for (let index = 0; index < MAX_STEPS_PER_SCHEDULE; index += 1) {
     await randomAwait();
+    observeStop();
     step();
   }
 
   for (let quiescencePass = 0; quiescencePass < 40; quiescencePass += 1) {
     await flush(12);
+    observeStop();
     let changed = false;
     while (probes.length > 0) {
       const probe = probes.shift()!;
@@ -538,7 +551,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     for (const [handle, timer] of [...timers.entries()]) {
       timers.delete(handle);
       if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-        now += HERMES_APPROVAL_DEADLINE_MS + 1;
+        if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
         coverage.dispatchRows.add("approval_timer_fire");
         markRefusal(timer.entryId, "deadline");
       } else {
@@ -567,14 +580,14 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
     }
     await flush(20);
     if (core.snapshot().lifecycle.recordCount !== 0) violations.push(`records retained ${core.snapshot().lifecycle.recordCount}`);
-    coverage.stopCauses.add("relay_shutdown");
     core.relayFrame({ kind: "relay_shutdown" });
     observeStop();
   }
   await flush(40);
+  observeStop();
   for (const [, timer] of [...timers.entries()]) {
     if (timer.ms === HERMES_APPROVAL_DEADLINE_MS) {
-      now += HERMES_APPROVAL_DEADLINE_MS + 1;
+      if (random() < 0.8) now += HERMES_APPROVAL_DEADLINE_MS + 1;
       coverage.dispatchRows.add("approval_timer_fire");
       markRefusal(timer.entryId, "deadline");
     } else {
@@ -585,6 +598,7 @@ async function runSchedule(seed: number): Promise<{ readonly violations: readonl
   }
   timers.clear();
   await flush(40);
+  observeStop();
   const snapshot = core.snapshot();
   if (!snapshot.drained) violations.push("not drained");
   if (snapshot.slot !== undefined) violations.push("slot retained");
