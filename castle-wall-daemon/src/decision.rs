@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
-pub(crate) use crate::admitted_identity::{AdmittedIdentity, AdmittedSubject};
+pub(crate) use crate::admitted_identity::{
+    AdmittedIdentity, AdmittedSubject, BootAdmittedIdentity,
+};
 use crate::audit::{AuditRingBuffer, WalError, WalWriter};
 use crate::failure::{default_disposition, FailureDisposition, FailureMode};
 use crate::manifest::canonical_json::CanonicalJsonError;
@@ -710,20 +712,19 @@ impl DecisionEngine {
                 }
             }
             Err(ManifestReloadAuthorizationError::Verify(err)) => {
-                if let Some((agent_uid, ceiling, gate_uid)) = err.boot_confined_subject() {
+                if let Some(boot_identity) =
+                    BootAdmittedIdentity::confined_scope_refusal(guard.expected_fortress_id(), err)
+                {
                     // The subject fields carry the pinned signing key's authenticated
                     // manifest claim: prepare_loaded already verified the signature,
                     // fortress id, high-water ordering and agent-origin derivation;
                     // only the scoped-rule admission failed, so arming this uid means
                     // kernel binding may confine it with no operator allow rules.
-                    AdmittedIdentity::boot_confined(
-                        guard.expected_fortress_id().to_string(),
-                        agent_uid,
-                        ceiling,
-                        gate_uid,
-                    )
+                    AdmittedIdentity::from_boot(boot_identity)
                 } else {
-                    AdmittedIdentity::boot_unconfined(self.fortress_id().to_string())
+                    AdmittedIdentity::from_boot(BootAdmittedIdentity::unconfined(
+                        self.fortress_id(),
+                    ))
                 }
             }
             Err(_) => return result,
@@ -867,13 +868,16 @@ impl DecisionEngine {
             ),
         };
 
-        let subject = match identity
-            .as_ref()
-            .ok()
-            .and_then(|identity| resolve_audit_subject(Some(identity), &request.agent_id))
-        {
-            Some(subject) => subject,
-            None => return Ok(self.unattributed_outcome()),
+        let subject = match identity {
+            Ok(identity) => match resolve_audit_subject(Some(&identity), &request.agent_id) {
+                Some(subject) => subject,
+                None => return Ok(self.unattributed_outcome()),
+            },
+            Err(_) => {
+                // `from_snapshot` is the only snapshot-field identity builder; a
+                // refused snapshot maps to Unattributed instead of rebuilding a subject.
+                return Ok(self.unattributed_outcome());
+            }
         };
 
         let timestamp_iso = current_timestamp_iso8601();
@@ -940,6 +944,9 @@ impl DecisionEngine {
                 let fail_closed_verdict = Verdict::Deny {
                     reason: DeniedReason::AuditWalAppendFailed,
                 };
+                // Both builders validate the same request field set; a rebuild
+                // over fields the first build accepted cannot fail, and an
+                // unreachable builder error maps to Err rather than substitute JSON.
                 let fail_closed_canonical_json = build_audit_event_canonical_json(
                     &fail_closed_verdict,
                     request,
@@ -1725,12 +1732,14 @@ mod armed_identity_tests {
 
     #[test]
     fn resolve_audit_subject_accepts_only_the_admitted_confined_uid_mark() {
-        let identity = AdmittedIdentity::boot_confined(
-            "0123456789abcdef".to_string(),
-            TEST_AGENT_UID,
-            FIXTURE_CEILING,
-            Some(TEST_AGENT_UID + 1),
-        );
+        let identity = AdmittedIdentity::from_snapshot(&PolicySnapshot {
+            fortress_id: "0123456789abcdef".to_string(),
+            confined_agent_uid: Some(TEST_AGENT_UID),
+            confined_agent_uid_ceiling: Some(FIXTURE_CEILING),
+            confined_gate_uid: Some(TEST_AGENT_UID + 1),
+            ..PolicySnapshot::default()
+        })
+        .expect("snapshot identity");
         let subject = resolve_audit_subject(
             Some(&identity),
             &crate::nftables::confined_agent_id(TEST_AGENT_UID),
@@ -1757,7 +1766,11 @@ mod armed_identity_tests {
             resolve_audit_subject(None, &crate::nftables::confined_agent_id(TEST_AGENT_UID))
                 .is_none()
         );
-        let unconfined = AdmittedIdentity::boot_unconfined("0123456789abcdef".to_string());
+        let unconfined = AdmittedIdentity::from_snapshot(&PolicySnapshot {
+            fortress_id: "0123456789abcdef".to_string(),
+            ..PolicySnapshot::default()
+        })
+        .expect("snapshot identity");
         assert!(resolve_audit_subject(
             Some(&unconfined),
             &crate::nftables::confined_agent_id(TEST_AGENT_UID)
@@ -2070,7 +2083,68 @@ mod armed_identity_tests {
         // can produce bytes, so the rebuild has no separate verdict-keyed input
         // path and no hand-built JSON substitute.
         assert!(!production.contains("serde_json::json!({\"identity_id\""));
-        assert!(!production.contains("AuditWalAppendFailed\n        }\n    )"));
+        let rebuild_suffix = &production[fail_closed_builder..];
+        let rebuild_statement = &rebuild_suffix[..rebuild_suffix
+            .find("// GF3: same bounded")
+            .expect("next invariant")];
+        assert!(
+            rebuild_statement
+                .contains(")\n                .map_err(AttemptError::AuditCanonicalize)?;"),
+            "the fail-closed rebuild propagates canonicalization errors"
+        );
+        assert!(
+            !rebuild_statement.contains("unwrap_or"),
+            "the fail-closed rebuild must not substitute a body"
+        );
+    }
+
+    #[test]
+    fn fail_closed_rebuild_body_matches_the_shared_builder() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            None,
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let _wal_guard = f.wal.lock().unwrap();
+        let request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+
+        let outcome = f.engine.evaluate_attempt(&request).expect("evaluate");
+
+        let OutcomeEvidence::RingOnlyFailClosed {
+            subject,
+            event_canonical_json,
+        } = &outcome.evidence
+        else {
+            panic!("expected ring-only fail-closed evidence");
+        };
+        let expected = build_audit_event_canonical_json(
+            &Verdict::Deny {
+                reason: DeniedReason::AuditWalAppendFailed,
+            },
+            &request,
+            subject,
+            &outcome.timestamp_iso8601,
+        )
+        .expect("canonical fail-closed body");
+        assert_eq!(event_canonical_json, &expected);
+
+        let ring = f.ring.lock().unwrap();
+        let row = ring
+            .iter()
+            .find(|row| {
+                row.event_canonical_json
+                    .contains("\"operation\":\"egress_blocked\"")
+            })
+            .expect("fail-closed ring row");
+        assert_eq!(row.event_canonical_json, expected);
     }
 
     #[test]
@@ -2187,6 +2261,12 @@ mod armed_identity_tests {
             assert!(AdmittedIdentity::from_snapshot(&snapshot).is_err());
         }
         let decision = source("src/decision.rs");
+        let admitted_identity = source("src/admitted_identity.rs");
+        let identity_production = production_lines(&admitted_identity).join("\n");
+        assert!(identity_production.contains("pub(crate) fn from_snapshot("));
+        assert!(identity_production.contains("pub(crate) fn from_boot("));
+        assert!(!identity_production.contains("fn boot_confined("));
+        assert!(!identity_production.contains("fn boot_unconfined("));
         let evaluate_at = decision
             .find("pub fn evaluate_attempt(")
             .expect("evaluate_attempt body");
@@ -2194,22 +2274,29 @@ mod armed_identity_tests {
         let close = crate::source_scan::matching_brace(&decision, open).unwrap();
         let body = &decision[open..=close];
         assert!(body.contains("AdmittedIdentity::from_snapshot(snapshot)"));
-        let err_to_unattributed = "identity\n            .as_ref()\n            .ok()\n            .and_then(|identity| resolve_audit_subject";
-        assert!(
-            body.contains(err_to_unattributed),
-            "the identity Result maps Err to the Unattributed resolver path"
+        let err_pattern = "Err(_) => {";
+        let err_at = body.find(err_pattern).expect("from_snapshot Err arm");
+        let err_open = body[err_at..].find('{').unwrap() + err_at;
+        let err_close = crate::source_scan::matching_brace(body, err_open).unwrap();
+        let err_body = &body[err_open + 1..err_close];
+        let err_body_without_comments = err_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            err_body_without_comments, "return Ok(self.unattributed_outcome());",
+            "a refused snapshot maps only to the Unattributed outcome"
         );
-        let after_from_snapshot = body
-            .split_once("AdmittedIdentity::from_snapshot(snapshot)")
-            .expect("from_snapshot call")
-            .1;
         assert!(
-            !after_from_snapshot.contains("snapshot.confined_agent_uid"),
-            "evaluate_attempt must not recover from from_snapshot Err by reading raw uid fields"
+            !err_body.contains("BootAdmittedIdentity::"),
+            "evaluate_attempt must not recover from from_snapshot Err through boot identity"
         );
         assert!(
-            !after_from_snapshot.contains("snapshot.confined_agent_uid_ceiling"),
-            "evaluate_attempt must not recover from from_snapshot Err by reading raw ceiling fields"
+            !err_body.contains("armed_identity().cloned().ok_or_else"),
+            "evaluate_attempt must not recover from from_snapshot Err through the frozen cell"
         );
     }
 
@@ -2437,7 +2524,7 @@ mod armed_identity_tests {
     }
 
     #[test]
-    fn store_guard_is_released_before_the_verdict_waits_on_the_wal() {
+    fn verdict_completes_while_store_lock_is_reacquired_after_store_phase() {
         let f = fixture();
         write_policy(
             &f.policy_dir,
@@ -2462,11 +2549,11 @@ mod armed_identity_tests {
         });
         started_rx.recv().unwrap();
         // 50ms is several bounded-lock poll intervals, enough for the worker to
-        // pass the short store read and wait at the WAL lock this test holds.
+        // leave the short store phase while this test holds the WAL guard.
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             !worker.is_finished(),
-            "the worker must be parked on the WAL while the test holds its guard"
+            "the worker remains in the bounded verdict path while the WAL guard is held"
         );
         let store_started = Instant::now();
         let store_guard = store

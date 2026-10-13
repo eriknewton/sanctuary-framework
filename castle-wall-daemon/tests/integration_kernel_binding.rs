@@ -839,6 +839,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         test_delay_before_ready_ms: None,
     };
 
+    let expected_identity_id = format!("{}/uid-{}", config.fortress_id, TEST_AGENT_UID);
     let handle = boot(config).expect("daemon boot");
 
     // WIRED-CONSUMER ASSERTION for slice A: the PRODUCTION composition root, not
@@ -1050,6 +1051,10 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .event_canonical_json()
         .expect("audit body")
         .contains("\"l1\""));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Evaluate: denied destination.
     let req_denied = EvaluationRequest {
@@ -1074,6 +1079,10 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .event_canonical_json()
         .expect("audit body")
         .contains("\"egress_blocked\""));
+    assert!(outcome_denied
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Live kernel regression for full-sweep #99: with only a single-IP allow
     // installed, raw TCP/443 traffic to an unlisted IP reaches NFQUEUE and
@@ -1100,6 +1109,10 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .event_canonical_json()
         .expect("audit body")
         .contains("\"egress_blocked\""));
+    assert!(outcome_raw_ip_denied
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Verify WAL has both events.
     let wal = handle.wal_writer().expect("wal");

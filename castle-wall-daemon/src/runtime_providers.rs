@@ -1143,9 +1143,9 @@ pub fn acquire_castle_table_component_for_test(
     // the refusal instead of the table-lifecycle paths it exists for.
     // `Unconfined` is the strict reading: no agent is bound on these paths, and a
     // per-agent binding appearing in a table this seam owns is refused.
-    decision_engine.freeze_armed_identity_for_test(
-        crate::decision::AdmittedIdentity::boot_unconfined("test-isolation-fortress".to_string()),
-    );
+    decision_engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity::from_boot(
+        crate::decision::BootAdmittedIdentity::unconfined("test-isolation-fortress"),
+    ));
     Box::new(NftablesTableProvider {
         lock_path: config.lock_path.clone(),
         journal_path: config.journal_path.clone(),
@@ -6418,14 +6418,15 @@ mod tests {
         );
         let (engine, _wal, audit_buffer, _injection) =
             audit_backed_engine(&dir, Some(Arc::clone(&store)));
-        assert!(engine.freeze_armed_identity_for_test(
-            crate::decision::AdmittedIdentity::boot_confined(
-                "deadbeef".to_string(),
-                agent_uid,
-                500,
-                None,
-            )
-        ));
+        let identity =
+            crate::decision::AdmittedIdentity::from_snapshot(&crate::policy::PolicySnapshot {
+                fortress_id: "deadbeef".to_string(),
+                confined_agent_uid: Some(agent_uid),
+                confined_agent_uid_ceiling: Some(500),
+                ..crate::policy::PolicySnapshot::default()
+            })
+            .expect("snapshot identity");
+        assert!(engine.freeze_armed_identity_for_test(identity));
 
         handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
             .expect("verification refusal audit must succeed");
@@ -6481,7 +6482,11 @@ mod tests {
         // cell set. `write_watcher_policy` admits no agent uid, so the frozen
         // identity is `Unconfined` and the reload preserves it.
         assert!(engine.freeze_armed_identity_for_test(
-            crate::decision::AdmittedIdentity::boot_unconfined("deadbeef".to_string())
+            crate::decision::AdmittedIdentity::from_snapshot(&crate::policy::PolicySnapshot {
+                fortress_id: "deadbeef".to_string(),
+                ..crate::policy::PolicySnapshot::default()
+            })
+            .expect("snapshot identity")
         ));
 
         handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
@@ -6528,7 +6533,11 @@ mod tests {
         // cell set. `write_watcher_policy` admits no agent uid, so the frozen
         // identity is `Unconfined` and the reload preserves it.
         assert!(engine.freeze_armed_identity_for_test(
-            crate::decision::AdmittedIdentity::boot_unconfined("deadbeef".to_string())
+            crate::decision::AdmittedIdentity::from_snapshot(&crate::policy::PolicySnapshot {
+                fortress_id: "deadbeef".to_string(),
+                ..crate::policy::PolicySnapshot::default()
+            })
+            .expect("snapshot identity")
         ));
 
         reconcile_manifest_after_watch_registration(&engine)
@@ -6895,11 +6904,21 @@ mod tests {
     // ---- The pure slice-A decision (A2/A3/A7): exhaustive, no kernel ----
 
     fn armed_confined(agent_uid: u32, ceiling: u32) -> AdmittedIdentity {
-        AdmittedIdentity::boot_confined("deadbeef".to_string(), agent_uid, ceiling, None)
+        AdmittedIdentity::from_snapshot(&crate::policy::PolicySnapshot {
+            fortress_id: "deadbeef".to_string(),
+            confined_agent_uid: Some(agent_uid),
+            confined_agent_uid_ceiling: Some(ceiling),
+            ..crate::policy::PolicySnapshot::default()
+        })
+        .expect("snapshot identity")
     }
 
     fn armed_unconfined() -> AdmittedIdentity {
-        AdmittedIdentity::boot_unconfined("deadbeef".to_string())
+        AdmittedIdentity::from_snapshot(&crate::policy::PolicySnapshot {
+            fortress_id: "deadbeef".to_string(),
+            ..crate::policy::PolicySnapshot::default()
+        })
+        .expect("snapshot identity")
     }
 
     fn known_history(uids: &[u32]) -> ConfinedHistory {

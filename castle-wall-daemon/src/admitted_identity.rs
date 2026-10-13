@@ -1,3 +1,4 @@
+use crate::manifest::ManifestStoreError;
 use crate::policy::PolicySnapshot;
 
 /// The identity this process is armed with after boot.
@@ -72,26 +73,10 @@ impl AdmittedIdentity {
         })
     }
 
-    pub(crate) fn boot_confined(
-        fortress_id: String,
-        agent_uid: u32,
-        ceiling: u32,
-        gate_uid: Option<u32>,
-    ) -> Self {
+    pub(crate) fn from_boot(source: BootAdmittedIdentity) -> Self {
         Self {
-            fortress_id,
-            subject: AdmittedSubject::Confined {
-                agent_uid,
-                ceiling,
-                gate_uid,
-            },
-        }
-    }
-
-    pub(crate) fn boot_unconfined(fortress_id: String) -> Self {
-        Self {
-            fortress_id,
-            subject: AdmittedSubject::Unconfined,
+            fortress_id: source.fortress_id,
+            subject: source.subject,
         }
     }
 
@@ -101,5 +86,37 @@ impl AdmittedIdentity {
 
     pub(crate) fn subject(&self) -> AdmittedSubject {
         self.subject
+    }
+}
+
+/// Boot-only identity source. Confined fields enter through the verified error
+/// variant, so no caller can feed raw snapshot fields into an admitted identity
+/// after `from_snapshot` has refused them.
+pub(crate) struct BootAdmittedIdentity {
+    fortress_id: String,
+    subject: AdmittedSubject,
+}
+
+impl BootAdmittedIdentity {
+    pub(crate) fn confined_scope_refusal(
+        fortress_id: &str,
+        error: &ManifestStoreError,
+    ) -> Option<Self> {
+        let (agent_uid, ceiling, gate_uid) = error.boot_confined_subject()?;
+        Some(Self {
+            fortress_id: fortress_id.to_string(),
+            subject: AdmittedSubject::Confined {
+                agent_uid,
+                ceiling,
+                gate_uid,
+            },
+        })
+    }
+
+    pub(crate) fn unconfined(fortress_id: &str) -> Self {
+        Self {
+            fortress_id: fortress_id.to_string(),
+            subject: AdmittedSubject::Unconfined,
+        }
     }
 }

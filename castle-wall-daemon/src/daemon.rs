@@ -3730,6 +3730,7 @@ mod tests {
         let (config, _signing) = fresh_config_in(&dir);
         let handle = boot(config).expect("boot");
         let engine = handle.decision_engine();
+        let baseline_ring = handle.audit_buffer.lock().unwrap().len();
 
         let outcome = engine
             .evaluate_attempt(&req_for(Some("unlisted.example"), 443))
@@ -3744,6 +3745,7 @@ mod tests {
                 reason: DeniedReason::DefaultDeny
             }
         ));
+        assert_eq!(handle.audit_buffer.lock().unwrap().len(), baseline_ring);
 
         drop(engine);
         handle.stop().expect("stop");

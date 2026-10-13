@@ -395,6 +395,21 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     write_bad_signature_manifest(&config.policy_dir, &signing);
 
     let handle = boot(config).expect("boot is best-effort on first manifest load");
+    let wal = handle.wal_writer().expect("wal").clone();
+    let egress_rows = || {
+        wal.lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry
+                    .event_canonical_json
+                    .contains("\"operation\":\"egress_")
+            })
+            .count()
+    };
+    let baseline_egress_rows = egress_rows();
 
     let request = EvaluationRequest {
         agent_id: nftables::confined_agent_id(TEST_AGENT_UID),
@@ -416,7 +431,9 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     ));
     assert!(outcome.wal_seq().is_none());
     assert!(outcome.event_canonical_json().is_none());
+    assert_eq!(egress_rows(), baseline_egress_rows);
     let _ = handle.stop();
+    assert_eq!(egress_rows(), baseline_egress_rows);
 }
 
 // ---- F-2 runtime daemon crash: kernel rules persist -----------------------

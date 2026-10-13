@@ -3472,9 +3472,14 @@ mod tests {
             "both builders insert exactly one identity_id"
         );
         for body in hits {
-            assert!(!body.contains("agent_id"), "{body}");
-            assert!(!body.contains("agent_id_for_audit"), "{body}");
-            assert!(body.contains("subject"), "{body}");
+            let executable_body = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!executable_body.contains("agent_id"), "{body}");
+            assert!(!executable_body.contains("agent_id_for_audit"), "{body}");
+            assert!(executable_body.contains("subject"), "{body}");
         }
         let audit_builder = policy_production[policy_production
             .find("pub fn build_audit_event_canonical_json")
