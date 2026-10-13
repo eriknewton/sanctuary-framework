@@ -1226,7 +1226,7 @@ export function createComplianceTools(deps: GeneratorDeps): {
         "Annex III high-risk categories of Regulation (EU) 2024/1689. " +
         "Returns zero or more candidate categories with a " +
         "rule_based_confidence score (sum of matched keyword weights " +
-        "clamped to [0, 1]). This is a RULE-BASED classifier — NOT " +
+        "clamped to [0, 1]). This is a RULE-BASED classifier, NOT " +
         "a machine-learning model, and NOT legal advice. Use the " +
         "result to narrow the deployer's review. Tier 3 (read-only, " +
         "auto-allow).",

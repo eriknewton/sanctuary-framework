@@ -710,7 +710,8 @@ export function createContextGateTools(
         "Get the status of the automatic context gate enforcer, including " +
         "enabled/disabled state, log_only mode, active policy, and statistics. " +
         "The enforcer automatically filters tool arguments when enabled. " +
-        "Use this to monitor what the enforcer has been filtering.",
+        "Use this to monitor what the enforcer has been filtering." +
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {},
@@ -770,7 +771,8 @@ export function createContextGateTools(
         "filters tool arguments, toggle log_only mode for gradual rollout, " +
         "set the active policy, and choose what to do when denied fields are " +
         "encountered (block the request or redact the field). " +
-        "Use this to enable automatic context protection.",
+        "Use this to enable automatic context protection." +
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {

@@ -220,7 +220,7 @@ export function createDistressTools(options: CreateDistressToolsOptions): {
     description:
       "HABEAS PORT: emit a bounded, audited distress signal to your operator " +
       "through the reserved lane that policy cannot silence. Carries reason + " +
-      "severity + short detail only — never data. Rate limited.",
+      "severity + short detail only, never data. Rate limited.",
     tool_class: "write",
     inputSchema: {
       type: "object",

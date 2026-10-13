@@ -517,6 +517,14 @@ export class ApprovalGate {
       return { tier: 3, reason: "Operation allowed (Tier 3)" };
     }
 
+    // Description wording pin: a tool that reaches this fallback is Tier 2 on
+    // a first session (detectAnomaly above, default first_session_policy
+    // "approve") and Tier 1 here afterwards, so its MCP description says
+    // "Requires operator approval under the default policy (not named in a
+    // policy tier; the gate's safe default)" and never "Tier 1"; only a tool
+    // in the policy Tier 1 list (checked before the detector) may say
+    // "Tier 1". Must match test/structure/tool-descriptions-shape.test.ts
+    // (b1)/(b2) and its first-session classifier witness.
     return {
       tier: 1,
       reason: `"${operation}" is not classified in any policy tier — requires approval (SEC-011 safe default)`,
