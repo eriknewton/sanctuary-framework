@@ -337,11 +337,10 @@ export function createErc8004Tools(
       name: "sanctuary/sign_erc8004_identity",
       description:
         "Request an ERC-8004 Identity Registry registration signature. " +
-        "The request flows through the three-tier policy gate: pre-approved " +
-        "counterparties get an immediate signature; others require operator " +
-        "approval via the inbox. No on-chain broadcast; the caller submits " +
-        "the returned signature to the registry contract." +
-        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
+        "Requires operator approval under the default policy (not named in a policy tier; the gate's safe default). " +
+        "After that approval the request passes the key-17 signing policy: a counterparty " +
+        "pre-approved there skips the second, in-handler check; others wait on the inbox. " +
+        "No on-chain broadcast; the caller submits the returned signature to the registry contract.",
       inputSchema: {
         type: "object",
         properties: {
