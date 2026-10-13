@@ -48,7 +48,8 @@ class FakeElement {
   getAttribute(name: string) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name]! : null; }
   setAttribute(name: string, value: string) { this.attrs[name] = String(value); }
   removeAttribute(name: string) { delete this.attrs[name]; }
-  closest() { return null; }
+  inside: string[] = [];
+  closest(selector: string) { return this.inside.includes(selector) ? this : null; }
   querySelector() { return null; }
   querySelectorAll() { return []; }
   contains() { return false; }
@@ -92,9 +93,14 @@ function boot(overrides: Record<string, () => unknown> = {}) {
   });
   runInContext(getClientScript(), context);
   const navigate = (route: string) => { location.hash = "#" + route; winListeners.hashchange!(); };
-  const click = (attrs: Record<string, string>) => docListeners.click!({ target: new FakeElement(attrs) });
+  const click = (attrs: Record<string, string>, inside: string[] = []) => {
+    const target = new FakeElement(attrs);
+    target.inside = inside;
+    docListeners.click!({ target });
+  };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
-  return { el, railLink, context, navigate, click, type };
+  const change = (target: FakeElement) => docListeners.change!({ target });
+  return { el, railLink, context, navigate, click, type, change };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => vi.useRealTimers());
@@ -244,5 +250,80 @@ describe("slice 2 shell wired consumers", () => {
     const pop = h.el["posture-seal-pop"]!.innerHTML;
     expect(pop).not.toContain("holds every agent");
     expect(pop).toContain("Lockdown revokes network access for every confined agent; agents keep running and keep local access.");
+  });
+
+  it("a layer line whose word is Unknown never wears the pass dot, in Enforcement or the seal popover", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": never,
+      // A sovereignty read that loads but carries no Heralds layer.
+      "/api/sovereignty": () => Promise.resolve(response({ live_enforcement: {}, layers: {} })),
+    });
+    await settle();
+    h.navigate("enforcement");
+    runInContext("state.posture.sealOpen = true; renderTopbar();", h.context);
+    for (const [where, html] of [["enforcement", h.el.main!.innerHTML], ["popover", h.el["posture-seal-pop"]!.innerHTML]]) {
+      const lines = [...html.matchAll(/<span class="(pp-dot[^"]*)"><\/span><span class="pp-k">([^<]*)<\/span><span class="pp-v">([^<]*)<\/span>/g)];
+      expect(lines.length, where).toBeGreaterThan(0);
+      const unknown = lines.filter((m) => /^unknown$/i.test(m[3]!));
+      // The Charter line (inbox unloaded) and the Heralds line (no l4) are among them.
+      expect(unknown.map((m) => m[2]), where).toEqual(expect.arrayContaining(["Charter approvals", "Heralds (reputation)"]));
+      for (const m of unknown) expect(m[1], `${where}: ${m[2]}`).toBe("pp-dot unknown");
+    }
+  });
+
+  it("a Heralds layer that is configured but not signing does not wear the pass dot", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/sovereignty": () => Promise.resolve(response({ live_enforcement: {}, layers: { l4: { status: "inactive" } } })) });
+    await settle();
+    h.navigate("enforcement");
+    const m = h.el.main!.innerHTML.match(/<span class="(pp-dot[^"]*)"><\/span><span class="pp-k">Heralds \(reputation\)<\/span><span class="pp-v">configured<\/span>/);
+    expect(m).toBeTruthy();
+    expect(m![1]).not.toBe("pp-dot");
+  });
+
+  it("Evidence names the rows outside the time range instead of saying nothing is pending", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-10T12:00:00Z"));
+    const old = { ...heldItem, item_id: "old-1", kind: "blocked_egress", tier: undefined, created_at: "2026-03-05T12:00:00Z" };
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [old, { ...old, item_id: "old-2" }] } })) });
+    await settle();
+    const select = new FakeElement({ "data-action": "time-range" }) as FakeElement & { tagName: string };
+    select.tagName = "SELECT";
+    select.value = "24h";
+    h.navigate("activity");
+    // The operator picks Last 24 hours in the top bar.
+    h.change(select);
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Inbox (0 of 2)");
+    expect(main).not.toContain("Nothing pending.");
+    expect(main).toContain("No open items in this view: 2 older items are outside the last 24 hours.");
+  });
+
+  it("Evidence says Nothing pending only when no item is open", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })) });
+    await settle();
+    h.navigate("activity");
+    expect(h.el.main!.innerHTML).toContain("Nothing pending.");
+  });
+
+  it("a search hit for another agent from the agent detail opens that agent and closes the results", async () => {
+    vi.useFakeTimers();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = [{ agent_id: "fixture-agent-a", status: "active", model_provider }, { agent_id: "fixture-agent-b", status: "active", model_provider }];
+    const h = boot({ "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })) });
+    await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "fixture-agent-a" });
+    h.navigate("agent-detail");
+    expect(h.el.main!.innerHTML).toContain("fixture-agent-a");
+    h.type("fixture-agent-b");
+    expect(h.el["search-results"]!.hidden).toBe(false);
+    // The hit's hash is the current one, so no hashchange will fire.
+    h.click({ "data-action": "open-agent", "data-agent-id": "fixture-agent-b" }, ["[data-search]"]);
+    expect(runInContext("state.selectedAgentId", h.context)).toBe("fixture-agent-b");
+    expect(h.el.main!.innerHTML).toContain("fixture-agent-b");
+    expect(h.el.main!.innerHTML).not.toContain("fixture-agent-a");
+    expect(h.el["search-results"]!.hidden).toBe(true);
   });
 });

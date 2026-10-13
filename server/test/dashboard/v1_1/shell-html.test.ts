@@ -120,6 +120,18 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(m![1]).not.toContain("--rust-bg");
   });
 
+  it("no Lock down state paints the rust fill: idle, hover, focus and engaged keep text and line only", () => {
+    const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
+    const rules = [...css.matchAll(/(?:^|\n)([^{}\n]*btn-lockdown[^{}\n]*) \{([^}]*)\}/g)];
+    expect(rules.length).toBeGreaterThan(0);
+    expect(rules.map((m) => m[1])).toEqual(expect.arrayContaining([expect.stringContaining(":hover")]));
+    for (const m of rules) {
+      expect(m[2], m[1]).not.toContain("--rust-bg");
+      const bg = m[2]!.match(/background:\s*([^;]+)/);
+      if (bg) expect(bg[1]!.trim(), m[1]).toBe("transparent");
+    }
+  });
+
   it("a folded section carries its own styled head, and the hosted page's eyebrow and h1 do not repeat", () => {
     const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
     const rule = (selector: string) => {

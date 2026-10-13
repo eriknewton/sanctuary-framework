@@ -155,7 +155,9 @@ body {
 .scope:hover { border-color: var(--ink-line); }
 .scope svg { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
 .scope svg:last-child { width: 14px; height: 14px; }
-.scope .machine-name { flex: none; }
+/* The machine name gives way with an ellipsis (3ch keeps its first letters);
+   the trigger's title and the menu head carry it in full. */
+.scope .machine-name { flex: 0 1 auto; min-width: 3ch; overflow: hidden; text-overflow: ellipsis; }
 /* 132px = 20 glyphs of the 11px (--text-xs) Roboto Mono id at its 0.6em
    advance (6.6px each): enough of the id to tell two fortresses apart; the
    full id is in the menu head and the title. */
@@ -299,7 +301,9 @@ body {
 /* Lock down is the one danger-styled control: bad text and the bad-line
    border, never a red fill (the TopBar preview's one destructive style). */
 .btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust-line); }
-.btn.btn-lockdown:hover:not(:disabled) { background: var(--rust-bg); border-color: var(--rust); }
+/* Hover and focus keep text and line only: the line steps up to the full
+   bad hue, and still no fill. */
+.btn.btn-lockdown:hover:not(:disabled), .btn.btn-lockdown:focus-visible { background: transparent; border-color: var(--rust); }
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-partial { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
@@ -1394,10 +1398,9 @@ body {
   .topbar .btn.btn-talk { padding: 0 var(--space-2); }
   .scope .sw-agent { max-width: 96px; }
   .search-wrap { min-width: 96px; }
-  /* 6px gap (--space-2 less one 2px step) and an 88px range buy the room
-     the scope needs at 1024 without truncating any evidence age. */
+  /* 6px gap (--space-2 less one 2px step) buys room at 1024; the range keeps
+     its content width so "Last 24 hours" and "Last 30 days" fit whole. */
   .topbar { gap: calc(var(--space-2) - 2px); }
-  .range { max-width: 88px; }
 }
 @media (max-width: 860px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; }
@@ -1457,7 +1460,9 @@ body {
 .agent-switcher-opt .opt-state { font-family: var(--mono); font-size: 9px; color: var(--ink-3); }
 
 /* Posture seal (top bar) + popover. Honest verdict drives the color. */
-.posture-seal-wrap { position: relative; }
+/* The seal gives way last (a tenth of the search's rate) and only in its
+   freshness text, which ellipsizes with its full text in a title. */
+.posture-seal-wrap { position: relative; min-width: 0; flex: 0 0.1 auto; display: flex; }
 /* The seal per the TopBar preview: 34px, the 8px control radius, mono
    uppercase word with its evidence age beside it in --ink-2. Each tone wears
    its own status hue, -bg tint and -line border, and its own glyph shape, so
@@ -1469,13 +1474,14 @@ body {
   display: inline-flex; align-items: center; gap: var(--space-2); height: 34px;
   padding: 0 var(--space-3); border-radius: 8px; cursor: pointer;
   border: 1px solid var(--rule-2); background: var(--surface-2); color: var(--ink-2);
-  font-family: var(--mono); font-size: var(--text-xs); font-weight: 500; white-space: nowrap; flex: none;
+  font-family: var(--mono); font-size: var(--text-xs); font-weight: 500; white-space: nowrap; flex: 0 1 auto; min-width: 0;
 }
 .posture-seal .seal-glyph { width: 12px; height: 12px; position: relative; flex-shrink: 0; }
 .posture-seal .seal-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .posture-seal .seal-glyph::after { content: ""; position: absolute; inset: 4px; background: currentColor; border-radius: 50%; opacity: 0.9; }
 .posture-seal .seal-word { text-transform: uppercase; font-weight: 600; letter-spacing: 0.06em; flex-shrink: 0; }
-.posture-seal .seal-freshness { color: var(--ink-2); letter-spacing: 0; flex-shrink: 0; }
+/* 8ch keeps an age such as "4m ago" whole before the ellipsis starts. */
+.posture-seal .seal-freshness { color: var(--ink-2); letter-spacing: 0; flex: 0 1 auto; min-width: 8ch; overflow: hidden; text-overflow: ellipsis; }
 .posture-seal.tone-protected { border-color: var(--sage-line); background: var(--sage-bg); color: var(--sage); }
 .posture-seal.tone-attention { border-color: var(--ochre-line); background: var(--ochre-bg); color: var(--ochre); }
 .posture-seal.tone-attention .seal-glyph::before { border: 0; border-radius: 0; background: currentColor; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
@@ -1506,6 +1512,9 @@ body {
 .posture-seal-pop .pp-dot, .enforcement-layers .pp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
 .posture-seal-pop .pp-dot.warn, .enforcement-layers .pp-dot.warn { background: var(--ochre); }
 .posture-seal-pop .pp-dot.off, .enforcement-layers .pp-dot.off { background: var(--ink-4); }
+/* Unknown: a hollow dotted slate ring, the unknown pill's mark, never the
+   pass fill. */
+.posture-seal-pop .pp-dot.unknown, .enforcement-layers .pp-dot.unknown { background: transparent; border: 1.5px dotted var(--slate); }
 .posture-seal-pop .pp-k, .enforcement-layers .pp-k { color: var(--ink-2); }
 .posture-seal-pop .pp-v, .enforcement-layers .pp-v { margin-left: auto; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
 .posture-seal-pop .pp-more {

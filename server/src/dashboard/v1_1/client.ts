@@ -1086,6 +1086,8 @@ function renderPostureSeal() {
   wordEl.textContent = seal.word;
   if (freshnessEl) {
     freshnessEl.textContent = seal.freshness.inline;
+    // The freshness may ellipsize on a narrow bar; the full text stays here.
+    freshnessEl.setAttribute("title", seal.freshness.inline);
     freshnessEl.classList.remove("fresh", "not-fresh");
     freshnessEl.classList.add(seal.freshness.current ? "fresh" : "not-fresh");
   }
@@ -1112,7 +1114,7 @@ function renderPostureSeal() {
     sub = "Current enforcement is Unknown. Retry the protection evidence read.";
   }
   const lines = postureLayerLines().map(function (l) {
-    const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
+    const dotCls = layerDotClass(l);
     return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
       '<span class="pp-k">' + escHtml(l.k) + '</span>' +
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
@@ -2872,14 +2874,14 @@ function inboxAgentOptions() {
   }).join("");
 }
 
-function filterInbox(items) {
+function filterInbox(items, ignoreTimeRange) {
   const f = state.inboxOps.filters;
   const q = f.search.trim().toLowerCase();
   const fromMs = f.from ? Date.parse(f.from + "T00:00:00.000Z") : null;
   const toMs = f.to ? Date.parse(f.to + "T23:59:59.999Z") : null;
   // The top-bar time range narrows the same list; like the date filters, an
   // item whose time does not parse is kept rather than silently dropped.
-  const windowMs = TIME_RANGE_MS[state.timeRange];
+  const windowMs = ignoreTimeRange ? undefined : TIME_RANGE_MS[state.timeRange];
   const sinceMs = typeof windowMs === "number" ? Date.now() - windowMs : null;
   return items.filter(function (i) {
     const args = i.display_template_args || {};
@@ -3168,8 +3170,18 @@ function renderActivityScreen() {
     ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
     : '';
   var inboxRows;
-  if (!visibleInbox.length) {
+  const openItems = state.inbox.filter(function (i) { return !i.resolved; });
+  if (!visibleInbox.length && !openItems.length) {
     inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
+  } else if (!visibleInbox.length) {
+    // Open items exist but the view shows none: say where they went, so an
+    // empty window never reads as an empty inbox.
+    const anyTime = filterInbox(openItems, true).length;
+    const hiddenByFilters = openItems.length - anyTime;
+    const parts = [];
+    if (anyTime) parts.push(anyTime + (anyTime === 1 ? " older item is" : " older items are") + " outside " + TIME_RANGE_LABEL[state.timeRange]);
+    if (hiddenByFilters) parts.push(hiddenByFilters + (hiddenByFilters === 1 ? " item is" : " items are") + " hidden by your filters");
+    inboxRows = redactedNotice + '<p class="muted">No open items in this view: ' + escHtml(parts.join("; ")) + '.</p>';
   } else {
     var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
@@ -3797,7 +3809,7 @@ function renderEnforcementScreen() {
     ? '<p class="muted">This vault is not on this machine\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
     : "";
   const layers = postureLayerLines().map(function (l) {
-    const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
+    const dotCls = layerDotClass(l);
     return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
       '<span class="pp-k">' + escHtml(l.k) + '</span>' +
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
@@ -4296,6 +4308,15 @@ function deriveSeal() {
 // Plain-English line for the named layer in the posture popover. Uses the
 // retired-L-number rule: named layers only, never "L1".."L4". Values are
 // honest: the wall line reflects the real arm-state, not config presence.
+// The dot beside a layer line. A line whose word is Unknown wears the unknown
+// dot (slate, hollow) whatever its other flags say: the pass dot is earned by
+// observed evidence, never by the absence of a warning. Shared by the seal
+// popover and the Enforcement screen so the two cannot disagree.
+function layerDotClass(l) {
+  if (l.unknown || /^unknown$/i.test(String(l.v).trim())) return "pp-dot unknown";
+  if (l.off) return "pp-dot off";
+  return l.warn ? "pp-dot warn" : "pp-dot";
+}
 function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
@@ -4319,7 +4340,9 @@ function postureLayerLines() {
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
     { k: "Sentinels watching agents", v: wrapped === "Unknown" ? "Unknown" : (wrapped === 1 ? "1 agent" : wrapped + " agents"), warn: wrapped === "Unknown", off: wrapped === 0 },
     { k: "Charter approvals", v: !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
-    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") }
+    // A Heralds layer that is configured but not active is not signing: it
+    // reads "configured" with the warn dot, never the pass dot.
+    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 || d.layers.l4.status !== "active" }
   ];
 }
 
@@ -5031,7 +5054,17 @@ document.addEventListener("click", function (ev) {
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
-  if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
+  if (action === "open-agent" && agentId) {
+    state.selectedAgentId = agentId;
+    // Close the search results here: a hit opened from #agent-detail assigns
+    // the hash it already has, so no hashchange fires to close them or to
+    // render the newly selected agent; setRoute does both explicitly.
+    state.search.open = false;
+    renderSearchResults();
+    if (location.hash !== "#agent-detail") location.hash = "agent-detail";
+    else setRoute("agent-detail");
+    return;
+  }
   // Click-to-inspect from the fortress-column agent rows (PR #100
   // sidebar wire-up): navigate to the agent-detail view AND fire the
   // synchronous /inspect/open route so the panel renders already-loaded.
