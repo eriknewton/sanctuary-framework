@@ -292,7 +292,7 @@ describe("slice 2 shell wired consumers", () => {
     select.tagName = "SELECT";
     select.value = "24h";
     h.navigate("activity");
-    // The operator picks Last 24 hours in the top bar.
+    // The operator picks the 24 hours range in the top bar.
     h.change(select);
     const main = h.el.main!.innerHTML;
     expect(main).toContain("Inbox (0 of 2)");

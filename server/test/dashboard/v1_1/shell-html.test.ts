@@ -83,8 +83,11 @@ describe("v1.1 dashboard shell HTML", () => {
     // non-button anchor in the main column, visited and hover included.
     const html = renderDashboardV11Html({ embedClient: false });
     const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
-    const m = css.match(/(?:^|\n)\.main a:not\(\.btn\), \.main a:not\(\.btn\):visited, \.main a:not\(\.btn\):hover \{([^}]*)\}/);
-    expect(m, ".main a:not(.btn) rule").toBeTruthy();
+    // :where() keeps the rule at zero specificity, so a link a component
+    // already colors keeps its own rule (a capture audit found the Settings
+    // tabs recolored by a plain-specificity version).
+    const m = css.match(/(?:^|\n):where\(\.main a:not\(\.btn\), \.main a:not\(\.btn\):visited, \.main a:not\(\.btn\):hover\) \{([^}]*)\}/);
+    expect(m, ":where(.main a:not(.btn)) rule").toBeTruthy();
     expect(m![1]).toContain("color: var(--accent)");
   });
 

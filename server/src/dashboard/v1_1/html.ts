@@ -139,9 +139,15 @@ body {
 }
 /* The one permitted gradient: the product mark, accent to --mark-teal. */
 .brand .mark { width: 24px; height: 24px; flex: none; border-radius: var(--rad); background: linear-gradient(135deg, var(--accent), var(--mark-teal)); display: inline-block; }
-/* Shrinks at a fifth of the search's rate: the search gives way to its floor
-   first, so the scope keeps its machine and agent names readable. */
-.scope-switcher { position: relative; flex: 0 0.2 auto; min-width: 0; display: flex; }
+/* Top-bar shrink order, by flex-shrink weight (the search 16, the scope 4,
+   everything else 0): the search gives way to its floor first, then the
+   scope's agent label and machine name. The seal never shrinks, so an
+   evidence age is never cut to fit; its freshness text is capped instead
+   (see .posture-seal .seal-freshness).
+   Each weight is at least 1 on purpose: when the unfrozen items' shrink
+   factors sum below 1, flexbox distributes only that fraction of the
+   overflow, and the rest pushes the bar past the viewport. */
+.scope-switcher { position: relative; flex: 0 4 auto; min-width: 0; display: flex; }
 /* 8px: the design's top-bar control radius (radius-lg); the server block
    carries 6px (--rad) and 10px (--rad-lg) only, so it is written here.
    34px: the TopBar preview's control height (its icon button is the 34px
@@ -155,22 +161,26 @@ body {
 .scope:hover { border-color: var(--ink-line); }
 .scope svg { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
 .scope svg:last-child { width: 14px; height: 14px; }
-/* The machine name gives way with an ellipsis (3ch keeps its first letters);
-   the trigger's title and the menu head carry it in full. */
-.scope .machine-name { flex: 0 1 auto; min-width: 3ch; overflow: hidden; text-overflow: ellipsis; }
+/* A long machine name gives way with an ellipsis; the trigger's title and
+   the menu head carry it in full. The 6ch floor keeps a short name (a host
+   name like "mini2") whole, so only names longer than six characters ever
+   ellipsize. */
+.scope .machine-name { flex: 0 1 auto; min-width: 6ch; overflow: hidden; text-overflow: ellipsis; }
 /* 132px = 20 glyphs of the 11px (--text-xs) Roboto Mono id at its 0.6em
    advance (6.6px each): enough of the id to tell two fortresses apart; the
    full id is in the menu head and the title. */
 .scope .id { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; min-width: 0; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
 .scope .scope-sep { width: 1px; height: 16px; background: var(--rule-2); flex: none; }
 /* 44px: room for two letters and the ellipsis, so the agent scope never vanishes. */
-.scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+/* flex-shrink 4: inside the scope the agent label gives way before the
+   machine name (shrink 1). */
+.scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; flex-shrink: 4; }
 /* The search is the bar's elastic slot: it gives way down to a floor that
    fits its placeholder beside the key hint, so the fixed controls never clip.
    200px basis and the 136px floor are the TopBar README's: 136px fits the
    placeholder "Search" in full beside the keyboard hint (measured there at
    1,200px with zero overflow). */
-.search-wrap { position: relative; flex: 1 1 200px; min-width: 136px; }
+.search-wrap { position: relative; flex: 1 16 200px; min-width: 136px; }
 .search {
   display: flex; align-items: center; gap: var(--space-2); height: 34px; padding: 0 var(--space-3);
   border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); color: var(--ink-3);
@@ -327,8 +337,11 @@ body {
    included. Why: dark is the default theme, and the user-agent link blue on
    the dark --paper is 2.04:1 (visited 1.74:1), under the 4.5:1 text floor;
    --accent is 5.16:1 on the light surface and 6.06:1 on the dark paper.
-   Buttons styled as links (.btn) keep their own color. */
-.main a:not(.btn), .main a:not(.btn):visited, .main a:not(.btn):hover { color: var(--accent); }
+   Buttons styled as links (.btn) keep their own color, and :where() gives
+   the rule zero specificity, so any link a component already colors (the
+   Settings tabs, the fold's "Open on its own page") keeps its own rule; only
+   the links that fell through to the user-agent blue change. */
+:where(.main a:not(.btn), .main a:not(.btn):visited, .main a:not(.btn):hover) { color: var(--accent); }
 .fortress { grid-area: fortress; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-2); padding: var(--space-3); display: flex; flex-direction: column; gap: 10px; }
 .app.route-full .fortress { display: none; }
 .card {
@@ -1397,9 +1410,14 @@ body {
   .topbar .btn.btn-talk .btn-label { display: none; }
   .topbar .btn.btn-talk { padding: 0 var(--space-2); }
   .scope .sw-agent { max-width: 96px; }
-  .search-wrap { min-width: 96px; }
-  /* 6px gap (--space-2 less one 2px step) buys room at 1024; the range keeps
-     its content width so "Last 24 hours" and "Last 30 days" fit whole. */
+  /* 104px: the 16px glyph, the 8px gap, 12px padding each side and the 1px
+     borders (50px of chrome) plus the placeholder "Search" (about 50px at
+     the body size), rounded up to a 4px step, so the placeholder never clips
+     once the key hint is hidden. */
+  .search-wrap { min-width: 104px; }
+  /* 6px gap (--space-2 less one 2px step) buys room at 1024. The range is
+     never capped: it keeps its content width, and its short option labels
+     ("24 hours", not "Last 24 hours") fit whole at every width. */
   .topbar { gap: calc(var(--space-2) - 2px); }
 }
 @media (max-width: 860px) {
@@ -1460,9 +1478,7 @@ body {
 .agent-switcher-opt .opt-state { font-family: var(--mono); font-size: 9px; color: var(--ink-3); }
 
 /* Posture seal (top bar) + popover. Honest verdict drives the color. */
-/* The seal gives way last (a tenth of the search's rate) and only in its
-   freshness text, which ellipsizes with its full text in a title. */
-.posture-seal-wrap { position: relative; min-width: 0; flex: 0 0.1 auto; display: flex; }
+.posture-seal-wrap { position: relative; flex: none; }
 /* The seal per the TopBar preview: 34px, the 8px control radius, mono
    uppercase word with its evidence age beside it in --ink-2. Each tone wears
    its own status hue, -bg tint and -line border, and its own glyph shape, so
@@ -1474,14 +1490,18 @@ body {
   display: inline-flex; align-items: center; gap: var(--space-2); height: 34px;
   padding: 0 var(--space-3); border-radius: 8px; cursor: pointer;
   border: 1px solid var(--rule-2); background: var(--surface-2); color: var(--ink-2);
-  font-family: var(--mono); font-size: var(--text-xs); font-weight: 500; white-space: nowrap; flex: 0 1 auto; min-width: 0;
+  font-family: var(--mono); font-size: var(--text-xs); font-weight: 500; white-space: nowrap; flex: none;
 }
 .posture-seal .seal-glyph { width: 12px; height: 12px; position: relative; flex-shrink: 0; }
 .posture-seal .seal-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .posture-seal .seal-glyph::after { content: ""; position: absolute; inset: 4px; background: currentColor; border-radius: 50%; opacity: 0.9; }
 .posture-seal .seal-word { text-transform: uppercase; font-weight: 600; letter-spacing: 0.06em; flex-shrink: 0; }
-/* 8ch keeps an age such as "4m ago" whole before the ellipsis starts. */
-.posture-seal .seal-freshness { color: var(--ink-2); letter-spacing: 0; flex: 0 1 auto; min-width: 8ch; overflow: hidden; text-overflow: ellipsis; }
+/* 26ch caps the freshness: the longest text the client writes is
+   "freshness window unknown" (24 characters; an age is one unit, so
+   "last evidenced 9999d ago" is 24 too), plus 2ch of slack. Every text the
+   client writes shows whole; only an unexpected longer string ellipsizes,
+   with its full text in the element's title. */
+.posture-seal .seal-freshness { color: var(--ink-2); letter-spacing: 0; flex: none; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; }
 .posture-seal.tone-protected { border-color: var(--sage-line); background: var(--sage-bg); color: var(--sage); }
 .posture-seal.tone-attention { border-color: var(--ochre-line); background: var(--ochre-bg); color: var(--ochre); }
 .posture-seal.tone-attention .seal-glyph::before { border: 0; border-radius: 0; background: currentColor; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
@@ -1900,9 +1920,9 @@ export function renderDashboardV11Html(
       <label class="sr-only" for="time-range">Time range</label>
       <select class="range" id="time-range" data-action="time-range" title="Time range applies to the Evidence list">
         <option value="all">All time</option>
-        <option value="24h">Last 24 hours</option>
-        <option value="7d">Last 7 days</option>
-        <option value="30d">Last 30 days</option>
+        <option value="24h">24 hours</option>
+        <option value="7d">7 days</option>
+        <option value="30d">30 days</option>
       </select>
       <button type="button" class="btn btn-talk" id="btn-talk" data-action="talk-toggle" aria-expanded="false" aria-controls="talk-panel" aria-label="Talk to your fortress" title="Talk to your fortress">${ICON_TALK}<span class="btn-label">Talk</span></button>
       <button type="button" class="btn btn-lockdown" id="btn-lockdown" data-action="lockdown" title="Revoke network access for every confined agent. Requires your approval before it takes effect.">Lock down</button>
