@@ -1,6 +1,7 @@
 // Type surface for build-design-fonts.mjs so the structure test can import the
 // same face table and renderer the generator runs. Must match the exports in
-// that file.
+// that file (UNICODE_RANGE, FACES, renderModule); the .mjs carries the matching
+// pin naming this file.
 export interface ConsoleFontFace {
   readonly family: string;
   readonly file: string;

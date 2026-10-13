@@ -277,7 +277,7 @@ export function renderPostureHomeHTML(): string {
     background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
     padding: 5px 9px; color: var(--ink-2); width: fit-content;
   }
-  .firstrun-foot { margin: 14px 0 0; font-size: 11.5px; color: var(--ink-4, var(--ink-3)); }
+  .firstrun-foot { margin: 14px 0 0; font-size: 11.5px; color: var(--ink-3); }
   /*
     S3 quiet empty state: "nothing here" should read as earned calm, not as a
     failure or a blank. Used for the panels that are legitimately empty on a

@@ -55,11 +55,14 @@ export const MOBILE_COMPANION_ROUTE_PREFIX = "/m";
  * Everything is inline and same-origin, so `default-src 'self'` with the
  * narrow inline allowances is sufficient; no external origin is ever needed.
  * `connect-src 'self'` keeps runtime fetches (the `/api/*` calls) same-origin.
- * `font-src data:` admits only the console faces this page embeds inline
- * (CONSOLE_FONT_FACE_CSS in design-fonts.ts); without it `default-src 'self'`
- * blocks them and the page silently falls back to the system stack. It opens
- * no network origin: a data: font is bytes already in the document, and
- * `style-src 'unsafe-inline'` already lets inline CSS declare a face.
+ * `font-src 'self' data:` is the directive as written. Its `data:` source
+ * admits the console faces this page embeds inline (CONSOLE_FONT_FACE_CSS in
+ * design-fonts.ts); without it `default-src 'self'` blocks them and the page
+ * silently falls back to the system stack. Its `'self'` source admits a
+ * same-origin font URL, which `default-src 'self'` already allowed and which
+ * the page never uses. It opens no network origin: a data: font is bytes
+ * already in the document, and `style-src 'unsafe-inline'` already lets
+ * inline CSS declare a face.
  */
 export const MOBILE_COMPANION_CSP =
   "default-src 'self'; " +

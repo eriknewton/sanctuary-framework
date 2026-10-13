@@ -166,7 +166,7 @@ export const EVIDENCE_SPINE_CSS = `.stat-of {
     margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
     justify-content: space-between; gap: 8px; flex-wrap: wrap;
   }
-  .stat-fresh { font-family: var(--mono, monospace); font-size: 10px; color: var(--ink-4, var(--ink-3)); white-space: nowrap; }
+  .stat-fresh { font-family: var(--mono, monospace); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
   .stat-fresh.none { color: var(--slate); }
   .stat-ev { font-size: 10.5px; color: var(--indigo); text-decoration: none; white-space: nowrap; }
   .stat-ev:hover { text-decoration: underline; }`;

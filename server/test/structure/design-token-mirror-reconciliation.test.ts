@@ -203,49 +203,146 @@ describe("semantic alias layer", () => {
     expect(CANONICAL.dark["--slate"]).not.toBe(CANONICAL.light["--slate"]);
   });
 
+  /**
+   * Follow a token's var() chain within one theme to the literal it renders.
+   * The dark map is the light block overlaid by the dark block, because the
+   * dark block redeclares only physical tokens on the same element and every
+   * alias reaches the dark value through that override.
+   */
+  const themeMap = (block: Block): Record<string, string> =>
+    block === "light" ? CANONICAL.light : { ...CANONICAL.light, ...CANONICAL.dark };
+  function resolveLiteral(map: Record<string, string>, name: string): string {
+    const seen = new Set<string>();
+    let current = name;
+    for (;;) {
+      expect(seen.has(current), `var() cycle through ${current}`).toBe(false);
+      seen.add(current);
+      const value = map[current];
+      expect(value, `${current} is not declared`).toBeDefined();
+      const next = value.match(/^var\((--[\w-]+)\)$/);
+      if (!next) return value.toLowerCase();
+      current = next[1];
+    }
+  }
+
   it("the reserved severity ramp and the chart pair are never a status alias", () => {
     // The --sev-* ramp is validated as an ordered scale and the --chart-* pair
     // as a categorical pair, each against the status hues. A status alias that
     // borrowed one would put two meanings on one hue, and the validation that
-    // kept them distinguishable would no longer describe what renders.
-    const borrowed: string[] = [];
-    for (const [name, value] of Object.entries(CANONICAL.light)) {
-      if (!name.startsWith(ALIAS_PREFIX)) continue;
-      if (/^var\(--(sev|chart)-/.test(value)) borrowed.push(`${name} -> ${value}`);
+    // kept them distinguishable would no longer describe what renders. The
+    // comparison is on RESOLVED literals per theme, so an alias routed through
+    // an intermediate token, or a physical token that copies a ramp literal,
+    // fails the same way a direct var(--sev-*) does. The -text tokens are word
+    // colors, not ramp hues (light ones are --ink-2), so they are not reserved.
+    const RESERVED = /^--(sev|chart)-(?!.*-text$)/;
+    for (const block of ["light", "dark"] as const) {
+      const map = themeMap(block);
+      const reserved = new Set(
+        Object.keys(map)
+          .filter((n) => RESERVED.test(n))
+          .map((n) => resolveLiteral(map, n)),
+      );
+      expect(reserved.size).toBeGreaterThanOrEqual(7);
+      const borrowed: string[] = [];
+      for (const name of Object.keys(CANONICAL.light)) {
+        if (!name.startsWith(ALIAS_PREFIX)) continue;
+        const literal = resolveLiteral(map, name);
+        if (reserved.has(literal)) borrowed.push(`${block} ${name} -> ${literal}`);
+      }
+      expect(borrowed).toEqual([]);
     }
-    expect(borrowed).toEqual([]);
-    // The locked status, like unknown, has a hue of its own in both themes.
+  });
+
+  it("the locked status has a hue of its own in both themes", () => {
+    // Locked, like unknown, must be told apart from every other status by
+    // its hue in BOTH themes; a dark --locked that copied the pass green
+    // would make a locked-down agent read as checked and passed in dark mode.
+    // The other status hues are read off the alias layer itself, so a status
+    // added later joins the comparison without editing this test.
     expect(CANONICAL.light["--color-status-locked"]).toBe("var(--locked)");
-    expect(CANONICAL.dark["--locked"]).toBeDefined();
-    expect(CANONICAL.light["--locked"]).not.toBe(CANONICAL.light["--slate"]);
-    expect(CANONICAL.light["--locked"]).not.toBe(CANONICAL.light["--sage"]);
+    const STATUS_HUE = /^--color-status-[a-z]+$/;
+    for (const block of ["light", "dark"] as const) {
+      const map = themeMap(block);
+      const locked = resolveLiteral(map, "--color-status-locked");
+      const others = Object.keys(CANONICAL.light).filter(
+        (n) => STATUS_HUE.test(n) && n !== "--color-status-locked",
+      );
+      expect(others.length).toBeGreaterThanOrEqual(5);
+      const collisions = others
+        .filter((n) => resolveLiteral(map, n) === locked)
+        .map((n) => `${block} ${n} = ${locked}`);
+      expect(collisions).toEqual([]);
+    }
   });
 
   it("the design system's component alias block is not declared in the canonical block", () => {
-    // The ratified design ships a second alias layer (--bg, --text, --border,
-    // --font-*, --radius-*, --good/--bad/--warn/--unknown/--neutral ...) for
-    // its component previews. The legacy approval board and the pre-v1.1
-    // dashboard define --bg and --border themselves, so declaring that layer
-    // here would repaint them on any page that carries both blocks. It lands
-    // only after those boards are retired or renamed.
+    // The ratified design ships a second alias layer for its component
+    // previews. The legacy approval board and the pre-v1.1 dashboard define
+    // --bg and --border themselves, so declaring that layer here would repaint
+    // them on any page that carries both blocks. It lands only after those
+    // boards are retired or renamed.
+    //
+    // The full set, not a sample: a sampled denylist passes when the one name
+    // declared is a name it skipped. Must match the COMPONENT ALIAS BLOCK in
+    // the ratified design system's tokens.css (the 2026-10-12 design handoff,
+    // which lives outside this repo), all 52 names in its order.
     const DESIGN_ONLY_ALIASES = [
       "--bg",
       "--text",
       "--text-2",
+      "--text-3",
+      "--text-4",
       "--border",
       "--border-2",
+      "--accent-tint",
       "--good",
+      "--good-bg",
+      "--good-line",
       "--warn",
+      "--warn-bg",
+      "--warn-line",
       "--bad",
+      "--bad-bg",
+      "--bad-line",
       "--unknown",
+      "--unknown-bg",
+      "--unknown-line",
       "--neutral",
-      "--font-sans",
+      "--neutral-bg",
+      "--neutral-line",
       "--font-display",
+      "--font-sans",
       "--font-mono",
+      "--radius-xs",
+      "--radius-sm",
       "--radius-md",
+      "--radius-control",
+      "--radius-lg",
       "--radius-xl",
+      "--radius-pill",
+      "--space-hair",
       "--space-tight",
+      "--space-page",
+      "--stroke-hairline",
+      "--stroke-marker",
+      "--stroke-focus",
+      "--shadow-none",
+      "--shadow-marker-accent",
+      "--size-topbar",
+      "--size-rail",
+      "--size-control",
+      "--size-button",
+      "--size-button-sm",
+      "--size-chip",
+      "--size-filter",
+      "--size-drawer",
+      "--size-icon",
+      "--size-icon-sm",
+      "--size-glyph",
     ];
+    // 52 = the count of declarations in that block; a short list here is the
+    // sampling defect this test exists to prevent.
+    expect(new Set(DESIGN_ONLY_ALIASES).size).toBe(52);
     const declared = DESIGN_ONLY_ALIASES.filter(
       (name) => name in CANONICAL.light || name in CANONICAL.dark,
     );

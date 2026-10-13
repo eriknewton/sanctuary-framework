@@ -140,8 +140,8 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     input[type="text"]::placeholder,
     input[type="password"]::placeholder {
-      /* --ink-4 is disabled labels only; a placeholder is read, so it takes
-         the tertiary text color. */
+      /* --ink-4 never carries text a person reads; a placeholder is read,
+         so it takes the tertiary text color. */
       color: var(--ink-3);
     }
 
@@ -3428,7 +3428,7 @@ export function generateFleetSwitcherHTML(options: {
       font-size: var(--text-md);
     }
     .add-form input#machine-url { font-family: var(--mono); }
-    .add-form input::placeholder { color: var(--ink-3); } /* --ink-4 is disabled labels only; a placeholder is read */
+    .add-form input::placeholder { color: var(--ink-3); } /* --ink-4 never carries text a person reads; a placeholder is read */
     .add-form input:focus { outline: 2px solid var(--ink-3); outline-offset: 1px; border-color: var(--ink-3); }
     .add-form input.invalid { border-color: var(--rust); }
     .add-form button {

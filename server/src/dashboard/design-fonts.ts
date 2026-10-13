@@ -13,8 +13,10 @@
  * Embedded, never fetched: the console is served by the local server and must
  * not reach a third-party font origin, which would both leak that the console
  * was opened and make its type depend on the network. A page that serves a
- * Content-Security-Policy must therefore allow `font-src data:` (the mobile
- * companion does; see MOBILE_COMPANION_CSP in mobile.ts).
+ * Content-Security-Policy must therefore allow `data:` fonts. The mobile
+ * companion does, with `font-src 'self' data:` (MOBILE_COMPANION_CSP in
+ * mobile.ts); its `'self'` source admits a same-origin font URL the page
+ * never uses.
  *
  * Interpolated verbatim, next to `PAPER_INK_ROOT_TOKENS_CSS`, into the inline
  * `<style>` of every page that interpolates the tokens (the consumer list is in

@@ -3012,7 +3012,7 @@ function renderFortress() {
       queueBody,
     '</div>',
     '<div class="rail-section">',
-      '<div class="rail-section-label" style="color:var(--ink-4)">Right now</div>',
+      '<div class="rail-section-label">Right now</div>',
       '<div class="ambient-posture">',
         '<div class="ambient-seal tone-' + seal.tone + '">',
           '<span class="as-glyph"></span>',

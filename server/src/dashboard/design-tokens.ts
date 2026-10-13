@@ -42,6 +42,12 @@
  *     "no data"; unknown gets its own full-weight gray, not a whisper.
  *   - `--locked` / `--locked-bg`: the fifth status hue (locked down, paused).
  *   - a `-line` chip border per status hue.
+ *   - `--ink-line`: the neutral chip border, a SERVER-ONLY name. The design
+ *     sets the neutral border as a per-theme hex directly on
+ *     `--color-status-neutral-line`; the server names that value `--ink-line`
+ *     so the semantic alias resolves to a physical token like every other
+ *     alias (the plain-`var()` rule at the alias layer). Same bytes in both
+ *     themes; one extra name here that the design's file does not declare.
  *   - `--sev-*`: the severity ramp, reserved for severity marks.
  *   - `--chart-allowed` / `--chart-blocked`: the egress chart pair.
  *
@@ -114,13 +120,18 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --paper-3: #e6eaf2;
   --ink: #0f172a;
   --ink-2: #4b5566;
-  /* Tertiary text: table headers, hints, evidence ages, timestamps, footers,
-     input placeholders. Stepped so 11px text clears 4.5:1 on every fill it
-     sits on, the active rail fill included. */
+  /* Tertiary text: table headers, section labels, hints, evidence ages,
+     timestamps, footers, message meta, input placeholders. Stepped so 11px
+     text clears 4.5:1 on every fill it sits on, the active rail fill
+     included. */
   --ink-3: #5e6879;
-  /* Disabled labels only, below the 4.5:1 text floor on purpose (WCAG exempts
-     disabled controls). Never a placeholder and never anything a person must
-     read: placeholders use --ink-3. */
+  /* Disabled labels, plus non-text marks (a dot, bar or ring for an off,
+     pending or empty state) whose meaning a word or title beside them
+     carries. Below the 4.5:1 text floor on purpose: WCAG exempts disabled
+     controls, and a mark that only repeats its word conveys nothing alone.
+     Never text a person must read: ages, timestamps, footers, meta lines,
+     section labels and placeholders use --ink-3, and the unknown status uses
+     --slate. */
   --ink-4: #a3abba;
   --rule: #d9dee9;
   /* Control borders. Below the 3:1 non-text floor for a control boundary
@@ -155,8 +166,9 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --locked-bg: #efeafa;
   --locked-line: #cbb8f0;
   /* Border of a neutral chip, in the -line pattern after the --ink-3 text the
-     neutral status draws from. Its own gray: the --rule-2 it replaced was all
-     but invisible on the neutral tint. */
+     neutral status draws from. Server-only name for the design's neutral
+     border value (see the header). No consumer draws it yet; it is declared
+     for the shell restyle, like the other -line borders. */
   --ink-line: #bcc2cf;
   /* The one accent: links, focus, selection, the primary button fill, the
      active rail marker. Never a status. */
@@ -243,13 +255,16 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      for the semantic name so the status vocabulary this system enforces is
      legible in the stylesheet rather than only in the prose above.
 
-     Why the layer is worth its lines: the status set has six members, and
-     "unknown" is one of them, with its own hue and its own name.
-     Green must mean "checked and passed," never "no data." A surface with no
-     result has --color-status-unknown to reach for, so it never has to borrow
-     the pass color for want of a token. The wired mapping of these onto
-     .pill classes is STATUS_PILL_CSS in
-     principal-policy/posture-html-shared.ts.
+     Why the layer is worth its lines: the status set has six members (pass,
+     attention, fault, neutral, unknown, locked), and "unknown" is one of
+     them, with its own hue and its own name. Green must mean "checked and
+     passed," never "no data." A surface with no result has
+     --color-status-unknown to reach for, so it never has to borrow the pass
+     color for want of a token. Five members are wired to .pill classes in
+     STATUS_PILL_CSS in principal-policy/posture-html-shared.ts (green, amber,
+     red, neutral, unknown). Locked is declared here for the shell restyle and
+     has no pill class or other consumer yet; the v1.1 locked seal still
+     paints the fault red until that slice.
 
      Every alias resolves to a physical token declared above, never to a
      literal. var() substitution is computed per element, and the dark palette

@@ -6,21 +6,45 @@
  *   node scripts/build-design-fonts.mjs --check   exit 1 if the committed module
  *                                                 or any font file has drifted
  *
- * Why generated: the console is a single HTML document served by the local
- * server, and it must never fetch a face from a third-party origin, so each
- * face rides inline as a base64 data URI. Hand-pasting roughly 106 KB of base64
- * is how a truncated or mismatched face ships; this script is the only writer,
- * and `test/structure/console-design-fonts.test.ts` re-derives the module from
- * the committed woff2 files on every run.
- *
- * Provenance. Each face was fetched from its upstream repository at the pinned
- * ref below into an empty scratch directory (nothing was executed from it), its
- * sha256 checked against SOURCE_SHA256, then subset offline with fonttools
- * 4.55.3 (`pyftsubset`) in a scratch virtualenv:
+ *   Re-cutting a subset (only when UNICODE_RANGE or a pinned source changes),
+ *   in a scratch virtualenv with fonttools 4.55.3 and brotli 1.2.0 (brotli is
+ *   the woff2 encoder, so its version decides the output bytes; Python 3.9.6):
  *
  *   pyftsubset <source>.ttf --unicodes="<UNICODE_RANGE>" --flavor=woff2 \
  *     --no-hinting --desubroutinize --layout-features+=tnum,case \
- *     --name-IDs=0,1,2,3,4,5,6,13,14 --output-file=<file>
+ *     --name-IDs=0,1,2,3,4,5,6,13,14 --output-file=assets/fonts/<file>
+ *
+ *   then update that face's subsetSha256 below and run this script. With
+ *   those versions the command reproduces every committed subset byte for
+ *   byte (checked 2026-10-12 against all three subsetSha256 pins). Failure
+ *   mode: a different brotli can write a valid but different woff2, so the
+ *   sha256 moves with no visible change; the subset hash below, not the
+ *   command, is the authority for what ships.
+ *
+ * Why generated: the console is a single HTML document served by the local
+ * server, and it must never fetch a face from a third-party origin, so each
+ * face rides inline as a base64 data URI. Hand-pasting the base64 is how a
+ * truncated or mismatched face ships; this script is the only writer, and
+ * `test/structure/console-design-fonts.test.ts` re-derives the module from
+ * the committed woff2 files on every run.
+ *
+ * Size. Per PAGE: 105,928 bytes of base64 (the three subsets total 79,440
+ * bytes; base64 writes 4 bytes per 3, per face), 107,059 bytes of @font-face
+ * CSS in every page that interpolates the constant. Per PACKAGE: tsup builds
+ * with splitting off, so each bundle that reaches the dashboard carries its
+ * own copy. Measured on the 2026-10-12 build: `dist/cli.js`, `dist/cli.cjs`,
+ * `dist/index.js` and `dist/index.cjs` each embed it once, and each of their
+ * four source maps carries it again in sourcesContent, so the npm package
+ * holds eight copies, 847,424 bytes of base64 in all (unpacked size).
+ *
+ * Provenance. Each face was fetched from its upstream repository at the pinned
+ * ref below into an empty scratch directory (nothing was executed from it), its
+ * sha256 checked against its sourceSha256, then subset offline with the command
+ * in the usage block above.
+ *
+ * Cross-file pin: `build-design-fonts.d.mts` declares the type surface of this
+ * file's exports (UNICODE_RANGE, FACES and renderModule) for the structure
+ * test; an export added, removed or reshaped here must be changed there too.
  *
  * The wght axis is kept whole (variable faces), so every weight a template asks
  * for resolves without a second file. Name IDs 0, 13 and 14 keep the copyright
@@ -47,9 +71,15 @@ const OUT_FILE = join(SERVER_DIR, "src", "dashboard", "design-fonts.ts");
 
 /**
  * Latin (U+0000-00FF plus the typographic punctuation block U+2000-206F and
- * Google's latin extras) and the glyphs the console templates draw: the arrows
- * U+2190-2193 and the shapes U+25B6, U+25BC, U+25C6, U+25C7, U+25CF. A shape a
- * face lacks is simply absent from its subset and falls back per character.
+ * Google's latin extras), the arrows U+2190-2193, and the shapes U+25B6,
+ * U+25BC, U+25C6, U+25C7, U+25CF. Manrope and Space Grotesk carry the arrows;
+ * Roboto Mono does not. None of the three faces carries any of those shapes,
+ * nor the four status-pill glyphs in STATUS_PILL_CSS (U+25B2, U+2B22, U+25CB,
+ * U+25CC; checked against each pinned source's cmap on 2026-10-12), so every
+ * shape renders from the system stack, as it did before the faces were
+ * bundled. Adding a code point no face carries changes no subset byte, which
+ * is why the status glyphs are not listed. A code point a face lacks falls
+ * back per character, never per word.
  * Must match the --unicodes argument used to cut the committed woff2 files.
  */
 export const UNICODE_RANGE =
@@ -140,8 +170,10 @@ export function renderModule() {
  * Embedded, never fetched: the console is served by the local server and must
  * not reach a third-party font origin, which would both leak that the console
  * was opened and make its type depend on the network. A page that serves a
- * Content-Security-Policy must therefore allow \`font-src data:\` (the mobile
- * companion does; see MOBILE_COMPANION_CSP in mobile.ts).
+ * Content-Security-Policy must therefore allow \`data:\` fonts. The mobile
+ * companion does, with \`font-src 'self' data:\` (MOBILE_COMPANION_CSP in
+ * mobile.ts); its \`'self'\` source admits a same-origin font URL the page
+ * never uses.
  *
  * Interpolated verbatim, next to \`PAPER_INK_ROOT_TOKENS_CSS\`, into the inline
  * \`<style>\` of every page that interpolates the tokens (the consumer list is in
