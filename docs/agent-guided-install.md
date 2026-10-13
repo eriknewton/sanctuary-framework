@@ -242,7 +242,7 @@ any harness supported by `sanctuary protect`.
 
 `full` additionally requires macOS, Hermes, the signed Castle Wall app at
 `/Applications/Sanctuary-CastleWall.app`, an enabled system extension, a root
-boot service, and observed live enforcement. The signed app is deliberately not
+boot service, and observed live enforcement on a patched host. The signed app is deliberately not
 downloaded by the planner: artifact provenance must come from the signed release
 channel or an explicitly supplied drill candidate. The agent may copy a verified
 artifact into place, launch it, and guide the operator to the named macOS pane.

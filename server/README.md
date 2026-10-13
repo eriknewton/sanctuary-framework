@@ -14,7 +14,7 @@ Every capability claim in this repository traces to a row in the [Assurance Matr
 |---|---|
 | **The wall.** Outbound traffic from a wrapped agent is allowed or denied below the agent, per operator policy, per agent account | **macOS: proven.** A signed operator policy with a clean per-uid allow/deny demonstration that survives attended reboot cycles. Not an audited per-rule, per-flow trail. **Linux: proven on Ubuntu 24.04 (x86-64) only.** On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Fault-injection witnesses, a real-agent harness, and every other distribution or architecture remain unproven. **Windows: roadmapped.** |
 | **Custody.** Keys and state under your passphrase, on your hardware | **Proven.** Ed25519 identity, Argon2id unlock, per-purpose derived subkeys, encrypted state at rest. The passphrase lives in the macOS Keychain or Linux Secret Service and generation fails closed without it. |
-| **The gate.** Policy you set, frozen at startup, the agent cannot read or infer; three approval tiers with a human on the irreversible ones | **Proven.** Cooperative gates on every MCP call routed through Sanctuary. The wall is what makes the gate more than a request. |
+| **The gate.** Policy you set, frozen at startup, the agent cannot read or infer; three approval tiers with a human on the irreversible ones | **Proven.** Cooperative gates on every MCP call Sanctuary executes or forwards. The wall is what makes the gate more than a request. |
 | **The record.** Append-only, hash-chained audit of what the agent did | **Partial.** The chain is live; production call sites sign checkpoints when the fortress holds an identity. Fortresses with no identity and the root daemon split audit store write honest unsigned checkpoints. The row stays partial pending the IC-05 external-verifier drill and the remaining local tamper-evidence follow-up. |
 | **Exit.** Keys, state, memory and reputation leave with you | **Partial.** Export and import ship; three exit-bundle gaps are open (IC-07, IC-08, IC-09). |
 
@@ -224,7 +224,7 @@ Sanctuary's security claims are structural, not cooperative-only, and each trace
 - 3-pass secure deletion (random overwrite before unlink)
 - Private keys never appear in any MCP tool response
 - Monotonic version numbers prevent state rollback
-- Principal Policy gates every MCP call routed through Sanctuary (three-tier approval)
+- Principal Policy gates every MCP call Sanctuary executes or forwards (three-tier approval)
 - Behavioral baseline detects anomalous agent behavior
 - Stderr is informational and deny-only; decision-ready Tier 1 approval requires an authenticated configured approval channel
 
