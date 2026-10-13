@@ -813,6 +813,33 @@ describe("HermesBridgeCore", () => {
     expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
   });
 
+  it("denies an insert when the approval deadline is seen during parked audit durability", async () => {
+    const h = makeHarness({ deferredAudit: true });
+    accept(h.core);
+    insert(h.core, "c1", "deadline-during-durability", "bridge text");
+    await h.tick();
+    const entry = h.core.snapshot().ledger.entry!;
+    h.core.ownerApprove(entry.id, entry.textSha256);
+    await h.tick(2);
+    const sentProbe = h.writes.find((frame): frame is Extract<NodeToRelayInput, { type: "probe" }> => frame.type === "probe")!;
+    h.core.relayFrame({ kind: "probe_reply", connectionId: "c1", nonce: sentProbe.nonce });
+    await h.tick(4);
+
+    expect(h.core.snapshot().slot?.durabilityPending).toBeGreaterThan(0);
+    h.timers.fireFirst();
+    await h.tick(12);
+
+    const recordId = h.recordIdForRequest("deadline-during-durability");
+    expect(recordId).toBeDefined();
+    expect(h.releasedRecordIds()).toContain(recordId);
+    expect(h.pendingAudits.length).toBe(h.audits.length);
+    expect(h.pendingAudits.length).toBeGreaterThan(0);
+    expect(h.store.size).toBe(0);
+    expect(responseFor(h.writes, "deadline-during-durability")).toMatchObject({ type: "error", message: HERMES_MEMORY_DENIAL });
+    expect(terminalStates(h.audits)).toContain("TIMED_OUT/deadline");
+    expect(h.core.snapshot().lifecycle.recordCount).toBe(0);
+  });
+
   it("denies an insert when peer shutdown arrives during the durability wait", async () => {
     const h = makeHarness({ deferredAudit: true });
     accept(h.core);
