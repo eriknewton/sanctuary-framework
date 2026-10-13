@@ -46,6 +46,7 @@ interface CellExpectation {
 interface SetupResult {
   readonly lifecycle: HermesConnectionLifecycle;
   readonly recordId?: string;
+  readonly recordRequestId?: string;
 }
 
 const CELL_TABLE: Record<HermesConnectionState, Record<CellEventType, CellExpectation>> = {
@@ -144,6 +145,7 @@ function actionTypes(actions: readonly HermesLifecycleAction[]): readonly Hermes
 function expectedActionsFor(
   event: HermesLifecycleEvent,
   recordId: string | undefined,
+  recordRequestId: string | undefined,
   expectedTypes: readonly HermesLifecycleAction["type"][],
 ): readonly HermesLifecycleAction[] {
   if (expectedTypes.length === 0) return [];
@@ -154,7 +156,7 @@ function expectedActionsFor(
     return [{ type: "deliver_control", connectionId: event.connectionId, recordId, requestId: event.mcpRequestId, control: "cancel" }];
   }
   if (expectedTypes[0] === "deliver_control" && event.type === "public_shutdown" && recordId !== undefined) {
-    return [{ type: "deliver_control", connectionId: event.connectionId, recordId, requestId: "r1", control: "shutdown" }];
+    return [{ type: "deliver_control", connectionId: event.connectionId, recordId, requestId: recordRequestId ?? "missing", control: "shutdown" }];
   }
   if (expectedTypes[0] === "send_close" && "connectionId" in event) {
     return [{ type: "send_close", connectionId: event.connectionId }];
@@ -196,6 +198,12 @@ function firstRecordId(actions: readonly HermesLifecycleAction[]): string {
   return action.recordId;
 }
 
+function firstRouteAction(actions: readonly HermesLifecycleAction[]): Extract<HermesLifecycleAction, { type: "route_call" }> {
+  const action = actions[0];
+  if (action?.type !== "route_call") throw new Error("expected routed call");
+  return action;
+}
+
 function setupState(state: HermesConnectionState): SetupResult {
   const lifecycle = new HermesConnectionLifecycle();
   if (state === "UNKNOWN") return { lifecycle };
@@ -206,14 +214,16 @@ function setupState(state: HermesConnectionState): SetupResult {
     return { lifecycle };
   }
   const call = lifecycle.apply({ type: "call", connectionId: "c1", requestId: "r1", kind: "tools_call", valid: true });
-  const recordId = firstRecordId(call.actions);
-  if (state === "OPEN_BUSY") return { lifecycle, recordId };
+  const record = firstRouteAction(call.actions);
+  const recordId = record.recordId;
+  const recordRequestId = record.requestId;
+  if (state === "OPEN_BUSY") return { lifecycle, recordId, recordRequestId };
   if (state === "OPEN_BUSY_PEER_SHUTTING") {
     lifecycle.apply({ type: "public_shutdown", connectionId: "c1" });
-    return { lifecycle, recordId };
+    return { lifecycle, recordId, recordRequestId };
   }
   lifecycle.apply({ type: "node_close", connectionId: "c1", reason: "unparseable_call" });
-  return { lifecycle, recordId };
+  return { lifecycle, recordId, recordRequestId };
 }
 
 function busy(lifecycle: HermesConnectionLifecycle, connectionId: string, requestId: string): string {
@@ -232,12 +242,12 @@ describe("Hermes connection lifecycle table", () => {
   it.each(CONNECTION_STATES.flatMap((state) => CELL_EVENTS.map((event) => [state, event] as const)))(
     "%s x %s follows the lifecycle table",
     (state, event) => {
-      const { lifecycle, recordId } = setupState(state);
+      const { lifecycle, recordId, recordRequestId } = setupState(state);
       const lifecycleEvent = eventFor(event, recordId);
       const result = lifecycle.apply(lifecycleEvent);
       const expected = CELL_TABLE[state][event];
       expect(actionTypes(result.actions)).toEqual(expected.actions);
-      expect(result.actions).toEqual(expectedActionsFor(lifecycleEvent, recordId, expected.actions));
+      expect(result.actions).toEqual(expectedActionsFor(lifecycleEvent, recordId, recordRequestId, expected.actions));
       expect(result.fatal?.reason).toBe(expected.fatal);
       expect(result.refusal?.reason).toBe(expected.refusal);
       expect(lifecycle.stateOf("c1")).toBe(expected.next);
@@ -321,8 +331,15 @@ describe("Hermes lifecycle amendments", () => {
       { type: "deliver_control", connectionId: "busy", recordId: attached, requestId: "r4", control: "shutdown" },
     ]);
     expect(lifecycle.recordsSnapshot().every((record) => record.state === "SHUT_DOWN")).toBe(true);
-    expect(lifecycle.apply({ type: "call", connectionId: "busy", requestId: "later", kind: "hello", valid: true }).actions).toEqual([]);
-    expect(lifecycle.apply({ type: "public_unparseable", connectionId: "busy" }).actions).toEqual([]);
+    const stoppedCall = lifecycle.apply({ type: "call", connectionId: "busy", requestId: "later", kind: "hello", valid: true });
+    expect(stoppedCall.actions).toEqual([]);
+    expect(stoppedCall.refusal?.reason).toBe("stopped");
+    const stoppedClose = lifecycle.apply({ type: "public_unparseable", connectionId: "busy" });
+    expect(stoppedClose.actions).toEqual([]);
+    expect(stoppedClose.refusal?.reason).toBe("stopped");
+    const stoppedResponse = lifecycle.apply({ type: "node_response_written", connectionId: "busy", recordId: attached });
+    expect(stoppedResponse.actions).toEqual([]);
+    expect(stoppedResponse.refusal?.reason).toBe("stopped");
   });
 
   it("admits a call when live closed rows and settling records remain under the total cap", () => {

@@ -64,6 +64,14 @@ function newStats(): Stats {
 
 type Operation = { kind: "apply"; event: HermesLifecycleEvent } | { kind: "release"; recordId: string };
 
+interface RecordSnapshot {
+  connectionId: string;
+  requestId: string;
+  kind: string;
+  state: string;
+  pendingShutdown: boolean;
+}
+
 class Harness {
   readonly lifecycle = new HermesConnectionLifecycle();
   readonly acceptFloor = new Map<string, number>();
@@ -83,7 +91,7 @@ class Harness {
   private internals() {
     return this.lifecycle as unknown as {
       rows: Map<string, { state: string; currentRecordId?: string }>;
-      records: Map<string, { connectionId: string; requestId: string; state: string; pendingShutdown: boolean }>;
+      records: Map<string, RecordSnapshot>;
       nextRecordNumber: number;
     };
   }
@@ -92,6 +100,7 @@ class Harness {
     const pre = this.internals();
     const preRecords = new Map([...pre.records.entries()].map(([key, value]) => [key, { ...value }]));
     const preRows = new Map([...pre.rows.entries()].map(([connectionId, row]) => [connectionId, { ...row }]));
+    const preNextRecordNumber = pre.nextRecordNumber;
     const preStopped = this.lifecycle.stopped;
     let result: HermesLifecycleResult | { actions: readonly HermesLifecycleAction[] };
     try {
@@ -102,8 +111,8 @@ class Harness {
     }
 
     if (preStopped && result.actions.length > 0) this.stats.actionAfterStop += result.actions.length;
-    if (operation.kind === "apply") this.checkApplyPayloads(operation.event, result as HermesLifecycleResult, preStopped, preRecords);
-    else this.checkReleasePayloads(operation.recordId, result.actions, preRows);
+    if (operation.kind === "apply") this.checkApplyPayloads(operation.event, result as HermesLifecycleResult, preStopped, preRecords, preRows, preNextRecordNumber);
+    else this.checkReleasePayloads(operation.recordId, result.actions, preRecords, preRows);
     this.recordSentFrames(operation, result.actions, preRows);
 
     const fatal = (result as HermesLifecycleResult).fatal;
@@ -134,39 +143,65 @@ class Harness {
     event: HermesLifecycleEvent,
     result: HermesLifecycleResult,
     preStopped: boolean,
-    preRecords: ReadonlyMap<string, { connectionId: string; requestId: string; pendingShutdown: boolean }>,
+    preRecords: ReadonlyMap<string, RecordSnapshot>,
+    preRows: ReadonlyMap<string, { currentRecordId?: string }>,
+    preNextRecordNumber: number,
   ): void {
     const actions = result.actions;
-    for (const action of actions) {
-      if (event.type === "relay_shutdown_or_eof") {
-        const expected = "recordId" in action ? preRecords.get(action.recordId) : undefined;
+    if (event.type === "relay_shutdown_or_eof") {
+      const expectedActions = [...preRecords.entries()]
+        .filter(([, record]) => !record.pendingShutdown)
+        .map(([recordId, record]) => ({
+          type: "deliver_control" as const,
+          connectionId: record.connectionId,
+          recordId,
+          requestId: record.requestId,
+          control: "shutdown" as const,
+        }));
+      if (JSON.stringify(actions) !== JSON.stringify(expectedActions)) {
+        this.stats.payloadViolations.push(`${this.tag} relay shutdown ${JSON.stringify(actions)}`);
+      }
+    } else {
+      for (const action of actions) {
+        if (action.connectionId !== event.connectionId) this.stats.payloadViolations.push(`${this.tag} connection ${JSON.stringify(action)}`);
         if (
-          action.type !== "deliver_control" ||
-          action.control !== "shutdown" ||
-          expected === undefined ||
-          action.connectionId !== expected.connectionId ||
-          action.requestId !== expected.requestId
+          action.type === "route_call" &&
+          event.type === "call" &&
+          (action.recordId !== `call-${preNextRecordNumber}` || action.requestId !== event.requestId || action.kind !== event.kind)
         ) {
-          this.stats.payloadViolations.push(`${this.tag} relay shutdown ${JSON.stringify(action)}`);
+          this.stats.payloadViolations.push(`${this.tag} route ${JSON.stringify(action)}`);
         }
-        continue;
-      }
-      if (action.connectionId !== event.connectionId) this.stats.payloadViolations.push(`${this.tag} connection ${JSON.stringify(action)}`);
-      if (action.type === "route_call" && event.type === "call" && (action.requestId !== event.requestId || action.kind !== event.kind)) {
-        this.stats.payloadViolations.push(`${this.tag} route ${JSON.stringify(action)}`);
-      }
-      if (
-        action.type === "send_fixed_denial" &&
-        event.type === "call" &&
-        (action.requestId !== event.requestId || action.responseClass !== "immediate" || action.message !== HERMES_MEMORY_DENIAL_MESSAGE)
-      ) {
-        this.stats.payloadViolations.push(`${this.tag} denial ${JSON.stringify(action)}`);
-      }
-      if (action.type === "deliver_control" && event.type === "cancel" && (action.control !== "cancel" || action.requestId !== event.mcpRequestId)) {
-        this.stats.payloadViolations.push(`${this.tag} cancel ${JSON.stringify(action)}`);
-      }
-      if (action.type === "deliver_control" && event.type === "public_shutdown" && action.control !== "shutdown") {
-        this.stats.payloadViolations.push(`${this.tag} shutdown ${JSON.stringify(action)}`);
+        if (
+          action.type === "send_fixed_denial" &&
+          event.type === "call" &&
+          (action.recordId !== `call-${preNextRecordNumber}` ||
+            action.requestId !== event.requestId ||
+            action.responseClass !== "immediate" ||
+            action.message !== HERMES_MEMORY_DENIAL_MESSAGE)
+        ) {
+          this.stats.payloadViolations.push(`${this.tag} denial ${JSON.stringify(action)}`);
+        }
+        if (action.type === "deliver_control" && event.type === "cancel") {
+          const currentRecordId = preRows.get(event.connectionId)?.currentRecordId;
+          if (currentRecordId === undefined || action.recordId !== currentRecordId || action.control !== "cancel" || action.requestId !== event.mcpRequestId) {
+            this.stats.payloadViolations.push(`${this.tag} cancel ${JSON.stringify(action)}`);
+          }
+        }
+        if (action.type === "deliver_control" && event.type === "public_shutdown") {
+          const currentRecordId = preRows.get(event.connectionId)?.currentRecordId;
+          const currentRecord = currentRecordId === undefined ? undefined : preRecords.get(currentRecordId);
+          if (
+            currentRecord === undefined ||
+            action.recordId !== currentRecordId ||
+            action.requestId !== currentRecord.requestId ||
+            action.control !== "shutdown"
+          ) {
+            this.stats.payloadViolations.push(`${this.tag} shutdown ${JSON.stringify(action)}`);
+          }
+        }
+        if (action.type === "send_close" && event.type !== "public_unparseable" && event.type !== "node_close") {
+          this.stats.payloadViolations.push(`${this.tag} close ${JSON.stringify(action)}`);
+        }
       }
     }
 
@@ -181,12 +216,20 @@ class Harness {
     }
   }
 
-  private checkReleasePayloads(recordId: string, actions: readonly HermesLifecycleAction[], preRows: ReadonlyMap<string, { currentRecordId?: string }>): void {
+  private checkReleasePayloads(
+    recordId: string,
+    actions: readonly HermesLifecycleAction[],
+    preRecords: ReadonlyMap<string, RecordSnapshot>,
+    preRows: ReadonlyMap<string, { currentRecordId?: string }>,
+  ): void {
     for (const action of actions) {
+      const expected = preRecords.get(recordId);
       if (
         action.type !== "send_fixed_denial" ||
         action.responseClass !== "release" ||
+        action.connectionId !== expected?.connectionId ||
         action.recordId !== recordId ||
+        action.requestId !== expected?.requestId ||
         action.message !== HERMES_MEMORY_DENIAL_MESSAGE
       ) {
         this.stats.payloadViolations.push(`${this.tag} release ${JSON.stringify(action)}`);

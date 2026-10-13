@@ -80,7 +80,8 @@ export type HermesRefusalReason =
   | "call_record_capacity"
   | "call_validation_failed"
   | "no_current_record"
-  | "record_not_current";
+  | "record_not_current"
+  | "stopped";
 
 export interface HermesLifecycleResult {
   readonly actions: readonly HermesLifecycleAction[];
@@ -186,8 +187,8 @@ export class HermesConnectionLifecycle {
     if (event.type === "relay_shutdown_or_eof") {
       return this.applyRelayShutdownOrEof();
     }
-    // The stopped gate is the per-connection lifecycle boundary: after relay shutdown no later row event emits Node output.
-    if (this.stoppedFlag) return { actions: [] };
+    // The stopped gate is the per-connection lifecycle boundary: after relay shutdown no later row event authorizes Node output.
+    if (this.stoppedFlag) return this.refusal(event.connectionId, "stopped");
 
     const row = this.rows.get(event.connectionId);
     if (row === undefined) return this.state_UNKNOWN(event);
