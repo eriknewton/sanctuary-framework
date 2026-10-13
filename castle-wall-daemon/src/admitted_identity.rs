@@ -90,8 +90,9 @@ impl AdmittedIdentity {
 }
 
 /// Boot-only identity source. Confined fields enter here from the boot-time
-/// scoped-rule refusal; the span is pinned by exact text, so any edit to it fails
-/// the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
+/// scoped-rule refusal; the span is pinned by exact text (comment lines and
+/// trailing whitespace are ignored), so any code edit inside it fails the pin;
+/// code outside the span is not covered.
 pub(crate) struct BootAdmittedIdentity {
     fortress_id: String,
     subject: AdmittedSubject,

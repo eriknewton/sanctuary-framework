@@ -841,7 +841,7 @@ impl DecisionEngine {
             Ok(guard) => match guard.current_snapshot() {
                 Some(snapshot) => (
                     snapshot.evaluate(request),
-                    // the span is pinned by exact text, so any edit to it fails the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
+                    // the span is pinned by exact text (comment lines and trailing whitespace are ignored), so any code edit inside it fails the pin; code outside the span is not covered.
                     AdmittedIdentity::from_snapshot(snapshot),
                 ),
                 None => (
@@ -872,7 +872,7 @@ impl DecisionEngine {
                 None => return Ok(self.unattributed_outcome()),
             },
             Err(_) => {
-                // the span is pinned by exact text, so any edit to it fails the pin and requires re-review; do not claim the pin excludes rewrites elsewhere.
+                // the span is pinned by exact text (comment lines and trailing whitespace are ignored), so any code edit inside it fails the pin; code outside the span is not covered.
                 return Ok(self.unattributed_outcome());
             }
         };
