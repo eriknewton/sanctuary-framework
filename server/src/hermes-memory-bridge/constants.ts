@@ -7,8 +7,10 @@ export const MAX_PUBLIC_FRAME_BYTES = 65_536;
 export const MAX_RESULT_FRAME_BYTES = 65_536;
 // Must match MAX_REQUEST_ID_BYTES in hermes-memory-relay/SEAM.md.
 export const MAX_REQUEST_ID_BYTES = 128;
-// Must match PROBE_NONCE_BYTES in hermes-memory-relay/SEAM.md.
+// Must match PROBE_NONCE_BYTES in hermes-memory-relay/SEAM.md: a hex-character length for 16 random bytes, never a byte length.
 export const PROBE_NONCE_BYTES = 32;
+// Must match ABANDONED_PROBE_NONCE_CAP in hermes-memory-relay/SEAM.md (value only; no eviction, pair-only state).
+export const ABANDONED_PROBE_NONCE_CAP = 16;
 // Must match MAX_CONNECTION_ID_BYTES in hermes-memory-relay/SEAM.md.
 export const MAX_CONNECTION_ID_BYTES = 21;
 // Must match PRIVATE_RESPONSE_ENVELOPE_SYNTAX_BYTES in hermes-memory-relay/SEAM.md.
