@@ -192,9 +192,6 @@ describe("Hermes connection lifecycle table", () => {
       if (expected.recordState !== undefined && recordId !== undefined) {
         expect(lifecycle.recordsSnapshot().find((record) => record.id === recordId)?.state).toBe(expected.recordState);
       }
-      for (const action of result.actions) {
-        expect(lifecycle.canSendLifecycleAction(action)).toBe(true);
-      }
     },
   );
 });
@@ -309,9 +306,9 @@ describe("Hermes lifecycle amendments", () => {
     expect(lifecycle.liveCount).toBe(HERMES_MAX_PUBLIC_CONNECTIONS);
   });
 
-  it("answers immediately and releases the record at the detached settling cap", () => {
+  it("answers immediately without retaining a record at the total call-record cap", () => {
     const lifecycle = new HermesConnectionLifecycle();
-    for (let i = 1; i <= HERMES_MAX_SETTLING_CALLS; i += 1) {
+    for (let i = 1; i <= HERMES_MAX_CALL_RECORDS; i += 1) {
       busy(lifecycle, `gone-${i}`, `gone-${i}`);
       lifecycle.apply({ type: "relay_closed", connectionId: `gone-${i}` });
     }
@@ -319,9 +316,32 @@ describe("Hermes lifecycle amendments", () => {
     const denied = lifecycle.apply({ type: "call", connectionId: "new", requestId: "new", kind: "tools_call", valid: true });
     expect(actionTypes(denied.actions)).toEqual(["send_fixed_denial"]);
     expect(denied.refusal?.reason).toBe("call_record_capacity");
-    expect(lifecycle.recordCount).toBe(HERMES_MAX_SETTLING_CALLS);
+    expect(lifecycle.recordCount).toBe(HERMES_MAX_CALL_RECORDS);
     expect(lifecycle.stateOf("new")).toBe("OPEN_IDLE");
     expect(lifecycle.canSendLifecycleAction(denied.actions[0])).toBe(true);
+  });
+
+  it("keeps the total record cap continuous across live and settling calls", () => {
+    const lifecycle = new HermesConnectionLifecycle();
+    for (let i = 1; i <= HERMES_MAX_SETTLING_CALLS - 1; i += 1) {
+      busy(lifecycle, `gone-${i}`, `gone-${i}`);
+      lifecycle.apply({ type: "relay_closed", connectionId: `gone-${i}` });
+    }
+    for (let i = 1; i <= HERMES_MAX_PUBLIC_CONNECTIONS; i += 1) {
+      lifecycle.apply({ type: "accepted", connectionId: `live-${i}` });
+      expect(actionTypes(lifecycle.apply({ type: "call", connectionId: `live-${i}`, requestId: `live-${i}`, kind: "tools_call", valid: true }).actions)).toEqual(["route_call"]);
+    }
+    for (let i = 1; i <= HERMES_MAX_PUBLIC_CONNECTIONS; i += 1) {
+      lifecycle.apply({ type: "relay_closed", connectionId: `live-${i}` });
+    }
+    expect(lifecycle.recordCount).toBe(HERMES_MAX_CALL_RECORDS - 1);
+    lifecycle.apply({ type: "accepted", connectionId: "eighth" });
+    expect(actionTypes(lifecycle.apply({ type: "call", connectionId: "eighth", requestId: "eighth", kind: "tools_call", valid: true }).actions)).toEqual(["route_call"]);
+    lifecycle.apply({ type: "accepted", connectionId: "ninth" });
+    const denied = lifecycle.apply({ type: "call", connectionId: "ninth", requestId: "ninth", kind: "tools_call", valid: true });
+    expect(actionTypes(denied.actions)).toEqual(["send_fixed_denial"]);
+    expect(denied.refusal?.reason).toBe("call_record_capacity");
+    expect(lifecycle.recordCount).toBe(HERMES_MAX_CALL_RECORDS);
   });
 
   it("requires a response event to name the current record", () => {
@@ -352,15 +372,83 @@ describe("Hermes lifecycle amendments", () => {
     for (const [summary, expected] of rows) {
       expect(classifyHermesPublicFrameSummary(summary).type).toBe(expected);
     }
-    for (const state of ["idle", "busy"] as const) {
-      const lifecycle = new HermesConnectionLifecycle();
-      lifecycle.apply({ type: "accepted", connectionId: "c1" });
-      if (state === "busy") lifecycle.apply({ type: "call", connectionId: "c1", requestId: "r1", kind: "tools_call", valid: true });
-      const classified = classifyHermesPublicFrameSummary({ topLevelType: "cancel", mcpRequestId: "r1", strictValid: false });
-      const result = lifecycle.apply({ ...classified, connectionId: "c1" } as HermesLifecycleEvent);
-      expect(result.actions).toEqual([]);
-      expect(result.fatal).toBeUndefined();
+    const machineRows = [
+      [{ topLevelType: "tools_call", requestId: "r9", strictValid: true }, ["route_call"], "second_call_forwarded"],
+      [{ topLevelType: "tools_call", requestId: "r9", strictValid: false }, ["send_fixed_denial"], "second_call_forwarded"],
+      [{ topLevelType: "cancel", mcpRequestId: "r1", strictValid: true }, [], ["deliver_control"]],
+      [{ topLevelType: "cancel", mcpRequestId: "r1", strictValid: false }, [], []],
+      [{ topLevelType: "shutdown", strictValid: true }, [], ["deliver_control"]],
+      [{ topLevelType: "shutdown", strictValid: false }, [], []],
+      [{ topLevelType: "?", strictValid: false }, ["send_close"], ["send_close"]],
+    ] as const;
+    for (const [summary, idleWant, busyWant] of machineRows) {
+      for (const state of ["idle", "busy"] as const) {
+        const lifecycle = new HermesConnectionLifecycle();
+        lifecycle.apply({ type: "accepted", connectionId: "c1" });
+        if (state === "busy") lifecycle.apply({ type: "call", connectionId: "c1", requestId: "r1", kind: "tools_call", valid: true });
+        const result = lifecycle.apply({ ...classifyHermesPublicFrameSummary(summary), connectionId: "c1" } as HermesLifecycleEvent);
+        const want = state === "idle" ? idleWant : busyWant;
+        if (typeof want === "string") expect(result.fatal?.reason).toBe(want);
+        else expect(actionTypes(result.actions)).toEqual(want);
+      }
     }
+  });
+
+  it("applies the lifecycle send rule to stateful and stopped actions", () => {
+    const lifecycle = new HermesConnectionLifecycle();
+    lifecycle.apply({ type: "accepted", connectionId: "busy" });
+    const route = lifecycle.apply({ type: "call", connectionId: "busy", requestId: "r1", kind: "tools_call", valid: true }).actions[0];
+    const cancel = lifecycle.apply({ type: "cancel", connectionId: "busy", mcpRequestId: "r1" }).actions[0];
+    expect(lifecycle.canSendLifecycleAction(route)).toBe(true);
+    expect(lifecycle.canSendLifecycleAction(cancel)).toBe(true);
+    lifecycle.apply({ type: "accepted", connectionId: "idle" });
+    const denial = lifecycle.apply({ type: "call", connectionId: "idle", requestId: "bad", kind: "tools_call", valid: false }).actions[0];
+    expect(lifecycle.canSendLifecycleAction(denial)).toBe(true);
+
+    lifecycle.apply({ type: "accepted", connectionId: "closed" });
+    lifecycle.apply({ type: "node_close", connectionId: "closed", reason: "unparseable_call" });
+    const forged: HermesLifecycleAction[] = [
+      { type: "send_close", connectionId: "closed" },
+      { type: "send_close", connectionId: "never-accepted" },
+      { type: "send_fixed_denial", connectionId: "busy", recordId: "call-999", requestId: "other", message: "Memory request denied.", responseClass: "immediate" },
+      { type: "route_call", connectionId: "closed", recordId: "call-998", requestId: "x", kind: "tools_call" },
+    ];
+    expect(forged.map((action) => lifecycle.canSendLifecycleAction(action))).toEqual([false, false, false, false]);
+    lifecycle.apply({ type: "relay_shutdown_or_eof" });
+    expect([route, cancel, denial, ...forged].map((action) => lifecycle.canSendLifecycleAction(action))).toEqual([false, false, false, false, false, false, false]);
+  });
+
+  it("separates re-accepted connection generations and returns a typed cap refusal", () => {
+    const lifecycle = new HermesConnectionLifecycle();
+    for (let i = 1; i <= HERMES_MAX_SETTLING_CALLS; i += 1) {
+      const recordId = busy(lifecycle, "reuse", `reuse-${i}`);
+      lifecycle.apply({ type: "node_close", connectionId: "reuse", reason: "unparseable_call" });
+      lifecycle.apply({ type: "relay_closed", connectionId: "reuse" });
+      expect(lifecycle.recordsSnapshot().some((record) => record.id === recordId && record.state === "CLOSED_BY_NODE")).toBe(true);
+    }
+    lifecycle.apply({ type: "accepted", connectionId: "reuse" });
+    lifecycle.apply({ type: "node_close", connectionId: "reuse", reason: "unparseable_call" });
+    expect(lifecycle.recordCount).toBe(HERMES_MAX_SETTLING_CALLS);
+
+    for (let i = 1; i <= HERMES_MAX_SETTLING_CALLS; i += 1) {
+      busy(lifecycle, `gone-${i}`, `gone-${i}`);
+      lifecycle.apply({ type: "relay_closed", connectionId: `gone-${i}` });
+    }
+    lifecycle.apply({ type: "accepted", connectionId: "new" });
+    expect(() => lifecycle.apply({ type: "call", connectionId: "new", requestId: "new", kind: "tools_call", valid: true })).not.toThrow();
+    const denied = lifecycle.apply({ type: "call", connectionId: "new", requestId: "new-2", kind: "tools_call", valid: true });
+    expect(denied.refusal?.reason).toBe("call_record_capacity");
+    expect(lifecycle.stateOf("new")).toBe("OPEN_IDLE");
+    expect(lifecycle.recordCount).toBe(HERMES_MAX_CALL_RECORDS);
+  });
+
+  it("release of a busy peer-shutting call keeps the peer-shutting state", () => {
+    const lifecycle = new HermesConnectionLifecycle();
+    const recordId = busy(lifecycle, "c1", "r1");
+    lifecycle.apply({ type: "public_shutdown", connectionId: "c1" });
+    expect(actionTypes(lifecycle.release(recordId).actions)).toEqual(["send_fixed_denial"]);
+    expect(lifecycle.stateOf("c1")).toBe("OPEN_IDLE_PEER_SHUTTING");
+    expect(lifecycle.apply({ type: "call", connectionId: "c1", requestId: "r2", kind: "tools_call", valid: true }).fatal?.reason).toBe("event_after_peer_shutdown");
   });
 
   it("releases settled records across repeated lifecycle paths", () => {

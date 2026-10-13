@@ -64,7 +64,7 @@ Current stable release: v1.8.4 on the npm latest channel. Requirements: Node.js 
 - [The Castle Architecture](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#the-castle-architecture): five named mechanisms, Castle Wall, Sentinels, Charter, Heralds, and Mantle, each with its bounds.
 - [Sanctuary and your harness's sandbox](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#sanctuary-and-your-harnesss-sandbox): what Sanctuary adds per platform, and what the harness sandbox gives that Sanctuary never claims.
 - [SANCTUARY_ARCHITECTURE.md](https://github.com/eriknewton/sanctuary-framework/blob/main/SANCTUARY_ARCHITECTURE.md): entry points, data flow, trust model, and the sovereignty properties as testable assertions.
-- [Module map](https://github.com/eriknewton/sanctuary-framework/blob/main/server/src/README.md): the 63-module index of the TypeScript server.
+- [Module map](https://github.com/eriknewton/sanctuary-framework/blob/main/server/src/README.md): the 64-module index of the TypeScript server.
 - [Start here if you read code](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#start-here-if-you-read-code): the reading order, about an hour.
 
 ## Blog
