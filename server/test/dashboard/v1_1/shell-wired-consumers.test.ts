@@ -371,6 +371,26 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["search-results"]!.hidden).toBe(false);
   });
 
+  it("choosing an agent scope repaints the Approvals screen, the rail pill and the bell with the scoped count", async () => {
+    vi.useFakeTimers();
+    const items = [
+      { ...heldItem, item_id: "held-a", agent_id: "fixture-agent-a" },
+      { ...heldItem, item_id: "held-b", agent_id: "fixture-agent-b" },
+    ];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el["rail-approvals-count"]!.textContent).toBe("2 of 2");
+    expect(h.el.main!.innerHTML).toContain('data-item-id="held-b"');
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-a" });
+    // The numerator is scoped to the chosen agent; the denominator stays the
+    // fortress-wide queue.
+    expect(h.el["rail-approvals-count"]!.textContent).toBe("1 of 2");
+    expect(h.el["notify-count"]!.innerHTML).toContain("1 of 2");
+    expect(h.el.main!.innerHTML).toContain('data-item-id="held-a"');
+    expect(h.el.main!.innerHTML).not.toContain('data-item-id="held-b"');
+  });
+
   it("a search hit for another agent from the agent detail opens that agent and closes the results", async () => {
     vi.useFakeTimers();
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };

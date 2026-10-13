@@ -4976,12 +4976,14 @@ document.addEventListener("click", function (ev) {
     const id = tgt.getAttribute("data-agent-id") || "";
     state.agentScope.selectedAgentId = id || null;
     state.agentScope.switcherOpen = false;
-    // Scope the queue + ambient posture to the chosen agent; re-render the
-    // rail and the topbar. The conversation spine stays fortress-wide in
-    // wave 1 (the concierge reads fortress state); per-agent conversation
-    // scoping is a wave-2 follow-up.
-    renderTopbar();
-    renderFortress();
+    // Scope the queue + ambient posture to the chosen agent and repaint
+    // everything that shows them: since slice 2 the queue renders on the
+    // Approvals screen (main) and its scoped count on the rail pill and the
+    // bell (shell chrome), so repainting only the top bar and the fortress
+    // column left a stale, unscoped count. The conversation spine stays
+    // fortress-wide in wave 1 (the concierge reads fortress state);
+    // per-agent conversation scoping is a wave-2 follow-up.
+    rerender();
     return;
   }
   if (action === "posture-seal-toggle") {
