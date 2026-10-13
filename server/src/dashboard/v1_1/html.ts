@@ -1398,10 +1398,14 @@ body {
   color: var(--ink);
 }
 
+/* 220px (the rail track below) keeps every rail label whole at 1024px
+   beside a four-digit waiting pill: measured, "Approvals" beside "140 of
+   140" lost 3.1px of its label at 200px, and each further digit is one
+   6.6px mono glyph (11px at its 0.6em advance), so "1400 of 1400" needs
+   3.1 + 2 x 6.6 = 16.3px more, rounded up to the 4px step. The fortress
+   column yields first. */
 @media (max-width: 1100px) {
-  /* 200px keeps every rail label whole at 1024px; the fortress column
-     yields first. */
-  .app, .app.route-full { grid-template-columns: 200px 1fr; grid-template-areas: "topbar topbar" "sidebar main"; }
+  .app, .app.route-full { grid-template-columns: 220px 1fr; grid-template-areas: "topbar topbar" "sidebar main"; }
   .fortress { display: none; }
   .template-grid { grid-template-columns: 1fr; }
   /* center h1s keep --text-display (26px); a 30px override here would grow them. */

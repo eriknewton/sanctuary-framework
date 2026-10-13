@@ -314,9 +314,10 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // The promote path writes a plain policy through the activator, which no
-    // production composition root binds, so the route answers 503 and
-    // nothing is written; the subtitle may say only that.
+    // Allow always compiles a draft (recorded in the audit log) and then asks
+    // the policy engine to activate it; where the engine is not configured,
+    // activation is refused and the policy is unchanged. The subtitle may
+    // promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
     expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");

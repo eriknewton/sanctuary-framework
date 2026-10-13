@@ -425,6 +425,11 @@ describe("v1.1 dashboard top bar at narrow widths", () => {
     expect(scope![1]).toContain("overflow: hidden");
   });
 
+  it("the narrow rail is wide enough for Approvals beside a four-digit waiting pill", () => {
+    const step = block("max-width: 1100px");
+    expect(step).toContain(".app, .app.route-full { grid-template-columns: 220px 1fr;");
+  });
+
   it("the second step starts at the measured 1240px and sheds the avatar before the scope's text floors give", () => {
     expect(css).not.toContain("@media (max-width: 1180px)");
     const step = block("max-width: 1240px");
