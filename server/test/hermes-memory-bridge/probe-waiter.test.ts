@@ -5,10 +5,13 @@ import { describe, expect, it } from "vitest";
 import {
   ABANDONED_PROBE_NONCE_CAP,
   HermesProbeWaiter,
+  NONCE_PATTERN,
+  PROBE_NONCE_BYTES,
   type HermesProbeNonceSource,
   type HermesProbeWaiterResult,
   type HermesProbeWaiterSnapshot,
   PrivateFrameDecoder,
+  createNodeCryptoHermesProbeNonceSource,
   parseRelayToNode,
 } from "../../src/hermes-memory-bridge/index.js";
 
@@ -33,11 +36,16 @@ type ProbeStep =
   | { readonly kind: "abandon"; readonly entryRef: string };
 
 const textEncoder = new TextEncoder();
-const LEGAL_FUZZ_SCHEDULES = 3_000;
-const ILLEGAL_FUZZ_SCHEDULES = 3_000;
-const FUZZ_ATTEMPT_VARIANTS = 6;
+const RELAY_LEGAL_SCHEDULES = 1_200;
+const CLOSED_CONNECTION_SCHEDULES = 300;
+const BAD_NONCE_SCHEDULES = 300;
+const CAP_PRESSURE_SCHEDULES = 800;
+const INJECTION_SCHEDULES = 1_200;
+const SHORT_PROFILE_STEPS = 120;
+const LONG_PROFILE_STEPS = 260;
 const ILLEGAL_NONCE_OFFSET = 9_001;
 const CAP_PRESSURE_TIMEOUTS = ABANDONED_PROBE_NONCE_CAP;
+const PROBE_NONCE_HEX_LENGTH = PROBE_NONCE_BYTES;
 const fixtureUrl = new URL("./fixtures/relay-frames.json", import.meta.url);
 const relayFixture = JSON.parse(readFileSync(fixtureUrl, "utf8")) as Readonly<Record<string, readonly FixtureEntry[]>>;
 
@@ -46,13 +54,13 @@ function queuedNonceSource(nonces: readonly string[]): HermesProbeNonceSource {
   return () => {
     const nonce = nonces[index];
     index += 1;
-    if (nonce === undefined) return "f".repeat(32);
+    if (nonce === undefined) throw new Error("scripted nonce source exhausted");
     return nonce;
   };
 }
 
 function nonce(index: number): string {
-  return index.toString(16).padStart(32, "0");
+  return index.toString(16).padStart(PROBE_NONCE_HEX_LENGTH, "0");
 }
 
 function waiter(nonces: readonly string[]): HermesProbeWaiter {
@@ -67,15 +75,20 @@ function pair(connectionId: string, nonceValue: string): { readonly connectionId
   return { connectionId, nonce: nonceValue };
 }
 
-function removePending(pairs: ProbeReplyFrame[], target: ProbeReplyFrame): void {
-  const index = pairs.findIndex((candidate) => candidate.connectionId === target.connectionId && candidate.nonce === target.nonce);
-  if (index >= 0) pairs.splice(index, 1);
-}
+type WaiterInternals = {
+  live?: { readonly state: "WAITING"; readonly entryRef: string; readonly connectionId: string; readonly nonce: string };
+  abandoned: Array<{ readonly connectionId: string; readonly nonce: string }>;
+  drawUsableNonce: () => string | undefined;
+};
 
 function expectInvariants(snapshot: HermesProbeWaiterSnapshot): void {
   const liveCount = snapshot.live === undefined ? 0 : 1;
   expect(snapshot.abandoned.length + liveCount).toBeLessThanOrEqual(ABANDONED_PROBE_NONCE_CAP);
   expect(snapshot.abandoned).toHaveLength(new Set(snapshot.abandoned.map((pair) => `${pair.connectionId}\0${pair.nonce}`)).size);
+}
+
+function expectSnapshot(machine: HermesProbeWaiter, expected: HermesProbeWaiterSnapshot): void {
+  expect(machine.snapshot()).toEqual(expected);
 }
 
 function expectResult(
@@ -144,9 +157,9 @@ function fixtureProbeReplies(name: string): readonly ProbeReplyFrame[] {
   return [parsed.frame];
 }
 
-class ReferenceWaiter {
-  private live: { entryRef: string; connectionId: string; nonce: string } | undefined;
-  private readonly abandoned: ProbeReplyFrame[] = [];
+class IndependentProbeModel {
+  private live: { readonly entryRef: string; readonly connectionId: string; readonly nonce: string } | undefined;
+  private readonly abandoned = new Map<string, ProbeReplyFrame>();
   private stopped = false;
 
   constructor(private readonly nonceSource: HermesProbeNonceSource) {}
@@ -154,17 +167,17 @@ class ReferenceWaiter {
   apply(step: ProbeStep): HermesProbeWaiterResult {
     switch (step.kind) {
       case "start":
-        return this.start(step.entryRef, step.connectionId);
+        return this.state_START(step.entryRef, step.connectionId);
       case "reply":
-        return this.reply(step.connectionId, step.nonce);
+        return this.state_REPLY(step.connectionId, step.nonce);
       case "timeout":
-        return this.timeout(step.entryRef, step.nonce);
+        return this.state_TIMEOUT(step.entryRef, step.nonce);
       case "closed":
-        return this.closed(step.connectionId);
+        return this.state_CLOSED(step.connectionId);
       case "stop":
-        return this.stop();
+        return this.state_STOP();
       case "abandon":
-        return this.abandon(step.entryRef);
+        return this.state_ABANDON(step.entryRef);
     }
   }
 
@@ -172,80 +185,99 @@ class ReferenceWaiter {
     return {
       stopped: this.stopped,
       live: this.live === undefined ? undefined : { state: "WAITING", ...this.live },
-      abandoned: this.abandoned.map((pair) => ({ connectionId: pair.connectionId, nonce: pair.nonce })),
+      abandoned: [...this.abandoned.values()].map((pair) => ({ connectionId: pair.connectionId, nonce: pair.nonce })),
     };
   }
 
-  private start(entryRef: string, connectionId: string): HermesProbeWaiterResult {
+  abandonedPairs(): readonly ProbeReplyFrame[] {
+    return [...this.abandoned.values()];
+  }
+
+  livePair(): ProbeReplyFrame | undefined {
+    return this.live === undefined ? undefined : reply(this.live.connectionId, this.live.nonce);
+  }
+
+  private state_START(entryRef: string, connectionId: string): HermesProbeWaiterResult {
     if (this.stopped) return { actions: [], refusal: "stopped" };
-    if (this.live?.entryRef === entryRef) {
-      this.abandoned.push(reply(this.live.connectionId, this.live.nonce));
-      this.live = undefined;
-    }
+    if (this.live?.entryRef === entryRef) this.moveLiveToAbandoned();
     if (this.live !== undefined) return { actions: [], refusal: "probe_busy" };
-    if (this.abandoned.length >= ABANDONED_PROBE_NONCE_CAP) {
+    if (this.abandoned.size + this.liveCount() >= ABANDONED_PROBE_NONCE_CAP) {
       return { actions: [], refusal: "abandoned_full" };
     }
-    let nonceValue: string;
-    try {
-      nonceValue = this.nonceSource();
-    } catch {
-      return { actions: [], refusal: "nonce_unusable" };
-    }
-    if (!/^[0-9a-f]{32}$/u.test(nonceValue)) return { actions: [], refusal: "nonce_unusable" };
-    if (this.abandoned.some((pair) => pair.nonce === nonceValue)) {
-      return { actions: [], refusal: "nonce_unusable" };
-    }
+
+    const nonceValue = this.drawUsableNonce();
+    if (nonceValue === undefined) return { actions: [], refusal: "nonce_unusable" };
+
     this.live = { entryRef, connectionId, nonce: nonceValue };
     return { actions: [{ kind: "send_probe", connectionId, nonce: nonceValue }] };
   }
 
-  private reply(connectionId: string, nonceValue: string): HermesProbeWaiterResult {
+  private state_REPLY(connectionId: string, nonceValue: string): HermesProbeWaiterResult {
     if (this.live?.connectionId === connectionId && this.live.nonce === nonceValue) {
       const entryRef = this.live.entryRef;
       this.live = undefined;
       return { actions: [{ kind: "resolved", entryRef }] };
     }
-    const index = this.abandoned.findIndex((pair) => pair.connectionId === connectionId && pair.nonce === nonceValue);
-    if (index >= 0) {
-      this.abandoned.splice(index, 1);
-      return { actions: [] };
-    }
+
+    const key = this.pairKey(connectionId, nonceValue);
+    if (this.abandoned.delete(key)) return { actions: [] };
+
     return { actions: [], fatal: "unmatched_probe_reply" };
   }
 
-  private timeout(entryRef: string, nonceValue: string): HermesProbeWaiterResult {
-    if (this.live === undefined || this.live.entryRef !== entryRef || this.live.nonce !== nonceValue) {
-      return { actions: [] };
-    }
+  private state_TIMEOUT(entryRef: string, nonceValue: string): HermesProbeWaiterResult {
+    if (this.live === undefined || this.live.entryRef !== entryRef || this.live.nonce !== nonceValue) return { actions: [] };
     const live = this.live;
-    this.abandoned.push(reply(live.connectionId, live.nonce));
-    this.live = undefined;
+    this.moveLiveToAbandoned();
     return { actions: [{ kind: "refused", entryRef: live.entryRef, reason: "timed_out" }] };
   }
 
-  private closed(connectionId: string): HermesProbeWaiterResult {
+  private state_CLOSED(connectionId: string): HermesProbeWaiterResult {
     if (this.live === undefined || this.live.connectionId !== connectionId) return { actions: [] };
     const live = this.live;
-    this.abandoned.push(reply(live.connectionId, live.nonce));
-    this.live = undefined;
+    this.moveLiveToAbandoned();
     return { actions: [{ kind: "refused", entryRef: live.entryRef, reason: "connection_gone" }] };
   }
 
-  private stop(): HermesProbeWaiterResult {
+  private state_STOP(): HermesProbeWaiterResult {
     this.stopped = true;
     if (this.live === undefined) return { actions: [] };
     const live = this.live;
-    this.abandoned.push(reply(live.connectionId, live.nonce));
-    this.live = undefined;
+    this.moveLiveToAbandoned();
     return { actions: [{ kind: "refused", entryRef: live.entryRef, reason: "stopped" }] };
   }
 
-  private abandon(entryRef: string): HermesProbeWaiterResult {
-    if (this.stopped || this.live === undefined || this.live.entryRef !== entryRef) return { actions: [] };
-    this.abandoned.push(reply(this.live.connectionId, this.live.nonce));
-    this.live = undefined;
+  private state_ABANDON(entryRef: string): HermesProbeWaiterResult {
+    if (this.live?.entryRef === entryRef) this.moveLiveToAbandoned();
     return { actions: [] };
+  }
+
+  private drawUsableNonce(): string | undefined {
+    let nonceValue: string;
+    try {
+      nonceValue = this.nonceSource();
+    } catch {
+      return undefined;
+    }
+    if (typeof nonceValue !== "string" || !NONCE_PATTERN.test(nonceValue)) return undefined;
+    if (this.live?.nonce === nonceValue) return undefined;
+    if ([...this.abandoned.values()].some((candidate) => candidate.nonce === nonceValue)) return undefined;
+    return nonceValue;
+  }
+
+  private moveLiveToAbandoned(): void {
+    if (this.live === undefined) return;
+    const abandoned = reply(this.live.connectionId, this.live.nonce);
+    this.abandoned.set(this.pairKey(abandoned.connectionId, abandoned.nonce), abandoned);
+    this.live = undefined;
+  }
+
+  private liveCount(): number {
+    return this.live === undefined ? 0 : 1;
+  }
+
+  private pairKey(connectionId: string, nonceValue: string): string {
+    return `${connectionId}\0${nonceValue}`;
   }
 }
 
@@ -266,7 +298,7 @@ function applyProduct(machine: HermesProbeWaiter, step: ProbeStep): HermesProbeW
   }
 }
 
-function compareStep(product: HermesProbeWaiter, reference: ReferenceWaiter, step: ProbeStep): HermesProbeWaiterResult {
+function compareStep(product: HermesProbeWaiter, reference: IndependentProbeModel, step: ProbeStep): HermesProbeWaiterResult {
   const actual = applyProduct(product, step);
   const expected = reference.apply(step);
   expect(actual).toEqual(expected);
@@ -283,6 +315,11 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       expectResult(machine.start("entry-a", "c1"), {
         actions: [{ kind: "send_probe", connectionId: "c1", nonce: nonce(1) }],
       }, machine);
+      expectSnapshot(machine, {
+        stopped: false,
+        live: { state: "WAITING", entryRef: "entry-a", connectionId: "c1", nonce: nonce(1) },
+        abandoned: [],
+      });
     },
   },
   {
@@ -291,6 +328,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       const machine = waiter([nonce(1)]);
       machine.stop();
       expectResult(machine.start("entry-a", "c1"), { actions: [], refusal: "stopped" }, machine);
+      expectSnapshot(machine, { stopped: true, live: undefined, abandoned: [] });
     },
   },
   {
@@ -299,7 +337,11 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       const machine = waiter([nonce(1), nonce(2)]);
       startAndNonce(machine, "entry-a", "c1");
       expectResult(machine.start("entry-b", "c2"), { actions: [], refusal: "probe_busy" }, machine);
-      expect(machine.snapshot().live?.entryRef).toBe("entry-a");
+      expectSnapshot(machine, {
+        stopped: false,
+        live: { state: "WAITING", entryRef: "entry-a", connectionId: "c1", nonce: nonce(1) },
+        abandoned: [],
+      });
     },
   },
   {
@@ -310,7 +352,11 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       expectResult(machine.start("entry-a", "c2"), {
         actions: [{ kind: "send_probe", connectionId: "c2", nonce: nonce(2) }],
       }, machine);
-      expect(machine.snapshot().abandoned).toEqual([pair("c1", nonce(1))]);
+      expectSnapshot(machine, {
+        stopped: false,
+        live: { state: "WAITING", entryRef: "entry-a", connectionId: "c2", nonce: nonce(2) },
+        abandoned: [pair("c1", nonce(1))],
+      });
     },
   },
   {
@@ -320,6 +366,8 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       fillAbandoned(machine, ABANDONED_PROBE_NONCE_CAP);
       expectResult(machine.start("entry-full", "c99"), { actions: [], refusal: "abandoned_full" }, machine);
       expect(machine.snapshot().abandoned).toHaveLength(ABANDONED_PROBE_NONCE_CAP);
+      expect(machine.snapshot().live).toBeUndefined();
+      expect(machine.snapshot().stopped).toBe(false);
     },
   },
   {
@@ -327,7 +375,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
     run: () => {
       const machine = waiter(["not-a-nonce"]);
       expectResult(machine.start("entry-a", "c1"), { actions: [], refusal: "nonce_unusable" }, machine);
-      expect(machine.snapshot().live).toBeUndefined();
+      expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
     },
   },
   {
@@ -336,7 +384,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       const machine = waiter([nonce(1)]);
       const issued = startAndNonce(machine, "entry-a", "c1");
       expectResult(machine.reply(reply("c1", issued)), { actions: [{ kind: "resolved", entryRef: "entry-a" }] }, machine);
-      expect(machine.snapshot().live).toBeUndefined();
+      expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
     },
   },
   {
@@ -346,7 +394,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       const issued = startAndNonce(machine, "entry-a", "c1");
       machine.timeout("entry-a", issued);
       expectResult(machine.reply(reply("c1", issued)), { actions: [] }, machine);
-      expect(machine.snapshot().abandoned).toHaveLength(0);
+      expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
     },
   },
   {
@@ -367,7 +415,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       expectResult(machine.timeout("entry-a", issued), {
         actions: [{ kind: "refused", entryRef: "entry-a", reason: "timed_out" }],
       }, machine);
-      expect(machine.snapshot().abandoned).toEqual([pair("c1", issued)]);
+      expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [pair("c1", issued)] });
     },
   },
   {
@@ -388,7 +436,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       expectResult(machine.connectionClosed("c1"), {
         actions: [{ kind: "refused", entryRef: "entry-a", reason: "connection_gone" }],
       }, machine);
-      expect(machine.snapshot().abandoned).toEqual([pair("c1", issued)]);
+      expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [pair("c1", issued)] });
     },
   },
   {
@@ -410,6 +458,7 @@ const transitionRows: readonly { readonly name: string; readonly run: () => void
       expectResult(machine.stop(), {
         actions: [{ kind: "refused", entryRef: "entry-a", reason: "stopped" }],
       }, machine);
+      expectSnapshot(machine, { stopped: true, live: undefined, abandoned: [pair("c1", issued)] });
       expectResult(machine.reply(reply("c1", issued)), { actions: [] }, machine);
       expectResult(machine.reply(reply("c9", nonce(9))), { actions: [], fatal: "unmatched_probe_reply" }, machine);
     },
@@ -420,6 +469,11 @@ describe("Hermes probe waiter transition table", () => {
   for (const row of transitionRows) {
     it(row.name, row.run);
   }
+
+  it("constructor refuses a missing or non-callable nonce source", () => {
+    expect(() => new HermesProbeWaiter(undefined as unknown as HermesProbeNonceSource)).toThrow(TypeError);
+    expect(() => new HermesProbeWaiter("not-callable" as unknown as HermesProbeNonceSource)).toThrow(TypeError);
+  });
 });
 
 describe("Hermes probe waiter schedules", () => {
@@ -443,6 +497,26 @@ describe("Hermes probe waiter schedules", () => {
     expectResult(machine.reply(reply("c1", oldNonce)), { actions: [] }, machine);
   });
 
+  it("nonce draw refuses a nonce already held by the live waiter", () => {
+    const machine = waiter([nonce(1), nonce(1)]);
+    startAndNonce(machine, "entry-live", "c1");
+    const internal = machine as unknown as WaiterInternals;
+    expect(internal.drawUsableNonce()).toBeUndefined();
+    expectSnapshot(machine, {
+      stopped: false,
+      live: { state: "WAITING", entryRef: "entry-live", connectionId: "c1", nonce: nonce(1) },
+      abandoned: [],
+    });
+  });
+
+  it("nonce source failure refuses without leaving a live waiter", () => {
+    const machine = new HermesProbeWaiter(() => {
+      throw new Error("nonce source unavailable");
+    });
+    expectResult(machine.start("entry-a", "c1"), { actions: [], refusal: "nonce_unusable" }, machine);
+    expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
+  });
+
   it("stale timeout after re-probe leaves the new waiter resolvable", () => {
     const machine = waiter([nonce(1), nonce(2)]);
     const oldNonce = startAndNonce(machine, "entry-live", "c1");
@@ -460,6 +534,37 @@ describe("Hermes probe waiter schedules", () => {
     expect(machine.snapshot()).toEqual(beforeNonce);
     expectResult(machine.reply(reply("c2", nonce(1))), { actions: [], fatal: "unmatched_probe_reply" }, machine);
     expect(machine.snapshot()).toEqual(beforeNonce);
+  });
+
+  it("matching live pair resolves before consulting abandoned pairs", () => {
+    const machine = waiter([nonce(1)]);
+    startAndNonce(machine, "entry-live", "c1");
+    const internal = machine as unknown as WaiterInternals;
+    internal.abandoned.push(pair("c1", nonce(1)));
+    expectResult(machine.reply(reply("c1", nonce(1))), { actions: [{ kind: "resolved", entryRef: "entry-live" }] }, machine);
+    expect(machine.snapshot().abandoned).toEqual([pair("c1", nonce(1))]);
+  });
+
+  it("abandoned nonce under another connection is fatal and keeps the pair drainable", () => {
+    const machine = waiter([nonce(1)]);
+    const issued = startAndNonce(machine, "entry-a", "c1");
+    machine.abandon("entry-a");
+    const beforeWrongConnection = machine.snapshot();
+    expectResult(machine.reply(reply("c2", issued)), { actions: [], fatal: "unmatched_probe_reply" }, machine);
+    expect(machine.snapshot()).toEqual(beforeWrongConnection);
+    expectResult(machine.reply(reply("c1", issued)), { actions: [] }, machine);
+    expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
+  });
+
+  it("never-issued nonce on an abandoned connection is fatal and keeps the pair drainable", () => {
+    const machine = waiter([nonce(1)]);
+    const issued = startAndNonce(machine, "entry-a", "c1");
+    machine.abandon("entry-a");
+    const beforeWrongNonce = machine.snapshot();
+    expectResult(machine.reply(reply("c1", nonce(2))), { actions: [], fatal: "unmatched_probe_reply" }, machine);
+    expect(machine.snapshot()).toEqual(beforeWrongNonce);
+    expectResult(machine.reply(reply("c1", issued)), { actions: [] }, machine);
+    expectSnapshot(machine, { stopped: false, live: undefined, abandoned: [] });
   });
 
   it("closed for another connection leaves the live waiter resolvable", () => {
@@ -496,6 +601,15 @@ describe("Hermes probe waiter schedules", () => {
     expectResult(machine.reply(reply("c1", issued)), { actions: [] }, machine);
   });
 
+  it("caller abandon for another entry leaves the live waiter resolvable", () => {
+    const machine = waiter([nonce(1)]);
+    const issued = startAndNonce(machine, "entry-b", "c1");
+    const before = machine.snapshot();
+    expectResult(machine.abandon("entry-a"), { actions: [] }, machine);
+    expect(machine.snapshot()).toEqual(before);
+    expectResult(machine.reply(reply("c1", issued)), { actions: [{ kind: "resolved", entryRef: "entry-b" }] }, machine);
+  });
+
   it("sixteen abandoned pairs refuse every start until a reply drains one slot", () => {
     const nonces = Array.from({ length: ABANDONED_PROBE_NONCE_CAP + 1 }, (_, index) => nonce(index + 1));
     const machine = waiter(nonces);
@@ -518,6 +632,23 @@ describe("Hermes probe waiter schedules", () => {
     const issued = startAndNonce(machine, "entry-a", "c1");
     expectResult(machine.reply(reply("c1", issued)), { actions: [{ kind: "resolved", entryRef: "entry-a" }] }, machine);
     expectResult(machine.reply(reply("c1", issued)), { actions: [], fatal: "unmatched_probe_reply" }, machine);
+  });
+});
+
+describe("Hermes probe waiter production nonce source", () => {
+  it("draws distinct lowercase hex nonces and can issue a probe", () => {
+    const source = createNodeCryptoHermesProbeNonceSource();
+    const first = source();
+    const second = source();
+    expect(first).toMatch(NONCE_PATTERN);
+    expect(second).toMatch(NONCE_PATTERN);
+    expect(second).not.toBe(first);
+
+    const machine = new HermesProbeWaiter(createNodeCryptoHermesProbeNonceSource());
+    const result = machine.start("entry-a", "c1");
+    expect(result.refusal).toBeUndefined();
+    expect(result.actions[0]?.kind).toBe("send_probe");
+    expect(result.actions[0]?.kind === "send_probe" ? result.actions[0].nonce : "").toMatch(NONCE_PATTERN);
   });
 });
 
@@ -552,75 +683,375 @@ describe("Hermes probe waiter relay probe reply fixtures", () => {
   });
 });
 
-describe("Hermes probe waiter fuzz oracle", () => {
-  it("matches the reference oracle for legal relay schedules", () => {
-    for (let seed = 0; seed < LEGAL_FUZZ_SCHEDULES; seed += 1) {
-      const nonceOffset = seed * 64;
-      const nonces = Array.from({ length: 64 }, (_, index) => nonce(nonceOffset + index + 1));
-      const product = waiter(nonces);
-      const reference = new ReferenceWaiter(queuedNonceSource(nonces));
-      const issuedPairs: ProbeReplyFrame[] = [];
-      const attempts = 1 + (seed % FUZZ_ATTEMPT_VARIANTS);
+function rng(seed: number): () => number {
+  let state = seed >>> 0 || 1;
+  return () => {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    return state / 4_294_967_296;
+  };
+}
 
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const entryRef = `entry-${seed}-${attempt}`;
-        const connectionId = `c${attempt + 1}`;
-        const start = compareStep(product, reference, { kind: "start", entryRef, connectionId });
-        const sent = start.actions[0];
-        if (sent?.kind !== "send_probe") continue;
-        issuedPairs.push(reply(sent.connectionId, sent.nonce));
+type NonceDraw = string | Error | number;
 
-        switch ((seed + attempt) % FUZZ_ATTEMPT_VARIANTS) {
-          case 0:
-            compareStep(product, reference, { kind: "reply", connectionId: sent.connectionId, nonce: sent.nonce });
-            removePending(issuedPairs, reply(sent.connectionId, sent.nonce));
-            break;
-          case 1:
-            compareStep(product, reference, { kind: "timeout", entryRef, nonce: sent.nonce });
-            break;
-          case 2:
-            compareStep(product, reference, { kind: "closed", connectionId: sent.connectionId });
-            break;
-          case 3:
-            compareStep(product, reference, { kind: "abandon", entryRef });
-            break;
-          case 4:
-            {
-              const reprobe = compareStep(product, reference, { kind: "start", entryRef, connectionId: `c${attempt + 20}` });
-              const next = reprobe.actions[0];
-              if (next?.kind === "send_probe") {
-                issuedPairs.push(reply(next.connectionId, next.nonce));
-                compareStep(product, reference, { kind: "timeout", entryRef, nonce: sent.nonce });
-                compareStep(product, reference, { kind: "reply", connectionId: sent.connectionId, nonce: sent.nonce });
-                removePending(issuedPairs, reply(sent.connectionId, sent.nonce));
-                compareStep(product, reference, { kind: "reply", connectionId: next.connectionId, nonce: next.nonce });
-                removePending(issuedPairs, reply(next.connectionId, next.nonce));
-              }
-            }
-            break;
-          case 5:
-            compareStep(product, reference, { kind: "stop" });
-            break;
-        }
-        if (product.snapshot().stopped) break;
+class DualRun {
+  readonly product: HermesProbeWaiter;
+  readonly reference: IndependentProbeModel;
+  private readonly draws: NonceDraw[] = [];
+  private productDrawIndex = 0;
+  private referenceDrawIndex = 0;
+
+  constructor(private readonly draw: (index: number, run: DualRun) => NonceDraw) {
+    this.product = new HermesProbeWaiter(this.source("product"));
+    this.reference = new IndependentProbeModel(this.source("reference"));
+  }
+
+  step(step: ProbeStep): HermesProbeWaiterResult {
+    const result = compareStep(this.product, this.reference, step);
+    this.countResult(step.kind, result);
+    return result;
+  }
+
+  snapshot(): HermesProbeWaiterSnapshot {
+    return this.product.snapshot();
+  }
+
+  livePair(): ProbeReplyFrame | undefined {
+    return this.reference.livePair();
+  }
+
+  abandonedPairs(): readonly ProbeReplyFrame[] {
+    return this.reference.abandonedPairs();
+  }
+
+  private source(which: "product" | "reference"): HermesProbeNonceSource {
+    return () => {
+      const drawIndex = which === "product" ? this.productDrawIndex : this.referenceDrawIndex;
+      if (which === "product") this.productDrawIndex += 1;
+      else this.referenceDrawIndex += 1;
+      if (this.draws[drawIndex] === undefined) this.draws[drawIndex] = this.draw(drawIndex, this);
+      const value = this.draws[drawIndex]!;
+      if (value instanceof Error) throw value;
+      return value as string;
+    };
+  }
+
+  private countResult(stepKind: ProbeStep["kind"], result: HermesProbeWaiterResult): void {
+    fuzzStats.steps += 1;
+    if (result.fatal !== undefined) fuzzStats.fatals += 1;
+    if (result.refusal !== undefined) fuzzStats.refusals[result.refusal] += 1;
+    const first = result.actions[0];
+    if (first?.kind === "refused") fuzzStats.terminals[first.reason] += 1;
+    if (first?.kind === "resolved") fuzzStats.resolved += 1;
+    fuzzStats.byStep[stepKind] += 1;
+  }
+}
+
+type FuzzStats = {
+  steps: number;
+  fatals: number;
+  resolved: number;
+  refusals: Record<NonNullable<HermesProbeWaiterResult["refusal"]>, number>;
+  terminals: Record<"timed_out" | "connection_gone" | "stopped", number>;
+  byStep: Record<ProbeStep["kind"], number>;
+  schedules: Record<string, number>;
+  coverage: {
+    abandonedFullSchedules: number;
+    probeBusy: number;
+    nonceUnusable: number;
+    injected: number;
+    injectionKinds: Record<InjectionKind, number>;
+  };
+};
+
+type InjectionKind =
+  | "never_issued_nonce"
+  | "issued_nonce_other_connection"
+  | "second_reply_consumed_pair"
+  | "abandoned_nonce_other_connection"
+  | "never_issued_live_connection";
+
+const injectionKinds: readonly InjectionKind[] = [
+  "never_issued_nonce",
+  "issued_nonce_other_connection",
+  "second_reply_consumed_pair",
+  "abandoned_nonce_other_connection",
+  "never_issued_live_connection",
+];
+
+const fuzzStats: FuzzStats = {
+  steps: 0,
+  fatals: 0,
+  resolved: 0,
+  refusals: { stopped: 0, probe_busy: 0, abandoned_full: 0, nonce_unusable: 0 },
+  terminals: { timed_out: 0, connection_gone: 0, stopped: 0 },
+  byStep: { start: 0, reply: 0, timeout: 0, closed: 0, stop: 0, abandon: 0 },
+  schedules: { relayLegal: 0, closedConnection: 0, badNonce: 0, capPressure: 0, injection: 0 },
+  coverage: {
+    abandonedFullSchedules: 0,
+    probeBusy: 0,
+    nonceUnusable: 0,
+    injected: 0,
+    injectionKinds: {
+      never_issued_nonce: 0,
+      issued_nonce_other_connection: 0,
+      second_reply_consumed_pair: 0,
+      abandoned_nonce_other_connection: 0,
+      never_issued_live_connection: 0,
+    },
+  },
+};
+
+function makeNonceDraw(seed: number, badRate: number): (index: number, run: DualRun) => NonceDraw {
+  const random = rng(seed * 7_919 + 11);
+  let counter = 0;
+  return (_index, run) => {
+    if (random() < badRate) {
+      const badKind = Math.floor(random() * 8);
+      const abandoned = run.abandonedPairs();
+      if (badKind === 0) return "0123456789ABCDEF0123456789ABCDEF";
+      if (badKind === 1) return "a".repeat(PROBE_NONCE_HEX_LENGTH - 1);
+      if (badKind === 2) return "a".repeat(PROBE_NONCE_HEX_LENGTH + 1);
+      if (badKind === 3) return new Error("nonce source unavailable");
+      if (badKind === 4) return 7;
+      if (badKind === 5) return `${"a".repeat(PROBE_NONCE_HEX_LENGTH)}\n`;
+      if (badKind === 6 && abandoned.length > 0) return abandoned[Math.floor(random() * abandoned.length)]!.nonce;
+    }
+    counter += 1;
+    return `${counter.toString(16)}e`.padStart(PROBE_NONCE_HEX_LENGTH, "0");
+  };
+}
+
+type LegalOptions = {
+  readonly steps: number;
+  readonly profile: keyof FuzzStats["schedules"];
+  readonly seed: number;
+  readonly probeClosed?: boolean;
+  readonly badNonceRate?: number;
+  readonly weights?: Partial<Record<"accept" | "start" | "relay" | "hangup" | "timer" | "abandon" | "shutdown" | "node", number>>;
+};
+
+function chooseBand(random: () => number, weights: LegalOptions["weights"]): string {
+  const bands: readonly (readonly [string, number])[] = [
+    ["accept", weights?.accept ?? 0.08],
+    ["start", weights?.start ?? 0.17],
+    ["relay", weights?.relay ?? 0.20],
+    ["hangup", weights?.hangup ?? 0.07],
+    ["timer", weights?.timer ?? 0.10],
+    ["abandon", weights?.abandon ?? 0.03],
+    ["shutdown", weights?.shutdown ?? 0.004],
+    ["node", weights?.node ?? 0.35],
+  ];
+  let point = random() * bands.reduce((sum, [, weight]) => sum + weight, 0);
+  for (const [band, weight] of bands) {
+    if (point < weight) return band;
+    point -= weight;
+  }
+  return "node";
+}
+
+function runLegalSchedule(options: LegalOptions): { readonly reachedFull: boolean } {
+  fuzzStats.schedules[options.profile] += 1;
+  const random = rng(options.seed);
+  const run = new DualRun(makeNonceDraw(options.seed, options.badNonceRate ?? 0));
+  const relayConnections: string[] = [];
+  const relayClosed = new Set<string>();
+  const nodeAccepted = new Set<string>();
+  const nodeClosed = new Set<string>();
+  const toRelay: ProbeReplyFrame[] = [];
+  const toNode: Array<["accepted", string] | ["closed", string] | ["probe_reply", string, string] | ["relay_shutdown"]> = [];
+  const timers: Array<{ readonly entryRef: string; readonly nonce: string }> = [];
+  let nextConnection = 1;
+  let nextEntry = 1;
+  let current: { readonly entryRef: string; readonly connectionId: string } | undefined;
+  let stopped = false;
+  let shutdownSent = false;
+  let reachedFull = false;
+
+  for (let index = 0; index < options.steps; index += 1) {
+    const band = chooseBand(random, options.weights);
+    if (band === "accept") {
+      if (!shutdownSent && relayConnections.filter((connectionId) => !relayClosed.has(connectionId)).length < 4) {
+        const connectionId = `c${nextConnection}`;
+        nextConnection += 1;
+        relayConnections.push(connectionId);
+        toNode.push(["accepted", connectionId]);
       }
-
-      for (const pair of [...issuedPairs]) {
-        const result = compareStep(product, reference, { kind: "reply", connectionId: pair.connectionId, nonce: pair.nonce });
+    } else if (band === "start") {
+      const open = [...nodeAccepted].filter((connectionId) => !nodeClosed.has(connectionId));
+      const pool = options.probeClosed ? [...nodeAccepted] : open;
+      if (pool.length === 0) continue;
+      const reuseCurrent = current !== undefined && random() < 0.45;
+      const reused = reuseCurrent ? current : undefined;
+      const entryRef = reused?.entryRef ?? `entry-${options.seed}-${nextEntry}`;
+      const connectionId = reused !== undefined && random() < 0.4 ? reused.connectionId : pool[Math.floor(random() * pool.length)]!;
+      nextEntry += reuseCurrent ? 0 : 1;
+      current = { entryRef, connectionId };
+      const result = run.step({ kind: "start", entryRef, connectionId });
+      if (result.refusal === "probe_busy") fuzzStats.coverage.probeBusy += 1;
+      if (result.refusal === "abandoned_full") {
+        reachedFull = true;
+        fuzzStats.coverage.abandonedFullSchedules += 1;
+      }
+      if (result.refusal === "nonce_unusable") fuzzStats.coverage.nonceUnusable += 1;
+      const sent = result.actions[0];
+      if (sent?.kind === "send_probe") {
+        const issued = reply(sent.connectionId, sent.nonce);
+        timers.push({ entryRef, nonce: sent.nonce });
+        if (nodeClosed.has(sent.connectionId)) toNode.push(["probe_reply", sent.connectionId, sent.nonce]);
+        else toRelay.push(issued);
+      }
+    } else if (band === "relay") {
+      const issued = toRelay.shift();
+      if (issued === undefined) continue;
+      if (!relayClosed.has(issued.connectionId) && random() < 0.3) {
+        relayClosed.add(issued.connectionId);
+        toNode.push(["closed", issued.connectionId]);
+      }
+      toNode.push(["probe_reply", issued.connectionId, issued.nonce]);
+    } else if (band === "hangup") {
+      if (shutdownSent) continue;
+      const open = relayConnections.filter((connectionId) => !relayClosed.has(connectionId));
+      if (open.length === 0) continue;
+      const connectionId = open[Math.floor(random() * open.length)]!;
+      relayClosed.add(connectionId);
+      toNode.push(["closed", connectionId]);
+    } else if (band === "timer") {
+      const timer = timers.splice(Math.floor(random() * timers.length), 1)[0];
+      if (timer !== undefined) run.step({ kind: "timeout", entryRef: timer.entryRef, nonce: timer.nonce });
+    } else if (band === "abandon") {
+      if (current === undefined) continue;
+      const entryRef = random() < 0.8 ? current.entryRef : `entry-${options.seed}-${Math.floor(random() * (nextEntry + 1))}`;
+      run.step({ kind: "abandon", entryRef });
+    } else if (band === "shutdown") {
+      if (!shutdownSent) {
+        shutdownSent = true;
+        toNode.push(["relay_shutdown"]);
+      }
+    } else {
+      const frame = toNode.shift();
+      if (frame === undefined) continue;
+      if (frame[0] === "accepted") nodeAccepted.add(frame[1]);
+      else if (frame[0] === "closed") {
+        nodeClosed.add(frame[1]);
+        run.step({ kind: "closed", connectionId: frame[1] });
+      } else if (frame[0] === "probe_reply") {
+        const result = run.step({ kind: "reply", connectionId: frame[1], nonce: frame[2] });
         expect(result.fatal).toBeUndefined();
+      } else {
+        stopped = true;
+        run.step({ kind: "stop" });
+        if (random() < 0.3) run.step({ kind: "stop" });
       }
-      expect(product.snapshot().abandoned).toHaveLength(0);
+    }
+    if (stopped && random() < 0.9) continue;
+  }
+
+  while (toRelay.length > 0) {
+    const issued = toRelay.shift()!;
+    toNode.push(["probe_reply", issued.connectionId, issued.nonce]);
+  }
+  while (toNode.length > 0) {
+    const frame = toNode.shift()!;
+    if (frame[0] === "accepted") nodeAccepted.add(frame[1]);
+    else if (frame[0] === "closed") run.step({ kind: "closed", connectionId: frame[1] });
+    else if (frame[0] === "probe_reply") {
+      const result = run.step({ kind: "reply", connectionId: frame[1], nonce: frame[2] });
+      expect(result.fatal).toBeUndefined();
+    } else {
+      run.step({ kind: "stop" });
+    }
+  }
+  if (run.snapshot().live === undefined) expect(run.snapshot().abandoned).toHaveLength(0);
+  return { reachedFull };
+}
+
+function injectionFrame(kind: InjectionKind, run: DualRun, fallbackNonce: string): ProbeReplyFrame {
+  const live = run.livePair();
+  const abandoned = run.abandonedPairs()[0];
+  if (kind === "never_issued_nonce") return reply("c999", nonce(ILLEGAL_NONCE_OFFSET));
+  if (kind === "issued_nonce_other_connection") return reply("c999", live?.nonce ?? fallbackNonce);
+  if (kind === "second_reply_consumed_pair") return live ?? reply("c1", fallbackNonce);
+  if (kind === "abandoned_nonce_other_connection") return reply("c999", abandoned?.nonce ?? fallbackNonce);
+  return reply(live?.connectionId ?? "c1", nonce(ILLEGAL_NONCE_OFFSET + 1));
+}
+
+function runInjectionSchedule(seed: number): void {
+  fuzzStats.schedules.injection += 1;
+  const kind = injectionKinds[seed % injectionKinds.length]!;
+  const run = new DualRun(makeNonceDraw(seed + 50_000, 0));
+  const connectionId = `c${(seed % 5) + 1}`;
+  const start = run.step({ kind: "start", entryRef: `entry-${seed}`, connectionId });
+  const sent = start.actions[0];
+  expect(sent?.kind).toBe("send_probe");
+  if (sent?.kind !== "send_probe") return;
+
+  if (kind === "second_reply_consumed_pair") {
+    run.step({ kind: "reply", connectionId: sent.connectionId, nonce: sent.nonce });
+  } else if (kind === "abandoned_nonce_other_connection") {
+    run.step(seed % 2 === 0 ? { kind: "timeout", entryRef: `entry-${seed}`, nonce: sent.nonce } : { kind: "abandon", entryRef: `entry-${seed}` });
+  }
+
+  const frame = injectionFrame(kind, run, sent.nonce);
+  const before = run.snapshot();
+  const result = run.step({ kind: "reply", connectionId: frame.connectionId, nonce: frame.nonce });
+  expect(result).toEqual({ actions: [], fatal: "unmatched_probe_reply" });
+  expect(run.snapshot()).toEqual(before);
+  fuzzStats.coverage.injected += 1;
+  fuzzStats.coverage.injectionKinds[kind] += 1;
+}
+
+describe("Hermes probe waiter independent schedule oracle", () => {
+  it("matches the independent model across relay-legal profiles", () => {
+    for (let seed = 1; seed <= RELAY_LEGAL_SCHEDULES; seed += 1) {
+      runLegalSchedule({ profile: "relayLegal", seed, steps: SHORT_PROFILE_STEPS });
+    }
+    for (let seed = 1; seed <= CLOSED_CONNECTION_SCHEDULES; seed += 1) {
+      runLegalSchedule({ profile: "closedConnection", seed: seed + 10_000, steps: SHORT_PROFILE_STEPS, probeClosed: true });
+    }
+    for (let seed = 1; seed <= BAD_NONCE_SCHEDULES; seed += 1) {
+      runLegalSchedule({ profile: "badNonce", seed: seed + 20_000, steps: SHORT_PROFILE_STEPS, badNonceRate: 0.18 });
+    }
+    expect(fuzzStats.coverage.probeBusy).toBeGreaterThan(0);
+    expect(fuzzStats.coverage.nonceUnusable).toBeGreaterThan(0);
+  });
+
+  it("matches the independent model under cap pressure", () => {
+    for (let seed = 1; seed <= CAP_PRESSURE_SCHEDULES; seed += 1) {
+      runLegalSchedule({
+        profile: "capPressure",
+        seed: seed + 30_000,
+        steps: LONG_PROFILE_STEPS,
+        weights: { accept: 0.05, start: 0.34, relay: 0.02, timer: 0.28, hangup: 0.02, abandon: 0.04, node: 0.25 },
+      });
+    }
+    expect(fuzzStats.coverage.abandonedFullSchedules).toBeGreaterThan(0);
+  });
+
+  it("keeps state unchanged for illegal probe replies inserted into schedules", () => {
+    for (let seed = 1; seed <= INJECTION_SCHEDULES; seed += 1) {
+      runInjectionSchedule(seed);
+    }
+    expect(fuzzStats.coverage.injected).toBe(INJECTION_SCHEDULES);
+    for (const kind of injectionKinds) {
+      expect(fuzzStats.coverage.injectionKinds[kind]).toBeGreaterThan(0);
     }
   });
 
-  it("reports a typed fatal for an injected illegal reply", () => {
-    for (let seed = 0; seed < ILLEGAL_FUZZ_SCHEDULES; seed += 1) {
-      const machine = waiter([nonce(seed + 1)]);
-      const issued = startAndNonce(machine, "entry-a", "c1");
-      const badPair = seed % 2 === 0 ? reply("c1", nonce(seed + ILLEGAL_NONCE_OFFSET)) : reply("c2", issued);
-      const before = machine.snapshot();
-      expectResult(machine.reply(badPair), { actions: [], fatal: "unmatched_probe_reply" }, machine);
-      expect(machine.snapshot()).toEqual(before);
-    }
+  it("records profile and coverage counts for the fix-round report", () => {
+    expect(fuzzStats.schedules).toEqual({
+      relayLegal: RELAY_LEGAL_SCHEDULES,
+      closedConnection: CLOSED_CONNECTION_SCHEDULES,
+      badNonce: BAD_NONCE_SCHEDULES,
+      capPressure: CAP_PRESSURE_SCHEDULES,
+      injection: INJECTION_SCHEDULES,
+    });
+    expect(fuzzStats.coverage.probeBusy).toBeGreaterThan(0);
+    expect(fuzzStats.coverage.nonceUnusable).toBeGreaterThan(0);
+    expect(fuzzStats.coverage.abandonedFullSchedules).toBeGreaterThan(0);
+    expect(fuzzStats.coverage.injected).toBe(INJECTION_SCHEDULES);
   });
 });

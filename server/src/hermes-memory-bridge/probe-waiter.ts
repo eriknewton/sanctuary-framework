@@ -22,6 +22,7 @@ export type HermesProbeFatalReason = "unmatched_probe_reply";
 
 export type HermesProbeWaiterAction =
   | { readonly kind: "send_probe"; readonly connectionId: string; readonly nonce: string }
+  // A resolved probe means the relay delivered every earlier public event on that connection to Node.
   | { readonly kind: "resolved"; readonly entryRef: HermesProbeEntryRef }
   | { readonly kind: "refused"; readonly entryRef: HermesProbeEntryRef; readonly reason: HermesProbeTerminalReason };
 
@@ -55,18 +56,27 @@ type ProbePair = {
 };
 
 const EMPTY_RESULT: HermesProbeWaiterResult = Object.freeze({ actions: Object.freeze([]) });
+const HEX_CHARACTERS_PER_BYTE = 2;
 
 /**
- * Caller contract for later bridge composition: start only for the current in-flight entry on an
- * open busy lifecycle row, treat resolved as necessary but not sufficient for commit, feed closed
- * and probe replies synchronously in fd-3 order, and route any failed probe write through global stop.
+ * Caller contract for later bridge composition: start only for an open busy row with this entry's
+ * record current and in flight, the peer not shutting, and the lifecycle not stopped, because the
+ * relay answers a probe for a closed connection at once. A resolved probe means the relay delivered
+ * every earlier public event on that connection to Node; that is necessary for commit, never
+ * sufficient, so the caller still applies queued control events and re-checks the row and record.
+ * Closed and probe replies are fed synchronously in fd-3 order. Every send_probe action is written,
+ * and a failed write goes through global stop rather than skipping that probe.
  */
 export class HermesProbeWaiter {
   private live: LiveProbeWaiter | undefined;
   private readonly abandoned: ProbePair[] = [];
   private stopped = false;
 
-  constructor(private readonly nonceSource: HermesProbeNonceSource) {}
+  constructor(private readonly nonceSource: HermesProbeNonceSource) {
+    if (typeof nonceSource !== "function") {
+      throw new TypeError("HermesProbeWaiter requires a nonce source");
+    }
+  }
 
   start(entryRef: HermesProbeEntryRef, connectionId: string): HermesProbeWaiterResult {
     if (this.stopped) return { actions: [], refusal: "stopped" };
@@ -134,7 +144,7 @@ export class HermesProbeWaiter {
   }
 
   abandon(entryRef: HermesProbeEntryRef): HermesProbeWaiterResult {
-    if (this.stopped || this.live === undefined || this.live.entryRef !== entryRef) return EMPTY_RESULT;
+    if (this.live === undefined || this.live.entryRef !== entryRef) return EMPTY_RESULT;
     this.abandonLiveWaiter();
     return EMPTY_RESULT;
   }
@@ -184,5 +194,6 @@ export class HermesProbeWaiter {
 }
 
 export function createNodeCryptoHermesProbeNonceSource(): HermesProbeNonceSource {
-  return () => randomBytes(PROBE_NONCE_BYTES / 2).toString("hex");
+  // PROBE_NONCE_BYTES is the relay-visible hex length, so the CSPRNG draw is half as many bytes.
+  return () => randomBytes(PROBE_NONCE_BYTES / HEX_CHARACTERS_PER_BYTE).toString("hex");
 }
