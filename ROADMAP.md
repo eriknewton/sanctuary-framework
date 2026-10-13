@@ -4,7 +4,7 @@ In the physical world, your body provides the perimeter, the custody, the memory
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-10-12. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
+Last updated: 2026-10-13. Freshness is enforced: a CI guard requires feature PRs to update this file (or carry an explicit `roadmap-exempt` label), a second guard requires any change to this file to move this date, and a weekly job files a drift issue listing any shipped features not yet reflected here. See `.github/workflows/roadmap-freshness.yml`.
 
 ---
 
@@ -28,7 +28,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, Cline, and Mastra today (Mastra fixture-tested only; no live Mastra-agent drill is recorded; other MCP-compatible harnesses can use the `--wrap` flag, whose generic config rewrite is tested but not that harness's own path). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-*Status: shipped through v1.8.4 (npm `latest`, released 2026-09-05); v1.8.6-rc.5 is the opt-in preview on the `next` channel.*
+*Status: shipped through v1.8.4 (npm `latest`, released 2026-09-05); v1.9.0-rc.1 is the opt-in preview on the `next` channel.*
 
 *`sanctuary protect --passphrase-stdin` (built 2026-10-10; release pending) reads the passphrase from stdin for scripted setup.*
 

@@ -6,7 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.9.0-rc.1] - 2026-10-13
+
+Pre-release on npm's `next` channel; the stable `latest` channel stays at 1.8.4 until 1.9.0 ships. This release carries the unpublished 1.8.5 changes and the 1.8.6 pre-release fixes (their own sections below) and everything merged to `main` since 1.8.4. Every capability claim is a bounded row of the [Assurance Matrix](ASSURANCE_MATRIX.md); the one row that moved since 1.8.4 is the Linux row, and only for the separately published Linux package (see Linux).
+
+### Added
+
+- `sanctuary protect --passphrase-stdin` reads the fortress passphrase from piped input, so a script or an installing agent can finish setup without a terminal prompt. It refuses empty input, an interactive terminal, and use together with `--passphrase`, `--unwrap` or `--dry-run`.
+- `sanctuary_help` answers an installing agent's evaluation questions ("should I install this", "what does this protect", "what are the bounds", "which platforms", "how do I verify", "how do I uninstall") by naming the read-only posture tool that answers each one, or `sanctuary doctor --json` and `sanctuary uninstall` where no tool does. The server's instructions now carry a short bounds paragraph copied from the README, and every tool whose default tier is Tier 1 says so in its description. No tool name or input schema changed.
+- `sanctuary-linux-policy-sign`, a new command in the package, signs Linux Castle Wall policies on an operator workstation. See the Linux section.
+- `docs/assurance-matrix.json` and `docs/.well-known/product-facts.json`: machine-readable copies of the Assurance Matrix and the README's install facts, generated from those files and checked in CI so neither says more than its source.
+
 ### Changed
+
+- The install planner (`sanctuary install --json`) reports whether a usable Tier 1 approval path exists (`tier1_approval`), where the staged recovery file is (`staged_recovery_file`), and whether the vault is provisioned (`vault_provision`). Memory installs require a usable Tier 1 approval channel before they report completion; dashboard approval requires an explicit operator bearer.
+- Default `init` provisions only the fortress-local vault and leaves the machine-wide Castle Wall trust anchor alone; that anchor changes only through an explicit, confirmed `sanctuary castle-wall re-pin`. `doctor`, `status`, the dashboard and the MCP health and attestation tools report whether a vault has completed that step, and an unreadable record reads as not walled. `--no-pin` and `SANCTUARY_INIT_NO_PIN` are still accepted and do nothing.
+- On macOS, the installer uses the command line bundled in the verified signed app for memory and full profiles, and refuses an app whose runtime is inconsistent.
+- A busy dashboard port no longer stops the MCP server. The server starts and serves its tools, and every operation that needs approval is refused in that session with the usual generic denial. One stderr line and one audit record name the port.
+- The dashboard starts without waiting on optional requests, loads each panel on its own, and shows a panel with no live data source as unavailable rather than as empty or failed. In standalone mode it labels the panels it does not serve. Its colors and type follow a new console design, with the fonts bundled in the package.
+- The command-line forms of `memory_ingest`, `memory_emit`, `memory_transcode` and `memory_transcode_restore` apply the same vault owner rule as the MCP server. On a fresh store the owner is recorded only after the operator approves. They require the wrapped agent's `SANCTUARY_AGENT_ID` and accept only the default `--owner-ref`, and command-line memory ingest works on a fresh store.
+- Memory handles from `sanctuary_remember` persist across server restarts.
+- A refused `protect` exits non-zero with a message that names the next step, including when an explicit `--provision-local-intelligence` request cannot be honored or a staged recovery file cannot be used. A deferred `protect` exit keeps the original failure.
+- The macOS headless host app refuses `--ttl` and `--no-ttl`. The arm lease lifetime is set only through `sanctuary castle-wall enable`, which sends it in the signed daemon lease.
+- `init` says "this machine" rather than "this Mac" on other operating systems, and the package builds outside a git checkout.
+- The signed model catalog adds `qwen3.5:9b` to the mid tier (catalog version 2), and the on-disk model check accepts that model's Ollama manifest.
+- Dependency updates, including `@modelcontextprotocol/sdk` 1.31.0 and `@noble/post-quantum` 0.7.1 (signatures and key formats unchanged).
+
+### Fixed
+
+- Full exports and checkpoints include every durable namespace, including from a freshly started process, and exit bundles find namespaces the same way storage does.
+- State import and checkpoint restore check version floors before writing anything, and accept entries signed before and after an identity rotation; an entry whose rotation chain does not verify is still refused. The export and exit guarantee as a whole stays `partial` in the Assurance Matrix.
+- An interrupted restore, or an interrupted master-key rotation (`rotate-master --resume`), completes on the next retry. A custody write commits its envelope and sentinel together, so an interrupted write leaves the old pair or the new pair, never one of each.
+- A confirmed `castle-wall re-pin` and `castle-wall provision-pin` open the fortress through the same custody resolver as `protect`, `export-passphrase` and the install planner, and `protect` hands the pin step no credential in arguments or environment.
+- A dashboard launch session follows the dashboard's own same-origin reads. Live Tier 1 approvals appear on the dashboard overview for a generic wrap.
+- Restoring the macOS operator agent reloads its existing launch file without rewriting it, and leaves the agent stopped with a reported problem when the file no longer matches what was saved.
+- Fortress custody repair leaves files with more than one name untouched and reports them as skipped, so an incomplete repair never reads as clean.
+- The wrapped agent account creates its own harness log directory.
+- The rotation-in-progress refusal names only commands that exist.
+- Signed provenance fields in the vault are verified before content classification and are not classified as content.
+- Storage worker start-up tolerates a bounded load.
+
+### Security
+
+- Ed25519 verification through the shared identity verifier uses a strict profile: a wrong-length signature, a non-canonical encoding, a small-order point, or a point outside the prime-order subgroup is refused, in the public key and in the signature commitment. The Castle Wall policy parser applies the same point checks.
+- A state export approved at the Tier 1 gate runs on exactly the namespace set the operator approved. The approval is bound to the call's arguments, used once, and expires.
+- Refusals for an unrecognized command-line option, argument or subcommand never print the text that was typed.
+- Each namespace name resolves to exactly one directory under the state root, and storage operations check stored names before they change anything; a name this version cannot address is refused.
+- Exit-bundle artifacts and memory-archive bundle files are read through one bounded reader that checks the declared size and a per-file cap before a full read, and refuses symlinks and other non-regular files.
+- The Castle Wall daemon bounds the flow and approval work it holds when storage stalls or approvals back up, and the dashboard's read routes end at a deadline with one request in flight per route.
+- The harness log directory is checked through a no-follow handle before its ownership or mode is changed.
+
+### Linux
+
+The Linux wall ships as a separate package, [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1). This release's command line signs policies for it and provides its upgrade command. The proven claim is one distribution and architecture (Ubuntu 24.04, x86-64), literal addresses only, a checksum-verified package with no signature or apt repository yet, and no real agent harness tested.
 
 - Linux. The Assurance Matrix row "Egress enforcement: Linux (Castle Wall Phase 1)" moves from `not_implemented` to `proven`, narrowed to exactly this claim: On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces a signed operator policy per user account: blocked destinations stay blocked and allowed ones connect, through five reboots, on three fresh servers, with the evidence checked by two independent reviewers. Evidence: the [2026-10-04 drill record](docs/audit/castle-wall-linux-install-grade-drill-2026-10-04.md). **Bounds:** fault injection, other distributions and CPU architectures, DNS and hostname rules, and a real agent harness are not covered. The proven package is published byte for byte as the GitHub pre-release [Castle Wall Linux 0.1.0-1](https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1) (SHA-256 `0be0eedb7a3ba3f217a3e580b8d893b884d16291a10e79eb28ece3ac86ef8f5b`), verified by checksum only: no signature and no apt repository yet.
 - Linux only. The signed agent-origin descriptor no longer accepts two uid values that name no single principal on a Linux host: the conventional `kernel.overflowuid` (65534) and the invalid-uid sentinel (4294967295), for either `agent_uid` or `gate_uid`. The publisher refuses to mint such a descriptor, and the Linux daemon refuses to load one, reading its own host's configured `kernel.overflowuid` rather than assuming the conventional value. **Upgrade bound:** a manifest already signed with either value in either field will not load on the new Linux daemon. Reissue it through the publisher, which now refuses the value at signing time. Manifests that bind ordinary mapped uids, including 65533, 65535 and 100000, are unaffected. Before the 2026-10-04 install-grade drill, Linux Castle Wall enforcement was still `not_implemented` publicly; this descriptor change was not the proof.
@@ -17,7 +69,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.8.6] - unreleased
 
-One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run caught this defect on the exact install path.
+Pre-releases rc.1 to rc.5 on `next` only; superseded by 1.9.0, which carries these fixes. One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run caught this defect on the exact install path.
 
 ### Fixed
 
