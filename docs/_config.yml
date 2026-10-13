@@ -8,6 +8,14 @@ markdown: kramdown
 theme: null
 plugins:
   - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-feed
+
+# Jekyll skips dotfolders unless they are listed here. .well-known carries
+# security.txt (RFC 9116) and the MCP registry namespace verification file;
+# both must publish at https://sanctuaryprotocol.ai/.well-known/.
+include:
+  - ".well-known"
 
 # Exclude from build
 exclude:

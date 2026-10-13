@@ -19,7 +19,7 @@ code, no vendor lock-in.
 Every runtime gets the same capabilities:
 
 - **Ed25519 Identity**: Cryptographic keypair + W3C DID per agent
-- **Encrypted Audit Trail**: Tamper-evident hash-chained logs; production audit checkpoints are currently unsigned until **IC-05** closes
+- **Encrypted Audit Trail**: Tamper-evident hash-chained logs. Production call sites sign checkpoints when the fortress holds an identity; a fortress with no identity yet, and the root daemon's split audit store, write honest unsigned checkpoints. The Assurance Matrix row stays partial pending the **IC-05** external-verifier drill
 - **Sovereignty Health Report**: Current status for Castle Wall, Sentinels, Charter, and Heralds
 - **Verascore Profile**: Portable, verifiable reputation
 - **Sovereignty Handshake**: Mutual trust verification between agents
