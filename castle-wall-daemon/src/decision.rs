@@ -1589,6 +1589,59 @@ mod armed_identity_tests {
         std::fs::write(policy_dir.join(MANIFEST_FILENAME), manifest_bytes).unwrap();
     }
 
+    fn write_policy_with_agent_origin_json(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        agent_origin: serde_json::Value,
+    ) {
+        use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+        let rule_file = "r1.json";
+        let rule_body = br#"{"id":"r1","schema_version":1,"created_at":"2026-09-19T00:00:00Z","match":{"ip":["203.0.113.7"]},"disposition":"allow"}"#.to_vec();
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
+        let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let manifest = serde_json::json!({
+            "schema_version": crate::constants::SCHEMA_VERSION_V1,
+            "fortress_id": FORTRESS,
+            "issued_at": "2026-09-19T00:00:00Z",
+            "generation": 1,
+            "agent_origin": agent_origin,
+            "rules": [
+                {
+                    "rule_id": rule_file.trim_end_matches(".json"),
+                    "file": rule_file,
+                    "sha256": sha256_hex(&rule_body)
+                },
+                {
+                    "rule_id": crate::habeas::HABEAS_LOCAL_RULE_ID,
+                    "file": habeas_file,
+                    "sha256": sha256_hex(&habeas_body)
+                }
+            ]
+        });
+        let canonical = crate::manifest::canonical_json::canonicalize_to_bytes(&manifest).unwrap();
+        let signature = signing.sign(&canonical);
+        let envelope = serde_json::json!({
+            "manifest": manifest,
+            "signature": {
+                "signature_scheme": crate::constants::SIGNATURE_SCHEME_V1,
+                "signing_key_id": crate::crypto::castle_wall_signing_key_id(
+                    &signing.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+                "signature_b64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signature.to_bytes())
+            }
+        });
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(rule_file), rule_body).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(habeas_file), habeas_body).unwrap();
+        std::fs::write(
+            policy_dir.join(MANIFEST_FILENAME),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn manifest_generation_and_signature(policy_dir: &std::path::Path) -> (u64, String) {
         let manifest_path = policy_dir.join(crate::manifest::MANIFEST_FILENAME);
         let raw = std::fs::read(&manifest_path).unwrap();
@@ -2161,6 +2214,46 @@ mod armed_identity_tests {
         let production = production_lines(&decision).join("\n");
         assert!(production.contains("AdmittedIdentity::from_snapshot(snapshot)"));
         assert!(!production.contains("snapshot.confined_agent_uid.unwrap_or"));
+    }
+
+    #[test]
+    fn signed_manifest_path_refuses_inconsistent_admission_before_evaluation() {
+        for agent_origin in [
+            serde_json::json!({
+                "mode": "uid",
+                "system_uid_allow_ceiling": FIXTURE_CEILING
+            }),
+            serde_json::json!({
+                "mode": "uid",
+                "agent_uid": TEST_AGENT_UID
+            }),
+        ] {
+            let f = fixture();
+            write_policy_with_agent_origin_json(&f.policy_dir, &f.signing, agent_origin);
+            let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
+            assert!(
+                matches!(err, ManifestReloadAuthorizationError::Verify(_)),
+                "{err}"
+            );
+            assert!(f.store.lock().unwrap().current_snapshot().is_none());
+            let baseline_wal = wal_len(&f.wal);
+            let baseline_ring = ring_len(&f.ring);
+            let baseline_counter = f.engine.unattributed_attempts_for_test();
+            let outcome = f
+                .engine
+                .evaluate_attempt(&evaluation_request(
+                    crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                    "203.0.113.7",
+                ))
+                .expect("evaluate");
+            assert_unattributed_without_audit(
+                &f,
+                &outcome,
+                baseline_wal,
+                baseline_ring,
+                baseline_counter,
+            );
+        }
     }
 
     #[test]
