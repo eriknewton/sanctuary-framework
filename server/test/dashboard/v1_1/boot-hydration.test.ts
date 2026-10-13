@@ -177,7 +177,8 @@ describe("dashboard bounded independent hydration", () => {
   it("keeps every unread and loading rail count unknown", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/agents": pending, "/api/hub/inbox": pending }); await settle();
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
-    expect(h.fortress.innerHTML).not.toMatch(/>0<\/span><span class="l">(Wrapped|Waiting)/);
+    // Retargeted (slice 2 shell): the ambient stat reads "Protection requested", not "Wrapped".
+    expect(h.fortress.innerHTML).not.toMatch(/>0<\/span><span class="l">(Protection requested|Waiting)/);
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
   it("Health and agent timeline distinguish failed reads from zero", async () => {
@@ -714,7 +715,8 @@ describe("D5 closure", () => {
       "/api/posture/home": () => response({ ...home, agents: [{ agent_id: "fixture", status: "active", harness: "codex", policy_protected: false, enforcement_active: "unknown" }] }),
     }); await settle();
     runInContext('state.route = "health"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("<dt>Wrapped agents</dt>");
+    // Retargeted (slice 2 copy): the retired "Wrapped" reads "Protection requested", still never "Protected agents".
+    expect(h.main.innerHTML).toContain("<dt>Protection requested</dt>");
     expect(h.main.innerHTML).not.toContain("<dt>Protected agents</dt>");
     runInContext('state.route = "agents"; rerender()', h.context);
     expect(h.main.innerHTML).toContain("1 agent. Click one");
