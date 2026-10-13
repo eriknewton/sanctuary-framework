@@ -160,9 +160,14 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
+          # Both subjects are globs on purpose: the first push-to-main run
+          # attested the glob subject and skipped the literal SHA256SUMS path
+          # (the Ubuntu workflow's three glob subjects all attested). A
+          # literal path here looks fine in the log and simply yields no
+          # attestation for the checksum file.
           subject-path: |
             ${{ runner.temp }}/arch-package/*.pkg.tar.zst
-            ${{ runner.temp }}/arch-package/SHA256SUMS
+            ${{ runner.temp }}/arch-package/SHA256SUM*
       - id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
