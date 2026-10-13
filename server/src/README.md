@@ -46,7 +46,7 @@ All 64 module directories under `server/src` are listed. Status legend: **canoni
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =
 a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a thin re-export
-`index.ts` (55 of 63 do today).
+`index.ts` (56 of 64 do today).
 
 | Module | Subject area | Status | What it owns | Distinct from | Barrel? | Do-not-touch |
 |--------|-------------|--------|--------------|---------------|---------|--------------|
