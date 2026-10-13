@@ -451,7 +451,7 @@ describe("Memory Integrity C2 encrypted attachment", () => {
       };
       visit(sourceFile);
     }
-    expect(constructors).toHaveLength(3);
+    expect(constructors).toHaveLength(4);
     for (const constructor of constructors) {
       const options = constructor.arguments?.[0];
       expect(options !== undefined && ts.isObjectLiteralExpression(options)).toBe(true);

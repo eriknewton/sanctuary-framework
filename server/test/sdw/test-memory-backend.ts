@@ -9,9 +9,12 @@ import {
 import { memoryInsertIngress } from "../../src/sdw/memory-provenance-ingress.js";
 import type { MemoryProvenanceSigningHandle } from "../../src/sdw/memory-provenance-contract.js";
 
+type StandardSdwMemoryBackendAdapterOptions =
+  Extract<SdwMemoryBackendAdapterOptions, { readonly mode?: "standard" }>;
+
 /** Explicit test fixture. Production code never imports this test-tree module. */
 export class TestSdwMemoryBackendAdapter extends SdwMemoryBackendAdapter {
-  constructor(options: Omit<SdwMemoryBackendAdapterOptions,
+  constructor(options: Omit<StandardSdwMemoryBackendAdapterOptions,
     "resolvePrimarySigningHandle" | "resolveSignerPublicKey" |
     "resolveMemoryIntegrityState" | "testOnlyDefaultProvenanceContext"
   > & {
