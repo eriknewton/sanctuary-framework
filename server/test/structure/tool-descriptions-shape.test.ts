@@ -1,4 +1,4 @@
-// fail-before-exempt: this change adds (b3), a reverse-direction regression guard (a Tier 3 tool must not claim operator approval) that holds on the pre-fix source by construction, since reputation_publish was Tier 3 there and its description made no approval claim. Fail-before coverage for the fix lives in reputation-publish-approval-tier.test.ts.
+// fail-before-exempt: this change adds (b3), a reverse-direction copy guard over the default Tier 3 list that holds on the base source by construction; this change's fail-before coverage lives in its dedicated approval-tier test.
 /**
  * Tool-description shape guard: the socket describes itself truthfully to an
  * evaluating agent.
