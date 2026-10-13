@@ -55,6 +55,7 @@ use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
+use castle_wall_daemon::decision::OutcomeEvidence;
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
 use castle_wall_daemon::ipc::auth::{handshake_signing_bytes, CHALLENGE_NONCE_BYTES};
 use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
@@ -396,7 +397,7 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     let handle = boot(config).expect("boot is best-effort on first manifest load");
 
     let request = EvaluationRequest {
-        agent_id: "agent-1".to_string(),
+        agent_id: nftables::confined_agent_id(TEST_AGENT_UID),
         agent_template: "claude-code".to_string(),
         dest_host: Some("api.anthropic.com".to_string()),
         dest_ip: Some("104.18.0.1".to_string()),
@@ -406,6 +407,7 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     };
     let outcome = handle.evaluate_attempt(&request).expect("evaluate");
 
+    assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
     assert!(matches!(
         outcome.verdict(),
         Verdict::Deny {

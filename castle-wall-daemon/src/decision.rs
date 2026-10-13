@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
+pub(crate) use crate::admitted_identity::{AdmittedIdentity, AdmittedSubject};
 use crate::audit::{AuditRingBuffer, WalError, WalWriter};
 use crate::failure::{default_disposition, FailureDisposition, FailureMode};
 use crate::manifest::canonical_json::CanonicalJsonError;
@@ -53,30 +54,12 @@ const BOOT_MANIFEST_LOAD_CONTEXT: &str = "boot";
 /// reason the same host tolerates a minute later.
 const MANIFEST_RELOAD_LOCK_BUDGET: Duration = Duration::from_secs(2);
 
-/// The identity this process is ARMED with: written once, at the boot manifest
-/// load, and never again while the process lives.
-///
-/// `fortress_id` travels WITH the subject so no expectation reader has to reach
-/// back into the manifest store for it. The store is behind a mutex a
-/// control-plane operation can hold across an fsync, and every reader that used
-/// to `try_lock` it had to treat contention as "not confined" — an indeterminate
-/// answer where a definite one exists. The cell is the definite one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AdmittedIdentity {
-    /// The fortress the boot snapshot was admitted under. Must match
-    /// `PolicySnapshot::fortress_id` in `src/policy.rs` and
-    /// `AgentRulesetId::fortress_id` in `src/nftables.rs`, which reads it from here.
-    pub(crate) fortress_id: String,
-    /// Who the manifest confines, if anyone.
-    pub(crate) subject: AdmittedSubject,
-}
-
 pub(crate) fn resolve_audit_subject(
     identity: Option<&AdmittedIdentity>,
     agent_id: &str,
 ) -> Option<ProtectionSubject> {
     let identity = identity?;
-    let AdmittedSubject::Confined { agent_uid, .. } = identity.subject else {
+    let AdmittedSubject::Confined { agent_uid, .. } = identity.subject() else {
         return None;
     };
     let parsed_uid = crate::nftables::parse_confined_agent_id(agent_id)?;
@@ -86,69 +69,7 @@ pub(crate) fn resolve_audit_subject(
     // The signed uid is both the uid the kernel matched and the uid the signed
     // manifest admitted. A valid signature proves who signed; this check makes
     // the field name the right principal.
-    ProtectionSubject::new(&identity.fortress_id, parsed_uid)
-}
-
-/// Who a manifest confines. The two variants are not interchangeable: a kernel
-/// binding is legitimate under exactly one of them, so collapsing them into an
-/// `Option<u32>` would lose the difference between "this manifest confines
-/// nobody" and "this manifest's confinement is unknown".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdmittedSubject {
-    /// The manifest admits no agent uid. No per-agent binding may be live.
-    Unconfined,
-    /// The manifest admits `agent_uid` under `ceiling`, optionally beside a
-    /// distinct `gate_uid`. All three move together (see `PolicySnapshot`).
-    Confined {
-        agent_uid: u32,
-        ceiling: u32,
-        gate_uid: Option<u32>,
-    },
-}
-
-impl AdmittedIdentity {
-    /// Derive the armed identity from a COMMITTED policy snapshot.
-    ///
-    /// INVARIANT this enforces at the point of derivation, and it is SYMMETRIC:
-    /// `confined_agent_uid` and `confined_agent_uid_ceiling` are `Some` together
-    /// or not at all (`PolicySnapshot` states it;
-    /// `snapshot_threads_the_whole_admitted_set` asserts it). A uid with no
-    /// ceiling would mean sealing a uid into a kernel rule without the floor
-    /// admission accepted it under. A ceiling with NO uid is the same invalid state seen
-    /// from the other side: the snapshot carries an admission bound that no
-    /// subject was derived from, so reading it as `Unconfined` would silently
-    /// discard half of an inconsistent pair and arm a wall that confines nobody
-    /// under a manifest that meant to confine someone. Both are refused here
-    /// rather than defaulted.
-    pub(crate) fn from_snapshot(snapshot: &PolicySnapshot) -> Result<Self, String> {
-        let subject = match (
-            snapshot.confined_agent_uid,
-            snapshot.confined_agent_uid_ceiling,
-        ) {
-            (None, None) => AdmittedSubject::Unconfined,
-            (Some(agent_uid), Some(ceiling)) => AdmittedSubject::Confined {
-                agent_uid,
-                ceiling,
-                gate_uid: snapshot.confined_gate_uid,
-            },
-            (Some(agent_uid), None) => {
-                return Err(format!(
-                    "the policy snapshot confines uid {agent_uid} with no admission ceiling; \
-                     the two are set together or not at all"
-                ))
-            }
-            (None, Some(ceiling)) => {
-                return Err(format!(
-                    "the policy snapshot carries an admission ceiling {ceiling} with no confined \
-                     uid; the two are set together or not at all"
-                ))
-            }
-        };
-        Ok(Self {
-            fortress_id: snapshot.fortress_id.clone(),
-            subject,
-        })
-    }
+    ProtectionSubject::new(identity.fortress_id(), parsed_uid)
 }
 
 /// Which side of the identity freeze a reload is on.
@@ -623,7 +544,7 @@ impl DecisionEngine {
                 AdmittedIdentity::from_snapshot(&snapshot)
                     .map_err(ControlAuditError::IdentityChangeWhileArmed)
             })?;
-        if candidate.subject == frozen.subject {
+        if candidate.subject() == frozen.subject() {
             return Ok(());
         }
         Err(ControlAuditError::IdentityChangeWhileArmed(format!(
@@ -631,7 +552,8 @@ impl DecisionEngine {
              (armed={:?} candidate={:?}); the kernel binding cannot follow a live identity \
              change, so the reload is refused and the prior policy stays live. Repair order: \
              stop the wall, --disarm, start",
-            frozen.subject, candidate.subject
+            frozen.subject(),
+            candidate.subject()
         )))
     }
 
@@ -794,19 +716,14 @@ impl DecisionEngine {
                     // fortress id, high-water ordering and agent-origin derivation;
                     // only the scoped-rule admission failed, so arming this uid means
                     // kernel binding may confine it with no operator allow rules.
-                    AdmittedIdentity {
-                        fortress_id: guard.expected_fortress_id().to_string(),
-                        subject: AdmittedSubject::Confined {
-                            agent_uid,
-                            ceiling,
-                            gate_uid,
-                        },
-                    }
+                    AdmittedIdentity::boot_confined(
+                        guard.expected_fortress_id().to_string(),
+                        agent_uid,
+                        ceiling,
+                        gate_uid,
+                    )
                 } else {
-                    AdmittedIdentity {
-                        fortress_id: self.fortress_id().to_string(),
-                        subject: AdmittedSubject::Unconfined,
-                    }
+                    AdmittedIdentity::boot_unconfined(self.fortress_id().to_string())
                 }
             }
             Err(_) => return result,
@@ -915,12 +832,17 @@ impl DecisionEngine {
         // contention, fail CLOSED (default-deny) rather than stall until the
         // NFQUEUE `verdict_deadline` fail-stops the whole daemon. The store guard
         // is a SHORT critical section (snapshot read only) and is dropped before
-        // the WAL append below, so no fsync is ever held under it.
+        // the WAL append below, so no fsync is ever held under it. Only the
+        // verdict and admitted identity leave this guard; body construction and
+        // WAL/ring acquisition happen after it has ended.
         let deadline = Instant::now() + EVALUATE_ATTEMPT_LOCK_BUDGET;
         let (verdict, identity) = match bounded_lock_until(store, deadline) {
             Ok(guard) => match guard.current_snapshot() {
                 Some(snapshot) => (
                     snapshot.evaluate(request),
+                    // `AdmittedIdentity` has private fields outside this module;
+                    // the Err arm cannot rebuild a subject from raw snapshot
+                    // fields and must map to the Unattributed outcome below.
                     AdmittedIdentity::from_snapshot(snapshot),
                 ),
                 None => (
@@ -1254,6 +1176,7 @@ mod armed_identity_tests {
         store: Arc<Mutex<ManifestStore>>,
         wal: Arc<Mutex<WalWriter>>,
         ring: Arc<Mutex<AuditRingBuffer>>,
+        diagnostics: Arc<Mutex<Vec<String>>>,
         engine: DecisionEngine,
     }
 
@@ -1286,11 +1209,18 @@ mod armed_identity_tests {
             64 * 1024,
             Duration::from_secs(60),
         )));
-        let engine = DecisionEngine::new(
+        let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+        let diagnostic_sink = {
+            let diagnostics = Arc::clone(&diagnostics);
+            Arc::new(move |line: &str| diagnostics.lock().unwrap().push(line.to_string()))
+        };
+        let engine = DecisionEngine::new_with_mutation_cancel_and_diagnostic_sink(
             engine_fortress.to_string(),
             Some(Arc::clone(&store)),
             Some(Arc::clone(&wal)),
             Arc::clone(&ring),
+            Arc::new(AtomicBool::new(false)),
+            diagnostic_sink,
         );
         Fixture {
             _dir: dir,
@@ -1299,6 +1229,7 @@ mod armed_identity_tests {
             store,
             wal,
             ring,
+            diagnostics,
             engine,
         }
     }
@@ -1773,7 +1704,7 @@ mod armed_identity_tests {
         assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
         assert!(f.store.lock().unwrap().current_snapshot().is_none());
         assert!(matches!(
-            f.engine.armed_identity().map(|identity| identity.subject),
+            f.engine.armed_identity().map(|identity| identity.subject()),
             Some(AdmittedSubject::Confined {
                 agent_uid: TEST_AGENT_UID,
                 ceiling: FIXTURE_CEILING,
@@ -1794,14 +1725,12 @@ mod armed_identity_tests {
 
     #[test]
     fn resolve_audit_subject_accepts_only_the_admitted_confined_uid_mark() {
-        let identity = AdmittedIdentity {
-            fortress_id: "0123456789abcdef".to_string(),
-            subject: AdmittedSubject::Confined {
-                agent_uid: TEST_AGENT_UID,
-                ceiling: FIXTURE_CEILING,
-                gate_uid: Some(TEST_AGENT_UID + 1),
-            },
-        };
+        let identity = AdmittedIdentity::boot_confined(
+            "0123456789abcdef".to_string(),
+            TEST_AGENT_UID,
+            FIXTURE_CEILING,
+            Some(TEST_AGENT_UID + 1),
+        );
         let subject = resolve_audit_subject(
             Some(&identity),
             &crate::nftables::confined_agent_id(TEST_AGENT_UID),
@@ -1813,6 +1742,7 @@ mod armed_identity_tests {
         for rejected in [
             crate::nftables::confined_agent_id(TEST_AGENT_UID + 1),
             crate::nftables::confined_agent_id(TEST_AGENT_UID + 2),
+            crate::nftables::confined_agent_id(TEST_AGENT_UID - 1),
             "agent-x".to_string(),
             "uid-01".to_string(),
             "uid-".to_string(),
@@ -1827,10 +1757,7 @@ mod armed_identity_tests {
             resolve_audit_subject(None, &crate::nftables::confined_agent_id(TEST_AGENT_UID))
                 .is_none()
         );
-        let unconfined = AdmittedIdentity {
-            fortress_id: "0123456789abcdef".to_string(),
-            subject: AdmittedSubject::Unconfined,
-        };
+        let unconfined = AdmittedIdentity::boot_unconfined("0123456789abcdef".to_string());
         assert!(resolve_audit_subject(
             Some(&unconfined),
             &crate::nftables::confined_agent_id(TEST_AGENT_UID)
@@ -1862,6 +1789,18 @@ mod armed_identity_tests {
         }
         assert_eq!(f.engine.unattributed_attempts_for_test(), 1000);
         assert_eq!(f.engine.unattributed_log_lines_for_test(), 10);
+        let logged_counts = f
+            .diagnostics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| {
+                line.rsplit_once("count=")
+                    .and_then(|(_, count)| count.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("diagnostic line carries count: {line}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(logged_counts, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
         assert_eq!(wal_len(&f.wal), baseline_wal);
         assert_eq!(ring_len(&f.ring), baseline_ring);
     }
@@ -1881,7 +1820,8 @@ mod armed_identity_tests {
         let baseline_wal = wal_len(&f.wal);
         let baseline_ring = ring_len(&f.ring);
 
-        for rejected in [TEST_AGENT_UID + 1, TEST_AGENT_UID + 2] {
+        for rejected in [TEST_AGENT_UID + 1, TEST_AGENT_UID + 2, TEST_AGENT_UID - 1] {
+            let baseline_counter = f.engine.unattributed_attempts_for_test();
             let outcome = f
                 .engine
                 .evaluate_attempt(&evaluation_request(
@@ -1892,6 +1832,10 @@ mod armed_identity_tests {
             assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
             assert_eq!(wal_len(&f.wal), baseline_wal);
             assert_eq!(ring_len(&f.ring), baseline_ring);
+            assert_eq!(
+                f.engine.unattributed_attempts_for_test(),
+                baseline_counter + 1
+            );
         }
 
         let outcome = f
@@ -1967,7 +1911,7 @@ mod armed_identity_tests {
     }
 
     #[test]
-    fn recorded_evidence_covers_allow_deny_and_prompt_verdicts() {
+    fn recorded_evidence_covers_allow_and_deny_verdicts() {
         for (disposition, expected) in [("allow", "allow"), ("allow", "deny")] {
             let f = fixture();
             write_policy_with_fortress_disposition(
@@ -2101,47 +2045,24 @@ mod armed_identity_tests {
     }
 
     #[test]
-    fn fail_closed_rebuild_canonical_error_leaves_no_substitute_body() {
-        let f = fixture();
-        write_policy(
-            &f.policy_dir,
-            &f.signing,
-            1,
-            Some(TEST_AGENT_UID),
-            None,
-            "r1",
+    fn fail_closed_rebuild_uses_the_same_builder_without_a_substitute_body() {
+        let decision = source("src/decision.rs");
+        let production = production_lines(&decision).join("\n");
+        let first_builder = production
+            .find("let event_canonical_json =\n            build_audit_event_canonical_json")
+            .expect("first verdict body builder");
+        let fail_closed_builder = production
+            .find("let fail_closed_canonical_json = build_audit_event_canonical_json")
+            .expect("fail-closed body builder");
+        assert!(
+            first_builder < fail_closed_builder,
+            "the normal receipt and the fail-closed receipt use the shared builder"
         );
-        f.engine.reload_manifest_authorized_at_boot().unwrap();
-        let baseline_wal = wal_len(&f.wal);
-        let baseline_ring = ring_len(&f.ring);
-        let held = Arc::clone(&f.wal);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
-            tx.send(()).unwrap();
-            std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
-        });
-        rx.recv().unwrap();
-        let mut request = evaluation_request(
-            crate::nftables::confined_agent_id(TEST_AGENT_UID),
-            "203.0.113.7",
-        );
-        request.agent_template = "claude\0code".to_string();
-
-        let err = f.engine.evaluate_attempt(&request).unwrap_err();
-        holder.join().unwrap();
-
-        assert!(matches!(err, AttemptError::AuditCanonicalize(_)));
-        assert_eq!(
-            wal_len(&f.wal),
-            baseline_wal,
-            "a refused fail-closed audit body must not append a WAL row"
-        );
-        assert_eq!(
-            ring_len(&f.ring),
-            baseline_ring,
-            "a refused fail-closed audit body must not synthesize a ring row"
-        );
+        // The shared builder validates the free-text fields before either call
+        // can produce bytes, so the rebuild has no separate verdict-keyed input
+        // path and no hand-built JSON substitute.
+        assert!(!production.contains("serde_json::json!({\"identity_id\""));
+        assert!(!production.contains("AuditWalAppendFailed\n        }\n    )"));
     }
 
     #[test]
@@ -2258,9 +2179,30 @@ mod armed_identity_tests {
             assert!(AdmittedIdentity::from_snapshot(&snapshot).is_err());
         }
         let decision = source("src/decision.rs");
-        let production = production_lines(&decision).join("\n");
-        assert!(production.contains("AdmittedIdentity::from_snapshot(snapshot)"));
-        assert!(!production.contains("snapshot.confined_agent_uid.unwrap_or"));
+        let evaluate_at = decision
+            .find("pub fn evaluate_attempt(")
+            .expect("evaluate_attempt body");
+        let open = decision[evaluate_at..].find('{').unwrap() + evaluate_at;
+        let close = crate::source_scan::matching_brace(&decision, open).unwrap();
+        let body = &decision[open..=close];
+        assert!(body.contains("AdmittedIdentity::from_snapshot(snapshot)"));
+        let err_to_unattributed = "identity\n            .as_ref()\n            .ok()\n            .and_then(|identity| resolve_audit_subject";
+        assert!(
+            body.contains(err_to_unattributed),
+            "the identity Result maps Err to the Unattributed resolver path"
+        );
+        let after_from_snapshot = body
+            .split_once("AdmittedIdentity::from_snapshot(snapshot)")
+            .expect("from_snapshot call")
+            .1;
+        assert!(
+            !after_from_snapshot.contains("snapshot.confined_agent_uid"),
+            "evaluate_attempt must not recover from from_snapshot Err by reading raw uid fields"
+        );
+        assert!(
+            !after_from_snapshot.contains("snapshot.confined_agent_uid_ceiling"),
+            "evaluate_attempt must not recover from from_snapshot Err by reading raw ceiling fields"
+        );
     }
 
     #[test]
@@ -2414,6 +2356,9 @@ mod armed_identity_tests {
             std::thread::sleep(EVALUATE_ATTEMPT_LOCK_BUDGET + Duration::from_millis(100));
         });
         rx.recv().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let baseline_counter = f.engine.unattributed_attempts_for_test();
         let outcome = f
             .engine
             .evaluate_attempt(&evaluation_request(
@@ -2440,6 +2385,9 @@ mod armed_identity_tests {
                 ..
             }
         ));
+        assert_eq!(wal_len(&f.wal), baseline_wal + 1);
+        assert_eq!(ring_len(&f.ring), baseline_ring + 1);
+        assert_eq!(f.engine.unattributed_attempts_for_test(), baseline_counter);
     }
 
     #[test]
@@ -2449,7 +2397,7 @@ mod armed_identity_tests {
             if let Some(subject) = identity {
                 write_policy(&f.policy_dir, &f.signing, 1, None, None, "r1");
                 f.engine.reload_manifest_authorized_at_boot().unwrap();
-                assert_eq!(f.engine.armed_identity().unwrap().subject, subject);
+                assert_eq!(f.engine.armed_identity().unwrap().subject(), subject);
             }
             let held = Arc::clone(&f.store);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2508,6 +2456,10 @@ mod armed_identity_tests {
         // 50ms is several bounded-lock poll intervals, enough for the worker to
         // pass the short store read and wait at the WAL lock this test holds.
         std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !worker.is_finished(),
+            "the worker must be parked on the WAL while the test holds its guard"
+        );
         let store_started = Instant::now();
         let store_guard = store
             .try_lock()
@@ -2642,8 +2594,8 @@ mod armed_identity_tests {
         let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
         assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
         let identity = f.engine.armed_identity().expect("the cell must be written");
-        assert_eq!(identity.subject, AdmittedSubject::Unconfined);
-        assert_eq!(identity.fortress_id, FORTRESS);
+        assert_eq!(identity.subject(), AdmittedSubject::Unconfined);
+        assert_eq!(identity.fortress_id(), FORTRESS);
     }
 
     #[test]
@@ -2653,7 +2605,7 @@ mod armed_identity_tests {
         f.engine.reload_manifest_authorized_at_boot().unwrap();
         let identity = f.engine.armed_identity().unwrap();
         assert_eq!(
-            identity.subject,
+            identity.subject(),
             AdmittedSubject::Confined {
                 agent_uid: 60123,
                 ceiling: 500,
@@ -2664,7 +2616,7 @@ mod armed_identity_tests {
         let guard = f.store.lock().unwrap();
         let snapshot = guard.current_snapshot().unwrap();
         assert_eq!(snapshot.confined_agent_uid, Some(60123));
-        assert_eq!(identity.fortress_id, snapshot.fortress_id);
+        assert_eq!(identity.fortress_id(), snapshot.fortress_id);
     }
 
     #[test]
@@ -2711,7 +2663,7 @@ mod armed_identity_tests {
             Some(60123)
         );
         assert_eq!(
-            f.engine.armed_identity().unwrap().subject,
+            f.engine.armed_identity().unwrap().subject(),
             AdmittedSubject::Confined {
                 agent_uid: 60123,
                 ceiling: 500,
@@ -2793,7 +2745,7 @@ mod armed_identity_tests {
 
         assert!(f.store.lock().unwrap().current_snapshot().is_some());
         assert!(matches!(
-            f.engine.armed_identity().map(|identity| identity.subject),
+            f.engine.armed_identity().map(|identity| identity.subject()),
             Some(AdmittedSubject::Confined {
                 agent_uid: TEST_AGENT_UID,
                 ceiling: FIXTURE_CEILING,
@@ -2829,7 +2781,7 @@ mod armed_identity_tests {
         assert_eq!(read_high_water_fixture(&f.policy_dir), committed_high_water);
         assert!(f.store.lock().unwrap().current_snapshot().is_none());
         assert!(matches!(
-            f.engine.armed_identity().map(|identity| identity.subject),
+            f.engine.armed_identity().map(|identity| identity.subject()),
             Some(AdmittedSubject::Confined {
                 agent_uid: TEST_AGENT_UID,
                 ceiling: FIXTURE_CEILING,
@@ -2883,7 +2835,7 @@ mod armed_identity_tests {
             "a refused reload must leave no success row: {operations:?}"
         );
         assert!(matches!(
-            f.engine.armed_identity().map(|identity| identity.subject),
+            f.engine.armed_identity().map(|identity| identity.subject()),
             Some(AdmittedSubject::Confined {
                 agent_uid: TEST_AGENT_UID,
                 ceiling: FIXTURE_CEILING,
@@ -2974,7 +2926,7 @@ mod armed_identity_tests {
         let other = Arc::clone(&shared);
         shared.reload_manifest_authorized_at_boot().unwrap();
         assert_eq!(
-            other.armed_identity().map(|identity| identity.subject),
+            other.armed_identity().map(|identity| identity.subject()),
             Some(AdmittedSubject::Confined {
                 agent_uid: 60123,
                 ceiling: 500,
@@ -3282,12 +3234,9 @@ mod armed_identity_tests {
         }
     }
 
-    /// Regression fixture: a production caller placed
-    /// AFTER an earlier top-level `#[cfg(test)]` function (the real shape in
-    /// `nfqueue.rs`, where a test-only helper at line 154 is followed by
-    /// ordinary production functions) must still be counted. The prior
-    /// `take_while` implementation stopped reading the whole file at the
-    /// first such attribute and would report zero callers here.
+    /// Fixture: a production caller placed after an earlier top-level
+    /// `#[cfg(test)]` function must still be counted. The scanner skips only
+    /// the annotated item and then resumes at the next production item.
     #[test]
     fn a_production_caller_after_a_test_only_fn_is_still_counted() {
         let source = "\
@@ -3506,11 +3455,11 @@ mod mutation_tests {
     }
 }
 
-pub fn should_log(n: u64) -> bool {
+fn should_log(n: u64) -> bool {
     n.is_power_of_two()
 }
 
-/// Policy decision plus its durable evidence receipt.
+/// Evidence produced, or deliberately not produced, for a policy decision.
 #[derive(Debug, Clone)]
 pub enum OutcomeEvidence {
     Recorded {
@@ -3547,6 +3496,8 @@ impl EvaluationOutcome {
     }
 
     pub fn releases(&self) -> bool {
+        // Only a recorded Allow releases a packet; every outcome without a
+        // recorded subject denies with no weaker subject synthesized later.
         matches!(
             &self.evidence,
             OutcomeEvidence::Recorded {

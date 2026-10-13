@@ -218,11 +218,11 @@ fn current_expected_agent_binding(
     use crate::decision::AdmittedSubject;
     use crate::nftables::ExpectedAgentBinding;
     match decision_engine.armed_identity() {
-        Some(identity) => match identity.subject {
+        Some(identity) => match identity.subject() {
             AdmittedSubject::Confined { agent_uid, .. } => ExpectedAgentBinding::Confined {
                 // The fortress id travels in the cell precisely so this line does
                 // not have to reach back into the store for it.
-                fortress_id: identity.fortress_id.clone(),
+                fortress_id: identity.fortress_id().to_string(),
                 agent_uid,
             },
             AdmittedSubject::Unconfined => ExpectedAgentBinding::NoneConfined,
@@ -833,7 +833,7 @@ fn owned_record_preserving_history(
 #[cfg(target_os = "linux")]
 fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u32>)> {
     use crate::decision::AdmittedSubject;
-    match decision_engine.armed_identity()?.subject {
+    match decision_engine.armed_identity()?.subject() {
         AdmittedSubject::Confined {
             agent_uid,
             gate_uid,
@@ -1143,10 +1143,9 @@ pub fn acquire_castle_table_component_for_test(
     // the refusal instead of the table-lifecycle paths it exists for.
     // `Unconfined` is the strict reading: no agent is bound on these paths, and a
     // per-agent binding appearing in a table this seam owns is refused.
-    decision_engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
-        fortress_id: "test-isolation-fortress".to_string(),
-        subject: crate::decision::AdmittedSubject::Unconfined,
-    });
+    decision_engine.freeze_armed_identity_for_test(
+        crate::decision::AdmittedIdentity::boot_unconfined("test-isolation-fortress".to_string()),
+    );
     Box::new(NftablesTableProvider {
         lock_path: config.lock_path.clone(),
         journal_path: config.journal_path.clone(),
@@ -1379,14 +1378,12 @@ fn plan_admitted_binding(
     };
 
     // (1) THE SET RULE, over the whole set B rather than over any one binding.
-    let staged = match (&identity.subject, live) {
+    let staged = match (identity.subject(), live) {
         // `Verified` under `Confined` IS the exact singleton: the set rule is
         // computed in one place (`owned_table_binding_set_from_json`) and both
         // acquisition and health apply that one answer.
         (AdmittedSubject::Confined { agent_uid, .. }, LiveBindingSet::Verified { .. }) => {
-            BindPlan::Adopt {
-                agent_uid: *agent_uid,
-            }
+            BindPlan::Adopt { agent_uid }
         }
         (
             AdmittedSubject::Confined {
@@ -1395,10 +1392,7 @@ fn plan_admitted_binding(
             LiveBindingSet::Mismatch {
                 binding_count: 0, ..
             },
-        ) => BindPlan::Install {
-            agent_uid: *agent_uid,
-            ceiling: *ceiling,
-        },
+        ) => BindPlan::Install { agent_uid, ceiling },
         (AdmittedSubject::Unconfined, LiveBindingSet::Verified { .. }) => BindPlan::NothingToBind,
         // Any other readable B: a chain under another agent id, two chains for
         // U, a different uid, any mixture, or any live binding at all under
@@ -1440,7 +1434,7 @@ fn plan_admitted_binding(
         None => Vec::new(),
         Some(uids) => uids
             .into_iter()
-            .filter(|uid| match identity.subject {
+            .filter(|uid| match identity.subject() {
                 AdmittedSubject::Confined { agent_uid, .. } => *uid != agent_uid,
                 AdmittedSubject::Unconfined => true,
             })
@@ -2087,7 +2081,7 @@ fn bind_admitted_uid_before_ready(
                 // From the CELL, not from a fresh store read: the fortress id is a
                 // seal input, and a seal computed under a value that could differ
                 // from the one the boot froze would not verify on the next reclaim.
-                fortress_id: identity.fortress_id.clone(),
+                fortress_id: identity.fortress_id().to_string(),
             },
             &ruleset,
             AgentUidBinding {
@@ -6424,16 +6418,14 @@ mod tests {
         );
         let (engine, _wal, audit_buffer, _injection) =
             audit_backed_engine(&dir, Some(Arc::clone(&store)));
-        assert!(
-            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
-                fortress_id: "deadbeef".to_string(),
-                subject: crate::decision::AdmittedSubject::Confined {
-                    agent_uid,
-                    ceiling: 500,
-                    gate_uid: None,
-                },
-            })
-        );
+        assert!(engine.freeze_armed_identity_for_test(
+            crate::decision::AdmittedIdentity::boot_confined(
+                "deadbeef".to_string(),
+                agent_uid,
+                500,
+                None,
+            )
+        ));
 
         handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
             .expect("verification refusal audit must succeed");
@@ -6488,12 +6480,9 @@ mod tests {
         // watcher can ever be acquired, so a watcher reload always runs with the
         // cell set. `write_watcher_policy` admits no agent uid, so the frozen
         // identity is `Unconfined` and the reload preserves it.
-        assert!(
-            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
-                fortress_id: "deadbeef".to_string(),
-                subject: crate::decision::AdmittedSubject::Unconfined,
-            })
-        );
+        assert!(engine.freeze_armed_identity_for_test(
+            crate::decision::AdmittedIdentity::boot_unconfined("deadbeef".to_string())
+        ));
 
         handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
             .expect("authorized watcher reload");
@@ -6538,12 +6527,9 @@ mod tests {
         // watcher can ever be acquired, so a watcher reload always runs with the
         // cell set. `write_watcher_policy` admits no agent uid, so the frozen
         // identity is `Unconfined` and the reload preserves it.
-        assert!(
-            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
-                fortress_id: "deadbeef".to_string(),
-                subject: crate::decision::AdmittedSubject::Unconfined,
-            })
-        );
+        assert!(engine.freeze_armed_identity_for_test(
+            crate::decision::AdmittedIdentity::boot_unconfined("deadbeef".to_string())
+        ));
 
         reconcile_manifest_after_watch_registration(&engine)
             .expect("post-registration reconciliation must authorize latest manifest");
@@ -6820,7 +6806,7 @@ mod tests {
             .reload_manifest_authorized_at_boot()
             .expect("the boot load must commit and freeze");
         assert_eq!(
-            engine.armed_identity().map(|id| id.subject),
+            engine.armed_identity().map(|id| id.subject()),
             Some(AdmittedSubject::Unconfined),
             "the cell holds the identity the COMMITTED snapshot carries"
         );
@@ -6874,7 +6860,7 @@ mod tests {
         // refused identity change is non-fatal), and the cell is still the one
         // boot froze.
         assert_eq!(
-            engine.armed_identity().map(|id| id.subject),
+            engine.armed_identity().map(|id| id.subject()),
             Some(AdmittedSubject::Unconfined)
         );
 
@@ -6909,21 +6895,11 @@ mod tests {
     // ---- The pure slice-A decision (A2/A3/A7): exhaustive, no kernel ----
 
     fn armed_confined(agent_uid: u32, ceiling: u32) -> AdmittedIdentity {
-        AdmittedIdentity {
-            fortress_id: "deadbeef".to_string(),
-            subject: AdmittedSubject::Confined {
-                agent_uid,
-                ceiling,
-                gate_uid: None,
-            },
-        }
+        AdmittedIdentity::boot_confined("deadbeef".to_string(), agent_uid, ceiling, None)
     }
 
     fn armed_unconfined() -> AdmittedIdentity {
-        AdmittedIdentity {
-            fortress_id: "deadbeef".to_string(),
-            subject: AdmittedSubject::Unconfined,
-        }
+        AdmittedIdentity::boot_unconfined("deadbeef".to_string())
     }
 
     fn known_history(uids: &[u32]) -> ConfinedHistory {

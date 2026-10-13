@@ -3735,6 +3735,10 @@ mod tests {
             .evaluate_attempt(&req_for(Some("unlisted.example"), 443))
             .expect("evaluate through shared engine");
         assert!(matches!(
+            outcome.evidence,
+            crate::decision::OutcomeEvidence::Unattributed
+        ));
+        assert!(matches!(
             outcome.verdict(),
             Verdict::Deny {
                 reason: DeniedReason::DefaultDeny
@@ -4094,9 +4098,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (config, _signing) = fresh_config_in(&dir);
         let handle = boot(config).expect("boot");
+        let baseline_ring = handle.audit_buffer.lock().unwrap().len();
         let outcome = handle
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
+        assert!(matches!(
+            outcome.evidence,
+            crate::decision::OutcomeEvidence::Unattributed
+        ));
         assert!(matches!(
             outcome.verdict(),
             Verdict::Deny {
@@ -4105,6 +4114,7 @@ mod tests {
         ));
         assert!(outcome.wal_seq().is_none());
         assert!(outcome.event_canonical_json().is_none());
+        assert_eq!(handle.audit_buffer.lock().unwrap().len(), baseline_ring);
         let _ = handle.stop();
     }
 

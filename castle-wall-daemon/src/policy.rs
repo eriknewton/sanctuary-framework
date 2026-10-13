@@ -1471,7 +1471,7 @@ pub fn build_audit_event_canonical_json(
     details.insert("agent_id".to_string(), audit_text(&request.agent_id)?);
     details.insert(
         "agent_template".to_string(),
-        serde_json::Value::String(request.agent_template.clone()),
+        audit_text(&request.agent_template)?,
     );
     if let Some(host) = request.dest_host.as_ref() {
         details.insert("dest_host".to_string(), audit_text(host)?);
@@ -1498,18 +1498,6 @@ pub fn build_audit_event_canonical_json(
     if let Some(rule_id) = matched_rule_id(verdict) {
         details.insert("rule_id_matched".to_string(), audit_text(rule_id)?);
     }
-    if matches!(
-        verdict,
-        Verdict::Deny {
-            reason: DeniedReason::AuditWalAppendFailed
-        }
-    ) {
-        // The fail-closed row is the remaining signed evidence when the durable
-        // allow receipt could not be written, so it refuses non-text template
-        // bytes rather than turning them into a substitute audit body.
-        audit_text(&request.agent_template)?;
-    }
-
     let mut entry = serde_json::Map::new();
     entry.insert(
         "timestamp".to_string(),
@@ -1585,14 +1573,8 @@ pub fn build_superseding_verdict_canonical_json(
         "superseded_wal_seq".to_string(),
         serde_json::Value::Number(serde_json::Number::from(superseded_wal_seq)),
     );
-    details.insert(
-        "final_verdict".to_string(),
-        serde_json::Value::String(final_verdict.to_string()),
-    );
-    details.insert(
-        "reason".to_string(),
-        serde_json::Value::String(reason.to_string()),
-    );
+    details.insert("final_verdict".to_string(), audit_text(final_verdict)?);
+    details.insert("reason".to_string(), audit_text(reason)?);
 
     let mut entry = serde_json::Map::new();
     entry.insert(
@@ -3471,17 +3453,66 @@ mod tests {
     fn identity_id_insertions_are_subject_only_and_decision_builds_no_identity_json() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let policy = std::fs::read_to_string(root.join("src/policy.rs")).unwrap();
-        for hit in policy.match_indices("entry.insert(\n        \"identity_id\"") {
-            let body = &policy[hit.0..policy[hit.0..].find(");").unwrap() + hit.0];
+        let policy_production = crate::source_scan::production_part(&policy);
+        let hits = policy_production
+            .match_indices("\"identity_id\"")
+            .filter_map(|(at, _)| {
+                let prefix = &policy_production[..at];
+                let insert_at = prefix.rfind("entry.insert(")?;
+                if prefix[insert_at..].contains(");") {
+                    return None;
+                }
+                let end = policy_production[at..].find(");")? + at;
+                Some(&policy_production[insert_at..end])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both builders insert exactly one identity_id"
+        );
+        for body in hits {
             assert!(!body.contains("agent_id"), "{body}");
             assert!(!body.contains("agent_id_for_audit"), "{body}");
             assert!(body.contains("subject"), "{body}");
         }
+        let audit_builder = policy_production[policy_production
+            .find("pub fn build_audit_event_canonical_json")
+            .unwrap()
+            ..policy_production
+                .find("pub const OPERATION_VERDICT_SUPERSEDED")
+                .unwrap()]
+            .to_string();
+        for field in [
+            "request.agent_id",
+            "request.agent_template",
+            "host",
+            "ip",
+            "request.dest_protocol",
+            "rule_id",
+        ] {
+            assert!(
+                audit_builder.contains(&format!("audit_text(&{field})"))
+                    || audit_builder.contains(&format!("audit_text({field})")),
+                "audit builder validates {field}"
+            );
+        }
+        assert!(
+            !audit_builder.contains("AuditWalAppendFailed"),
+            "text validation is independent of the verdict"
+        );
+        let superseding_builder = policy_production[policy_production
+            .find("pub fn build_superseding_verdict_canonical_json")
+            .unwrap()..]
+            .to_string();
+        for field in ["final_verdict", "reason"] {
+            assert!(
+                superseding_builder.contains(&format!("audit_text({field})")),
+                "superseding builder validates {field}"
+            );
+        }
         let decision = std::fs::read_to_string(root.join("src/decision.rs")).unwrap();
-        let decision_production = decision
-            .split("\n#[cfg(test)]\nmod ")
-            .next()
-            .expect("production prefix");
+        let decision_production = crate::source_scan::production_part(&decision);
         assert!(
             !decision_production.contains("\"identity_id\""),
             "decision code must call the shared builder rather than hand-building subject JSON"
