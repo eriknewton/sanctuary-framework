@@ -207,4 +207,4 @@ Beneath the cooperative surface, on a patched macOS host the Castle Wall enforce
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
-111 registered MCP tools (measured 2026-10-06). Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. The current prerelease is v1.8.6-rc.5 on the npm `next` tag; the current published stable version on npm is `@sanctuary-framework/mcp-server@1.8.4`.
+111 registered MCP tools (measured 2026-10-13). Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. The current prerelease is v1.9.0-rc.1 on the npm `next` tag; the current published stable version on npm is `@sanctuary-framework/mcp-server@1.8.4`.
