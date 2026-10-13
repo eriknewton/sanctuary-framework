@@ -1,6 +1,6 @@
 {
   "name": "sanctuary-framework",
-  "version": "0.3.0",
+  "version": "1.8.4",
   "description": "Open source wall under your AI agent: egress enforced by the OS on a patched macOS host, keys the operator holds, a hash-chained audit record. Linux: proven on Ubuntu 24.04 (x86-64) only, on a patched host. Wraps Claude Code, Cursor, Hermes, OpenClaw and Cline on tested config paths (Assurance Matrix: partial).",
   "author": {
     "name": "Erik Newton",
