@@ -4,7 +4,7 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 
 ## Procedure
 
-1. Land the release commit on `main`. `server/package.json` must be at the exact version string being published (example `1.0.0-rc.3` or `1.0.1`).
+1. Land the release commit on `main`. `server/package.json` must be at the exact version string being published (example `1.0.0-rc.3` or `1.0.1`). For a stable version, the same commit sets the pinned version in `plugin/.mcp.json` to that version; `server/test/structure/plugin-launcher-pinned.test.ts` fails the release gate if it does not. Failure mode: a stable release with a stale pin keeps Claude plugin installs on the previous version with no error anywhere.
 2. Tag the SHA locally and push the tag, for example `git tag v1.0.1 && git push origin v1.0.1`. The tag is for git history; it does not trigger publish.
 3. Open the repo on GitHub, go to Actions, select the "Publish (manual)" workflow, click "Run workflow".
 4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). The workflow always checks out the immutable matching tag (`v<version>`); publishing an arbitrary branch or SHA is intentionally unsupported.

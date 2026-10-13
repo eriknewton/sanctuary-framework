@@ -8,7 +8,7 @@ Gives your agent encrypted state storage, self-custodied cryptographic identity,
 
 ## Install, verify, uninstall
 
-This plugin's `.mcp.json` starts the Sanctuary MCP server with a bare `npx -y @sanctuary-framework/mcp-server` entry. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
+This plugin's `.mcp.json` starts the Sanctuary MCP server with `npx -y @sanctuary-framework/mcp-server@<version>`, pinned to the exact stable release the plugin was shipped with. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
