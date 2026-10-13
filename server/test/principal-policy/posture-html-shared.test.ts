@@ -84,8 +84,9 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
       expect(html).not.toContain("#0e1116");
       expect(html).not.toContain("#58a6ff");
       expect(html).not.toContain("#2ea043");
-      // The paper/ink palette is present.
-      expect(html).toContain("--paper: #f7f5f0;");
+      // The canonical palette is present (the ratified 2026-10-12 page
+      // ground; must match --paper in server/src/dashboard/design-tokens.ts).
+      expect(html).toContain("--paper: #f4f6fa;");
     }
   });
 });

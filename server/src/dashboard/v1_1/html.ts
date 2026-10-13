@@ -20,6 +20,7 @@
 import { getClientScript } from "./client.js";
 import { SANCTUARY_VERSION } from "../../config.js";
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../design-fonts.js";
 
 export interface DashboardV11HtmlOptions {
   /** Bearer token for hub API auth, when not running loopback auto-auth. */
@@ -45,7 +46,8 @@ export interface DashboardV11HtmlOptions {
   embedClient?: boolean;
 }
 
-const STYLES = String.raw`${PAPER_INK_ROOT_TOKENS_CSS}
+const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
+${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
@@ -190,7 +192,7 @@ body {
 .chat-msg.system { background: var(--paper-3); color: var(--ink-3); font-size: var(--text-sm); max-width: 100%; }
 .chat-msg.agent { align-self: flex-start; }
 .chat-msg.operator { align-self: flex-end; background: var(--ink); color: var(--paper); }
-.chat-msg .meta { font-size: 10px; color: var(--ink-4); margin-top: 4px; }
+.chat-msg .meta { font-size: 10px; color: var(--ink-3); margin-top: 4px; }
 .composer { display: flex; gap: var(--space-2); padding: var(--space-2); border-top: 1px solid var(--rule); }
 .composer input { flex: 1; padding: 6px 8px; border: 1px solid var(--rule); border-radius: var(--rad); font-family: var(--sans); }
 .wizard-step { padding: 10px; border: 1px solid var(--rule); border-radius: var(--rad); margin-bottom: 8px; background: var(--surface); }
@@ -549,7 +551,7 @@ body {
   font-family: var(--mono);
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  color: var(--ink-3);
 }
 .concierge-msg-body {
   padding: 11px 14px;
@@ -572,7 +574,7 @@ body {
 .concierge-msg-meta {
   display: flex; gap: 6px;
   font-size: 10px;
-  color: var(--ink-4);
+  color: var(--ink-3);
   font-family: var(--mono);
 }
 .concierge-empty {
@@ -650,11 +652,11 @@ body {
   font-size: var(--text-md);
   outline: none;
 }
-.concierge-composer input::placeholder { color: var(--ink-4); }
+.concierge-composer input::placeholder { color: var(--ink-3); } /* --ink-4 never carries text a person reads; a placeholder is read */
 .concierge-composer .composer-meta {
   font-family: var(--mono);
   font-size: 10px;
-  color: var(--ink-4);
+  color: var(--ink-3);
   letter-spacing: 0.04em;
 }
 .concierge-composer .btn-primary {
@@ -1189,8 +1191,7 @@ body {
   .nav-footer, .nav-group-label { display: none; }
   .topbar .idchip { display: none; }
   .template-grid { grid-template-columns: 1fr; }
-  .policy-center h1 { font-size: 30px; }
-  .intel-center h1 { font-size: 30px; }
+  /* center h1s keep --text-display (26px); a 30px override here would grow them. */
   .intel-row { grid-template-columns: 1fr; }
   .intel-grid { grid-template-columns: 1fr; }
   .intel-failure-row { grid-template-columns: 1fr; }
@@ -1218,7 +1219,7 @@ body {
    under the Assist group; posture (Overview) leads the primary spine. */
 .nav-group-label {
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--ink-4);
+  text-transform: uppercase; color: var(--ink-3);
   padding: 10px 12px 4px;
 }
 
@@ -1348,7 +1349,7 @@ body {
   margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
   justify-content: space-between; gap: 8px; flex-wrap: wrap;
 }
-.pm-fresh { font-family: var(--mono); font-size: 10px; color: var(--ink-4); white-space: nowrap; }
+.pm-fresh { font-family: var(--mono); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
 .pm-fresh.none { color: var(--slate); }
 .pm-ev { font-size: 10.5px; color: var(--indigo); text-decoration: none; white-space: nowrap; }
 .pm-ev:hover { text-decoration: underline; }
@@ -1368,7 +1369,7 @@ body {
   background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
   padding: 5px 9px; color: var(--ink-2); width: fit-content;
 }
-.firstrun-foot { margin: 14px 0 0; font-size: var(--text-xs); color: var(--ink-4); }
+.firstrun-foot { margin: 14px 0 0; font-size: var(--text-xs); color: var(--ink-3); }
 .posture-quiet { display: flex; align-items: baseline; gap: 8px; font-size: var(--text-sm); color: var(--ink-2); }
 .posture-quiet .quiet-mark { color: var(--sage); font-size: 11px; }
 .posture-quiet .quiet-why { color: var(--ink-3); font-size: var(--text-xs); }
@@ -1449,8 +1450,16 @@ body {
 .ambient-seal { display: flex; align-items: center; gap: 9px; padding-bottom: 11px; border-bottom: 1px solid var(--rule); }
 .ambient-seal .as-glyph { width: 16px; height: 16px; position: relative; flex-shrink: 0; color: var(--sage); }
 .ambient-seal.tone-attention .as-glyph { color: var(--ochre); }
+/* Locked stays on the fault red here until the shell-restyle slice moves the
+   seal onto --locked; the locked hue is declared in design-tokens.ts but no
+   consumer reads it yet, so changing this rule is a visible behavior change
+   that belongs to that slice, not to the value-only token swap. */
 .ambient-seal.tone-locked .as-glyph { color: var(--rust); }
-.ambient-seal.tone-unknown .as-glyph { color: var(--ink-4); }
+/* Unknown wears the unknown status hue at full weight, never the disabled
+   --ink-4: "no answer arrived" is a state a person must read. The seal glyph
+   is a ring plus a dot for every tone, so the word beside it, not the shape,
+   tells unknown apart from the neutral gray. */
+.ambient-seal.tone-unknown .as-glyph { color: var(--slate); }
 .ambient-seal .as-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .ambient-seal .as-glyph::after { content: ""; position: absolute; inset: 5px; background: currentColor; border-radius: 50%; opacity: 0.9; }
 .ambient-seal .as-text { display: flex; flex-direction: column; line-height: 1.2; }
