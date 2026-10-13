@@ -169,8 +169,8 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --locked-line: #cbb8f0;
   /* Border of a neutral chip, in the -line pattern after the --ink-3 text the
      neutral status draws from. Server-only name for the design's neutral
-     border value (see the header). No consumer draws it yet; it is declared
-     for the shell restyle, like the other -line borders. */
+     border value (see the header). Consumer: the v1.1 shell's scope switcher
+     hover border (the .scope:hover rule in dashboard/v1_1/html.ts). */
   --ink-line: #bcc2cf;
   /* The one accent: links, focus, selection, the primary button fill, the
      active rail marker. Never a status. */
@@ -264,10 +264,10 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      --color-status-unknown to reach for, so it never has to borrow the pass
      color for want of a token. Five members are wired to .pill classes in
      STATUS_PILL_CSS in principal-policy/posture-html-shared.ts (green, amber,
-     red, neutral, unknown). Locked is declared here for the shell restyle and
-     has no consumer yet: the v1.1 .pill.tone-locked, .posture-seal.tone-locked
-     and .ambient-seal.tone-locked rules all still paint the fault red until
-     that slice.
+     red, neutral, unknown). Locked is consumed by the v1.1 shell in
+     dashboard/v1_1/html.ts: the .pill.tone-locked, .posture-seal.tone-locked
+     and .ambient-seal.tone-locked .as-glyph rules paint the violet --locked
+     with its -bg and -line, never the fault red.
 
      Every alias resolves to a physical token declared above, never to a
      literal. var() substitution is computed per element, and the dark palette
