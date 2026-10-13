@@ -251,6 +251,13 @@ const state = {
   // (the concierge reads fortress state), so the scope label is shown but
   // the concierge thread is not re-queried per agent in wave 1.
   agentScope: { selectedAgentId: null, switcherOpen: false },
+  // Slice 2 shell (2026-10-13): Talk opens the concierge as a panel beside
+  // the current screen; the top-bar search filters only what this page has
+  // already loaded (no endpoint); the time range is a client-side window
+  // over the Evidence list, "all" until the operator narrows it.
+  talk: { open: false },
+  search: { query: "", open: false },
+  timeRange: "all",
   // Wave 1: HONEST posture from the evidence-gated /api/sovereignty verdict
   // (#828). castleWallArmState drives the seal color; NEVER green-on-presence.
   // null until first load; load failure leaves it null and the seal reads
@@ -812,20 +819,68 @@ const INBOX_ACTION_LABEL = {
 };
 
 // ── Render: app-level ─────────────────────────────────────────────────
+// Slice 2 rail (2026-10-13): which rail item a hash route lights. The rail
+// carries ten destinations; the older routes fold into them as tabs,
+// sections or actions, and every older hash still renders its own screen
+// when navigated directly. Talk ("dashboard") lights no rail item: it is a
+// top-bar button. Must match RAIL_PRIMARY and RAIL_CONFIGURE in
+// server/src/dashboard/v1_1/html.ts: every value here is a rail id there.
+const ROUTE_RAIL_PARENT = {
+  "posture": "posture",
+  "approvals": "approvals",
+  "agents": "agents",
+  "agent-detail": "agents",
+  "enforcement": "enforcement",
+  "findings": "findings",
+  "honeypot": "findings",
+  "activity": "activity",
+  "exit-drill": "activity",
+  "policy": "policy",
+  "auto-trigger": "policy",
+  "integrations": "integrations",
+  "coordination": "integrations",
+  "settings": "settings",
+  "health": "settings",
+  "privacy": "settings",
+  "intelligence": "settings",
+  "attestation": "settings",
+  "dashboard": null
+};
+// Settings tabs: each is a plain hash link to the older route id, so the tab
+// IS the route and a deep link to #privacy still lands on Privacy.
+const SETTINGS_TABS = [
+  { id: "health", label: "Health" },
+  { id: "privacy", label: "Privacy" },
+  { id: "intelligence", label: "Local models" },
+  { id: "attestation", label: "Attestation" }
+];
+// Time-range windows, in milliseconds, for the Evidence list. Only the
+// Evidence screen has a client-side window today; every other screen shows
+// current state, so the control is disabled there with a title saying so.
+const MS_PER_HOUR = 60 * 60 * 1000;
+const TIME_RANGE_MS = { "24h": 24 * MS_PER_HOUR, "7d": 7 * 24 * MS_PER_HOUR, "30d": 30 * 24 * MS_PER_HOUR };
+const TIME_RANGE_LABEL = { "all": "all time", "24h": "the last 24 hours", "7d": "the last 7 days", "30d": "the last 30 days" };
+const TIME_RANGE_ROUTES = ["activity"];
+// Every route but Talk's full page is route-full: the fortress column (the
+// queue and ambient posture beside the concierge) shows only there. The
+// route-walk test asserts this for every hash id but "dashboard".
+const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
-  if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
+  if (ROUTE_FULL.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
+  const railRoute = Object.prototype.hasOwnProperty.call(ROUTE_RAIL_PARENT, route) ? ROUTE_RAIL_PARENT[route] : null;
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
-    if (a.getAttribute("data-route") === route) a.classList.add("active");
-    else a.classList.remove("active");
+    if (railRoute && a.getAttribute("data-route") === railRoute) { a.classList.add("active"); a.setAttribute("aria-current", "page"); }
+    else { a.classList.remove("active"); a.removeAttribute("aria-current"); }
   });
+  state.search.open = false;
   renderMain();
   renderFortress();
+  renderShellChrome();
   // Tunability UX: entering the Policy surface loads the LIVE plain-English
   // policy from the operator-bearer-gated GET /api/policy/current. Fired
   // fire-and-forget; loadPolicyView rerenders when the view arrives.
@@ -945,7 +1000,11 @@ function renderTopbar() {
     btn.classList.add("tier1-engaged");
     btn.disabled = true;
   } else {
-    btn.textContent = "Lockdown";
+    // The idle label is the ratified verb "Lock down" (slice 2 top bar).
+    // TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts still reads
+    // "Lockdown": that table is frozen this slice and has no runtime
+    // consumer; reconciling it is a named follow-up, not a silent drift.
+    btn.textContent = "Lock down";
   }
   renderAgentSwitcher();
   renderPostureSeal();
@@ -965,11 +1024,15 @@ function agentScopeGlyph(agentId) {
   return (cleaned.slice(0, 2) || "··").toUpperCase();
 }
 function renderAgentSwitcher() {
+  // Slice 2: the agent switcher folded into the top bar's scope control. The
+  // trigger shows the machine and its id (server-rendered) plus the agent
+  // scope; the menu's static head carries the full id and its copy control,
+  // and the agent options are written into #agent-switcher-options.
   const labelEl = document.getElementById("agent-switcher-label");
-  const glyphEl = document.getElementById("agent-switcher-glyph");
   const menuEl = document.getElementById("agent-switcher-menu");
+  const optionsEl = document.getElementById("agent-switcher-options") || menuEl;
   const trigger = document.getElementById("agent-switcher-trigger");
-  if (!labelEl || !glyphEl || !menuEl) return;
+  if (!labelEl || !menuEl) return;
   const selected = state.agentScope.selectedAgentId;
   const selectedAgent = selected
     ? state.agents.find(function (a) { return a.agent_id === selected; })
@@ -978,18 +1041,18 @@ function renderAgentSwitcher() {
   if (selected && !selectedAgent) state.agentScope.selectedAgentId = null;
   const curLabel = state.agentScope.selectedAgentId || "All agents";
   labelEl.textContent = curLabel;
-  glyphEl.textContent = agentScopeGlyph(state.agentScope.selectedAgentId);
   const open = !!state.agentScope.switcherOpen;
   menuEl.hidden = !open;
   if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
   if (!open) return;
-  if (!sourceLoaded(HUB + "/agents")) { menuEl.innerHTML = renderSourceRead(HUB + "/agents"); return; }
+  if (!sourceLoaded(HUB + "/agents")) { optionsEl.innerHTML = renderSourceRead(HUB + "/agents"); return; }
   const allSelected = !state.agentScope.selectedAgentId;
   const rows = ['<button type="button" class="agent-switcher-opt' + (allSelected ? ' selected' : '') +
     '" data-action="agent-scope-select" data-agent-id="">' +
     '<span class="opt-glyph">··</span>' +
     '<span class="opt-name">All agents</span>' +
-    '<span class="opt-state">' + state.agents.length + ' wrapped</span>' +
+    // A roster count, never "protected": enforcement evidence is per agent.
+    '<span class="opt-state">' + (state.agents.length === 1 ? "1 agent" : state.agents.length + " agents") + '</span>' +
     '</button>'];
   state.agents.forEach(function (a) {
     const map = agentDisplayStatus(a);
@@ -1001,7 +1064,7 @@ function renderAgentSwitcher() {
       '<span class="opt-state">' + escHtml(map.label || "") + '</span>' +
       '</button>');
   });
-  menuEl.innerHTML = rows.join("");
+  optionsEl.innerHTML = rows.join("");
 }
 
 // Wave 1 (2026-06-30): the posture seal. Honest verdict drives its color and
@@ -1013,14 +1076,18 @@ function renderPostureSeal() {
   const freshnessEl = document.getElementById("posture-seal-freshness");
   const popEl = document.getElementById("posture-seal-pop");
   if (!sealEl || !wordEl || !popEl) return;
-  sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked");
+  sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked", "tone-unknown");
   if (seal.tone === "protected") sealEl.classList.add("tone-protected");
   else if (seal.tone === "locked") sealEl.classList.add("tone-locked");
   else if (seal.tone === "attention") sealEl.classList.add("tone-attention");
-  // "unknown" tone keeps the neutral default styling.
+  // Unknown wears its own full-weight slate and an empty dotted ring, never
+  // the neutral "Checking" chrome and never the pass hue.
+  else sealEl.classList.add("tone-unknown");
   wordEl.textContent = seal.word;
   if (freshnessEl) {
     freshnessEl.textContent = seal.freshness.inline;
+    // The freshness may ellipsize on a narrow bar; the full text stays here.
+    freshnessEl.setAttribute("title", seal.freshness.inline);
     freshnessEl.classList.remove("fresh", "not-fresh");
     freshnessEl.classList.add(seal.freshness.current ? "fresh" : "not-fresh");
   }
@@ -1035,7 +1102,10 @@ function renderPostureSeal() {
     sub = "Protected means Castle Wall enforcement was observed within the freshness window and the Charter still gates risky actions. It does not mean every past action is fully verified here.";
   } else if (seal.tone === "locked") {
     head = "This fortress is locked down.";
-    sub = "Lockdown holds wrapped agents. Protected is only shown when Castle Wall enforcement has current evidence.";
+    // Must match the Lock down button title in html.ts and the
+    // approval_pending.tier1.fortress_lockdown template: network access is
+    // revoked for confined agents, and agents keep running and local access.
+    sub = "Lockdown revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
     sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
@@ -1044,7 +1114,7 @@ function renderPostureSeal() {
     sub = "Current enforcement is Unknown. Retry the protection evidence read.";
   }
   const lines = postureLayerLines().map(function (l) {
-    const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
+    const dotCls = layerDotClass(l);
     return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
       '<span class="pp-k">' + escHtml(l.k) + '</span>' +
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
@@ -1067,31 +1137,54 @@ function renderPostureSeal() {
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
 
-// ── Render: main area ──────────────────────────────────────────────────
-function renderMain() {
-  const main = document.getElementById("main");
-  if (!main) return;
-  // F8 fix: capture focused-input identity + caret position so an SSE-
-  // triggered rerender during typing does not clobber the operator's
-  // typing experience. innerHTML replacement creates new DOM nodes; we
-  // re-find the equivalent input by data-action + optional data-agent-id
-  // and restore focus + selection range.
+// F8 fix: capture focused-input identity + caret position so an SSE-
+// triggered rerender during typing does not clobber the operator's typing
+// experience. innerHTML replacement creates new DOM nodes; we re-find the
+// equivalent input by data-action + optional data-agent-id and restore focus
+// + selection range. Shared by #main and the Talk panel, the two containers
+// whose inputs a rerender rewrites.
+function captureInputFocus(container) {
   const active = document.activeElement;
-  let focus = null;
   if (
-    active && (!main.contains || main.contains(active)) &&
+    active && (!container.contains || container.contains(active)) &&
     active.tagName === "INPUT" &&
     ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 &&
     typeof active.getAttribute === "function" &&
     active.getAttribute("data-action")
   ) {
-    focus = {
+    return {
       action: active.getAttribute("data-action"),
       agentId: active.getAttribute("data-agent-id"),
       selectionStart: active.selectionStart,
       selectionEnd: active.selectionEnd
     };
   }
+  return null;
+}
+function restoreInputFocus(container, focus) {
+  if (!focus || !container.querySelector) return;
+  let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
+  if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
+  const el = container.querySelector(sel);
+  if (el && typeof el.focus === "function") {
+    try {
+      el.focus();
+      if (
+        typeof el.setSelectionRange === "function" &&
+        focus.selectionStart != null &&
+        focus.selectionEnd != null
+      ) {
+        el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
+      }
+    } catch (e) { /* ignore browsers that disallow programmatic focus */ }
+  }
+}
+
+// ── Render: main area ──────────────────────────────────────────────────
+function renderMain() {
+  const main = document.getElementById("main");
+  if (!main) return;
+  const focus = captureInputFocus(main);
   // Finding DDD (v1.2.0-rc.5): capture whether the operator is
   // following the conversation BEFORE the DOM is replaced. With the
   // rc.5 bounded-card layout, .concierge-history is the inner scroll
@@ -1131,16 +1224,23 @@ function renderMain() {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
     case "activity": nextHtml = renderActivityScreen(); break;
     case "posture": nextHtml = renderPostureScreen(); break;
+    case "approvals": nextHtml = renderApprovalsScreen(); break;
     case "agents": nextHtml = renderAgentsList(); break;
     case "agent-detail": nextHtml = renderAgentDetail(); break;
-    case "policy": nextHtml = renderPolicyCenter(); break;
+    case "enforcement": nextHtml = renderEnforcementScreen(); break;
+    case "findings": nextHtml = renderFindingsScreen(); break;
+    // Policies hosts the auto-trigger ladder as a section; #auto-trigger
+    // still renders the ladder on its own.
+    case "policy": nextHtml = renderPolicyCenter() + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage(), '<span class="pill tone-info">operator controlled</span>'); break;
     case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
-    case "intelligence": nextHtml = renderIntelligenceCenter() + renderSourceRead(HUB + "/intelligence/status") + renderSourceRead(HUB + "/intelligence/config"); break;
-    case "attestation": nextHtml = renderAttestation(); break;
+    case "integrations": nextHtml = renderIntegrationsScreen(); break;
+    case "settings": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
+    case "intelligence": nextHtml = settingsTabStrip("intelligence") + renderIntelligenceCenter() + renderSourceRead(HUB + "/intelligence/status") + renderSourceRead(HUB + "/intelligence/config"); break;
+    case "attestation": nextHtml = settingsTabStrip("attestation") + renderAttestation(); break;
     case "honeypot": nextHtml = renderHoneypotPage(); break;
-    case "privacy": nextHtml = renderPrivacyPage(); break;
+    case "privacy": nextHtml = settingsTabStrip("privacy") + renderPrivacyPage(); break;
     case "coordination": nextHtml = renderCoordinationPage(); break;
-    case "health": nextHtml = renderHealthPage(); break;
+    case "health": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
@@ -1180,23 +1280,7 @@ function renderMain() {
       state.chat.concierge.pendingScroll = false;
     }
   }
-  if (focus) {
-    let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
-    if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
-    const el = main.querySelector(sel);
-    if (el && typeof el.focus === "function") {
-      try {
-        el.focus();
-        if (
-          typeof el.setSelectionRange === "function" &&
-          focus.selectionStart != null &&
-          focus.selectionEnd != null
-        ) {
-          el.setSelectionRange(focus.selectionStart, focus.selectionEnd);
-        }
-      } catch (e) { /* ignore browsers that disallow programmatic focus */ }
-    }
-  }
+  restoreInputFocus(main, focus);
 }
 
 // ── Render: dashboard concierge ────────────────────────────────────────
@@ -1778,7 +1862,7 @@ function renderAgentInspectPanel(agent) {
           '<div class="policy-line"><span class="k">Agent id</span><span class="v">' + escHtml(agent.agent_id) + '</span></div>' +
           '<div class="policy-line"><span class="k">Harness</span><span class="v">' + escHtml(agent.harness) + '</span></div>' +
           modelLine +
-          '<div class="policy-line"><span class="k">Wrapped since</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
+          '<div class="policy-line"><span class="k">Protection requested</span><span class="v">' + escHtml(shortTime(agent.wrapped_at)) + '</span></div>' +
         '</div>' +
         '<p class="muted" style="margin-top:10px;font-size:12px;">' +
           '<a href="#activity?agent=' + escHtml(agent.agent_id) + '">View full activity</a> · ' +
@@ -1872,7 +1956,7 @@ function renderHealthPage() {
     '<p class="muted">Projected from existing data.</p>' +
     '<div class="card"><h3>Fortress at a glance</h3>' +
       '<dl class="kv">' +
-      '<dt>Wrapped agents</dt><dd>' + escHtml(totalAgents) + '</dd>' +
+      '<dt>Protection requested</dt><dd>' + escHtml(totalAgents) + '</dd>' +
       '<dt>Locked down</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? lockedDown : "Unknown") + '</dd>' +
       '<dt>Errored</dt><dd>' + escHtml(sourceLoaded(HUB + "/agents") ? errored : "Unknown") + '</dd>' +
       '<dt>Denials in feed</dt><dd>' + escHtml(sourceLoaded(HUB + "/activity") ? recentDenials : "Unknown") + '</dd>' +
@@ -2672,7 +2756,7 @@ function renderExitDrill() {
   const step1Body = exportDone
     ? 'Bundle approved and packaging.'
     : exportPending
-    ? '<span class="muted">Awaiting approval. See inbox in the right pane.</span>'
+    ? '<span class="muted">Awaiting approval. It waits in <a href="#approvals">Approvals</a>.</span>'
     : '<button class="btn btn-primary" data-action="exit-export-start">Snapshot now</button>';
   const step2Body = exportDone ? 'Re-key complete.' : '<span class="muted">Re-keying state for portable export.</span>';
   // A7: always render state_entry_count (including 0) so "Bundle ready" cannot
@@ -2790,11 +2874,15 @@ function inboxAgentOptions() {
   }).join("");
 }
 
-function filterInbox(items) {
+function filterInbox(items, ignoreTimeRange) {
   const f = state.inboxOps.filters;
   const q = f.search.trim().toLowerCase();
   const fromMs = f.from ? Date.parse(f.from + "T00:00:00.000Z") : null;
   const toMs = f.to ? Date.parse(f.to + "T23:59:59.999Z") : null;
+  // The top-bar time range narrows the same list; like the date filters, an
+  // item whose time does not parse is kept rather than silently dropped.
+  const windowMs = ignoreTimeRange ? undefined : TIME_RANGE_MS[state.timeRange];
+  const sinceMs = typeof windowMs === "number" ? Date.now() - windowMs : null;
   return items.filter(function (i) {
     const args = i.display_template_args || {};
     const agent = i.agent_id || args.agent_id || "";
@@ -2807,6 +2895,7 @@ function filterInbox(items) {
     if (f.agent && agent !== f.agent) return false;
     if (fromMs !== null && Number.isFinite(when) && when < fromMs) return false;
     if (toMs !== null && Number.isFinite(when) && when > toMs) return false;
+    if (sinceMs !== null && Number.isFinite(when) && when < sinceMs) return false;
     if (q && text.indexOf(q) < 0) return false;
     return true;
   });
@@ -2827,9 +2916,13 @@ function filterInbox(items) {
 // hub/api-router.ts (#823). See test/dashboard/v1_1/queue-approve-token-gate.test.ts.
 function pendingApprovalItems() {
   // Pending Tier-1 approvals, scoped to the selected agent when one is
-  // chosen. These are the only items the rail queue shows; everything else
-  // (privacy events, budget warnings, blocked egress) lives on Activity.
-  const scope = state.agentScope.selectedAgentId;
+  // chosen. These are the only items the queue shows; everything else
+  // (privacy events, budget warnings, blocked egress) lives on Evidence.
+  return heldApprovalItems(state.agentScope.selectedAgentId);
+}
+// Every held operation, optionally narrowed to one agent. Called with null
+// it is the fortress-wide denominator the waiting count is stated against.
+function heldApprovalItems(scope) {
   return state.inbox.filter(function (i) {
     if (i.resolved) return false;
     if (i.kind !== "approval_pending") return false;
@@ -2931,13 +3024,13 @@ function renderApprovalTile(i) {
   // other non-operation approvals are not promotable and omit the button.
   const promotable = promotableOperation(i);
   const promoteBtn = promotable
-    ? '<button class="btn btn-sm at-promote" data-action="inbox-promote" data-item-id="' + escHtml(i.item_id) + '" title="Turn this into a standing rule so agents can do it without asking you again.">Always allow</button>'
+    ? '<button class="btn btn-sm at-promote" data-action="inbox-promote" data-item-id="' + escHtml(i.item_id) + '" title="Turn this into a standing rule so agents can do it without asking you again.">Allow always</button>'
     : '';
   return '<div class="approval-tile" data-approval-tile="' + escHtml(i.item_id) + '">' +
     '<div class="at-what">' + escHtml(text) + '</div>' +
     '<div class="at-agent"><span class="ad"></span>' + escHtml(agentId) + '</div>' +
     '<div class="at-actions">' +
-      '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '">Approve</button>' +
+      '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '" title="Let this one operation through">Allow once</button>' +
       '<button class="btn btn-sm at-deny" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
       promoteBtn +
     '</div>' +
@@ -2976,11 +3069,11 @@ function renderFortress() {
   const pending = pendingApprovalItems();
   const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
   const countCls = queueCount ? "count" : "count zero";
-  const queueBody = !sourceLoaded(HUB + "/inbox") ? renderSourceRead(HUB + "/inbox") : state.inboxRedacted
-    ? '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>'
-    : pending.length
-    ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
-    : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  // The Approvals screen renders this same queue body in the main column, and
+  // the fortress column is hidden there (route-full), so the column skips it:
+  // the queue's element ids and its approve/deny controls exist once in the
+  // document. Every other route keeps rendering it here, hidden or shown.
+  const queueBody = state.route === "approvals" ? "" : renderApprovalQueueBody();
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3020,7 +3113,7 @@ function renderFortress() {
         '</div>',
         '<div class="ambient-line"><span class="lead">What is protecting you</span>' + escHtml(protectingLine) + '</div>',
         '<div class="ambient-stats">',
-          '<div class="ambient-stat"><span class="n">' + wrapped + '</span><span class="l">Wrapped</span></div>',
+          '<div class="ambient-stat" title="Agents placed under Sanctuary protection; enforcement evidence is stated per agent"><span class="n">' + wrapped + '</span><span class="l">Protection requested</span></div>',
           '<div class="ambient-stat"><span class="n">' + queueCount + '</span><span class="l">Waiting</span></div>',
           '<div class="ambient-stat"><span class="n">' + federationState + '</span><span class="l">Federation</span></div>',
         '</div>',
@@ -3077,8 +3170,18 @@ function renderActivityScreen() {
     ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
     : '';
   var inboxRows;
-  if (!visibleInbox.length) {
+  const openItems = state.inbox.filter(function (i) { return !i.resolved; });
+  if (!visibleInbox.length && !openItems.length) {
     inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
+  } else if (!visibleInbox.length) {
+    // Open items exist but the view shows none: say where they went, so an
+    // empty window never reads as an empty inbox.
+    const anyTime = filterInbox(openItems, true).length;
+    const hiddenByFilters = openItems.length - anyTime;
+    const parts = [];
+    if (anyTime) parts.push(anyTime + (anyTime === 1 ? " older item is" : " older items are") + " outside " + TIME_RANGE_LABEL[state.timeRange]);
+    if (hiddenByFilters) parts.push(hiddenByFilters + (hiddenByFilters === 1 ? " item is" : " items are") + " hidden by your filters");
+    inboxRows = redactedNotice + '<p class="muted">No open items in this view: ' + escHtml(parts.join("; ")) + '.</p>';
   } else {
     var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
@@ -3108,7 +3211,21 @@ function renderActivityScreen() {
     inboxRows = redactedNotice + sections.join("\n");
   }
   const total = sourceLoaded(HUB + "/inbox") ? state.inbox.filter(function (i) { return !i.resolved; }).length : "Unknown";
+  // The count states what the filters and the time range left showing, out of
+  // every open item, so a narrowed list never reads as the whole inbox.
+  const inboxCount = sourceLoaded(HUB + "/inbox") ? visibleInbox.length + " of " + total : "Unknown";
   if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
+  // Export: Exit drill folds in here as an action, beside the two evidence
+  // exports the posture board already links. No new route is served.
+  const exportGroup =
+    '<section class="card export-group"><h3>Export</h3>' +
+      '<p class="muted">Take your evidence, or your whole fortress, with you.</p>' +
+      '<div class="toolbar">' +
+        '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
+        '<a class="btn" href="/api/audit-log">Audit log (JSON)</a>' +
+        '<a class="btn" href="#exit-drill">Exit drill: export the fortress</a>' +
+      '</div>' +
+    '</section>';
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
@@ -3122,9 +3239,10 @@ function renderActivityScreen() {
         '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
         '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
       '</section>',
-      '<section class="card"><h3>Inbox (' + total + ')</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
       '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
       '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
+      exportGroup,
     '</section>'
   ].join("");
 }
@@ -3221,7 +3339,7 @@ function renderPostureStory(d) {
     ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
     : d.chain_verdict === "verified_suffix_only"
       ? '<span class="pill tone-degraded">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
-      : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
+      : '<span class="pill tone-unverified">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
   // S3 denominators: each count states the whole it came out of, so a "4" reads
   // as 4-of-2,113 rather than an unanchored number. Both totals are computed
   // from fields already on the digest; nothing new is fetched.
@@ -3341,7 +3459,7 @@ function renderPostureScreen() {
     ? '<span class="pill tone-verified">Verified</span>'
     : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
       ? '<span class="pill tone-degraded">Suffix-only</span>'
-      : '<span class="pill tone-locked">Unverified</span>';
+      : '<span class="pill tone-unverified">Unverified</span>';
   // S3 evidence spine. Every tile carries, where the payload already supports
   // it, a denominator, a freshness stamp, and a link to its evidence. Nothing
   // here fetches new data: detectedTotal, the wall's evidence timestamp, and the
@@ -3408,6 +3526,374 @@ function renderPostureScreen() {
       '</section>',
     '</section>'
   ].join("");
+}
+
+// ── Slice 2 shell: folded destinations (2026-10-13) ─────────────────────
+// The rail's new screens are compositions of renderers this client already
+// had; none reads a new endpoint, and every number keeps its denominator and
+// the age of the read behind it. The older routes they host keep rendering
+// on their own hashes.
+
+// A folded section: an older screen hosted inside a rail destination, with a
+// link to the same content on its own route (the frozen hash id). The fold's
+// head carries the hosted page's eyebrow and title, and the stylesheet hides
+// the hosted page's own eyebrow and h1 inside a fold, so no heading repeats.
+// titleSuffixHtml is trusted markup from the caller (a status pill the hosted
+// h1 carried), never data.
+function renderFoldedSection(eyebrow, title, routeId, html, titleSuffixHtml) {
+  return '<section class="folded-section" data-folded-route="' + escHtml(routeId) + '">' +
+    '<div class="folded-head"><div><p class="eyebrow">' + escHtml(eyebrow) + '</p>' +
+    '<h2>' + escHtml(title) + (titleSuffixHtml ? ' ' + titleSuffixHtml : '') + '</h2></div>' +
+    '<a href="#' + escHtml(routeId) + '">Open on its own page</a></div>' +
+    html + '</section>';
+}
+
+// Settings tab strip. Each tab is a hash link to the older route id, so the
+// active tab is simply the current route.
+function settingsTabStrip(activeId) {
+  return '<div class="screen-tabs"><p class="eyebrow">Settings</p><nav aria-label="Settings">' +
+    SETTINGS_TABS.map(function (t) {
+      const active = t.id === activeId;
+      return '<a href="#' + t.id + '"' + (active ? ' class="active" aria-current="page"' : '') + '>' + escHtml(t.label) + '</a>';
+    }).join("") + '</nav></div>';
+}
+
+// The age of a source's last read, as "Ns ago", or null before any read.
+// Read start is the bound: the data on screen is at least this old.
+function sourceReadAge(path) {
+  const read = sourceRead(path);
+  if (!read || !read.lastReadAt) return null;
+  return durationLabelFromMs(Date.now() - read.lastReadAt) + " ago";
+}
+
+// The waiting count, its denominator, and the age of the queue read behind
+// it, as one sentence for titles and accessible names. Unknown until the
+// queue read is LOADED (never a zero the client has not observed). The
+// numerator honors the agent scope; the denominator is every held operation
+// on this fortress. A redacted queue reports the server's pending count,
+// which no agent scope can narrow.
+function approvalWaitingSummary() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return { known: false, n: null, of: null, sentence: "Held operations waiting on you: Unknown until the approval queue loads" };
+  }
+  const age = sourceReadAge(HUB + "/inbox") || "at an unknown time";
+  if (state.inboxRedacted) {
+    const hidden = state.inboxRedactedCount;
+    return { known: true, n: hidden, of: hidden, sentence: hidden + " of " + hidden + " held operations wait on you, hidden until you paste the operator token · queue read " + age };
+  }
+  const n = pendingApprovalItems().length;
+  const of = heldApprovalItems(null).length;
+  const scope = state.agentScope.selectedAgentId;
+  return { known: true, n: n, of: of, sentence: n + " of " + of + " held operations wait on you" + (scope ? " (scoped to " + scope + ")" : "") + " · queue read " + age };
+}
+
+function renderApprovalCounts() {
+  const w = approvalWaitingSummary();
+  const text = w.known ? w.n + " of " + w.of : "Unknown";
+  const railCount = document.getElementById("rail-approvals-count");
+  if (railCount) {
+    railCount.className = "count" + (!w.known ? " unknown" : w.n > 0 ? " hot" : "");
+    railCount.textContent = text;
+    const link = railCount.parentElement;
+    if (link && typeof link.setAttribute === "function") {
+      link.setAttribute("title", w.sentence);
+      link.setAttribute("aria-label", "Approvals: " + w.sentence);
+    }
+  }
+  const notify = document.getElementById("btn-notifications");
+  if (notify) {
+    notify.setAttribute("title", w.sentence);
+    notify.setAttribute("aria-label", "Approvals: " + w.sentence);
+    // The badge goes only when nothing waits fortress-wide: a zero scoped to
+    // one agent while other agents' holds wait is not an all-clear, so the
+    // badge stays and reads "0 of N". The title states the count with its
+    // denominator and age either way.
+    if (w.known && w.of === 0) notify.classList.remove("waiting");
+    else notify.classList.add("waiting");
+  }
+  const badge = document.getElementById("notify-count");
+  if (badge) {
+    badge.hidden = w.known && w.of === 0;
+    badge.className = "wait" + (w.known ? "" : " unknown");
+    badge.innerHTML = '<i aria-hidden="true"></i>' + escHtml(text);
+  }
+}
+
+// Route-dependent top-bar state: the waiting count, the time range (live
+// only where a screen has a client-side window), the Talk button and panel,
+// and the search results. Called on every route change and rerender.
+function renderShellChrome() {
+  renderApprovalCounts();
+  const range = document.getElementById("time-range");
+  if (range) {
+    const applies = TIME_RANGE_ROUTES.indexOf(state.route) >= 0;
+    range.disabled = !applies;
+    range.value = state.timeRange;
+    range.setAttribute("title", applies
+      ? "Time range for the Evidence list: " + TIME_RANGE_LABEL[state.timeRange] + "."
+      : "This screen shows current state and has no time window. The time range applies to the Evidence list.");
+  }
+  const talkBtn = document.getElementById("btn-talk");
+  if (talkBtn) {
+    const talkShown = state.route === "dashboard" || !!state.talk.open;
+    if (talkShown) talkBtn.classList.add("active"); else talkBtn.classList.remove("active");
+    talkBtn.setAttribute("aria-expanded", state.talk.open && state.route !== "dashboard" ? "true" : "false");
+  }
+  renderTalkPanel();
+  renderSearchResults();
+}
+
+// Talk as a panel: the full-page concierge renderer, mounted in the right-hand
+// panel. On Talk's own full-page route the panel stays shut, so the
+// concierge's element ids exist once in the document.
+let talkPanelCache = null;
+function renderTalkPanel() {
+  const panel = document.getElementById("talk-panel");
+  const body = document.getElementById("talk-panel-body");
+  if (!panel || !body) return;
+  const open = !!state.talk.open && state.route !== "dashboard";
+  panel.hidden = !open;
+  if (!open) {
+    if (talkPanelCache !== null) { body.innerHTML = ""; talkPanelCache = null; }
+    return;
+  }
+  const html = renderDashboardConcierge();
+  if (html === talkPanelCache) return;
+  let following = true;
+  const prevHist = body.querySelector ? body.querySelector("#concierge-history") : null;
+  if (prevHist) {
+    const lastMsg = prevHist.querySelector(".concierge-msg:last-child");
+    if (lastMsg) {
+      const h = prevHist.getBoundingClientRect();
+      const l = lastMsg.getBoundingClientRect();
+      following = l.top < h.bottom && l.bottom > h.top;
+    }
+  }
+  const focus = captureInputFocus(body);
+  body.innerHTML = html;
+  talkPanelCache = html;
+  restoreInputFocus(body, focus);
+  const hist = body.querySelector ? body.querySelector("#concierge-history") : null;
+  if (hist && (state.chat.concierge.pendingScroll || following)) {
+    const lastMsg = hist.querySelector(".concierge-msg:last-child");
+    if (lastMsg && typeof lastMsg.scrollIntoView === "function") lastMsg.scrollIntoView({ block: "end", behavior: "auto" });
+  }
+  state.chat.concierge.pendingScroll = false;
+}
+
+// Top-bar search over what this page already holds: agents, waiting
+// approvals and recent evidence rows. No endpoint; a group whose read has not
+// loaded says so instead of reporting no match.
+const SEARCH_HITS_PER_GROUP = 6;
+function searchGroups(needle) {
+  const match = function (text) { return String(text || "").toLowerCase().indexOf(needle) >= 0; };
+  return [
+    {
+      label: "Agents",
+      loaded: sourceLoaded(HUB + "/agents"),
+      total: state.agents.length,
+      hits: state.agents.filter(function (a) { return match(a.agent_id) || match(a.harness); }).map(function (a) {
+        return '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) +
+          '<span class="sr-meta">' + escHtml(agentDisplayStatus(a).label || "") + '</span></a>';
+      })
+    },
+    {
+      label: "Waiting approvals",
+      loaded: sourceLoaded(HUB + "/inbox") && !state.inboxRedacted,
+      // Loaded but redacted: the server withheld the items, so a match can be
+      // neither shown nor ruled out until the operator token is pasted.
+      hidden: sourceLoaded(HUB + "/inbox") && !!state.inboxRedacted,
+      total: heldApprovalItems(null).length,
+      hits: heldApprovalItems(null).filter(function (i) {
+        return match(renderTemplate(i.display_template_id, i.display_template_args)) || match(i.agent_id);
+      }).map(function (i) {
+        return '<a href="#approvals">' + escHtml(renderTemplate(i.display_template_id, i.display_template_args)) +
+          '<span class="sr-meta">' + escHtml(i.tier || "") + '</span></a>';
+      })
+    },
+    {
+      label: "Recent evidence",
+      loaded: sourceLoaded(HUB + "/activity"),
+      total: state.activity.length,
+      hits: state.activity.filter(function (e) {
+        return match(renderTemplate(e.display_template_id, e.display_template_args)) || match(e.agent_id) || match(e.category);
+      }).map(function (e) {
+        return '<a href="#activity">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) +
+          '<span class="sr-meta">' + escHtml(shortTime(e.emitted_at)) + '</span></a>';
+      })
+    }
+  ];
+}
+function renderSearchResults() {
+  const panel = document.getElementById("search-results");
+  const input = document.getElementById("global-search");
+  if (!panel) return;
+  const needle = String(state.search.query || "").trim().toLowerCase();
+  const open = !!state.search.open && needle.length > 0;
+  panel.hidden = !open;
+  if (input && typeof input.setAttribute === "function") input.setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) return;
+  const groups = searchGroups(needle);
+  const scope = groups.map(function (g) {
+    return g.loaded ? g.total + " " + g.label.toLowerCase() : g.label.toLowerCase() + (g.hidden ? " hidden" : " not loaded");
+  }).join(", ");
+  let any = false;
+  // A "no match" line is a negative result, so it is earned only when at
+  // least one group actually loaded and none matched; with nothing loaded
+  // the honest answer is that nothing searchable has loaded yet.
+  const anyLoaded = groups.some(function (g) { return g.loaded; });
+  const body = groups.map(function (g) {
+    if (g.hidden) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: hidden until you paste the operator token, so a match cannot be ruled out.</div>';
+    if (!g.loaded) return '<div class="sr-group">' + escHtml(g.label) + '</div><div class="sr-empty">Unknown: not loaded yet, so a match cannot be ruled out.</div>';
+    if (!g.hits.length) return "";
+    any = true;
+    const shown = g.hits.slice(0, SEARCH_HITS_PER_GROUP);
+    return '<div class="sr-group">' + escHtml(g.label) + ' (' + shown.length + ' of ' + g.hits.length + ' matches)</div>' + shown.join("");
+  }).join("");
+  panel.innerHTML = '<div class="sr-scope">Searching what this page has loaded: ' + escHtml(scope) + '.</div>' +
+    body + (any ? "" : anyLoaded
+      ? '<div class="sr-empty" data-search-no-match="1">No match in what this page has loaded.</div>'
+      : '<div class="sr-empty" data-search-nothing-loaded="1">Nothing searchable has loaded yet, so no result is known.</div>');
+}
+
+// The queue body shared by the Approvals screen and the fortress column:
+// Unknown with a Retry until the queue read loads, the redacted notice when
+// approvals are hidden, the Allow once / Deny / Allow always tiles, or the
+// earned empty state.
+function renderApprovalQueueBody() {
+  const pending = pendingApprovalItems();
+  if (!sourceLoaded(HUB + "/inbox")) return renderSourceRead(HUB + "/inbox");
+  if (state.inboxRedacted) return '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>';
+  if (pending.length) return '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>';
+  // The green check is earned only by an empty fortress-wide queue. Scoped
+  // to one agent while other agents' holds wait, the empty state names them
+  // and carries no check.
+  const others = heldApprovalItems(null).length;
+  if (others > 0) {
+    return '<div class="queue-empty" data-scoped-empty="1">Nothing waiting for ' + escHtml(state.agentScope.selectedAgentId || "this agent") +
+      '. ' + others + ' of ' + others + ' held operations wait on other agents; choose All agents in the scope menu to see them.</div>';
+  }
+  return '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+}
+
+function renderApprovalsScreen() {
+  const w = approvalWaitingSummary();
+  const countLine = w.known
+    ? '<span class="count-age">' + escHtml(w.sentence) + '</span>'
+    : '<span class="count-age">Unknown until the approval queue loads</span>';
+  // The fortress column renders the same queue beside Talk's full page; on
+  // this screen it skips the queue body (renderFortress), so the queue's
+  // element ids exist once in the document.
+  return [
+    '<section class="concierge-wrap">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Approvals</p>',
+        '<h1>Held operations waiting on you.</h1>',
+        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+      '</div></div>',
+      '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
+      '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',
+    '</section>'
+  ].join("");
+}
+
+function renderEnforcementScreen() {
+  const home = state.posture.home;
+  const head =
+    '<div class="page-head"><div>' +
+      '<p class="eyebrow">Enforcement</p>' +
+      '<h1>What is enforced on this machine.</h1>' +
+      '<p class="sub">Castle Wall reads enforcing only on a fresh enforcement check. Outbound counts come from the kernel for the stated window.</p>' +
+    '</div></div>';
+  if (!sourceLoaded("/api/posture/home") || !home) {
+    const why = state.posture.homeError
+      ? 'Enforcement status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
+      : 'Enforcement status unavailable. Current data is Unknown.';
+    return '<section class="concierge-wrap">' + head +
+      '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
+      '</section>';
+  }
+  const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
+  const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
+  const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
+  const wallAgeHtml = wallAge
+    ? '<span class="pm-fresh" title="' + escHtml(wallEvidenceAt) + '">last enforcement evidence ' + escHtml(wallAge) + '</span>'
+    : '<span class="pm-fresh none">no enforcement evidence yet</span>';
+  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
+  const vaultNotice = vaultProvision === "not_yet_walled"
+    ? '<p class="muted">This vault is not on this machine\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    : "";
+  const layers = postureLayerLines().map(function (l) {
+    const dotCls = layerDotClass(l);
+    return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
+      '<span class="pp-k">' + escHtml(l.k) + '</span>' +
+      '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
+  }).join("");
+  const d = home.digest || {};
+  // A kernel count the digest does not carry is Unknown, never 0: the total
+  // and the "N of total" sentence need both counts observed.
+  const blocksKnown = typeof d.kernel_blocks === "number";
+  const allowsKnown = typeof d.kernel_allows === "number";
+  const unknownCount = '<strong class="unknown-value">Unknown</strong>';
+  let egress;
+  if (blocksKnown && allowsKnown) {
+    egress = '<div class="story-line"><strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(d.kernel_blocks + d.kernel_allows) + ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.</div>';
+  } else if (blocksKnown || allowsKnown) {
+    egress = '<div class="story-line">' +
+      (blocksKnown ? '<strong>' + escHtml(d.kernel_blocks) + '</strong>' : unknownCount) + ' outbound connections blocked at the kernel; ' +
+      (allowsKnown ? '<strong>' + escHtml(d.kernel_allows) + '</strong>' : unknownCount) + ' allowed. The total is Unknown until both counts are in the posture read.</div>';
+  } else {
+    egress = '<p class="muted">Outbound connection counts are not in this posture read. This is not a confirmation of zero connections.</p>';
+  }
+  return [
+    '<section class="concierge-wrap">',
+      head,
+      '<section class="card">',
+        '<div class="card-head-row"><h3>Castle Wall</h3><span class="' + wall.cls + '">' + escHtml(wall.text) + '</span></div>',
+        '<div class="evidence pm-foot">' + wallAgeHtml + '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>',
+        vaultNotice,
+        '<div class="enforcement-layers">' + layers + '</div>',
+        renderSourceRead("/api/sovereignty"),
+      '</section>',
+      '<section class="card">',
+        '<h3>Outbound connections (last 24h)</h3>',
+        egress,
+        postureStoryFoot(d),
+      '</section>',
+      '<section class="card">',
+        '<h3>Per-agent enforcement (' + (home.agents || []).length + ')</h3>',
+        renderPostureAgentRows(home),
+      '</section>',
+    '</section>'
+  ].join("");
+}
+
+function renderFindingsScreen() {
+  const findings = state.posture.anomalies || [];
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const age = sourceReadAge("/api/anomaly/findings");
+  const countLine = unknown
+    ? '<span class="count-age">Unknown: the detector has not answered</span>'
+    : '<span class="count-age">' + escHtml(findings.length) + ' open' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
+  return [
+    '<section class="concierge-wrap">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Findings</p>',
+        '<h1>What your Sentinels and traps found.</h1>',
+        '<p class="sub">Open anomaly findings from the Sentinels, and what the honeypot traps caught. A silent detector is shown as Unknown, never as a clean bill of health.</p>',
+      '</div></div>',
+      '<section class="card"><h3>Anomaly findings ' + countLine + '</h3>',
+        renderPostureAnomalies(findings, unknown), renderSourceRead("/api/anomaly/findings"),
+      '</section>',
+      renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()),
+    '</section>'
+  ].join("");
+}
+
+function renderIntegrationsScreen() {
+  return '<div class="screen-tabs"><p class="eyebrow">Integrations</p><nav aria-label="Integrations">' +
+    '<a href="#coordination" class="active" aria-current="page">Coordination</a></nav></div>' +
+    renderCoordinationPage();
 }
 
 // ── Hub API actions ────────────────────────────────────────────────────
@@ -3837,6 +4323,15 @@ function deriveSeal() {
 // Plain-English line for the named layer in the posture popover. Uses the
 // retired-L-number rule: named layers only, never "L1".."L4". Values are
 // honest: the wall line reflects the real arm-state, not config presence.
+// The dot beside a layer line. A line whose word is Unknown wears the unknown
+// dot (slate, hollow) whatever its other flags say: the pass dot is earned by
+// observed evidence, never by the absence of a warning. Shared by the seal
+// popover and the Enforcement screen so the two cannot disagree.
+function layerDotClass(l) {
+  if (l.unknown || /^unknown$/i.test(String(l.v).trim())) return "pp-dot unknown";
+  if (l.off) return "pp-dot off";
+  return l.warn ? "pp-dot warn" : "pp-dot";
+}
 function postureLayerLines() {
   const d = state.posture.data;
   const seal = deriveSeal();
@@ -3858,9 +4353,11 @@ function postureLayerLines() {
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Freshness window", v: seal.freshness.windowKnown ? "within " + seal.freshness.windowLabel : "unknown", warn: !seal.freshness.windowKnown },
     { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
-    { k: "Sentinels watching agents", v: wrapped === "Unknown" ? "Unknown" : wrapped + " wrapped", warn: wrapped === "Unknown", off: wrapped === 0 },
+    { k: "Sentinels watching agents", v: wrapped === "Unknown" ? "Unknown" : (wrapped === 1 ? "1 agent" : wrapped + " agents"), warn: wrapped === "Unknown", off: wrapped === 0 },
     { k: "Charter approvals", v: !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
-    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") }
+    // A Heralds layer that is configured but not active is not signing: it
+    // reads "configured" with the warn dot, never the pass dot.
+    { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 || d.layers.l4.status !== "active" }
   ];
 }
 
@@ -4336,6 +4833,7 @@ function rerender() {
   renderTopbar();
   renderMain();
   renderFortress();
+  renderShellChrome();
 }
 
 // ── Wire-up: events ────────────────────────────────────────────────────
@@ -4347,6 +4845,36 @@ function bindHashRoute() {
   window.addEventListener("hashchange", fromHash);
   fromHash();
 }
+
+// Slice 2 keyboard: Ctrl-K (Cmd-K on a Mac) focuses the top-bar search;
+// Escape closes, in order, the search results, an open top-bar popover, and
+// the Talk panel.
+document.addEventListener("keydown", function (ev) {
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && String(ev.key || "").toLowerCase() === "k") {
+    const input = document.getElementById("global-search");
+    if (input && typeof input.focus === "function") {
+      ev.preventDefault();
+      input.focus();
+      if (typeof input.select === "function") input.select();
+      if (state.search.query) { state.search.open = true; renderSearchResults(); }
+    }
+    return;
+  }
+  if (ev.key !== "Escape") return;
+  if (state.search.open) { state.search.open = false; renderSearchResults(); return; }
+  if (state.agentScope.switcherOpen || state.posture.sealOpen) {
+    state.agentScope.switcherOpen = false;
+    state.posture.sealOpen = false;
+    renderTopbar();
+    return;
+  }
+  if (state.talk.open) {
+    state.talk.open = false;
+    renderShellChrome();
+    const talkBtn = document.getElementById("btn-talk");
+    if (talkBtn && typeof talkBtn.focus === "function") talkBtn.focus();
+  }
+});
 
 document.addEventListener("visibilitychange", function () {
   if (document.visibilityState === "visible") rerender();
@@ -4376,6 +4904,15 @@ document.addEventListener("click", function (ev) {
       renderTopbar();
     }
   }
+  // Slice 2: the search results close on any click outside the search box,
+  // and on any click on a result. A result that links to the route already
+  // showing (an approval hit from #approvals, an evidence hit from
+  // #activity) assigns an unchanged hash, so no hashchange fires; the close
+  // here is explicit for that reason, not left to the route change.
+  if (state.search.open && (!rawTgt.closest("[data-search]") || rawTgt.closest("#search-results a"))) {
+    state.search.open = false;
+    renderSearchResults();
+  }
   if (!tgt) return;
   const action = tgt.getAttribute("data-action");
   if (action === "retry-panel") return void retryPanel(tgt.getAttribute("data-read"));
@@ -4389,6 +4926,21 @@ document.addEventListener("click", function (ev) {
   const intelLocalModel = tgt.getAttribute("data-intel-local-model");
   const intelFrontierProvider = tgt.getAttribute("data-intel-frontier-provider");
   if (action === "lockdown") return void onLockdownClick();
+  // Slice 2: Talk opens the concierge as a panel beside the current screen.
+  if (action === "talk-toggle") {
+    if (state.route === "dashboard") return;
+    state.talk.open = !state.talk.open;
+    return renderShellChrome();
+  }
+  if (action === "talk-close") {
+    state.talk.open = false;
+    renderShellChrome();
+    const talkBtn = document.getElementById("btn-talk");
+    if (talkBtn && typeof talkBtn.focus === "function") talkBtn.focus();
+    return;
+  }
+  // The full-page link keeps its href navigation; the panel closes with it.
+  if (action === "talk-open-full") { state.talk.open = false; return; }
   if (action === "theme-toggle") {
     const isDark = document.documentElement.getAttribute("data-theme") === "dark";
     const next = isDark ? "light" : "dark";
@@ -4433,12 +4985,14 @@ document.addEventListener("click", function (ev) {
     const id = tgt.getAttribute("data-agent-id") || "";
     state.agentScope.selectedAgentId = id || null;
     state.agentScope.switcherOpen = false;
-    // Scope the queue + ambient posture to the chosen agent; re-render the
-    // rail and the topbar. The conversation spine stays fortress-wide in
-    // wave 1 (the concierge reads fortress state); per-agent conversation
-    // scoping is a wave-2 follow-up.
-    renderTopbar();
-    renderFortress();
+    // Scope the queue + ambient posture to the chosen agent and repaint
+    // everything that shows them: since slice 2 the queue renders on the
+    // Approvals screen (main) and its scoped count on the rail pill and the
+    // bell (shell chrome), so repainting only the top bar and the fortress
+    // column left a stale, unscoped count. The conversation spine stays
+    // fortress-wide in wave 1 (the concierge reads fortress state);
+    // per-agent conversation scoping is a wave-2 follow-up.
+    rerender();
     return;
   }
   if (action === "posture-seal-toggle") {
@@ -4520,7 +5074,17 @@ document.addEventListener("click", function (ev) {
   if (action === "exit-export-start") return void onExitExportStart();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
-  if (action === "open-agent" && agentId) { state.selectedAgentId = agentId; location.hash = "agent-detail"; return; }
+  if (action === "open-agent" && agentId) {
+    state.selectedAgentId = agentId;
+    // Close the search results here: a hit opened from #agent-detail assigns
+    // the hash it already has, so no hashchange fires to close them or to
+    // render the newly selected agent; setRoute does both explicitly.
+    state.search.open = false;
+    renderSearchResults();
+    if (location.hash !== "#agent-detail") location.hash = "agent-detail";
+    else setRoute("agent-detail");
+    return;
+  }
   // Click-to-inspect from the fortress-column agent rows (PR #100
   // sidebar wire-up): navigate to the agent-detail view AND fire the
   // synchronous /inspect/open route so the panel renders already-loaded.
@@ -4655,6 +5219,11 @@ document.addEventListener("input", function (ev) {
     // Mirror composer text into state without rerender so keystrokes
     // do not clobber the input element's value or caret position.
     state.chat.concierge.composer = tgt.value;
+  } else if (action === "global-search") {
+    // Search results re-render alone, so typing never rewrites the input.
+    state.search.query = tgt.value;
+    state.search.open = true;
+    renderSearchResults();
   } else if (action === "inbox-filter-search") {
     state.inboxOps.filters.search = tgt.value;
     saveInboxPrefs();
@@ -4674,6 +5243,12 @@ document.addEventListener("change", function (ev) {
   const tgt = ev.target;
   if (!(tgt instanceof Element) || tgt.tagName !== "SELECT") return;
   const action = tgt.getAttribute("data-action");
+  if (action === "time-range") {
+    // A client-side window only: it narrows what is already loaded and is not
+    // saved with the inbox preferences.
+    state.timeRange = Object.prototype.hasOwnProperty.call(TIME_RANGE_LABEL, tgt.value) ? tgt.value : "all";
+    return rerender();
+  }
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
@@ -4687,12 +5262,12 @@ document.addEventListener("change", function (ev) {
 // then the dashboard view renders a static welcome card with no form
 // inputs that could be confused for a working command surface.
 
-// Theme: explicit operator preference (sessionStorage) overrides system
-// pref. The toggle button in the topbar dispatches data-action
-// "theme-toggle" which writes the chosen theme and updates the
-// [data-theme] attribute. When no explicit choice exists, fall back to
-// system preference and track changes so dark-mode-at-sunset behavior
-// keeps working on macOS / Windows.
+// Theme: the ratified console is DARK BY DEFAULT (2026-10-13). An explicit
+// operator choice (sessionStorage, written by the top-bar toggle) wins; with
+// no explicit choice the page is dark whatever the OS reports. Must match
+// THEME_BOOTSTRAP_SCRIPT in server/src/dashboard/design-tokens.ts, which
+// applies the same rule in the head before first paint: same key, and "no
+// explicit choice" resolves to dark in both.
 const THEME_KEY = "sanctuary-v11-theme";
 function applyTheme(theme) {
   if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
@@ -4700,17 +5275,13 @@ function applyTheme(theme) {
 }
 const explicitTheme = sessionStorage.getItem(THEME_KEY);
 const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-if (explicitTheme === "dark" || explicitTheme === "light") {
-  applyTheme(explicitTheme);
-} else if (mq && mq.matches) {
-  applyTheme("dark");
-}
-if (mq) mq.addEventListener("change", function (e) {
-  // Only honor system pref changes when the operator has not made an
-  // explicit choice. Once they toggle, the choice sticks for the
-  // session.
+applyTheme(explicitTheme === "light" ? "light" : "dark");
+if (mq) mq.addEventListener("change", function () {
+  // An OS appearance change applies only when the operator has made no
+  // explicit choice, and the no-choice state is dark: it no longer follows
+  // the OS to light.
   if (sessionStorage.getItem(THEME_KEY)) return;
-  applyTheme(e.matches ? "dark" : "light");
+  applyTheme("dark");
 });
 
 // Boot.

@@ -169,8 +169,8 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
   --locked-line: #cbb8f0;
   /* Border of a neutral chip, in the -line pattern after the --ink-3 text the
      neutral status draws from. Server-only name for the design's neutral
-     border value (see the header). No consumer draws it yet; it is declared
-     for the shell restyle, like the other -line borders. */
+     border value (see the header). Consumer: the v1.1 shell's scope switcher
+     hover border (the .scope:hover rule in dashboard/v1_1/html.ts). */
   --ink-line: #bcc2cf;
   /* The one accent: links, focus, selection, the primary button fill, the
      active rail marker. Never a status. */
@@ -264,10 +264,10 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      --color-status-unknown to reach for, so it never has to borrow the pass
      color for want of a token. Five members are wired to .pill classes in
      STATUS_PILL_CSS in principal-policy/posture-html-shared.ts (green, amber,
-     red, neutral, unknown). Locked is declared here for the shell restyle and
-     has no consumer yet: the v1.1 .pill.tone-locked, .posture-seal.tone-locked
-     and .ambient-seal.tone-locked rules all still paint the fault red until
-     that slice.
+     red, neutral, unknown). Locked is consumed by the v1.1 shell in
+     dashboard/v1_1/html.ts: the .pill.tone-locked, .posture-seal.tone-locked
+     and .ambient-seal.tone-locked .as-glyph rules paint the violet --locked
+     with its -bg and -line, never the fault red.
 
      Every alias resolves to a physical token declared above, never to a
      literal. var() substitution is computed per element, and the dark palette
@@ -362,32 +362,32 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
 }`;
 
 /**
- * Theme bootstrap for the STANDALONE web pages (posture Home / per-agent /
- * Evidence, and the Fleet Switcher) that do not embed the v1.1 client module.
+ * Theme bootstrap for the console's web pages: the STANDALONE pages (posture
+ * Home / per-agent / Evidence, and the Fleet Switcher) that do not embed the
+ * v1.1 client module, and the v1.1 shell's own head, so its first paint
+ * already wears the right theme.
  *
- * The paper/ink token block defaults to the light `:root` palette and applies
- * the dark palette under `[data-theme="dark"]`. The v1.1 dashboard sets
- * that attribute from its own client (an explicit toggle written to
- * `sessionStorage["sanctuary-v11-theme"]`, falling back to the OS preference).
- * These standalone pages have no client module, so without this bootstrap they
- * would render light-only and visibly diverge from a dark dashboard. This tiny
- * head script reuses the SAME storage key so an explicit dashboard choice
- * carries across (same origin), and otherwise follows the OS preference. It is
- * read-only and side-effect free beyond setting the attribute; it never writes
- * the key (only the dashboard's toggle does), so it cannot fight the toggle.
+ * The paper/ink token block declares the light palette on `:root` and the
+ * dark palette under `[data-theme="dark"]`. The ratified console is DARK BY
+ * DEFAULT (2026-10-13): with no explicit choice the page is dark, whatever the
+ * OS reports; an explicit "light" choice, written by the dashboard's theme
+ * toggle to `sessionStorage["sanctuary-v11-theme"]`, still wins. The same key
+ * is read here so a dashboard choice carries across pages (same origin). The
+ * prefers-color-scheme preference no longer selects light. Storage that
+ * throws is the same as no choice: dark.
  *
- * Interpolated verbatim into a `<script>` tag in each page's `<head>` so the
- * attribute is set before first paint (no flash of the wrong theme).
+ * Must match the theme fallback in `dashboard/v1_1/client.ts` (the
+ * `THEME_KEY` block near its end): both read the same key and both resolve
+ * "no explicit choice" to dark.
+ *
+ * Read-only and side-effect free beyond setting the attribute; it never
+ * writes the key (only the dashboard's toggle does), so it cannot fight the
+ * toggle. Interpolated verbatim into a `<script>` tag in each page's `<head>`
+ * so the attribute is set before first paint (no flash of the wrong theme).
  */
 export const THEME_BOOTSTRAP_SCRIPT = `(function () {
   try {
-    var choice = sessionStorage.getItem("sanctuary-v11-theme");
-    if (choice === "dark" || choice === "light") {
-      if (choice === "dark") document.documentElement.setAttribute("data-theme", "dark");
-      return;
-    }
-    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      document.documentElement.setAttribute("data-theme", "dark");
-    }
-  } catch (e) { /* storage blocked: fall through to light default */ }
+    if (sessionStorage.getItem("sanctuary-v11-theme") === "light") return;
+  } catch (e) { /* storage blocked: no explicit choice, so the dark default */ }
+  document.documentElement.setAttribute("data-theme", "dark");
 })();`;
