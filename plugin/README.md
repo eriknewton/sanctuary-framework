@@ -8,12 +8,12 @@ Gives your agent encrypted state storage, self-custodied cryptographic identity,
 
 ## Install, verify, uninstall
 
-This plugin's `.mcp.json` starts the Sanctuary MCP server with a bare `npx -y @sanctuary-framework/mcp-server` entry. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
+This plugin's `.mcp.json` starts the Sanctuary MCP server with `npx -y @sanctuary-framework/mcp-server@1.8.4`, pinned to the exact stable release the plugin was shipped with; the commands below use the same version. That is a stdio server running in parallel with your other MCP servers: it gives you the Sanctuary tools, and it does not place calls to those other servers behind Sanctuary's cooperative policy gate. For the gated shape, run `protect` once. The MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping).
 
 ```bash
-npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
-npx -y @sanctuary-framework/mcp-server doctor --json
-npx -y @sanctuary-framework/mcp-server uninstall
+npx -y @sanctuary-framework/mcp-server@1.8.4 protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.8.4 doctor --json
+npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
 ```
 
 `-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
@@ -38,7 +38,7 @@ Tier 1 marks operations the shipped default Principal Policy (`DEFAULT_POLICY`, 
 If you're running OpenClaw, wrap it rather than adding a parallel entry:
 
 ```bash
-npx -y @sanctuary-framework/mcp-server protect --openclaw --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.8.4 protect --openclaw --no-open --no-dashboard
 ```
 
 Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your existing OpenClaw setup:

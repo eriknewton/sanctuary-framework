@@ -19,14 +19,14 @@ Sanctuary gives your agent protection it can prove: encrypted state, self-custod
 ## Install, verify, uninstall
 
 ```bash
-npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
-npx -y @sanctuary-framework/mcp-server doctor --json
-npx -y @sanctuary-framework/mcp-server uninstall
+npx -y @sanctuary-framework/mcp-server@1.8.4 protect --claude-code --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.8.4 doctor --json
+npx -y @sanctuary-framework/mcp-server@1.8.4 uninstall
 ```
 
 `-y` skips npm's install prompt; without it npx asks before fetching the package in a terminal. `--no-dashboard` skips the per-call dashboard, which otherwise serves in the foreground until you stop it; wrap still persists the agent record so a separately-running `sanctuary dashboard` (or a later wrap) sees the harness; start it later with `sanctuary dashboard`. `--no-open` runs headless: it skips opening the dashboard in a browser and switches custody confirmation to the non-interactive mode `protect` already uses whenever stdin is not a terminal.
 
-Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A bare `npx -y @sanctuary-framework/mcp-server` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
+Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for the harness you run. With `protect`, the MCP server entries in the config are rewritten to point at Sanctuary. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (Assurance Matrix, Agent wrapping). A plain `npx -y @sanctuary-framework/mcp-server@1.8.4` entry beside other MCP servers starts the server but does not gate calls to those servers. `doctor --json` is read-only. `uninstall` keeps keys, state, and the audit log; `protect --unwrap` restores the original harness configuration. The passphrase stays in the platform credential store: never put a passphrase or recovery key in a harness configuration, never read staged recovery material, and never ask the operator to paste it into chat.
 
 ## Quick Start
 
@@ -55,7 +55,7 @@ If you're running OpenClaw, Sanctuary adds protections that OpenClaw doesn't pro
 **One-command setup:**
 
 ```bash
-npx -y @sanctuary-framework/mcp-server protect --openclaw --no-open --no-dashboard
+npx -y @sanctuary-framework/mcp-server@1.8.4 protect --openclaw --no-open --no-dashboard
 ```
 
 Then run `sanctuary/sovereignty_audit` to see your protection posture with OpenClaw-specific gap analysis.
@@ -207,4 +207,4 @@ Beneath the cooperative surface, on a patched macOS host the Castle Wall enforce
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
-111 registered MCP tools (measured 2026-10-13). Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. The current prerelease is v1.9.0-rc.1 on the npm `next` tag; the current published stable version is v1.8.4 on npm as `@sanctuary-framework/mcp-server`.
+111 registered MCP tools (measured 2026-10-13). Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. The current prerelease is v1.9.0-rc.1 on the npm `next` tag; the current published stable version on npm is `@sanctuary-framework/mcp-server@1.8.4`.
