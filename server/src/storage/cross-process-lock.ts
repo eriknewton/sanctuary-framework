@@ -181,6 +181,7 @@ export type CrossProcessLockErrorKind =
   | "capability"
   | "contention"
   | "holder-lost"
+  | "operation_aborted"
   | "poisoned"
   | "io";
 
@@ -253,6 +254,8 @@ export interface CrossProcessLockOptions {
   timeoutMs?: number;
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
   retryMs?: number;
+  /** Optional caller-owned cancellation for the bounded wait before acquisition. */
+  abortSignal?: AbortSignal;
   /**
    * HIGH-B (Codex gate, 2026-08-22): merged into the lockfile's own JSON
    * alongside `pid`/`acquired_at`, purely for a human reading the file
@@ -540,14 +543,14 @@ export async function withRequiredCrossProcessLock<T>(
   options: CrossProcessLockOptions = {},
 ): Promise<T> {
   const explicit = asNamespaceLockCapabilities(storage);
-  if (!explicit) {
-    throw new CrossProcessLockError(
-      "storage backend does not expose the required namespace-lock capability; " +
-        "use a backend or decorator that explicitly implements withNamespaceLock",
-      "capability",
-    );
+  if (explicit) {
+    return explicit.withNamespaceLock(namespace, lockFileName, operation, options);
   }
-  return explicit.withNamespaceLock(namespace, lockFileName, operation, options);
+  throw new CrossProcessLockError(
+    "storage backend does not expose the required namespace-lock capability; " +
+      "use a backend or decorator that explicitly implements withNamespaceLock",
+    "capability",
+  );
 }
 
 /**
@@ -600,8 +603,16 @@ export async function withPathLock<T>(
   let contentions = 0;
 
   for (;;) {
+    assertLockWaitNotAborted(options.abortSignal, lockPath);
     try {
       const handle = await open(lockPath, "wx", 0o600);
+      if (options.abortSignal?.aborted === true) {
+        // The lockfile has become visible, so an abort after O_EXCL acquire must
+        // remove it before refusing or every later bridge writer would see a
+        // stale holder created by this process.
+        await closeAndRemoveAbortedPathLock(handle, lockPath);
+        assertLockWaitNotAborted(options.abortSignal, lockPath);
+      }
       // MEDIUM (Codex gate, 2026-08-22 / 2026-08-23): the O_EXCL create
       // SUCCEEDED at this point, so this process (uniquely) owns the lock
       // file - a failure writing/syncing its metadata, OR a failure in
@@ -683,6 +694,7 @@ export async function withPathLock<T>(
       // hint. A genuinely-dead holder is cleared by a one-time operator `rm`.
       contentions += 1;
       options.onContended?.(contentions);
+      assertLockWaitNotAborted(options.abortSignal, lockPath);
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `cross-process lock ${lockPath} held >${timeoutMs}ms; refusing to proceed ` +
@@ -692,7 +704,7 @@ export async function withPathLock<T>(
             `crashed while holding it; clear it with: rm '${lockPath}'`,
         );
       }
-      await sleep(retryMs);
+      await sleepLockRetry(retryMs, options.abortSignal, lockPath);
     }
   }
 
@@ -701,6 +713,68 @@ export async function withPathLock<T>(
   } finally {
     await rm(lockPath, { force: true });
   }
+}
+
+function assertLockWaitNotAborted(signal: AbortSignal | undefined, lockPath: string): void {
+  if (signal?.aborted !== true) return;
+  throw new CrossProcessLockError(
+    `cross-process lock wait aborted before acquiring ${lockPath}`,
+    "operation_aborted",
+  );
+}
+
+async function closeAndRemoveAbortedPathLock(
+  handle: Awaited<ReturnType<typeof open>>,
+  lockPath: string,
+): Promise<void> {
+  let closeErr: unknown;
+  try {
+    await handle.close();
+  } catch (err) {
+    closeErr = err;
+  }
+  let unlinkErr: unknown;
+  try {
+    await rm(lockPath, { force: true });
+  } catch (err) {
+    unlinkErr = err;
+  }
+  if (closeErr !== undefined || unlinkErr !== undefined) {
+    throw new CrossProcessLockError(
+      `cross-process lock wait aborted after acquiring ${lockPath}, but cleanup failed ` +
+        `(close: ${closeErr === undefined ? "ok" : errorMessage(closeErr)}; ` +
+        `remove: ${unlinkErr === undefined ? "ok" : errorMessage(unlinkErr)})`,
+      "operation_aborted",
+    );
+  }
+}
+
+async function sleepLockRetry(
+  ms: number,
+  signal: AbortSignal | undefined,
+  lockPath: string,
+): Promise<void> {
+  if (signal === undefined) {
+    await sleep(ms);
+    return;
+  }
+  assertLockWaitNotAborted(signal, lockPath);
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timer = setTimeout(resolve, ms);
+      abort = () => reject(new CrossProcessLockError(
+        `cross-process lock wait aborted before acquiring ${lockPath}`,
+        "operation_aborted",
+      ));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (abort !== undefined) signal.removeEventListener("abort", abort);
+  }
+  assertLockWaitNotAborted(signal, lockPath);
 }
 
 interface KernelDirectoryIdentity {

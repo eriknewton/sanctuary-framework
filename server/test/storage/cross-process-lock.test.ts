@@ -38,6 +38,7 @@ import {
   acquireMasterWriteBarrier,
   withCrossProcessLock,
   withPathLock,
+  withRequiredCrossProcessLock,
   CrossProcessLockError,
   resetKernelLockPoisonForTests,
   __testSweepUnusedBarrierScaffolds,
@@ -850,6 +851,48 @@ describe("withCrossProcessLock", () => {
     await holder;
   });
 
+  it("aborts a contended wait before the operation can write", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const holder = track(
+      withCrossProcessLock(storage, NS, LOCK, async () => {
+        await held;
+      }),
+      release,
+    );
+    await sleep(20);
+
+    const controller = new AbortController();
+    let ran = false;
+    const contender = track(
+      withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => {
+          ran = true;
+          await storage.write(NS, "must-not-land", new Uint8Array([1]));
+        },
+        {
+          timeoutMs: 500,
+          retryMs: 10,
+          abortSignal: controller.signal,
+        },
+      ),
+    );
+    controller.abort();
+
+    await expect(contender).rejects.toMatchObject({
+      kind: "operation_aborted",
+      message: expect.stringContaining("wait aborted"),
+    });
+    expect(ran).toBe(false);
+    await expect(storage.read(NS, "must-not-land")).resolves.toBeNull();
+
+    release();
+    await holder;
+  });
+
   it("FIX 4: does NOT auto-break a stale lock (no read-then-unlink TOCTOU); fails CLOSED with a manual-rm hint", async () => {
     // Write a lockfile whose holder PID cannot exist (a never-allocated high PID),
     // simulating a crashed process that never released its lock. The OLD code
@@ -919,6 +962,81 @@ describe("withCrossProcessLock", () => {
       ran = true;
     });
     expect(ran).toBe(true);
+  });
+
+  it("required namespace locks refuse a filesystem-only decorator", async () => {
+    const memory = new MemoryStorage();
+    const decorator = {
+      read: (namespace: string, key: string) => memory.read(namespace, key),
+      write: (namespace: string, key: string, data: Uint8Array) =>
+        memory.write(namespace, key, data),
+      delete: (namespace: string, key: string, secureOverwrite?: boolean) =>
+        memory.delete(namespace, key, secureOverwrite),
+      list: (namespace: string, prefix?: string) => memory.list(namespace, prefix),
+      exists: (namespace: string, key: string) => memory.exists(namespace, key),
+      totalSize: () => memory.totalSize(),
+      namespacePath: (namespace: string) => join(base, namespace),
+      writeDurable: (namespace: string, key: string, data: Uint8Array) =>
+        memory.write(namespace, key, data),
+    };
+    let ran = false;
+    await expect(withRequiredCrossProcessLock(
+      decorator,
+      NS,
+      LOCK,
+      async () => { ran = true; },
+    )).rejects.toMatchObject({ kind: "capability" });
+    expect(ran).toBe(false);
+  });
+
+  it("abort after path-lock acquisition refuses and removes this process lockfile", async () => {
+    const dir = join(base, "abort-after-open");
+    const lockPath = join(dir, LOCK);
+    let abortedReads = 0;
+    const signal = {
+      get aborted(): boolean {
+        abortedReads += 1;
+        return abortedReads >= 2;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    } as unknown as AbortSignal;
+    let ran = false;
+    await expect(withPathLock(
+      dir,
+      LOCK,
+      async () => { ran = true; },
+      { abortSignal: signal },
+    )).rejects.toMatchObject({ kind: "operation_aborted" });
+    expect(ran).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("abort during path-lock retry sleep refuses promptly without running", async () => {
+    const dir = join(base, "abort-during-sleep");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const lockPath = join(dir, LOCK);
+    await writeFile(lockPath, "held");
+    const controller = new AbortController();
+    let ran = false;
+    const pending = withPathLock(
+      dir,
+      LOCK,
+      async () => { ran = true; },
+      { abortSignal: controller.signal, retryMs: 500, timeoutMs: 2_000 },
+    ).then(
+      () => "resolved" as const,
+      (error) => error,
+    );
+    setTimeout(() => controller.abort(), 10);
+    const result = await Promise.race([
+      pending,
+      new Promise<"TIMEOUT">((resolve) => setTimeout(() => resolve("TIMEOUT"), 100)),
+    ]);
+    expect(result).not.toBe("TIMEOUT");
+    expect(result).toMatchObject({ kind: "operation_aborted" });
+    expect(ran).toBe(false);
+    await rm(lockPath, { force: true });
   });
 
   it("fails an unsupported kernel-lock host before creating its target layout", async () => {
