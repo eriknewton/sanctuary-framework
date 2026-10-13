@@ -35,10 +35,17 @@ BINARIES = {
 }
 CLI_SOURCE_BIN = "sanctuary-linux-arch"
 MOUNT_NAME = r"var-lib-sanctuary\x2dagent\x2dworkspace.mount"
+# The repo copy of the mount unit has a portable file name (no backslash) so the
+# repository checks out on every OS; it installs under the systemd-escaped name,
+# which systemd requires to match the mount path. Must match MOUNT_SOURCE in
+# packaging/ubuntu/install-layout.py and the three castle-wall-daemon tests that
+# read the unit by source path (agent_unit.rs, integration_linux_runtime_activation.rs,
+# linux_agent_launch_manager.rs).
+MOUNT_SOURCE = "systemd/var-lib-sanctuary-agent-workspace.mount.source"
 SOURCES = {
     "etc/systemd/system/sanctuary-castle-wall.service": "systemd/sanctuary-castle-wall.service",
     "etc/systemd/system/sanctuary-agent@.service": "systemd/sanctuary-agent@.service",
-    "etc/systemd/system/" + MOUNT_NAME: "systemd/" + MOUNT_NAME,
+    "etc/systemd/system/" + MOUNT_NAME: MOUNT_SOURCE,
     SHARE + "/schemas/contract.rs": "src/linux_install/contract.rs",
     SHARE + "/operator-guide.md": "packaging/ubuntu/README.md",
 }
