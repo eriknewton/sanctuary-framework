@@ -5,8 +5,9 @@
  * ESM. Pattern matches the v1.0 dashboard at `dashboard/html.ts` and the
  * principal-policy console.
  *
- * The shell renders the static skeleton: sidebar nav, top bar, three-pane
- * grid layout, FortressColumn slots, and the SSE wire-up bootstrap. The
+ * The shell renders the static skeleton: the top bar, the rail, the main
+ * column (plus the fortress column beside Talk's full page), the Talk panel,
+ * and the SSE wire-up bootstrap. The
  * client.ts module fills the dynamic regions from the hub API.
  *
  * Naming-discipline rule: no competitor names anywhere here.
@@ -19,7 +20,7 @@
 
 import { getClientScript } from "./client.js";
 import { SANCTUARY_VERSION } from "../../config.js";
-import { PAPER_INK_ROOT_TOKENS_CSS } from "../design-tokens.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../design-tokens.js";
 import { CONSOLE_FONT_FACE_CSS } from "../design-fonts.js";
 
 export interface DashboardV11HtmlOptions {
@@ -57,55 +58,193 @@ body {
   color: var(--ink);
   line-height: 1.45;
 }
+/* Slice 2 shell (2026-10-13): a full-width top bar over a left rail and the
+   main column, as on the ratified Overview canvas. 232px is the canvas rail
+   width; 56px the canvas top-bar height; 360px the fortress column, which
+   shows only beside Talk's full-page route (every other route is route-full). */
 .app {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 220px 1fr 360px;
-  grid-template-rows: 48px 1fr;
+  grid-template-columns: 232px 1fr 360px;
+  grid-template-rows: 56px 1fr;
   grid-template-areas:
-    "sidebar topbar topbar"
+    "topbar topbar topbar"
     "sidebar main fortress";
 }
 .app.route-full {
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 232px 1fr;
   grid-template-areas:
-    "sidebar topbar"
+    "topbar topbar"
     "sidebar main";
 }
-.sidebar { grid-area: sidebar; background: var(--paper-2); border-right: 1px solid var(--rule); padding: 12px 8px; display: flex; flex-direction: column; }
-.sidebar h1 { font-family: var(--serif); font-size: var(--text-lg); margin: 4px 8px 16px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+/* The rail (RailItem preview). It stays in view while the main column
+   scrolls: sticky under the 56px top bar, its own scroll when it outgrows
+   the viewport. Chrome recedes: surface and rule only; color is spent on
+   state (the waiting pill) and on the one accent (the active marker). */
+.sidebar {
+  grid-area: sidebar; background: var(--surface); border-right: 1px solid var(--rule);
+  padding: var(--space-3) var(--space-2); display: flex; flex-direction: column;
+  position: sticky; top: 56px; height: calc(100vh - 56px); overflow-y: auto;
+}
 .sidebar nav { display: flex; flex-direction: column; gap: 2px; }
-/* S2: version / deployment / attestation demoted from the top bar to the
-   sidebar footer, stacked and muted so the top bar carries one state pill. */
+/* S2: version / deployment / mode / attestation sit in the rail footer,
+   stacked and muted, so the top bar carries one state element (the seal). */
 .nav-footer { margin-top: auto; padding: 12px 6px 2px; border-top: 1px solid var(--rule); }
 .nav-footer .pills { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
 .nav-footer .pills .pill { font-size: 10px; padding: 1px 7px; }
+/* 7px: the design's control radius (radius-control), one step between the
+   6px --rad and the 8px top-bar control radius; no server token carries it. */
 .sidebar nav a {
   display: flex; align-items: center; gap: var(--space-2);
-  padding: 6px 10px; border-radius: var(--rad);
-  color: var(--ink-2); text-decoration: none; font-size: var(--text-base);
+  height: 34px; padding: 0 var(--space-2); border-radius: 7px;
+  color: var(--ink-2); text-decoration: none; font-size: var(--text-base); font-weight: 500;
 }
-.sidebar nav a svg {
-  flex-shrink: 0; width: 16px; height: 16px;
-  color: var(--ink-3);
+.sidebar nav a svg { flex: none; width: 16px; height: 16px; }
+.sidebar nav a .rail-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar nav a:hover { background: var(--surface-2); color: var(--ink); }
+.sidebar nav a.active { background: var(--accent-tint-strong); color: var(--ink); box-shadow: inset 2px 0 0 var(--accent); }
+.sidebar nav a:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+/* A rail count is an inventory size with its denominator; the rail is too
+   narrow for the age, so the link's title and accessible name carry the
+   whole sentence. The waiting pill (hot) is the only colored count: 18px is
+   the design's chip height (22px) less one 4px space step. */
+.sidebar nav a .count { margin-left: auto; flex: none; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.sidebar nav a .count.hot {
+  color: var(--paper); background: var(--ochre); height: 18px; padding: 0 6px;
+  border-radius: 999px; font-weight: 600; display: inline-flex; align-items: center; line-height: 1;
 }
-.sidebar nav a:hover { background: var(--paper-3); }
-.sidebar nav a:hover svg { color: var(--ink-2); }
-.sidebar nav a.active { background: var(--surface); color: var(--ink); border: 1px solid var(--rule); }
-.sidebar nav a.active svg { color: var(--ink); }
-.topbar { grid-area: topbar; display: flex; align-items: center; gap: var(--space-3); padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--surface); }
-/* S2: machine identity. Human alias leads (serif); the raw id is demoted to a
-   short mono chip that copies the full id on click. */
-.topbar .machine { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.topbar .machine-name { font-family: var(--serif); font-size: var(--text-md); font-weight: 600; white-space: nowrap; }
-.topbar .idchip {
-  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
-  border: 1px solid var(--rule); border-radius: 4px; padding: 1px 6px;
-  background: var(--surface-2); cursor: pointer; max-width: 220px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+/* Unknown is its own full-weight gray with the dashed unknown border, never
+   hidden and never read as zero. */
+.sidebar nav a .count.unknown {
+  color: var(--slate); background: var(--slate-bg); border: 1px dashed var(--slate-line);
+  height: 18px; padding: 0 6px; border-radius: 999px; display: inline-flex; align-items: center; line-height: 1;
 }
-.topbar .idchip:hover { border-color: var(--rule-2); color: var(--ink-2); }
-.topbar-spacer { flex: 1; }
+.nav-group-label {
+  font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-2);
+  padding: var(--space-3) var(--space-2) var(--space-1);
+}
+/* The top bar (TopBar preview). Sticky so the seal, the waiting count and
+   Lock down stay in reach while the main column scrolls. */
+.topbar {
+  grid-area: topbar; position: sticky; top: 0; z-index: 40;
+  display: flex; align-items: center; gap: var(--space-3); min-width: 0;
+  padding: 0 var(--space-4); border-bottom: 1px solid var(--rule); background: var(--surface);
+}
+/* The search is the bar's elastic slot: it gives way down to a floor that fits its
+   placeholder beside the key hint, so the fixed controls never clip. */
+.brand {
+  display: flex; align-items: center; gap: var(--space-2); flex: none; min-width: 24px;
+  font-family: var(--display); font-weight: 700; font-size: 15px; letter-spacing: 0.01em;
+  white-space: nowrap; overflow: hidden; color: var(--ink);
+}
+/* The one permitted gradient: the product mark, accent to --mark-teal. */
+.brand .mark { width: 24px; height: 24px; flex: none; border-radius: var(--rad); background: linear-gradient(135deg, var(--accent), var(--mark-teal)); display: inline-block; }
+/* 8px: the design's top-bar control radius (radius-lg); the server block
+   carries 6px (--rad) and 10px (--rad-lg) only, so it is written here. */
+/* Shrinks at a fifth of the search's rate: the search gives way to its floor
+   first, so the scope keeps its machine and agent names readable. */
+.scope-switcher { position: relative; flex: 0 0.2 auto; min-width: 0; display: flex; }
+.scope {
+  display: flex; align-items: center; gap: var(--space-2); height: 34px; max-width: min(360px, 100%); min-width: 0;
+  padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--rule-2); border-radius: 8px;
+  background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.scope:hover { border-color: var(--ink-line); }
+.scope svg { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
+.scope svg:last-child { width: 14px; height: 14px; }
+.scope .machine-name { flex: none; }
+.scope .id { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; min-width: 0; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+.scope .scope-sep { width: 1px; height: 16px; background: var(--rule-2); flex: none; }
+/* 44px: room for two letters and the ellipsis, so the agent scope never vanishes. */
+.scope .sw-agent { font-weight: 500; color: var(--ink-2); min-width: 44px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.search-wrap { position: relative; flex: 1 1 200px; min-width: 136px; }
+.search {
+  display: flex; align-items: center; gap: var(--space-2); height: 34px; padding: 0 var(--space-3);
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); color: var(--ink-3);
+}
+.search svg { flex: none; width: 16px; height: 16px; }
+.search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); font: inherit; outline: none; }
+.search input::placeholder { color: var(--ink-3); }
+.search input::-webkit-search-cancel-button { display: none; }
+/* 4px: the design's small radius (radius-sm), --rad less one 2px step. */
+.search kbd { flex: none; font-family: var(--mono); font-size: var(--text-xs); padding: 2px 6px; border: 1px solid var(--rule-2); border-radius: calc(var(--rad) - 2px); color: var(--ink-3); }
+.search-results {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; min-width: 320px; max-height: 420px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
+  padding: var(--space-2); z-index: 50;
+}
+.search-results[hidden] { display: none; }
+.search-results .sr-scope { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); padding: 2px 6px 6px; }
+.search-results .sr-group { font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); padding: var(--space-2) 6px 2px; }
+.search-results a { display: flex; gap: var(--space-2); align-items: baseline; padding: 6px; border-radius: var(--rad); color: var(--ink); text-decoration: none; font-size: var(--text-cell); }
+.search-results a:hover, .search-results a:focus-visible { background: var(--surface-2); }
+.search-results a:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.search-results a .sr-meta { margin-left: auto; flex: none; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.search-results .sr-empty { padding: 6px; color: var(--ink-3); font-size: var(--text-cell); }
+.range {
+  height: 32px; padding: 0 var(--space-2); border: 1px solid var(--rule-2); border-radius: 7px;
+  background: transparent; color: var(--ink); font: inherit; font-weight: 600; font-size: var(--text-sm); cursor: pointer; flex: none;
+}
+.range:disabled { color: var(--ink-3); cursor: not-allowed; border-style: dashed; }
+.range option { background: var(--surface); color: var(--ink); }
+.topbar .btn { height: 32px; padding: 0 var(--space-3); border-radius: 7px; border-color: var(--rule-2); background: transparent; font-weight: 600; flex: none; white-space: nowrap; }
+.topbar .btn svg { width: 16px; height: 16px; flex: none; }
+.topbar .btn.btn-talk.active { background: var(--accent-tint-strong); box-shadow: inset 0 -2px 0 var(--accent); }
+.iconbtn {
+  width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--surface-2); color: var(--ink-2);
+  cursor: pointer; position: relative; flex: none; font: inherit;
+}
+.iconbtn:hover { color: var(--ink); border-color: var(--rule-2); }
+.iconbtn svg { width: 16px; height: 16px; flex: none; }
+.iconbtn.waiting { width: auto; padding: 0 var(--space-2); }
+/* The waiting badge: the same 18px warn pill as the rail's, with a triangle
+   glyph so the count reads as "waits on you" in monochrome too. */
+.iconbtn .wait {
+  height: 18px; padding: 0 6px; border-radius: 999px; background: var(--ochre); color: var(--paper);
+  font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; display: inline-flex; align-items: center; gap: 4px; line-height: 1; white-space: nowrap;
+}
+.iconbtn .wait[hidden] { display: none; }
+.iconbtn .wait i { width: 8px; height: 8px; background: var(--paper); clip-path: polygon(50% 0, 100% 100%, 0 100%); display: inline-block; }
+.iconbtn .wait.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate-line); font-weight: 500; }
+.iconbtn .wait.unknown i { background: transparent; clip-path: none; border: 1.5px dotted var(--slate); border-radius: 50%; }
+.avatar {
+  width: 30px; height: 30px; border-radius: 50%; flex: none; background: var(--surface-2); border: 1px solid var(--rule-2);
+  display: inline-flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2);
+}
+/* Keyboard focus: 2px solid accent ring, 2px offset, on every control the
+   top bar carries. */
+.topbar :is(button, select, a):focus-visible, .search:focus-within, .talk-panel :is(button, a):focus-visible, .screen-tabs a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.search input:focus-visible { outline: none; }
+/* Talk: the concierge mounted as a right-hand panel under the top bar, so it
+   opens beside whatever screen is showing instead of replacing it. */
+.talk-panel {
+  position: fixed; top: 56px; right: 0; bottom: 0; width: min(460px, 100vw); z-index: 45;
+  background: var(--paper); border-left: 1px solid var(--rule); display: flex; flex-direction: column;
+}
+.talk-panel[hidden] { display: none; }
+.talk-panel-head { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--rule); background: var(--surface); }
+.talk-panel-head strong { font-family: var(--display); font-size: var(--text-md); }
+.talk-panel-head a { margin-left: auto; font-size: var(--text-sm); color: var(--accent); }
+.talk-panel-body { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-3) var(--space-4); }
+.talk-panel-body .concierge-wrap { max-width: none; }
+/* Folded destinations: a screen that hosts an older route as a tab or a
+   section names it here, and every tab is a plain hash link so the older
+   route ids keep rendering when navigated directly. */
+.screen-tabs { margin: 0 0 var(--space-4); }
+.screen-tabs .eyebrow { margin: 0 0 var(--space-2); font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.screen-tabs nav { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+.screen-tabs nav a { padding: var(--space-2) var(--space-3); color: var(--ink-2); text-decoration: none; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: var(--rad) var(--rad) 0 0; }
+.screen-tabs nav a:hover { color: var(--ink); background: var(--surface-2); }
+.screen-tabs nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+.folded-section { margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--rule); }
+.folded-section > .folded-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); }
+.folded-section > .folded-head a { font-size: var(--text-sm); color: var(--accent); }
+.export-group .toolbar { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.export-group .toolbar a.btn { text-decoration: none; }
+.count-age { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; }
 .pill {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 8px; border-radius: 12px; font-size: var(--text-xs);
@@ -114,7 +253,10 @@ body {
 }
 .pill.tone-verified { background: var(--sage-bg); color: var(--sage); border-color: var(--sage); }
 .pill.tone-degraded { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
-.pill.tone-unverified, .pill.tone-locked { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
+.pill.tone-unverified { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
+/* Locked down or paused is its own status, the violet --locked hue, never
+   the fault red: an operator lock is a decision, not a failure. */
+.pill.tone-locked { background: var(--locked-bg); color: var(--locked); border-color: var(--locked-line); }
 .pill.tone-info { background: var(--indigo-bg); color: var(--indigo); border-color: var(--indigo); }
 .btn {
   display: inline-flex; align-items: center; gap: 4px;
@@ -128,10 +270,10 @@ body {
 .btn.btn-primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .btn.btn-primary:hover:not(:disabled) { background: var(--ink-2); }
 .btn.btn-danger { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
-/* S2: Lockdown is quiet (outlined) until it is actually engaged. The
-   tier1-engaged state below fills it loud when lockdown is ON. */
-.btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust); }
-.btn.btn-lockdown:hover:not(:disabled) { background: var(--rust-bg); }
+/* Lock down is the one danger-styled control: bad text and the bad-line
+   border, never a red fill (the TopBar preview's one destructive style). */
+.btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust-line); }
+.btn.btn-lockdown:hover:not(:disabled) { background: var(--rust-bg); border-color: var(--rust); }
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-partial { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
@@ -141,9 +283,10 @@ body {
   color: var(--ink-2);
 }
 .btn.btn-icon svg { width: 16px; height: 16px; }
-.btn.btn-icon .icon-sun { display: none; }
-[data-theme="dark"] .btn.btn-icon .icon-moon { display: none; }
-[data-theme="dark"] .btn.btn-icon .icon-sun { display: inline; }
+.btn-icon .icon-sun { display: none; }
+[data-theme="dark"] .btn-icon .icon-moon { display: none; }
+[data-theme="dark"] .btn-icon .icon-sun { display: inline; }
+.btn-icon .icon-moon, .btn-icon .icon-sun { line-height: 0; }
 .main { grid-area: main; overflow-y: auto; padding: 16px 24px; }
 .fortress { grid-area: fortress; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-2); padding: var(--space-3); display: flex; flex-direction: column; gap: 10px; }
 .app.route-full .fortress { display: none; }
@@ -1184,12 +1327,10 @@ body {
 }
 
 @media (max-width: 1100px) {
-  .app, .app.route-full { grid-template-columns: 56px 1fr; grid-template-areas: "sidebar topbar" "sidebar main"; }
+  /* 200px keeps every rail label whole at 1024px; the fortress column
+     yields first. */
+  .app, .app.route-full { grid-template-columns: 200px 1fr; grid-template-areas: "topbar topbar" "sidebar main"; }
   .fortress { display: none; }
-  .sidebar h1, .sidebar nav a span { display: none; }
-  .sidebar nav a { justify-content: center; padding: 8px 6px; }
-  .nav-footer, .nav-group-label { display: none; }
-  .topbar .idchip { display: none; }
   .template-grid { grid-template-columns: 1fr; }
   /* center h1s keep --text-display (26px); a 30px override here would grow them. */
   .intel-row { grid-template-columns: 1fr; }
@@ -1199,6 +1340,34 @@ body {
   .agents-list-head, .agents-list .agent-row { grid-template-columns: minmax(0, 1fr) 90px 90px; }
   .agents-list-head span:nth-child(4), .agents-list .agent-row > .agent-last { display: none; }
   .inspect-pane { position: static; max-height: none; }
+}
+/* The top bar sheds its quiet parts before any control or any evidence age
+   clips: the gaps tighten, then the key hint, the brand word and the Talk
+   label go (each control keeps its accessible name), and the scope's id and
+   agent narrow with an ellipsis whose full text stays in the title. */
+@media (max-width: 1360px) {
+  .topbar { gap: var(--space-2); padding: 0 var(--space-3); }
+  .search kbd { display: none; }
+  .scope .id { display: none; }
+  .scope .sw-agent { max-width: 120px; }
+}
+@media (max-width: 1180px) {
+  .brand .brand-word { display: none; }
+  .topbar .btn.btn-talk .btn-label { display: none; }
+  .topbar .btn.btn-talk { padding: 0 var(--space-2); }
+  .scope .sw-agent { max-width: 96px; }
+  .search-wrap { min-width: 96px; }
+  /* 6px gap (--space-2 less one 2px step) and an 88px range buy the room
+     the scope needs at 1024 without truncating any evidence age. */
+  .topbar { gap: calc(var(--space-2) - 2px); }
+  .range { max-width: 88px; }
+}
+@media (max-width: 860px) {
+  .app, .app.route-full { grid-template-columns: 56px 1fr; }
+  .sidebar nav a .rail-label, .sidebar nav a .count, .nav-footer, .nav-group-label { display: none; }
+  .sidebar nav a { justify-content: center; padding: 0 6px; }
+  .scope .id, .scope .scope-sep { display: none; }
+}
 }
 
 /* ===================================================================
@@ -1215,41 +1384,16 @@ body {
  * only (ochre = waiting on you, sage = protected, rust = locked).
  * =================================================================== */
 
-/* S2 (2026-07-18): the Talk hero block retired. Talk is now a normal item
-   under the Assist group; posture (Overview) leads the primary spine. */
-.nav-group-label {
-  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--ink-3);
-  padding: 10px 12px 4px;
-}
-
-/* Top-bar agent switcher. */
-.agent-switcher { position: relative; }
-.agent-switcher-trigger {
-  display: flex; align-items: center; gap: 9px;
-  padding: 4px 9px 4px 6px;
-  border: 1px solid var(--rule); border-radius: 999px;
-  background: var(--surface); color: var(--ink);
-  font-family: var(--sans); font-size: var(--text-sm); cursor: pointer;
-}
-.agent-switcher-trigger:hover { border-color: var(--rule-2); background: var(--surface-2); }
-.agent-switcher-trigger .sw-glyph {
-  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
-  display: grid; place-items: center;
-  background: var(--paper-3); border: 1px solid var(--rule);
-  font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--ink-2);
-}
-.agent-switcher-trigger .sw-text { display: flex; flex-direction: column; line-height: 1.15; text-align: left; }
-.agent-switcher-trigger .sw-agent { font-size: var(--text-base); font-weight: 500; }
-.agent-switcher-trigger .sw-scope { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.02em; }
-.agent-switcher-trigger .sw-caret {
-  width: 0; height: 0; margin-left: 1px;
-  border-left: 4px solid transparent; border-right: 4px solid transparent;
-  border-top: 5px solid var(--ink-3);
-}
+/* The scope switcher's menu: this machine (with its full id and a copy
+   control), the protected agents to scope the queue to, and the fleet. */
+.scope-menu-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px var(--space-2); padding: 6px 8px 8px; border-bottom: 1px solid var(--rule); margin-bottom: 4px; }
+.scope-menu-head .lead { font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); width: 100%; }
+.scope-menu-head .mono { font-size: var(--text-xs); color: var(--ink-3); overflow-wrap: anywhere; flex: 1; min-width: 0; }
+.scope-fleet { display: block; margin-top: 4px; padding: 8px; border-top: 1px solid var(--rule); color: var(--accent); text-decoration: none; font-size: var(--text-sm); }
+.scope-fleet:hover { text-decoration: underline; }
 .agent-switcher-menu {
   position: absolute; top: calc(100% + 6px); left: 0;
-  width: 260px; max-height: 320px; overflow-y: auto;
+  width: 320px; max-height: 320px; overflow-y: auto;
   background: var(--surface); border: 1px solid var(--rule-2);
   border-radius: var(--rad-lg); box-shadow: var(--shadow);
   padding: 6px; z-index: 50;
@@ -1261,8 +1405,9 @@ body {
   background: transparent; color: var(--ink); cursor: pointer;
   font-family: var(--sans); font-size: var(--text-base); text-align: left;
 }
-.agent-switcher-opt:hover { background: var(--paper-2); }
-.agent-switcher-opt.selected { background: var(--paper-2); box-shadow: inset 3px 0 0 var(--ink); }
+.agent-switcher-opt:hover { background: var(--surface-2); }
+.agent-switcher-opt.selected { background: var(--accent-tint-strong); box-shadow: inset 2px 0 0 var(--accent); }
+.agent-switcher-opt:focus-visible, .scope-menu-head .btn:focus-visible, .scope-fleet:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .agent-switcher-opt .opt-glyph {
   width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
   display: grid; place-items: center;
@@ -1274,21 +1419,37 @@ body {
 
 /* Posture seal (top bar) + popover. Honest verdict drives the color. */
 .posture-seal-wrap { position: relative; }
+/* The seal per the TopBar preview: 34px, the 8px control radius, mono
+   uppercase word with its evidence age beside it in --ink-2. Each tone wears
+   its own status hue, -bg tint and -line border, and its own glyph shape, so
+   the seal reads in monochrome: protected a ring and dot, attention a
+   triangle, locked a square, unknown an empty dotted ring. The freshness
+   text is never truncated: the age is the evidence, so the bar sheds other
+   parts first (see the max-width media rules). */
 .posture-seal {
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 4px 11px 4px 8px; border-radius: 999px; cursor: pointer;
-  border: 1px solid var(--rule); background: var(--surface-2); color: var(--ink-2);
-  font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0;
-  max-width: min(300px, 42vw); white-space: nowrap;
+  display: inline-flex; align-items: center; gap: var(--space-2); height: 34px;
+  padding: 0 var(--space-3); border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--rule-2); background: var(--surface-2); color: var(--ink-2);
+  font-family: var(--mono); font-size: var(--text-xs); font-weight: 500; white-space: nowrap; flex: none;
 }
 .posture-seal .seal-glyph { width: 12px; height: 12px; position: relative; flex-shrink: 0; }
 .posture-seal .seal-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
 .posture-seal .seal-glyph::after { content: ""; position: absolute; inset: 4px; background: currentColor; border-radius: 50%; opacity: 0.9; }
-.posture-seal .seal-word { text-transform: uppercase; font-weight: 600; flex-shrink: 0; }
-.posture-seal .seal-freshness { min-width: 0; overflow: hidden; text-overflow: ellipsis; opacity: 0.78; letter-spacing: 0; }
-.posture-seal.tone-protected { border-color: var(--sage); background: var(--sage-bg); color: var(--sage); }
-.posture-seal.tone-attention { border-color: var(--ochre); background: var(--ochre-bg); color: var(--ochre); }
-.posture-seal.tone-locked { border-color: var(--rust); background: var(--rust-bg); color: var(--rust); }
+.posture-seal .seal-word { text-transform: uppercase; font-weight: 600; letter-spacing: 0.06em; flex-shrink: 0; }
+.posture-seal .seal-freshness { color: var(--ink-2); letter-spacing: 0; flex-shrink: 0; }
+.posture-seal.tone-protected { border-color: var(--sage-line); background: var(--sage-bg); color: var(--sage); }
+.posture-seal.tone-attention { border-color: var(--ochre-line); background: var(--ochre-bg); color: var(--ochre); }
+.posture-seal.tone-attention .seal-glyph::before { border: 0; border-radius: 0; background: currentColor; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.posture-seal.tone-attention .seal-glyph::after { display: none; }
+/* Locked down is the violet --locked status, never the fault red. */
+.posture-seal.tone-locked { border-color: var(--locked-line); background: var(--locked-bg); color: var(--locked); }
+.posture-seal.tone-locked .seal-glyph::before { border-radius: 2px; }
+.posture-seal.tone-locked .seal-glyph::after { border-radius: 1px; }
+/* Unknown: full-weight slate, dashed border, an empty dotted ring. Never
+   green, never dimmed. */
+.posture-seal.tone-unknown { border: 1px dashed var(--slate-line); background: var(--slate-bg); color: var(--slate); }
+.posture-seal.tone-unknown .seal-glyph::before { border-style: dotted; }
+.posture-seal.tone-unknown .seal-glyph::after { display: none; }
 .posture-seal-pop {
   position: absolute; top: calc(100% + 6px); right: 0;
   width: 320px; background: var(--surface);
@@ -1298,16 +1459,16 @@ body {
 .posture-seal-pop[hidden] { display: none; }
 .posture-seal-pop h4 { margin: 0 0 4px; font-family: var(--serif); font-weight: 500; font-size: var(--text-lg); }
 .posture-seal-pop .pp-sub { margin: 0 0 10px; color: var(--ink-3); font-size: var(--text-sm); line-height: 1.5; }
-.posture-seal-pop .pp-line {
+.posture-seal-pop .pp-line, .enforcement-layers .pp-line {
   display: flex; align-items: center; gap: 8px; padding: 6px 0;
   border-bottom: 1px dashed var(--rule); font-size: var(--text-base);
 }
-.posture-seal-pop .pp-line:last-child { border-bottom: 0; }
-.posture-seal-pop .pp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
-.posture-seal-pop .pp-dot.warn { background: var(--ochre); }
-.posture-seal-pop .pp-dot.off { background: var(--ink-4); }
-.posture-seal-pop .pp-k { color: var(--ink-2); }
-.posture-seal-pop .pp-v { margin-left: auto; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.posture-seal-pop .pp-line:last-child, .enforcement-layers .pp-line:last-child { border-bottom: 0; }
+.posture-seal-pop .pp-dot, .enforcement-layers .pp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
+.posture-seal-pop .pp-dot.warn, .enforcement-layers .pp-dot.warn { background: var(--ochre); }
+.posture-seal-pop .pp-dot.off, .enforcement-layers .pp-dot.off { background: var(--ink-4); }
+.posture-seal-pop .pp-k, .enforcement-layers .pp-k { color: var(--ink-2); }
+.posture-seal-pop .pp-v, .enforcement-layers .pp-v { margin-left: auto; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
 .posture-seal-pop .pp-more {
   display: inline-block; margin-top: 10px; font-size: var(--text-sm);
   color: var(--indigo); text-decoration: none;
@@ -1450,11 +1611,9 @@ body {
 .ambient-seal { display: flex; align-items: center; gap: 9px; padding-bottom: 11px; border-bottom: 1px solid var(--rule); }
 .ambient-seal .as-glyph { width: 16px; height: 16px; position: relative; flex-shrink: 0; color: var(--sage); }
 .ambient-seal.tone-attention .as-glyph { color: var(--ochre); }
-/* Locked stays on the fault red here until the shell-restyle slice moves the
-   seal onto --locked; the locked hue is declared in design-tokens.ts but no
-   consumer reads it yet, so changing this rule is a visible behavior change
-   that belongs to that slice, not to the value-only token swap. */
-.ambient-seal.tone-locked .as-glyph { color: var(--rust); }
+/* Locked down wears the violet --locked status, never the fault red, the
+   same as the top-bar seal and the locked pill. */
+.ambient-seal.tone-locked .as-glyph { color: var(--locked); }
 /* Unknown wears the unknown status hue at full weight, never the disabled
    --ink-4: "no answer arrived" is a state a person must read. The seal glyph
    is a ring plus a dot for every tone, so the word beside it, not the shape,
@@ -1477,109 +1636,87 @@ body {
 .ambient-stat .l { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
 `;
 
-type NavItem = { id: string; label: string; href?: string; icon?: string };
+type NavItem = { id: string; label: string; href?: string; icon?: string; count?: "approvals"; title?: string };
 
 /**
- * Sidebar nav definition. Out-of-scope screens at v1.1 ship are NOT
- * present in this list. Federation (v1.3), Composition (v1.4+), and full
- * Recovery management are excluded by construction.
+ * The rail (slice 2, 2026-10-13): eight destinations in the buyer's words,
+ * then a Configure group, per the ratified information architecture
+ * (Dashboard_Design_Research_2026-10-12 section 5.3). A security buyer reads
+ * Overview / Approvals / Agents / Machines / Enforcement / Findings / Evidence
+ * / Policies as a console of theirs; the fourteen destinations the rail
+ * carried before fold into these ten instead of disappearing:
+ *   - Talk (route "dashboard") is a top-bar button that opens the concierge
+ *     as a panel; "#dashboard" still renders it as a full page.
+ *   - Health, Privacy, Intelligence (shown as "Local models") and Attestation
+ *     are the four tabs of Settings; each old hash still renders directly.
+ *   - Coordination is the content of Integrations; Auto-trigger is a section
+ *     of Policies; Honeypots is a section of Findings; Exit drill is the
+ *     Export action group on Evidence. Each old hash still renders directly.
+ * Route ids are frozen surfaces (posture, agents, policy, activity,
+ * dashboard, attestation, health, auto-trigger, intelligence, privacy,
+ * honeypot, coordination, exit-drill): only labels, grouping and order move.
+ * The new hash ids (approvals, enforcement, findings, integrations,
+ * settings) are additive. Machines stays the real /fleet href this slice,
+ * never a hash route, so it cannot collide with an SPA id. Out-of-scope
+ * screens (Federation, Composition, full Recovery) are absent by
+ * construction. Castle Wall, Sentinels, Charter and Heralds survive as
+ * layer names inside screens and help text, never as rail labels.
  *
- * S2 redesign (2026-07-18): posture becomes Home. The primary nav is now a
- * flat, noun-based spine ordered Overview / Agents / Machines / Policy /
- * Evidence, matching the CISO trust grammar (a posture-summary home, then
- * inventory, then rules, then the audit record). "Overview" is the posture
- * route promoted to the landing surface; "Evidence" is the activity/audit
- * route relabeled; "Machines" links out to the Fleet Switcher page (a real
- * href, not a hash route). Talk demotes from the old promoted hero block to
- * a normal item under the Assist group. Everything secondary steps down into
- * Advanced. Route ids are unchanged frozen surfaces (posture, agents, policy,
- * activity, dashboard, ...); only the visible grouping, ordering, and the
- * "Posture" -> "Overview" / "Activity" -> "Evidence" / "Dashboard" -> "Talk"
- * labels move.
- *
- * "Activity" (now labeled Evidence) hosts the full inbox + the heavy
- * six-field filter panel that previously sat inline on the right rail. The
- * rail keeps only the click-to-clear approvals queue; power-querying lives
- * here.
+ * Must match ROUTE_RAIL_PARENT in client.ts: every rail id below is a parent
+ * there, and every folded route there names one of these ids.
  */
-const NAV_PRIMARY: NavItem[] = [
-  // Overview: the posture board ("How safe you are right now"), promoted to the
-  // landing surface. Reuses the existing /api/posture/* data endpoints; the
-  // seal in the top bar also expands into this same screen.
+export const RAIL_PRIMARY: readonly NavItem[] = [
+  // Overview: the posture board, the landing surface (frozen id "posture").
   { id: "posture", label: "Overview" },
+  // Approvals: the held-operation queue as its own screen; its rail item
+  // carries the waiting count with its denominator.
+  { id: "approvals", label: "Approvals", count: "approvals" },
   { id: "agents", label: "Agents" },
-  // Machines: the Fleet Switcher page (absorbs the old top-bar Fleet link).
-  // A real href, not a hash route, so it never collides with an SPA route id.
-  { id: "machines", label: "Machines", href: "/fleet", icon: "machines" },
-  { id: "policy", label: "Policy" },
-  // Evidence: the activity/audit feed (frozen route id "activity").
-  { id: "activity", label: "Evidence", icon: "activity" },
+  // Machines: the Fleet Switcher page, a real href (not a hash route).
+  { id: "machines", label: "Machines", href: "/fleet", title: "Switch between Sanctuary machines" },
+  { id: "enforcement", label: "Enforcement" },
+  { id: "findings", label: "Findings" },
+  // Evidence: the activity and audit feed (frozen id "activity").
+  { id: "activity", label: "Evidence" },
+  // Policies: the policy center (frozen id "policy"), auto-trigger folded in.
+  { id: "policy", label: "Policies" },
 ];
 
-const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
-  {
-    label: "Assist",
-    items: [
-      // Talk: the concierge, frozen route id "dashboard". Demoted from the
-      // old promoted hero to a normal Assist item now that posture leads.
-      { id: "dashboard", label: "Talk", icon: "talk" },
-    ],
-  },
-  {
-    label: "Advanced",
-    items: [
-      { id: "attestation", label: "Attestation" },
-      { id: "health", label: "Health" },
-      { id: "auto-trigger", label: "Auto-trigger" },
-      { id: "intelligence", label: "Intelligence" },
-      { id: "privacy", label: "Privacy" },
-      { id: "honeypot", label: "Honeypots" },
-      { id: "coordination", label: "Coordination" },
-      { id: "exit-drill", label: "Exit drill" },
-    ],
-  },
+export const RAIL_CONFIGURE: readonly NavItem[] = [
+  { id: "integrations", label: "Integrations" },
+  { id: "settings", label: "Settings" },
 ];
 
 /**
- * Inline-SVG icon set for the sidebar nav. Each icon is 16x16, fill:none,
- * stroke:currentColor (so themed via the `.sidebar nav a svg` rule).
- * Lucide-style geometry kept deliberately simple to fit the paper/ink
- * aesthetic without introducing an icon library dependency. The svg
- * attributes are emitted by the rendering loop to keep these strings
- * compact.
+ * Rail glyphs from the RailItem preview: 24-unit viewBox, 2px stroke,
+ * fill none, drawn in currentColor so the active and hover states recolor
+ * them. Each is a distinct shape (grid, list-with-check, person, monitor,
+ * shield, clock, document, page, rows, gear), so the rail reads in
+ * monochrome. Inline SVG, no icon library dependency.
  */
-const NAV_ICON_PATHS: Record<string, string> = {
-  dashboard:
-    '<rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/>',
-  agents:
-    '<circle cx="6" cy="5.5" r="2.3"/><path d="M2 13.5c0-2.2 1.8-4 4-4s4 1.8 4 4"/><circle cx="11.5" cy="6" r="1.8"/><path d="M14 12.5c0-1.7-1.1-2.7-2.5-3"/>',
-  policy:
-    '<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/><path d="M6 9h4M6 11.5h4"/>',
-  "auto-trigger":
-    '<path d="M3 12V4l5-2 5 2v8l-5 2z"/><path d="M8 5v3l2 1"/>',
-  activity:
-    '<path d="M1.5 8h3l2-5 3 10 2-5h3"/>',
+const RAIL_ICON_PATHS: Record<string, string> = {
   posture:
-    '<path d="M8 1.5l5 2v4.5c0 3.1-2.1 5.2-5 6.5-2.9-1.3-5-3.4-5-6.5V3.5z"/><path d="M5.8 8l1.6 1.6L10.4 6"/>',
-  talk:
-    '<path d="M2 3.5h12v7H8l-3 3v-3H2z"/>',
-  machines:
-    '<rect x="2" y="3" width="12" height="7" rx="1"/><path d="M5.5 13h5M8 10v3"/>',
-  intelligence:
-    '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
-  attestation:
-    '<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8h1.5M13 8h1.5"/>',
-  honeypot:
-    '<path d="M8 1.5l5 2v4.5c0 3.1-2.1 5.2-5 6.5-2.9-1.3-5-3.4-5-6.5V3.5z"/><path d="M6 7.5h4M6.5 10h3"/>',
-  privacy:
-    '<path d="M8 1.5L3 3v4.5c0 3 2.2 5.4 5 7 2.8-1.6 5-4 5-7V3z"/><path d="M6 8l1.5 1.5L10.5 6"/>',
-  coordination:
-    '<circle cx="4" cy="3.5" r="1.4"/><circle cx="4" cy="12.5" r="1.4"/><circle cx="12" cy="8" r="1.4"/><path d="M4 4.9V11.1M4 5c0 3 3 3 6.7 3"/>',
-  health:
-    '<path d="M2 8h2.5l1.5-4 3 8 1.5-4H14"/>',
-  "exit-drill":
-    '<path d="M9.5 2H3v12h6.5"/><path d="M11 5l3 3-3 3"/><path d="M14 8H6.5"/>',
+    '<rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/>',
+  approvals: '<path d="M4 6h16M4 12h10M4 18h7"/><path d="M16 16l2 2 4-4"/>',
+  agents: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>',
+  machines: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/>',
+  enforcement: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  findings: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/>',
+  activity: '<path d="M6 3h9l5 5v13H6z"/><path d="M14 3v6h6M9 13h6M9 17h6"/>',
+  policy: '<path d="M5 4h14v16H5z"/><path d="M9 9h6M9 13h6"/>',
+  integrations: '<path d="M4 7h16M4 12h16M4 17h16"/>',
+  settings:
+    '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/>',
 };
+
+const RAIL_SVG_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+// Top-bar glyphs share the rail's 24-unit geometry (TopBar preview).
+const ICON_MACHINE = RAIL_SVG_OPEN + '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/></svg>';
+const ICON_CARET = RAIL_SVG_OPEN + '<path d="M6 9l6 6 6-6"/></svg>';
+const ICON_SEARCH = RAIL_SVG_OPEN + '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>';
+const ICON_BELL = RAIL_SVG_OPEN + '<path d="M6 16V11a6 6 0 0112 0v5l2 2H4z"/><path d="M10 21h4"/></svg>';
+const ICON_TALK = RAIL_SVG_OPEN + '<path d="M4 5h16v11h-9l-4 4v-4H4z"/></svg>';
+const ICON_CLOSE = RAIL_SVG_OPEN + '<path d="M6 6l12 12M18 6L6 18"/></svg>';
 
 const SVG_OPEN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
 
@@ -1604,6 +1741,13 @@ function escHtml(value: unknown): string {
     .replace(/'/g, "&#039;");
 }
 
+/** Two initials for the operator avatar: the first two letters or digits of
+ *  the identity label, uppercased; the full label rides in the title. */
+function operatorInitials(identityId: string): string {
+  const cleaned = identityId.replace(/[^a-zA-Z0-9]/g, "");
+  return (cleaned.slice(0, 2) || "OP").toUpperCase();
+}
+
 export function renderDashboardV11Html(
   options: DashboardV11HtmlOptions = {},
 ): string {
@@ -1620,22 +1764,29 @@ export function renderDashboardV11Html(
   const embedClient = options.embedClient !== false;
 
   const navItemHtml = (n: NavItem) => {
-    const iconPath = NAV_ICON_PATHS[n.icon ?? n.id] ?? "";
-    const icon = iconPath ? SVG_OPEN + iconPath + "</svg>" : "";
+    const iconPath = RAIL_ICON_PATHS[n.icon ?? n.id] ?? "";
+    const icon = iconPath ? RAIL_SVG_OPEN + iconPath + "</svg>" : "";
+    const label = `<span class="rail-label">${escHtml(n.label)}</span>`;
     // A href item (Machines -> /fleet) is a full-page link, not a hash route,
     // so it carries no data-route and never matches the SPA active-highlight.
     if (n.href) {
-      return `<a href="${escHtml(n.href)}" title="Switch between Sanctuary machines">${icon}<span>${escHtml(n.label)}</span></a>`;
+      return `<a href="${escHtml(n.href)}" title="${escHtml(n.title ?? n.label)}">${icon}${label}</a>`;
     }
-    return `<a href="#${n.id}" data-route="${n.id}">${icon}<span>${escHtml(n.label)}</span></a>`;
+    // The waiting count is Unknown until the queue read lands: never blank,
+    // never a zero the client has not observed. The client rewrites the
+    // count, the title and the accessible name on every render.
+    const count = n.count === "approvals"
+      ? `<span class="count unknown" id="rail-approvals-count" data-count="approvals">Unknown</span>`
+      : "";
+    const title = n.count === "approvals"
+      ? ` title="Held operations waiting on you: Unknown until the approval queue loads"`
+      : "";
+    return `<a href="#${n.id}" data-route="${n.id}"${title}>${icon}${label}${count}</a>`;
   };
-  // S2: primary flat spine (Overview leads) followed by the named groups.
-  const navPrimary = NAV_PRIMARY.map(navItemHtml).join("\n          ");
-  const navGroups = NAV_GROUPS.map((g) => {
-    const groupItems = g.items.map(navItemHtml).join("\n          ");
-    return `<div class="nav-group-label">${escHtml(g.label)}</div>\n          ${groupItems}`;
-  }).join("\n        ");
-  const nav = navPrimary + "\n        " + navGroups;
+  const nav = RAIL_PRIMARY.map(navItemHtml).join("\n        ") +
+    `\n        <div class="nav-group-label">Configure</div>\n        ` +
+    RAIL_CONFIGURE.map(navItemHtml).join("\n        ");
+  const machineName = tenantName ? tenantName : "This machine";
 
   // Emit raw JSON inside `<script type="application/json">`. HTML parsers
   // treat script content as RAWTEXT so character references are NOT
@@ -1657,19 +1808,73 @@ export function renderDashboardV11Html(
     ? `<script type="module">${getClientScript()}</script>`
     : `<!-- client script omitted by render option -->`;
 
+  // THEME_BOOTSTRAP_SCRIPT runs in the head so the dark default (or an
+  // explicit light choice) is on the root element before first paint; the
+  // client module at the end of the body applies the same rule again.
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sanctuary Dashboard v1.1</title>
+  <script>${THEME_BOOTSTRAP_SCRIPT}</script>
   <style>${STYLES}</style>
 </head>
 <body>
   <div class="app route-full" id="app" data-route="posture">
+    <header class="topbar">
+      <div class="brand"><span class="mark" aria-hidden="true"></span><span class="brand-word">Sanctuary</span></div>
+      <!--
+        Scope switcher: this machine or the fleet. The old .machine block (the
+        human alias plus the copyable id chip) and the agent switcher fold
+        into this one control. The menu carries the full id with its copy
+        control, the protected agents that scope the approvals queue, and the
+        Fleet Switcher link.
+      -->
+      <div class="scope-switcher" id="agent-switcher" data-switcher>
+        <button type="button" class="scope" id="agent-switcher-trigger" data-action="agent-switcher-toggle" aria-haspopup="true" aria-expanded="false" title="Scope: ${escHtml(machineName)}, fortress ${escHtml(fortressId)}. Choose which protected agent you are steering, or switch machines.">
+          ${ICON_MACHINE}<span class="machine-name">${escHtml(machineName)}</span><span class="id mono">${escHtml(fortressId)}</span><span class="scope-sep" aria-hidden="true"></span><span class="sw-agent" id="agent-switcher-label">All agents</span>${ICON_CARET}
+        </button>
+        <div class="agent-switcher-menu" id="agent-switcher-menu" role="menu" hidden>
+          <div class="scope-menu-head">
+            <span class="lead">This machine: ${escHtml(machineName)}</span>
+            <span class="mono">${escHtml(fortressId)}</span>
+            <button type="button" class="btn btn-sm" data-action="copy-fortress-id" data-fortress-id="${escHtml(fortressId)}" title="Copy machine id">Copy id</button>
+          </div>
+          <div id="agent-switcher-options"></div>
+          <a class="scope-fleet" href="/fleet" title="Switch between Sanctuary machines">Fleet: every machine you run</a>
+        </div>
+      </div>
+      <div class="search-wrap" data-search>
+        <label class="search">${ICON_SEARCH}<input id="global-search" type="search" placeholder="Search" autocomplete="off" spellcheck="false" data-action="global-search" aria-label="Search the agents, waiting approvals and recent evidence this page has loaded" title="Searches what this page has loaded: agents, waiting approvals and recent evidence rows" aria-controls="search-results" aria-expanded="false"><kbd>Ctrl K</kbd></label>
+        <div class="search-results" id="search-results" role="region" aria-label="Search results" hidden></div>
+      </div>
+      <label class="sr-only" for="time-range">Time range</label>
+      <select class="range" id="time-range" data-action="time-range" title="Time range applies to the Evidence list">
+        <option value="all">All time</option>
+        <option value="24h">Last 24 hours</option>
+        <option value="7d">Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+      </select>
+      <button type="button" class="btn btn-talk" id="btn-talk" data-action="talk-toggle" aria-expanded="false" aria-controls="talk-panel" aria-label="Talk to your fortress" title="Talk to your fortress">${ICON_TALK}<span class="btn-label">Talk</span></button>
+      <button type="button" class="btn btn-lockdown" id="btn-lockdown" data-action="lockdown" title="Revoke network access for every confined agent. Requires your approval before it takes effect.">Lock down</button>
+      <div class="posture-seal-wrap" id="posture-seal-wrap" data-seal>
+        <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="Current protection evidence">
+          <span class="seal-glyph" aria-hidden="true"></span>
+          <span class="seal-word" id="posture-seal-word">Checking</span>
+          <span class="seal-freshness" id="posture-seal-freshness">loading evidence</span>
+        </button>
+        <div class="posture-seal-pop" id="posture-seal-pop" hidden></div>
+      </div>
+      <button type="button" class="iconbtn" id="btn-notifications" data-action="set-route" data-route="approvals" aria-label="Approvals: held operations waiting on you are Unknown until the approval queue loads" title="Held operations waiting on you: Unknown until the approval queue loads">${ICON_BELL}<span class="wait unknown" id="notify-count"><i aria-hidden="true"></i>Unknown</span></button>
+      <span class="avatar" title="Operator: ${escHtml(identityId)}" aria-label="Operator ${escHtml(identityId)}">${escHtml(operatorInitials(identityId))}</span>
+      <button type="button" class="iconbtn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+        <span class="icon-moon">${THEME_ICON_MOON}</span>
+        <span class="icon-sun">${THEME_ICON_SUN}</span>
+      </button>
+    </header>
     <aside class="sidebar">
-      <h1>Sanctuary</h1>
-      <nav id="sidebar-nav">
+      <nav id="sidebar-nav" aria-label="Primary">
         ${nav}
       </nav>
       <div class="nav-footer">
@@ -1687,37 +1892,13 @@ export function renderDashboardV11Html(
         </div>
       </div>
     </aside>
-    <header class="topbar">
-      <div class="machine">
-        <span class="machine-name">${escHtml(tenantName ? tenantName : "This machine")}</span>
-        <button type="button" class="idchip mono" data-action="copy-fortress-id" data-fortress-id="${escHtml(fortressId)}" title="Copy machine id">${escHtml(fortressId)}</button>
-      </div>
-      <div class="agent-switcher" id="agent-switcher" data-switcher>
-        <button type="button" class="agent-switcher-trigger" id="agent-switcher-trigger" data-action="agent-switcher-toggle" aria-haspopup="true" aria-expanded="false" title="Choose which protected agent you are steering">
-          <span class="sw-glyph" id="agent-switcher-glyph">··</span>
-          <span class="sw-text"><span class="sw-agent" id="agent-switcher-label">All agents</span><span class="sw-scope">this fortress</span></span>
-          <span class="sw-caret" aria-hidden="true"></span>
-        </button>
-        <div class="agent-switcher-menu" id="agent-switcher-menu" role="menu" hidden></div>
-      </div>
-      <div class="topbar-spacer"></div>
-      <div class="posture-seal-wrap" id="posture-seal-wrap" data-seal>
-        <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="Current protection evidence">
-          <span class="seal-glyph" aria-hidden="true"></span>
-          <span class="seal-word" id="posture-seal-word">Checking</span>
-          <span class="seal-freshness" id="posture-seal-freshness">loading evidence</span>
-        </button>
-        <div class="posture-seal-pop" id="posture-seal-pop" hidden></div>
-      </div>
-      <button class="btn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
-        <span class="icon-moon">${THEME_ICON_MOON}</span>
-        <span class="icon-sun">${THEME_ICON_SUN}</span>
-      </button>
-      <button class="btn btn-lockdown" id="btn-lockdown" data-action="lockdown">Lockdown</button>
-    </header>
     <main class="main" id="main"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
   </div>
+  <aside class="talk-panel" id="talk-panel" aria-label="Talk to your fortress" hidden>
+    <div class="talk-panel-head"><strong>Talk</strong><a href="#dashboard" data-action="talk-open-full">Open as a full page</a><button type="button" class="iconbtn" data-action="talk-close" aria-label="Close the Talk panel" title="Close">${ICON_CLOSE}</button></div>
+    <div class="talk-panel-body" id="talk-panel-body"></div>
+  </aside>
   <div id="toast-host" aria-live="polite"></div>
   <script id="dashboard-config" type="application/json">${config}</script>
   ${clientBlock}

@@ -14,25 +14,116 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { createContext, runInContext } from "node:vm";
 import {
   renderDashboardV11Html,
   getClientScript,
 } from "../../../src/dashboard/v1_1/index.js";
+import { THEME_BOOTSTRAP_SCRIPT } from "../../../src/dashboard/design-tokens.js";
 
 describe("v1.1 dashboard shell HTML", () => {
   it("renders the sidebar nav and excludes out-of-scope routes", () => {
     const html = renderDashboardV11Html({});
-    expect(html).toContain('data-route="dashboard"');
-    expect(html).toContain('data-route="agents"');
-    expect(html).toContain('data-route="policy"');
-    expect(html).toContain('data-route="privacy"');
-    expect(html).toContain('data-route="coordination"');
-    expect(html).toContain('data-route="health"');
-    expect(html).toContain('data-route="exit-drill"');
+    // Slice 2 rail: the eight destinations plus Configure (order is pinned in
+    // shell-route-walk.test.ts).
+    for (const id of ["posture", "approvals", "agents", "enforcement", "findings", "activity", "policy", "integrations", "settings"]) {
+      expect(html).toContain(`data-route="${id}"`);
+    }
+    // Retargeted (slice 2 shell): Talk, Privacy, Coordination, Health and
+    // Exit drill left the rail; each folded id resolves through the client's
+    // rail-parent table and still renders on its own hash.
+    const client = getClientScript();
+    expect(client).toContain('"dashboard": null');
+    expect(client).toContain('"privacy": "settings"');
+    expect(client).toContain('"coordination": "integrations"');
+    expect(client).toContain('"health": "settings"');
+    expect(client).toContain('"exit-drill": "activity"');
     // Out-of-scope at v1.1 ship: federation, composition, full recovery.
     expect(html).not.toContain('data-route="federation"');
     expect(html).not.toContain('data-route="composition"');
     expect(html).not.toContain('data-route="recovery"');
+    expect(client).not.toContain('case "federation"');
+    expect(client).not.toContain('case "composition"');
+    expect(client).not.toContain('case "recovery"');
+  });
+
+  it("locked status paints the violet locked hue, never the fault red", () => {
+    const html = renderDashboardV11Html({ embedClient: false });
+    // Locked down is an operator decision, not a failure: the pill, the
+    // top-bar seal and the ambient seal all read --locked with its tint and
+    // line, and none of them reads the --rust fault hue.
+    const rule = (selector: string) => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const m = html.match(new RegExp(`(?:^|\\n)${esc} \\{([^}]*)\\}`));
+      expect(m, selector).toBeTruthy();
+      return m![1]!;
+    };
+    const pill = rule(".pill.tone-locked");
+    expect(pill).toContain("var(--locked-bg)");
+    expect(pill).toContain("color: var(--locked)");
+    expect(pill).toContain("var(--locked-line)");
+    expect(pill).not.toContain("--rust");
+    const seal = rule(".posture-seal.tone-locked");
+    expect(seal).toContain("var(--locked-bg)");
+    expect(seal).toContain("color: var(--locked)");
+    expect(seal).toContain("var(--locked-line)");
+    expect(seal).not.toContain("--rust");
+    const ambient = rule(".ambient-seal.tone-locked .as-glyph");
+    expect(ambient).toContain("color: var(--locked)");
+    expect(ambient).not.toContain("--rust");
+    // No combined selector smuggles the locked tone back onto the fault red
+    // (comments stripped first: the token block's prose names these selectors).
+    const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(css).not.toMatch(/tone-locked[^{]*\{[^}]*--rust/);
+  });
+
+  it("the theme bootstrap yields dark with empty storage, and an explicit light choice wins", () => {
+    const run = (storage: { getItem: (k: string) => string | null }) => {
+      const attrs: Record<string, string> = {};
+      const context = createContext({
+        sessionStorage: storage,
+        document: { documentElement: { setAttribute: (k: string, v: string) => { attrs[k] = v; } } },
+      });
+      runInContext(THEME_BOOTSTRAP_SCRIPT, context);
+      return attrs["data-theme"];
+    };
+    expect(run({ getItem: () => null })).toBe("dark");
+    expect(run({ getItem: () => "dark" })).toBe("dark");
+    expect(run({ getItem: () => "light" })).toBeUndefined();
+    expect(run({ getItem: () => { throw new Error("storage blocked"); } })).toBe("dark");
+    // The shell runs the same bootstrap in its head, before first paint.
+    const html = renderDashboardV11Html({ embedClient: false });
+    expect(html.indexOf(THEME_BOOTSTRAP_SCRIPT)).toBeGreaterThan(0);
+    expect(html.indexOf(THEME_BOOTSTRAP_SCRIPT)).toBeLessThan(html.indexOf("<style>"));
+  });
+
+  it("the client's theme fallback is dark with no explicit choice and light only when chosen", () => {
+    const boot = (choice: string | null) => {
+      const calls: string[] = [];
+      const context = createContext({
+        document: {
+          getElementById: () => null, addEventListener() {}, querySelectorAll: () => [],
+          documentElement: {
+            setAttribute: (k: string, v: string) => calls.push(`set ${k}=${v}`),
+            removeAttribute: (k: string) => calls.push(`remove ${k}`),
+          },
+        },
+        // An OS that prefers light must not pull the no-choice state to light.
+        window: { addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) },
+        location: { hash: "", search: "", origin: "http://fixture" },
+        sessionStorage: { getItem: (k: string) => (k === "sanctuary-v11-theme" ? choice : null) },
+        URLSearchParams, URL, AbortController, Date, Element: class {},
+        setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
+        EventSource: class { addEventListener() {} close() {} },
+        fetch: () => new Promise<never>(() => {}),
+      });
+      runInContext(getClientScript(), context);
+      return calls;
+    };
+    expect(boot(null)).toContain("set data-theme=dark");
+    expect(boot("dark")).toContain("set data-theme=dark");
+    expect(boot("light")).toContain("remove data-theme");
+    expect(boot("light")).not.toContain("set data-theme=dark");
   });
 
   it("embeds dashboard config as a JSON script tag without serializing the bearer", () => {
@@ -74,9 +165,10 @@ describe("v1.1 dashboard shell HTML", () => {
   it("exposes a Posture entry in the sidebar (folded-in posture detail)", () => {
     const html = renderDashboardV11Html({});
     expect(html).toContain('data-route="posture"');
-    // It sits in the Verify group alongside Activity / Attestation / Health.
+    // It leads the rail, with Evidence (activity) beside it.
     expect(html).toContain('data-route="activity"');
-    expect(html).toContain('data-route="attestation"');
+    // Retargeted (slice 2 shell): Attestation is a Settings tab, not a rail item.
+    expect(getClientScript()).toContain('{ id: "attestation", label: "Attestation" }');
   });
 
   it("renders the folded Posture screen reusing the existing posture data endpoints", () => {
@@ -172,7 +264,8 @@ describe("v1.1 dashboard shell HTML", () => {
     // S2: the Fleet Switcher moved from a top-bar link to the "Machines" item
     // in the sidebar nav spine. The /fleet route stays reachable, unremoved.
     expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
-    const navMatch = html.match(/<nav id="sidebar-nav">[\s\S]*?<\/nav>/);
+    // Retargeted (slice 2 shell): the nav now carries aria-label="Primary".
+    const navMatch = html.match(/<nav id="sidebar-nav"[^>]*>[\s\S]*?<\/nav>/);
     expect(navMatch).toBeTruthy();
     expect(navMatch![0]).toContain('href="/fleet"');
     expect(navMatch![0]).toContain("Machines");
