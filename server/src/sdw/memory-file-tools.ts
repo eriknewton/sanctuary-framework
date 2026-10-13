@@ -88,7 +88,7 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "custom policy relaxed memory_ingest itself. This does not sync, watch, or replace " +
     "the harness write path, and memory later sent to a model vendor is " +
     "exposed to that vendor at inference." +
-    " Tier 1: requires operator approval.",
+    " Tier 1 under the default policy: requires operator approval.",
   memory_emit:
     "Manually emit Claude Code or Codex memory files from the SDW vault into an " +
     "operator-named output directory. Existing memory files are never " +
@@ -97,7 +97,7 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "files are plaintext for the harness; " +
     "this does not sync or write back to the source memory directory, and " +
     "memory later sent to a model vendor is exposed to that vendor at inference." +
-    " Tier 1: requires operator approval.",
+    " Tier 1 under the default policy: requires operator approval.",
   memory_transcode:
     "Manually project one already-mirrored Claude Code or Codex memory snapshot " +
     "from the encrypted SDW vault into the other harness format. The output is " +
@@ -106,14 +106,14 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "Existing output files are never overwritten. This does not sync, watch, or " +
     "replace either harness write path, and memory later sent to a model vendor " +
     "is exposed to that vendor at inference." +
-    " Tier 1: requires operator approval.",
+    " Tier 1 under the default policy: requires operator approval.",
   memory_transcode_restore:
     "Manually restore the exact source files from a completed encrypted Sanctuary " +
     "memory transcode archive into an empty operator-named directory. Restored " +
     "files are plaintext and existing files are never overwritten. This does not " +
     "sync, watch, or write back to a live harness directory, and memory later sent " +
     "to a model vendor is exposed to that vendor at inference." +
-    " Tier 1: requires operator approval.",
+    " Tier 1 under the default policy: requires operator approval.",
 } as const;
 
 export interface MemoryFileApprovalContext {
