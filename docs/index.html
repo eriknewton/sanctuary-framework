@@ -334,7 +334,7 @@ layout: null
         <h2 id="harnesses-title">Drop it into your MCP harness.</h2>
         <p>
           Sanctuary speaks standard MCP over stdio. Claude Code, Cursor, Hermes, OpenClaw
-          and Cline have tested wrapping paths. CrewAI connects through its MCP field and
+          and Cline have tested wrapping paths. CrewAI connects through its mcps field with a stdio server and
           LangChain through the langchain-mcp-adapters package, as shown below; neither
           has a tested wrapping path.
         </p>
@@ -379,11 +379,18 @@ servers:
             <span>python · mcp</span>
           </div>
           <div class="code-card">
-<pre><code><span class="token--dim"># crewai native mcps field</span>
+<pre><code><span class="token--dim"># crewai mcps field, local stdio server</span>
+from crewai import Agent
+from crewai.mcp import MCPServerStdio
+
 agent = Agent(
   role="analyst",
-  mcps=["sanctuary"],
-  tools=[],
+  goal="answer with Sanctuary's tools",
+  backstory="runs under operator custody",
+  mcps=[MCPServerStdio(
+    command="npx",
+    args=["-y", "@sanctuary-framework/mcp-server"],
+  )],
 )</code></pre>
           </div>
         </article>
@@ -396,10 +403,8 @@ agent = Agent(
           <div class="code-card">
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
 
-async with MultiServerMCPClient(
+client = MultiServerMCPClient(
     {
         "sanctuary": {
             "command": "npx",
@@ -407,8 +412,8 @@ async with MultiServerMCPClient(
             "transport": "stdio",
         }
     }
-) as client:
-    tools = client.get_tools()</code></pre>
+)
+tools = await client.get_tools()</code></pre>
           </div>
         </article>
       </div>
