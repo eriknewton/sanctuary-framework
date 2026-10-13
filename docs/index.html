@@ -331,11 +331,12 @@ layout: null
     <div class="container">
       <div class="section__heading">
         <span class="eyebrow">Interop</span>
-        <h2 id="harnesses-title">Drop it into any harness.</h2>
+        <h2 id="harnesses-title">Drop it into your MCP harness.</h2>
         <p>
-          Sanctuary speaks standard MCP. No forks, no adapters, no special case for your stack.
-          Point your harness at the server and every tool in the custody stack becomes
-          available to your agent immediately.
+          Sanctuary speaks standard MCP over stdio. Claude Code, Cursor, Hermes, OpenClaw
+          and Cline have tested wrapping paths. CrewAI connects through its mcps field with a stdio server and
+          LangChain through the langchain-mcp-adapters package, as shown below; neither
+          has a tested wrapping path.
         </p>
       </div>
 
@@ -378,11 +379,18 @@ servers:
             <span>python · mcp</span>
           </div>
           <div class="code-card">
-<pre><code><span class="token--dim"># crewai native mcps field</span>
+<pre><code><span class="token--dim"># crewai 1.15+ (crewai.mcp), local stdio server</span>
+from crewai import Agent
+from crewai.mcp import MCPServerStdio
+
 agent = Agent(
   role="analyst",
-  mcps=["sanctuary"],
-  tools=[],
+  goal="answer with Sanctuary's tools",
+  backstory="runs under operator custody",
+  mcps=[MCPServerStdio(
+    command="npx",
+    args=["-y", "@sanctuary-framework/mcp-server"],
+  )],
 )</code></pre>
           </div>
         </article>
@@ -394,20 +402,22 @@ agent = Agent(
           </div>
           <div class="code-card">
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
+import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
 
-async with MultiServerMCPClient(
-    {
-        "sanctuary": {
-            "command": "npx",
-            "args": ["-y", "@sanctuary-framework/mcp-server"],
-            "transport": "stdio",
+async def main():
+    client = MultiServerMCPClient(
+        {
+            "sanctuary": {
+                "command": "npx",
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
+                "transport": "stdio",
+            }
         }
-    }
-) as client:
-    tools = client.get_tools()</code></pre>
+    )
+    tools = await client.get_tools()
+
+asyncio.run(main())</code></pre>
           </div>
         </article>
       </div>
