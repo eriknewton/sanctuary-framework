@@ -1775,7 +1775,15 @@ mod armed_identity_tests {
             crate::nftables::confined_agent_id(TEST_AGENT_UID),
             "203.0.113.7",
         );
-        for _ in 0..1000 {
+        let first = f.engine.evaluate_attempt(&request).expect("evaluate");
+        assert!(matches!(first.evidence, OutcomeEvidence::Unattributed));
+        assert_eq!(f.engine.unattributed_attempts_for_test(), 1);
+        assert_eq!(f.engine.unattributed_log_lines_for_test(), 1);
+        assert_eq!(
+            f.diagnostics.lock().unwrap().as_slice(),
+            ["castle-wall-daemon: denied packet without an attributable confined subject count=1"]
+        );
+        for _ in 1..1000 {
             let outcome = f.engine.evaluate_attempt(&request).expect("evaluate");
             assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
             assert!(matches!(
