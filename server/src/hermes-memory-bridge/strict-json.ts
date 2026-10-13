@@ -91,6 +91,7 @@ class StrictJsonParser {
       this.skipWhitespace();
       this.consume(":");
       this.skipWhitespace();
+      // On a null-prototype object, assignment and defineProperty both create an own __proto__ data property; this keeps that invariant explicit.
       Object.defineProperty(result, key, {
         value: this.parseValue(depth + 1),
         enumerable: true,

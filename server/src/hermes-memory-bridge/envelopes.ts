@@ -183,6 +183,14 @@ export const HERMES_MEMORY_WIRE_SCHEMAS = Object.freeze({
 });
 
 export function parseRelayToNode(bytes: Uint8Array): RelayToNodeParseResult {
+  try {
+    return parseRelayToNodeUnchecked(bytes);
+  } catch {
+    return fatal("invalid private frame");
+  }
+}
+
+function parseRelayToNodeUnchecked(bytes: Uint8Array): RelayToNodeParseResult {
   let envelope: Record<string, unknown>;
   try {
     envelope = parseStrictJsonObject(bytes);
@@ -215,6 +223,14 @@ export function parseRelayToNode(bytes: Uint8Array): RelayToNodeParseResult {
 }
 
 export function parsePublicFrame(bytes: Uint8Array): PublicFrameParseResult {
+  try {
+    return parsePublicFrameUnchecked(bytes);
+  } catch {
+    return rejectPublic("invalid public frame");
+  }
+}
+
+function parsePublicFrameUnchecked(bytes: Uint8Array): PublicFrameParseResult {
   if (bytes.byteLength > MAX_PUBLIC_FRAME_BYTES) return rejectPublic("public frame exceeds cap");
   let frame: Record<string, unknown>;
   try {
@@ -331,7 +347,8 @@ function parsePublicToolsCall(frame: Record<string, unknown>): PublicFrameParseR
 }
 
 function parseToolArguments(name: HermesMemoryToolName, args: Record<string, unknown>): HermesMemoryToolArguments | null {
-  const toolSchema = HERMES_MEMORY_WIRE_SCHEMAS.toolArguments[name];
+  const toolSchema = getSchema(HERMES_MEMORY_WIRE_SCHEMAS.toolArguments, name);
+  if (toolSchema === undefined) return null;
   if (!validateObjectSchema(args, toolSchema)) return null;
   if (name === "memory_insert") {
     return {
@@ -372,7 +389,8 @@ function shouldUseDenial(requestId: string, publicPayloadBytes: Uint8Array): boo
   }
   const type = parsed.type;
   if (type !== "result" && type !== "error") return true;
-  const publicSchema = HERMES_MEMORY_WIRE_SCHEMAS.publicOutbound[type];
+  const publicSchema = getSchema(HERMES_MEMORY_WIRE_SCHEMAS.publicOutbound, type);
+  if (publicSchema === undefined) return true;
   // Node owns the complete public result and error shape because the relay checks only type and request_id.
   return !validateObjectSchema(parsed, publicSchema) || parsed.request_id !== requestId;
 }
@@ -410,7 +428,7 @@ function validateObjectSchema(value: Record<string, unknown>, objectSchema: Obje
 }
 
 function getSchema(table: SchemaTable, type: string): ObjectSchema | undefined {
-  return table[type];
+  return Object.prototype.hasOwnProperty.call(table, type) ? table[type] : undefined;
 }
 
 function isRequestId(value: unknown): value is string {

@@ -29,14 +29,11 @@ type FixtureEntry = {
   readonly bytes_hex?: string;
 };
 
+type FixtureSurface = "publicOrClient" | "nodeToRelay" | "relayToNode";
+
 const fixtureUrl = new URL("./fixtures/relay-frames.json", import.meta.url);
 const relayFixtureText = readFileSync(fixtureUrl, "utf8");
-const relayFixture = JSON.parse(relayFixtureText) as {
-  readonly valid: readonly FixtureEntry[];
-  readonly malformed: readonly FixtureEntry[];
-  readonly wrong_allowlist: readonly FixtureEntry[];
-  readonly stream_cases: readonly FixtureEntry[];
-};
+const relayFixture = JSON.parse(relayFixtureText) as Readonly<Record<string, readonly FixtureEntry[]>>;
 
 const textEncoder = new TextEncoder();
 
@@ -128,20 +125,35 @@ function findFixtureVector(name: string): FixtureEntry {
 }
 
 function allFixtureEntries(): readonly FixtureEntry[] {
-  return [
-    ...relayFixture.valid,
-    ...relayFixture.malformed,
-    ...relayFixture.wrong_allowlist,
-    ...relayFixture.stream_cases,
-  ];
+  return Object.entries(relayFixture).flatMap(([sectionName, section]) => {
+    if (!Array.isArray(section)) throw new Error(`fixture section is not an array: ${sectionName}`);
+    return section;
+  });
+}
+
+function fixtureTotal(): number {
+  return Object.values(relayFixture).reduce((total, section) => total + section.length, 0);
+}
+
+function fixtureSurface(entry: FixtureEntry): FixtureSurface {
+  if (entry.direction === "relayToNode" || entry.channel === "relay_to_node") return "relayToNode";
+  if (entry.direction === "nodeToRelay" || entry.channel === "node_to_relay") return "nodeToRelay";
+  if (entry.direction === "publicInbound" || entry.direction === "clientOutbound" || entry.channel === "public") {
+    return "publicOrClient";
+  }
+  throw new Error(`fixture vector has unknown channel: ${entry.name}`);
 }
 
 function relayToNodeVectors(): readonly FixtureEntry[] {
-  return allFixtureEntries().filter((entry) => entry.direction === "relayToNode" || entry.channel === "relay_to_node");
+  return allFixtureEntries().filter((entry) => fixtureSurface(entry) === "relayToNode");
 }
 
 function nodeToRelayVectors(): readonly FixtureEntry[] {
-  return allFixtureEntries().filter((entry) => entry.direction === "nodeToRelay" || entry.channel === "node_to_relay");
+  return allFixtureEntries().filter((entry) => fixtureSurface(entry) === "nodeToRelay");
+}
+
+function publicOrClientVectors(): readonly FixtureEntry[] {
+  return allFixtureEntries().filter((entry) => fixtureSurface(entry) === "publicOrClient");
 }
 
 function stateDependentNames(): readonly string[] {
@@ -164,7 +176,16 @@ function expectedRelayFrameFromBody(body: Uint8Array): Record<string, unknown> {
     case "relay_shutdown":
       return { kind: "relay_shutdown" };
     case "frame":
-      return { kind: "frame", connectionId: envelope.connection_id };
+      {
+        const publicBytes = decodeStandardBase64(envelope.frame_b64 as string);
+        if (publicBytes === null) throw new Error("fixture frame has invalid public bytes");
+        return {
+          kind: "frame",
+          connectionId: envelope.connection_id,
+          publicBytes,
+          publicFrame: parsePublicFrame(publicBytes),
+        };
+      }
     default:
       throw new Error("not a typed relay-to-Node frame");
   }
@@ -214,6 +235,10 @@ describe("Hermes memory bridge strict JSON", () => {
     expect(() => parseStrictJsonObject(toolsCallWithArrays(MAX_JSON_NESTING_DEPTH, "\"alpha\""))).toThrow(/nesting/u);
     const topLevelCompositeOver = `{"a":${"[".repeat(MAX_JSON_NESTING_DEPTH + 1)}${"]".repeat(MAX_JSON_NESTING_DEPTH + 1)}}`;
     expect(() => parseStrictJsonObject(textEncoder.encode(topLevelCompositeOver))).toThrow(/nesting/u);
+    const nestedObjects = (count: number) =>
+      textEncoder.encode(`{"type":"tools_call","request_id":"mcp-1","name":"memory_search","arguments":${"{\"k\":".repeat(count)}{}${"}".repeat(count)}}`);
+    expect(() => parseStrictJsonObject(nestedObjects(MAX_JSON_NESTING_DEPTH - 1))).not.toThrow();
+    expect(() => parseStrictJsonObject(nestedObjects(MAX_JSON_NESTING_DEPTH))).toThrow(/nesting/u);
   });
 
   it("refuses unsafe numbers, malformed UTF-8, leading byte-order marks, controls, and trailing bytes", () => {
@@ -290,12 +315,23 @@ describe("Hermes memory bridge private framing", () => {
 });
 
 describe("Hermes memory bridge relay-to-Node envelopes", () => {
+  it("classifies every fixture vector exactly once", () => {
+    const counts = {
+      relayToNode: relayToNodeVectors().length,
+      nodeToRelay: nodeToRelayVectors().length,
+      publicOrClient: publicOrClientVectors().length,
+    };
+    expect(counts.relayToNode + counts.nodeToRelay + counts.publicOrClient).toBe(fixtureTotal());
+    expect(new Set(allFixtureEntries().map((entry) => entry.name)).size).toBe(fixtureTotal());
+  });
+
   it("walks every relay-to-Node fixture vector through the decoder and parser", () => {
     const handled = new Set<string>();
     for (const vector of relayToNodeVectors()) {
       handled.add(vector.name);
       const frames = collectFrames(privateBytesForFixture(vector));
-      if (vector.name === "relay over cap length") {
+      if (frames.length === 1 && frames[0] === "fatal") {
+        expect(vector.expected_action, vector.name).toBe("fatal_bridge");
         expect(frames, vector.name).toEqual(["fatal"]);
         continue;
       }
@@ -308,7 +344,7 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
           expect(parsed.kind, vector.name).toBe("fatal");
         } else {
           expect(parsed.kind, vector.name).toBe("ok");
-          if (parsed.kind === "ok") expect(parsed.frame, vector.name).toMatchObject(expectedRelayFrameFromBody(frame));
+          if (parsed.kind === "ok") expect(parsed.frame, vector.name).toEqual(expectedRelayFrameFromBody(frame));
         }
       }
     }
@@ -366,6 +402,44 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
       kind: "public_rejection",
       reason: "public frame exceeds cap",
     });
+  });
+
+  it("returns typed outcomes when frame types share Object prototype names", () => {
+    const prototypeNames = Object.getOwnPropertyNames(Object.prototype);
+    for (const type of prototypeNames) {
+      expect(() => parseRelayToNode(jsonBytes({ type, connection_id: "c1" })), `relay ${type}`).not.toThrow();
+      expect(parseRelayToNode(jsonBytes({ type, connection_id: "c1" })), `relay ${type}`).toMatchObject({
+        kind: "fatal",
+        reason: "unknown relay frame type",
+      });
+
+      const publicBytes = jsonBytes({ type, request_id: "mcp-1" });
+      expect(() => parsePublicFrame(publicBytes), `public ${type}`).not.toThrow();
+      expect(parsePublicFrame(publicBytes), `public ${type}`).toMatchObject({
+        kind: "public_rejection",
+        disposition: "close",
+        frameType: type,
+        reason: "public frame type is not forwarded to Node",
+      });
+
+      const viaRelay = parseRelayToNode(jsonBytes({
+        type: "frame",
+        connection_id: "c1",
+        frame_b64: Buffer.from(publicBytes).toString("base64"),
+      }));
+      expect(viaRelay, `relay frame ${type}`).toMatchObject({
+        kind: "ok",
+        frame: {
+          kind: "frame",
+          publicFrame: {
+            kind: "public_rejection",
+            disposition: "close",
+            frameType: type,
+            reason: "public frame type is not forwarded to Node",
+          },
+        },
+      });
+    }
   });
 
   it("reports the request id and disposition for rejected public call frames", () => {
@@ -434,6 +508,9 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
     })).kind;
     expect(call({ query: "a", limit: 1 })).toBe("ok");
     expect(call({ query: "a", limit: 20 })).toBe("ok");
+    expect(call({ text: "a" })).toBe("ok");
+    expect(call({ text: "a", query: "b" })).toBe("public_rejection");
+    expect(call({ tag: "t" })).toBe("public_rejection");
     expect(call({ query: "a", limit: 0 })).toBe("public_rejection");
     expect(call({ query: "a", limit: 21 })).toBe("public_rejection");
     expect(call({ query: "a", limit: 1.5 })).toBe("public_rejection");
@@ -448,8 +525,38 @@ describe("Hermes memory bridge relay-to-Node envelopes", () => {
     expect(parsePublicFrame(jsonBytes({
       type: "tools_call",
       request_id: "m",
+      name: "memory_insert",
+      arguments: { text: "t", taint: "other" },
+    })).kind).toBe("public_rejection");
+    expect(parsePublicFrame(jsonBytes({
+      type: "tools_call",
+      request_id: "m",
+      name: "memory_insert",
+      arguments: { text: "t", taint: "user_content", tags: [1] },
+    })).kind).toBe("public_rejection");
+    expect(parsePublicFrame(jsonBytes({
+      type: "tools_call",
+      request_id: "m",
+      name: "memory_insert",
+      arguments: { text: "t", taint: "user_content", tags: ["a"], passage_id: "p" },
+    })).kind).toBe("ok");
+    expect(parsePublicFrame(jsonBytes({
+      type: "tools_call",
+      request_id: "m",
       name: "memory_get",
       arguments: { passage_id: "p", extra: 1 },
+    })).kind).toBe("public_rejection");
+    expect(parsePublicFrame(jsonBytes({
+      type: "tools_call",
+      request_id: "m",
+      name: "memory_get",
+      arguments: [],
+    })).kind).toBe("public_rejection");
+    expect(parsePublicFrame(jsonBytes({
+      type: "hello",
+      request_id: "h",
+      protocol_version: 1,
+      client_name: "c",
     })).kind).toBe("public_rejection");
   });
 });
@@ -521,6 +628,7 @@ describe("Hermes memory bridge Node-to-relay encoder", () => {
     for (const bytes of [
       textEncoder.encode("{\"type\":\"result\",\"request_id\":\"mcp-1\"}"),
       textEncoder.encode("{\"type\":\"result\",\"request_id\":\"mcp-1\",\"payload\":5}"),
+      textEncoder.encode("{\"type\":\"result\",\"request_id\":\"mcp-1\",\"payload\":[]}"),
       textEncoder.encode("{\"type\":\"error\",\"request_id\":\"mcp-1\",\"payload\":{}}"),
       textEncoder.encode("{\"type\":\"error\",\"request_id\":\"mcp-1\",\"message\":{\"x\":1}}"),
       textEncoder.encode("{\"type\":\"result\",\"request_id\":\"mcp-1\",\"payload\":{},\"message\":\"m\"}"),
@@ -529,6 +637,12 @@ describe("Hermes memory bridge Node-to-relay encoder", () => {
     ]) {
       expectDenialFromResponseBytes("mcp-1", bytes);
     }
+
+    const prefix = "{\"type\":\"result\",\"request_id\":\"mcp-1\",\"payload\":{\"text\":\"";
+    const suffix = "\"}}";
+    const wellFormedOverCap = textEncoder.encode(`${prefix}${"a".repeat(MAX_RESULT_FRAME_BYTES - prefix.length - suffix.length + 1)}${suffix}`);
+    expect(wellFormedOverCap.byteLength).toBe(MAX_RESULT_FRAME_BYTES + 1);
+    expectDenialFromResponseBytes("mcp-1", wellFormedOverCap);
   });
 
   it("cannot produce invalid Node-to-relay fixture shapes from typed input", () => {

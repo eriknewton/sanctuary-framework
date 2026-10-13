@@ -74,7 +74,7 @@ In this order, about an hour:
 
 1. [ASSURANCE_MATRIX.md](ASSURANCE_MATRIX.md). Every claim, its platform, its evidence, its gap, and the next proof owed. A row reads `proven` only on a captured drill; a green suite is not a claim.
 2. [SANCTUARY_ARCHITECTURE.md](SANCTUARY_ARCHITECTURE.md). Entry points, data flow, trust model, and the sovereignty properties stated as testable assertions.
-3. [server/src/README.md](server/src/README.md). The module map: 63 modules (counted 2026-10-06), what each owns, and the names that collide.
+3. [server/src/README.md](server/src/README.md). The module map: 64 modules and 56 barrels (counted 2026-10-13), what each owns, and the names that collide.
 4. The macOS wall drills the matrix cites: [allow/deny](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md), [boot survival](docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md), [full scope](docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md).
 5. [ROADMAP.md](ROADMAP.md). What ships today with its bounds, and what is next. The Linux row moved only for Ubuntu 24.04 (x86-64) after an install-grade proof of kernel enforcement on a shipped artifact with independent adjudication; the next Linux gates are fault injection, a real-agent harness, and broader platform coverage.
 6. [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html), for the why.
@@ -434,7 +434,7 @@ Sanctuary installs the protections your body used to provide by default: a perim
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the roadmap.
 
-**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 63-module index (counted 2026-10-06) of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 64-module index with 56 barrels (counted 2026-10-13) of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
