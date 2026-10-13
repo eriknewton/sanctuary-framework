@@ -5,10 +5,15 @@
  * subsystems (identity, SHR, Verascore publishing, principal policy):
  *
  *   sanctuary/sanctuary_bootstrap              (Tier 1)
- *   sanctuary/sanctuary_policy_status          (Tier 3)
+ *   sanctuary/sanctuary_policy_status          (Tier 1, a forced operator-approved read)
  *   sanctuary/sanctuary_export_identity_bundle (Tier 1)
- *   sanctuary/sanctuary_link_to_human          (Tier 2, auto-allowed + anomaly-gated)
- *   sanctuary/sanctuary_sign_challenge         (Tier 2, auto-allowed + anomaly-gated)
+ *   sanctuary/sanctuary_link_to_human          (unlisted: operator approval under the default policy)
+ *   sanctuary/sanctuary_sign_challenge         (unlisted: operator approval under the default policy)
+ *
+ * Tier labels must match each tool's `description` below and the default
+ * policy in `principal-policy/loader.ts` (`enforceForcedTiers(DEFAULT_POLICY)`);
+ * an unlisted tool is Tier 2 on a first session and Tier 1 afterwards, so this
+ * header names the approval, never a tier number, for those two.
  */
 
 import type { ToolDefinition } from "./router.js";

@@ -779,6 +779,9 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(verify.guidance).toContain("sanctuary doctor --json");
     const uninstall = await callTool(env.facadeTools, "sanctuary_help", { intent: "how do I uninstall" });
     expect(uninstall.guidance).toContain("sanctuary uninstall");
+    // The route also matches "unwrap"; the guidance must name the harness-config
+    // restore too (README "Uninstall": footprint vs harness config are different verbs).
+    expect(uninstall.guidance).toContain("sanctuary protect --unwrap");
     expect(uninstall.example).toBeNull();
     const bounds = await callTool(env.facadeTools, "sanctuary_help", { intent: "what are the bounds" });
     expect(bounds.guidance).toContain("ASSURANCE_MATRIX.md");

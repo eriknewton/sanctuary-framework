@@ -192,13 +192,17 @@ export const EVALUATE_RELATED_TOOLS = [
 /**
  * The two evaluate questions no MCP tool answers: verification runs end to
  * end on the CLI, and removal is deliberately not an MCP tool. Must match the
- * `doctor` and `uninstall` verbs in `server/src/cli/subcommands.ts`.
+ * `doctor` and `uninstall` verbs in `server/src/cli/subcommands.ts` and the
+ * `protect --unwrap` flag in `server/src/cli.ts`. The removal split (the
+ * enforcement footprint versus the harness config) must match the README
+ * "Uninstall" paragraph: the route also matches "unwrap", so the guidance
+ * names both commands or an agent asking to unwrap is sent to the wrong one.
  */
 export const EVALUATE_CLI_GUIDANCE = {
   verify:
     "On the CLI, run `sanctuary doctor --json` for a machine-readable end-to-end check of this install; in-session, monitor_health reports what this server can see of its own posture.",
   uninstall:
-    "On the CLI, run `sanctuary uninstall`; there is no MCP tool for removal.",
+    "On the CLI: `sanctuary uninstall` removes the installed enforcement footprint and keeps the fortress state, keys and audit log; `sanctuary protect --unwrap` restores the original harness config and removes nothing else. There is no MCP tool for either.",
 } as const;
 
 /** The named evaluate states `sanctuary_help` can land in; first match wins. */
