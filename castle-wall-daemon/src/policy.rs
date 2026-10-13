@@ -3479,7 +3479,7 @@ mod tests {
                 .join("\n");
             assert!(!executable_body.contains("agent_id"), "{body}");
             assert!(!executable_body.contains("agent_id_for_audit"), "{body}");
-            assert!(executable_body.contains("subject"), "{body}");
+            assert!(executable_body.contains("subject.as_str()"), "{body}");
         }
         let audit_builder = policy_production[policy_production
             .find("pub fn build_audit_event_canonical_json")
