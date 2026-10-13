@@ -34,7 +34,7 @@ use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
 use castle_wall_daemon::ipc::messages::{IpcMessage, MessageEnvelope};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
 use castle_wall_daemon::manifest::verify::{
-    AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use ed25519_dalek::{Signer, SigningKey};
@@ -52,6 +52,9 @@ mod isolation;
 
 const SIGNATURE_SCHEME_V1: &str = "ed25519-v1";
 const IPC_NAMESPACE: &str = "castle-wall";
+const TEST_AGENT_UID: u32 = 60_123;
+const TEST_GATE_UID: u32 = 60_124;
+const TEST_UID_CEILING: u32 = 500;
 
 struct BootedDaemon {
     handle: castle_wall_daemon::daemon::DaemonHandle,
@@ -195,7 +198,15 @@ fn write_signed_manifest(
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
         generation,
-        agent_origin: None,
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: Some(TEST_GATE_UID),
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
         operator_baseline: None,
         rules: entries,
     };
@@ -994,8 +1005,8 @@ fn audit_drain_ack_truncates_wal_through_seq() {
     let _ = booted.handle.stop();
 }
 
-/// TEARDOWN RACE (P2): a packet the fence DROPS must not leave the audit trail
-/// ending on a canonical `allow` receipt.
+/// A packet the teardown fence drops must not leave the audit trail ending on a
+/// canonical `allow` receipt.
 ///
 /// The race is real and not hypothetical: `evaluate_attempt` makes its decision
 /// durable BEFORE returning (deliberately - evidence must never trail the
@@ -1044,7 +1055,9 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
     let packet = PendingPacket {
         packet_id: 7,
         nfmark: 1,
-        source_agent_id: Some("agent-fence-race".to_string()),
+        source_agent_id: Some(castle_wall_daemon::nftables::confined_agent_id(
+            TEST_AGENT_UID,
+        )),
         source_cgroup_id: 1,
         dest_ip: Some("203.0.113.7".to_string()),
         dest_port: 443,
@@ -1148,7 +1161,7 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         other => panic!("authorized reload failed: {other:?}"),
     }
     let request = EvaluationRequest {
-        agent_id: "agent-1".to_string(),
+        agent_id: castle_wall_daemon::nftables::confined_agent_id(TEST_AGENT_UID),
         agent_template: "claude-code".to_string(),
         // The fixture rule names this exact IP. Host/port/protocol are otherwise
         // unconstrained, so this request resolves through the intended rule.
@@ -1161,7 +1174,7 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     let outcome = booted.handle.evaluate_attempt(&request).expect("evaluate");
     // Sanity: the verdict resolved through the rule we installed.
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         castle_wall_daemon::policy::Verdict::Allow { .. }
     ));
 
@@ -1193,7 +1206,14 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
             assert!(approved.critical, "evaluate_attempt emits critical events");
             assert!(approved.event_canonical_json.contains("\"l1\""));
             assert!(approved.event_canonical_json.contains("\"static_rule\""));
-            assert!(approved.event_canonical_json.contains("\"agent-1\""));
+            assert!(approved.event_canonical_json.contains(&format!(
+                "\"{}\"",
+                castle_wall_daemon::nftables::confined_agent_id(TEST_AGENT_UID)
+            )));
+            assert!(approved.event_canonical_json.contains(&format!(
+                "\"identity_id\":\"{}/uid-{}\"",
+                booted.fortress_id, TEST_AGENT_UID
+            )));
             assert!(approved
                 .event_canonical_json
                 .contains("\"api.example.com\""));

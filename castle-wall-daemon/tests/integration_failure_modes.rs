@@ -407,13 +407,13 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     let outcome = handle.evaluate_attempt(&request).expect("evaluate");
 
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
-    assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+    assert!(outcome.wal_seq().is_none());
+    assert!(outcome.event_canonical_json().is_none());
     let _ = handle.stop();
 }
 

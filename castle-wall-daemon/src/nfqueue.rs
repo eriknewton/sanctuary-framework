@@ -632,10 +632,6 @@ pub fn build_verdict_callback(
         let Some(agent_id) = packet.source_agent_id.clone() else {
             return NfVerdict::Drop;
         };
-        // Kept for the superseding record below, which must name the same
-        // subject the superseded receipt did.
-        let agent_id_for_audit = agent_id.clone();
-
         let protocol_str = match packet.protocol {
             6 => "tcp".to_string(),
             17 => "udp".to_string(),
@@ -669,18 +665,15 @@ pub fn build_verdict_callback(
             // Only the allow case needs it: a deny/prompt receipt already agrees
             // with the drop.
             if let Ok(outcome) = evaluated.as_ref() {
-                if matches!(outcome.verdict, crate::policy::Verdict::Allow { .. }) {
-                    supersede_allow_receipt(&decision_engine, outcome, &agent_id_for_audit);
+                if outcome.releases() {
+                    supersede_allow_receipt(&decision_engine, outcome);
                 }
             }
             return NfVerdict::Drop;
         }
         match evaluated {
-            Ok(outcome) => match outcome.verdict {
-                crate::policy::Verdict::Allow { .. } => NfVerdict::Accept,
-                crate::policy::Verdict::PromptRequired { .. } => NfVerdict::Drop,
-                crate::policy::Verdict::Deny { .. } => NfVerdict::Drop,
-            },
+            Ok(outcome) if outcome.releases() => NfVerdict::Accept,
+            Ok(_) => NfVerdict::Drop,
             Err(_) => NfVerdict::Drop,
         }
     })
@@ -706,28 +699,35 @@ const SUPERSEDING_RECORD_BUDGET: Duration = Duration::from_millis(50);
 fn supersede_allow_receipt(
     decision_engine: &crate::decision::DecisionEngine,
     outcome: &crate::decision::EvaluationOutcome,
-    identity_id: &str,
 ) {
-    let Some(seq) = outcome.wal_seq else {
+    let crate::decision::OutcomeEvidence::Recorded {
+        verdict: crate::policy::Verdict::Allow { .. },
+        wal_seq,
+        subject,
+        ..
+    } = &outcome.evidence
+    else {
         // No durable receipt was written, so there is nothing to supersede and
         // no divergence to close.
         return;
     };
     if let Err(err) = decision_engine.append_superseding_verdict(
-        seq,
+        *wal_seq,
         "drop",
         "teardown mutation fence dropped the packet after the allow decision was recorded",
-        identity_id,
+        // The correction names the receipt's own subject; recomputing it here
+        // could combine an unrelated fortress with a signed uid.
+        subject,
         SUPERSEDING_RECORD_BUDGET,
     ) {
-        // LOUD, never silent: an absent correction is exactly the shape of the
-        // defect this exists to close, so it must be visible in the journal
-        // rather than inferred from a missing record.
+        // LOUD, never silent: an absent correction would leave the receipt
+        // uncorrected, so it must be visible in the journal rather than inferred
+        // from a missing record.
         // SAFETY: stderr is the last-resort channel for an audit-trail correction
         // that could not be written; routing it through the audit log is exactly what
         // just failed, so a structured logger would lose the message.
         eprintln!(
-            "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {seq} \
+            "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {wal_seq} \
              recorded an allow, and the superseding record could not be written ({err}); \
              the audit trail for that sequence overstates what happened"
         );

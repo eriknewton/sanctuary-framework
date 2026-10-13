@@ -50,6 +50,7 @@ pub mod nftables;
 pub mod ownership_journal;
 pub mod policy;
 pub mod protected_agent;
+pub mod protection_subject;
 pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
@@ -63,7 +64,7 @@ pub use config::DaemonConfig;
 pub use daemon::{
     boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState, SupervisionOutcome,
 };
-pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome};
+pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome, OutcomeEvidence};
 pub use enforcement::{
     derive_daemon_state, enforcement_status, AcquiredComponent, ComponentKind, ComponentProvider,
     EnforcementError, EnforcementRuntime, EnforcementStartError, EnforcementStatus, NotReadyReason,
@@ -75,6 +76,7 @@ pub use policy::{
     build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot,
     PolicySnapshotError, Verdict,
 };
+pub use protection_subject::ProtectionSubject;
 pub use runtime_providers::{
     disarm_castle_runtime, linux_production_plan, DisarmOutcome, LinuxRuntimeConfig,
 };

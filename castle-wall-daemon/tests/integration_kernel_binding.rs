@@ -1041,9 +1041,15 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         opaque: false,
     };
     let outcome = handle.evaluate_attempt(&req_allowed).expect("evaluate");
-    assert!(matches!(outcome.verdict, Verdict::Allow { .. }));
-    assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
-    assert!(outcome.event_canonical_json.contains("\"l1\""));
+    assert!(matches!(outcome.verdict(), Verdict::Allow { .. }));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"egress_approved\""));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"l1\""));
 
     // Evaluate: denied destination.
     let req_denied = EvaluationRequest {
@@ -1059,13 +1065,14 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .evaluate_attempt(&req_denied)
         .expect("evaluate denied");
     assert!(matches!(
-        outcome_denied.verdict,
+        outcome_denied.verdict(),
         Verdict::Deny {
             reason: castle_wall_daemon::DeniedReason::DefaultDeny
         }
     ));
     assert!(outcome_denied
-        .event_canonical_json
+        .event_canonical_json()
+        .expect("audit body")
         .contains("\"egress_blocked\""));
 
     // Live kernel regression for full-sweep #99: with only a single-IP allow
@@ -1084,13 +1091,14 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .evaluate_attempt(&req_raw_ip_denied)
         .expect("evaluate raw ip denied");
     assert!(matches!(
-        outcome_raw_ip_denied.verdict,
+        outcome_raw_ip_denied.verdict(),
         Verdict::Deny {
             reason: castle_wall_daemon::DeniedReason::DefaultDeny
         }
     ));
     assert!(outcome_raw_ip_denied
-        .event_canonical_json
+        .event_canonical_json()
+        .expect("audit body")
         .contains("\"egress_blocked\""));
 
     // Verify WAL has both events.

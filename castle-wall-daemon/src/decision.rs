@@ -7,7 +7,7 @@
 //! when the daemon later owns an NFQUEUE thread whose callback must evaluate
 //! packets through the daemon's policy state.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use crate::manifest::{ManifestStore, ManifestStoreError};
 use crate::policy::{
     build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot, Verdict,
 };
+use crate::protection_subject::ProtectionSubject;
 
 /// The operation string the boot manifest load audits under.
 ///
@@ -68,6 +69,24 @@ pub(crate) struct AdmittedIdentity {
     pub(crate) fortress_id: String,
     /// Who the manifest confines, if anyone.
     pub(crate) subject: AdmittedSubject,
+}
+
+pub(crate) fn resolve_audit_subject(
+    identity: Option<&AdmittedIdentity>,
+    agent_id: &str,
+) -> Option<ProtectionSubject> {
+    let identity = identity?;
+    let AdmittedSubject::Confined { agent_uid, .. } = identity.subject else {
+        return None;
+    };
+    let parsed_uid = crate::nftables::parse_confined_agent_id(agent_id)?;
+    if parsed_uid != agent_uid {
+        return None;
+    }
+    // The signed uid is both the uid the kernel matched and the uid the signed
+    // manifest admitted. A valid signature proves who signed; this check makes
+    // the field name the right principal.
+    ProtectionSubject::new(&identity.fortress_id, parsed_uid)
 }
 
 /// Who a manifest confines. The two variants are not interchangeable: a kernel
@@ -160,6 +179,8 @@ pub struct DecisionEngine {
     wal_writer: Option<Arc<Mutex<WalWriter>>>,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     mutation_cancel: Arc<AtomicBool>,
+    unattributed_attempts: Arc<AtomicU64>,
+    unattributed_log_lines: Arc<AtomicU64>,
     /// The write-once armed identity, SHARED by every clone of this engine.
     ///
     /// It is an `Arc<OnceLock<_>>` and not an `OnceLock<_>` for the same reason
@@ -201,6 +222,8 @@ impl DecisionEngine {
             audit_buffer,
             mutation_cancel,
             armed_identity: Arc::new(OnceLock::new()),
+            unattributed_attempts: Arc::new(AtomicU64::new(0)),
+            unattributed_log_lines: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -253,6 +276,16 @@ impl DecisionEngine {
         self.wal_writer.as_ref()
     }
 
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub fn unattributed_attempts_for_test(&self) -> u64 {
+        self.unattributed_attempts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub fn unattributed_log_lines_for_test(&self) -> u64 {
+        self.unattributed_log_lines.load(Ordering::SeqCst)
+    }
+
     /// Record that an already-durable verdict was OVERRIDDEN before the packet
     /// was released, so the audit trail cannot end on an `allow` receipt for a
     /// packet the kernel dropped.
@@ -288,7 +321,7 @@ impl DecisionEngine {
         superseded_wal_seq: u64,
         final_verdict: &str,
         reason: &str,
-        identity_id: &str,
+        subject: &ProtectionSubject,
         deadline: Duration,
     ) -> Result<u64, ControlAuditError> {
         let wal = self
@@ -299,8 +332,7 @@ impl DecisionEngine {
             superseded_wal_seq,
             final_verdict,
             reason,
-            &self.fortress_id,
-            identity_id,
+            subject,
             &current_timestamp_iso8601(),
         )
         .map_err(ControlAuditError::Canonicalize)?;
@@ -859,43 +891,47 @@ impl DecisionEngine {
         // is a SHORT critical section (snapshot read only) and is dropped before
         // the WAL append below, so no fsync is ever held under it.
         let deadline = Instant::now() + EVALUATE_ATTEMPT_LOCK_BUDGET;
-        let (verdict, audit_fortress_id, audit_confined_agent_uid) =
-            match bounded_lock_until(store, deadline) {
-                Ok(guard) => match guard.current_snapshot() {
-                    Some(snapshot) => (
-                        snapshot.evaluate(request),
-                        snapshot.fortress_id.clone(),
-                        snapshot.confined_agent_uid,
-                    ),
-                    None => (
-                        Verdict::Deny {
-                            reason: DeniedReason::DefaultDeny,
-                        },
-                        self.fortress_id.clone(),
-                        None,
-                    ),
-                },
-                Err(LockAcquireError::Poisoned) => return Err(AttemptError::ManifestStorePoisoned),
-                // Timeout (a stalled control-plane holder): fail closed with a
-                // default-deny verdict, then still durably record it below.
-                Err(_) => (
+        let (verdict, identity) = match bounded_lock_until(store, deadline) {
+            Ok(guard) => match guard.current_snapshot() {
+                Some(snapshot) => (
+                    snapshot.evaluate(request),
+                    AdmittedIdentity::from_snapshot(snapshot),
+                ),
+                None => (
                     Verdict::Deny {
                         reason: DeniedReason::DefaultDeny,
                     },
-                    self.fortress_id.clone(),
-                    None,
+                    self.armed_identity()
+                        .cloned()
+                        .ok_or_else(|| "armed identity is unset".to_string()),
                 ),
-            };
+            },
+            Err(LockAcquireError::Poisoned) => return Err(AttemptError::ManifestStorePoisoned),
+            // The write-once armed identity cell is the definite identity under
+            // contention; the store guard is not held while WAL or ring locks are taken.
+            Err(_) => (
+                Verdict::Deny {
+                    reason: DeniedReason::DefaultDeny,
+                },
+                self.armed_identity()
+                    .cloned()
+                    .ok_or_else(|| "armed identity is unset".to_string()),
+            ),
+        };
+
+        let subject = match identity
+            .as_ref()
+            .ok()
+            .and_then(|identity| resolve_audit_subject(Some(identity), &request.agent_id))
+        {
+            Some(subject) => subject,
+            None => return Ok(self.unattributed_outcome()),
+        };
 
         let timestamp_iso = current_timestamp_iso8601();
-        let event_canonical_json = build_audit_event_canonical_json(
-            &verdict,
-            request,
-            &audit_fortress_id,
-            audit_confined_agent_uid,
-            &timestamp_iso,
-        )
-        .map_err(AttemptError::AuditCanonicalize)?;
+        let event_canonical_json =
+            build_audit_event_canonical_json(&verdict, request, &subject, &timestamp_iso)
+                .map_err(AttemptError::AuditCanonicalize)?;
 
         // GF3: acquire the WAL under the SAME shared deadline. A control-plane
         // op holding the WAL mutex across a slow fsync must not stall the verdict
@@ -931,9 +967,12 @@ impl DecisionEngine {
                     });
                 }
                 Ok(EvaluationOutcome {
-                    verdict,
-                    wal_seq: Some(seq),
-                    event_canonical_json,
+                    evidence: OutcomeEvidence::Recorded {
+                        verdict,
+                        wal_seq: seq,
+                        subject,
+                        event_canonical_json,
+                    },
                     timestamp_iso8601: timestamp_iso,
                 })
             }
@@ -956,8 +995,7 @@ impl DecisionEngine {
                 let fail_closed_canonical_json = build_audit_event_canonical_json(
                     &fail_closed_verdict,
                     request,
-                    &audit_fortress_id,
-                    audit_confined_agent_uid,
+                    &subject,
                     &timestamp_iso,
                 )
                 .map_err(AttemptError::AuditCanonicalize)?;
@@ -975,12 +1013,37 @@ impl DecisionEngine {
                 }
 
                 Ok(EvaluationOutcome {
-                    verdict: fail_closed_verdict,
-                    wal_seq: None,
-                    event_canonical_json: fail_closed_canonical_json,
+                    evidence: OutcomeEvidence::RingOnlyFailClosed {
+                        subject,
+                        event_canonical_json: fail_closed_canonical_json,
+                    },
                     timestamp_iso8601: timestamp_iso,
                 })
             }
+        }
+    }
+
+    fn unattributed_outcome(&self) -> EvaluationOutcome {
+        let post_increment = self
+            .unattributed_attempts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if should_log(post_increment) {
+            self.unattributed_log_lines.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: stderr is the bounded operator channel for a denied packet
+            // with no attributable confined subject; powers of two in u64 cap
+            // this process to 64 lines, and a saturated counter is not a power of two.
+            eprintln!(
+                "castle-wall-daemon: denied packet without an attributable confined subject \
+                 count={post_increment}"
+            );
+        }
+        EvaluationOutcome {
+            evidence: OutcomeEvidence::Unattributed,
+            timestamp_iso8601: current_timestamp_iso8601(),
         }
     }
 }
@@ -1165,6 +1228,7 @@ mod armed_identity_tests {
         signing: SigningKey,
         store: Arc<Mutex<ManifestStore>>,
         wal: Arc<Mutex<WalWriter>>,
+        ring: Arc<Mutex<AuditRingBuffer>>,
         engine: DecisionEngine,
     }
 
@@ -1197,7 +1261,7 @@ mod armed_identity_tests {
             FORTRESS.to_string(),
             Some(Arc::clone(&store)),
             Some(Arc::clone(&wal)),
-            ring,
+            Arc::clone(&ring),
         );
         Fixture {
             _dir: dir,
@@ -1205,6 +1269,7 @@ mod armed_identity_tests {
             signing,
             store,
             wal,
+            ring,
             engine,
         }
     }
@@ -1440,6 +1505,159 @@ mod armed_identity_tests {
                 row["operation"].as_str().unwrap_or_default().to_string()
             })
             .collect()
+    }
+
+    fn evaluation_request(agent_id: String, ip: &str) -> EvaluationRequest {
+        EvaluationRequest {
+            agent_id,
+            agent_template: "claude-code".to_string(),
+            dest_host: Some("api.example.com".to_string()),
+            dest_ip: Some(ip.to_string()),
+            dest_port: 443,
+            dest_protocol: "tcp".to_string(),
+            opaque: false,
+        }
+    }
+
+    fn wal_len(wal: &Arc<Mutex<WalWriter>>) -> usize {
+        wal.lock().unwrap().snapshot_after(None, 100).unwrap().len()
+    }
+
+    fn ring_len(ring: &Arc<Mutex<AuditRingBuffer>>) -> usize {
+        ring.lock().unwrap().len()
+    }
+
+    #[test]
+    fn should_log_is_exactly_the_power_of_two_schedule() {
+        for n in 0..=4096 {
+            assert_eq!(should_log(n), n.is_power_of_two(), "{n}");
+        }
+        assert!(!should_log(0));
+        assert!(!should_log(u64::MAX));
+    }
+
+    #[test]
+    fn resolve_audit_subject_accepts_only_the_admitted_confined_uid_mark() {
+        let identity = AdmittedIdentity {
+            fortress_id: "0123456789abcdef".to_string(),
+            subject: AdmittedSubject::Confined {
+                agent_uid: TEST_AGENT_UID,
+                ceiling: FIXTURE_CEILING,
+                gate_uid: Some(TEST_AGENT_UID + 1),
+            },
+        };
+        let subject = resolve_audit_subject(
+            Some(&identity),
+            &crate::nftables::confined_agent_id(TEST_AGENT_UID),
+        )
+        .expect("admitted subject");
+        assert_eq!(subject.as_str(), "0123456789abcdef/uid-60123");
+        assert_eq!(subject.fortress_id(), "0123456789abcdef");
+
+        for rejected in [
+            crate::nftables::confined_agent_id(TEST_AGENT_UID + 1),
+            crate::nftables::confined_agent_id(TEST_AGENT_UID + 2),
+            "agent-x".to_string(),
+            "uid-01".to_string(),
+            "uid-".to_string(),
+            "uid-0".to_string(),
+        ] {
+            assert!(
+                resolve_audit_subject(Some(&identity), &rejected).is_none(),
+                "{rejected}"
+            );
+        }
+        assert!(
+            resolve_audit_subject(None, &crate::nftables::confined_agent_id(TEST_AGENT_UID))
+                .is_none()
+        );
+        let unconfined = AdmittedIdentity {
+            fortress_id: "0123456789abcdef".to_string(),
+            subject: AdmittedSubject::Unconfined,
+        };
+        assert!(resolve_audit_subject(
+            Some(&unconfined),
+            &crate::nftables::confined_agent_id(TEST_AGENT_UID)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unattributed_attempts_are_counted_and_never_touch_wal_or_ring() {
+        let f = fixture();
+        let _ = f.engine.reload_manifest_authorized_at_boot();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+        let request = evaluation_request(
+            crate::nftables::confined_agent_id(TEST_AGENT_UID),
+            "203.0.113.7",
+        );
+        for _ in 0..1000 {
+            let outcome = f.engine.evaluate_attempt(&request).expect("evaluate");
+            assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
+            assert!(matches!(
+                outcome.verdict(),
+                Verdict::Deny {
+                    reason: DeniedReason::DefaultDeny
+                }
+            ));
+            assert!(outcome.wal_seq().is_none());
+            assert!(outcome.event_canonical_json().is_none());
+        }
+        assert_eq!(f.engine.unattributed_attempts_for_test(), 1000);
+        assert_eq!(f.engine.unattributed_log_lines_for_test(), 10);
+        assert_eq!(wal_len(&f.wal), baseline_wal);
+        assert_eq!(ring_len(&f.ring), baseline_ring);
+    }
+
+    #[test]
+    fn evaluate_attempt_records_only_the_admitted_snapshot_uid_mark() {
+        let f = fixture();
+        write_policy(
+            &f.policy_dir,
+            &f.signing,
+            1,
+            Some(TEST_AGENT_UID),
+            Some(TEST_AGENT_UID + 1),
+            "r1",
+        );
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal_len(&f.wal);
+        let baseline_ring = ring_len(&f.ring);
+
+        for rejected in [TEST_AGENT_UID + 1, TEST_AGENT_UID + 2] {
+            let outcome = f
+                .engine
+                .evaluate_attempt(&evaluation_request(
+                    crate::nftables::confined_agent_id(rejected),
+                    "203.0.113.7",
+                ))
+                .expect("evaluate");
+            assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
+            assert_eq!(wal_len(&f.wal), baseline_wal);
+            assert_eq!(ring_len(&f.ring), baseline_ring);
+        }
+
+        let outcome = f
+            .engine
+            .evaluate_attempt(&evaluation_request(
+                crate::nftables::confined_agent_id(TEST_AGENT_UID),
+                "203.0.113.7",
+            ))
+            .expect("evaluate");
+        assert!(matches!(
+            outcome.evidence,
+            OutcomeEvidence::Recorded {
+                verdict: Verdict::Allow { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.subject().expect("subject").as_str(),
+            "deadbeef/uid-60123"
+        );
+        assert_eq!(wal_len(&f.wal), baseline_wal + 1);
+        assert_eq!(ring_len(&f.ring), baseline_ring + 1);
     }
 
     #[test]
@@ -2343,6 +2561,15 @@ mod mutation_tests {
             Some(Arc::clone(&wal)),
             Arc::clone(&ring),
         );
+        let agent_uid = 60_123;
+        assert!(engine.freeze_armed_identity_for_test(AdmittedIdentity {
+            fortress_id: "f".to_string(),
+            subject: AdmittedSubject::Confined {
+                agent_uid,
+                ceiling: 500,
+                gate_uid: None,
+            },
+        }));
         // Hold the ring from another thread for longer than the verdict budget.
         let held = Arc::clone(&ring);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2353,7 +2580,7 @@ mod mutation_tests {
         });
         rx.recv().unwrap(); // the ring is now provably held before the verdict runs
         let request = EvaluationRequest {
-            agent_id: "a".to_string(),
+            agent_id: crate::nftables::confined_agent_id(agent_uid),
             agent_template: "t".to_string(),
             dest_host: None,
             dest_ip: Some("203.0.113.1".to_string()),
@@ -2367,7 +2594,7 @@ mod mutation_tests {
             .expect("verdict must return, never block unboundedly on a contended ring");
         let elapsed = started.elapsed();
         assert!(
-            outcome.wal_seq.is_some(),
+            outcome.wal_seq().is_some(),
             "the durable verdict receipt must still be written while the ring is contended"
         );
         assert!(
@@ -2379,13 +2606,84 @@ mod mutation_tests {
     }
 }
 
+pub fn should_log(n: u64) -> bool {
+    n.is_power_of_two()
+}
+
+/// Policy decision plus its durable evidence receipt.
+#[derive(Debug, Clone)]
+pub enum OutcomeEvidence {
+    Recorded {
+        verdict: Verdict,
+        wal_seq: u64,
+        subject: ProtectionSubject,
+        event_canonical_json: String,
+    },
+    RingOnlyFailClosed {
+        subject: ProtectionSubject,
+        event_canonical_json: String,
+    },
+    Unattributed,
+}
+
 /// Policy decision plus its durable evidence receipt.
 #[derive(Debug, Clone)]
 pub struct EvaluationOutcome {
-    pub verdict: Verdict,
-    pub wal_seq: Option<u64>,
-    pub event_canonical_json: String,
+    pub evidence: OutcomeEvidence,
     pub timestamp_iso8601: String,
+}
+
+impl EvaluationOutcome {
+    pub fn verdict(&self) -> Verdict {
+        match &self.evidence {
+            OutcomeEvidence::Recorded { verdict, .. } => verdict.clone(),
+            OutcomeEvidence::RingOnlyFailClosed { .. } => Verdict::Deny {
+                reason: DeniedReason::AuditWalAppendFailed,
+            },
+            OutcomeEvidence::Unattributed => Verdict::Deny {
+                reason: DeniedReason::DefaultDeny,
+            },
+        }
+    }
+
+    pub fn releases(&self) -> bool {
+        matches!(
+            &self.evidence,
+            OutcomeEvidence::Recorded {
+                verdict: Verdict::Allow { .. },
+                ..
+            }
+        )
+    }
+
+    pub fn wal_seq(&self) -> Option<u64> {
+        match &self.evidence {
+            OutcomeEvidence::Recorded { wal_seq, .. } => Some(*wal_seq),
+            OutcomeEvidence::RingOnlyFailClosed { .. } | OutcomeEvidence::Unattributed => None,
+        }
+    }
+
+    pub fn event_canonical_json(&self) -> Option<&str> {
+        match &self.evidence {
+            OutcomeEvidence::Recorded {
+                event_canonical_json,
+                ..
+            }
+            | OutcomeEvidence::RingOnlyFailClosed {
+                event_canonical_json,
+                ..
+            } => Some(event_canonical_json.as_str()),
+            OutcomeEvidence::Unattributed => None,
+        }
+    }
+
+    pub fn subject(&self) -> Option<&ProtectionSubject> {
+        match &self.evidence {
+            OutcomeEvidence::Recorded { subject, .. }
+            | OutcomeEvidence::RingOnlyFailClosed { subject, .. } => Some(subject),
+            OutcomeEvidence::Unattributed => None,
+        }
+    }
 }
 
 /// Errors returned before a kernel verdict can be produced.

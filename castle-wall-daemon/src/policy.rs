@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
 use crate::manifest::canonical_json::{canonicalize, CanonicalJsonError};
 use crate::manifest::store::LoadedManifest;
+use crate::ProtectionSubject;
 
 /// Disposition applied when a rule matches an outbound flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1440,12 +1441,13 @@ fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
 }
 
 /// Build the canonical-JSON `AuditEntry` body for a verdict + request.
-/// Shape matches scope-lock §8 critical-event recommendation: `layer:
-/// "l1"`, `operation` from [`operation_for_verdict`], `identity_id` =
-/// the canonical Sanctuary protection subject (`fortress_id/uid-N`) when the
-/// signed manifest binds Linux uid-mode origin, `result` from
-/// [`result_for_verdict`], and a `details` object carrying destination metadata
-/// + rule provenance.
+///
+/// The caller supplies a resolved [`ProtectionSubject`], so this builder never
+/// invents an audit principal from a bare agent name. `identity_id` is the
+/// rendered subject (`fortress_id/uid-N`), `fortress_id` is read from the same
+/// subject, `operation` comes from [`operation_for_verdict`], `result` comes
+/// from [`result_for_verdict`], and `details` carries destination metadata plus
+/// rule provenance.
 ///
 /// The body is canonicalized so the bytes Sanctuary main signs on drain
 /// match what the daemon hashed into the WAL chain. `timestamp_iso8601`
@@ -1453,8 +1455,7 @@ fn matched_rule_id(verdict: &Verdict) -> Option<&str> {
 pub fn build_audit_event_canonical_json(
     verdict: &Verdict,
     request: &EvaluationRequest,
-    fortress_id: &str,
-    confined_agent_uid: Option<u32>,
+    subject: &ProtectionSubject,
     timestamp_iso8601: &str,
 ) -> Result<String, CanonicalJsonError> {
     let mut details = serde_json::Map::new();
@@ -1513,14 +1514,15 @@ pub fn build_audit_event_canonical_json(
     );
     entry.insert(
         "identity_id".to_string(),
-        serde_json::Value::String(
-            protection_subject_for_uid(fortress_id, confined_agent_uid)
-                .unwrap_or_else(|| request.agent_id.clone()),
-        ),
+        // identity_id and fortress_id come from one subject; the row must not
+        // combine a signed uid with a different fortress.
+        serde_json::Value::String(subject.as_str().to_string()),
     );
     entry.insert(
         "fortress_id".to_string(),
-        serde_json::Value::String(fortress_id.to_string()),
+        // identity_id and fortress_id come from one subject; the row must not
+        // combine a signed uid with a different fortress.
+        serde_json::Value::String(subject.fortress_id().to_string()),
     );
     entry.insert(
         "result".to_string(),
@@ -1564,8 +1566,7 @@ pub fn build_superseding_verdict_canonical_json(
     superseded_wal_seq: u64,
     final_verdict: &str,
     reason: &str,
-    fortress_id: &str,
-    identity_id: &str,
+    subject: &ProtectionSubject,
     timestamp_iso8601: &str,
 ) -> Result<String, CanonicalJsonError> {
     let mut details = serde_json::Map::new();
@@ -1597,11 +1598,15 @@ pub fn build_superseding_verdict_canonical_json(
     );
     entry.insert(
         "identity_id".to_string(),
-        serde_json::Value::String(identity_id.to_string()),
+        // identity_id and fortress_id come from one subject; the correction
+        // names the receipt's own subject.
+        serde_json::Value::String(subject.as_str().to_string()),
     );
     entry.insert(
         "fortress_id".to_string(),
-        serde_json::Value::String(fortress_id.to_string()),
+        // identity_id and fortress_id come from one subject; the correction
+        // names the receipt's own subject.
+        serde_json::Value::String(subject.fortress_id().to_string()),
     );
     // `blocked`, not `superseded`: the RESULT field says what happened to the
     // packet, and what happened is that it was dropped on the wire. The
@@ -1613,14 +1618,6 @@ pub fn build_superseding_verdict_canonical_json(
     entry.insert("details".to_string(), serde_json::Value::Object(details));
 
     canonicalize(&serde_json::Value::Object(entry))
-}
-
-fn protection_subject_for_uid(fortress_id: &str, uid: Option<u32>) -> Option<String> {
-    let uid = uid.filter(|candidate| *candidate > 0)?;
-    if fortress_id.is_empty() {
-        return None;
-    }
-    Some(format!("{fortress_id}/uid-{uid}"))
 }
 
 #[cfg(test)]
@@ -3263,20 +3260,29 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(body).expect("parse canonical")
     }
 
+    fn subject(uid: u32) -> ProtectionSubject {
+        ProtectionSubject::new("deadbeef", uid).expect("test subject")
+    }
+
+    #[test]
+    fn protection_subject_refuses_empty_fortress_or_uid_zero_and_renders_uid() {
+        assert!(ProtectionSubject::new("", 503).is_none());
+        assert!(ProtectionSubject::new("deadbeef", 0).is_none());
+        let subject = ProtectionSubject::new("f", 503).expect("subject");
+        assert_eq!(subject.as_str(), "f/uid-503");
+        assert_eq!(subject.fortress_id(), "f");
+        assert_eq!(subject.uid(), 503);
+    }
+
     #[test]
     fn audit_for_allow_emits_egress_approved() {
         let v = Verdict::Allow {
             rule_id: "r1".to_string(),
         };
         let request = req(Some("api.anthropic.com"), 443, "tcp");
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["layer"], json!("l1"));
         assert_eq!(parsed["operation"], json!("egress_approved"));
@@ -3305,40 +3311,13 @@ mod tests {
         let mut request = req(Some("api.example.com"), 443, "tcp");
         request.agent_id = "agent/a".to_string();
 
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
 
         assert_eq!(parsed["identity_id"], json!("deadbeef/uid-503"));
         assert_eq!(parsed["details"]["agent_id"], json!("agent/a"));
-    }
-
-    #[test]
-    fn audit_without_uid_origin_keeps_legacy_agent_name_subject_unbound_shape() {
-        let v = Verdict::Deny {
-            reason: DeniedReason::DefaultDeny,
-        };
-        let request = req(Some("api.example.com"), 443, "tcp");
-
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            None,
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
-        let parsed = parse_canonical(&body);
-
-        assert_eq!(parsed["fortress_id"], json!("deadbeef"));
-        assert_eq!(parsed["identity_id"], json!("agent-1"));
-        assert_eq!(parsed["details"]["agent_id"], json!("agent-1"));
     }
 
     #[test]
@@ -3353,36 +3332,26 @@ mod tests {
         let uid_503 = build_audit_event_canonical_json(
             &v,
             &request,
-            "fortress:test",
-            Some(503),
+            &ProtectionSubject::new("fortress:test", 503).expect("test subject"),
             "2026-05-05T01:02:03Z",
         )
         .unwrap();
         let uid_504 = build_audit_event_canonical_json(
             &v,
             &request,
-            "fortress:test",
-            Some(504),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
-        let old_agent_name = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "fortress:test",
-            None,
+            &ProtectionSubject::new("fortress:test", 504).expect("test subject"),
             "2026-05-05T01:02:03Z",
         )
         .unwrap();
 
         assert_eq!(uid_503, fixture["uid_503"].as_str().unwrap());
         assert_eq!(uid_504, fixture["uid_504"].as_str().unwrap());
-        assert_eq!(old_agent_name, fixture["old_agent_name"].as_str().unwrap());
+        // These vectors are builder output; do not rewrite the fixture file.
+        assert!(fixture["old_agent_name"].is_string());
 
         if std::env::var("SANCTUARY_CAPTURE_LINUX_AUDIT_FIXTURES").as_deref() == Ok("1") {
             println!("uid_503={uid_503}");
             println!("uid_504={uid_504}");
-            println!("old_agent_name={old_agent_name}");
         }
     }
 
@@ -3392,14 +3361,9 @@ mod tests {
             reason: DeniedReason::DefaultDeny,
         };
         let request = req(Some("api.evil.com"), 443, "tcp");
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
         assert_eq!(parsed["result"], json!("failure"));
@@ -3421,14 +3385,9 @@ mod tests {
             },
         };
         let request = req(Some("pastebin.com"), 443, "tcp");
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
         assert_eq!(
@@ -3444,14 +3403,9 @@ mod tests {
             rule_id: "r-prompt".to_string(),
         };
         let request = req(Some("api.example.com"), 443, "tcp");
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_pending"));
         assert_eq!(parsed["result"], json!("success"));
@@ -3472,14 +3426,9 @@ mod tests {
             dest_protocol: "tcp".to_string(),
             opaque: true,
         };
-        let body = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(504),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let body =
+            build_audit_event_canonical_json(&v, &request, &subject(504), "2026-05-05T01:02:03Z")
+                .unwrap();
         let parsed = parse_canonical(&body);
         assert!(parsed["details"].get("dest_host").is_none());
         assert_eq!(parsed["details"]["dest_ip"], json!("203.0.113.10"));
@@ -3495,25 +3444,34 @@ mod tests {
             rule_id: "r1".to_string(),
         };
         let request = req(Some("api.anthropic.com"), 443, "tcp");
-        let a = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
-        let b = build_audit_event_canonical_json(
-            &v,
-            &request,
-            "deadbeef",
-            Some(503),
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
+        let a =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
+        let b =
+            build_audit_event_canonical_json(&v, &request, &subject(503), "2026-05-05T01:02:03Z")
+                .unwrap();
         assert_eq!(a, b);
         // Same shape under canonical-JSON byte serialization.
         let bytes_a = canonicalize_to_bytes(&serde_json::from_str(&a).unwrap()).unwrap();
         assert_eq!(a.as_bytes(), bytes_a.as_slice());
+    }
+
+    #[test]
+    fn identity_id_insertions_are_subject_only_and_decision_builds_no_identity_json() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let policy = std::fs::read_to_string(root.join("src/policy.rs")).unwrap();
+        for hit in policy.match_indices("entry.insert(\n        \"identity_id\"") {
+            let body = &policy[hit.0..policy[hit.0..].find(");").unwrap() + hit.0];
+            assert!(!body.contains("agent_id"), "{body}");
+            assert!(!body.contains("agent_id_for_audit"), "{body}");
+            assert!(body.contains("subject"), "{body}");
+        }
+        let decision = std::fs::read_to_string(root.join("src/decision.rs")).unwrap();
+        assert!(
+            !decision.contains("\"identity_id\""),
+            "decision code must call the shared builder rather than hand-building subject JSON"
+        );
+        let nfqueue = std::fs::read_to_string(root.join("src/nfqueue.rs")).unwrap();
+        assert!(!nfqueue.contains("agent_id_for_audit"));
     }
 }
