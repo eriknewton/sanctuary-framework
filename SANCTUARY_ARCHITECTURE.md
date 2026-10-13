@@ -142,7 +142,7 @@ These are testable assertions. Each should be verifiable by inspection or automa
 
 **Operational sovereignty:**
 
-9. "Every tool call is evaluated by the ApprovalGate before execution. There is no code path that bypasses the gate." *(Verified by router.ts wrapping all handlers)*
+9. "The router evaluates every tool call it dispatches to a tool handler or an upstream server through the ApprovalGate before execution." *(Verified by router.ts wrapping all handlers)*
 10. "Tier 1 operations (export, import, rotate, delete) require out-of-band human approval. If the approval channel is unreachable, the operation is denied, never auto-approved."
 11. "The agent cannot read, modify, or infer the contents of the Principal Policy at runtime. Denial messages are generic."
 12. "All gate decisions (approve, deny, auto-allow) are appended to the encrypted audit log."
