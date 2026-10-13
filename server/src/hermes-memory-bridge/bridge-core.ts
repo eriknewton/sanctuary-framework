@@ -531,14 +531,15 @@ export class HermesBridgeCore {
     slot.commitIds = { passageId: context.passageId, documentId: context.documentId };
     const probe = this.startProbeOrRefuse(slot);
     const verdict = probe === "pending" ? await this.awaitProbeVerdict(slot) : probe;
-    const durable = verdict === "resolved" ? await this.awaitDurabilityForAllow(slot) : false;
-    const finalVerdict: HermesApprovalProbeVerdict = durable ? verdict : "refused";
+    if (verdict === "resolved") {
+      await this.awaitDurabilityForAllow(slot);
+    }
     const entry = this.ledger.snapshot().entry;
     const record = this.recordSnapshot(slot.recordId);
     const recordCurrent = entry?.id === slot.entryId && record?.state === "IN_FLIGHT";
     // No await is allowed between this record snapshot and commitCheck; queued controls must already be reflected in ledger state.
     const checked = this.ledger.commitCheck(slot.entryId, {
-      probe: finalVerdict,
+      probe: verdict,
       nowMs: this.ports.nowMs(),
       recordCurrent,
       passageTextSha256: context.passageTextSha256,
