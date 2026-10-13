@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   HERMES_MAX_CALL_RECORDS,
+  HERMES_MEMORY_DENIAL_MESSAGE,
   HERMES_MAX_PUBLIC_CONNECTIONS,
   HERMES_SETTLING_RESERVE,
   HermesConnectionLifecycle,
@@ -140,6 +141,55 @@ function actionTypes(actions: readonly HermesLifecycleAction[]): readonly Hermes
   return actions.map((action) => action.type);
 }
 
+function expectedActionsFor(
+  event: HermesLifecycleEvent,
+  recordId: string | undefined,
+  expectedTypes: readonly HermesLifecycleAction["type"][],
+): readonly HermesLifecycleAction[] {
+  if (expectedTypes.length === 0) return [];
+  if (expectedTypes[0] === "route_call" && event.type === "call") {
+    return [{ type: "route_call", connectionId: event.connectionId, recordId: recordId ?? "call-1", requestId: event.requestId, kind: event.kind }];
+  }
+  if (expectedTypes[0] === "deliver_control" && event.type === "cancel" && recordId !== undefined) {
+    return [{ type: "deliver_control", connectionId: event.connectionId, recordId, requestId: event.mcpRequestId, control: "cancel" }];
+  }
+  if (expectedTypes[0] === "deliver_control" && event.type === "public_shutdown" && recordId !== undefined) {
+    return [{ type: "deliver_control", connectionId: event.connectionId, recordId, requestId: "r1", control: "shutdown" }];
+  }
+  if (expectedTypes[0] === "send_close" && "connectionId" in event) {
+    return [{ type: "send_close", connectionId: event.connectionId }];
+  }
+  return [];
+}
+
+function exactFrameActions(summary: Parameters<typeof classifyHermesPublicFrameSummary>[0], state: "idle" | "busy"): readonly HermesLifecycleAction[] {
+  const classified = classifyHermesPublicFrameSummary(summary);
+  if (state === "idle" && classified.type === "call") {
+    if (classified.valid) {
+      return [{ type: "route_call", connectionId: "c1", recordId: "call-1", requestId: classified.requestId, kind: classified.kind }];
+    }
+    return [
+      {
+        type: "send_fixed_denial",
+        connectionId: "c1",
+        recordId: "call-1",
+        requestId: classified.requestId,
+        message: HERMES_MEMORY_DENIAL_MESSAGE,
+        responseClass: "immediate",
+      },
+    ];
+  }
+  if (state === "idle" && classified.type === "public_unparseable") return [{ type: "send_close", connectionId: "c1" }];
+  if (state === "busy" && classified.type === "cancel") {
+    return [{ type: "deliver_control", connectionId: "c1", recordId: "call-1", requestId: classified.mcpRequestId, control: "cancel" }];
+  }
+  if (state === "busy" && classified.type === "public_shutdown") {
+    return [{ type: "deliver_control", connectionId: "c1", recordId: "call-1", requestId: "r1", control: "shutdown" }];
+  }
+  if (state === "busy" && classified.type === "public_unparseable") return [{ type: "send_close", connectionId: "c1" }];
+  return [];
+}
+
 function firstRecordId(actions: readonly HermesLifecycleAction[]): string {
   const action = actions[0];
   if (action === undefined || !("recordId" in action)) throw new Error("expected record action");
@@ -183,9 +233,11 @@ describe("Hermes connection lifecycle table", () => {
     "%s x %s follows the lifecycle table",
     (state, event) => {
       const { lifecycle, recordId } = setupState(state);
-      const result = lifecycle.apply(eventFor(event, recordId));
+      const lifecycleEvent = eventFor(event, recordId);
+      const result = lifecycle.apply(lifecycleEvent);
       const expected = CELL_TABLE[state][event];
       expect(actionTypes(result.actions)).toEqual(expected.actions);
+      expect(result.actions).toEqual(expectedActionsFor(lifecycleEvent, recordId, expected.actions));
       expect(result.fatal?.reason).toBe(expected.fatal);
       expect(result.refusal?.reason).toBe(expected.refusal);
       expect(lifecycle.stateOf("c1")).toBe(expected.next);
@@ -195,21 +247,6 @@ describe("Hermes connection lifecycle table", () => {
     },
   );
 
-  it("emits close in every lifecycle table closing cell", () => {
-    const closingCells = CONNECTION_STATES.flatMap((state) =>
-      CELL_EVENTS.filter((event) => CELL_TABLE[state][event].actions.includes("send_close")).map((event) => `${state} x ${event}`),
-    );
-    expect(closingCells.sort()).toEqual(
-      [
-        "OPEN_BUSY x node_close",
-        "OPEN_BUSY x public_unparseable",
-        "OPEN_BUSY_PEER_SHUTTING x node_close",
-        "OPEN_IDLE x node_close",
-        "OPEN_IDLE x public_unparseable",
-        "OPEN_IDLE_PEER_SHUTTING x node_close",
-      ].sort(),
-    );
-  });
 });
 
 describe("Hermes lifecycle amendments", () => {
@@ -278,6 +315,11 @@ describe("Hermes lifecycle amendments", () => {
     expect(reached.has(nodeClosed)).toBe(true);
     expect(reached.has(attached)).toBe(true);
     expect(reached.has(alreadyShutdown)).toBe(false);
+    expect(shutdown.actions).toEqual([
+      { type: "deliver_control", connectionId: "gone", recordId: gone, requestId: "r1", control: "shutdown" },
+      { type: "deliver_control", connectionId: "node", recordId: nodeClosed, requestId: "r2", control: "shutdown" },
+      { type: "deliver_control", connectionId: "busy", recordId: attached, requestId: "r4", control: "shutdown" },
+    ]);
     expect(lifecycle.recordsSnapshot().every((record) => record.state === "SHUT_DOWN")).toBe(true);
     expect(lifecycle.apply({ type: "call", connectionId: "busy", requestId: "later", kind: "hello", valid: true }).actions).toEqual([]);
     expect(lifecycle.apply({ type: "public_unparseable", connectionId: "busy" }).actions).toEqual([]);
@@ -401,7 +443,10 @@ describe("Hermes lifecycle amendments", () => {
         const result = lifecycle.apply({ ...classifyHermesPublicFrameSummary(summary), connectionId: "c1" } as HermesLifecycleEvent);
         const want = state === "idle" ? idleWant : busyWant;
         if (typeof want === "string") expect(result.fatal?.reason).toBe(want);
-        else expect(actionTypes(result.actions)).toEqual(want);
+        else {
+          expect(actionTypes(result.actions)).toEqual(want);
+          expect(result.actions).toEqual(exactFrameActions(summary, state));
+        }
       }
     }
   });
