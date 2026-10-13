@@ -31,6 +31,7 @@
 
 import {
   AGENT_PILL_FN_SOURCE,
+  CONSOLE_FONT_FACE_CSS,
   POSTURE_ROOT_TOKENS_CSS,
   STATUS_PILL_CSS,
   THEME_BOOTSTRAP_SCRIPT,
@@ -47,6 +48,7 @@ export function renderPostureAgentHTML(): string {
 <title>Sanctuary - Agent posture</title>
 <script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
+  ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {
