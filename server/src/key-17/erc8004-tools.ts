@@ -335,12 +335,17 @@ export function createErc8004Tools(
   const tools: ToolDefinition[] = [
     {
       name: "sanctuary/sign_erc8004_identity",
+      // The CLI verb, its required flags and `--auto-approve` named below must
+      // match printUsage in server/src/cli/erc8004.ts; the description never
+      // shows a partial invocation an agent would paste and have refused.
       description:
         "Request an ERC-8004 Identity Registry registration signature. " +
-        "The request flows through the three-tier policy gate: pre-approved " +
-        "counterparties get an immediate signature; others require operator " +
-        "approval via the inbox. No on-chain broadcast; the caller submits " +
-        "the returned signature to the registry contract.",
+        "Requires operator approval under the default policy (not named in a policy tier; the gate's safe default). " +
+        "After that approval the request also passes the key-17 signing policy; a request that policy does not " +
+        "allow returns pending_approval with an inbox entry, and in this release it is not completed from this tool: " +
+        "the operator produces the signature on the CLI by running `sanctuary erc8004 register` with its required " +
+        "registry, chain, agent-id and nonce flags plus `--auto-approve` (the flag that skips the inbox wait). " +
+        "No on-chain broadcast; the caller submits the returned signature to the registry contract.",
       inputSchema: {
         type: "object",
         properties: {

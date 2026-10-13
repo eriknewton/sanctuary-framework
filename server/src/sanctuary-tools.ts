@@ -5,10 +5,15 @@
  * subsystems (identity, SHR, Verascore publishing, principal policy):
  *
  *   sanctuary/sanctuary_bootstrap              (Tier 1)
- *   sanctuary/sanctuary_policy_status          (Tier 3)
+ *   sanctuary/sanctuary_policy_status          (Tier 1, a forced operator-approved read)
  *   sanctuary/sanctuary_export_identity_bundle (Tier 1)
- *   sanctuary/sanctuary_link_to_human          (Tier 2, auto-allowed + anomaly-gated)
- *   sanctuary/sanctuary_sign_challenge         (Tier 2, auto-allowed + anomaly-gated)
+ *   sanctuary/sanctuary_link_to_human          (unlisted: operator approval under the default policy)
+ *   sanctuary/sanctuary_sign_challenge         (unlisted: operator approval under the default policy)
+ *
+ * Tier labels must match each tool's `description` below and the default
+ * policy in `principal-policy/loader.ts` (`enforceForcedTiers(DEFAULT_POLICY)`);
+ * an unlisted tool is Tier 2 on a first session and Tier 1 afterwards, so this
+ * header names the approval, never a tier number, for those two.
  */
 
 import type { ToolDefinition } from "./router.js";
@@ -126,7 +131,8 @@ export function createSanctuaryTools(
         "One-shot bootstrap for a new sovereign agent identity. " +
         "Generates an Ed25519 keypair, stores the encrypted identity, " +
         "constructs an SHR, and OPTIONALLY publishes to Verascore when publish=true " +
-        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status.",
+        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status. " +
+        "Tier 1: requires operator approval, because it mints a new identity and may publish.",
       inputSchema: {
         type: "object",
         properties: {
@@ -295,11 +301,13 @@ export function createSanctuaryTools(
 
     // ─── sanctuary_policy_status ───────────────────────────────────────
     {
+      // Must match EVALUATE_ROUTE_TOOLS.policyStatus in server/src/agent-native/capabilities-catalog.ts.
       name: "sanctuary_policy_status",
       description:
         "Return active Principal Policy summary: explicit Tier 1 and Tier 3 operation " +
         "lists plus Tier 2 anomaly-detection configuration. Tier 2 is not exposed as " +
-        "a named operation list.",
+        "a named operation list." +
+        " Tier 1 and non-relaxable: requires operator approval on every call.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -341,7 +349,8 @@ export function createSanctuaryTools(
       description:
         "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. " +
         "The bundle is signed with the identity's Ed25519 key so a recipient can verify " +
-        "authenticity against the public key. Private keys are never included.",
+        "authenticity against the public key. Private keys are never included. " +
+        "Tier 1: requires operator approval, because the bundle leaves the local store.",
       inputSchema: {
         type: "object",
         properties: {
@@ -431,7 +440,8 @@ export function createSanctuaryTools(
         "Trigger a Verascore magic-link login flow so a human principal can " +
         "authenticate and subsequently claim this agent's DID. The email is " +
         "sent by Verascore to the supplied address. This tool only initiates " +
-        "the flow — it does not directly bind the DID.",
+        "the flow; it does not directly bind the DID." +
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {
@@ -506,10 +516,11 @@ export function createSanctuaryTools(
         "Used in DID-ownership proof flows. The signed message is constructed as: " +
         "'sanctuary-sign-challenge-v1\\x00' + purpose + '\\x00' + nonce. " +
         "The verifier MUST reconstruct the same domain-prefixed message before " +
-        "calling Ed25519 verify — a raw-nonce signature is NOT valid for this tool. " +
+        "calling Ed25519 verify; a raw-nonce signature is NOT valid for this tool. " +
         "The `purpose` field binds the signature to a specific use case (e.g. " +
         "'verascore-claim') so a signature produced for one purpose cannot be " +
-        "replayed against a different verifier.",
+        "replayed against a different verifier." +
+        " Requires operator approval under the default policy (not named in a policy tier; the gate's safe default).",
       inputSchema: {
         type: "object",
         properties: {
