@@ -32,7 +32,13 @@ export type HermesMemoryToolArguments =
 
 export type PublicFrameParseResult =
   | { readonly kind: "ok"; readonly frame: PublicFrame }
-  | { readonly kind: "public_rejection"; readonly reason: string };
+  | {
+    readonly kind: "public_rejection";
+    readonly reason: string;
+    readonly disposition: "deny" | "silent" | "close";
+    readonly frameType?: string;
+    readonly requestId?: string;
+  };
 
 export type RelayToNodeFrame =
   | { readonly kind: "accepted"; readonly connectionId: string }
@@ -51,6 +57,131 @@ export type NodeToRelayInput =
   | { readonly type: "response"; readonly connectionId: string; readonly requestId: string; readonly publicPayloadBytes: Uint8Array }
   | { readonly type: "close"; readonly connectionId: string };
 
+export type HermesWireEncodeErrorCode =
+  | "invalid_connection_id"
+  | "invalid_nonce"
+  | "invalid_request_id"
+  | "invalid_encoder_envelope"
+  | "private_frame_over_cap";
+
+export class HermesWireEncodeError extends Error {
+  constructor(
+    readonly code: HermesWireEncodeErrorCode,
+    message: string = code,
+  ) {
+    super(message);
+    this.name = "HermesWireEncodeError";
+  }
+}
+
+type FieldValidator = (value: unknown) => boolean;
+
+type ObjectSchema = {
+  readonly required: readonly string[];
+  readonly optional?: readonly string[];
+  readonly fields: Readonly<Record<string, FieldValidator>>;
+  readonly refine?: (value: Record<string, unknown>) => boolean;
+};
+
+type SchemaTable = Readonly<Record<string, ObjectSchema>>;
+
+const stringField: FieldValidator = (value) => typeof value === "string";
+const objectField: FieldValidator = (value) => isRecord(value);
+const literal = (expected: string): FieldValidator => (value) => value === expected;
+
+const requestIdField: FieldValidator = (value) => isRequestId(value);
+const connectionIdField: FieldValidator = (value) => isConnectionId(value);
+const nonceField: FieldValidator = (value) => typeof value === "string" && NONCE_PATTERN.test(value);
+const standardBase64Field: FieldValidator = (value) => typeof value === "string" && decodeStandardBase64(value) !== null;
+const searchLimitField: FieldValidator = (value) =>
+  typeof value === "number" && Number.isInteger(value) && value >= MIN_SEARCH_LIMIT && value <= MAX_SEARCH_LIMIT;
+const stringArrayField: FieldValidator = (value) => Array.isArray(value) && value.every((entry) => typeof entry === "string");
+const taintField: FieldValidator = (value) => isTaint(value);
+
+// This table is the parser and encoder agreement point; every frame side uses the same keys and validators.
+export const HERMES_MEMORY_WIRE_SCHEMAS = Object.freeze({
+  relayToNode: Object.freeze({
+    accepted: schema(["type", "connection_id"], { type: literal("accepted"), connection_id: connectionIdField }),
+    frame: schema(["type", "connection_id", "frame_b64"], {
+      type: literal("frame"),
+      connection_id: connectionIdField,
+      frame_b64: standardBase64Field,
+    }),
+    closed: schema(["type", "connection_id"], { type: literal("closed"), connection_id: connectionIdField }),
+    probe_reply: schema(["type", "connection_id", "nonce"], {
+      type: literal("probe_reply"),
+      connection_id: connectionIdField,
+      nonce: nonceField,
+    }),
+    relay_shutdown: schema(["type"], { type: literal("relay_shutdown") }),
+  } satisfies SchemaTable),
+  nodeToRelay: Object.freeze({
+    ready: schema(["type"], { type: literal("ready") }),
+    probe: schema(["type", "connection_id", "nonce"], {
+      type: literal("probe"),
+      connection_id: connectionIdField,
+      nonce: nonceField,
+    }),
+    response: schema(["type", "connection_id", "request_id", "result_b64"], {
+      type: literal("response"),
+      connection_id: connectionIdField,
+      request_id: requestIdField,
+      result_b64: standardBase64Field,
+    }),
+    close: schema(["type", "connection_id"], { type: literal("close"), connection_id: connectionIdField }),
+  } satisfies SchemaTable),
+  publicInbound: Object.freeze({
+    hello: schema(["type", "request_id", "protocol_version", "client_name"], {
+      type: literal("hello"),
+      request_id: requestIdField,
+      protocol_version: stringField,
+      client_name: stringField,
+    }),
+    tools_list: schema(["type", "request_id"], { type: literal("tools_list"), request_id: requestIdField }),
+    tools_call: schema(["type", "request_id", "name", "arguments"], {
+      type: literal("tools_call"),
+      request_id: requestIdField,
+      name: stringField,
+      arguments: objectField,
+    }),
+    cancel: schema(["type", "mcp_request_id"], { type: literal("cancel"), mcp_request_id: requestIdField }),
+    shutdown: schema(["type"], { type: literal("shutdown") }),
+    ping: schema(["type"], { type: literal("ping") }),
+  } satisfies SchemaTable),
+  publicOutbound: Object.freeze({
+    result: schema(["type", "request_id", "payload"], {
+      type: literal("result"),
+      request_id: requestIdField,
+      payload: objectField,
+    }),
+    error: schema(["type", "request_id", "message"], {
+      type: literal("error"),
+      request_id: requestIdField,
+      message: stringField,
+    }),
+    pong: schema(["type"], { type: literal("pong") }),
+  } satisfies SchemaTable),
+  toolArguments: Object.freeze({
+    memory_insert: schema(["text", "taint"], {
+      text: stringField,
+      taint: taintField,
+      tags: stringArrayField,
+      passage_id: stringField,
+    }, ["tags", "passage_id"]),
+    memory_get: schema(["passage_id"], { passage_id: stringField }),
+    memory_search: schema([], {
+      text: stringField,
+      query: stringField,
+      tag: stringField,
+      limit: searchLimitField,
+    }, ["text", "query", "tag", "limit"], (args) => {
+      const hasText = typeof args.text === "string";
+      const hasQuery = typeof args.query === "string";
+      return hasText !== hasQuery;
+    }),
+  } satisfies SchemaTable),
+});
+
 export function parseRelayToNode(bytes: Uint8Array): RelayToNodeParseResult {
   let envelope: Record<string, unknown>;
   try {
@@ -60,20 +191,27 @@ export function parseRelayToNode(bytes: Uint8Array): RelayToNodeParseResult {
   }
   const type = envelope.type;
   if (typeof type !== "string") return fatal("missing private frame type");
+  const relaySchema = getSchema(HERMES_MEMORY_WIRE_SCHEMAS.relayToNode, type);
+  if (relaySchema === undefined) return fatal("unknown relay frame type");
+  // Exact schema validation is the fail-closed boundary between relay bytes and typed bridge frames.
+  if (!validateObjectSchema(envelope, relaySchema)) return fatal("unexpected private frame fields");
+
   switch (type) {
     case "accepted":
-      return parseConnectionEnvelope(envelope, "accepted");
+      return { kind: "ok", frame: { kind: "accepted", connectionId: envelope.connection_id as string } };
     case "closed":
-      return parseConnectionEnvelope(envelope, "closed");
+      return { kind: "ok", frame: { kind: "closed", connectionId: envelope.connection_id as string } };
     case "probe_reply":
-      return parseProbeReply(envelope);
+      return {
+        kind: "ok",
+        frame: { kind: "probe_reply", connectionId: envelope.connection_id as string, nonce: envelope.nonce as string },
+      };
     case "relay_shutdown":
-      return parseRelayShutdown(envelope);
+      return { kind: "ok", frame: { kind: "relay_shutdown" } };
     case "frame":
       return parseFrameEnvelope(envelope);
-    default:
-      return fatal("unknown relay frame type");
   }
+  return fatal("unknown relay frame type");
 }
 
 export function parsePublicFrame(bytes: Uint8Array): PublicFrameParseResult {
@@ -85,34 +223,53 @@ export function parsePublicFrame(bytes: Uint8Array): PublicFrameParseResult {
     return rejectPublic("invalid public JSON");
   }
   const type = frame.type;
-  if (typeof type !== "string") return rejectPublic("missing public frame type");
+  if (typeof type !== "string") return rejectPublic("missing public frame type", frame);
+  const publicSchema = getSchema(HERMES_MEMORY_WIRE_SCHEMAS.publicInbound, type);
+  if (publicSchema === undefined) return rejectPublic("public frame type is not forwarded to Node", frame);
+  if (!validateObjectSchema(frame, publicSchema)) return rejectPublic("invalid public frame fields", frame);
+
   switch (type) {
     case "hello":
-      return parsePublicHello(frame);
+      return {
+        kind: "ok",
+        frame: {
+          kind: "hello",
+          requestId: frame.request_id as string,
+          protocolVersion: frame.protocol_version as string,
+          clientName: frame.client_name as string,
+        },
+      };
     case "tools_list":
-      return parsePublicToolsList(frame);
+      return { kind: "ok", frame: { kind: "tools_list", requestId: frame.request_id as string } };
     case "tools_call":
       return parsePublicToolsCall(frame);
     case "cancel":
-      return parsePublicCancel(frame);
+      return { kind: "ok", frame: { kind: "cancel", mcpRequestId: frame.mcp_request_id as string } };
     case "shutdown":
-      return parsePublicShutdown(frame);
-    default:
-      return rejectPublic("public frame type is not forwarded to Node");
+      return { kind: "ok", frame: { kind: "shutdown" } };
+    case "ping":
+      return rejectPublic("ping is answered by the relay", frame);
   }
+  return rejectPublic("public frame type is not forwarded to Node", frame);
 }
 
 export function encodeNodeToRelay(input: NodeToRelayInput): Buffer {
   switch (input.type) {
     case "ready":
-      return encodeJsonEnvelope({ type: "ready" });
+      return encodeJsonEnvelope({ type: "ready" }, HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay.ready);
     case "probe":
       requireConnectionId(input.connectionId);
       requireNonce(input.nonce);
-      return encodeJsonEnvelope({ type: "probe", connection_id: input.connectionId, nonce: input.nonce });
+      return encodeJsonEnvelope(
+        { type: "probe", connection_id: input.connectionId, nonce: input.nonce },
+        HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay.probe,
+      );
     case "close":
       requireConnectionId(input.connectionId);
-      return encodeJsonEnvelope({ type: "close", connection_id: input.connectionId });
+      return encodeJsonEnvelope(
+        { type: "close", connection_id: input.connectionId },
+        HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay.close,
+      );
     case "response":
       requireConnectionId(input.connectionId);
       requireRequestId(input.requestId);
@@ -122,11 +279,15 @@ export function encodeNodeToRelay(input: NodeToRelayInput): Buffer {
 
 export function buildDeniedPublicResponseBytes(requestId: string): Uint8Array {
   requireRequestId(requestId);
-  return Buffer.from(JSON.stringify({
+  const envelope = {
     type: "error",
     request_id: requestId,
     message: HERMES_MEMORY_DENIAL,
-  }), "utf8");
+  };
+  if (!validateObjectSchema(envelope, HERMES_MEMORY_WIRE_SCHEMAS.publicOutbound.error)) {
+    throw new HermesWireEncodeError("invalid_encoder_envelope", "fixed denial violates public error schema");
+  }
+  return Buffer.from(JSON.stringify(envelope), "utf8");
 }
 
 export function decodeStandardBase64(value: string): Uint8Array | null {
@@ -136,34 +297,9 @@ export function decodeStandardBase64(value: string): Uint8Array | null {
   return decoded;
 }
 
-function parseConnectionEnvelope(
-  envelope: Record<string, unknown>,
-  type: "accepted" | "closed",
-): RelayToNodeParseResult {
-  if (!hasExactKeys(envelope, ["type", "connection_id"])) return fatal("unexpected private frame fields");
-  if (!isConnectionId(envelope.connection_id)) return fatal("invalid connection id");
-  return { kind: "ok", frame: { kind: type, connectionId: envelope.connection_id } };
-}
-
-function parseProbeReply(envelope: Record<string, unknown>): RelayToNodeParseResult {
-  if (!hasExactKeys(envelope, ["type", "connection_id", "nonce"])) return fatal("unexpected private frame fields");
-  if (!isConnectionId(envelope.connection_id)) return fatal("invalid connection id");
-  if (typeof envelope.nonce !== "string" || !NONCE_PATTERN.test(envelope.nonce)) {
-    return fatal("invalid probe nonce");
-  }
-  return { kind: "ok", frame: { kind: "probe_reply", connectionId: envelope.connection_id, nonce: envelope.nonce } };
-}
-
-function parseRelayShutdown(envelope: Record<string, unknown>): RelayToNodeParseResult {
-  if (!hasExactKeys(envelope, ["type"])) return fatal("unexpected private frame fields");
-  return { kind: "ok", frame: { kind: "relay_shutdown" } };
-}
-
 function parseFrameEnvelope(envelope: Record<string, unknown>): RelayToNodeParseResult {
-  if (!hasExactKeys(envelope, ["type", "connection_id", "frame_b64"])) return fatal("unexpected private frame fields");
-  if (!isConnectionId(envelope.connection_id)) return fatal("invalid connection id");
-  if (typeof envelope.frame_b64 !== "string") return fatal("invalid public frame encoding");
-  const publicBytes = decodeStandardBase64(envelope.frame_b64);
+  const publicBytes = decodeStandardBase64(envelope.frame_b64 as string);
+  // The relay already bounded public bytes, but Node repeats the cap before handing bytes to the public parser.
   if (publicBytes === null || publicBytes.byteLength > MAX_PUBLIC_FRAME_BYTES) {
     return fatal("invalid public frame encoding");
   }
@@ -171,108 +307,47 @@ function parseFrameEnvelope(envelope: Record<string, unknown>): RelayToNodeParse
     kind: "ok",
     frame: {
       kind: "frame",
-      connectionId: envelope.connection_id,
+      connectionId: envelope.connection_id as string,
       publicBytes,
       publicFrame: parsePublicFrame(publicBytes),
     },
   };
 }
 
-function parsePublicHello(frame: Record<string, unknown>): PublicFrameParseResult {
-  if (!hasExactKeys(frame, ["type", "request_id", "protocol_version", "client_name"])) {
-    return rejectPublic("unexpected hello fields");
-  }
-  if (!isRequestId(frame.request_id) || typeof frame.protocol_version !== "string" || typeof frame.client_name !== "string") {
-    return rejectPublic("invalid hello fields");
-  }
-  return {
-    kind: "ok",
-    frame: {
-      kind: "hello",
-      requestId: frame.request_id,
-      protocolVersion: frame.protocol_version,
-      clientName: frame.client_name,
-    },
-  };
-}
-
-function parsePublicToolsList(frame: Record<string, unknown>): PublicFrameParseResult {
-  if (!hasExactKeys(frame, ["type", "request_id"])) return rejectPublic("unexpected tools_list fields");
-  if (!isRequestId(frame.request_id)) return rejectPublic("invalid request id");
-  return { kind: "ok", frame: { kind: "tools_list", requestId: frame.request_id } };
-}
-
 function parsePublicToolsCall(frame: Record<string, unknown>): PublicFrameParseResult {
-  if (!hasExactKeys(frame, ["type", "request_id", "name", "arguments"])) {
-    return rejectPublic("unexpected tools_call fields");
-  }
-  if (!isRequestId(frame.request_id) || typeof frame.name !== "string" || !isRecord(frame.arguments)) {
-    return rejectPublic("invalid tools_call fields");
-  }
-  if (!isHermesMemoryToolName(frame.name)) return rejectPublic("invalid tool name");
-  const parsedArguments = parseToolArguments(frame.name, frame.arguments);
-  if (parsedArguments === null) return rejectPublic("invalid tool arguments");
+  const name = frame.name as string;
+  if (!isHermesMemoryToolName(name)) return rejectPublic("invalid tool name", frame);
+  const parsedArguments = parseToolArguments(name, frame.arguments as Record<string, unknown>);
+  if (parsedArguments === null) return rejectPublic("invalid tool arguments", frame);
   return {
     kind: "ok",
     frame: {
       kind: "tools_call",
-      requestId: frame.request_id,
-      name: frame.name,
+      requestId: frame.request_id as string,
+      name,
       arguments: parsedArguments,
     },
   };
 }
 
-function parsePublicCancel(frame: Record<string, unknown>): PublicFrameParseResult {
-  if (!hasExactKeys(frame, ["type", "mcp_request_id"])) return rejectPublic("unexpected cancel fields");
-  if (!isRequestId(frame.mcp_request_id)) return rejectPublic("invalid cancel id");
-  return { kind: "ok", frame: { kind: "cancel", mcpRequestId: frame.mcp_request_id } };
-}
-
-function parsePublicShutdown(frame: Record<string, unknown>): PublicFrameParseResult {
-  if (!hasExactKeys(frame, ["type"])) return rejectPublic("unexpected shutdown fields");
-  return { kind: "ok", frame: { kind: "shutdown" } };
-}
-
 function parseToolArguments(name: HermesMemoryToolName, args: Record<string, unknown>): HermesMemoryToolArguments | null {
+  const toolSchema = HERMES_MEMORY_WIRE_SCHEMAS.toolArguments[name];
+  if (!validateObjectSchema(args, toolSchema)) return null;
   if (name === "memory_insert") {
-    if (!hasOnlyKeys(args, ["text", "taint", "tags", "passage_id"])) return null;
-    if (typeof args.text !== "string" || !isTaint(args.taint)) return null;
-    if (args.tags !== undefined && !isStringArray(args.tags)) return null;
-    if (args.passage_id !== undefined && typeof args.passage_id !== "string") return null;
     return {
-      text: args.text,
-      taint: args.taint,
-      ...(args.tags === undefined ? {} : { tags: args.tags }),
-      ...(args.passage_id === undefined ? {} : { passage_id: args.passage_id }),
+      text: args.text as string,
+      taint: args.taint as "user_content" | "agent_derived_clean" | "system_generated",
+      ...(args.tags === undefined ? {} : { tags: args.tags as readonly string[] }),
+      ...(args.passage_id === undefined ? {} : { passage_id: args.passage_id as string }),
     };
   }
-  if (name === "memory_get") {
-    if (!hasExactKeys(args, ["passage_id"]) || typeof args.passage_id !== "string") return null;
-    return { passage_id: args.passage_id };
-  }
-  if (name === "memory_search") {
-    if (!hasOnlyKeys(args, ["text", "query", "tag", "limit"])) return null;
-    const text = args.text;
-    const query = args.query;
-    const tag = args.tag;
-    const limit = args.limit;
-    if (typeof text !== "string" && typeof query !== "string") return null;
-    if (typeof text === "string" && typeof query === "string") return null;
-    if (tag !== undefined && typeof tag !== "string") return null;
-    if (limit !== undefined && (typeof limit !== "number" || !Number.isInteger(limit) || limit < MIN_SEARCH_LIMIT || limit > MAX_SEARCH_LIMIT)) {
-      return null;
-    }
-    const textValue = typeof text === "string" ? text : undefined;
-    const queryValue = typeof query === "string" ? query : undefined;
-    return {
-      ...(textValue === undefined ? {} : { text: textValue }),
-      ...(queryValue === undefined ? {} : { query: queryValue }),
-      ...(tag === undefined ? {} : { tag }),
-      ...(limit === undefined ? {} : { limit }),
-    };
-  }
-  return null;
+  if (name === "memory_get") return { passage_id: args.passage_id as string };
+  return {
+    ...(args.text === undefined ? {} : { text: args.text as string }),
+    ...(args.query === undefined ? {} : { query: args.query as string }),
+    ...(args.tag === undefined ? {} : { tag: args.tag as string }),
+    ...(args.limit === undefined ? {} : { limit: args.limit as number }),
+  };
 }
 
 function encodeResponse(connectionId: string, requestId: string, publicPayloadBytes: Uint8Array): Buffer {
@@ -284,7 +359,7 @@ function encodeResponse(connectionId: string, requestId: string, publicPayloadBy
     connection_id: connectionId,
     request_id: requestId,
     result_b64: Buffer.from(resultBytes).toString("base64"),
-  });
+  }, HERMES_MEMORY_WIRE_SCHEMAS.nodeToRelay.response);
 }
 
 function shouldUseDenial(requestId: string, publicPayloadBytes: Uint8Array): boolean {
@@ -295,25 +370,47 @@ function shouldUseDenial(requestId: string, publicPayloadBytes: Uint8Array): boo
   } catch {
     return true;
   }
-  return !hasOnlyKeys(parsed, ["type", "request_id", "payload", "message"]) ||
-    (parsed.type !== "result" && parsed.type !== "error") ||
-    parsed.request_id !== requestId;
+  const type = parsed.type;
+  if (type !== "result" && type !== "error") return true;
+  const publicSchema = HERMES_MEMORY_WIRE_SCHEMAS.publicOutbound[type];
+  // Node owns the complete public result and error shape because the relay checks only type and request_id.
+  return !validateObjectSchema(parsed, publicSchema) || parsed.request_id !== requestId;
 }
 
-function encodeJsonEnvelope(envelope: Record<string, unknown>): Buffer {
+function encodeJsonEnvelope(envelope: Record<string, unknown>, schemaForType: ObjectSchema): Buffer {
+  if (!validateObjectSchema(envelope, schemaForType)) {
+    throw new HermesWireEncodeError("invalid_encoder_envelope", "Node-to-relay envelope violates shared schema");
+  }
   const payload = Buffer.from(JSON.stringify(envelope), "utf8");
   if (payload.byteLength > MAX_PRIVATE_FRAME_BYTES) {
-    throw new Error("Hermes memory private frame exceeds relay cap");
+    throw new HermesWireEncodeError("private_frame_over_cap", "Hermes memory private frame exceeds relay cap");
   }
   return encodePrivateFrame(payload);
 }
 
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  return Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+function schema(
+  required: readonly string[],
+  fields: Readonly<Record<string, FieldValidator>>,
+  optional: readonly string[] = [],
+  refine?: (value: Record<string, unknown>) => boolean,
+): ObjectSchema {
+  return Object.freeze({ required, optional, fields, refine });
 }
 
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
+function validateObjectSchema(value: Record<string, unknown>, objectSchema: ObjectSchema): boolean {
+  const allowed = new Set([...objectSchema.required, ...(objectSchema.optional ?? [])]);
+  const actual = Object.keys(value);
+  if (actual.some((key) => !allowed.has(key))) return false;
+  if (objectSchema.required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return false;
+  for (const key of actual) {
+    const validator = objectSchema.fields[key];
+    if (validator === undefined || !validator(value[key])) return false;
+  }
+  return objectSchema.refine?.(value) ?? true;
+}
+
+function getSchema(table: SchemaTable, type: string): ObjectSchema | undefined {
+  return table[type];
 }
 
 function isRequestId(value: unknown): value is string {
@@ -325,7 +422,7 @@ function isHermesMemoryToolName(value: string): value is HermesMemoryToolName {
 }
 
 function requireRequestId(value: string): void {
-  if (!isRequestId(value)) throw new Error("invalid request id");
+  if (!isRequestId(value)) throw new HermesWireEncodeError("invalid_request_id", "invalid request id");
 }
 
 function isConnectionId(value: unknown): value is string {
@@ -337,25 +434,31 @@ function isConnectionId(value: unknown): value is string {
 }
 
 function requireConnectionId(value: string): void {
-  if (!isConnectionId(value)) throw new Error("invalid connection id");
+  if (!isConnectionId(value)) throw new HermesWireEncodeError("invalid_connection_id", "invalid connection id");
 }
 
 function requireNonce(value: string): void {
-  if (!NONCE_PATTERN.test(value)) throw new Error("invalid probe nonce");
+  if (!NONCE_PATTERN.test(value)) throw new HermesWireEncodeError("invalid_nonce", "invalid probe nonce");
 }
 
 function isTaint(value: unknown): value is "user_content" | "agent_derived_clean" | "system_generated" {
   return value === "user_content" || value === "agent_derived_clean" || value === "system_generated";
 }
 
-function isStringArray(value: unknown): value is readonly string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
-}
-
 function fatal(reason: string): RelayToNodeParseResult {
   return { kind: "fatal", reason };
 }
 
-function rejectPublic(reason: string): PublicFrameParseResult {
-  return { kind: "public_rejection", reason };
+function rejectPublic(reason: string, frame?: Record<string, unknown>): PublicFrameParseResult {
+  const frameType = typeof frame?.type === "string" ? frame.type : undefined;
+  if (frameType === "hello" || frameType === "tools_list" || frameType === "tools_call") {
+    const requestId = isRequestId(frame?.request_id) ? frame.request_id : undefined;
+    return requestId === undefined
+      ? { kind: "public_rejection", reason, disposition: "close", frameType }
+      : { kind: "public_rejection", reason, disposition: "deny", frameType, requestId };
+  }
+  if (frameType === "cancel" || frameType === "shutdown" || frameType === "ping") {
+    return { kind: "public_rejection", reason, disposition: "silent", frameType };
+  }
+  return { kind: "public_rejection", reason, disposition: "close", ...(frameType === undefined ? {} : { frameType }) };
 }

@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 
 import { LENGTH_PREFIX_BYTES, MAX_PRIVATE_FRAME_BYTES } from "./constants.js";
 
-export type PrivateFrameErrorCode = "frame_over_cap" | "zero_length" | "invalid_state";
+export type PrivateFrameErrorCode = "frame_over_cap" | "zero_length";
 
 export class PrivateFrameError extends Error {
   constructor(
@@ -23,6 +23,9 @@ export class PrivateFrameDecoder {
   private buffered = Buffer.alloc(0);
   private fatalError: PrivateFrameError | undefined;
 
+  /**
+   * The caller owns backpressure: stop pushing once bufferedBytes reaches one prefix plus the private cap.
+   */
   push(bytes: Uint8Array): void {
     if (this.fatalError !== undefined) return;
     if (bytes.byteLength === 0) return;

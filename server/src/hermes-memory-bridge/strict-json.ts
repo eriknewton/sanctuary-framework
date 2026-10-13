@@ -21,7 +21,7 @@ export class StrictJsonError extends Error {
 export function parseStrictJson(bytes: Uint8Array, maxDepth = MAX_JSON_NESTING_DEPTH): unknown {
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new StrictJsonError("invalid_utf8");
   }
@@ -63,7 +63,6 @@ class StrictJsonParser {
   }
 
   private parseValue(depth: number): unknown {
-    this.assertDepth(depth);
     const ch = this.peek();
     if (ch === "{") return this.parseObject(depth);
     if (ch === "[") return this.parseArray(depth);
@@ -236,7 +235,7 @@ class StrictJsonParser {
   }
 
   private assertDepth(depth: number): void {
-    // The top-level frame object plus one arguments object leaves exactly 63 nested arrays inside the seam bound.
-    if (depth > this.maxDepth + 2) throw new StrictJsonError("depth_exceeded", "JSON nesting exceeds bound");
+    // Only object and array nesting counts: the top-level object is depth 1 and the deepest allowed composite is 64 levels below it.
+    if (depth > this.maxDepth + 1) throw new StrictJsonError("depth_exceeded", "JSON nesting exceeds bound");
   }
 }
