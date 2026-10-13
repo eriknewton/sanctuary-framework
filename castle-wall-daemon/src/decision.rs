@@ -873,8 +873,8 @@ impl DecisionEngine {
                 None => return Ok(self.unattributed_outcome()),
             },
             Err(_) => {
-                // The structural pins keep present snapshots on `from_snapshot`
-                // and make a refused snapshot an Unattributed outcome.
+                // Structural tests pin this refused-identity arm to the
+                // Unattributed return and subject resolution to the next statement.
                 return Ok(self.unattributed_outcome());
             }
         };
@@ -2327,6 +2327,28 @@ mod armed_identity_tests {
             !err_body.contains("armed_identity().cloned().ok_or_else"),
             "evaluate_attempt must not recover from from_snapshot Err through the frozen cell"
         );
+        let body_without_comments = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let identity_match_at = body_without_comments
+            .find("let (verdict, identity) = match bounded_lock_until(store, deadline) {")
+            .expect("identity-producing match");
+        let after_identity_match = &body_without_comments[identity_match_at..];
+        let subject_pattern = "let subject = match identity {";
+        let subject_at = after_identity_match
+            .find(subject_pattern)
+            .expect("subject resolution");
+        let before_subject = &after_identity_match[..subject_at];
+        let identity_match_close = before_subject
+            .rfind("        };")
+            .expect("identity-producing match close");
+        let gap = &before_subject[identity_match_close + "        };".len()..];
+        assert!(
+            gap.lines().all(|line| line.trim().is_empty()),
+            "subject resolution follows the identity-producing match without intervening statements"
+        );
         let production = production_lines(&decision).join("\n");
         let freeze_body = crate::source_scan::fn_body(&production, "freeze_at_boot");
         for token in ["AdmittedIdentity::from_boot(", "BootConfinedScopeRefusal {"] {
@@ -2594,12 +2616,10 @@ mod armed_identity_tests {
             "the worker remains in the bounded verdict path while the WAL guard is held"
         );
         let store_started = Instant::now();
-        let store_guard = store
-            .try_lock()
-            .expect("store guard is not held after the verdict snapshot read");
+        let store_guard = store.try_lock().expect("store mutex is not held");
         assert!(
             store_started.elapsed() < Duration::from_millis(50),
-            "the store guard is reacquired within the bounded verdict path"
+            "try_lock returned within 50ms"
         );
         drop(store_guard);
         drop(wal_guard);

@@ -437,6 +437,7 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
         "unattributed first evaluation writes no egress WAL row"
     );
     let _ = handle.stop();
+    // Ring-only writes are witnessed by daemon.rs's own unit test, not here.
     assert_eq!(
         egress_rows(),
         baseline_egress_rows,
