@@ -80,7 +80,8 @@ export function createSovereigntyProfileTools(
         "Update Sovereignty Profile configuration. Updating context_gating " +
         "reconfigures the runtime context-gate enforcer; approval_gate remains " +
         "always enabled; other flags update profile/signaling state unless " +
-        "separate runtime wiring is present.",
+        "separate runtime wiring is present. " +
+        "Tier 1: requires operator approval, because it changes enforcement behavior.",
       inputSchema: {
         type: "object",
         properties: {

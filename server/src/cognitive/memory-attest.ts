@@ -77,7 +77,7 @@ export function createMemoryAttestTools(
       description:
         "Create an Ed25519-signed attestation for a memory operation. " +
         "Records who accessed what (content hash, not content), when, and through " +
-        "which memory provider — without exposing the memory content itself. " +
+        "which memory provider, without exposing the memory content itself. " +
         "Works with any MCP-compatible memory provider (Mem0, Zep, Letta, etc.). " +
         "Use after add_memory, search_memories, or any memory CRUD operation to " +
         "build a cryptographically verifiable audit trail of memory access.",

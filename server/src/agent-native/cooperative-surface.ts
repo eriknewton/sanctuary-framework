@@ -7,7 +7,15 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
-import { COOPERATIVE_CAPABILITIES } from "./capabilities-catalog.js";
+import {
+  COOPERATIVE_CAPABILITIES,
+  EVALUATE_NOUNS,
+  EVALUATE_RELATED_TOOLS,
+  EVALUATE_ROUTES,
+  type EvaluateQuestion,
+  type EvaluateRoute,
+  type EvaluateRouteToolName,
+} from "./capabilities-catalog.js";
 import {
   ApprovalProofStore,
   approvalEnvelopeHash,
@@ -69,6 +77,29 @@ export interface CooperativeSurfaceOptions {
   storage?: StorageBackend;
   approvalProofStore?: ApprovalProofStore;
 }
+
+/**
+ * The memory verbs, defined once and derived three ways so the routes and
+ * the evaluate-noun yield rule cannot drift apart (pinned from
+ * EVALUATE_NOUN_WORDS in capabilities-catalog.ts). `remember` and `recall`
+ * are the ordinary route regexes, byte-for-byte the sets the routes used
+ * before the evaluate state existed; `ordinary` is their union (the
+ * multi-clause check); `outranksEvaluateNoun` is every memory verb except the
+ * bare read/get, which are also everyday words for "tell me" and so yield to
+ * an evaluate noun.
+ */
+const REMEMBER_VERB_WORDS = ["remember", "store", "save"] as const;
+const RECALL_VERB_WORDS = ["recall", "read", "lookup", "get"] as const;
+const BARE_READ_VERB_WORDS: ReadonlySet<string> = new Set(["read", "get"]);
+const wordAlternation = (words: readonly string[]): RegExp => new RegExp(`\\b(${words.join("|")})\\b`);
+export const MEMORY_VERBS = {
+  remember: wordAlternation(REMEMBER_VERB_WORDS),
+  recall: wordAlternation(RECALL_VERB_WORDS),
+  ordinary: wordAlternation([...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS]),
+  outranksEvaluateNoun: wordAlternation(
+    [...REMEMBER_VERB_WORDS, ...RECALL_VERB_WORDS].filter((word) => !BARE_READ_VERB_WORDS.has(word))
+  ),
+} as const;
 
 export function createAgentNativeCooperativeTools(
   options: CooperativeSurfaceOptions
@@ -363,9 +394,14 @@ export function createAgentNativeCooperativeTools(
 
   function classifyIntent(intent: string): {
     safety_class: "ordinary" | "sensitive" | "gated";
-    tool: CooperativeToolName | null;
+    /** Present only on the evaluate state; the ordinary/sensitive/gated routes are unchanged. */
+    intent_class?: "evaluate";
+    evaluate_question?: EvaluateQuestion;
+    tool: CooperativeToolName | EvaluateRouteToolName | null;
     example: Record<string, unknown> | null;
     why_sanctuary: string;
+    guidance?: string;
+    related_tools?: typeof EVALUATE_RELATED_TOOLS;
     remediation_class?: "request_review" | "try_lower_scope" | "wait";
     probe_key?: string;
   } {
@@ -432,8 +468,7 @@ export function createAgentNativeCooperativeTools(
       "priorsession",
       "widen",
     ];
-    const isOrdinaryClause = (value: string): boolean =>
-      /\b(remember|store|save|recall|read|lookup|get)\b/.test(value);
+    const isOrdinaryClause = (value: string): boolean => MEMORY_VERBS.ordinary.test(value);
     const clauseHasGatedNeedle = (value: string): string | undefined => {
       const compact = value.replace(/[^a-z0-9:/._-]/g, "");
       return gated.find((needle) => value.includes(needle) || compact.includes(needle));
@@ -482,7 +517,37 @@ export function createAgentNativeCooperativeTools(
         probe_key: matchedGated,
       };
     }
-    if (/\b(remember|store|save)\b/.test(haystack)) {
+    // State order after the gated routes (gated always wins above):
+    //   state_EVALUATE_NOUN: an evaluate noun (EVALUATE_NOUNS) beats a BARE
+    //     read/get verb, so "read the bounds" is a bounds question, not a
+    //     recall; any other memory verb (MEMORY_VERBS.outranksEvaluateNoun)
+    //     keeps the intent on the memory routes, so "remember platform=linux"
+    //     and "recall my bounds note" are never hijacked;
+    //   state_REMEMBER, state_RECALL: the ordinary memory routes, with the
+    //     same verb sets as before the evaluate state existed, so their
+    //     responses are byte-identical;
+    //   state_EVALUATE_FALLBACK: a question with no noun and no memory verb
+    //     ("what do you not do") still lands on its route;
+    //   otherwise the ambiguous fallback.
+    // Matched on the lower-cased intent only, not the decoded haystack: the
+    // decoded variants exist to catch obfuscated gated requests, and an
+    // evaluate question has nothing to obfuscate. Routing table, noun list and
+    // tool-name pins: capabilities-catalog.ts.
+    const evaluateRoute = EVALUATE_ROUTES.find((route) => route.matches.test(lower));
+    const evaluateAnswer = (route: EvaluateRoute) => ({
+      safety_class: "ordinary" as const,
+      intent_class: "evaluate" as const,
+      evaluate_question: route.question,
+      tool: route.tool,
+      example: route.example,
+      why_sanctuary: route.why_sanctuary,
+      guidance: route.guidance,
+      related_tools: EVALUATE_RELATED_TOOLS,
+    });
+    if (evaluateRoute && EVALUATE_NOUNS.test(lower) && !MEMORY_VERBS.outranksEvaluateNoun.test(haystack)) {
+      return evaluateAnswer(evaluateRoute);
+    }
+    if (MEMORY_VERBS.remember.test(haystack)) {
       return {
         safety_class: "ordinary",
         tool: COOPERATIVE_TOOL_NAMES.remember,
@@ -490,13 +555,17 @@ export function createAgentNativeCooperativeTools(
         why_sanctuary: "State is encrypted, identity-bound, and audited.",
       };
     }
-    if (/\b(recall|read|lookup|get)\b/.test(haystack)) {
+    if (MEMORY_VERBS.recall.test(haystack)) {
       return {
         safety_class: "ordinary",
         tool: COOPERATIVE_TOOL_NAMES.recall,
         example: { key: "user_tz" },
         why_sanctuary: "Recall preserves verification status in the response.",
       };
+    }
+    // state_EVALUATE_FALLBACK (see the state order above the memory routes).
+    if (evaluateRoute) {
+      return evaluateAnswer(evaluateRoute);
     }
     return {
       safety_class: "sensitive",
@@ -784,7 +853,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: COOPERATIVE_TOOL_NAMES.help,
-      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
+      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\", \"should I install this\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. Evaluation questions (what this protects, what the bounds are, which platforms, how to verify, which tier waits on a human, how to uninstall) return intent_class \"evaluate\" with a guidance string (the README bounds, or the CLI command), a runnable example only where a Tier 3 read-only tool answers unattended, and the related read-only tools with their tiers. An evaluate noun outranks only a bare read or get verb (\"read the bounds\" is a bounds question); an intent with remember, store, save, recall or lookup keeps its memory route whatever evaluate nouns it carries; a sensitive or gated word still wins, as before. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -797,7 +866,11 @@ export function createAgentNativeCooperativeTools(
           await recordHelpProbe(args.intent as string, classified.probe_key, classified.safety_class);
           const auditRef = await audit("sanctuary_help", {
             safety_class: classified.safety_class,
-            runnable_example: classified.safety_class === "ordinary",
+            // An evaluate route with no example (uninstall; the Tier 1 tiers
+            // route) is audited as not runnable;
+            // every pre-existing ordinary route carries one, so this is
+            // unchanged for them.
+            runnable_example: classified.safety_class === "ordinary" && classified.example !== null,
           });
           return toolResult({ ...classified, probe_key: undefined, audit_ref: auditRef });
         } catch {

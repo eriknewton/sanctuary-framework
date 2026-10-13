@@ -7,17 +7,44 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap.">
+<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, on a patched host, with keys only you hold. Enforcement is proven on macOS on a patched host; on Ubuntu 24.04 x86-64, on a patched host, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live on macOS; on Ubuntu 24.04 x86-64, the fresh-install per-account signed-policy claim is proven; Windows is roadmap. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level, on a patched host, with keys only you hold. Enforcement is proven on macOS on a patched host; on Ubuntu 24.04 x86-64, on a patched host, the fresh-install per-account signed-policy claim is proven; Windows is roadmapped. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
 <meta name="twitter:card" content="summary_large_image">
+<meta property="og:image" content="https://sanctuaryprotocol.ai/images/blog/operator-custody-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:image" content="https://sanctuaryprotocol.ai/images/blog/operator-custody-card.png">
+
+<!-- Structured data. Every claim here must match README.md "What is proven, and what is not";
+     softwareVersion must match the npm latest tag named in README.md "Release status". -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Sanctuary",
+  "alternateName": "@sanctuary-framework/mcp-server",
+  "applicationCategory": "SecurityApplication",
+  "operatingSystem": "macOS; Linux (Ubuntu 24.04 x86-64, bounded)",
+  "softwareVersion": "1.8.4",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "url": "https://sanctuaryprotocol.ai/",
+  "downloadUrl": "https://www.npmjs.com/package/@sanctuary-framework/mcp-server",
+  "codeRepository": "https://github.com/eriknewton/sanctuary-framework",
+  "author": {
+    "@type": "Person",
+    "name": "Erik Newton"
+  },
+  "description": "A firewall for your AI agent that runs on your own machine. It enforces what the agent can reach at the operating-system level, on a patched host, under a policy you sign, with keys only you hold, and writes what the agent did to a hash-chained record. Enforcement is proven on macOS on a patched host (a signed operator policy with per-uid allow and deny that survives attended reboots; not a per-rule, per-flow audit trail); on Linux it is proven on Ubuntu 24.04 (x86-64) only, on a patched host; Windows is roadmapped. Apache-2.0. Installs with npx."
+}
+</script>
 
 <!-- Fonts -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -71,24 +98,28 @@ layout: null
 
     <p class="hero__sub">
       Sanctuary is a firewall for your AI agent that runs on your own Mac. It enforces what the
-      agent is allowed to reach at the operating-system level, with keys only you hold, so a
-      prompt-injected or jailbroken agent cannot route around it or shut it off. The enforcement
-      lives below the agent, inside the operating system itself.
+      agent is allowed to reach at the operating-system level, on a patched host, with keys only
+      you hold, and it does not depend on the agent's cooperation. The enforcement lives below
+      the agent, inside the operating system itself.
     </p>
 
     <p class="hero__sub" style="opacity:0.66;margin-top:-0.75rem;">
-      Live today on macOS. Ubuntu 24.04 x86-64 has a proven fresh-install per-account claim. Windows is roadmap.
+      Proven on macOS, on a patched host. Ubuntu 24.04 x86-64: the fresh-install per-account signed-policy claim is proven, on a patched host. Windows: roadmapped.
     </p>
 
     <!-- Install block -->
     <div class="install surface-card">
       <div class="install__label">
         <span>Install</span>
-        <span>Node 22+ · macOS live wall · Ubuntu 24.04 bounded proof</span>
+        <span>Node 22+ · macOS wall proven on a patched host · Ubuntu 24.04 bounded proof</span>
       </div>
       <div class="install__row">
-        <code class="install__cmd mono"><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code>
-        <button type="button" class="install__copy" data-copy="npx @sanctuary-framework/mcp-server" aria-label="Copy install command">Copy</button>
+        <code class="install__cmd mono"><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code</code>
+        <button type="button" class="install__copy" data-copy="npx -y @sanctuary-framework/mcp-server protect --claude-code" aria-label="Copy install command">Copy</button>
+      </div>
+      <div class="install__label">
+        <span>Interactive form: opens the dashboard in your browser.</span>
+        <span>Agents: the headless install, verify and uninstall lines are in the <a href="#quickstart">quickstart</a>.</span>
       </div>
     </div>
 
@@ -103,7 +134,7 @@ layout: null
     </div>
 
     <div class="hero__stats" aria-label="Project stats">
-      <div class="hero__stat"><strong>4</strong><span>Castle layers</span></div>
+      <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
   </section>
@@ -154,12 +185,12 @@ layout: null
             <div>
               <h3 class="provisioning__heading">Kernel-level egress wall</h3>
               <p class="provisioning__body">
-                On macOS today, the Castle Wall blocks unauthorized outbound calls at the
-                operating system. A prompt-injected agent cannot route around that path within
-                the proven scope because the kernel itself enforces. It enforces a signed
+                On macOS today, on a patched host, the Castle Wall blocks unauthorized outbound calls
+                at the operating system. Within the proven scope the enforcement does not depend on
+                the agent's cooperation, because the kernel itself enforces. It enforces a signed
                 operator policy, per account, and re-establishes itself after a restart.
-                On Ubuntu 24.04 (x86-64), a fresh install of the shipped package enforces
-                a signed operator policy per user account: blocked destinations stay blocked
+                On Ubuntu 24.04 (x86-64), on a patched host, a fresh install of the shipped package
+                enforces a signed operator policy per user account: blocked destinations stay blocked
                 and allowed ones connect, through five reboots, on three fresh servers, with
                 the evidence checked by two independent reviewers. Other Linux distributions,
                 DNS, DoH, DoT, hostname paths, and a real-agent harness remain unproven.
@@ -199,12 +230,12 @@ layout: null
         <span class="eyebrow">Architecture</span>
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
-          Four layers, each with a distinct contract: operating-system egress enforcement
-          (live on macOS today, with a narrowed Ubuntu 24.04 x86-64 fresh-install proof), behavioral observation
-          inside the box, an encrypted state surface for cooperative agents, and receipts and
-          reputation that travel across vendors. Underneath them, an install-time mechanism
-          called Mantle binds all four to your machine. The layers compose, and none of them
-          substitutes for another.
+          Five named layers, each with a distinct contract. Castle Wall: operating-system egress
+          enforcement, proven on macOS on a patched host and, on Linux, proven on Ubuntu 24.04
+          (x86-64) only, on a patched host. Sentinels: behavioral observation inside the box. Charter: the encrypted
+          state and policy surface for cooperative agents. Heralds: receipts and reputation that
+          travel across vendors. Mantle: the install-time mechanism that binds the other four to
+          your machine. The layers compose, and none of them substitutes for another.
         </p>
       </div>
 
@@ -214,10 +245,10 @@ layout: null
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
             Operating-system-level egress filtering. Network Extension on macOS, where Phase 1
-            is proven on a signed and notarized build. On Ubuntu 24.04 (x86-64), a fresh
-            install of the shipped package enforces a signed operator policy per user account
-            through five reboots on three fresh servers; DNS, DoH, DoT, hostname paths, and
-            other Linux platforms remain unproven.
+            is proven on a signed and notarized build, on a patched host. On Ubuntu 24.04 (x86-64),
+            on a patched host, a fresh install of the shipped package enforces a signed operator
+            policy per user account through five reboots on three fresh servers; DNS, DoH, DoT,
+            hostname paths, and other Linux platforms remain unproven.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">kernel-binding</span>
@@ -248,9 +279,12 @@ layout: null
           <h3 class="layer__title">Charter (Cooperative MCP)</h3>
           <p class="layer__body">
             Encrypted state, hash-chained audit, mandate primitives, canonical policy slots, and
-            substrate selector. Production audit checkpoints are currently unsigned until IC-05
-            closes. Compliant agents that voluntarily route through Sanctuary get the full surface. On macOS with the wall
-            installed and armed, non-compliant agents still hit the wall and the Sentinels.
+            substrate selector. Production call sites sign audit checkpoints when the fortress
+            holds an identity; a fortress with no identity yet, and the root daemon's split audit
+            store, write honest unsigned checkpoints, and the audit-chain row stays partial
+            pending the IC-05 external-verifier drill. Compliant agents that voluntarily route
+            through Sanctuary get the full surface. On macOS with the wall installed and armed on
+            a patched host, non-compliant agents still hit the wall and the Sentinels.
           </p>
           <div class="layer__tags">
             <span class="layer__tag">approval-gates</span>
@@ -360,10 +394,20 @@ agent = Agent(
           </div>
           <div class="code-card">
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
-from langchain_mcp import MCPTool
-sanctuary = MCPTool.from_stdio(
-  "npx", ["-y", "@sanctuary-framework/mcp-server"],
-)</code></pre>
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+async with MultiServerMCPClient(
+    {
+        "sanctuary": {
+            "command": "npx",
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
+            "transport": "stdio",
+        }
+    }
+) as client:
+    tools = client.get_tools()</code></pre>
           </div>
         </article>
       </div>
@@ -377,31 +421,32 @@ sanctuary = MCPTool.from_stdio(
         <span class="eyebrow">60 seconds</span>
         <h2 id="quickstart-title">From zero to <span class="text-gradient">custody</span>.</h2>
         <p>
-          Three commands. A local vault, a self-custodied identity, and a running approval
-          dashboard before your coffee cools.
+          Three commands, in order: install, verify, uninstall. Each exists on the v1.8.4 tag that
+          <code>npx</code> resolves to, and none of them prompts when stdin is not a terminal.
         </p>
       </div>
 
       <div class="quickstart">
         <article class="step surface-card">
-          <span class="step__number">Step 01 · Install</span>
-          <h3 class="step__heading">Boot the server</h3>
-          <p class="step__body">One npx command. No global install, no build step, no config file required.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> npx @sanctuary-framework/mcp-server</code></pre>
+          <span class="step__number">Step 01 · Protect</span>
+          <h3 class="step__heading">Wrap the harness you already run</h3>
+          <p class="step__body">One npx command. It backs up your harness config, rewrites its MCP server entries to point at Sanctuary, and starts the dashboard unless you pass <code>--no-dashboard</code>. The harness's own built-in tools are not MCP calls and are not touched. The rewrite is tested on representative harness paths and is not proven for every harness version (<a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">Assurance Matrix</a>, Agent wrapping). Substitute <code>--openclaw</code>, <code>--hermes</code>, <code>--cursor</code>, <code>--cline</code>, <code>--mastra</code> (fixture-tested only; no live Mastra-agent drill recorded), or <code>--wrap &lt;path-to-config&gt;</code> for <code>--claude-code</code>; other MCP-compatible harnesses work via the <code>--wrap</code> flag and are covered as drills extend the matrix.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard</code></pre>
+          <p class="step__body"><code>-y</code> skips npm's install prompt. <code>--no-open</code> runs headless: it skips opening the dashboard in a browser. <code>--no-dashboard</code> skips the per-call dashboard, which otherwise serves in the foreground until you stop it; start it later with <code>sanctuary dashboard</code>. After <code>npm install -g @sanctuary-framework/mcp-server</code>, the <code>sanctuary</code> command replaces the <code>npx -y @sanctuary-framework/mcp-server</code> prefix, and the rest of this page writes <code>sanctuary</code>. The Sovereignty Dashboard starts on <code>http://localhost:3501</code> (or the next free port, trying up to twenty ports from 3501).</p>
         </article>
 
         <article class="step surface-card">
-          <span class="step__number">Step 02 · Connect</span>
-          <h3 class="step__heading">Wire into your harness</h3>
-          <p class="step__body">Add Sanctuary as an MCP server in your harness config. No agent code changes.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> claude mcp add sanctuary -- npx -y @sanctuary-framework/mcp-server</code></pre>
+          <span class="step__number">Step 02 · Verify</span>
+          <h3 class="step__heading">Read one JSON object</h3>
+          <p class="step__body"><code>doctor --json</code> is read-only. Healthy: exit code 0 and no check with <code>"status": "FAIL"</code>. Failing: exit code 1 and at least one <code>FAIL</code> check whose <code>hint</code> names the next step. Read <code>storage_path</code> before the checks: <code>doctor</code> pointed at the wrong <code>--fortress</code> path reports a healthy runtime and a failing fortress.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server doctor --json</code></pre>
         </article>
 
         <article class="step surface-card">
-          <span class="step__number">Step 03 · Approve</span>
-          <h3 class="step__heading">Open the dashboard</h3>
-          <p class="step__body">Approve sensitive operations at the local dashboard URL.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> open http://127.0.0.1:3501</code></pre>
+          <span class="step__number">Step 03 · Uninstall</span>
+          <h3 class="step__heading">Remove the footprint, keep your data</h3>
+          <p class="step__body"><code>uninstall</code> removes Sanctuary's installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it reports any residue that needs sudo, the Castle Wall host app, or a reboot. <code>sanctuary protect --unwrap</code> restores the original harness config from <code>~/.sanctuary/backup/</code> and removes nothing else.</p>
+<pre class="step__code"><code><span class="token--dim">$</span> npx -y @sanctuary-framework/mcp-server uninstall</code></pre>
         </article>
       </div>
 
@@ -457,7 +502,7 @@ sanctuary = MCPTool.from_stdio(
           </div>
           <h3 class="journal__title">The Castle Wall, Linux Phase 1 Source Path</h3>
           <p class="journal__excerpt">
-            Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does on macOS within the proven scope.
+            Cooperative gates do not stop a prompt-injected agent. Kernel-level enforcement does on macOS, on a patched host, within the proven scope.
             Current correction: the May 2026 source-path claim is retired; a later Ubuntu 24.04
             x86-64 package has the narrowed fresh-install per-account proof.
           </p>
@@ -477,7 +522,7 @@ sanctuary = MCPTool.from_stdio(
       <div class="cta surface-card">
         <span class="eyebrow">Ship agents you actually control</span>
         <h2 id="cta-title">Put the Sanctuary wall around your agent.</h2>
-        <p>Open source and local-first. Castle Wall enforcement is proven on macOS and, on Ubuntu 24.04 (x86-64), for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
+        <p>Open source and local-first. Castle Wall enforcement is proven on a patched host: on macOS, and on Ubuntu 24.04 (x86-64) for the fresh-install per-account signed-policy claim in the Assurance Matrix. Telemetry-free and blockchain-free.</p>
         <div class="btn-row" style="justify-content: center;">
           <a class="btn btn--primary" href="https://github.com/eriknewton/sanctuary-framework">View on GitHub</a>
           <a class="btn btn--secondary" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">Install from npm</a>
@@ -498,9 +543,9 @@ sanctuary = MCPTool.from_stdio(
           Sanctuary
         </a>
         <p>
-          A custody substrate for AI agents: operating-system enforcement is live on macOS today,
-          and the Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim is proven
-          within the Assurance Matrix bounds; Windows remains roadmap for enforcement, with
+          A custody substrate for AI agents: operating-system enforcement is proven on macOS, on a
+          patched host, and the Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim
+          is proven, on a patched host, within the Assurance Matrix bounds; Windows remains roadmap for enforcement, with
           portable reputation and current bounds in the Assurance Matrix.
         </p>
       </div>
