@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import * as Bridge from "../../src/hermes-memory-bridge/index.js";
+import * as BridgeCore from "../../src/hermes-memory-bridge/bridge-core.js";
 import * as Constants from "../../src/hermes-memory-bridge/constants.js";
 import * as Envelopes from "../../src/hermes-memory-bridge/envelopes.js";
 import * as Framing from "../../src/hermes-memory-bridge/framing.js";
 import * as Lifecycle from "../../src/hermes-memory-bridge/connection-lifecycle.js";
 import * as ProbeWaiter from "../../src/hermes-memory-bridge/probe-waiter.js";
+import * as PublicResults from "../../src/hermes-memory-bridge/public-results.js";
 import * as StrictJson from "../../src/hermes-memory-bridge/strict-json.js";
 import type {
   HermesCallKind,
@@ -83,7 +85,7 @@ type BarrelTypeSurface = [
 
 const typeSurfaceCompiles = true satisfies BarrelTypeSurface extends readonly unknown[] ? true : false;
 
-const composedSurfaces = [Constants, Envelopes, Framing, Lifecycle, ProbeWaiter, StrictJson] as const;
+const composedSurfaces = [BridgeCore, Constants, Envelopes, Framing, Lifecycle, ProbeWaiter, PublicResults, StrictJson] as const;
 
 describe("Hermes memory bridge composition", () => {
   it("publishes the composed module surface", () => {
