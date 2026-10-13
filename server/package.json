@@ -110,9 +110,6 @@
     "it-pipe": "3.0.1",
     "libp2p": "2.10.0",
     "lmdb": "3.5.6",
-    "pg": "8.23.0",
-    "pgvector": "0.3.0",
-    "uint8arraylist": "3.0.2",
     "uint8arrays": "6.1.1",
     "viem": "2.56.9"
   },
