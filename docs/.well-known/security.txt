@@ -1,0 +1,7 @@
+# Sanctuary security contact, RFC 9116. Reporting policy, response times and safe harbor: SECURITY.md in the repository.
+Contact: https://github.com/eriknewton/sanctuary-framework/security/advisories/new
+Contact: mailto:eriknewton@gmail.com
+Expires: 2027-10-11T00:00:00.000Z
+Policy: https://github.com/eriknewton/sanctuary-framework/blob/main/SECURITY.md
+Preferred-Languages: en
+Canonical: https://sanctuaryprotocol.ai/.well-known/security.txt
