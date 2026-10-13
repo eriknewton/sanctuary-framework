@@ -79,7 +79,12 @@ const OUT_FILE = join(SERVER_DIR, "src", "dashboard", "design-fonts.ts");
  * shape renders from the system stack, as it did before the faces were
  * bundled. Adding a code point no face carries changes no subset byte, which
  * is why the status glyphs are not listed. A code point a face lacks falls
- * back per character, never per word.
+ * back per character, never per word: unicode-range only narrows which
+ * characters a face is considered for, and the cmap still decides, so a
+ * listed shape no face carries draws from the system stack exactly as it
+ * would unlisted (confirmed by render on 2026-10-12: the committed CSS, the
+ * same CSS with the shapes and arrows trimmed from every range, and no faces
+ * at all draw every shape identically, with no .notdef).
  * Must match the --unicodes argument used to cut the committed woff2 files.
  */
 export const UNICODE_RANGE =

@@ -157,7 +157,8 @@ export const PAPER_INK_ROOT_TOKENS_CSS = `:root {
      borrow the pass hue, because a green with no evidence behind it reads as
      protection that was never checked. Full weight, never dimmed, never
      hidden, never counted as protected; told apart from the neutral gray by
-     its hollow-ring glyph and its word. */
+     its dotted ring (the neutral pill's ring is solid), its dashed border,
+     its tint and its word. */
   --slate: #60697d;
   --slate-bg: #e9eaed;
   --slate-line: #b7bcc5;
