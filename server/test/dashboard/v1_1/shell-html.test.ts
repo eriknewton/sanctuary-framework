@@ -77,6 +77,36 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(css).not.toMatch(/tone-locked[^{]*\{[^}]*--rust/);
   });
 
+  it("a bare link in the main column reads the accent, never the user-agent blue", () => {
+    // Dark is the default theme, and the user-agent link blue on the dark
+    // paper is about 2:1, under the 4.5:1 text floor. One rule colors every
+    // non-button anchor in the main column, visited and hover included.
+    const html = renderDashboardV11Html({ embedClient: false });
+    const css = html.replace(/\/\*[\s\S]*?\*\//g, "");
+    const m = css.match(/(?:^|\n)\.main a:not\(\.btn\), \.main a:not\(\.btn\):visited, \.main a:not\(\.btn\):hover \{([^}]*)\}/);
+    expect(m, ".main a:not(.btn) rule").toBeTruthy();
+    expect(m![1]).toContain("color: var(--accent)");
+  });
+
+  it("the stylesheet's braces balance: no unmatched closer, depth zero at the end", () => {
+    // CSS error recovery folds a stray closing brace into the next rule's
+    // prelude and silently drops that rule, so a balanced stylesheet is a
+    // rendering invariant, not a lint. Comments and quoted strings are skipped.
+    const html = renderDashboardV11Html({ embedClient: false });
+    const css = html.slice(html.indexOf("<style>") + "<style>".length, html.indexOf("</style>"));
+    let depth = 0;
+    let unmatched = 0;
+    for (let i = 0; i < css.length; i++) {
+      const c = css[i];
+      if (c === "/" && css[i + 1] === "*") { const end = css.indexOf("*/", i + 2); i = end < 0 ? css.length : end + 1; continue; }
+      if (c === '"' || c === "'") { let j = i + 1; while (j < css.length && css[j] !== c) j += css[j] === "\\" ? 2 : 1; i = j; continue; }
+      if (c === "{") depth++;
+      else if (c === "}") { if (depth === 0) unmatched++; else depth--; }
+    }
+    expect(unmatched, "unmatched closing braces").toBe(0);
+    expect(depth, "unclosed blocks at the end").toBe(0);
+  });
+
   it("the theme bootstrap yields dark with empty storage, and an explicit light choice wins", () => {
     const run = (storage: { getItem: (k: string) => string | null }) => {
       const attrs: Record<string, string> = {};

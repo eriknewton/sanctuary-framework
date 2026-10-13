@@ -288,6 +288,12 @@ body {
 [data-theme="dark"] .btn-icon .icon-sun { display: inline; }
 .btn-icon .icon-moon, .btn-icon .icon-sun { line-height: 0; }
 .main { grid-area: main; overflow-y: auto; padding: 16px 24px; }
+/* Every bare link in the main column reads the accent, visited and hover
+   included. Why: dark is the default theme, and the user-agent link blue on
+   the dark --paper is 2.04:1 (visited 1.74:1), under the 4.5:1 text floor;
+   --accent is 5.16:1 on the light surface and 6.06:1 on the dark paper.
+   Buttons styled as links (.btn) keep their own color. */
+.main a:not(.btn), .main a:not(.btn):visited, .main a:not(.btn):hover { color: var(--accent); }
 .fortress { grid-area: fortress; overflow-y: auto; border-left: 1px solid var(--rule); background: var(--paper-2); padding: var(--space-3); display: flex; flex-direction: column; gap: 10px; }
 .app.route-full .fortress { display: none; }
 .card {
@@ -1367,7 +1373,6 @@ body {
   .sidebar nav a .rail-label, .sidebar nav a .count, .nav-footer, .nav-group-label { display: none; }
   .sidebar nav a { justify-content: center; padding: 0 6px; }
   .scope .id, .scope .scope-sep { display: none; }
-}
 }
 
 /* ===================================================================
