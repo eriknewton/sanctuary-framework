@@ -2,7 +2,7 @@
   "mcpServers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["-y", "@sanctuary-framework/mcp-server"],
+      "args": ["-y", "@sanctuary-framework/mcp-server@1.8.4"],
       "env": {}
     }
   }
