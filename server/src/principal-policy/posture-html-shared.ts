@@ -112,14 +112,14 @@ export const POSTURE_ROOT_TOKENS_CSS = PAPER_INK_ROOT_TOKENS_CSS;
  * Two additions the design audit called for, on top of the paper/ink recolor:
  *
  *   - **Color + shape redundancy.** Every status pill carries a leading glyph
- *     (filled circle = good, triangle = attention, hexagon = fault, open circle
- *     = neutral, dashed ring = unknown), so state is legible without color for
+ *     (filled circle = good, triangle = attention, square = fault, dash =
+ *     neutral, hollow ring = unknown), so state is legible without color for
  *     colorblind and projector viewing. The glyph is injected by CSS `::before`,
  *     so the honesty mappers' emitted markup (`<span class="pill green">...`) is
  *     byte-unchanged - the pinned mapper sources cannot drift from this.
  *
  *   - **The slate "unknown / not monitored" treatment.** A full-weight neutral
- *     gray with a dashed ring - never a whisper, never mistaken for green.
+ *     gray with a hollow ring, never a whisper, never mistaken for green.
  *     "Green must mean checked-and-passed, never no-data." Available here for
  *     surfaces that render an unknown status (wired incrementally); adding the
  *     treatment does not itself change any mapper's color model.
@@ -137,11 +137,11 @@ export const STATUS_PILL_CSS = `.pill {
   .pill.amber { background: var(--ochre-bg); color: var(--ochre); }
   .pill.amber::before { content: "\\25B2"; }
   .pill.red { background: var(--rust-bg); color: var(--rust); }
-  .pill.red::before { content: "\\2B22"; }
+  .pill.red::before { content: "\\25A0"; }
   .pill.neutral { background: var(--surface-2); color: var(--ink-3); }
-  .pill.neutral::before { content: "\\25CB"; }
+  .pill.neutral::before { content: "\\2013"; }
   .pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate); }
-  .pill.unknown::before { content: "\\25CC"; }`;
+  .pill.unknown::before { content: "\\25CB"; }`;
 
 /**
  * The shared evidence-spine CSS: the denominator, freshness stamp, and
@@ -166,7 +166,7 @@ export const EVIDENCE_SPINE_CSS = `.stat-of {
     margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
     justify-content: space-between; gap: 8px; flex-wrap: wrap;
   }
-  .stat-fresh { font-family: var(--mono, monospace); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
+  .stat-fresh { font-family: var(--mono); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
   .stat-fresh.none { color: var(--slate); }
   .stat-ev { font-size: 10.5px; color: var(--indigo); text-decoration: none; white-space: nowrap; }
   .stat-ev:hover { text-decoration: underline; }`;
