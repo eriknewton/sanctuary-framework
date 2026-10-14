@@ -34,7 +34,7 @@ use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
 use castle_wall_daemon::ipc::messages::{IpcMessage, MessageEnvelope};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
 use castle_wall_daemon::manifest::verify::{
-    AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use ed25519_dalek::{Signer, SigningKey};
@@ -52,6 +52,9 @@ mod isolation;
 
 const SIGNATURE_SCHEME_V1: &str = "ed25519-v1";
 const IPC_NAMESPACE: &str = "castle-wall";
+const TEST_AGENT_UID: u32 = 60_123;
+const TEST_GATE_UID: u32 = 60_124;
+const TEST_UID_CEILING: u32 = 500;
 
 struct BootedDaemon {
     handle: castle_wall_daemon::daemon::DaemonHandle,
@@ -195,7 +198,15 @@ fn write_signed_manifest(
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
         generation,
-        agent_origin: None,
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: Some(TEST_GATE_UID),
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
         operator_baseline: None,
         rules: entries,
     };
@@ -453,7 +464,7 @@ fn boot_manifest_is_durably_authorized_before_daemon_started() {
     booted.handle.stop().unwrap();
 }
 
-/// FAIL-BEFORE for the contention-read-as-failure defect (P1).
+/// A contended policy read reports the last known state rather than inventing loss.
 ///
 /// The manifest store lock is genuinely contended in normal operation: verdict
 /// evaluation takes it per packet, and an authorized reload holds it across
@@ -994,8 +1005,8 @@ fn audit_drain_ack_truncates_wal_through_seq() {
     let _ = booted.handle.stop();
 }
 
-/// TEARDOWN RACE (P2): a packet the fence DROPS must not leave the audit trail
-/// ending on a canonical `allow` receipt.
+/// A packet the teardown fence drops must not leave the audit trail ending on a
+/// canonical `allow` receipt.
 ///
 /// The race is real and not hypothetical: `evaluate_attempt` makes its decision
 /// durable BEFORE returning (deliberately - evidence must never trail the
@@ -1044,7 +1055,9 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
     let packet = PendingPacket {
         packet_id: 7,
         nfmark: 1,
-        source_agent_id: Some("agent-fence-race".to_string()),
+        source_agent_id: Some(castle_wall_daemon::nftables::confined_agent_id(
+            TEST_AGENT_UID,
+        )),
         source_cgroup_id: 1,
         dest_ip: Some("203.0.113.7".to_string()),
         dest_port: 443,
@@ -1109,6 +1122,13 @@ fn a_packet_dropped_at_the_teardown_fence_leaves_a_superseding_record() {
             .contains("\"final_verdict\":\"drop\""),
         "the superseding record must state what actually happened to the packet"
     );
+    assert!(superseding.event_canonical_json.contains(&format!(
+        "\"identity_id\":\"{}/uid-{}\"",
+        booted.fortress_id, TEST_AGENT_UID
+    )));
+    assert!(superseding
+        .event_canonical_json
+        .contains(&format!("\"fortress_id\":\"{}\"", booted.fortress_id)));
 
     let _ = booted.handle.stop();
 }
@@ -1119,7 +1139,12 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
     // evaluate_attempt through the DaemonHandle, drain via the IPC server
     // over a real UDS, and assert the audit event arrives on the wire
     // with the canonical egress_approved + static_rule shape.
-    use castle_wall_daemon::policy::EvaluationRequest;
+    use castle_wall_daemon::constants::PRODUCER_SIG_KEY_ID_V1;
+    use castle_wall_daemon::ipc::producer_sig::producer_signing_bytes;
+    use castle_wall_daemon::nfqueue::{
+        build_verdict_callback, register_agent_mark, resolve_agent_mark, NfVerdict, PendingPacket,
+    };
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let booted = boot_daemon_with_policy(0);
     // Manifest store currently has no rule; reload from disk via the
     // DaemonHandle to load the snapshot. boot_daemon_with_policy(0) wrote
@@ -1147,23 +1172,47 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
         IpcMessage::PolicyReloadResponse { ok: true, .. } => {}
         other => panic!("authorized reload failed: {other:?}"),
     }
-    let request = EvaluationRequest {
-        agent_id: "agent-1".to_string(),
-        agent_template: "claude-code".to_string(),
-        // The fixture rule names this exact IP. Host/port/protocol are otherwise
-        // unconstrained, so this request resolves through the intended rule.
-        dest_host: Some("api.example.com".to_string()),
+    let callback = build_verdict_callback(booted.handle.decision_engine());
+    let packet_for_mark = |mark: u32| PendingPacket {
+        packet_id: mark,
+        nfmark: mark,
+        source_agent_id: resolve_agent_mark(mark),
+        source_cgroup_id: 1,
         dest_ip: Some("203.0.113.7".to_string()),
         dest_port: 443,
-        dest_protocol: "tcp".to_string(),
-        opaque: false,
+        protocol: 6,
+        packet_len: 64,
     };
-    let outcome = booted.handle.evaluate_attempt(&request).expect("evaluate");
-    // Sanity: the verdict resolved through the rule we installed.
-    assert!(matches!(
-        outcome.verdict,
-        castle_wall_daemon::policy::Verdict::Allow { .. }
+    let admitted_mark = register_agent_mark(&castle_wall_daemon::nftables::confined_agent_id(
+        TEST_AGENT_UID,
     ));
+    assert_eq!(callback(&packet_for_mark(admitted_mark)), NfVerdict::Accept);
+    let wal = booted.handle.wal_writer().expect("wal");
+    let rows_after_admitted = wal.lock().unwrap().snapshot_after(None, 500).unwrap().len();
+    for mark in [
+        register_agent_mark(&castle_wall_daemon::nftables::confined_agent_id(
+            TEST_GATE_UID,
+        )),
+        register_agent_mark(&castle_wall_daemon::nftables::confined_agent_id(
+            TEST_AGENT_UID + 1,
+        )),
+        register_agent_mark(&castle_wall_daemon::nftables::confined_agent_id(
+            TEST_AGENT_UID - 1,
+        )),
+        register_agent_mark("agent-x"),
+    ] {
+        assert_eq!(callback(&packet_for_mark(mark)), NfVerdict::Drop);
+        assert_eq!(
+            wal.lock().unwrap().snapshot_after(None, 500).unwrap().len(),
+            rows_after_admitted,
+            "unadmitted mark {mark} must not append an egress row"
+        );
+    }
+    assert_eq!(
+        wal.lock().unwrap().snapshot_after(None, 500).unwrap().len(),
+        rows_after_admitted,
+        "unadmitted marks must not append egress rows"
+    );
 
     let mut stream = connect_and_handshake(
         &booted.socket_path,
@@ -1188,15 +1237,49 @@ fn evaluate_attempt_audit_drains_through_real_ipc_wire() {
             assert!(events.len() >= 2);
             let approved = events
                 .iter()
-                .find(|e| e.event_canonical_json.contains("\"egress_approved\""))
-                .expect("egress_approved on the wire");
+                .filter(|e| e.event_canonical_json.contains("\"egress_approved\""))
+                .collect::<Vec<_>>();
+            assert_eq!(approved.len(), 1, "the admitted mark writes one egress row");
+            let approved = approved[0];
             assert!(approved.critical, "evaluate_attempt emits critical events");
+            let pub_bytes =
+                fs::read(booted.policy_dir.join("audit-producer.pub")).expect("producer pub key");
+            let mut pk_arr = [0u8; 32];
+            pk_arr.copy_from_slice(&pub_bytes);
+            let verifying_key = VerifyingKey::from_bytes(&pk_arr).expect("valid verifying key");
+            assert_eq!(
+                approved.producer_key_id.as_deref(),
+                Some(PRODUCER_SIG_KEY_ID_V1)
+            );
+            let signature_b64 = approved
+                .producer_signature_b64url
+                .as_ref()
+                .expect("producer signature");
+            let signature_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(signature_b64)
+                .expect("signature b64");
+            let signature =
+                Signature::try_from(signature_bytes.as_slice()).expect("ed25519 signature");
+            let message = producer_signing_bytes(
+                &approved.event_canonical_json,
+                approved.captured_at_unix_ms,
+                approved.seq,
+            );
+            verifying_key.verify(&message, &signature).unwrap();
             assert!(approved.event_canonical_json.contains("\"l1\""));
             assert!(approved.event_canonical_json.contains("\"static_rule\""));
-            assert!(approved.event_canonical_json.contains("\"agent-1\""));
+            assert!(approved.event_canonical_json.contains(&format!(
+                "\"{}\"",
+                castle_wall_daemon::nftables::confined_agent_id(TEST_AGENT_UID)
+            )));
+            assert!(approved.event_canonical_json.contains(&format!(
+                "\"identity_id\":\"{}/uid-{}\"",
+                booted.fortress_id, TEST_AGENT_UID
+            )));
             assert!(approved
                 .event_canonical_json
-                .contains("\"api.example.com\""));
+                .contains(&format!("\"fortress_id\":\"{}\"", booted.fortress_id)));
+            assert!(approved.event_canonical_json.contains("\"203.0.113.7\""));
             // Chain integrity: the egress_approved entry's prior_sha256_hex
             // is not None (it has at least the daemon_started predecessor).
             assert!(approved.prior_sha256_hex.is_some());
