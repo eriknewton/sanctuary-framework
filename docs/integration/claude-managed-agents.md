@@ -56,6 +56,8 @@ See the [verification checklist](./_verification-checklist.md) for expected resu
 Call: reputation_publish
 ```
 
+From 1.9.0 this call always waits for operator approval (Tier 1), because the signed report leaves the machine. Releases before 1.9.0 publish without asking under the default policy.
+
 Visit `https://verascore.ai/agent/{did}` to see the live profile.
 
 ## What You Get

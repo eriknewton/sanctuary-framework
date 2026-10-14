@@ -3730,16 +3730,22 @@ mod tests {
         let (config, _signing) = fresh_config_in(&dir);
         let handle = boot(config).expect("boot");
         let engine = handle.decision_engine();
+        let baseline_ring = handle.audit_buffer.lock().unwrap().len();
 
         let outcome = engine
             .evaluate_attempt(&req_for(Some("unlisted.example"), 443))
             .expect("evaluate through shared engine");
         assert!(matches!(
-            outcome.verdict,
+            outcome.evidence,
+            crate::decision::OutcomeEvidence::Unattributed
+        ));
+        assert!(matches!(
+            outcome.verdict(),
             Verdict::Deny {
                 reason: DeniedReason::DefaultDeny
             }
         ));
+        assert_eq!(handle.audit_buffer.lock().unwrap().len(), baseline_ring);
 
         drop(engine);
         handle.stop().expect("stop");
@@ -3961,12 +3967,16 @@ mod tests {
 
     use crate::manifest::canonical_json::canonicalize_to_bytes;
     use crate::manifest::verify::{
-        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+        AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
     };
     use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
     use base64::Engine as _;
     use ed25519_dalek::Signer;
     use sha2::{Digest, Sha256};
+
+    const TEST_AGENT_UID: u32 = 60_123;
+    const TEST_GATE_UID: u32 = 60_124;
+    const TEST_UID_CEILING: u32 = 500;
 
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -4016,7 +4026,15 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
             generation: 1,
-            agent_origin: None,
+            agent_origin: Some(AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(TEST_AGENT_UID),
+                gate_uid: Some(TEST_GATE_UID),
+                system_uid_allow_ceiling: TEST_UID_CEILING,
+            }),
             operator_baseline: None,
             rules: vec![
                 ManifestRuleEntry {
@@ -4061,7 +4079,7 @@ mod tests {
 
     fn req_for(host: Option<&str>, port: u16) -> EvaluationRequest {
         EvaluationRequest {
-            agent_id: "agent-1".to_string(),
+            agent_id: crate::nftables::confined_agent_id(TEST_AGENT_UID),
             agent_template: "claude-code".to_string(),
             dest_host: host.map(|h| h.to_string()),
             dest_ip: Some(if host == Some("pastebin.com") {
@@ -4082,18 +4100,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (config, _signing) = fresh_config_in(&dir);
         let handle = boot(config).expect("boot");
+        let baseline_ring = handle.audit_buffer.lock().unwrap().len();
         let outcome = handle
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
         assert!(matches!(
-            outcome.verdict,
+            outcome.evidence,
+            crate::decision::OutcomeEvidence::Unattributed
+        ));
+        assert!(matches!(
+            outcome.verdict(),
             Verdict::Deny {
                 reason: crate::policy::DeniedReason::DefaultDeny
             }
         ));
-        // The audit body matches the canonical egress_blocked + default_deny shape.
-        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
-        assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+        assert!(outcome.wal_seq().is_none());
+        assert!(outcome.event_canonical_json().is_none());
+        assert_eq!(handle.audit_buffer.lock().unwrap().len(), baseline_ring);
         let _ = handle.stop();
     }
 
@@ -4104,15 +4127,19 @@ mod tests {
         let outcome = handle
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-anthropic"),
             other => panic!("expected Allow verdict; got {:?}", other),
         }
         // The WAL seq monotonically increases past the daemon_started seq=0.
-        assert!(outcome.wal_seq.expect("wal_seq present on success") >= 1);
-        assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
+        assert!(outcome.wal_seq().expect("wal_seq present on success") >= 1);
         assert!(outcome
-            .event_canonical_json
+            .event_canonical_json()
+            .expect("audit body")
+            .contains("\"egress_approved\""));
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
             .contains("\"rule-allow-anthropic\""));
         let _ = handle.stop();
     }
@@ -4127,13 +4154,19 @@ mod tests {
             .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
             .expect("evaluate");
         assert!(matches!(
-            outcome.verdict,
+            outcome.verdict(),
             Verdict::Deny {
                 reason: crate::policy::DeniedReason::DefaultDeny
             }
         ));
-        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
-        assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
+            .contains("\"egress_blocked\""));
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
+            .contains("\"default_deny\""));
         let _ = handle.stop();
     }
 
@@ -4143,16 +4176,23 @@ mod tests {
         let outcome = handle
             .evaluate_attempt(&req_for(Some("pastebin.com"), 443))
             .expect("evaluate");
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Deny {
                 reason: crate::policy::DeniedReason::ExplicitRule { rule_id },
             } => assert_eq!(rule_id, "rule-deny-pastebin"),
             other => panic!("expected explicit deny; got {:?}", other),
         }
-        assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
-        assert!(outcome.event_canonical_json.contains("\"static_rule\""));
         assert!(outcome
-            .event_canonical_json
+            .event_canonical_json()
+            .expect("audit body")
+            .contains("\"egress_blocked\""));
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
+            .contains("\"static_rule\""));
+        assert!(outcome
+            .event_canonical_json()
+            .expect("audit body")
             .contains("\"rule-deny-pastebin\""));
         let _ = handle.stop();
     }
@@ -4167,8 +4207,8 @@ mod tests {
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
         // Each evaluation produces a distinct WAL seq, in order.
-        let first_seq = first.wal_seq.expect("first wal_seq present on success");
-        let second_seq = second.wal_seq.expect("second wal_seq present on success");
+        let first_seq = first.wal_seq().expect("first wal_seq present on success");
+        let second_seq = second.wal_seq().expect("second wal_seq present on success");
         assert!(second_seq > first_seq);
         // Mirror appears in the in-memory ring too (one daemon_started + two
         // evaluation events = at least 3 entries).
@@ -4245,7 +4285,7 @@ mod tests {
         injection.store(false, std::sync::atomic::Ordering::SeqCst);
 
         // 1) Verdict is the synthesized fail-closed shape, NOT the original Allow.
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
@@ -4254,30 +4294,37 @@ mod tests {
 
         // 2) wal_seq is None: no durable record landed.
         assert!(
-            outcome.wal_seq.is_none(),
+            outcome.wal_seq().is_none(),
             "wal_seq must be None on fail-closed dispatch; got {:?}",
-            outcome.wal_seq
+            outcome.wal_seq()
         );
 
         // 3) Audit body reflects the fail-closed shape (egress_blocked +
         //    audit_wal_append_failed provenance), NOT the original
         //    egress_approved that would have been emitted on the Allow path.
         assert!(
-            outcome.event_canonical_json.contains("\"egress_blocked\""),
+            outcome
+                .event_canonical_json()
+                .expect("audit body")
+                .contains("\"egress_blocked\""),
             "fail-closed audit body must contain egress_blocked; got {}",
-            outcome.event_canonical_json
+            outcome.event_canonical_json().expect("audit body")
         );
         assert!(
             outcome
-                .event_canonical_json
+                .event_canonical_json()
+                .expect("audit body")
                 .contains("\"audit_wal_append_failed\""),
             "fail-closed audit body must contain audit_wal_append_failed provenance; got {}",
-            outcome.event_canonical_json
+            outcome.event_canonical_json().expect("audit body")
         );
         assert!(
-            !outcome.event_canonical_json.contains("\"egress_approved\""),
+            !outcome
+                .event_canonical_json()
+                .expect("audit body")
+                .contains("\"egress_approved\""),
             "fail-closed audit body must NOT contain egress_approved; got {}",
-            outcome.event_canonical_json
+            outcome.event_canonical_json().expect("audit body")
         );
 
         // 4) The in-memory ring buffer absorbed the fail-closed event.
@@ -4324,12 +4371,12 @@ mod tests {
         let recovered = handle
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate after disarm");
-        match &recovered.verdict {
+        match &recovered.verdict() {
             Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-anthropic"),
             other => panic!("expected Allow after disarm; got {other:?}"),
         }
         assert!(
-            recovered.wal_seq.is_some(),
+            recovered.wal_seq().is_some(),
             "wal_seq should be Some after disarm"
         );
 
@@ -4343,9 +4390,8 @@ mod tests {
         // emits the AuditWalAppendFailed-flavored fail-closed shape, NOT
         // the original DefaultDeny shape. The audit body must reflect the
         // dispatch provenance, not the original deny reason.
-        let dir = TempDir::new().unwrap();
-        let (config, _signing) = fresh_config_in(&dir);
-        let handle = boot(config).expect("boot");
+        let (handle, _dir) =
+            boot_with_single_rule("rule-allow-anthropic", "api.anthropic.com", "allow");
 
         let wal_arc = handle.wal_writer().expect("wal wired").clone();
         let injection = wal_arc.lock().unwrap().injection_handle();
@@ -4357,19 +4403,23 @@ mod tests {
 
         injection.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
             other => panic!("expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"),
         }
-        assert!(outcome.wal_seq.is_none());
+        assert!(outcome.wal_seq().is_none());
         // Provenance must be audit_wal_append_failed, NOT default_deny.
         assert!(outcome
-            .event_canonical_json
+            .event_canonical_json()
+            .expect("audit body")
             .contains("\"audit_wal_append_failed\""));
         assert!(
-            !outcome.event_canonical_json.contains("\"default_deny\""),
+            !outcome
+                .event_canonical_json()
+                .expect("audit body")
+                .contains("\"default_deny\""),
             "fail-closed dispatch must override the default_deny provenance"
         );
         let _ = handle.stop();
@@ -4390,7 +4440,7 @@ mod tests {
 
         injection.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
@@ -4400,11 +4450,13 @@ mod tests {
         // decision_provenance="static_rule"; the dispatched shape clears
         // both in favor of the audit_wal_append_failed provenance.
         assert!(outcome
-            .event_canonical_json
+            .event_canonical_json()
+            .expect("audit body")
             .contains("\"audit_wal_append_failed\""));
         assert!(
             !outcome
-                .event_canonical_json
+                .event_canonical_json()
+                .expect("audit body")
                 .contains("\"rule-deny-pastebin\""),
             "fail-closed dispatch must drop the original rule_id_matched stamp"
         );
@@ -4452,14 +4504,14 @@ mod tests {
         );
         // 2) Fail CLOSED: the audit store was unreachable, so the verdict is Deny
         //    with the audit-failure reason, never a durable Allow.
-        match &outcome.verdict {
+        match &outcome.verdict() {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
             other => panic!("expected fail-closed Deny(AuditWalAppendFailed); got {other:?}"),
         }
         assert!(
-            outcome.wal_seq.is_none(),
+            outcome.wal_seq().is_none(),
             "a stalled WAL cannot have durably sequenced the record"
         );
 

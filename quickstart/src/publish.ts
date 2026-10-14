@@ -13,7 +13,19 @@
  * Signature is computed over the UTF-8 bytes of JSON.stringify(data).
  */
 
+import { createRequire } from "node:module";
+
 import { signBytes, type QuickstartIdentity } from "./identity.js";
+
+/**
+ * The package version, read from the shipped package.json (one directory up
+ * from both `src/` and `dist/`) so the payload's `sanctuary_version` can never
+ * drift from the published version. npm always includes package.json in the
+ * tarball, so this read cannot miss in an installed copy.
+ */
+export const QUICKSTART_VERSION: string = (
+  createRequire(import.meta.url)("../package.json") as { version: string }
+).version;
 
 export interface PublishPayload {
   did: string;
@@ -45,7 +57,7 @@ export function buildPayload(
   return {
     did: identity.did,
     name: agentName,
-    sanctuary_version: "quickstart-0.1.0",
+    sanctuary_version: `quickstart-${QUICKSTART_VERSION}`,
     layers: {
       l1: "partial",
       l2: "none",
@@ -64,14 +76,36 @@ export function didToAgentId(did: string): string {
   return did.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase();
 }
 
+/** The exact HTTP request quickstart would send, built before anything is sent. */
+export interface PublishRequest {
+  /** Absolute URL of Verascore's publish endpoint. */
+  endpoint: string;
+  /** Profile URL Verascore serves for this DID once published. */
+  profileUrl: string;
+  /** The JSON request body, byte-for-byte what `sendPublishRequest` POSTs. */
+  body: {
+    agentId: string;
+    signature: string;
+    publicKey: string;
+    type: "shr";
+    data: PublishPayload;
+  };
+}
+
 /**
- * Sign the payload and POST it to Verascore's /api/publish.
+ * Build and sign the publish request without sending it.
+ *
+ * Built once and reused: the consent prompt shows this object and
+ * `sendPublishRequest` sends the same object, so what the operator approved
+ * is exactly what leaves the machine (the payload timestamp is fixed here,
+ * not re-read at send time). The private key is used to sign and is not
+ * part of the request.
  */
-export async function publishProfile(
+export function buildPublishRequest(
   identity: QuickstartIdentity,
   agentName: string,
   verascoreUrl: string,
-): Promise<PublishResult> {
+): PublishRequest {
   const payload = buildPayload(identity, agentName);
   const agentId = didToAgentId(identity.did);
 
@@ -80,20 +114,28 @@ export async function publishProfile(
   const payloadBytes = new TextEncoder().encode(payloadJson);
   const signature = signBytes(payloadBytes, identity.privateKey);
 
-  const requestBody = {
-    agentId,
-    signature,
-    publicKey: identity.publicKey,
-    type: "shr",
-    data: payload,
+  const base = verascoreUrl.replace(/\/+$/, "");
+  return {
+    endpoint: `${base}/api/publish`,
+    profileUrl: `${base}/agent/${encodeURIComponent(identity.did)}`,
+    body: {
+      agentId,
+      signature,
+      publicKey: identity.publicKey,
+      type: "shr",
+      data: payload,
+    },
   };
+}
 
-  const profileUrl = `${verascoreUrl.replace(/\/+$/, "")}/agent/${encodeURIComponent(identity.did)}`;
-
-  const response = await fetch(`${verascoreUrl.replace(/\/+$/, "")}/api/publish`, {
+/** POST a request built by `buildPublishRequest` to Verascore. */
+export async function sendPublishRequest(
+  request: PublishRequest,
+): Promise<PublishResult> {
+  const response = await fetch(request.endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify(request.body),
   });
 
   let body: unknown = null;
@@ -107,6 +149,21 @@ export async function publishProfile(
     ok: response.ok,
     status: response.status,
     body,
-    profileUrl,
+    profileUrl: request.profileUrl,
   };
+}
+
+/**
+ * Sign the payload and POST it to Verascore's /api/publish in one step.
+ * Callers that need operator consent first use `buildPublishRequest`, show
+ * the result, then `sendPublishRequest`.
+ */
+export async function publishProfile(
+  identity: QuickstartIdentity,
+  agentName: string,
+  verascoreUrl: string,
+): Promise<PublishResult> {
+  return sendPublishRequest(
+    buildPublishRequest(identity, agentName, verascoreUrl),
+  );
 }

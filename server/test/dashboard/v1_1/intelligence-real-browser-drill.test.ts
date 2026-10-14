@@ -159,9 +159,10 @@ describe("Intelligence real-browser drill — SPA shell + responsive layout", ()
       identityId: IDENTITY,
       fortressId: FORTRESS,
     });
-    // Sidebar nav
-    expect(html).toContain('data-route="intelligence"');
-    expect(html).toContain(">Intelligence<");
+    // Retargeted (slice 2 shell): Intelligence is the "Local models" tab of
+    // Settings in the rail; the tab table rides in the embedded client.
+    expect(html).toContain('data-route="settings"');
+    expect(html).toContain('{ id: "intelligence", label: "Local models" }');
     // CSS skeleton for picker + panel
     expect(html).toContain(".intel-modal-backdrop");
     expect(html).toContain(".intel-row");
@@ -169,11 +170,14 @@ describe("Intelligence real-browser drill — SPA shell + responsive layout", ()
     expect(html).toContain(".intel-status-dot.green");
     expect(html).toContain(".intel-status-dot.yellow");
     expect(html).toContain(".intel-status-dot.red");
-    // Sidebar nav anchored alongside Privacy / Coordination / Health.
+    // Rail anchors: Policies and Integrations; Privacy and Health are
+    // Settings tabs and Coordination is Integrations' content (retargeted,
+    // slice 2 shell: the folded ids resolve through the client's table).
     expect(html).toContain('data-route="policy"');
-    expect(html).toContain('data-route="privacy"');
-    expect(html).toContain('data-route="coordination"');
-    expect(html).toContain('data-route="health"');
+    expect(html).toContain('data-route="integrations"');
+    expect(html).toContain('{ id: "privacy", label: "Privacy" }');
+    expect(html).toContain('{ id: "health", label: "Health" }');
+    expect(html).toContain('"coordination": "integrations"');
   });
 
   it("layout holds at simulated widths 800 / 1280 / 1440 / 1920 px (CSS-driven)", () => {
@@ -191,10 +195,11 @@ describe("Intelligence real-browser drill — SPA shell + responsive layout", ()
     const mediaBlock = html.slice(mediaIdx, mediaIdx + 800);
     expect(mediaBlock).toMatch(/\.intel-row\s*\{\s*grid-template-columns:\s*1fr/);
 
-    // The .app shell stays a 220 / 1fr / 360 grid at default widths
-    // (1280 / 1440 / 1920 px) and collapses to 56 / 1fr at narrow widths
-    // (800 px). Both cases live in the same stylesheet.
-    expect(html).toMatch(/\.app\s*\{[^}]*grid-template-columns:\s*220px\s+1fr\s+360px/);
+    // The .app shell is a 232 / 1fr / 360 grid at default widths (1280 /
+    // 1440 / 1920 px; 232px is the ratified rail width, retargeted from 220
+    // in the slice 2 shell) and narrows inside the 1100px block. Both cases
+    // live in the same stylesheet.
+    expect(html).toMatch(/\.app\s*\{[^}]*grid-template-columns:\s*232px\s+1fr\s+360px/);
     expect(mediaBlock).toContain(".app, .app.route-full");
   });
 
@@ -217,8 +222,10 @@ describe("Intelligence real-browser drill — picker flow over HTTP", () => {
     const res = await fetch(`${d.url}/v1.1`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('data-route="intelligence"');
-    expect(html).toContain(">Intelligence<");
+    // Retargeted (slice 2 shell): the served shell carries the Settings rail
+    // item and the Local models tab that hosts Intelligence.
+    expect(html).toContain('data-route="settings"');
+    expect(html).toContain('{ id: "intelligence", label: "Local models" }');
   });
 
   it("step 4a: initial /status reports defaults across all six surfaces", async () => {
