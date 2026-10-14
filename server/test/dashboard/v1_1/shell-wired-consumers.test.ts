@@ -552,7 +552,8 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).toContain("Always allow this operation for every agent on this fortress.");
     // The rule is added to the fortress policy and this console cannot remove it, so the note claims neither a
     // signature nor a revocation path.
-    expect(main).toContain("Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet.");
+    // The screen escapes the apostrophe as &#039; (escHtml), so the rendered markup carries that entity.
+    expect(main).toContain("Adds a standing rule to this fortress&#039;s policy. The console has no control to remove a standing rule yet.");
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("revocable");
     expect(main).toContain("Allow always first allows this request, then asks the policy engine to compile a standing rule for state_export and activate it with your operator token.");
