@@ -429,8 +429,9 @@ function beginMfpRead(path) {
   return source.generation;
 }
 function currentMfpRead(path, generation) { return sourceRead(path).generation === generation; }
-// Every site that bumps a read's revision also sets that read's state (queuePanel to LOADING and queues the trailing
-// read; a restart to UNREAD; a stop to FAILED), so this refusal means "not mine to publish", never a failed read.
+// For the three snapshot readers (fetchMfpRead and readPolicyView), every site that bumps the read's revision also sets
+// its state (queuePanel to LOADING and queues the trailing read; a restart to UNREAD; a stop to FAILED), so this refusal
+// means "not mine to publish", never a failed read. Other panels reach loadPanel's catch and still fail on it.
 function supersededByRefresh() {
   const error = new Error("A newer refresh is pending.");
   error.supersededByRefresh = true;
@@ -490,6 +491,9 @@ function readResponse(url, init, deadlineMs, generation) {
   }, function (error) {
     // An older failure cannot revoke evidence already supplied by a newer generation.
     if (generation !== undefined && !currentMfpRead(url, generation)) throw error;
+    // A snapshot read whose revision moved failed after a trailing read or a stop took over its state, so the failure
+    // is not this source's result: the reader keeps its snapshot, as it does when a superseded read succeeds.
+    if (generation !== undefined && source && source.revision !== revision) throw supersededByRefresh();
     if (error && error.dashboardModeNotServed) markSourceNotServed(url);
     else failSource(url, error);
     if (source && source.state !== "state_NOT_SERVED") source.status = error.status;
@@ -6108,6 +6112,9 @@ function stopLiveUpdates() {
   liveUpdatesStopped = true;
   clearSealFreshnessTimer();
   sourceReads.forEach(function (read) { read.revision++; read.state = "state_FAILED"; read.error = "Live updates stopped. Retry to resume."; });
+  // Every read is now failed, so no findings snapshot is current: the selection closes, as a failed findings read
+  // closes it, and a restart cannot reopen it.
+  state.mfp.findingId = null;
   rerender();
 }
 
