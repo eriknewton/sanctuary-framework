@@ -848,7 +848,7 @@ function inboxActions(item) {
 }
 
 const INBOX_ACTION_LABEL = {
-  approve: "Approve",
+  approve: "Allow once",
   deny: "Deny",
   dismiss: "Dismiss",
   review_receipt: "Review receipt",
@@ -3194,7 +3194,10 @@ const EVIDENCE_CHAIN_VERDICTS = ${JSON.stringify(EVIDENCE_CHAIN_VERDICTS)};
 const EVIDENCE_PAGE_SIZE = EVIDENCE_ROUTE_DEFAULT_LIMIT;
 const EVIDENCE_DETAIL_VALUE_MAX_CHARS = 240; // 240 = four 60-char lines in the drawer key-value column.
 const EVIDENCE_RAW_RECORD_MAX_CHARS = 6000; // 6000 = about 100 60-char lines, enough for inspection without unbounded DOM growth.
+// The decided approvals list shows at most one audit page of rows, so the screen's two lists share one row budget.
+const EVIDENCE_DECIDED_APPROVAL_LIMIT = EVIDENCE_PAGE_SIZE;
 const EVIDENCE_DETAIL_KEY_LIMIT = EVIDENCE_PAGE_SIZE; // One record gets at most the same row budget as one audit page.
+const EVIDENCE_SINCE_ROUND_MS = 60 * 1000; // One minute: the time range start sent with the read is rounded to it.
 const EVIDENCE_FINDING_DISPLAY_LIMIT = 5; // Five findings fit in the strip before the table leaves the first viewport.
 // Must match the limit default in handleAuditLog in server/src/principal-policy/dashboard.ts: the audit
 // log read serves the most recent entries up to this limit, so the export says it is that bound.
@@ -3295,7 +3298,28 @@ function applyEvidenceHashFilters(hash) {
   filters.event = params.get("event") || "";
   const result = params.get("result") || "";
   filters.result = result === "success" || result === "failure" ? result : "";
-  filters.from = params.get("from") || "";
+  filters.from = evidenceFromDate(params.get("from") || "");
+}
+
+// The From filter is a calendar date in the operator's own time zone (what a date input holds), so
+// anything that is not a real YYYY-MM-DD date is dropped instead of sent as a window that matches nothing.
+function evidenceFromDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!m) return "";
+  const local = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return local.getFullYear() === Number(m[1]) && local.getMonth() === Number(m[2]) - 1 && local.getDate() === Number(m[3]) ? value : "";
+}
+
+// The start of the Evidence read's window: the later of the From date's local midnight and the start of
+// the top-bar time range. The time range start is rounded down to the minute, so reads within one minute
+// ask for the same window and a repeated read compares equal.
+function evidenceSinceIso() {
+  const from = evidenceFromDate(state.evidence.filters.from);
+  const fromMs = from ? new Date(Number(from.slice(0, 4)), Number(from.slice(5, 7)) - 1, Number(from.slice(8, 10))).getTime() : null;
+  const windowMs = TIME_RANGE_MS[state.timeRange];
+  const rangeMs = typeof windowMs === "number" ? Math.floor((Date.now() - windowMs) / EVIDENCE_SINCE_ROUND_MS) * EVIDENCE_SINCE_ROUND_MS : null;
+  const since = fromMs === null ? rangeMs : rangeMs === null ? fromMs : Math.max(fromMs, rangeMs);
+  return since === null ? "" : new Date(since).toISOString();
 }
 
 function evidenceHashFromFilters() {
@@ -3326,7 +3350,8 @@ function evidenceReadUrl() {
   const params = new URLSearchParams();
   const filters = state.evidence.filters;
   if (filters.agent) params.set("agent", filters.agent);
-  if (filters.from) params.set("since", filters.from);
+  const since = evidenceSinceIso();
+  if (since) params.set("since", since);
   if (filters.event) params.set("operation_type", filters.event);
   if (filters.layer) params.set("layer", filters.layer);
   if (filters.result) params.set("result", filters.result);
@@ -3427,9 +3452,10 @@ function renderEvidenceIntegrity(view) {
   const status = view.chain_verdict;
   const known = Object.prototype.hasOwnProperty.call(EVIDENCE_CHAIN_VERDICTS, status);
   // Only the served whole-chain verdict with no findings earns CHAIN VERIFIED.
-  // Continuing paths: verified -> clean; suffix -> qualified; findings -> bad;
-  // key unavailable or an unrecognized verdict -> no verification claim.
-  const verdict = known ? EVIDENCE_CHAIN_VERDICTS[findings.length && status === "verified" ? "findings" : status] : {
+  // Continuing paths: verified -> clean; suffix -> qualified; any served finding -> bad, whatever the
+  // served verdict, so no reassuring word sits above a finding; key unavailable or an unrecognized
+  // verdict -> no verification claim.
+  const verdict = known ? EVIDENCE_CHAIN_VERDICTS[findings.length ? "findings" : status] : {
     kind: "unknown", word: "UNKNOWN", summary: "The audit chain status was not recognized or was not served."
   };
   const chipKind = verdict.kind;
@@ -3441,13 +3467,15 @@ function renderEvidenceIntegrity(view) {
   }).join("");
   const findingCount = findings.length
     ? '<span>showing ' + escHtml(Math.min(findings.length, EVIDENCE_FINDING_DISPLAY_LIMIT)) + ' of ' + escHtml(findings.length) + ' findings</span>'
-    : '<span><b>0</b> integrity findings in window</span>';
+    : '<span><b>0</b> integrity findings reported for the whole chain</span>';
   return '<section class="evidence-integrity ' + escHtml(chipKind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(chipKind, chipWord) + '</div>' +
     '<div class="ei-facts"><strong>' + escHtml(summary) + '</strong><span><b>' + escHtml(total) + '</b> entries in the served window before page limit and result filter</span>' +
-    findingCount + '<span>sealed region: ' + escHtml(sealed) + '</span><span>last verified: age of this read ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span>' +
+    findingCount + '<span>sealed region: ' + escHtml(sealed) + '</span><span>age of this read: ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span>' +
     shownFindings + '</div></section>';
 }
 
+// Must match SealedRegionVerdict in server/src/operational/audit-log.ts: every served status has its own
+// words here, and a status this list does not name reads Unknown, never a verification.
 function renderSealedRegion(sealed) {
   if (!sealed || typeof sealed !== "object") return "Unknown";
   if (sealed.status === "not_present") return "no sealed legacy region present";
@@ -3473,7 +3501,8 @@ function renderEvidenceQueryBar() {
     "Agent: " + (f.agent || "Any"),
     "Event: " + (f.event || "Any"),
     "Result: " + (f.result ? sentenceCase(f.result) : "Any"),
-    "From: " + (f.from || "Any")
+    "From: " + (f.from || "Any"),
+    "Time range: " + TIME_RANGE_LABEL[state.timeRange]
   ].map(function (chip) { return '<span class="evidence-chip">' + escHtml(chip) + '</span>'; }).join("");
   return '<section class="card evidence-query"><div class="filter-bar" role="group" aria-label="Filter evidence entries">' +
     '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: result: event: or text" value="' + escHtml(f.query) + '"></label>' +
@@ -3545,7 +3574,9 @@ function renderEvidenceExports() {
 // home of the panel moved.
 function renderActivityScreen() {
   const view = state.evidence.view;
-  const entries = sourceLoaded("/api/posture/evidence") && view && Array.isArray(view.entries) ? view.entries : [];
+  // Must match AuditLog.query in server/src/operational/audit-log.ts, which serves the most recent
+  // entries oldest first (filtered.slice(-limit)); the table lists that page newest first.
+  const entries = sourceLoaded("/api/posture/evidence") && view && Array.isArray(view.entries) ? view.entries.slice().reverse() : [];
   const filtered = filteredEvidenceEntries(entries);
   const shown = filtered.slice(0, EVIDENCE_PAGE_SIZE);
   if (!shown[state.evidence.selectedIndex]) state.evidence.selectedIndex = 0;
@@ -3592,7 +3623,7 @@ function renderEvidenceDecidedApprovals() {
   if (!sourceLoaded(HUB + "/inbox")) return "";
   if (state.inboxRedacted) return '<section class="card"><h3>Decided approvals</h3><p>Approvals are hidden, not empty. Paste the operator token to review them.</p></section>';
   const decided = state.inbox.filter(function (item) { return item.kind === "approval_pending" && item.resolved; });
-  const shown = filterInbox(decided).slice(0, EVIDENCE_PAGE_SIZE);
+  const shown = filterInbox(decided).slice(0, EVIDENCE_DECIDED_APPROVAL_LIMIT);
   // Resolution is a served historical fact, never permission to decide the item again.
   return '<section class="card"><h3>Decided approvals</h3><p class="muted">showing ' + shown.length + ' of ' + decided.length +
     ' loaded decisions · inbox read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</p>' +
@@ -5889,15 +5920,18 @@ async function onEvidenceJsonExport() {
   try {
     // api() sends the exact /api/audit-log path unprefixed, so the read relies on the route's default limit.
     const body = await api("/api/audit-log", { method: "GET" });
-    // The audit log read answers with an entry array, and with an empty array both for an empty log and
-    // for a log it could not read, so an empty answer is reported as no entries, never as a downloaded log.
-    if (!Array.isArray(body)) throw new Error("the audit log read did not return entries");
-    if (!body.length) {
+    // Must match handleAuditLog in server/src/principal-policy/dashboard.ts: with an audit log it serves the
+    // query result object ({ entries, total, integrity_findings }), and without one, or when the query fails,
+    // an empty array. An empty answer of either shape is reported as no entries, never as a downloaded log.
+    const entries = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.entries) ? body.entries : null;
+    if (!entries) throw new Error("the audit log read did not return entries");
+    if (!entries.length) {
       toast("No audit entries were returned, so nothing was exported. The audit log read returns none both for an empty log and for a log it could not read.", "info");
       return;
     }
+    // The file is the served answer unchanged, so the export carries the read's own total and findings with its entries.
     downloadJsonFile(body, "sanctuary-audit-log.json");
-    toast("Downloaded the latest " + body.length + " audit entries as JSON (at most " + EVIDENCE_JSON_EXPORT_LIMIT + ").", "info");
+    toast("Downloaded the latest " + entries.length + (entries.length === 1 ? " audit entry" : " audit entries") + " as JSON (at most " + EVIDENCE_JSON_EXPORT_LIMIT + ").", "info");
   } catch (e) {
     toast("Audit log JSON export failed: " + (e && e.message ? e.message : "unknown"), "error");
   }
@@ -6513,7 +6547,7 @@ document.addEventListener("input", function (ev) {
   } else if (action === "evidence-filter-event") {
     setEvidenceFilter("event", tgt.value);
   } else if (action === "evidence-filter-from") {
-    setEvidenceFilter("from", tgt.value);
+    setEvidenceFilter("from", evidenceFromDate(tgt.value));
   }
 });
 
@@ -6522,10 +6556,14 @@ document.addEventListener("change", function (ev) {
   if (!(tgt instanceof Element) || tgt.tagName !== "SELECT") return;
   const action = tgt.getAttribute("data-action");
   if (action === "time-range") {
-    // A client-side window only: it narrows what is already loaded and is not
-    // saved with the inbox preferences.
+    // Not saved with the inbox preferences. It narrows the loaded inbox list on the client, and it is
+    // sent with the Evidence entries read as that read's window start, so the table, its counts and the
+    // integrity strip's entry total cover the range the control shows.
+    const previousUrl = evidenceReadUrl();
     state.timeRange = Object.prototype.hasOwnProperty.call(TIME_RANGE_LABEL, tgt.value) ? tgt.value : "all";
-    return rerender();
+    rerender();
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
+    return;
   }
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;

@@ -1979,6 +1979,9 @@ body {
   margin: 0; max-height: 320px; overflow: auto; padding: 10px;
   border: 1px solid var(--rule); border-radius: var(--rad); background: var(--paper);
   color: var(--ink-2); font-family: var(--mono); font-size: var(--text-xs); white-space: pre-wrap;
+  /* A served value can be one unbroken token (a hash or a long URL); it wraps inside the pane instead of
+     hiding past its right edge behind a sideways scroll. */
+  overflow-wrap: anywhere;
 }
 .evidence-export .toolbar .btn:disabled { color: var(--ink-4); border-style: dashed; cursor: not-allowed; background: var(--surface-2); }
 

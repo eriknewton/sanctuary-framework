@@ -30,7 +30,7 @@ import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import type { TypeAliasDeclaration, UnionTypeNode, LiteralTypeNode, StringLiteral } from "typescript";
+import type { TypeAliasDeclaration, UnionTypeNode, LiteralTypeNode, StringLiteral, TypeLiteralNode, PropertySignature, Identifier } from "typescript";
 const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
 import type { AuditChainVerdictStatus } from "../../../src/operational/audit-log.js";
 
@@ -39,6 +39,16 @@ function unionValues(name: string) {
   const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
   const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
   return (alias.type as UnionTypeNode).types.map((node) => ((node as LiteralTypeNode).literal as StringLiteral).text).sort();
+}
+
+// The `status` literal of each member of an object-type union such as SealedRegionVerdict.
+function unionStatusValues(name: string) {
+  const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
+  return (alias.type as UnionTypeNode).types.map((node) => {
+    const member = (node as TypeLiteralNode).members.find((m) => m.name && (m.name as Identifier).text === "status") as PropertySignature;
+    return ((member.type as LiteralTypeNode).literal as StringLiteral).text;
+  }).sort();
 }
 
 const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
@@ -1580,7 +1590,16 @@ describe("slice 5 Evidence wired consumers", () => {
   const now = "2026-10-14T17:00:00.000Z";
   const evidencePayload = (overrides: Record<string, unknown> = {}) => ({
     origin_machine: "fixture-mac",
+    // Served oldest first, as AuditLog.query returns its most recent page; the table lists it newest first.
     entries: [
+      {
+        timestamp: "2026-10-14T16:57:00.000Z",
+        layer: "l2",
+        identity_id: "sentinel-agent",
+        operation: "sentinel_finding",
+        result: "success",
+        details: { summary: "Finding opened" },
+      },
       {
         timestamp: "2026-10-14T16:58:00.000Z",
         layer: "l1",
@@ -1593,14 +1612,6 @@ describe("slice 5 Evidence wired consumers", () => {
           agent_saw: "<script>alert(1)</script>",
           event_text: "<img src=x onerror=alert(1)>",
         },
-      },
-      {
-        timestamp: "2026-10-14T16:57:00.000Z",
-        layer: "l2",
-        identity_id: "sentinel-agent",
-        operation: "sentinel_finding",
-        result: "success",
-        details: { summary: "Finding opened" },
       },
     ],
     total: 2,
@@ -1642,7 +1653,9 @@ describe("slice 5 Evidence wired consumers", () => {
       expect(html, status).toContain(cases[status].text);
       if (status !== "verified") expect(html).not.toContain("CHAIN VERIFIED");
       expect(html, status).toContain("sealed region:");
-      expect(html, status).toContain("last verified: age of this read");
+      // The read's age is stated on every verdict, never as a verification time.
+      expect(html, status).toContain("age of this read:");
+      expect(html, status).not.toContain("last verified");
       expect(html, status).not.toContain("signer");
       expect(html, status).not.toContain("head <span");
     }
@@ -1654,6 +1667,32 @@ describe("slice 5 Evidence wired consumers", () => {
     const missing = await bootEvidence(evidencePayload(), { "/api/posture/evidence": never });
     expect(missing.el.main!.innerHTML).toContain("Chain verification Unknown");
     expect(missing.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("a served finding reads as INTEGRITY FINDINGS under any served verdict, and the findings line covers the whole chain", async () => {
+    for (const status of ["verified", "verified_suffix_only", "key_unavailable"] as const) {
+      const h = await bootEvidence(evidencePayload({ chain_verdict: status, integrity_findings: [{ kind: "entry_hash_mismatch", message: "entry mismatch" }] }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("INTEGRITY FINDINGS");
+      expect(html, status).not.toContain("CHAIN VERIFIED");
+      expect(html, status).not.toContain("RECENT ENTRIES VERIFIED");
+    }
+    const clean = await bootEvidence(evidencePayload());
+    expect(clean.el.main!.innerHTML).toContain("integrity findings reported for the whole chain");
+    expect(clean.el.main!.innerHTML).not.toContain("findings in window");
+  });
+
+  it("words every served sealed region status, over the full SealedRegionVerdict union", async () => {
+    const statuses = unionStatusValues("SealedRegionVerdict");
+    expect(statuses.length).toBeGreaterThan(0);
+    for (const status of statuses) {
+      const h = await bootEvidence(evidencePayload({ sealed_region: { status, entries_verified: 3, note: "fixture note", expected_tip: 9, highest_present: 7, sequence: 4 } }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("sealed region: ");
+      expect(html, status).not.toContain("sealed region: Unknown");
+    }
+    const unknown = await bootEvidence(evidencePayload({ sealed_region: { status: "not_a_served_status" } }));
+    expect(unknown.el.main!.innerHTML).toContain("sealed region: Unknown");
   });
 
   it("renders only served entry fields and result words, never chain verdict words as entry results", async () => {
@@ -1731,17 +1770,51 @@ describe("slice 5 Evidence wired consumers", () => {
     h.input("evidence-filter-from", "2026-10-14");
     await settle();
     const request = new URL(h.requests.at(-1)!.url, "http://fixture");
-    expect(Object.fromEntries(request.searchParams)).toEqual({ layer: "l4", agent: "agent-alpha", operation_type: "egress", result: "failure", since: "2026-10-14", limit: "50" });
+    // The From date is the operator's calendar date, so it is sent as that date's local midnight.
+    expect(Object.fromEntries(request.searchParams)).toEqual({ layer: "l4", agent: "agent-alpha", operation_type: "egress", result: "failure", since: new Date(2026, 9, 14).toISOString(), limit: "50" });
     h.navigate("activity"); await settle();
     expect(h.requests.at(-1)!.url).toBe("/api/posture/evidence?limit=50");
+  });
+
+  it("the top-bar time range narrows the entries read, and the later of it and the From date starts the window", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-14T17:00:30.000Z"));
+    const h = await bootEvidence(evidencePayload());
+    expect(h.el.main!.innerHTML).toContain("Time range: all time");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    // The range start is rounded down to the minute.
+    const rangeStart = "2026-10-13T17:00:00.000Z";
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(rangeStart);
+    expect(h.el.main!.innerHTML).toContain("Time range: the last 24 hours");
+    h.input("evidence-filter-from", "2026-10-14");
+    await settle();
+    const later = new Date(Math.max(new Date(2026, 9, 14).getTime(), Date.parse(rangeStart))).toISOString();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(later);
+    h.input("evidence-filter-from", "");
+    range.value = "all"; h.change(range);
+    await settle();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since")).toBe(false);
+  });
+
+  it("drops a From value that is not a real calendar date instead of sending a window that matches nothing", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const h = await bootEvidence(evidencePayload());
+    for (const bad of ["garbage", "2026-02-30", "2026-1-5"]) {
+      h.navigate("activity?from=" + encodeURIComponent(bad));
+      await settle();
+      expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since"), bad).toBe(false);
+      expect(h.el.main!.innerHTML, bad).toContain("From: Any");
+      expect(h.el.main!.innerHTML, bad).not.toContain("From: " + bad);
+    }
   });
 
   it("narrows free-text search only over the loaded page and keeps total as the served window count", async () => {
     const h = await bootEvidence({
       ...evidencePayload(),
       entries: [
-        { timestamp: "2026-10-14T16:58:00.000Z", layer: "l1", identity_id: "one", operation: "matched_event", result: "success", details: { summary: "needle" } },
         { timestamp: "2026-10-14T16:57:00.000Z", layer: "l2", identity_id: "two", operation: "other_event", result: "failure", details: { summary: "hay" } },
+        { timestamp: "2026-10-14T16:58:00.000Z", layer: "l1", identity_id: "one", operation: "matched_event", result: "success", details: { summary: "needle" } },
       ],
       total: 99,
     });
@@ -1773,11 +1846,13 @@ describe("slice 5 Evidence wired consumers", () => {
   it("exports JSON through api with the operator token and keeps unavailable exports disabled with reasons", async () => {
     const blobs: Blob[] = [];
     const exportedEntry = { timestamp: now, layer: "l1", operation: "egress", identity_id: "research-agent", result: "failure" };
+    const servedBody = { entries: [exportedEntry], total: 1, integrity_findings: [] };
     const h = await bootEvidence(evidencePayload(), {
       "/api/audit-log": (init) => {
         expect(init?.headers).toMatchObject({ Authorization: "Bearer operator-token" });
-        // Retargeted to the served shape: handleAuditLog answers with an entry array, not an object.
-        return Promise.resolve(response([exportedEntry]));
+        // Must match the served shape pinned in test/principal-policy/dashboard-audit-log-route-shape.test.ts:
+        // with an audit log wired, handleAuditLog answers with the AuditLog.query result object.
+        return Promise.resolve(response(servedBody));
       },
     }, {
       sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
@@ -1794,7 +1869,22 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
     expect(h.downloads).toHaveLength(1);
     expect((h.downloads[0] as unknown as { download: string }).download).toBe("sanctuary-audit-log.json");
-    expect(JSON.parse(await blobs[0]!.text())).toEqual([exportedEntry]);
+    expect(JSON.parse(await blobs[0]!.text())).toEqual(servedBody);
+    expect(h.el["toast-host"]!.innerHTML).toContain("Downloaded the latest 1 audit entry as JSON");
+  });
+
+  it("the JSON export reports a served result object with no entries as no entries, never as a downloaded log", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response({ entries: [], total: 0, integrity_findings: [] })),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("export failed");
   });
 
   it("the JSON export names its bound and reports an empty audit log read instead of downloading a file", async () => {
@@ -1842,6 +1932,9 @@ describe("slice 5 Evidence wired consumers", () => {
     const html = h.el.main!.innerHTML;
     expect(html).toContain('data-action="inbox-approve" data-item-id="t2"');
     expect(html).toContain('data-action="inbox-deny" data-item-id="t2"');
+    // The one-time decision reads the same as on the Overview and the Approvals screen.
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2">Allow once</button>');
+    expect(html).not.toContain(">Approve</button>");
     for (const id of ["t1", "tx"]) {
       expect(html).not.toContain('data-action="inbox-approve" data-item-id="' + id + '"');
       expect(html).not.toContain('data-action="inbox-deny" data-item-id="' + id + '"');
@@ -1906,6 +1999,15 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(pane).not.toContain("z".repeat(6001));
   });
 
+  it("lists the served page newest first and opens the newest entry in the record pane", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table.indexOf("egress")).toBeGreaterThan(-1);
+    expect(table.indexOf("egress")).toBeLessThan(table.indexOf("sentinel_finding"));
+    expect(html).toMatch(/<aside class="panel evidence-detail"[\s\S]*?198\.51\.100\.23:8080/);
+  });
+
   it("selects each served record through its rendered control", async () => {
     const h = await bootEvidence();
     const controls = [...h.el.main!.innerHTML.matchAll(/data-action="evidence-select" data-evidence-index="(\d+)"/g)];
@@ -1942,6 +2044,30 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.el.main!.innerHTML).not.toContain('aria-label="Selected entry"');
     release(response(evidencePayload({ entries: [], total: 0 }))); await settle();
     expect(h.el.main!.innerHTML).toContain("No entries match this view");
+  });
+
+  it("an older filter's response that settles after the filter changed never publishes its rows", async () => {
+    vi.useFakeTimers();
+    const held: Record<string, (value: unknown) => void> = {};
+    const requested: string[] = [];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": (_init, url) => {
+        const agent = new URL(url!, "http://fixture").searchParams.get("agent");
+        if (agent === "first" || agent === "second") { requested.push(agent); return new Promise(resolve => { held[agent] = resolve; }); }
+        return Promise.resolve(response(evidencePayload()));
+      },
+    });
+    const only = (operation: string) => evidencePayload({ entries: [{ timestamp: "2026-10-14T16:59:00.000Z", layer: "l1", identity_id: "agent-x", operation, result: "success", details: {} }], total: 1 });
+    h.input("evidence-filter-agent", "first"); await settle();
+    h.input("evidence-filter-agent", "second"); await settle();
+    expect(requested).toEqual(["first"]);
+    // The first read settles after the filter moved on: its rows must not appear under the second filter.
+    held.first!(response(only("first_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+    expect(requested).toEqual(["first", "second"]);
+    held.second!(response(only("second_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).toContain("second_filter_operation");
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
   });
 
   it("restores Inbox unknown and redacted states and the served fortress identity", async () => {
