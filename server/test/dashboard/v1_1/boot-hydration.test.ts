@@ -176,7 +176,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
     expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
+    expect(runInContext("sourceReads.size", h.context)).toBe(22); // Twenty existing sources plus the fleet roster and Sentinel findings; dynamic failures add none.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -557,13 +557,14 @@ describe("dashboard bounded independent hydration", () => {
   it("policy activation does not reuse a pre-activation policy read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
     const h = harness({
-      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], marker: "new" } } }),
+      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], policy_version: 2 } } }),
       "/api/policy/drafts/fixture/activate": () => response({ data: { status: "activated" } }),
     }); await settle();
     runInContext('state.route = "policy"; void loadPolicyView()', h.context); await settle();
     runInContext('void activateStandingRule("fixture", "fixture-op", false)', h.context); await settle();
-    release(response({ data: { view: { lines: [], marker: "old" } } })); await settle();
-    expect(runInContext('state.policyView.view.marker', h.context)).toBe("new"); expect(reads).toBe(2);
+    release(response({ data: { view: { lines: [], policy_version: 1 } } })); await settle();
+    // The bounded view retains the real policy version, not a synthetic marker field.
+    expect(runInContext('state.policyView.view.policy_version', h.context)).toBe(2); expect(reads).toBe(2);
   });
   it("recognition mutation cannot be overwritten by a pre-mutation health read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;

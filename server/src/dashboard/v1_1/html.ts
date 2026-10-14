@@ -1927,6 +1927,52 @@ body {
 .agent-event > .muted, .agent-event > .att { grid-column: 3; }
 @media (max-width: 1100px) { .agent-entity-grid { grid-template-columns: minmax(0, 1fr); } }
 
+/* Slice 6b uses the same table, chip and entity vocabulary as the Overview.
+   1100px matches the design system breakpoint for stacking queue drawers. */
+.mfp-screen { display: grid; gap: 16px; min-width: 0; }
+.mfp-screen .page-head, .mfp-screen p { margin-top: 0; }
+.mfp-screen h1, .policy-center h1 { font-family: var(--serif); }
+.mfp-screen h2, .mfp-drawer h2, .policy-panel h2 { font-size: var(--text-lg); }
+.mfp-screen h3, .mfp-drawer h3, .mfp-policy-groups h3 { font-size: var(--text-md); }
+.mfp-table { font-size: var(--text-cell); }
+.mfp-table th, .mfp-table td { padding: 8px 12px; }
+.mfp-table td { overflow-wrap: anywhere; }
+.mfp-table tr:hover { background: var(--accent-tint-faint); }
+.mfp-table tr.selected { background: var(--indigo-bg); box-shadow: inset 2px 0 var(--accent); }
+.mfp-table .link-btn { text-align: left; overflow-wrap: anywhere; }
+.mfp-pager, .mfp-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.mfp-pager { margin: 12px 0; color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono); }
+.mfp-queue-grid, .mfp-policy-grid { display: grid; gap: 16px; min-width: 0; }
+.mfp-queue-grid.has-selection { grid-template-columns: minmax(0, 1fr) minmax(0, 420px); }
+.mfp-policy-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+.mfp-queue-grid > *, .mfp-policy-grid > * { min-width: 0; }
+.mfp-drawer { align-self: start; position: sticky; top: 12px; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; overflow-wrap: anywhere; }
+.mfp-drawer pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--paper); padding: 12px; font-size: var(--text-xs); }
+.mfp-drawer dd { margin: 4px 0 12px; color: var(--ink-2); }
+.mfp-drawer dt { color: var(--ink-3); }
+.mfp-policy-groups section { padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.mfp-policy-groups li { margin-bottom: 8px; overflow-wrap: anywhere; }
+.mfp-fold { margin: 16px 0; border: 1px solid var(--rule); border-radius: 10px; padding: 12px; min-width: 0; }
+.mfp-fold summary { cursor: pointer; font-weight: 600; }
+.mfp-severity { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: var(--text-xs); white-space: nowrap; }
+.mfp-severity b { display: inline-block; width: 4px; height: 16px; border-radius: 2px; }
+.mfp-severity.critical { color: var(--sev-critical-text); }
+.mfp-severity.critical b { background: var(--sev-critical); }
+.mfp-severity.high { color: var(--sev-high-text); }
+.mfp-severity.high b { background: var(--sev-high); }
+.mfp-severity.medium { color: var(--sev-medium-text); }
+.mfp-severity.medium b { background: var(--sev-medium); }
+.mfp-severity.low { color: var(--sev-low-text); }
+.mfp-severity.low b { background: var(--sev-low); }
+.mfp-severity.info { color: var(--sev-info-text); }
+.mfp-severity.info b { background: var(--sev-info); }
+@media (max-width: 1100px) {
+  .mfp-queue-grid.has-selection, .mfp-policy-grid { grid-template-columns: minmax(0, 1fr); }
+  .mfp-drawer { position: static; }
+}
+
+.browser-machines h1 { font-size: var(--text-lg); margin: 0; }
+
 `;
 
 type NavItem = { id: string; label: string; href?: string; icon?: string; count?: "approvals"; title?: string };

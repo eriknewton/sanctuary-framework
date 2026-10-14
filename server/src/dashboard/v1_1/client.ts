@@ -161,7 +161,7 @@ const sourceReads = new Map([
   HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
   "/api/honeypot/tool-traps", "/api/honeypot/credential-traps",
-  "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings"
+  "/api/sovereignty", "/api/posture/home", "/api/anomaly/findings", "/api/fleet/roster", "/api/sentinels/findings"
 ].map(function (path) { return [readKey(path), { state: "state_UNREAD", error: null, failures: 0, nextReadAt: 0, revision: 0, lastReadAt: 0 }]; }));
 const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute after repeated failures.
 function readKey(url) {
@@ -201,6 +201,7 @@ function isDashboardModeNotServedResponse(status, body) {
     body.unavailable === true &&
     body.message === DASHBOARD_MODE_NOT_SERVED_MESSAGE;
 }
+function mfpOptionalText(value) { return value == null || typeof value === "string"; }
 function validateReadBody(key, body) {
   const data = body && body.data;
   const arrayFields = [
@@ -209,8 +210,18 @@ function validateReadBody(key, body) {
     [HUB + "/activity?category=handoff", "entries"], [HUB + "/policies", "policies"],
     [HUB + "/chat/concierge/history", "messages"], [AUTO_TRIGGER + "/rules", "rules"],
     [AUTO_TRIGGER + "/recommendations", "recommendations"], ["/api/anomaly/findings", "findings"],
-    ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"]
+    ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"], ["/api/sentinels/findings", "findings"]
   ];
+  if (key === readKey("/api/fleet/roster") && (!body || typeof body.available !== "boolean" || !Array.isArray(body.nodes) || !body.nodes.every(function (node) {
+    return node && typeof node.node_id === "string" && mfpOptionalText(node.label) && mfpOptionalText(node.trust_state) &&
+      mfpOptionalText(node.reach) && mfpOptionalText(node.last_sync_received_at) &&
+      (node.policy == null || (typeof node.policy === "object" && mfpOptionalText(node.policy.drift_state)));
+  }))) return false;
+  if (key === readKey("/api/sentinels/findings") && (!data || !Array.isArray(data.findings) || !data.findings.every(function (finding) {
+    return finding && typeof finding.finding_id === "string" && mfpOptionalText(finding.summary) && mfpOptionalText(finding.severity) &&
+      mfpOptionalText(finding.sentinel_id) && mfpOptionalText(finding.agent_id) && mfpOptionalText(finding.observed_at) &&
+      (finding.evidence_audit_ids == null || (Array.isArray(finding.evidence_audit_ids) && finding.evidence_audit_ids.every(function (id) { return typeof id === "string"; })));
+  }))) return false;
   const array = arrayFields.find(function (entry) { return readKey(entry[0]) === key; });
   if (array && !(array[1] === "items" && isPendingApprovalsRedactedMarker(data)) && (!data || !Array.isArray(data[array[1]]))) return false;
   if ([HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config", POLICY + "/current"].some(function (path) { return readKey(path) === key; }) && (!data || typeof data !== "object" || Array.isArray(data))) return false;
@@ -227,6 +238,7 @@ const state = {
   // Overview board ("How safe you are right now"), not the concierge. Talk
   // stays fully reachable at the frozen "dashboard" route via the Assist nav.
   route: "posture",
+  mfp: { roster: null, findings: [], totals: { roster: 0, findings: 0, policy: 0 }, findingId: null, folds: { "auto-trigger": false, honeypot: false }, pages: { roster: 0, findings: 0, policy: 0, bindings: 0 } },
   agents: [],
   agentInventory: { status: "", harness: "", sort: "name", page: 0 },
   agentTab: "overview",
@@ -422,7 +434,9 @@ function readResponse(url, init, deadlineMs) {
     if (deadlineMs !== undefined && deadlineMs <= 0) throw new Error("Read timed out. The latest result is unavailable.");
     const res = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
     let body = null;
-    try { body = await res.json(); } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
+    try {
+      body = key === readKey("/api/fleet/roster") || key === readKey("/api/sentinels/findings") ? await readMfpBody(res) : await res.json();
+    } catch (_) { /* Preserve HTTP status even for proxy HTML or empty error bodies. */ }
     if (!res.ok) {
       if (isDashboardModeNotServedResponse(res.status, body)) {
         const error = new Error(DASHBOARD_MODE_NOT_SERVED_MESSAGE);
@@ -468,6 +482,7 @@ function dashboardResponse(url, init, deadlineAt) {
 
 function readLabel(path) {
   const labels = [
+    ["/api/fleet/roster", "Fleet roster"], ["/api/sentinels/findings", "Sentinel findings"],
     [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
     ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
     [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
@@ -915,7 +930,13 @@ async function readPolicyView() {
   state.policyView.loadError = null;
   try {
     const r = await policyApi("/current", { method: "GET" });
-    state.policyView.view = (r && r.data && r.data.view) || null;
+    const view = r && r.data && r.data.view;
+    if (!view || !Array.isArray(view.lines) || !view.lines.every(function (line) { return line && typeof line.section === "string" && typeof line.text === "string" && line.text.length <= MFP_EVIDENCE_CHAR_LIMIT; })) throw new Error("Policy rule list unavailable.");
+    state.mfp.totals.policy = view.lines.length;
+    // Only a bounded projection is retained; every refresh replaces the previous policy snapshot.
+    state.policyView.view = { policy_version: view.policy_version, lines: view.lines.slice(0, MFP_RECORD_LIMIT).map(function (line) {
+      return { section: line.section, text: line.text };
+    }) };
   } catch (e) {
     state.policyView.view = null;
     state.policyView.loadError =
@@ -1269,7 +1290,7 @@ function renderMain() {
     case "findings": nextHtml = renderFindingsScreen(); break;
     // Policies hosts the auto-trigger ladder as a section; #auto-trigger
     // still renders the ladder on its own.
-    case "policy": nextHtml = renderPolicyCenter() + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage(), '<span class="pill tone-info">operator controlled</span>'); break;
+    case "policy": nextHtml = renderPolicyCenter() + renderMfpFoldedSections(); break;
     case "auto-trigger": nextHtml = renderAutoTriggerPage(); break;
     case "integrations": nextHtml = renderIntegrationsScreen(); break;
     case "settings": nextHtml = settingsTabStrip("health") + renderHealthPage(); break;
@@ -1623,12 +1644,12 @@ function renderHoneypotPage() {
   if (!sourceLoaded("/api/honeypot/tool-traps") || !sourceLoaded("/api/honeypot/credential-traps")) return unavailablePanel("Honeypots", ["/api/honeypot/tool-traps", "/api/honeypot/credential-traps"]);
   const toolTraps = state.honeypot.toolTraps || [];
   const credentialTraps = state.honeypot.credentialTraps || [];
-  const toolRows = toolTraps.length ? toolTraps.map(function (trap) {
+  const toolRows = toolTraps.length ? toolTraps.slice(0, MFP_PAGE_SIZE).map(function (trap) {
     const activations = trap.activations || [];
     const latest = activations.length ? activations[activations.length - 1] : null;
     const followups = latest && latest.follow_up_tool_calls ? latest.follow_up_tool_calls : [];
     const followupText = followups.length
-      ? followups.map(function (f) { return escHtml(f.tool_name) + " at " + escHtml(shortTime(f.called_at)); }).join(", ")
+      ? followups.slice(0, MFP_PAGE_SIZE).map(function (f) { return escHtml(f.tool_name) + " at " + escHtml(shortTime(f.called_at)); }).join(", ")
       : "No follow-up calls in the 5 minute window.";
     const latestText = latest
       ? escHtml(latest.caller_identity) + " invoked " + escHtml(trap.fake_tool_name) + " at " + escHtml(shortTime(latest.invoked_at)) + "; received the operator-configured fake response; followed up with " + followups.length + " calls."
@@ -1648,7 +1669,7 @@ function renderHoneypotPage() {
       (latest ? '<pre class="terminal-block">' + escHtml(JSON.stringify(latest.invocation_args || {}, null, 2)) + '</pre>' : '') +
     '</section>';
   }).join("") : '<section class="card"><h3>No tool-call traps deployed.</h3><p class="muted">Compile and deploy a tool_call honeypot to see catalog injections and invocations here.</p></section>';
-  const credentialRows = credentialTraps.length ? credentialTraps.map(function (trap) {
+  const credentialRows = credentialTraps.length ? credentialTraps.slice(0, MFP_PAGE_SIZE).map(function (trap) {
     const accesses = trap.accesses || [];
     const attempts = trap.use_attempts || [];
     const latestAccess = accesses.length ? accesses[accesses.length - 1] : null;
@@ -1687,7 +1708,7 @@ function renderHoneypotPage() {
     '<p class="eyebrow">Honeypots</p>' +
     '<h1>Honeypot traps.</h1>' +
     '<p class="sub">Fake tools and fake credentials. Reads, invocations, and attempted credential use create sentinel findings without revealing the trap.</p>' +
-  '</div></div>' + error + createCta + credentialRows + toolRows;
+  '</div></div>' + error + createCta + mfpPreviewCount(credentialTraps, "/api/honeypot/credential-traps") + credentialRows + mfpPreviewCount(toolTraps, "/api/honeypot/tool-traps") + toolRows;
 }
 
 function relTimeFromIso(iso) {
@@ -2737,46 +2758,48 @@ const POLICY_SECTION_TITLES = {
 };
 const POLICY_SECTION_ORDER = ["approval", "auto_allow", "anomaly", "channel"];
 function renderPolicyPlainEnglishPanel() {
-  const pv = state.policyView;
-  let body;
-  if (pv.loadError) {
-    body = '<p class="muted">' + escHtml(pv.loadError) + '</p>';
-  } else if (!pv.view) {
-    body = '<p class="muted">' + (pv.loading ? "Loading your policy." : "Your policy will appear here.") + '</p>';
-  } else {
-    const lines = pv.view.lines || [];
-    const sections = POLICY_SECTION_ORDER.map(function (sec) {
-      const secLines = lines.filter(function (l) { return l.section === sec; });
-      if (!secLines.length) return "";
-      return '<div class="policy-plain-section">' +
-        '<h3>' + escHtml(POLICY_SECTION_TITLES[sec] || sec) + '</h3>' +
-        '<ul class="policy-plain-list">' +
-        secLines.map(function (l) { return '<li>' + escHtml(l.text) + '</li>'; }).join("") +
-        '</ul>' +
-      '</div>';
-    }).join("");
-    body = sections || '<p class="muted">No rules configured yet.</p>';
-  }
-  return '<section class="policy-panel policy-plain-english">' +
-    '<h2>Your policy in plain English</h2>' +
-    '<p class="muted">This is what your fine-grained policy does right now. It is read-only here; tune it by approving from the queue or editing a rule.</p>' +
-    (sourceLoaded(POLICY + "/current") || state.policyView.loadError ? body : "") + renderSourceRead(POLICY + "/current") +
-  '</section>';
+  const path = POLICY + "/current";
+  const view = sourceLoaded(path) && state.policyView.view;
+  if (!view || !Array.isArray(view.lines)) return '<section class="policy-panel"><h2>Policy Unknown</h2>' + overviewChip("unknown", "UNKNOWN") +
+    '<p>' + escHtml(state.policyView.loadError || "The current policy did not answer with a rule list.") + '</p>' + (sourceLoaded(path) ? '<button class="btn" data-action="retry-panel" data-read="/api/policy/current">Retry</button>' : renderSourceRead(path)) + '</section>';
+  const page = mfpPage(view.lines, "policy");
+  page.total = state.mfp.totals.policy;
+  const sections = POLICY_SECTION_ORDER.map(function (section) {
+    const lines = page.rows.filter(function (line) { return line.section === section; });
+    if (!lines.length) return "";
+    return '<section><h3>' + escHtml(section === "approval" ? "What asks you first" : POLICY_SECTION_TITLES[section]) + '</h3><ul>' +
+      lines.map(function (line) { return '<li>' + escHtml(line.text) + '</li>'; }).join("") + '</ul></section>';
+  }).join("");
+  const unknownGroup = function (title, reason) { return '<section><h3>' + title + '</h3>' + overviewChip("unknown", "UNKNOWN") + '<p>' + reason + '</p></section>'; };
+  const rows = page.rows.map(function (line, index) {
+    return '<tr><td class="mono">' + (page.start + index + 1) + '</td><td>' + escHtml(POLICY_SECTION_TITLES[line.section] || "Unknown") + '</td><td>' + escHtml(line.text) + '</td></tr>';
+  }).join("");
+  return '<section class="policy-panel" data-mfp-policy><div class="card-head-row"><h2>Principal policy</h2>' +
+    overviewChip(typeof view.policy_version === "number" ? "neutral" : "unknown", typeof view.policy_version === "number" ? "Version " + view.policy_version : "Version Unknown") + '</div>' +
+    '<p>Signature: ' + overviewChip("unknown", "UNKNOWN") + ' Signature state is not served by this policy view.</p>' +
+    '<p class="muted">Read-only policy lines. Groups and table show the same page of the current policy; row numbers are display positions.</p>' +
+    mfpPager(page, "policy", path) +
+    (view.lines.length ? '<div class="mfp-policy-grid"><div class="mfp-policy-groups">' +
+      unknownGroup("What agents may reach", "Destination and tool reach rules are not served by this policy view.") + sections +
+      unknownGroup("What is never allowed", "A deny list is not served by this policy view.") +
+      '</div><section><h3>Rule table</h3><div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Row</th><th>Group</th><th>Rule</th></tr></thead><tbody>' + rows + '</tbody></table></div></section></div>' :
+      mfpEmpty("No policy lines returned", "The current policy returned 0 of 0 lines; this is not a claim that every action is allowed.", path)) + '</section>';
 }
 
 function renderPolicyCenter() {
   const tmplCards = CHANNEL_TEMPLATES.map(function (t) {
     return '<article class="template-card">' +
       '<div class="template-card-head">' +
-        '<span class="severity ' + (t.severity === "MEDIUM" ? "medium" : "low") + '">' + escHtml(t.severity) + '</span>' +
+        overviewChip("neutral", "TEMPLATE") +
         '<span class="template-id mono">' + escHtml(t.id) + '</span>' +
       '</div>' +
       '<h3>' + escHtml(t.title) + '</h3>' +
       '<p>' + escHtml(t.description) + '</p>' +
     '</article>';
   }).join("\n");
+  const bindingPage = mfpPage(state.agents, "bindings");
   const rows = state.agents.length
-    ? state.agents.map(function (a) {
+    ? bindingPage.rows.map(function (a) {
         const binding = a.channel_template_id || "default none";
         const budget = a.budget_summary && a.budget_summary.daily
           ? "$" + escHtml(a.budget_summary.daily.cap) + "/day"
@@ -2799,16 +2822,16 @@ function renderPolicyCenter() {
       }).join("\n")
     : '<tr><td colspan="7" class="muted">No protected agents yet.</td></tr>';
   return '<section class="policy-center">' +
-    '<p class="eyebrow">POLICY CENTER</p>' +
-    '<h1>One screen for every rule</h1>' +
+    '<p class="eyebrow">Configure</p>' +
+    '<h1>Policies</h1>' +
     // Traced to the edit path: a template change is queued as a Tier 1
     // approval; approving it records the new template and policy binding
     // on the agent's record, and approving or denying it appends an audit
     // log entry. The copy claims nothing past that.
-    '<p class="policy-subtitle">Templates, per-agent rules, egress allowlists, retention, budgets, and privacy-minimization settings. A template change waits for your approval; approving it records the new template on the agent, and your decision either way is written to your audit log.</p>' +
+    '<p class="policy-subtitle">Principal policy lines and agent template bindings. A template change waits for your approval; approving it records the new template on the agent, and your decision either way is written to your audit log.</p>' +
     renderPolicyPlainEnglishPanel() +
     '<section class="policy-panel"><h2>Channel templates · ' + CHANNEL_TEMPLATES.length + ' shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
-    '<section class="policy-panel"><h2>Per-agent rules</h2>' +
+    '<section class="policy-panel"><h2>Per-agent rules</h2><p class="muted">Agent template bindings and daily budgets. Other rule fields are not served here.</p>' + (sourceLoaded(HUB + "/agents") ? mfpPager(bindingPage, "bindings", HUB + "/agents") : "") +
       '<div class="rules-scroll"><table class="rules-table">' +
       '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
       '<tbody>' + (sourceLoaded(HUB + "/agents") ? rows : '<tr><td colspan="7">' + renderSourceRead(HUB + "/agents") + '</td></tr>') + '</tbody></table></div>' +
@@ -2820,10 +2843,10 @@ function renderAutoTriggerPage() {
   const rules = state.autoTrigger.rules || [];
   const recs = state.autoTrigger.recommendations || [];
   const summary = !sourceLoaded(AUTO_TRIGGER + "/rules") ? renderSourceRead(AUTO_TRIGGER + "/rules") : rules.length
-    ? '<div class="auto-trigger-rule-list">' + rules.map(renderAutoTriggerRuleRow).join("") + '</div>'
+    ? mfpPreviewCount(rules, AUTO_TRIGGER + "/rules") + '<div class="auto-trigger-rule-list">' + rules.slice(0, MFP_PAGE_SIZE).map(renderAutoTriggerRuleRow).join("") + '</div>'
     : '<p class="muted">No auto-trigger ladders configured. Ladders appear here after a sentinel, anomaly detector, or honeypot records its first finding. Use <code>sanctuary auto-trigger promote</code> to create one.</p>';
   const body = !sourceLoaded(AUTO_TRIGGER + "/recommendations") ? renderSourceRead(AUTO_TRIGGER + "/recommendations") : recs.length
-    ? '<div class="recommendation-list">' + recs.map(function (r) {
+    ? mfpPreviewCount(recs, AUTO_TRIGGER + "/recommendations") + '<div class="recommendation-list">' + recs.slice(0, MFP_PAGE_SIZE).map(function (r) {
         const hs = r.history_summary || {};
         const approval = Math.round(((hs.operator_approval_rate || 0) * 100));
         const cancel = hs.operator_cancel_rate == null ? null : Math.round(hs.operator_cancel_rate * 100);
@@ -4179,26 +4202,113 @@ function renderEnforcementScreen() {
   ].join("");
 }
 
+// 25 rows per page keeps the console scannable; 20 pages bound sorting and retained snapshots.
+const MFP_PAGE_SIZE = 25;
+const MFP_RECORD_LIMIT = MFP_PAGE_SIZE * 20;
+// Evidence text is a preview capped at 16 KiB, with the original read available separately.
+const MFP_EVIDENCE_CHAR_LIMIT = 16 * 1024;
+function mfpPage(items, key) {
+  const count = Math.min(items.length, MFP_RECORD_LIMIT);
+  const last = Math.max(0, Math.ceil(count / MFP_PAGE_SIZE) - 1);
+  const page = Math.min(last, Math.max(0, state.mfp.pages[key] || 0));
+  state.mfp.pages[key] = page;
+  const start = page * MFP_PAGE_SIZE;
+  return { rows: items.slice(start, start + MFP_PAGE_SIZE), total: items.length, start: start, page: page, last: last };
+}
+function mfpPager(page, key, path) {
+  return '<div class="mfp-pager"><span>Showing ' + page.rows.length + ' of ' + page.total + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + '</span>' +
+    '<a href="' + escHtml(credentialedReadUrl(path, "GET")) + '">Full source</a>' +
+    (page.total > MFP_RECORD_LIMIT ? '<span>Only the first ' + MFP_RECORD_LIMIT + ' returned records are browsable here.</span>' : '') +
+    (page.last ? '<button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="-1"' + (page.page === 0 ? ' disabled' : '') + '>Previous</button>' +
+      '<span>Page ' + (page.page + 1) + ' of ' + (page.last + 1) + '</span><button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="1"' + (page.page === page.last ? ' disabled' : '') + '>Next</button>' : '') + '</div>';
+}
+function mfpPreviewCount(items, path) {
+  return '<p class="muted">Showing ' + Math.min(items.length, MFP_PAGE_SIZE) + ' of ' + items.length + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + ' · <a href="' + escHtml(credentialedReadUrl(path, "GET")) + '">Full source</a></p>';
+}
+function mfpEmpty(title, reason, path) {
+  return '<div class="overview-empty">' + overviewChip("neutral", "EMPTY") + '<h3>' + title + '</h3><p>' + reason + ' Read ' + escHtml(sourceReadAge(path) || "Unknown") + '.</p>' +
+    '<button class="btn" data-action="retry-panel" data-read="' + escHtml(path) + '">Refresh</button></div>';
+}
+function renderMfpFoldedSections() {
+  return '<details class="mfp-fold" data-mfp-fold="auto-trigger"' + (state.mfp.folds["auto-trigger"] ? ' open' : '') + '><summary>Auto-trigger</summary>' + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage()) + '</details>' +
+    '<details class="mfp-fold" data-mfp-fold="honeypot"' + (state.mfp.folds.honeypot ? ' open' : '') + '><summary>Honeypots</summary>' + renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()) + '</details>';
+}
+// Server severity is preserved in the copy; the display scale maps alert to High and warn to Medium.
+function mfpSeverity(value) {
+  const level = value === "alert" ? "high" : value === "warn" ? "medium" : value;
+  return ["critical", "high", "medium", "low", "info"].indexOf(level) >= 0 ? level : null;
+}
+function mfpSeverityMark(value) {
+  const level = mfpSeverity(value);
+  return level ? '<span class="mfp-severity ' + level + '"><b aria-hidden="true"></b>' + escHtml(sentenceCase(level)) + '</span>' : overviewChip("unknown", "UNKNOWN");
+}
+// Keep expanded configuration sections open across polling renders; only these two fixed keys persist.
+document.addEventListener("toggle", function (event) {
+  const target = event.target;
+  if (!target || !target.getAttribute) return;
+  const key = target.getAttribute("data-mfp-fold");
+  if (Object.prototype.hasOwnProperty.call(state.mfp.folds, key)) state.mfp.folds[key] = target.open === true;
+}, true);
+function renderFindingDrawer(finding) {
+  const details = JSON.stringify(finding.details || {}, null, 2);
+  const evidence = Array.isArray(finding.evidence_audit_ids) ? finding.evidence_audit_ids : [];
+  return '<aside class="mfp-drawer" aria-label="Finding evidence"><div class="card-head-row"><h2>Finding evidence</h2><button class="btn" data-action="mfp-finding-close">Close</button></div>' +
+    mfpSeverityMark(finding.severity) + ' ' + overviewChip("unknown", "LIFECYCLE UNKNOWN") +
+    '<h3>' + escHtml(finding.summary || "Finding") + '</h3><p class="mono">' + escHtml(finding.finding_id) + '</p>' +
+    '<dl><dt>Sentinel</dt><dd>' + escHtml(finding.sentinel_id || "Unknown") + '</dd><dt>Agent</dt><dd>' + escHtml(finding.agent_id || "Fortress-wide") +
+    '</dd><dt>Observed</dt><dd>' + escHtml(finding.observed_at || "Unknown") + ' · ' + escHtml(finding.observed_at ? relTimeFromIso(finding.observed_at) : "Unknown") + '</dd></dl>' +
+    '<h3>Evidence and baseline</h3><p class="muted">Detector-supplied data. Shown as recorded, not as instructions.</p><pre>' + escHtml(details.slice(0, MFP_EVIDENCE_CHAR_LIMIT)) + '</pre>' +
+    (details.length > MFP_EVIDENCE_CHAR_LIMIT ? '<p>Evidence preview truncated. Open the full source for the returned payload.</p>' : '') +
+    '<h3>Audit references</h3><p>Showing ' + Math.min(evidence.length, MFP_PAGE_SIZE) + ' of ' + evidence.length + ' recorded references.</p><ul>' +
+    evidence.slice(0, MFP_PAGE_SIZE).map(function (id) { return '<li class="mono">' + escHtml(id) + '</li>'; }).join("") + '</ul><a href="#activity">Open Evidence</a></aside>';
+}
 function renderFindingsScreen() {
-  const findings = state.posture.anomalies || [];
-  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
-  const age = sourceReadAge("/api/anomaly/findings");
-  const countLine = unknown
-    ? '<span class="count-age">Unknown: the detector has not answered</span>'
-    : '<span class="count-age">' + escHtml(findings.length) + ' open' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
-  return [
-    '<section class="concierge-wrap">',
-      '<div class="page-head"><div>',
-        '<p class="eyebrow">Findings</p>',
-        '<h1>What your Sentinels and traps found.</h1>',
-        '<p class="sub">Open anomaly findings from the Sentinels, and what the honeypot traps caught. A silent detector is shown as Unknown, never as a clean bill of health.</p>',
-      '</div></div>',
-      '<section class="card"><h3>Anomaly findings ' + countLine + '</h3>',
-        renderPostureAnomalies(findings, unknown), renderSourceRead("/api/anomaly/findings"),
-      '</section>',
-      renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()),
-    '</section>'
-  ].join("");
+  const path = "/api/sentinels/findings";
+  const loaded = sourceLoaded(path);
+  // No lifecycle field exists in the shipped finding schema: absence never becomes an invented Open state.
+  const findings = loaded ? state.mfp.findings.slice(0, MFP_RECORD_LIMIT).sort(function (a, b) {
+    return severityRank(mfpSeverity(a.severity)) - severityRank(mfpSeverity(b.severity));
+  }) : [];
+  const page = mfpPage(findings, "findings");
+  page.total = loaded ? state.mfp.totals.findings : 0;
+  const selected = loaded && findings.find(function (f) { return f.finding_id === state.mfp.findingId; });
+  const rows = page.rows.map(function (finding) {
+    return '<tr' + (finding.finding_id === state.mfp.findingId ? ' class="selected"' : '') + '><td>' + mfpSeverityMark(finding.severity) + '</td><td><button class="link-btn" data-action="mfp-finding" data-finding-id="' + escHtml(finding.finding_id) + '">' +
+      escHtml(finding.summary || "Finding") + '</button></td><td>' + overviewChip("unknown", "UNKNOWN") + '</td><td class="mono">' + escHtml(finding.sentinel_id || "Unknown") + '</td><td class="mono">' + escHtml(finding.observed_at ? relTimeFromIso(finding.observed_at) : "Unknown") + '</td></tr>';
+  }).join("");
+  return '<section class="mfp-screen" data-mfp-findings><div class="page-head"><div><p class="eyebrow">This fortress</p><h1>Findings</h1><p class="sub">Sentinel observations, ranked by severity. Read-only. Lifecycle is not served; this view cannot resolve or dismiss findings.</p></div></div>' +
+    '<div class="mfp-legend" aria-label="Severity scale">' + ["critical", "high", "medium", "low", "info"].map(mfpSeverityMark).join("") + '</div>' +
+    '<p class="muted">Server alert maps to High, warn to Medium, and info to Info. Critical and Low are display levels not emitted by this source. The source returns a limited history, not an open-finding count.</p>' +
+    '<div class="mfp-queue-grid' + (selected ? ' has-selection' : '') + '"><section class="card"><h2>Sentinel queue</h2>' +
+    (!loaded ? '<h3>Sentinel findings Unknown</h3>' + overviewChip("unknown", "UNKNOWN") + renderSourceRead(path) :
+      !findings.length ? mfpEmpty("No findings returned", "The source returned 0 of 0 findings. This does not establish detector coverage.", path) :
+      mfpPager(page, "findings", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Severity</th><th>Finding</th><th>Lifecycle</th><th>Sentinel</th><th>Age</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
+    '</section>' + (selected ? renderFindingDrawer(selected) : '') + '</div>' + renderMfpFoldedSections() + '</section>';
+}
+
+function renderServerFleetRoster() {
+  const path = "/api/fleet/roster";
+  const roster = sourceLoaded(path) && state.mfp.roster;
+  if (!roster) return '<section class="card" data-mfp-roster><h2>Fleet roster Unknown</h2>' + overviewChip("unknown", "UNKNOWN") + renderSourceRead(path) + '</section>';
+  if (!roster.available) return '<section class="card" data-mfp-roster><h2>Fleet not configured</h2><p>The server reports no provisioned federation roster. Read ' + escHtml(sourceReadAge(path)) + '.</p><a class="btn" href="/fleet">Open Fleet Switcher</a></section>';
+  const page = mfpPage(roster.nodes, "roster");
+  page.total = state.mfp.totals.roster;
+  const status = function (value, labels, warnings) {
+    if (!Object.prototype.hasOwnProperty.call(labels, value)) return overviewChip("unknown", "UNKNOWN");
+    // These are recorded federation verdicts, not fresh enforcement claims; never infer trust from reach.
+    return overviewChip(value === "revoked" || value === "untrusted" ? "bad" : warnings.indexOf(value) >= 0 ? "warn" : "neutral", labels[value]);
+  };
+  const rows = page.rows.map(function (node) {
+    return '<tr><td><strong>' + escHtml(node.label || node.node_id || "Unknown") + '</strong><div class="mono">' + escHtml(node.node_id || "Unknown") + '</div></td>' +
+      '<td>' + status(node.trust_state, { admitted: "ADMITTED", revoked: "REVOKED", untrusted: "UNTRUSTED" }, ["revoked", "untrusted"]) + '</td>' +
+      '<td>' + status(node.reach, { recent: "RECENT SYNC", stale: "STALE SYNC", never: "NEVER SYNCED" }, ["stale"]) + '</td>' +
+      '<td>' + status(node.policy && node.policy.drift_state, { in_sync: "IN SYNC", drifted: "DRIFTED" }, ["drifted"]) + '</td>' +
+      '<td>' + overviewChip("unknown", "UNKNOWN") + '</td><td class="mono">Roster read ' + escHtml(sourceReadAge(path) || "Unknown") +
+      '<div>Last sync: ' + escHtml(node.last_sync_received_at ? relTimeFromIso(node.last_sync_received_at) : "Unknown") + '</div></td></tr>';
+  }).join("");
+  return '<section class="card" data-mfp-roster><h2>Fleet roster</h2><p>Trust, reach and policy drift are server verdicts at the roster read. Enrollment status is not served. Enrollment actions are not available in this read-only roster.</p>' +
+    (!roster.nodes.length ? mfpEmpty("No machines in the roster", "The server returned 0 of 0 machines in the federation roster.", path) :
+      mfpPager(page, "roster", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Machine</th><th>Trust</th><th>Reach</th><th>Drift</th><th>Enrollment</th><th>Last check</th></tr></thead><tbody>' + rows + '</tbody></table></div>') + '</section>';
 }
 
 function renderIntegrationsScreen() {
@@ -4419,11 +4529,12 @@ function renderMachinesScreen() {
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Machines</p>',
-        '<h1>Machines saved in this browser.</h1>',
-        '<p class="sub">The machines saved in this browser, each checked at its host health check. Online means the host answered; it is not a statement about that machine\'s protection. Add or remove machines on the <a href="/fleet">Fleet Switcher</a>.</p>',
+        '<h1>Machines</h1>',
+        '<p class="sub">The authenticated federation roster is separate from machines saved in this browser. Saved machines are checked at their host health check. Online means the host answered; it is not a statement about that machine\'s protection. Add or remove machines on the <a href="/fleet">Fleet Switcher</a>.</p>',
       '</div></div>',
-      '<section class="card">',
-        '<div class="card-head-row"><h3>Fleet <span class="count-age" id="machines-summary"></span></h3>',
+      renderServerFleetRoster(),
+      '<section class="card browser-machines" aria-label="Saved in this browser">',
+        '<div class="card-head-row"><div><h1>Machines saved in this browser.</h1><span class="count-age" id="machines-summary"></span></div>',
         '<button type="button" class="btn" data-action="machines-recheck">Check again</button></div>',
         '<div class="machine-list" id="machines-list"></div>',
       '</section>',
@@ -4644,8 +4755,39 @@ function hydrateMachinesScreen() {
 // ── Hub API actions ────────────────────────────────────────────────────
 // Each independent panel publishes as soon as it settles. One slow route must
 // never hold Posture, or another panel, behind it. Retries select one panel.
+// Two MiB covers 500 public records at roughly 4 KiB each; larger reads fail Unknown.
+const MFP_BODY_BYTE_LIMIT = 2 * 1024 * 1024;
+async function readMfpBody(response) {
+  if (!response.body || !response.body.getReader) throw new Error("Roster or findings body unavailable");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      // Untrusted machine and finding text cannot grow the retained response beyond the fixed budget.
+      if (bytes > MFP_BODY_BYTE_LIMIT) throw new Error("Roster or findings body too large");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } finally { void reader.cancel().catch(function () {}); reader.releaseLock(); }
+}
+async function fetchMfpRead(path, key) {
+  const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
+  const res = await readResponse(credentialedReadUrl(path + "?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
+  const body = await res.json();
+  // Snapshots replace prior state; the byte cap bounds text and the record cap bounds sorting and DOM work.
+  const rows = key === "roster" ? body.nodes : body.data.findings;
+  state.mfp.totals[key] = rows.length;
+  state.mfp[key] = key === "roster" ? { available: body.available, nodes: rows.slice(0, MFP_RECORD_LIMIT) } : rows.slice(0, MFP_RECORD_LIMIT);
+}
 const panelJobs = [
   { paths: [INBOX_PREFS], load: loadInboxPrefs },
+  { paths: ["/api/fleet/roster"], load: function () { return fetchMfpRead("/api/fleet/roster", "roster"); } },
+  { paths: ["/api/sentinels/findings"], load: function () { return fetchMfpRead("/api/sentinels/findings", "findings"); } },
   { paths: [HUB + "/agents"], load: async function () {
     const ar = await api("/agents");
     state.agents = ar.data.agents || [];
@@ -5500,7 +5642,7 @@ function connectStream() {
         if (String(e.display_template_id || "").indexOf("auto_trigger") >= 0 || String(e.display_template_id || "").indexOf("auto_action") >= 0) {
           void refreshAutoTriggerPanels();
         }
-        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot", "/api/anomaly/findings"];
+        const paths = [HUB + "/activity", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff", "/api/honeypot", "/api/anomaly/findings", "/api/sentinels/findings"];
         void queueStreamRefresh(paths);
       } catch (err) { /* ignore */ }
     });
@@ -5669,6 +5811,19 @@ document.addEventListener("click", function (ev) {
   const action = tgt.getAttribute("data-action");
   if (action === "retry-panel") return void retryPanel(tgt.getAttribute("data-read"));
   if (!action) return;
+  if (action === "mfp-page") {
+    const key = tgt.getAttribute("data-list");
+    if (Object.prototype.hasOwnProperty.call(state.mfp.pages, key)) {
+      const step = tgt.getAttribute("data-step") === "-1" ? -1 : 1;
+      state.mfp.pages[key] = Math.max(0, Math.min(Math.ceil(MFP_RECORD_LIMIT / MFP_PAGE_SIZE) - 1, state.mfp.pages[key] + step));
+      rerender();
+    }
+    return;
+  }
+  if (action === "mfp-finding" || action === "mfp-finding-close") {
+    state.mfp.findingId = action === "mfp-finding" ? tgt.getAttribute("data-finding-id") : null;
+    rerender(); return;
+  }
   const itemId = tgt.getAttribute("data-item-id");
   const agentId = tgt.getAttribute("data-agent-id");
   const ruleId = tgt.getAttribute("data-rule-id");

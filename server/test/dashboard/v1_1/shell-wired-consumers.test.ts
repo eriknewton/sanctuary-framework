@@ -22,6 +22,7 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+import { mfpScenario } from "./fixtures/mfp-scenarios.js";
 import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
@@ -2103,4 +2104,156 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).not.toContain("APPROVED");
   });
 
+});
+
+
+describe("slice 6b Machines Findings Policies wired consumers", () => {
+  async function mfpBoot(route: string, change?: (s: ReturnType<typeof mfpScenario>) => void, overrides = {}) {
+    vi.useFakeTimers();
+    const s = mfpScenario();
+    change?.(s);
+    const h = boot({
+      "/api/fleet/roster": () => Promise.resolve(response(s.roster)),
+      "/api/sentinels/findings": () => Promise.resolve(response({ data: { findings: s.findings } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: s.policy } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: s.agents } })),
+      ...overrides,
+    });
+    await settle(); h.navigate(route); await settle();
+    return h;
+  }
+  it("reads the authenticated roster separately from browser-saved machines", async () => {
+    const h = await mfpBoot("machines");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).toContain('Build box');
+    expect(html).toContain('ADMITTED');
+    expect(html).toContain('Saved in this browser');
+    expect(html).toContain('Showing 1 of 1');
+    expect(html).toContain('Enrollment status is not served');
+    expect(html).toContain('Last check');
+  });
+  it("never derives roster trust or drift from attestation or reach", async () => {
+    const h = await mfpBoot("machines", s => {
+      Object.assign(s.roster.nodes[0]!, { trust_state: undefined, policy: undefined, attestation_status: 'verified', reach: 'recent' });
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).not.toContain('ADMITTED');
+    expect(html).not.toContain('IN SYNC');
+    expect(html.match(/state-chip unknown/g)!.length).toBeGreaterThanOrEqual(3);
+  });
+  it("shows a roster read failure as Unknown without old rows or a zero", async () => {
+    const h = await mfpBoot("machines", undefined, { '/api/fleet/roster': () => Promise.reject(new Error('unavailable')) });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Showing 0 of 0');
+    expect(h.el.main!.innerHTML).toContain('data-read="/api/fleet/roster"');
+  });
+  it("paginates the roster with a bounded page and an exact denominator", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = Array.from({ length: 51 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, label: 'Machine ' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).not.toContain('Machine 25<');
+    h.click({ 'data-action': 'mfp-page', 'data-list': 'roster', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Machine 25<');
+  });
+  it("ranks the served Sentinel vocabulary and declares its five-level display scale", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-findings');
+    for (const level of ['critical', 'high', 'medium', 'low', 'info']) expect(html).toContain('mfp-severity ' + level);
+    expect(html.indexOf('alert outbound observation')).toBeLessThan(html.indexOf('warn outbound observation'));
+    expect(html.indexOf('warn outbound observation')).toBeLessThan(html.indexOf('info outbound observation'));
+    expect(html).toContain('egress-volume');
+    expect(html).toContain('Read-only');
+    expect(html).toContain('Lifecycle is not served');
+    expect(html).not.toMatch(/data-action="finding-(resolve|dismiss|acknowledge)"/);
+  });
+  it("opens finding evidence in a drawer and escapes hostile text throughout", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("findings", s => { s.findings[1]!.summary = hostile; s.findings[1]!.details = { evidence: hostile }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('aria-label="Finding evidence"');
+    expect(html).toContain('baseline');
+    expect(html).toContain('&lt;img');
+    expect(html).not.toContain(hostile);
+    expect(html).toContain('egress_blocked');
+    expect(html).toContain('data-action="mfp-finding-close"');
+  });
+  it("keeps findings Unknown when the Sentinel source fails", async () => {
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('No findings returned');
+  });
+  it("bounds the findings queue and clears a selected record when its source fails", async () => {
+    let failed = false;
+    const s = mfpScenario();
+    s.findings = Array.from({ length: 51 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response({ data: { findings: s.findings } })) });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'f-0' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true;
+    h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+  });
+  it("renders policy groups beside the served rule table with truthful metadata", async () => {
+    const h = await mfpBoot("policy");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-policy');
+    for (const label of ['What agents may reach', 'What asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
+    expect(html).toContain('export your saved state off the machine');
+    expect(html).toContain('data-action="template-picker-open"');
+    expect(html).not.toContain('state-chip good');
+  });
+  it("does not retain policy metadata or rules after a failed read", async () => {
+    const h = await mfpBoot("policy", undefined, { '/api/policy/current': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Policy Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Version 7');
+    expect(h.el.main!.innerHTML).not.toContain('export your saved state off the machine');
+  });
+  it("bounds served policy lines and escapes their text", async () => {
+    const h = await mfpBoot("policy", s => { s.policy.lines = Array.from({ length: 51 }, () => ({ section: 'approval', text: '<script>bad()</script>' })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).toContain('&lt;script&gt;');
+    expect(h.el.main!.innerHTML).not.toContain('<script>bad()');
+  });
+  it("shows evidenced empty states for all three screens", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = []; s.findings = []; s.policy.lines = []; });
+    expect(h.el.main!.innerHTML).toContain('No machines in the roster');
+    h.navigate('findings'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No findings returned');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No policy lines returned');
+  });
+  it("rejects malformed roster entries without claiming a checked empty fleet", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("rejects malformed findings without a lifecycle or empty claim", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+  });
+  it("refuses an oversized roster response within its read budget", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = 'x'.repeat(2 * 1024 * 1024); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("bounds repeated snapshots and exposes records beyond the preview cap", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+    expect(h.el.main!.innerHTML).toContain('Only the first 500');
+    for (let i = 0; i < 22; i++) h.click({ 'data-action': 'mfp-page', 'data-list': 'findings', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Page 20 of 20');
+    expect(h.el.main!.innerHTML).not.toContain('data-finding-id="f-500"');
+    for (let i = 0; i < 3; i++) { h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle(); }
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+  });
+  it("folds Auto-trigger and Honeypots into both Findings and Policies", async () => {
+    const h = await mfpBoot("findings");
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+  });
 });

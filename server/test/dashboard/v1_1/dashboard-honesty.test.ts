@@ -14,11 +14,12 @@ function liftDashboardRenderers(): {
   renderPolicy: (state: unknown) => string;
 } {
   const src = getClientScript();
-  const end = src.indexOf("// ── Render: exit drill");
+  // Include the shared table presenters used by the policy screen.
+  const end = src.indexOf("// ── Hub API actions");
   let chunk = src.slice(0, end);
   chunk = chunk.replace(/const\s+state\s*=/, "var state =");
   const wrapper = `
-    var document = { getElementById: () => null };
+    var document = { getElementById: () => null, addEventListener: () => {} };
     var window = { matchMedia: () => null };
     var sessionStorage = { getItem: () => null, setItem: () => null };
     var location = { hash: "", host: "test", origin: "http://test" };
@@ -39,6 +40,7 @@ function liftDashboardRenderers(): {
 
 function fakeState(extras: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    mfp: { pages: { policy: 0, bindings: 0 }, totals: { policy: 0 } },
     agents: [],
     activity: [],
     policyView: { view: null, loadError: null, loading: false },
