@@ -1904,6 +1904,11 @@ body {
 
 /* Agent entity layout: the 1100px stack point matches the ratified entity design.
  * Spacing uses the design's four-pixel grid; the two columns follow its 2:3 ratio. */
+/* Four equal tracks use the Agents container width, including the narrow 1024px shell.
+ * 4 inventory tiles and 8px gaps (two design spacing units) are independent of Overview. */
+.agents-tiles { --agents-tile-count: 4; --agents-tile-gap: 8px; display: grid; grid-template-columns: repeat(var(--agents-tile-count), minmax(0, 1fr)); gap: var(--agents-tile-gap); }
+.agents-tiles .overview-tile { overflow-wrap: anywhere; }
+.overview-table-agents .state-chip { display: inline-flex; flex-wrap: nowrap; white-space: nowrap; }
 .agent-entity { display: grid; gap: 16px; min-width: 0; }
 .agent-entity-header h1 { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }
 .agent-entity-header p { overflow-wrap: anywhere; }

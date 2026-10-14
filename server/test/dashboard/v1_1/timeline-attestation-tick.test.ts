@@ -19,6 +19,7 @@ describe("v1.2.x dashboard timeline per-action attestation tick", () => {
   const client = getClientScript();
 
   it("Agent detail Timeline card guards on e.attestation and renders the badge", () => {
+    // The extracted timeline renderer now owns the same per-entry attestation guard.
     const detailFn = client.match(
       /function renderAgentTimeline\(agent, evidenceTab\)[\s\S]*?\n\}\n/,
     );

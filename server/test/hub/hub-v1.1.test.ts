@@ -1899,15 +1899,20 @@ describe("slice 6a composed agent capabilities", () => {
       const record = rig.registry.get("agent-alpha")!;
       record.capabilities.can_lockdown = false;
       rig.registry.put(record);
-      const read = async () => {
-        const res = await fetch(rig.url + HUB_API_PREFIX + "/agents", { headers: withAuth({}, rig.authToken) });
-        return (await res.json() as { data: { agents: LocalAgentRecord[] } }).data.agents[0]!.capabilities;
+      const readBoth = async () => {
+        const results = [];
+        for (const path of ["/agents", "/agents/agent-alpha"]) {
+          const res = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+          const body = await res.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+          results.push((body.data.agent ?? body.data.agents![0]!).capabilities);
+        }
+        return results;
       };
-      expect(await read()).toMatchObject({ can_pause: true, can_resume: true, can_restart: true, can_unwrap: false, can_lockdown: false });
-      Object.defineProperty(controller, "supports", { value: undefined, configurable: true });
-      expect(await read()).toMatchObject({ can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: false });
-      Object.defineProperty(controller, "supports", { value: () => { throw new Error("unavailable"); } });
-      expect(await read()).toMatchObject({ can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: false });
+      for (const flags of await readBoth()) expect(flags).toMatchObject({ can_pause: true, can_resume: true, can_restart: true, can_unwrap: false, can_lockdown: false });
+      for (const probe of [undefined, () => { throw new Error("unavailable"); }, () => Promise.reject(new Error("unavailable")), () => "yes", () => 1]) {
+        Object.defineProperty(controller, "supports", { value: probe, configurable: true });
+        for (const flags of await readBoth()) expect(flags).toMatchObject({ can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: false });
+      }
     } finally { await rig.stop(); }
   });
 
@@ -1924,4 +1929,18 @@ describe("slice 6a composed agent capabilities", () => {
       expect(rig.service.listInbox().filter(i => i.kind === "approval_pending")).toEqual([]);
     } finally { await rig.stop(); }
   });
+  it("6a r2 stored non-boolean permission refuses a supported control without queueing", async () => {
+    const controller = new UnsupportedUnwrapController();
+    Object.defineProperty(controller, "supports", { value: () => true });
+    const rig = await startRig({ controller });
+    try {
+      const record = rig.registry.get("agent-alpha")!;
+      record.capabilities.can_lockdown = "yes" as unknown as boolean;
+      rig.registry.put(record);
+      const res = await fetch(rig.url + HUB_API_PREFIX + "/agents/agent-alpha/lockdown", { method: "POST", headers: withAuth({}, rig.authToken) });
+      expect(res.status).toBe(422);
+      expect(rig.service.listInbox().filter(item => item.kind === "approval_pending")).toEqual([]);
+    } finally { await rig.stop(); }
+  });
+
 });

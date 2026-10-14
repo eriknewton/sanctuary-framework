@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a retargets the existing inspect-panel call assertion to the entity Overview; no new behavior test.
 /**
  * Sanctuary v1.2 Dashboard — Concierge surface (WP-V1.2-4)
  *

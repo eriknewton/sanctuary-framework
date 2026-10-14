@@ -30,6 +30,11 @@ export function agentsScenario(name = 'protected', now = Date.now()) {
       chain_verified: false, chain_verdict: 'findings', integrity_finding_count: 1 },
     unwrapped: { origin_machine: 'fixture-linux', detection_method: 'config_file_presence', unwrapped: [] },
   };
+  // This additional capture fixture has scoped, current enforcement evidence; roster intent alone stays unknown.
+  if (name === 'evidenced-protected') {
+    home.agents = home.agents!.map(row => ({ ...row, enforcement_active: 'active', last_enforcement_evidence_at: at(0), freshness_window_ms: 5 * minute }));
+    home.enforcement_confirmed_count = agents.length;
+  }
   const approval: HubApprovalPendingItem = {
     version: '1.1', item_id: 'held-agent', identity_id: agent.identity_id, agent_id: agent.agent_id,
     kind: 'approval_pending', tier: 'tier1', operation_category: 'lockdown', created_at: at(minute), resolved: false,

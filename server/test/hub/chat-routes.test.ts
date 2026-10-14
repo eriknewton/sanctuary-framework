@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a adds an explicit true support probe to the existing all-controls chat fixture.
 /**
  * Hub Chat Routes — Behavioral Tests (WP-V1.2-4)
  *
@@ -17,7 +18,6 @@
  *   - GET /api/hub/chat/sessions returns active sessions
  *   - capability error when operator chat is not wired
  */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createServer,

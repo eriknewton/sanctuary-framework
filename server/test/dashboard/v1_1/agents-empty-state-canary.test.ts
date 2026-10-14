@@ -85,10 +85,11 @@ describe("v1.1 Agents empty-state canary (Finding Z regression)", () => {
     // The empty-state copy is acceptable in the source as long as it's
     // gated behind this check. A regression that drops the guard would
     // render the empty-state alongside or instead of agent rows.
+    // First-run copy requires a loaded roster so unread agents cannot appear empty.
     expect(script).toMatch(
       /function renderAgentsList\(\)\s*\{[^}]*if\s*\(\s*loaded\s*&&\s*!state\.agents\.length\s*\)\s*return\s*['"]<h1>Agents<\/h1>/,
     );
-    // Pin the negation: the empty-state copy points operators at protect.
+    // The first-run heading drops its final period while keeping the protect instruction.
     expect(script).toContain("No protected agents yet");
   });
 
