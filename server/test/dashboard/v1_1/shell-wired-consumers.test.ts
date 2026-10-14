@@ -2256,4 +2256,18 @@ describe("Approvals round-one decision and evidence states", () => {
       expect(html).not.toContain("1 of 1 held operations");
     }
   });
+
+  it("the fortress count badge is a lower bound on a full page and counts unrecognized holds", async () => {
+    vi.useFakeTimers();
+    const holdCount = 3; // Three visible holds amid the rest of a full page.
+    const full = boot({ "/api/hub/inbox": inbox([...Array.from({ length: holdCount }, (_, i) => ({ ...heldItem, item_id: `hold-${i}` })), ...pageOthers(cap - holdCount)]) });
+    await settle();
+    expect(full.el.fortress!.innerHTML).toContain(`<span class="count" id="queue-count">${holdCount}+</span>`);
+    const unrecognized = boot({ "/api/hub/inbox": inbox([{ ...heldItem, tier: "tier9" }]) });
+    await settle();
+    expect(unrecognized.el.fortress!.innerHTML).toContain('<span class="count" id="queue-count">1</span>');
+    const earned = boot({ "/api/hub/inbox": inbox([]) });
+    await settle();
+    expect(earned.el.fortress!.innerHTML).toContain('<span class="count zero" id="queue-count">0</span>');
+  });
 });

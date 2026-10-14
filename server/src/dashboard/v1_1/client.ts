@@ -3133,10 +3133,11 @@ function promotableOperation(i) {
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const pending = pendingApprovalItems();
-  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
-  const countCls = queueCount ? "count" : "count zero";
-  const approvalSummary = approvalQueueEvidence().summary;
+  const evidence = approvalQueueEvidence();
+  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : evidence.count;
+  // The muted zero badge is the same claim as the green check, so it needs the same earned evidence.
+  const countCls = evidence.earned ? "count zero" : "count";
+  const approvalSummary = evidence.summary;
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3956,7 +3957,9 @@ function approvalQueueEvidence() {
   }
   if (!sourceLoaded(HUB + "/inbox")) summary = renderSourceRead(HUB + "/inbox");
   else if (state.inboxRedacted) summary = '<div class="queue-empty" data-pending-approvals-redacted="1">' + escHtml(line) + '</div>';
-  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning };
+  // The badge counts every waiting hold, recognized or not, and on a full page it is only a lower bound.
+  const count = (waiting + unknown) + (full ? "+" : "");
+  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned };
 }
 
 function resetApprovalConsent() {
