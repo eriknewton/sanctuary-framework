@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only deletes the pin on the removed Overview metric tile; no assertion is added or changed, so nothing here can fail at the base.
 import { describe, expect, it } from "vitest";
 import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
 import {
