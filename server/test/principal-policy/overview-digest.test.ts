@@ -215,6 +215,60 @@ describe("round 2 destination labels", () => {
 describe("round 2 coverage read bounds", () => {
   // The posture surface builds the digest inside runEagerReads (buildDigest in posture-routes.ts); this mirrors it.
   const eagerDigest = (audit: AuditLog) => audit.runEagerReads(() => digest(audit));
+  // fail-before-exempt: existing behavior; plant complete after finding the floor entry without the sequence-1 check.
+  it("withholds coverage for an append between the chain head and eager view reads", async () => {
+    // Freeze the backstop clock so a timed reload cannot discard the prefix during this schedule.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const firstSequence = 1; // Audit chains start at sequence one.
+    const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+    const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+    const readHead = audit.getChainHead.bind(audit);
+    const head = vi.spyOn(audit, "getChainHead");
+    try {
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      head.mockImplementationOnce(async () => {
+        const snapshot = await readHead();
+        await append(audit, appendedCount + 1);
+        return snapshot;
+      });
+      const result = await eagerDigest(audit);
+      expect(head).toHaveBeenCalledOnce();
+      expect((await readHead()).sequence).toBe(appendedCount + 1);
+      // Must match routineWindowCoverage in posture.ts: a raced view cannot vouch for complete coverage.
+      expect(result.window_complete).toBe(false);
+      expect(["retention", "coverage_unknown"]).toContain(result.window_incomplete_reason);
+    } finally {
+      head.mockRestore();
+      clock.mockRestore();
+    }
+  });
+  // fail-before-exempt: existing behavior; plant retention whenever the authenticated base sequence exceeds one.
+  it("covers a pruned prefix still held in the eager view but reports retention outside it", async () => {
+    // Freeze the backstop clock so a timed reload cannot discard the prefix before the eager read.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const firstSequence = 1; // Audit chains start at sequence one.
+    const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+    const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+    try {
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
+      await audit.runEagerReads(async () => {
+        const retained = await audit.query({});
+        const head = await audit.getChainHead();
+        expect(retained.entries).toHaveLength(appendedCount);
+        expect(head.sequence - retained.total + firstSequence).toBe(firstSequence);
+        // Must match routineWindowCoverage in posture.ts: the same full view supplies both counts and coverage.
+        expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null, kernel_blocks: appendedCount });
+      });
+      // A disk read loses the rotated prefix, so its smaller count cannot claim complete coverage.
+      expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention", kernel_blocks: retainedCount });
+    } finally {
+      clock.mockRestore();
+    }
+  });
   it("settles coverage from the eager view without re-reading the chain from disk", async () => {
     const audit = log(); await append(audit, 1);
     const stream = vi.spyOn(audit, "streamVerifiedChain"); const view = vi.spyOn(audit, "verifiedChainView");

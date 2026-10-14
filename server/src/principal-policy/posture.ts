@@ -1149,10 +1149,11 @@ async function routineWindowCoverage(
   try {
     const floor = await auditLog.authenticatedRotationFloor();
     if (floor.status === "invalid") return "coverage_unknown";
-    const start = parseIsoInstantWithOffset(windowStart);
-    if (start === undefined) return "coverage_unknown";
+    // An unparseable window cannot support a coverage claim; parsing is a fail-closed gate, not a retention time bound.
+    if (parseIsoInstantWithOffset(windowStart) === undefined) return "coverage_unknown";
     // The head is read before the view, so an append between the two reads can only lower the view's computed oldest
-    // sequence; that moves the floor lookup to a newer entry or out of the view, never to an older one.
+    // sequence away from one; coverage then fails closed as retention or coverage_unknown.
+    // Must match the append-between-reads test in test/principal-policy/overview-digest.test.ts.
     const head = await auditLog.getChainHead();
     // The posture surface runs the digest inside runEagerReads, so this read serves references into the verified
     // in-memory view; a full on-disk re-read per board paint or stream push is the load this surface must not pay. The
@@ -1171,6 +1172,7 @@ async function routineWindowCoverage(
     // Entry timestamps are caller-supplied and need not rise with sequence, so no retained entry's time bounds what
     // retention removed before it. Coverage holds only while the view still reaches the chain's first entry; otherwise
     // the reason is retention until the audit module serves an authenticated time bound for the pruned prefix.
+    // Must match the eager-pruned-prefix test in test/principal-policy/overview-digest.test.ts: the full view supplies the counts.
     return viewOldestSequence === firstSequence ? null : "retention";
   } catch {
     return "coverage_unknown";
