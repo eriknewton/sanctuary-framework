@@ -62,10 +62,11 @@
  * NOT DECLARED HERE: the design system's component alias block (`--bg`,
  * `--text`, `--border`, `--radius-*`, `--font-*`, `--space-tight` and the
  * rest), which maps the design's preview names onto these server names. The
- * legacy approval board and the pre-v1.1 dashboard (`dashboard/html.ts`) each
- * define their own `--bg` and `--border`; the alias block would repaint them
- * the moment any page carried both. It lands only after those boards are
- * retired or renamed.
+ * legacy approval board defines its own `--bg` and `--border`; the alias
+ * block would repaint it the moment any page carried both. It lands only
+ * after that board is retired or renamed. (The pre-v1.1 dashboard,
+ * `dashboard/html.ts`, dropped its own names in slice 2b and now reads these
+ * tokens directly.)
  *
  * Consumed as a RAW CSS string interpolated verbatim into each page's inline
  * `<style>` tag. Keep it dependency free and side-effect free.
@@ -73,11 +74,20 @@
  * IN-REPO CONSUMERS (each interpolates this constant and declares no `:root` of
  * its own; each also interpolates `CONSOLE_FONT_FACE_CSS` from
  * `design-fonts.ts` so the named faces resolve): `dashboard/v1_1/html.ts`,
- * `dashboard/mobile.ts`, `principal-policy/posture-html-shared.ts`
- * (re-exported as `POSTURE_ROOT_TOKENS_CSS`), and
- * `principal-policy/dashboard-html.ts` in `generateLoginHTML` and
- * `generateFleetSwitcherHTML`. That list is exhaustive: this constant is NOT
- * the source for every page the server serves.
+ * `dashboard/mobile.ts`, `dashboard/html.ts` (`renderDashboardHTML`),
+ * `dashboard/multi-html.ts` (`renderMultiAgentHTML`),
+ * `principal-policy/posture-html-shared.ts` (re-exported as
+ * `POSTURE_ROOT_TOKENS_CSS`), and `principal-policy/dashboard-html.ts` in
+ * `generateLoginHTML` and `generateFleetSwitcherHTML`. That list is
+ * exhaustive: this constant is NOT the source for every page the server
+ * serves.
+ *
+ * READ AS DATA BY ONE CONSUMER: `dashboard/mobile.ts` parses the light block
+ * below at module load for the companion's web-manifest colors
+ * (`background_color` from `--paper`, `theme_color` from `--ink`). Must match
+ * `lightTokenHex` there: keep both tokens as six-digit hex declarations in the
+ * light block, before the `[data-theme="dark"]` block, or that module fails
+ * to load (it never falls back to a hand-copied color).
  *
  * ONE SURFACE IS STILL OUTSIDE THIS SYSTEM: `generateDashboardHTML` in
  * `principal-policy/dashboard-html.ts` carries its own GitHub-dark `:root`
