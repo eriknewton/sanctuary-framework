@@ -267,12 +267,12 @@ const state = {
   // "Unknown / Attention", never a fabricated "Protected".
   //
   // home / homeError (2026-06-30 one-surface fold): the full posture-home
-  // payload from GET /api/posture/home (metric cards, today's story, anomaly
+  // payload from GET /api/posture/home (today's story, anomaly
   // findings, per-agent rows). Reuses the EXISTING posture data endpoint - the
   // Posture screen folded into this single surface renders from this, and links
   // out to the per-agent drill-down (/posture/agent/:id) and the evidence view
-  // (/posture/evidence). storyPlain toggles the plain-language story summary.
-  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null, storyPlain: false },
+  // (/posture/evidence).
+  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
   },
@@ -3336,18 +3336,11 @@ function renderActivityScreen() {
   ].join("");
 }
 
-// ── Posture screen (one-surface fold, 2026-06-30) ───────────────────────
-// The full posture detail folded into the single default surface. Reuses the
-// EXISTING /api/posture/* data (state.posture.home, fetched by fetchPostureHome)
-// and renders the same evidence the standalone posture board showed: the six
-// metric cards (Protection Requested, Enforcement Confirmed, Castle Wall,
-// Approvals Waiting, Open Anomalies, Audit Chain), Today's Story with the
-// plain-summary toggle, the Anomaly Findings list, and the per-agent rows that
-// link out to the per-agent drill-down (/posture/agent/:id) and the Evidence
-// view (/posture/evidence). HONESTY: Castle Wall reads green only on an "armed"
-// arm-state; each agent reads green only on confirmed live enforcement; the
-// audit chain reads VERIFIED only when chain_verified is true. Named layers
-// only (no L-numbers); no em-dashes in user-visible copy.
+// ── Posture screen (Overview, 2026-10-14) ────────────────────────────────
+// The default surface is the security-console Overview. It reuses served
+// posture, roster, inbox and Sentinel data, then renders honest tiles, the
+// decision queue, findings, and the agents table. Named layers only (no
+// L-numbers); no em-dashes in user-visible copy.
 function evidenceCurrent(evidence) {
   // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
   const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
@@ -3359,8 +3352,7 @@ function agentEvidenceStatus(agent) {
   if (agent.status !== "active") return agent.status;
   // Only this agent's loaded posture evidence can vouch for protection; roster or machine timestamps cannot.
   const home = sourceLoaded("/api/posture/home") && state.posture.home;
-  const evidence = home && (home.agents || []).find(function (row) { return row.agent_id === agent.agent_id; });
-  return evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence) ? "active" : "unknown";
+  return home && agentEnforcementConfirmedNow(agent, home) ? "active" : "unknown";
 }
 function agentDisplayStatus(agent) {
   return STATUS_MAP[agentEvidenceStatus(agent)] || STATUS_MAP.unknown;
@@ -3376,74 +3368,196 @@ function postureWallLabel(armState) {
   if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
   return { cls: "pill tone-unknown", text: "Unknown" };
 }
-// S3 evidence spine tile. The opts argument and every field in it are optional:
-// the honest render of a missing denominator or a missing timestamp is to OMIT
-// it, never to substitute a placeholder that reads like data.
-//   opts.of            a denominator, rendered only when it is a finite number,
-//                      so a null/NaN total renders a bare count rather than
-//                      "of 0" or "of -".
-//   opts.fresh         an ISO timestamp, rendered through relTimeFromIso. When
-//                      it is absent we render opts.freshNone in the slate
-//                      unknown tone, so "not checked" can never be mistaken
-//                      for "checked recently".
-//   opts.ev            { href, text } link to the evidence behind the number.
-function postureMetricCard(value, label, opts) {
-  const o = opts || {};
-  const ofText = (typeof o.of === "number" && isFinite(o.of))
-    ? '<span class="pm-of">of ' + escHtml(o.of) + '</span>'
-    : "";
-  const freshText = o.fresh ? relTimeFromIso(o.fresh) : "";
-  let freshHtml = "";
-  if (freshText) {
-    freshHtml = '<span class="pm-fresh" title="' + escHtml(o.fresh) + '">checked ' + escHtml(freshText) + '</span>';
-  } else if (o.freshNone) {
-    freshHtml = '<span class="pm-fresh none">' + escHtml(o.freshNone) + '</span>';
-  }
-  const evHtml = o.ev
-    ? '<a class="pm-ev" href="' + escHtml(o.ev.href) + '">' + escHtml(o.ev.text) + ' &rarr;</a>'
-    : "";
-  const foot = (freshHtml || evHtml)
-    ? '<span class="pm-foot">' + freshHtml + evHtml + '</span>'
-    : "";
-  return '<div class="posture-metric"><span class="pm-v">' + value + ofText + '</span><span class="pm-l">' + escHtml(label) + '</span>' + foot + '</div>';
+// Slice 3 Overview caps. Each rendered list prints "showing M of N" beside
+// the panel title so the cap bounds client work without hiding the backlog.
+const OVERVIEW_DECISION_LIMIT = 4;
+const OVERVIEW_FINDING_LIMIT = 3;
+const OVERVIEW_AGENT_LIMIT = 8;
+
+function overviewSourceReason(path, noun) {
+  const read = sourceRead(path);
+  if (sourceNotServed(path)) return noun + " is not served on this host";
+  if (!read || read.state === "state_UNREAD" || read.state === "state_LOADING") return noun + " has not answered yet";
+  if (read.state === "state_FAILED") return noun + " did not answer" + (read.error ? ": " + stripTrailingPeriod(read.error) : "");
+  return noun + " is not evaluated";
 }
-function renderPostureStory(d) {
-  // F2 BLOCKER-1: three-state from the shared verdict. Never "verified clean"
-  // over a tampered sealed entry; a neutral "sealed history not re-verifiable at
-  // this privilege" for verified_suffix_only.
-  if (state.posture.storyPlain) {
-    const chainText = d.chain_verified
-      ? "The audit log verified clean: no tampering."
-      : d.chain_verdict === "verified_suffix_only"
-        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
-        : "The audit log is unverified: " + escHtml(d.integrity_finding_count) + " integrity finding(s).";
-    return '<p>Today your agents ran <strong>' + escHtml(d.total_operations) +
-      '</strong> operations in the last 24h. Sanctuary blocked <strong>' + escHtml(d.kernel_blocks) +
-      '</strong> outbound connections and allowed <strong>' + escHtml(d.kernel_allows) +
-      '</strong>. You denied <strong>' + escHtml(d.approvals_denied) +
-      '</strong> approvals and granted <strong>' + escHtml(d.approvals_granted) +
-      '</strong>. ' + chainText + '</p>';
+function sentenceCase(text) {
+  const value = String(text || "");
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+}
+function stripTrailingPeriod(text) {
+  return String(text || "").replace(/[.]+$/, "");
+}
+function loadedSourceReadAge(path) {
+  return sourceLoaded(path) ? sourceReadAge(path) : null;
+}
+
+function overviewChip(kind, word, detail) {
+  return '<span class="state-chip ' + escHtml(kind) + '"><i aria-hidden="true"></i>' +
+    escHtml(word) + (detail ? ' · <span>' + escHtml(detail) + '</span>' : '') + '</span>';
+}
+
+function overviewTile(label, valueHtml, evidenceHtml, href) {
+  return '<div class="overview-tile">' +
+    '<a class="ot-label" href="' + escHtml(href || "#activity") + '">' + escHtml(label) + '</a>' +
+    '<span class="ot-value">' + valueHtml + '</span>' +
+    '<span class="ot-evidence">' + (typeof evidenceHtml === "string" ? evidenceHtml : (evidenceHtml && evidenceHtml.text) || "") + '</span>' +
+  '</div>';
+}
+
+function postureEvidenceByAgent(home) {
+  const map = Object.create(null);
+  (home && home.agents || []).forEach(function (row) { if (row && row.agent_id) map[row.agent_id] = row; });
+  return map;
+}
+
+function unprotectedHarnesses(home) {
+  return home && home.unwrapped && Array.isArray(home.unwrapped.unwrapped) ? home.unwrapped.unwrapped : null;
+}
+
+function isRosterStateProtectable(agent) {
+  return agent && agent.status !== "locked_down" && agent.status !== "error" && agent.status !== "paused";
+}
+
+function agentEnforcementConfirmedNow(agent, home) {
+  const evidence = postureEvidenceByAgent(home)[agent && agent.agent_id];
+  // Invariant: confirmed means this protected agent has current active enforcement evidence and is not in a continuing roster state that suspends or invalidates it.
+  return !!(isRosterStateProtectable(agent) && evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence));
+}
+
+function oldestAge(items) {
+  const times = items.map(function (i) { return parseEvidenceTimestamp(i.created_at || ""); }).filter(Number.isFinite);
+  if (!times.length) return "oldest age Unknown";
+  return "oldest " + durationLabelFromMs(Date.now() - Math.min.apply(null, times)) + " ago";
+}
+
+function overviewFirstRun(home) {
+  const unwrapped = unprotectedHarnesses(home);
+  const detectedHarnesses = Array.isArray(unwrapped) ? unwrapped : [];
+  const reason = !Array.isArray(unwrapped)
+    ? "Unprotected-harness list was not served"
+    : detectedHarnesses.length
+    ? String(detectedHarnesses.length) + " agent harness" + (detectedHarnesses.length === 1 ? "" : "es") + " detected, none protected"
+    : "No harness was detected";
+  return '<section class="overview-empty" data-overview-first-run="1">' +
+    '<h2>No agents protected yet</h2>' +
+    '<p>' + escHtml(sentenceCase(reason) + ". Evidence read " + (loadedSourceReadAge("/api/posture/home") || "is current only after the first check") + ".") + '</p>' +
+    (detectedHarnesses.length ? '<p class="muted">' + escHtml(detectedHarnesses.map(function (u) { return u.harness || "unknown harness"; }).join(", ")) + '</p>' : '') +
+    '<a class="btn btn-primary" href="#agents">Protect an agent</a>' +
+  '</section>';
+}
+
+function overviewDecisionRow(item) {
+  const text = renderTemplate(item.display_template_id, item.display_template_args);
+  const agentId = item.agent_id || "";
+  const createdAt = parseEvidenceTimestamp(item.created_at || "");
+  const wait = Number.isFinite(createdAt) ? durationLabelFromMs(Date.now() - createdAt) + " ago" : "Unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : (item.tier ? "Tier " + String(item.tier) : "Tier unknown");
+  // Invariant: inline decisions are a positive Tier 2 affordance only; every other served tier stays on the full Approvals path.
+  const actions = item.tier === "tier2"
+    ? '<div class="actions"><button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>' +
+      '<button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button></div>'
+    : '<a class="btn btn-sm" href="#approvals" data-overview-review="' + escHtml(item.item_id) + '">Review in Approvals</a>';
+  const agentCell = agentId
+    ? '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a>'
+    : '<span>agent not named</span>';
+  return '<tr><td><span class="mono">' + escHtml(tier) + '</span></td><td>' + agentCell + '</td>' +
+    '<td class="mono">' + escHtml(item.operation_category || "approval") + '</td><td>' + escHtml(text) + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
+}
+
+function renderOverviewDecisionQueue() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Not evaluated</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason(HUB + "/inbox", "approval queue"))) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/inbox" + '">Retry</button></div></section>';
   }
-  const chainLine = d.chain_verified
-    ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
-    : d.chain_verdict === "verified_suffix_only"
-      ? '<span class="pill tone-degraded">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
-      : '<span class="pill tone-unverified">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
-  // S3 denominators: each count states the whole it came out of, so a "4" reads
-  // as 4-of-2,113 rather than an unanchored number. Both totals are computed
-  // from fields already on the digest; nothing new is fetched.
-  const connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
-  const decidedTotal = (d.approvals_denied || 0) + (d.approvals_granted || 0);
-  const lines = [
-    '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h' +
-      (d.failures ? ', ' + escHtml(d.failures) + ' of them failed.' : '.'),
-    '<strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(connTotal) +
-      ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
-    '<strong>' + escHtml(d.approvals_denied) + '</strong> of ' + escHtml(decidedTotal) +
-      ' decided approvals denied by you, ' + escHtml(d.approvals_granted) + ' granted.',
-    chainLine
-  ];
-  return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
+  if (state.inboxRedacted) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Unknown</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals hidden</h3><p>Approval queue is hidden until you paste the operator token. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p><a class="btn" href="#approvals">Open Approvals</a></div></section>';
+  }
+  const all = heldApprovalItems(null).slice().sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const shown = all.slice(0, OVERVIEW_DECISION_LIMIT);
+  if (!all.length) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">0 of 0 · queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' +
+      '<div class="overview-empty"><h3>No approvals waiting</h3><p>0 of 0 held operations are open. Queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '.</p><a class="btn" href="#activity">Open Evidence</a></div></section>';
+  }
+  return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
+    '<a href="#approvals">all approvals</a></div><div class="overview-table-scroll"><table class="overview-table overview-table-decisions"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting</th><th></th></tr></thead><tbody>' +
+    shown.map(overviewDecisionRow).join("") + '</tbody></table></div></section>';
+}
+
+function severityClass(level) {
+  const v = String(level || "info").toLowerCase();
+  if (v === "critical" || v === "high" || v === "medium" || v === "low") return v;
+  return "info";
+}
+function severityRank(level) {
+  const sev = severityClass(level);
+  return sev === "critical" ? 0 : sev === "high" ? 1 : sev === "medium" ? 2 : sev === "low" ? 3 : 4;
+}
+
+function renderOverviewFindingsPanel() {
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const findings = unknown ? [] : (state.posture.anomalies || []).slice().sort(function (a, b) {
+    return severityRank(a.severity) - severityRank(b.severity);
+  });
+  const shown = findings.slice(0, OVERVIEW_FINDING_LIMIT);
+  const list = unknown
+    ? '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(sentenceCase(overviewSourceReason("/api/anomaly/findings", "Sentinels"))) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="/api/anomaly/findings">Retry Anomaly findings</button></div>'
+    : shown.length
+      ? '<div class="overview-list">' + shown.map(function (f) {
+          const sev = severityClass(f.severity);
+          return '<div class="item"><span class="severity ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
+        }).join("") + '</div>'
+      : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
+  return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
+    (unknown ? "Not evaluated" : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
+    '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
+}
+
+function agentBudgetText(agent) {
+  const daily = agent && agent.budget_summary && agent.budget_summary.daily;
+  if (!daily) return "Unknown";
+  return String(daily.used) + " of " + String(daily.cap) + " " + String(daily.unit || "");
+}
+
+function agentStateChip(agent) {
+  const status = agentEvidenceStatus(agent);
+  const evidence = postureEvidenceByAgent(state.posture.home || {})[agent && agent.agent_id];
+  const evidenceAge = evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "";
+  if (status === "active") return overviewChip("good", "RUNNING", evidenceAge);
+  if (agent.status === "paused") return overviewChip("neutral", "PAUSED");
+  if (agent.status === "locked_down") return overviewChip("locked", "LOCKED DOWN");
+  if (agent.status === "error") return overviewChip("bad", "ERROR");
+  return overviewChip("unknown", "UNKNOWN");
+}
+
+function agentEnforcementChip(agent) {
+  const evidence = postureEvidenceByAgent(state.posture.home || {})[agent && agent.agent_id];
+  const evidenceAge = evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "";
+  return agentEvidenceStatus(agent) === "active"
+    ? overviewChip("good", "CONFIRMED", evidenceAge)
+    : overviewChip("unknown", "UNKNOWN");
+}
+
+function renderOverviewAgentsTable() {
+  if (!sourceLoaded(HUB + "/agents")) {
+    return '<section class="card"><div class="card-head-row"><h3>Agents <span class="count-age">Not evaluated</span></h3></div><div class="overview-empty"><h3>Agent roster Unknown</h3><p>' + escHtml(overviewSourceReason(HUB + "/agents", "agent roster")) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/agents" + '">Retry</button></div></section>';
+  }
+  const shown = state.agents.slice(0, OVERVIEW_AGENT_LIMIT);
+  const rows = shown.map(function (a) {
+    const owner = a.identity_id || "Unknown";
+    const template = a.channel_template_id || "Unknown";
+    const policyAge = loadedSourceReadAge(HUB + "/policies");
+    return '<tr><td><a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</a></td>' +
+      '<td>' + escHtml(owner) + '</td><td>' + escHtml(a.harness || "Unknown") + '</td><td>' + escHtml(template) + '</td>' +
+      '<td class="mono">Unknown hosts · Unknown MCP · Unknown tools<br><span class="muted">' + escHtml((a.policy_id || "policy Unknown") + (policyAge ? " · policy read " + policyAge : "")) + '</span></td>' +
+      '<td>' + agentEnforcementChip(a) + '</td><td>' + agentStateChip(a) + '</td><td>' + escHtml(agentBudgetText(a)) + '</td><td class="mono muted">' + escHtml(a.last_activity_at ? relTimeFromIso(a.last_activity_at) : "no activity reported") + '</td></tr>';
+  }).join("");
+  return '<section class="card"><div class="card-head-row"><h3>Agents <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(state.agents.length) + ' · <a href="#agents">all agents</a></span></h3><span class="count-age">Reach (allowed of requested)' + (loadedSourceReadAge(HUB + "/policies") ? ' · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies")) : '') + '</span></div>' +
+    '<div class="overview-table-scroll"><table class="overview-table overview-table-agents"><thead><tr><th>Agent</th><th>Owner</th><th>Harness</th><th>Policy template</th><th>Reach (allowed of requested)</th><th>Enforcement</th><th>State</th><th>Budget today</th><th>Last activity</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
 }
 // S3 evidence spine for Today's story: how recently the counted window closed,
 // beside the link to the evidence behind the counts. A digest with no
@@ -3516,103 +3630,75 @@ function renderPostureScreen() {
   const home = state.posture.home;
   const head =
     '<div class="page-head"><div>' +
-      '<p class="eyebrow">Posture</p>' +
-      '<h1>How safe you are right now.</h1>' +
-      '<p class="sub">The full posture detail, on this one surface. Castle Wall reads protected only on a fresh enforcement check. Every number traces to your signed audit trail.</p>' +
+      '<p class="eyebrow">Overview</p>' +
+      '<h1>Overview</h1>' +
+      '<p class="sub">What needs attention now. Unknown means a source has not answered or has not proven the value.</p>' +
     '</div></div>';
   if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
-      ? 'Protection status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
-      : 'Protection status unavailable. Current data is Unknown.';
-    return '<section class="concierge-wrap">' + head +
+      ? 'Protection status unavailable. Overview unavailable. This dashboard could not read the latest posture check. ' + escHtml(state.posture.homeError)
+      : 'Protection status unavailable. Overview unavailable. Current posture is Unknown.';
+    return '<section class="overview-page">' + head +
       '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
+  const machineLine = home.origin_machine
+    ? '<p class="muted overview-machine">Machine <span class="mono">' + escHtml(home.origin_machine) + '</span></p>'
+    : '';
+  if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
+    const below = [];
+    if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && heldApprovalItems(null).length) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
+    if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
+    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + below.join("") + '</section>';
+  }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
-  // ADDITIVE vault-level line. The wall label above is the MACHINE arm-state and
-  // is unchanged; a Mac armed by an earlier install renders it protected while
-  // this vault is on no wall, so the vault's own claim gets its own sentence
-  // rather than being folded into that label. NOTE: this whole browser script
-  // lives inside a TypeScript template literal, so a backtick here would
-  // terminate it; comments in this file use plain words, never code quotes.
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
-  const vaultNotice =
-    vaultProvision === "not_yet_walled"
-      ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
-      : "";
-  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
+  const vaultNotice = vaultProvision === "not_yet_walled"
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    : "";
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
-  // F2 BLOCKER-1: three-state audit-chain pill from the shared verdict.
-  const chainPill = home.digest && home.digest.chain_verified
-    ? '<span class="pill tone-verified">Verified</span>'
-    : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
-      ? '<span class="pill tone-degraded">Suffix-only</span>'
-      : '<span class="pill tone-unverified">Unverified</span>';
-  // S3 evidence spine. Every tile carries, where the payload already supports
-  // it, a denominator, a freshness stamp, and a link to its evidence. Nothing
-  // here fetches new data: detectedTotal, the wall's evidence timestamp, and the
-  // digest window all come from the /api/posture/home payload already in state.
-  // Tiles the payload cannot honestly qualify (approvals, anomalies) get an
-  // evidence link only, with no invented denominator or age.
-  const detectedTotal =
-    ((home.agents && home.agents.length) || 0) +
-    ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
   const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
   const digest = home.digest || {};
+  const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
+  const wallChip = wall.text === "Enforcing"
+    ? overviewChip("good", "ENFORCING", wallAge)
+    : wall.text === "Coarse-only" || wall.text === "Degraded"
+      ? overviewChip("warn", wall.text.toUpperCase(), wallAge || "evidence not current")
+      : wall.text === "Locked down"
+        ? overviewChip("locked", "LOCKED DOWN", wallAge)
+        : wall.text === "Not installed"
+          ? overviewChip("warn", "NOT INSTALLED", wallAge || "not installed")
+          : overviewChip("unknown", "UNKNOWN", wallAge || "no evidence");
+  const pendingKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
+  const pending = pendingKnown ? heldApprovalItems(null) : [];
+  const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
+  // Invariant: the chain tile has three states from the served verdict. VERIFIED needs a parseable check age; findings are bad; suffix-only stays partial rather than green.
+  const chainVerified = digest.chain_verified === true && Number.isFinite(chainWindowEnd);
+  const chainChip = chainVerified
+    ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
+    : digest.chain_verdict === "findings"
+      ? overviewChip("bad", "FAILED", typeof digest.integrity_finding_count === "number" ? digest.integrity_finding_count + " findings" : "findings")
+      : digest.chain_verdict === "verified_suffix_only"
+      ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
+      : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
   const metricCards =
-    '<div class="posture-metrics">' +
-      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested", {
-        of: detectedTotal,
-        // Hash route, matching the SPA's own nav ids, so this stays in-app.
-        ev: { href: "#agents", text: "agents" },
-      }) +
-      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed", {
-        of: home.protection_requested_count,
-        ev: { href: "/posture/evidence", text: "evidence" },
-      }) +
-      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall", {
-        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
-        // of this render. No evidence says so outright: absence must read as
-        // absence, never as a recent check that happened to pass.
-        fresh: wallEvidenceAt,
-        freshNone: "no enforcement evidence yet",
-      }) +
-      vaultNotice + renderSourceRead(HUB + "/inbox") +
-      postureMetricCard(!sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : escHtml(pending), "Approvals waiting") +
-      postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
-      postureMetricCard(chainPill, "Audit chain", {
-        // The digest window is the period this verdict covers; its end states
-        // how current the verdict is.
-        fresh: digest.window_end,
-        freshNone: "no verify on record",
-        ev: { href: "/api/audit-log", text: "audit log" },
-      }) +
+    '<div class="overview-tiles" aria-label="At a glance">' +
+      overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
+      overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
+      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
-  const storyToggle =
-    '<label class="story-toggle"><input type="checkbox" data-action="posture-story-plain"' +
-    (state.posture.storyPlain ? ' checked' : '') + '> Plain summary</label>';
   return [
-    '<section class="concierge-wrap">',
+    '<section class="overview-page">',
       head,
-      '<section class="card">',
-        '<h3>At a glance</h3>',
-        metricCards,
-        '<p class="muted">Machine: ' + escHtml(home.origin_machine || "(local)") + '</p>',
-      '</section>',
-      '<section class="card">',
-        '<div class="card-head-row"><h3>Today&#39;s story</h3>' + storyToggle + '</div>',
-        renderPostureStory(home.digest || {}),
-        postureStoryFoot(home.digest || {}),
-      '</section>',
-      '<section class="card">',
-        '<h3>Anomaly findings</h3>',
-        renderPostureAnomalies(findings, anomalyUnknown), renderSourceRead("/api/anomaly/findings"),
-      '</section>',
-      '<section class="card">',
-        '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
-        renderPostureAgentRows(home),
-      '</section>',
+      machineLine,
+      metricCards,
+      vaultNotice,
+      renderOverviewDecisionQueue(),
+      renderOverviewFindingsPanel(),
+      renderOverviewAgentsTable(),
+      '<p class="muted">Overview values come directly from served posture, approval, Sentinel and roster reads. Unknown remains explicit when a source has not answered.</p>',
     '</section>'
   ].join("");
 }
@@ -3910,7 +3996,7 @@ function renderEnforcementScreen() {
     : '<span class="pm-fresh none">no enforcement evidence yet</span>';
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
   const vaultNotice = vaultProvision === "not_yet_walled"
-    ? '<p class="muted">This vault is not on this machine\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
     : "";
   const layers = postureLayerLines().map(function (l) {
     const dotCls = layerDotClass(l);
@@ -3945,7 +4031,7 @@ function renderEnforcementScreen() {
         renderSourceRead("/api/sovereignty"),
       '</section>',
       '<section class="card">',
-        '<h3>Outbound connections (last 24h)</h3>',
+        '<h3>Outbound connections</h3>',
         egress,
         postureStoryFoot(d),
       '</section>',
@@ -5537,11 +5623,6 @@ document.addEventListener("click", function (ev) {
     renderTopbar();
     return;
   }
-  // Today's Story plain-summary toggle on the Posture screen.
-  if (action === "posture-story-plain") {
-    state.posture.storyPlain = !state.posture.storyPlain;
-    return rerender();
-  }
   if (action === "intel-reload") { return void refreshPanel(HUB + "/intelligence"); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
   if (action === "intel-picker-close") return onIntelPickerClose();
@@ -5601,6 +5682,7 @@ document.addEventListener("click", function (ev) {
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) {
+    if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
     state.selectedAgentId = agentId;
     // Close the search results here: a hit opened from #agent-detail assigns
     // the hash it already has, so no hashchange fires to close them or to
