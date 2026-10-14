@@ -23,7 +23,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
     },
     layers: {
       l1: {
-        label: "Castle Wall",
+        label: "Cognitive",
         state: "full",
         headline: "State encrypted at rest",
         encryption: "AES-256-GCM",
@@ -31,7 +31,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         memory_attest_ready: true,
       },
       l2: {
-        label: "Sentinels",
+        label: "Operational",
         state: "degraded",
         headline: "Process isolation: no TEE on this host",
         isolation_type: "process-level",
@@ -40,7 +40,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         sandbox_status: "Principal Policy gate active",
       },
       l3: {
-        label: "Charter",
+        label: "Selective Disclosure",
         state: "full",
         headline: "Selective disclosure ready",
         did_active: true,
@@ -48,7 +48,7 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
         proofs_today: 1,
       },
       l4: {
-        label: "Heralds",
+        label: "Verifiable Reputation",
         state: "full",
         headline: "Verascore attached",
         score: 82,
@@ -102,10 +102,10 @@ function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSn
 describe("renderDashboardHTML", () => {
   it("renders all four layer cards with their labels", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
-    expect(html).toContain("Castle Wall");
-    expect(html).toContain("Sentinels");
-    expect(html).toContain("Charter");
-    expect(html).toContain("Heralds");
+    expect(html).toContain("Cognitive");
+    expect(html).toContain("Operational");
+    expect(html).toContain("Selective Disclosure");
+    expect(html).toContain("Verifiable Reputation");
   });
 
   it("applies the correct shield color class for green status", () => {
@@ -178,10 +178,10 @@ describe("renderDashboardHTML", () => {
 
   it("echoes the aggregator headline in the hero sub-text", () => {
     const snap = makeSnapshot({
-      overall: { status: "healthy", light: "green", headline: "Castle Wall, Charter, and Heralds full. Sentinels degraded" },
+      overall: { status: "healthy", light: "green", headline: "Castle Wall enforcing, Operational layer degraded (no TEE on this host)" },
     });
     const html = renderDashboardHTML({ snapshot: snap });
-    expect(html).toContain("Castle Wall, Charter, and Heralds full");
+    expect(html).toContain("Castle Wall enforcing, Operational layer degraded (no TEE on this host)");
   });
 
   it("shows the agent display name and DID fingerprint", () => {
@@ -209,7 +209,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "Heralds",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -232,7 +232,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "Heralds",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -255,7 +255,7 @@ describe("renderDashboardHTML", () => {
       layers: {
         ...makeSnapshot().layers,
         l4: {
-          label: "Heralds",
+          label: "Verifiable Reputation",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -334,7 +334,7 @@ describe("renderDashboardHTML", () => {
         layers: {
           ...base.layers,
           l4: {
-            label: "Heralds",
+            label: "Verifiable Reputation",
             state: "degraded" as const,
             headline: "Attached, but evidence is degraded",
             score: 82,
@@ -375,9 +375,9 @@ describe("renderDashboardHTML", () => {
       };
     }
 
-    it("renders the Heralds score and evidence counts when evidence is present", () => {
+    it("renders the Verifiable Reputation score and evidence counts when evidence is present", () => {
       const html = renderDashboardHTML({ snapshot: snapshotWithEvidence() });
-      expect(html).toContain("Heralds score");
+      expect(html).toContain("Verifiable Reputation score");
       expect(html).toContain("55 / 100");
       expect(html).toContain("Attestations");
       expect(html).toContain(">7<");
@@ -407,7 +407,7 @@ describe("renderDashboardHTML", () => {
       // stylesheet so consumers can theme them — we check the rendered
       // DOM instead.)
       expect(html).not.toContain(`<div class="l4-evidence">`);
-      expect(html).not.toMatch(/<dt>Heralds score<\/dt>/);
+      expect(html).not.toMatch(/<dt>Verifiable Reputation score<\/dt>/);
     });
 
     it("escapes HTML in evidence-derived fields", () => {

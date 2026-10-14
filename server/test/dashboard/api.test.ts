@@ -99,7 +99,7 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.layers).toBeDefined();
-    expect(body.layers.l1.label).toBe("Castle Wall");
+    expect(body.layers.l1.label).toBe("Cognitive");
     expect(body.overall.light).toMatch(/^(green|yellow|red)$/);
     expect(body.server_version).toBe("0.9.0-test");
   });
@@ -115,10 +115,10 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<!DOCTYPE html>");
-    expect(html).toContain("Castle Wall");
-    expect(html).toContain("Sentinels");
-    expect(html).toContain("Charter");
-    expect(html).toContain("Heralds");
+    expect(html).toContain("Cognitive");
+    expect(html).toContain("Operational");
+    expect(html).toContain("Selective Disclosure");
+    expect(html).toContain("Verifiable Reputation");
     expect(html).toContain("id=\"shield\"");
   });
 

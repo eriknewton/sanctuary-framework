@@ -38,6 +38,7 @@ import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
+import { LEGACY_LAYER_NAMES } from "./legacy-layer-names.js";
 import { pendingApprovalsRedactedMarker } from "./pending-redaction.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
@@ -558,7 +559,7 @@ function buildCognitive(
   const state: LayerState = hasIdentity ? "full" : "degraded";
   let headline: string;
   if (!hasIdentity) {
-    headline = "No protected identity yet. Run sanctuary_bootstrap";
+    headline = "No identity yet. Run sanctuary_bootstrap";
   } else if (hasLiveIntegrityEvidence) {
     headline = "State encrypted at rest";
   } else if (sealedUnverifiedAtPrivilege) {
@@ -575,7 +576,7 @@ function buildCognitive(
   // clean this snapshot. Absent that, the honest answer is "not ready".
   const memoryAttestReady = hasIdentity && hasLiveIntegrityEvidence;
   return {
-    label: "Castle Wall",
+    label: LEGACY_LAYER_NAMES.l1,
     state,
     headline,
     encryption: "AES-256-GCM + HKDF per namespace",
@@ -631,7 +632,7 @@ function buildOperational(
     sandbox_status = "Principal Policy gate configured (no recent adjudication)";
   }
   return {
-    label: "Sentinels",
+    label: LEGACY_LAYER_NAMES.l2,
     state,
     headline: teeAvailable
       ? "Hardware isolation active"
@@ -667,7 +668,7 @@ function buildDisclosure(
       e.details?.["reconcile"] !== true
   ).length;
   return {
-    label: "Charter",
+    label: LEGACY_LAYER_NAMES.l3,
     state: didActive ? "full" : "degraded",
     headline: didActive
       ? "Selective disclosure ready"
@@ -690,7 +691,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
 
   const base: ReputationStatus = rep?.score != null
     ? {
-        label: "Heralds",
+        label: LEGACY_LAYER_NAMES.l4,
         state: "full",
         headline: "Verascore attached",
         score: rep.score,
@@ -699,7 +700,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
       }
     : hasDid
       ? {
-          label: "Heralds",
+          label: LEGACY_LAYER_NAMES.l4,
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -707,7 +708,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
           claim_cta: "Claim your profile at verascore.ai",
         }
       : {
-          label: "Heralds",
+          label: LEGACY_LAYER_NAMES.l4,
           state: "degraded",
           headline: "No identity claimed",
           score: null,
@@ -833,7 +834,7 @@ function computeOverall(
       headline:
         l2.state === "full"
           ? "All layers full, Castle Wall enforcing"
-          : "Castle Wall enforcing, Sentinels degraded (no TEE on this host)",
+          : "Castle Wall enforcing, Operational layer degraded (no TEE on this host)",
     };
   }
   if (allCriticalFull && !wallArmed) {

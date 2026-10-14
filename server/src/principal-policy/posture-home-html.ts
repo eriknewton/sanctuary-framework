@@ -152,6 +152,8 @@ export function renderPostureHomeHTML(): string {
   ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  html[data-theme="dark"] { color-scheme: dark; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 var(--sans);
@@ -238,7 +240,7 @@ export function renderPostureHomeHTML(): string {
   .footer strong { color: var(--ink); }
   .empty { color: var(--ink-3); font-style: italic; }
   .err { color: var(--rust); }
-  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
   .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
   button.guided {
     margin-top: 8px; background: var(--surface-2); color: var(--ink);
@@ -257,7 +259,7 @@ export function renderPostureHomeHTML(): string {
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
   .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0; }
   .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12px; user-select: none; }
-  .story-toggle input { margin: 0; }
+  .story-toggle input { margin: 0; accent-color: var(--indigo); }
   .story-summary { margin: 0; }
   /*
     S3 first-run empty state. An empty fortress is the most common first
@@ -832,10 +834,18 @@ export function renderPostureHomeHTML(): string {
   // display:none until a 200 supplies real evidence, so a locked/booting fortress
   // shows nothing (honest absence), not a composition-off implication.
   var RECOGNITION_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+  function isRecognitionPanel(panel) {
+    return !!panel && panel.composition_enabled === true &&
+      typeof panel.receipts === "object" && panel.receipts !== null;
+  }
   function loadRecognition(attempt) {
     var section = document.getElementById("recognition-section");
     if (!section) return;
-    api("/api/posture/recognition").then(function (panel) {
+    return api("/api/posture/recognition").then(function (panel) {
+      if (!isRecognitionPanel(panel)) {
+        section.style.display = "none";
+        return;
+      }
       // composition_enabled is always true on a served panel; reveal + render.
       section.style.display = "";
       renderRecognition(panel);
@@ -1178,6 +1188,10 @@ export function renderPostureHomeHTML(): string {
     return rows;
   }
 
+  function servedArray(value) {
+    return Array.isArray(value) ? value : null;
+  }
+
   function approvalRedirect(status) {
     return status && status.policy && status.policy.approval_redirect
       ? status.policy.approval_redirect
@@ -1202,10 +1216,13 @@ export function renderPostureHomeHTML(): string {
   // were not allowed to see -- and in standalone/redirect mode the inbox is
   // the source that answers, so that is the LIKELIER half to be wrong.
   function buildApprovalState(legacyBody, inboxBody, status, queueDenied) {
-    var legacyList = legacyBody && legacyBody.pending ? legacyBody.pending : legacyBody;
-    var inboxList = inboxBody && inboxBody.data && inboxBody.data.entries
-      ? inboxBody.data.entries
-      : [];
+    // The served approval routes return arrays. A malformed successful body is
+    // unread evidence, not an empty queue; otherwise one bad auxiliary body can
+    // throw here and blank the whole posture board.
+    var legacyList = servedArray(legacyBody);
+    var inboxList = servedArray(inboxBody && inboxBody.data && inboxBody.data.entries);
+    var queueUnavailable = legacyList === null ||
+      (inboxBody && inboxBody.data && inboxList === null);
     var selected = chooseApprovalRows(
       mapRows(legacyList || [], normalizeLegacyApproval),
       mapRows(inboxList || [], normalizeInboxApproval),
@@ -1221,6 +1238,7 @@ export function renderPostureHomeHTML(): string {
       // An approval-queue read was DENIED. Everything downstream must treat
       // this view as incomplete rather than empty.
       locked: queueDenied === true,
+      unavailable: queueUnavailable === true,
     };
   }
 
@@ -1241,6 +1259,13 @@ export function renderPostureHomeHTML(): string {
       "</div></div>";
   }
 
+  function unavailableApprovalsHTML() {
+    return '<div class="approval-locked" data-approvals-unavailable="1">' +
+      '<div class="approval-locked-title">Approval queue unavailable.</div>' +
+      '<div class="approval-detail">This page received an unreadable approval response, so it cannot verify whether anything is waiting on your decision.</div>' +
+      "</div>";
+  }
+
   function wireApprovalsUnlock(el) {
     var button = el.querySelector("[data-approvals-unlock]");
     if (!button) return;
@@ -1257,16 +1282,24 @@ export function renderPostureHomeHTML(): string {
     if (approvalState && approvalState.locked) {
       return '<span class="pill amber">LOCKED</span>';
     }
+    if (approvalState && approvalState.unavailable) {
+      return '<span class="pill amber">UNAVAILABLE</span>';
+    }
     return (approvalState && approvalState.rows && approvalState.rows.length) || 0;
   }
 
   function renderApprovals(approvalState) {
     var pending = (approvalState && approvalState.rows) || [];
     var locked = !!(approvalState && approvalState.locked);
+    var unavailable = !!(approvalState && approvalState.unavailable);
     var el = document.getElementById("approvals");
     if (locked && !pending.length) {
       el.innerHTML = lockedApprovalsHTML();
       wireApprovalsUnlock(el);
+      return;
+    }
+    if (unavailable && !pending.length) {
+      el.innerHTML = unavailableApprovalsHTML();
       return;
     }
     if (!pending.length) {
@@ -1283,7 +1316,7 @@ export function renderPostureHomeHTML(): string {
     // Rows we DID get (the approval-inbox source can answer while the legacy
     // queue is denied). The lock notice stays above them so a partial view is
     // never read as the whole picture.
-    var html = locked ? lockedApprovalsHTML() : "";
+    var html = locked ? lockedApprovalsHTML() : unavailable ? unavailableApprovalsHTML() : "";
     pending.forEach(function (p) {
       html += '<div class="approval-row" data-approval-row="' + esc(p.id) + '">' +
         '<div class="approval-main"><div class="approval-title">' + esc(p.title) + "</div>" +

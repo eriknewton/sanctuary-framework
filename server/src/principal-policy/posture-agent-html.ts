@@ -51,6 +51,8 @@ export function renderPostureAgentHTML(): string {
   ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  html[data-theme="dark"] { color-scheme: dark; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 var(--sans);
@@ -68,7 +70,7 @@ export function renderPostureAgentHTML(): string {
   a:hover { text-decoration: underline; }
   .empty { color: var(--ink-3); font-style: italic; }
   .err { color: var(--rust); }
-  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
   .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
   .meta { color: var(--ink-3); font-size: 12px; }
   table.reach { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -221,7 +223,7 @@ export function renderPostureAgentHTML(): string {
       '<div class="standing-row">' +
         '<span class="pill neutral">' + esc(row.status) + "</span>" +
         '<span class="name">Status</span>' +
-        '<span class="why">Current lifecycle status from the hub registry.</span></div>",
+        '<span class="why">Current lifecycle status from the hub registry.</span></div>',
       '<div class="standing-row">' +
         (row.policy_protected
           ? '<span class="pill amber">requested</span>'

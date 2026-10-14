@@ -140,7 +140,7 @@ export const STATUS_PILL_CSS = `.pill {
   .pill.red::before { content: "\\25A0"; }
   .pill.neutral { background: var(--surface-2); color: var(--ink-3); }
   .pill.neutral::before { content: "\\2013"; }
-  .pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px solid var(--slate-line); }
+  .pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate); }
   .pill.unknown::before { content: "\\25CB"; }`;
 
 /**

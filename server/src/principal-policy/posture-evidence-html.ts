@@ -32,6 +32,7 @@ import {
   STATUS_PILL_CSS,
   THEME_BOOTSTRAP_SCRIPT,
 } from "./posture-html-shared.js";
+import { LEGACY_LAYER_NAMES } from "../dashboard/legacy-layer-names.js";
 
 export function renderPostureEvidenceHTML(): string {
   return `<!DOCTYPE html>
@@ -45,6 +46,8 @@ export function renderPostureEvidenceHTML(): string {
   ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  html[data-theme="dark"] { color-scheme: dark; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 var(--sans);
@@ -70,7 +73,7 @@ export function renderPostureEvidenceHTML(): string {
   .err { color: var(--rust); }
   code {
     background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
-    font-size: 12px;
+    font-family: var(--mono); font-size: 12px;
   }
   .findings-banner {
     background: var(--rust-bg); border: 1px solid var(--rust);
@@ -156,10 +159,9 @@ export function renderPostureEvidenceHTML(): string {
           <label>Layer</label>
           <select id="f-layer">
             <option value="">any</option>
-            <option value="l1">Castle Wall (Boundary)</option>
-            <option value="l2">Sentinels (Operational)</option>
-            <option value="l3">Charter (Selective Disclosure)</option>
-            <option value="l4">Heralds (Verifiable Reputation)</option>
+            ${Object.entries(LEGACY_LAYER_NAMES)
+              .map(([token, name]) => `<option value="${token}">${name}</option>`)
+              .join("")}
           </select>
         </div>
         <div class="filter-group">
@@ -247,9 +249,14 @@ export function renderPostureEvidenceHTML(): string {
     try { return JSON.stringify(v, null, 2); } catch { return String(v); }
   }
 
+  var LEGACY_LAYER_NAMES = ${JSON.stringify(LEGACY_LAYER_NAMES)};
   function layerPill(layer) {
-    var label = esc(layer);
-    return '<span class="pill neutral">' + label + "</span>";
+    var raw = String(layer == null ? "" : layer);
+    var label = Object.prototype.hasOwnProperty.call(LEGACY_LAYER_NAMES, raw)
+      ? LEGACY_LAYER_NAMES[raw]
+      : null;
+    return '<span class="pill neutral" title="' + esc(raw) + '">' +
+      esc(label || raw) + "</span>";
   }
 
   function resultPill(result) {

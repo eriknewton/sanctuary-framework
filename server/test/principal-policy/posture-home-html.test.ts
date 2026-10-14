@@ -58,7 +58,7 @@ type BannerHarness = {
       castle_wall: { arm_state: string };
       digest: { chain_verified: boolean };
     },
-    approvalState: { rows: unknown[] },
+    approvalState: { rows: unknown[]; locked?: boolean; unavailable?: boolean },
     anomalies: unknown[],
   ) => void;
   originEl: { textContent: string };
@@ -761,6 +761,7 @@ describe("posture home - folded approval controls", () => {
     }>;
     can_decide: boolean;
     mode: string;
+    unavailable?: boolean;
   };
   type ApprovalHelpers = {
     buildApprovalState: (
@@ -880,6 +881,21 @@ describe("posture home - folded approval controls", () => {
     expect(region).toContain("review &rarr;");
   });
 
+  it("a malformed /api/pending body marks approvals unavailable instead of throwing", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      {},
+      { data: { entries: [] } },
+      {
+        standalone_mode: false,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.rows).toEqual([]);
+    expect(state.unavailable).toBe(true);
+  });
+
   it("decision POSTs prefer the bearer header and retry once after a 401 prompt", () => {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("function decisionHeaders()");
@@ -944,6 +960,30 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
     // The retry never renders a greyed shell while waiting: the section stays
     // display:none until a 200, so there is exactly one reveal path.
     expect(region).toContain('section.style.display = "none"');
+  });
+
+  it("keeps Recognition absent when a 200 response is not the served panel shape", async () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function isRecognitionPanel(panel)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const section = { style: { display: "" } };
+    const rendered: unknown[] = [];
+    const source =
+      html.slice(start, end) +
+      "\nreturn loadRecognition(0).then(function () { return { display: section.style.display, rendered: rendered.length }; });";
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const result = await new Function("api", "document", "renderRecognition", "setTimeout", "section", "rendered", source)(
+      () => Promise.resolve({}),
+      { getElementById: (id: string) => id === "recognition-section" ? section : null },
+      (panel: unknown) => { rendered.push(panel); },
+      () => undefined,
+      section,
+      rendered,
+    ) as { display: string; rendered: number };
+
+    expect(result).toEqual({ display: "none", rendered: 0 });
   });
 
   it("never fetches a vendor reputation score: no score-fetch path in the page source", () => {
