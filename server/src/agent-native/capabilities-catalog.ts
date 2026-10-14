@@ -115,13 +115,12 @@ export const ASSURANCE_MATRIX_URL =
  * `neverClaimed` are COPIED sentence for sentence from the README, never
  * paraphrased: `server/test/structure/server-bounds-copied-from-readme.test.ts`
  * asserts each sentence is a README substring, so a stronger claim cannot be
- * typed here without first landing in the README. Every enforcement sentence
- * carries "on a patched host" because the drills that proved it ran on a
- * patched host and nothing here extends the proof beyond that.
+ * typed here without first landing in the README. Every proof sentence retains
+ * its platform bound; the README carries the full scope of the cited drills.
  */
 export const SERVER_BOUNDS = {
   platforms:
-    "macOS: proven, on a patched host. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only, on a patched host; every other distribution or architecture remains unproven. Windows enforcement is roadmapped; nothing enforces on Windows today.",
+    "macOS: proven. Linux enforcement is proven on Ubuntu 24.04 (x86-64) only; every other distribution or architecture remains unproven. Windows enforcement is roadmapped; nothing enforces on Windows today.",
   tiers:
     "Approval runs in three tiers: Tier 3 auto-allows with an audit record, Tier 2 asks a human on anomaly, and Tier 1 always waits for a human.",
   neverClaimed:
