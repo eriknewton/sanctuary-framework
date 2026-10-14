@@ -34,7 +34,7 @@ No security software stops every attack. What each part of Sanctuary has and has
 
 ## 5. Third-party services
 
-Some optional features connect to services run by others: the AI model providers and local model software you choose, Telegram, Sigstore's public transparency log, npm, GitHub, and blockchain RPC providers you choose. Each has its own terms and privacy policy, and you are responsible for following them and for any fees they charge. The [privacy policy](/privacy) lists what each feature sends and when.
+Some optional features connect to services run by others: AI model providers you choose or whose keys are on your computer, the local model software you choose, Telegram, Sigstore's public transparency log, npm, GitHub, and blockchain RPC providers you choose. Each has its own terms and privacy policy, and you are responsible for following them and for any fees they charge. The [privacy policy](/privacy) lists what each feature sends and when.
 
 Verascore (verascore.ai) is a separate reputation service, also run by me. Sanctuary works fully without it, and using it is governed by the [Verascore terms](https://verascore.ai/terms).
 
@@ -46,7 +46,7 @@ Sanctuary includes encryption software, and you are responsible for complying wi
 
 ## 7. Trademarks
 
-"Sanctuary Framework" and "Castle Wall" are trademarks of Erik Newton. As section 6 of the license says, the license does not grant permission to use them, except as required for reasonable and customary use in describing the origin of the software and copying the content of any NOTICE file.
+"Sanctuary Framework" and "Castle Wall" are trademarks of Erik Newton. Section 6 of the license does not grant permission to use them, beyond the reasonable and customary use needed to describe where the software came from and to carry the content of any NOTICE file.
 
 ## 8. Contributions
 
