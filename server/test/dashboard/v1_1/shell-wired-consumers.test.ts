@@ -2061,9 +2061,12 @@ describe("slice 5 Evidence wired consumers", () => {
     h.input("evidence-filter-agent", "first"); await settle();
     h.input("evidence-filter-agent", "second"); await settle();
     expect(requested).toEqual(["first"]);
-    // The first read settles after the filter moved on: its rows must not appear under the second filter.
+    // The first read settles after the filter moved on: its rows must not appear under the second filter. The
+    // trailing read already marks the source loading, so the screen alone cannot tell; the revision check in
+    // readResponse is what keeps the stale answer out of the view state, so the test reads that state too.
     held.first!(response(only("first_filter_operation"))); await settle();
     expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+    expect(runInContext("JSON.stringify(state.evidence.view)", h.context)).not.toContain("first_filter_operation");
     expect(requested).toEqual(["first", "second"]);
     held.second!(response(only("second_filter_operation"))); await settle();
     expect(h.el.main!.innerHTML).toContain("second_filter_operation");
