@@ -42,7 +42,7 @@ const EXPECTED_SENTENCES = {
   denial: GENERAL_SENTENCE,
   egress: GENERAL_SENTENCE,
   privacy: "Privacy event recorded for agent (unknown).",
-  handoff: "Internal handoff event involving agent (unknown).",
+  handoff: GENERAL_SENTENCE,
   lifecycle: GENERAL_SENTENCE,
   config: GENERAL_SENTENCE,
   other: GENERAL_SENTENCE,

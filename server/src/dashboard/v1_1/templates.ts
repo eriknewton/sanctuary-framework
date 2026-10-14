@@ -29,11 +29,10 @@ const ACTIVITY_TEMPLATE_NAMESPACES = Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPA
 
 // Categories whose sentence only says an event of that kind was recorded, so it holds for every operation the hub
 // files there. The other category sentences assert an actor or an outcome (an operator approval or denial, traffic
-// that left, a decision, a lifecycle change, a change applied) that an operation in the category need not carry: the
-// hub files by substring and catch-all rules, so views and refusals land there too.
+// that left, a decision, an internal handoff, a lifecycle change, a change applied) that an operation in the category
+// need not carry: the hub files by prefix, substring and catch-all rules, so views and refusals land there too.
 const ACTIVITY_CATEGORIES_WITH_GENERAL_SENTENCES: ReadonlyArray<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES> = [
   "privacy",
-  "handoff",
   "other",
 ];
 
