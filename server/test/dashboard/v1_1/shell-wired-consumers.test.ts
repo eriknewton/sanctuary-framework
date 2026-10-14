@@ -2030,6 +2030,18 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(empty.el.main!.innerHTML).toContain("No entries match this view");
   });
 
+  it("reads a time range that matches nothing as a filtered view, not an empty log", async () => {
+    const h = await bootEvidence(evidencePayload({ entries: [], total: 0 }));
+    expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+    expect(h.el.main!.innerHTML).toContain("0 entries were loaded for the last 24 hours.");
+    expect(h.el.main!.innerHTML).toContain("Clear filters keeps the time range; change it in the top bar.");
+    expect(h.el.main!.innerHTML).not.toContain("No audit entries in this view");
+  });
+
   it("keeps obsolete filter responses hidden until the latest filtered read completes", async () => {
     vi.useFakeTimers();
     let release!: (value: unknown) => void;

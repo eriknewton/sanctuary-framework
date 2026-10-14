@@ -3590,9 +3590,15 @@ function renderActivityScreen() {
   const searchedLine = state.evidence.filters.query
     ? "searching the " + entries.length + " entries loaded"
     : "search is local to the " + entries.length + " entries loaded";
+  // The top-bar time range is a server filter too (evidenceSinceIso sends it as since), so a range that
+  // matches nothing is a filtered view, never an empty log; Clear filters leaves the range in place.
+  const timeRangeActive = state.timeRange !== "all";
+  const noMatchNote = timeRangeActive
+    ? entries.length + " entries were loaded for " + TIME_RANGE_LABEL[state.timeRange] + ". The time range, the active server filters or page-local search have no matches on this page. Clear filters keeps the time range; change it in the top bar."
+    : entries.length + " entries were loaded. The active server filters or page-local search have no matches on this page.";
   const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
-    ? entries.length || total > 0 || Object.values(state.evidence.filters).some(Boolean)
-      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(entries.length + " entries were loaded. The active server filters or page-local search have no matches on this page.") + '</p><a class="btn" href="#activity">Clear filters</a></div>'
+    ? entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
+      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p><a class="btn" href="#activity">Clear filters</a></div>'
       : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
     : "";
   const table = sourceLoaded("/api/posture/evidence")
