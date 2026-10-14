@@ -2274,4 +2274,61 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
     expect(html).toContain('Unusual outbound volume');
     expect(html).toContain('data-mfp-findings');
   });
+  it("6b retains at most the record cap from each roster, findings and policy snapshot", async () => {
+    const h = await mfpBoot("findings", s => {
+      s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+      s.roster.nodes = Array.from({ length: 501 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i }));
+      s.policy.lines = Array.from({ length: 501 }, (_, i) => ({ ...s.policy.lines[0]!, text: 'Policy line ' + i }));
+    });
+    h.navigate('machines'); await settle();
+    h.navigate('policy'); await settle();
+    // The render pages within the cap too, so only the retained state shows whether a snapshot was cut on arrival.
+    expect(runInContext("state.mfp.findings.length", h.context)).toBe(500);
+    expect(runInContext("state.mfp.totals.findings", h.context)).toBe(501);
+    expect(runInContext("state.mfp.roster.nodes.length", h.context)).toBe(500);
+    expect(runInContext("state.policyView.view.lines.length", h.context)).toBe(500);
+  });
+  it("6b each finding row shows the served alert as High, warn as Medium and info as Info", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    const row = (summary: string) => (html.match(new RegExp('<tr[^>]*>(?:(?!</tr>)[\\s\\S])*' + summary + '(?:(?!</tr>)[\\s\\S])*</tr>')) || [''])[0];
+    expect(row('alert outbound observation')).toContain('mfp-severity high');
+    expect(row('alert outbound observation')).toContain('>High<');
+    expect(row('warn outbound observation')).toContain('mfp-severity medium');
+    expect(row('info outbound observation')).toContain('mfp-severity info');
+  });
+  it("6b roster trust verdicts never render a green chip", async () => {
+    const h = await mfpBoot("machines", s => {
+      s.roster.nodes = ['admitted', 'revoked', 'untrusted'].map((trust_state, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state, reach: 'recent', policy: { drift_state: 'in_sync' } })) as never;
+    });
+    const roster = (h.el.main!.innerHTML.match(/<section class="card" data-mfp-roster>[\s\S]*?<\/section>/) || [''])[0];
+    expect(roster).toContain('ADMITTED');
+    expect(roster).toContain('REVOKED');
+    expect(roster).not.toContain('state-chip good');
+  });
+  it("6b escapes hostile roster labels and node ids", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = hostile; s.roster.nodes[0]!.node_id = hostile + '-id'; });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain(hostile);
+  });
+  it("6b the evidence drawer previews at most the evidence character limit", async () => {
+    const h = await mfpBoot("findings", s => { s.findings[1]!.details = { evidence: 'z'.repeat(20 * 1024) }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const pre = (h.el.main!.innerHTML.match(/<pre>([\s\S]*?)<\/pre>/) || ['', ''])[1]!;
+    const previewed = (pre.match(/z/g) || []).length;
+    expect(previewed).toBeGreaterThan(0);
+    expect(previewed).toBeLessThanOrEqual(16 * 1024);
+    expect(h.el.main!.innerHTML).toContain('Evidence preview truncated at ' + 16 * 1024 + ' characters of');
+  });
+  it("6b refuses roster entries whose node id or label is not text", async () => {
+    for (const change of [
+      (n: Record<string, unknown>) => { n.node_id = 7; },
+      (n: Record<string, unknown>) => { n.label = { text: 'Build box' }; },
+    ]) {
+      const h = await mfpBoot("machines", s => { change(s.roster.nodes[0] as never); });
+      expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    }
+  });
 });
