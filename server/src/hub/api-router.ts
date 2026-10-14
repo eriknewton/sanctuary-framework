@@ -614,7 +614,8 @@ export async function handleHubRoute(
           ? { harnesses: parseHarnessFilter(harnessesRaw) }
           : {}),
       };
-      const records = deps.service.listAgents(filter);
+      // The existing roster limit bounds this projection to HUB_AGENTS_MAX_LIMIT records and five support checks per record.
+      const records = await Promise.all(deps.service.listAgents(filter).map((record) => deps.service.projectAgentCapabilities(record)));
       // Liveness aging: a stored `active` status is the last value written and
       // is never aged by the registry, so a crashed/dead agent would keep
       // reading "Running / online / protected / verified" on the fleet view.
@@ -661,7 +662,7 @@ export async function handleHubRoute(
 
       // GET /api/hub/agents/:id
       if (method === "GET" && remainder === null) {
-        const record = deps.service.getAgent(agentId);
+        const record = await deps.service.projectAgentCapabilities(deps.service.getAgent(agentId));
         const snapshot = deps.service.getAgentStatusSnapshot(agentId);
         writeJSON(res, 200, {
           ok: true,

@@ -2034,6 +2034,36 @@ body {
 .overview-empty h2, .overview-empty h3 { margin: 0 0 6px; }
 .overview-empty p { margin: 0 0 10px; color: var(--ink-2); }
 
+/* Agent entity layout: the 1100px stack point matches the ratified entity design.
+ * Spacing uses the design's four-pixel grid; the two columns follow its 2:3 ratio. */
+/* Four equal tracks use the Agents container width, including the narrow 1024px shell.
+ * 4 inventory tiles and 8px gaps (two design spacing units) are independent of Overview. */
+.agents-tiles { --agents-tile-count: 4; --agents-tile-gap: 8px; display: grid; grid-template-columns: repeat(var(--agents-tile-count), minmax(0, 1fr)); gap: var(--agents-tile-gap); }
+.agents-tiles .overview-tile { overflow-wrap: anywhere; }
+.overview-table-agents .state-chip { display: inline-flex; flex-wrap: nowrap; white-space: nowrap; }
+.agent-entity { display: grid; gap: 16px; min-width: 0; }
+.agent-entity-header h1 { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }
+.agent-entity-header p { overflow-wrap: anywhere; }
+.agent-entity-actions, .agent-tabs, .agent-filters, .agent-pagination { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.agent-entity-actions { margin-top: 16px; }
+.agent-tabs { padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
+.agent-tabs [aria-pressed="true"] { color: var(--accent); background: var(--indigo-bg); box-shadow: inset 0 -2px var(--accent); }
+.agent-filters { margin: 16px 0; }
+.agent-filters label { display: grid; gap: 4px; color: var(--ink-2); }
+.agent-pagination { margin: 12px 0; }
+.agent-entity-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 16px; }
+.agent-entity-grid > div { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.agent-entity .card { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.agent-entity .inspect-pane { position: static; max-height: none; }
+.agent-entity .kv dd { min-width: 0; overflow-wrap: anywhere; }
+.agent-reach-lane { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; padding: 12px 0; border-top: 1px solid var(--rule); }
+.agent-reach-lane h4 { margin: 0; }
+.agent-event { display: grid; grid-template-columns: 64px auto minmax(0, 1fr); gap: 8px; align-items: start; padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.agent-event time, .agent-event small { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); }
+.agent-event small { display: block; margin-top: 4px; }
+.agent-event > .muted, .agent-event > .att { grid-column: 3; }
+@media (max-width: 1100px) { .agent-entity-grid { grid-template-columns: minmax(0, 1fr); } }
+
 `;
 
 type NavItem = { id: string; label: string; href?: string; icon?: string; count?: "approvals"; title?: string };

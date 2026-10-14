@@ -444,7 +444,17 @@ describe("seedDemoFortress", () => {
         const expected = expectedByAgentId.get(String(agent.agent_id));
         expect(expected).toBeDefined();
         expect(agent.status).toBe(expected?.status);
-        expect(agent.capabilities).toEqual(expected?.capabilities);
+        // The hub serves a control only where its executor can run it (projectAgentCapabilities in
+        // src/hub/hub-service.ts). Must match CastleWallAgentController.supports in
+        // src/dashboard/v1_1/castle-wall-agent-controller.ts: pause, resume, restart and unwrap have no executor, and
+        // lockdown follows its stored flag.
+        expect(agent.capabilities).toEqual({
+          ...expected?.capabilities,
+          can_pause: false,
+          can_resume: false,
+          can_restart: false,
+          can_unwrap: false,
+        });
         expect(agent.protection_subject).toBeUndefined();
         expect(dataRecord(agent.budget_summary).daily).toBeUndefined();
         expect(dataRecord(agent.budget_summary).monthly).toBeUndefined();
