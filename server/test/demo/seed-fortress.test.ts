@@ -5,6 +5,7 @@ import {
   rm,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   stat,
@@ -152,7 +153,6 @@ async function snapshotTree(root: string): Promise<Record<string, PathSnapshotEn
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       const key = relative(root, path);
-      const info = await stat(path);
       if (entry.isDirectory()) {
         out[key] = { kind: "dir", size: 0 };
         await walk(path);
@@ -160,7 +160,7 @@ async function snapshotTree(root: string): Promise<Record<string, PathSnapshotEn
         const bytes = await readFile(path);
         out[key] = {
           kind: "file",
-          size: info.size,
+          size: bytes.length,
           sha256: createHash("sha256").update(bytes).digest("hex"),
         };
       }
@@ -254,6 +254,16 @@ function parseSeededItemRows(readme: string): Map<string, string[]> {
     rows.set(cells[0] ?? "", cells);
   }
   return rows;
+}
+
+// Reads a file's permission bits and contents through one handle, so both describe the same file.
+async function readModeAndText(path: string): Promise<{ mode: number; text: string }> {
+  const handle = await open(path, "r");
+  try {
+    return { mode: (await handle.stat()).mode & FILE_MODE_BITS, text: await handle.readFile("utf8") };
+  } finally {
+    await handle.close();
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -405,11 +415,9 @@ describe("seedDemoFortress", () => {
         KERNEL_SOCKET_PATH_MAX_BYTES,
       );
       assertUnder(seeded.home, seeded.authTokenPath);
-      const tokenStats = await stat(seeded.authTokenPath);
-      expect(tokenStats.mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
-      expect((await readFile(seeded.authTokenPath, "utf8")).trim()).toBe(
-        seeded.authToken,
-      );
+      const tokenFile = await readModeAndText(seeded.authTokenPath);
+      expect(tokenFile.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
+      expect(tokenFile.text.trim()).toBe(seeded.authToken);
 
       const agentsPayload = dataRecord(
         await getJson(
@@ -589,8 +597,9 @@ describe("seedDemoFortress", () => {
     try {
       await waitForOutput(run, /^Teardown: /m);
       const tokenPath = run.stdout.match(/^Operator token file: (.+)$/m)![1];
-      const token = (await readFile(tokenPath, "utf8")).trim();
-      expect((await stat(tokenPath)).mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
+      const tokenFile = await readModeAndText(tokenPath);
+      const token = tokenFile.text.trim();
+      expect(tokenFile.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
       expect(run.stdout).toContain("Paste the token from that file");
       run.child.kill("SIGTERM");
       expect(await waitForExit(run)).toEqual({ code: 0, signal: null });
@@ -687,8 +696,9 @@ describe("seedDemoFortress", () => {
     try {
       await waitForOutput(run, /^Teardown: /m);
       const pidPath = join(run.home!, DEMO_PID_FILE_BASENAME);
-      expect((await stat(pidPath)).mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
-      expect((await readFile(pidPath, "utf8")).trim()).toBe(String(run.child.pid));
+      const pidFile = await readModeAndText(pidPath);
+      expect(pidFile.mode).toBe(OPERATOR_TOKEN_FILE_MODE);
+      expect(pidFile.text.trim()).toBe(String(run.child.pid));
       const tokenPath = run.stdout.match(/^Operator token file: (.+)$/m)![1];
       const token = (await readFile(tokenPath, "utf8")).trim();
       const refused = await spawnCli(["--teardown", run.home!]);
