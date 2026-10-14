@@ -839,6 +839,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         test_delay_before_ready_ms: None,
     };
 
+    let expected_identity_id = format!("{}/uid-{}", config.fortress_id, TEST_AGENT_UID);
     let handle = boot(config).expect("daemon boot");
 
     // WIRED-CONSUMER ASSERTION for slice A: the PRODUCTION composition root, not
@@ -1032,7 +1033,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // Evaluate: allowed destination. Must carry the IP the allow rule pins
     // (203.0.113.44), since the enforceable rule matches on the wire IP.
     let req_allowed = EvaluationRequest {
-        agent_id: "test-e2e".to_string(),
+        agent_id: daemon_agent_id.clone(),
         agent_template: "claude-code".to_string(),
         dest_host: Some("example.com".to_string()),
         dest_ip: Some("203.0.113.44".to_string()),
@@ -1041,13 +1042,23 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         opaque: false,
     };
     let outcome = handle.evaluate_attempt(&req_allowed).expect("evaluate");
-    assert!(matches!(outcome.verdict, Verdict::Allow { .. }));
-    assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
-    assert!(outcome.event_canonical_json.contains("\"l1\""));
+    assert!(matches!(outcome.verdict(), Verdict::Allow { .. }));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"egress_approved\""));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"l1\""));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Evaluate: denied destination.
     let req_denied = EvaluationRequest {
-        agent_id: "test-e2e".to_string(),
+        agent_id: daemon_agent_id.clone(),
         agent_template: "claude-code".to_string(),
         dest_host: Some("evil.example.com".to_string()),
         dest_ip: Some("198.51.100.1".to_string()),
@@ -1059,20 +1070,25 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .evaluate_attempt(&req_denied)
         .expect("evaluate denied");
     assert!(matches!(
-        outcome_denied.verdict,
+        outcome_denied.verdict(),
         Verdict::Deny {
             reason: castle_wall_daemon::DeniedReason::DefaultDeny
         }
     ));
     assert!(outcome_denied
-        .event_canonical_json
+        .event_canonical_json()
+        .expect("audit body")
         .contains("\"egress_blocked\""));
+    assert!(outcome_denied
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Live kernel regression for full-sweep #99: with only a single-IP allow
     // installed, raw TCP/443 traffic to an unlisted IP reaches NFQUEUE and
     // defaults closed instead of being accepted by a static dport rule.
     let req_raw_ip_denied = EvaluationRequest {
-        agent_id: "test-e2e".to_string(),
+        agent_id: daemon_agent_id.clone(),
         agent_template: "claude-code".to_string(),
         dest_host: None,
         dest_ip: Some("198.51.100.99".to_string()),
@@ -1084,14 +1100,19 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .evaluate_attempt(&req_raw_ip_denied)
         .expect("evaluate raw ip denied");
     assert!(matches!(
-        outcome_raw_ip_denied.verdict,
+        outcome_raw_ip_denied.verdict(),
         Verdict::Deny {
             reason: castle_wall_daemon::DeniedReason::DefaultDeny
         }
     ));
     assert!(outcome_raw_ip_denied
-        .event_canonical_json
+        .event_canonical_json()
+        .expect("audit body")
         .contains("\"egress_blocked\""));
+    assert!(outcome_raw_ip_denied
+        .event_canonical_json()
+        .expect("audit body")
+        .contains(&format!("\"identity_id\":\"{expected_identity_id}\"")));
 
     // Verify WAL has both events.
     let wal = handle.wal_writer().expect("wal");

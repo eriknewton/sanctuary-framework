@@ -205,7 +205,7 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
 
 fn dns_request(host: Option<&str>, ip: &str, port: u16, protocol: &str) -> EvaluationRequest {
     EvaluationRequest {
-        agent_id: "agent-bypass-test".to_string(),
+        agent_id: nftables::confined_agent_id(BYPASS_AGENT_UID),
         agent_template: "claude-code".to_string(),
         dest_host: host.map(|h| h.to_string()),
         dest_ip: Some(ip.to_string()),
@@ -245,14 +245,20 @@ fn policy_blocks_plain_dns_to_unallowed_resolver_emits_egress_blocked_default_de
         .evaluate_attempt(&dns_request(None, "8.8.8.8", 53, "udp"))
         .expect("evaluate plain DNS");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
-    assert!(outcome.event_canonical_json.contains("\"udp\""));
-    assert!(outcome.event_canonical_json.contains("53"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"udp\""));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("53"));
     let _ = handle.stop();
 }
 
@@ -267,12 +273,12 @@ fn policy_blocks_plain_dns_tcp_to_unallowed_resolver() {
         .evaluate_attempt(&dns_request(None, "1.1.1.1", 53, "tcp"))
         .expect("evaluate DNS-over-TCP");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -288,13 +294,16 @@ fn policy_blocks_doh_to_unallowed_provider_emits_egress_blocked_default_deny() {
         .evaluate_attempt(&dns_request(Some("dns.google"), "8.8.8.8", 443, "tcp"))
         .expect("evaluate DoH dns.google");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
-    assert!(outcome.event_canonical_json.contains("\"dns.google\""));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"dns.google\""));
     let _ = handle.stop();
 }
 
@@ -313,12 +322,12 @@ fn policy_blocks_doh_to_cloudflare_provider() {
         ))
         .expect("evaluate DoH cloudflare");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -338,13 +347,16 @@ fn policy_blocks_dot_to_unallowed_resolver_emits_egress_blocked_default_deny() {
         ))
         .expect("evaluate DoT");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
-    assert!(outcome.event_canonical_json.contains("853"));
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
+    assert!(outcome
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("853"));
     let _ = handle.stop();
 }
 
@@ -359,12 +371,12 @@ fn policy_blocks_dot_to_quad9_resolver() {
         .evaluate_attempt(&dns_request(Some("dns.quad9.net"), "9.9.9.9", 853, "tcp"))
         .expect("evaluate DoT quad9");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -382,12 +394,12 @@ fn policy_blocks_raw_ip_https_with_no_dns_resolution() {
         .evaluate_attempt(&dns_request(None, "203.0.113.42", 443, "tcp"))
         .expect("evaluate raw-IP HTTPS");
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert_default_deny_audit(&outcome.event_canonical_json);
+    assert_default_deny_audit(outcome.event_canonical_json().expect("audit body"));
     let _ = handle.stop();
 }
 
@@ -403,7 +415,7 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
     // Explicit-allow path.
     let allowed = handle
         .evaluate_attempt(&EvaluationRequest {
-            agent_id: "agent-bypass-test".to_string(),
+            agent_id: nftables::confined_agent_id(BYPASS_AGENT_UID),
             agent_template: "claude-code".to_string(),
             dest_host: Some("example.com".to_string()),
             // Must match the IP the single allow rule pins
@@ -416,18 +428,21 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
             opaque: false,
         })
         .expect("evaluate allowed");
-    match allowed.verdict {
+    match allowed.verdict() {
         Verdict::Allow { rule_id } => assert_eq!(rule_id, "rule-allow-example"),
         other => panic!("expected Allow for example.com:443; got {other:?}"),
     }
-    assert!(allowed.event_canonical_json.contains("\"egress_approved\""));
+    assert!(allowed
+        .event_canonical_json()
+        .expect("audit body")
+        .contains("\"egress_approved\""));
 
     // Bypass path (DoH).
     let denied = handle
         .evaluate_attempt(&dns_request(Some("dns.google"), "8.8.8.8", 443, "tcp"))
         .expect("evaluate DoH bypass");
     assert!(matches!(
-        denied.verdict,
+        denied.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }

@@ -632,10 +632,6 @@ pub fn build_verdict_callback(
         let Some(agent_id) = packet.source_agent_id.clone() else {
             return NfVerdict::Drop;
         };
-        // Kept for the superseding record below, which must name the same
-        // subject the superseded receipt did.
-        let agent_id_for_audit = agent_id.clone();
-
         let protocol_str = match packet.protocol {
             6 => "tcp".to_string(),
             17 => "udp".to_string(),
@@ -669,18 +665,17 @@ pub fn build_verdict_callback(
             // Only the allow case needs it: a deny/prompt receipt already agrees
             // with the drop.
             if let Ok(outcome) = evaluated.as_ref() {
-                if matches!(outcome.verdict, crate::policy::Verdict::Allow { .. }) {
-                    supersede_allow_receipt(&decision_engine, outcome, &agent_id_for_audit);
+                if outcome.releases() {
+                    supersede_allow_receipt(&decision_engine, outcome);
                 }
             }
             return NfVerdict::Drop;
         }
         match evaluated {
-            Ok(outcome) => match outcome.verdict {
-                crate::policy::Verdict::Allow { .. } => NfVerdict::Accept,
-                crate::policy::Verdict::PromptRequired { .. } => NfVerdict::Drop,
-                crate::policy::Verdict::Deny { .. } => NfVerdict::Drop,
-            },
+            // Only a recorded Allow releases a packet; every other outcome drops
+            // even if a verdict accessor renders a deny for callers.
+            Ok(outcome) if outcome.releases() => NfVerdict::Accept,
+            Ok(_) => NfVerdict::Drop,
             Err(_) => NfVerdict::Drop,
         }
     })
@@ -706,39 +701,136 @@ const SUPERSEDING_RECORD_BUDGET: Duration = Duration::from_millis(50);
 fn supersede_allow_receipt(
     decision_engine: &crate::decision::DecisionEngine,
     outcome: &crate::decision::EvaluationOutcome,
-    identity_id: &str,
 ) {
-    let Some(seq) = outcome.wal_seq else {
+    let crate::decision::OutcomeEvidence::Recorded {
+        verdict: crate::policy::Verdict::Allow { .. },
+        wal_seq,
+        subject,
+        ..
+    } = &outcome.evidence
+    else {
         // No durable receipt was written, so there is nothing to supersede and
         // no divergence to close.
         return;
     };
     if let Err(err) = decision_engine.append_superseding_verdict(
-        seq,
+        *wal_seq,
         "drop",
         "teardown mutation fence dropped the packet after the allow decision was recorded",
-        identity_id,
+        // The correction names the receipt's own subject; recomputing it here
+        // could combine an unrelated fortress with a signed uid.
+        subject,
         SUPERSEDING_RECORD_BUDGET,
     ) {
-        // LOUD, never silent: an absent correction is exactly the shape of the
-        // defect this exists to close, so it must be visible in the journal
-        // rather than inferred from a missing record.
+        // LOUD, never silent: an absent correction would leave the receipt
+        // uncorrected, so it must be visible in the journal rather than inferred
+        // from a missing record.
         // SAFETY: stderr is the last-resort channel for an audit-trail correction
         // that could not be written; routing it through the audit log is exactly what
         // just failed, so a structured logger would lose the message.
-        eprintln!(
-            "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {seq} \
+        decision_engine.emit_diagnostic(&format!(
+            "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {wal_seq} \
              recorded an allow, and the superseding record could not be written ({err}); \
              the audit trail for that sequence overstates what happened"
-        );
+        ));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditRingBuffer;
+    use crate::audit::{AuditRingBuffer, WalWriter};
     use crate::decision::DecisionEngine;
+    use crate::manifest::canonical_json::canonicalize_to_bytes;
+    use crate::manifest::verify::{
+        AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    };
+    use crate::manifest::{ManifestStore, MANIFEST_FILENAME, RULES_SUBDIR};
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    const TEST_FORTRESS: &str = "0123456789abcdef";
+    const TEST_AGENT_UID: u32 = 60_123;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn write_signed_policy(policy_dir: &std::path::Path, signing: &SigningKey, disposition: &str) {
+        let rule_file = "r1.json";
+        let rule_body = format!(
+            r#"{{"id":"r1","schema_version":1,"created_at":"2026-09-19T00:00:00Z","match":{{"ip":["203.0.113.7"]}},"disposition":"{disposition}"}}"#
+        )
+        .into_bytes();
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
+        let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let manifest = AllowlistManifest {
+            schema_version: crate::constants::SCHEMA_VERSION_V1,
+            fortress_id: TEST_FORTRESS.to_string(),
+            issued_at: "2026-09-19T00:00:00Z".to_string(),
+            generation: 1,
+            agent_origin: Some(AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(TEST_AGENT_UID),
+                gate_uid: None,
+                system_uid_allow_ceiling: 500,
+            }),
+            operator_baseline: None,
+            rules: vec![
+                ManifestRuleEntry {
+                    rule_id: "r1".to_string(),
+                    file: rule_file.to_string(),
+                    sha256: sha256_hex(&rule_body),
+                },
+                ManifestRuleEntry {
+                    rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
+                    file: habeas_file.clone(),
+                    sha256: sha256_hex(&habeas_body),
+                },
+            ],
+        };
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+        let signature = signing.sign(&canonical);
+        let signed = SignedManifest {
+            manifest,
+            signature: ManifestSignature {
+                signature_scheme: crate::constants::SIGNATURE_SCHEME_V1.to_string(),
+                signing_key_id: crate::crypto::castle_wall_signing_key_id(
+                    &signing.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+                signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signature.to_bytes()),
+            },
+        };
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(rule_file), rule_body).unwrap();
+        std::fs::write(policy_dir.join(RULES_SUBDIR).join(habeas_file), habeas_body).unwrap();
+        std::fs::write(
+            policy_dir.join(MANIFEST_FILENAME),
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_signed_allow_policy(policy_dir: &std::path::Path, signing: &SigningKey) {
+        write_signed_policy(policy_dir, signing, "allow");
+    }
+
+    fn wal_contains_operation(wal: &Arc<Mutex<WalWriter>>, needle: &str) -> bool {
+        wal.lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event_canonical_json.contains(needle))
+    }
 
     /// The two kernel conditions that mean "no packet ready / retry", expressed
     /// as the raw errnos the kernel actually returns, must classify transient.
@@ -756,11 +848,9 @@ mod tests {
         }
     }
 
-    /// FAIL-BEFORE for the locale defect: an idle poll whose rendered message is
-    /// NOT the English `strerror` text (the shape produced under a non-English
-    /// `LC_MESSAGES`) must still classify transient. The previous substring match
-    /// returned `false` here, ending the verdict thread and restart-looping the
-    /// daemon on a healthy host; this test fails against that implementation.
+    /// An idle poll whose rendered message is NOT the English `strerror` text
+    /// still classifies transient. The classifier uses `ErrorKind`, so locale
+    /// text cannot decide whether the verdict loop continues.
     #[test]
     fn a_non_english_idle_message_is_still_transient() {
         let localized = std::io::Error::new(
@@ -830,22 +920,40 @@ mod tests {
 
     #[test]
     fn mutation_fence_drops_without_entering_policy_evaluation() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[8u8; 32]);
+        write_signed_allow_policy(&policy_dir, &signing);
+        let store = Arc::new(Mutex::new(ManifestStore::new(
+            policy_dir,
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            TEST_FORTRESS.to_string(),
+        )));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
         let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
             1024,
             Duration::from_secs(60),
         )));
         let engine = Arc::new(DecisionEngine::new(
-            "mutation-fence".to_string(),
-            None,
-            None,
+            TEST_FORTRESS.to_string(),
+            Some(store),
+            Some(Arc::clone(&wal)),
             Arc::clone(&audit),
         ));
+        engine.reload_manifest_authorized_at_boot().unwrap();
+        let baseline_wal = wal.lock().unwrap().snapshot_after(None, 100).unwrap().len();
+        let baseline_ring = audit.lock().unwrap().len();
+        let baseline_counter = engine.unattributed_attempts_for_test();
         engine.mutation_cancel_flag().store(true, Ordering::SeqCst);
-        let callback = build_verdict_callback(engine);
+        let callback = build_verdict_callback(Arc::clone(&engine));
         let packet = PendingPacket {
             packet_id: 1,
             nfmark: 1,
-            source_agent_id: Some("agent-fenced".to_string()),
+            source_agent_id: Some(crate::nftables::confined_agent_id(TEST_AGENT_UID)),
             source_cgroup_id: 1,
             dest_ip: Some("203.0.113.10".to_string()),
             dest_port: 443,
@@ -856,9 +964,415 @@ mod tests {
         assert_eq!(callback(&packet), NfVerdict::Drop);
         assert_eq!(
             audit.lock().unwrap().len(),
-            0,
+            baseline_ring,
             "the pre-evaluation fence must return before policy/audit mutation"
         );
+        assert_eq!(
+            wal.lock().unwrap().snapshot_after(None, 100).unwrap().len(),
+            baseline_wal
+        );
+        assert_eq!(callback(&packet), NfVerdict::Drop);
+        assert_eq!(audit.lock().unwrap().len(), baseline_ring);
+        assert_eq!(
+            wal.lock().unwrap().snapshot_after(None, 100).unwrap().len(),
+            baseline_wal
+        );
+        assert_eq!(callback(&packet), NfVerdict::Drop);
+        assert_eq!(engine.unattributed_attempts_for_test(), baseline_counter);
+    }
+
+    #[test]
+    fn packet_without_a_source_agent_mark_drops_before_policy_evaluation() {
+        let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "no-source".to_string(),
+            None,
+            None,
+            Arc::clone(&audit),
+        ));
+        let callback = build_verdict_callback(engine);
+        let packet = PendingPacket {
+            packet_id: 1,
+            nfmark: 1,
+            source_agent_id: None,
+            source_cgroup_id: 1,
+            dest_ip: Some("203.0.113.10".to_string()),
+            dest_port: 443,
+            protocol: 6,
+            packet_len: 64,
+        };
+
+        assert_eq!(callback(&packet), NfVerdict::Drop);
+        assert_eq!(audit.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn policy_evaluation_error_maps_to_drop() {
+        let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "unwired".to_string(),
+            None,
+            None,
+            Arc::clone(&audit),
+        ));
+        let callback = build_verdict_callback(engine);
+        let packet = PendingPacket {
+            packet_id: 1,
+            nfmark: 1,
+            source_agent_id: Some("uid-60123".to_string()),
+            source_cgroup_id: 1,
+            dest_ip: Some("203.0.113.10".to_string()),
+            dest_port: 443,
+            protocol: 6,
+            packet_len: 64,
+        };
+
+        assert_eq!(callback(&packet), NfVerdict::Drop);
+    }
+
+    #[test]
+    fn callback_accepts_only_recorded_allow_from_real_evaluation() {
+        let packet = |source_agent_id: Option<String>, dest_ip: &str| PendingPacket {
+            packet_id: 1,
+            nfmark: 1,
+            source_agent_id,
+            source_cgroup_id: 1,
+            dest_ip: Some(dest_ip.to_string()),
+            dest_port: 443,
+            protocol: 6,
+            packet_len: 64,
+        };
+        let engine_with_policy = |disposition: &str| {
+            let dir = TempDir::new().unwrap();
+            let policy_dir = dir.path().join("policy");
+            std::fs::create_dir_all(&policy_dir).unwrap();
+            let signing = SigningKey::from_bytes(&[11u8; 32]);
+            write_signed_policy(&policy_dir, &signing, disposition);
+            let store = Arc::new(Mutex::new(ManifestStore::new(
+                policy_dir,
+                dir.path().join("pinned.key"),
+                signing.verifying_key().to_bytes(),
+                TEST_FORTRESS.to_string(),
+            )));
+            let wal = Arc::new(Mutex::new(
+                WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+            ));
+            let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+                64 * 1024,
+                Duration::from_secs(60),
+            )));
+            let engine = Arc::new(DecisionEngine::new(
+                TEST_FORTRESS.to_string(),
+                Some(store),
+                Some(Arc::clone(&wal)),
+                ring,
+            ));
+            engine.reload_manifest_authorized_at_boot().unwrap();
+            (dir, engine, wal)
+        };
+        let mark = Some(crate::nftables::confined_agent_id(TEST_AGENT_UID));
+
+        let (_dir, engine, _wal) = engine_with_policy("allow");
+        let callback = build_verdict_callback(engine);
+        assert_eq!(
+            callback(&packet(mark.clone(), "203.0.113.7")),
+            NfVerdict::Accept
+        );
+
+        let (_dir, engine, _wal) = engine_with_policy("deny");
+        let callback = build_verdict_callback(engine);
+        assert_eq!(
+            callback(&packet(mark.clone(), "203.0.113.7")),
+            NfVerdict::Drop
+        );
+
+        let (_dir, engine, _wal) = engine_with_policy("allow");
+        let callback = build_verdict_callback(engine);
+        assert_eq!(
+            callback(&packet(mark.clone(), "203.0.113.10")),
+            NfVerdict::Drop
+        );
+
+        let (_dir, engine, wal) = engine_with_policy("allow");
+        let wal_guard = wal.lock().unwrap();
+        let callback = build_verdict_callback(engine);
+        assert_eq!(
+            callback(&packet(mark.clone(), "203.0.113.7")),
+            NfVerdict::Drop
+        );
+        drop(wal_guard);
+
+        let (_dir, engine, _wal) = engine_with_policy("allow");
+        let callback = build_verdict_callback(engine);
+        assert_eq!(
+            callback(&packet(Some("uid-0".to_string()), "203.0.113.7")),
+            NfVerdict::Drop
+        );
+
+        let audit = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "unwired".to_string(),
+            None,
+            None,
+            Arc::clone(&audit),
+        ));
+        let callback = build_verdict_callback(engine);
+        assert_eq!(callback(&packet(mark, "203.0.113.7")), NfVerdict::Drop);
+    }
+
+    #[test]
+    fn teardown_fence_drops_and_reports_one_line_when_superseding_write_times_out() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        write_signed_allow_policy(&policy_dir, &signing);
+        let store = Arc::new(Mutex::new(ManifestStore::new(
+            policy_dir,
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            TEST_FORTRESS.to_string(),
+        )));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+        let diagnostic_sink = {
+            let diagnostics = Arc::clone(&diagnostics);
+            Arc::new(move |line: &str| diagnostics.lock().unwrap().push(line.to_string()))
+        };
+        let engine = Arc::new(
+            DecisionEngine::new_with_mutation_cancel_and_diagnostic_sink(
+                TEST_FORTRESS.to_string(),
+                Some(Arc::clone(&store)),
+                Some(Arc::clone(&wal)),
+                Arc::clone(&ring),
+                Arc::new(AtomicBool::new(false)),
+                diagnostic_sink,
+            ),
+        );
+        engine.reload_manifest_authorized_at_boot().unwrap();
+
+        let ring_guard = ring.lock().unwrap();
+        let callback = build_verdict_callback(Arc::clone(&engine));
+        let worker = std::thread::spawn(move || {
+            callback(&PendingPacket {
+                packet_id: 1,
+                nfmark: 1,
+                source_agent_id: Some(crate::nftables::confined_agent_id(TEST_AGENT_UID)),
+                source_cgroup_id: 1,
+                dest_ip: Some("203.0.113.7".to_string()),
+                dest_port: 443,
+                protocol: 6,
+                packet_len: 64,
+            })
+        });
+
+        let poll_started = Instant::now();
+        while !wal_contains_operation(&wal, "\"operation\":\"egress_approved\"") {
+            assert!(
+                poll_started.elapsed() < Duration::from_secs(2),
+                "the allow receipt must be durable before the correction is exercised"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wal_guard = wal.lock().unwrap();
+        engine.mutation_cancel_flag().store(true, Ordering::SeqCst);
+        drop(ring_guard);
+
+        assert_eq!(worker.join().unwrap(), NfVerdict::Drop);
+        let lines = diagnostics.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a failed correction emits exactly one operator diagnostic"
+        );
+        assert!(
+            lines[0].contains("superseding record could not be written"),
+            "{lines:?}"
+        );
+        drop(wal_guard);
+        assert!(
+            !wal_contains_operation(&wal, "\"operation\":\"egress_verdict_superseded\""),
+            "the deadline-failed correction must not leave a partial row"
+        );
+    }
+
+    #[test]
+    fn teardown_fence_supersedes_with_the_receipt_subject_from_the_callback() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[10u8; 32]);
+        write_signed_allow_policy(&policy_dir, &signing);
+        let store = Arc::new(Mutex::new(ManifestStore::new(
+            policy_dir,
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            TEST_FORTRESS.to_string(),
+        )));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let engine = Arc::new(DecisionEngine::new(
+            "feedface".to_string(),
+            Some(store),
+            Some(Arc::clone(&wal)),
+            Arc::clone(&ring),
+        ));
+        engine.reload_manifest_authorized_at_boot().unwrap();
+
+        let ring_guard = ring.lock().unwrap();
+        let callback = build_verdict_callback(Arc::clone(&engine));
+        let worker = std::thread::spawn(move || {
+            callback(&PendingPacket {
+                packet_id: 1,
+                nfmark: 1,
+                source_agent_id: Some(crate::nftables::confined_agent_id(TEST_AGENT_UID)),
+                source_cgroup_id: 1,
+                dest_ip: Some("203.0.113.7".to_string()),
+                dest_port: 443,
+                protocol: 6,
+                packet_len: 64,
+            })
+        });
+
+        let poll_started = Instant::now();
+        while !wal_contains_operation(&wal, "\"operation\":\"egress_approved\"") {
+            assert!(
+                poll_started.elapsed() < Duration::from_secs(2),
+                "the allow receipt must be durable before the post-evaluation fence"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.mutation_cancel_flag().store(true, Ordering::SeqCst);
+        drop(ring_guard);
+
+        assert_eq!(worker.join().unwrap(), NfVerdict::Drop);
+        let rows = wal.lock().unwrap().snapshot_after(None, 100).unwrap();
+        let superseding = rows
+            .iter()
+            .find(|row| {
+                row.event_canonical_json
+                    .contains("\"operation\":\"egress_verdict_superseded\"")
+            })
+            .expect("superseding row");
+        assert!(superseding.event_canonical_json.contains(&format!(
+            "\"identity_id\":\"{TEST_FORTRESS}/uid-{TEST_AGENT_UID}\""
+        )));
+        assert!(superseding
+            .event_canonical_json
+            .contains(&format!("\"fortress_id\":\"{TEST_FORTRESS}\"")));
+        assert!(!superseding
+            .event_canonical_json
+            .contains("\"fortress_id\":\"feedface\""));
+    }
+
+    #[test]
+    fn supersede_allow_receipt_writes_only_for_recorded_allow() {
+        let dir = TempDir::new().unwrap();
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let engine = DecisionEngine::new(
+            TEST_FORTRESS.to_string(),
+            None,
+            Some(Arc::clone(&wal)),
+            ring,
+        );
+        let subject = crate::ProtectionSubject::new(TEST_FORTRESS, TEST_AGENT_UID).unwrap();
+        let non_allow_outcomes = [
+            crate::decision::EvaluationOutcome {
+                evidence: crate::decision::OutcomeEvidence::Recorded {
+                    verdict: crate::policy::Verdict::Deny {
+                        reason: crate::policy::DeniedReason::ExplicitRule {
+                            rule_id: "r-deny".to_string(),
+                        },
+                    },
+                    wal_seq: 1,
+                    subject: subject.clone(),
+                    event_canonical_json: "{}".to_string(),
+                },
+                timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::decision::EvaluationOutcome {
+                evidence: crate::decision::OutcomeEvidence::Recorded {
+                    verdict: crate::policy::Verdict::Deny {
+                        reason: crate::policy::DeniedReason::DefaultDeny,
+                    },
+                    wal_seq: 1,
+                    subject: subject.clone(),
+                    event_canonical_json: "{}".to_string(),
+                },
+                timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::decision::EvaluationOutcome {
+                evidence: crate::decision::OutcomeEvidence::RingOnlyFailClosed {
+                    subject: subject.clone(),
+                    event_canonical_json: "{}".to_string(),
+                },
+                timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+            },
+            crate::decision::EvaluationOutcome {
+                evidence: crate::decision::OutcomeEvidence::Unattributed,
+                timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+            },
+        ];
+        for outcome in &non_allow_outcomes {
+            supersede_allow_receipt(&engine, outcome);
+        }
+        assert!(!wal_contains_operation(
+            &wal,
+            "\"operation\":\"egress_verdict_superseded\""
+        ));
+        engine
+            .append_control_audit("daemon_started", "test")
+            .unwrap();
+        let allow = crate::decision::EvaluationOutcome {
+            evidence: crate::decision::OutcomeEvidence::Recorded {
+                verdict: crate::policy::Verdict::Allow {
+                    rule_id: "r1".to_string(),
+                },
+                wal_seq: 0,
+                subject,
+                event_canonical_json: "{}".to_string(),
+            },
+            timestamp_iso8601: "2026-01-01T00:00:00Z".to_string(),
+        };
+        supersede_allow_receipt(&engine, &allow);
+        let rows = wal.lock().unwrap().snapshot_after(None, 10).unwrap();
+        let superseding = rows
+            .iter()
+            .filter(|row| {
+                row.event_canonical_json
+                    .contains("\"operation\":\"egress_verdict_superseded\"")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(superseding.len(), 1);
+        assert!(superseding[0].event_canonical_json.contains(&format!(
+            "\"identity_id\":\"{TEST_FORTRESS}/uid-{TEST_AGENT_UID}\""
+        )));
     }
 
     #[test]
