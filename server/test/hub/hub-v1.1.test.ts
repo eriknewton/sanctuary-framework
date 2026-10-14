@@ -1942,5 +1942,21 @@ describe("slice 6a composed agent capabilities", () => {
       expect(rig.service.listInbox().filter(item => item.kind === "approval_pending")).toEqual([]);
     } finally { await rig.stop(); }
   });
+  it("6a r2 a stored non-boolean permission reads false on both agent reads", async () => {
+    const controller = new UnsupportedUnwrapController();
+    Object.defineProperty(controller, "supports", { value: () => true });
+    const rig = await startRig({ controller });
+    try {
+      const record = rig.registry.get("agent-alpha")!;
+      record.capabilities.can_lockdown = "yes" as unknown as boolean;
+      rig.registry.put(record);
+      for (const path of ["/agents", "/agents/agent-alpha"]) {
+        const res = await fetch(rig.url + HUB_API_PREFIX + path, { headers: withAuth({}, rig.authToken) });
+        const body = await res.json() as { data: { agents?: LocalAgentRecord[]; agent?: LocalAgentRecord } };
+        // The read projection and the control route share one rule: only a stored boolean true grants a control.
+        expect((body.data.agent ?? body.data.agents![0]!).capabilities.can_lockdown).toBe(false);
+      }
+    } finally { await rig.stop(); }
+  });
 
 });

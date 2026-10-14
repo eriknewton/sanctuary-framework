@@ -2452,6 +2452,16 @@ describe("slice 6a Agents wired consumers", () => {
     });
   }
 
+  it("6a r2 a loaded reach read past its one-minute age reads expired", async () => {
+    const { h } = await start();
+    // AGENT_REACH_MAX_AGE_MS is the client's own constant, so the read is exactly one millisecond past its age.
+    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - AGENT_REACH_MAX_AGE_MS - 1 };', h.context);
+    h.navigate("agent-detail");
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain("The reach source answered without a record for this agent.");
+  });
+
   it("6a r2 unknown hash state selects All states and keeps the roster", async () => {
     const { h } = await start();
     h.navigate("agents?state=nope");
