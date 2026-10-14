@@ -15,7 +15,7 @@
  * SSE never connects (progressive enhancement). The connection indicator is the
  * honesty surface (#617): "Live" (green dot) is shown ONLY when a fresh frame
  * arrived inside the staleness window; any drop or silence flips it to
- * "Reconnecting…" (amber) while keeping a "last updated <time>" so a stale view
+ * "Reconnecting..." (amber) while keeping a "last updated <time>" so a stale view
  * can never be mistaken for a live green-all-well.
  *
  * The page authenticates via the same loopback/bearer model as the rest of the
@@ -154,7 +154,7 @@ export function renderPostureHomeHTML(): string {
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.5 var(--sans);
   }
   header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
   .header-row { display: flex; align-items: flex-start; gap: 16px; }
@@ -163,7 +163,7 @@ export function renderPostureHomeHTML(): string {
   .sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .fleet-link {
     flex: none; align-self: center; color: var(--indigo); font-size: 13px;
-    padding: 6px 12px; border: 1px solid var(--rule); border-radius: 6px;
+    padding: 6px 12px; border: 1px solid var(--ink-3); border-radius: 6px;
     background: var(--surface); white-space: nowrap;
   }
   .fleet-link:hover { border-color: var(--indigo); text-decoration: none; }
@@ -217,7 +217,7 @@ export function renderPostureHomeHTML(): string {
   .approval-detail { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .approval-actions { display: flex; gap: 8px; flex: none; }
   .approval-actions button {
-    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px;
+    border: 1px solid var(--ink-3); border-radius: 6px; padding: 5px 10px;
     color: var(--ink); background: var(--surface-2); cursor: pointer; font-size: 12px;
   }
   .approval-actions button.approve { border-color: var(--sage); }
@@ -242,7 +242,7 @@ export function renderPostureHomeHTML(): string {
   .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
   button.guided {
     margin-top: 8px; background: var(--surface-2); color: var(--ink);
-    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
+    border: 1px solid var(--ink-3); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
   }
   button.guided:hover { border-color: var(--indigo); }
   /* Live-refresh connection indicator. The dot color is the at-a-glance honesty
@@ -273,7 +273,7 @@ export function renderPostureHomeHTML(): string {
   .firstrun-steps { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
   .firstrun-steps li { font-size: 12.5px; color: var(--ink-2); }
   .firstrun-cmd {
-    display: block; margin-top: 5px; font-family: var(--mono, monospace); font-size: 11.5px;
+    display: block; margin-top: 5px; font-family: var(--mono); font-size: 11.5px;
     background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
     padding: 5px 9px; color: var(--ink-2); width: fit-content;
   }
@@ -1031,7 +1031,7 @@ export function renderPostureHomeHTML(): string {
         ev: { href: "/api/audit-log", text: "audit log" },
       });
   }
-  // F2 BLOCKER-1: three-state pill from the shared verdict — green VERIFIED only
+  // F2 BLOCKER-1: three-state pill from the shared verdict: green VERIFIED only
   // for a fully-verified chain; a neutral SUFFIX-ONLY when the sealed history is
   // unreadable at this privilege (an armed box's operator uid); red UNVERIFIED on
   // tamper/failure. Never green over an in-place-corrupted sealed entry.
@@ -1776,7 +1776,7 @@ export function renderPostureHomeHTML(): string {
       // reconnecting / connecting / stale all read as "reconnecting" amber so a
       // stale screen can never look like a healthy live one.
       el.classList.add("reconnecting");
-      label.textContent = "Reconnecting…";
+      label.textContent = "Reconnecting...";
     }
     updated.textContent = lastFrameAt
       ? " · last updated " + fmtTime(lastFrameAt)

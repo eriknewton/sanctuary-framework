@@ -439,10 +439,10 @@ describe("getProtectionSnapshot", () => {
 
   it("echoes the 4-card layer labels so the HTML can match on them", async () => {
     const snap = await getProtectionSnapshot(baseSources());
-    expect(snap.layers.l1.label).toBe("L1 Cognitive");
-    expect(snap.layers.l2.label).toBe("L2 Operational");
-    expect(snap.layers.l3.label).toBe("L3 Disclosure");
-    expect(snap.layers.l4.label).toBe("L4 Reputation");
+    expect(snap.layers.l1.label).toBe("Castle Wall");
+    expect(snap.layers.l2.label).toBe("Sentinels");
+    expect(snap.layers.l3.label).toBe("Charter");
+    expect(snap.layers.l4.label).toBe("Heralds");
   });
 
   it("flips to red when aggregator sources indicate a compromised L1 via null identity + failure-heavy audit", async () => {

@@ -53,7 +53,7 @@ export function renderPostureAgentHTML(): string {
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.5 var(--sans);
   }
   header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }

@@ -137,7 +137,7 @@ function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
   const score = l4.layer_score ?? 100;
 
   const summaryLine = `
-    <div><dt>L4 score</dt><dd>${escHtml(score)} / 100</dd></div>
+    <div><dt>Heralds score</dt><dd>${escHtml(score)} / 100</dd></div>
     <div><dt>Attestations</dt><dd>${escHtml(ev.attestation_count)}</dd></div>
     <div><dt>Verified tiers</dt><dd>${escHtml(tierSovereign)} sovereign · ${escHtml(tierDegraded)} degraded</dd></div>
     <div><dt>Lower tiers</dt><dd>${escHtml(tierSelf)} self · ${escHtml(tierUnverified)} unverified</dd></div>

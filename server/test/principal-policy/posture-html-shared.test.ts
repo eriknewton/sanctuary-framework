@@ -4,6 +4,8 @@ import { renderPostureAgentHTML } from "../../src/principal-policy/posture-agent
 import { renderPostureEvidenceHTML } from "../../src/principal-policy/posture-evidence-html.js";
 import { POSTURE_ROOT_TOKENS_CSS } from "../../src/principal-policy/posture-html-shared.js";
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../../src/dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../../src/dashboard/design-fonts.js";
+import { contrast, ownStyleProblems, themeTokens } from "../dashboard/console-style-helpers.js";
 
 /**
  * Extract the first `:root { ... }` custom-property block from a rendered
@@ -87,6 +89,62 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
       // The canonical palette is present (the ratified 2026-10-12 page
       // ground; must match --paper in server/src/dashboard/design-tokens.ts).
       expect(html).toContain("--paper: #f4f6fa;");
+    }
+  });
+
+  it("all three posture surfaces load the bundled faces and carry no local palette, foreign font, or remote resource", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(ownStyleProblems(html, {
+        fonts: CONSOLE_FONT_FACE_CSS,
+        tokens: PAPER_INK_ROOT_TOKENS_CSS,
+      })).toEqual([]);
+    }
+  });
+
+  it("all three posture surfaces boot dark by default while preserving a stored light choice", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(html).toContain('sessionStorage.getItem("sanctuary-v11-theme") === "light"');
+      expect(html).toContain('setAttribute("data-theme", "dark")');
+    }
+  });
+
+  it("all three posture surfaces render no em dash and no L-numbered layer labels", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(html).not.toContain("\u2014");
+      expect(html).not.toContain("&mdash;");
+      expect(html).not.toMatch(/\bL[1-4]\s+(?:Cognitive|Operational|Disclosure|Reputation)\b/);
+    }
+  });
+
+  it("the shared status pills give every state a shape, and Unknown does not wear the pass shape", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain(".pill.green::before { content: \"\\25CF\"; }");
+    expect(html).toContain(".pill.amber::before { content: \"\\25B2\"; }");
+    expect(html).toContain(".pill.red::before { content: \"\\25A0\"; }");
+    expect(html).toContain(".pill.neutral::before { content: \"\\2013\"; }");
+    expect(html).toContain(".pill.unknown::before { content: \"\\25CB\"; }");
+    const unknownRule = html.match(/\.pill\.unknown::before \{[^}]+}/)?.[0] ?? "";
+    expect(unknownRule).not.toContain("\\25CF");
+  });
+
+  it("the posture control edge token clears the 3:1 non-text floor in both themes", () => {
+    const tokens = themeTokens();
+    for (const theme of ["light", "dark"] as const) {
+      for (const fill of ["surface", "surface-2", "paper"] as const) {
+        expect(contrast(tokens[theme]["ink-3"]!, tokens[theme][fill]!), `${theme} ${fill}`).toBeGreaterThanOrEqual(3);
+      }
     }
   });
 });

@@ -558,7 +558,7 @@ function buildCognitive(
   const state: LayerState = hasIdentity ? "full" : "degraded";
   let headline: string;
   if (!hasIdentity) {
-    headline = "No sovereign identity — run sanctuary_bootstrap";
+    headline = "No protected identity yet. Run sanctuary_bootstrap";
   } else if (hasLiveIntegrityEvidence) {
     headline = "State encrypted at rest";
   } else if (sealedUnverifiedAtPrivilege) {
@@ -575,7 +575,7 @@ function buildCognitive(
   // clean this snapshot. Absent that, the honest answer is "not ready".
   const memoryAttestReady = hasIdentity && hasLiveIntegrityEvidence;
   return {
-    label: "L1 Cognitive",
+    label: "Castle Wall",
     state,
     headline,
     encryption: "AES-256-GCM + HKDF per namespace",
@@ -631,14 +631,14 @@ function buildOperational(
     sandbox_status = "Principal Policy gate configured (no recent adjudication)";
   }
   return {
-    label: "L2 Operational",
+    label: "Sentinels",
     state,
     headline: teeAvailable
       ? "Hardware isolation active"
-      : "Process isolation — no TEE on this host",
+      : "Process isolation: no TEE on this host",
     isolation_type: teeAvailable ? "hardware-tee" : "process-level",
     tee_available: teeAvailable,
-    tee_status: teeAvailable ? "Attested" : "Not available — normal on local dev",
+    tee_status: teeAvailable ? "Attested" : "Not available, normal on local dev",
     sandbox_status,
   };
 }
@@ -667,11 +667,11 @@ function buildDisclosure(
       e.details?.["reconcile"] !== true
   ).length;
   return {
-    label: "L3 Disclosure",
+    label: "Charter",
     state: didActive ? "full" : "degraded",
     headline: didActive
       ? "Selective disclosure ready"
-      : "No DID — disclosure unavailable",
+      : "No DID: disclosure unavailable",
     did_active: didActive,
     vc_count: vcCount,
     proofs_today: countProofsToday(audit),
@@ -690,7 +690,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
 
   const base: ReputationStatus = rep?.score != null
     ? {
-        label: "L4 Reputation",
+        label: "Heralds",
         state: "full",
         headline: "Verascore attached",
         score: rep.score,
@@ -699,7 +699,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
       }
     : hasDid
       ? {
-          label: "L4 Reputation",
+          label: "Heralds",
           state: "degraded",
           headline: "Claim your profile",
           score: null,
@@ -707,7 +707,7 @@ function buildReputation(sources: AggregatorSources): ReputationStatus {
           claim_cta: "Claim your profile at verascore.ai",
         }
       : {
-          label: "L4 Reputation",
+          label: "Heralds",
           state: "degraded",
           headline: "No identity claimed",
           score: null,
@@ -808,7 +808,7 @@ function computeOverall(
     return {
       status: "compromised",
       light: "red",
-      headline: "Sovereignty compromised",
+      headline: "Protection compromised",
     };
   }
   const allCriticalFull = critical.every((s) => s === "full");
@@ -833,7 +833,7 @@ function computeOverall(
       headline:
         l2.state === "full"
           ? "All layers full, Castle Wall enforcing"
-          : "Castle Wall enforcing, L2 degraded (no TEE on this host)",
+          : "Castle Wall enforcing, Sentinels degraded (no TEE on this host)",
     };
   }
   if (allCriticalFull && !wallArmed) {
