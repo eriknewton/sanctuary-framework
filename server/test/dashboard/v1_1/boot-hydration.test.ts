@@ -773,7 +773,7 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).not.toContain("1 agents.");
     runInContext('state.route = "posture"; rerender()', h.context);
     // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
-    expect(h.main.innerHTML).toContain("UNKNOWN");
+    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {

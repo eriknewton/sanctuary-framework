@@ -908,7 +908,7 @@ describe("slice 3 Overview wired consumers", () => {
     return h;
   };
 
-  it("renders the six evidence-bearing tiles, the queue, egress panel and agents table from served sources", async () => {
+  it("renders the remaining source-backed tiles, the queue, findings panel and agents table from served sources", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = boot({
@@ -939,18 +939,17 @@ describe("slice 3 Overview wired consumers", () => {
     });
     await settle();
     const html = h.el.main!.innerHTML;
-    for (const label of ["Protected agents", "Enforcement confirmed", "Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
+    for (const label of ["Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
       expect(html).toContain(label);
     }
-    expect(html).toContain('2 <small>of 2 detected</small>');
-    expect(html).toContain('<div class="overview-tile"><a class="ot-label" href="#agents">Protected agents</a>');
+    expect(html).not.toContain("Protected agents");
+    expect(html).not.toContain("Enforcement confirmed");
     expect(html).not.toContain('<a class="overview-tile"');
-    expect(html).toContain("<strong>3</strong> of 10 observed outbound connections blocked");
     expect(html).toContain("Needs your decision");
     expect(html).toContain('data-overview-review="tier1-1"');
     expect(html).toContain('data-action="inbox-approve" data-item-id="tier2-1"');
-    expect(html).toContain("Egress enforcement");
-    expect(html).toContain("frontier_model_api");
+    expect(html).not.toContain("Egress enforcement");
+    expect(html).not.toContain("frontier_model_api");
     expect(html).not.toContain("allowed_api");
     expect(html).not.toContain("last 24h");
     expect(html).toContain("Agents <span class=\"n\">showing 2 of 2");
@@ -983,21 +982,21 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("Not evaluated");
     expect(html).toContain("approval queue did not answer");
     expect(html).toContain("Sentinels did not answer");
-    expect(html).toContain("blocked egress inbox did not answer");
     expect(html).not.toContain("0 approvals waiting");
     expect(html).not.toContain("0 open findings");
     expect(html).not.toContain("ENFORCING");
   });
 
-  it("Protected agents is Unknown when the unprotected harness list is not served", async () => {
+  it("renders no protection summary tiles when the unprotected harness list is not served", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, { ...overviewHome(), unwrapped: undefined });
-    expect(h.el.main!.innerHTML).toContain("unprotected harness list not served");
-    expect(textOnly(h.el.main!.innerHTML)).not.toContain("0 of 1 detected");
+    expect(h.el.main!.innerHTML).not.toContain("Protected agents");
+    expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
+    expect(textOnly(h.el.main!.innerHTML)).not.toContain("of 1 detected");
   });
 
-  it("Enforcement confirmed uses the shared predicate and can differ from protected agents", async () => {
+  it("keeps stale per-agent enforcement out of the agent chips", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const stale = { last_enforcement_evidence_at: "2026-10-14T15:00:00.000Z", freshness_window_ms: 10 * 60 * 1000 };
@@ -1006,28 +1005,29 @@ describe("slice 3 Overview wired consumers", () => {
       agents: [{ agent_id: "research-agent", status: "active", enforcement_active: "active", ...stale }],
     });
     const html = h.el.main!.innerHTML;
-    expect(html).toContain('Protected agents</a><span class="ot-value">1 <small>of 1 detected</small>');
-    expect(html).toContain('Enforcement confirmed</a><span class="ot-value">0 <small>of 1 requested</small>');
-    expect(html).toContain("server reports 1");
+    expect(html).not.toContain("Enforcement confirmed");
+    expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(html).not.toContain("server reports 1");
   });
 
-  it("Enforcement confirmed keeps the denominator Unknown when requested count is not served", async () => {
+  it("does not render requested-count fallback copy when requested count is not served", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const body = overviewHome();
     delete (body as Record<string, unknown>).protection_requested_count;
     const h = await bootOverview({}, body);
-    expect(h.el.main!.innerHTML).toContain("requested count not served");
+    expect(h.el.main!.innerHTML).not.toContain("requested count not served");
+    expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
     expect(h.el.main!.innerHTML).not.toContain("of 1 requested");
   });
 
-  it("Enforcement confirmed warns when the predicate count exceeds the served requested count", async () => {
+  it("does not render server confirmed-count disagreement copy", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, overviewHome({ protection_requested_count: 0 }));
-    expect(h.el.main!.innerHTML).toContain('class="state-chip warn"');
-    expect(h.el.main!.innerHTML).toContain("counts disagree");
-    expect(h.el.main!.innerHTML).toContain('<a href="#agents">Agents</a>');
+    expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
+    expect(h.el.main!.innerHTML).not.toContain("counts disagree");
+    expect(h.el.main!.innerHTML).not.toContain("server reports");
   });
 
   it("Castle Wall and audit chain never go green without parseable fresh evidence", async () => {
@@ -1092,7 +1092,8 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("Claude Code, Codex CLI");
     expect(html).toContain("Protect an agent");
     expect(html).toContain("Needs your decision");
-    expect(html).toContain("fortress-wide");
+    expect(html).toContain("agent not named");
+    expect(html).not.toContain("fortress-wide");
     expect(html).toContain("Fortress-wide finding");
     expect(html).not.toContain("Protected agents");
   });
@@ -1115,8 +1116,10 @@ describe("slice 3 Overview wired consumers", () => {
     const html = h.el.main!.innerHTML;
     expect(html).toContain('data-overview-review="tier1-1"');
     expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
-    expect(html).toContain("Tier unknown");
-    expect(html).toContain("Tier teir2");
+    expect(html).not.toContain("Tier unknown");
+    expect(html).not.toContain("Tier teir2");
+    expect(html).not.toContain('data-overview-review="missing-tier"');
+    expect(html).not.toContain('data-overview-review="misspelled-tier"');
     expect(html).not.toContain('data-action="inbox-approve" data-item-id="missing-tier"');
     expect(html).not.toContain('data-action="inbox-approve" data-item-id="misspelled-tier"');
     h.click({ "data-action": "inbox-approve", "data-item-id": "tier2-1" });
@@ -1138,7 +1141,7 @@ describe("slice 3 Overview wired consumers", () => {
     expect(calls).toEqual(["/api/hub/inbox/tier2-1/deny"]);
   });
 
-  it("egress destinations use blocked_egress inbox items only, filter by digest window, and cap with a full-screen link", async () => {
+  it("renders no egress panel even when blocked egress inbox items are present", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({
@@ -1153,22 +1156,24 @@ describe("slice 3 Overview wired consumers", () => {
       "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [{ entry_id: "allowed", emitted_at: "2026-10-14T16:20:00.000Z", category: "egress", agent_id: "a", display_template_id: "activity.egress.allowed", display_template_args: [{ kind: "destination_category", value: "allowed-api" }] }] } })),
     });
     const html = h.el.main!.innerHTML;
-    expect(html).toContain("window ");
-    expect(html).toContain("dest-one");
-    expect(html).toContain("2 agents");
+    expect(html).not.toContain("Egress enforcement");
+    expect(html).not.toContain("dest-one");
+    expect(html).not.toContain("2 agents");
     expect(html).not.toContain("old-dest");
     expect(html).not.toContain("allowed-api");
-    expect(html).toContain('showing 3 of 4 blocked destinations · <a href="#activity">full screen</a>');
+    expect(html).not.toContain("blocked destinations");
     expect(html).not.toContain("last 24h");
   });
 
-  it("egress destinations distinguish unanswered inbox from an answered empty inbox", async () => {
+  it("renders no egress empty or failed states from the Overview", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const unanswered = await bootOverview({ "/api/hub/inbox": () => Promise.reject(new Error("queue down.")) });
-    expect(unanswered.el.main!.innerHTML).toContain("Not evaluated: blocked egress inbox did not answer: queue down.");
+    expect(unanswered.el.main!.innerHTML).not.toContain("blocked egress inbox did not answer");
+    expect(unanswered.el.main!.innerHTML).not.toContain("Egress enforcement");
     const empty = await bootOverview();
-    expect(empty.el.main!.innerHTML).toContain("No blocked destinations in this window");
+    expect(empty.el.main!.innerHTML).not.toContain("No blocked destinations in this window");
+    expect(empty.el.main!.innerHTML).not.toContain("Egress enforcement");
   });
 
   it("structurally renders no nested anchors in Overview HTML", async () => {

@@ -2994,15 +2994,6 @@ function heldApprovalItems(scope) {
     return true;
   });
 }
-function overviewHeldItems(scope) {
-  return state.inbox.filter(function (i) {
-    if (i.resolved) return false;
-    if (i.kind !== "approval_pending") return false;
-    if (scope && (i.agent_id || "") !== scope) return false;
-    return true;
-  });
-}
-
 // Wave 1: the fortress-column agents card and Recognition Layer health card
 // previously lived on the right rail. They are real surfaces (agent
 // lifecycle controls + did:web rotation), so they were relocated to the
@@ -3329,9 +3320,8 @@ function renderActivityScreen() {
 // ── Posture screen (Overview, 2026-10-14) ────────────────────────────────
 // The default surface is the security-console Overview. It reuses served
 // posture, roster, inbox and Sentinel data, then renders honest tiles, the
-// decision queue, egress evidence from kernel digest plus blocked-egress inbox
-// rows, findings, and the agents table. Named layers only (no L-numbers); no
-// em-dashes in user-visible copy.
+// decision queue, findings, and the agents table. Named layers only (no
+// L-numbers); no em-dashes in user-visible copy.
 function evidenceCurrent(evidence) {
   // Protection requires one unambiguous, valid instant; invalid or offset-less evidence fails closed.
   const timestamp = evidence && parseEvidenceTimestamp(evidence.last_enforcement_evidence_at);
@@ -3359,48 +3349,11 @@ function postureWallLabel(armState) {
   if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
   return { cls: "pill tone-unknown", text: "Unknown" };
 }
-// S3 evidence spine tile. The opts argument and every field in it are optional:
-// the honest render of a missing denominator or a missing timestamp is to OMIT
-// it, never to substitute a placeholder that reads like data.
-//   opts.of            a denominator, rendered only when it is a finite number,
-//                      so a null/NaN total renders a bare count rather than
-//                      "of 0" or "of -".
-//   opts.fresh         an ISO timestamp, rendered through relTimeFromIso. When
-//                      it is absent we render opts.freshNone in the slate
-//                      unknown tone, so "not checked" can never be mistaken
-//                      for "checked recently".
-//   opts.ev            { href, text } link to the evidence behind the number.
-function postureMetricCard(value, label, opts) {
-  const o = opts || {};
-  const ofText = (typeof o.of === "number" && isFinite(o.of))
-    ? '<span class="pm-of">of ' + escHtml(o.of) + '</span>'
-    : "";
-  const freshText = o.fresh ? relTimeFromIso(o.fresh) : "";
-  let freshHtml = "";
-  if (freshText) {
-    freshHtml = '<span class="pm-fresh" title="' + escHtml(o.fresh) + '">checked ' + escHtml(freshText) + '</span>';
-  } else if (o.freshNone) {
-    freshHtml = '<span class="pm-fresh none">' + escHtml(o.freshNone) + '</span>';
-  }
-  const evHtml = o.ev
-    ? '<a class="pm-ev" href="' + escHtml(o.ev.href) + '">' + escHtml(o.ev.text) + ' &rarr;</a>'
-    : "";
-  const foot = (freshHtml || evHtml)
-    ? '<span class="pm-foot">' + freshHtml + evHtml + '</span>'
-    : "";
-  return '<div class="posture-metric"><span class="pm-v">' + value + ofText + '</span><span class="pm-l">' + escHtml(label) + '</span>' + foot + '</div>';
-}
-
 // Slice 3 Overview caps. Each rendered list prints "showing M of N" beside
 // the panel title so the cap bounds client work without hiding the backlog.
 const OVERVIEW_DECISION_LIMIT = 4;
 const OVERVIEW_FINDING_LIMIT = 3;
-const OVERVIEW_BLOCKED_DESTINATION_LIMIT = 3;
 const OVERVIEW_AGENT_LIMIT = 8;
-const OVERVIEW_AGENT_TABLE_MIN_WIDTH_PX = 820; // 820px keeps nine dense columns readable; the first column stays sticky.
-const OVERVIEW_DECISION_TABLE_MIN_WIDTH_PX = 640; // 640px lets Allow once and Deny show at a 1024px viewport.
-const OVERVIEW_EGRESS_TABLE_MIN_WIDTH_PX = 520; // 520px fits destination, agent count and last columns in the stacked 1024px panel.
-const OVERVIEW_CLOCK_PAD_WIDTH = 2; // HH:MM uses two digits for each field.
 
 function overviewSourceReason(path, noun) {
   const read = sourceRead(path);
@@ -3418,12 +3371,6 @@ function stripTrailingPeriod(text) {
 }
 function loadedSourceReadAge(path) {
   return sourceLoaded(path) ? sourceReadAge(path) : null;
-}
-
-function overviewEvidence(path, label, href) {
-  const age = loadedSourceReadAge(path);
-  const text = age ? label + " read " + age : overviewSourceReason(path, label);
-  return escHtml(text) + (href ? ' · <a href="' + escHtml(href) + '">evidence</a>' : '');
 }
 
 function overviewChip(kind, word, detail) {
@@ -3452,26 +3399,6 @@ function postureEvidenceByAgent(home) {
 function unprotectedHarnesses(home) {
   return home && home.unwrapped && Array.isArray(home.unwrapped.unwrapped) ? home.unwrapped.unwrapped : null;
 }
-function detectedAgentSummary(home) {
-  const unwrapped = unprotectedHarnesses(home);
-  if (!unwrapped) return { known: false, count: null, reason: "unprotected harness list not served" };
-  const ids = new Map();
-  if (sourceLoaded(HUB + "/agents")) {
-    state.agents.forEach(function (a) { if (a && a.agent_id) ids.set("agent:" + a.agent_id, true); });
-  } else {
-    (home && home.agents || []).forEach(function (a) { if (a && a.agent_id) ids.set("agent:" + a.agent_id, true); });
-  }
-  // Unwrapped harness rows have no protected agent id, so their config path is the served identity for deduping.
-  unwrapped.forEach(function (u) {
-    const key = "unwrapped:" + String((u && (u.config_path || u.harness)) || "unknown");
-    ids.set(key, true);
-  });
-  return { known: true, count: ids.size, reason: "" };
-}
-
-function protectedAgentCount(home) {
-  return sourceLoaded(HUB + "/agents") ? state.agents.length : (home && home.agents && home.agents.length) || 0;
-}
 
 function isRosterStateProtectable(agent) {
   return agent && agent.status !== "locked_down" && agent.status !== "error" && agent.status !== "paused";
@@ -3483,11 +3410,6 @@ function agentEnforcementConfirmedNow(agent, home) {
   return !!(isRosterStateProtectable(agent) && evidence && evidence.enforcement_active === "active" && evidenceCurrent(evidence));
 }
 
-function enforcementConfirmedCount(home) {
-  const agents = sourceLoaded(HUB + "/agents") ? state.agents : (home && home.agents || []);
-  return agents.filter(function (agent) { return agentEnforcementConfirmedNow(agent, home); }).length;
-}
-
 function oldestAge(items) {
   const times = items.map(function (i) { return parseEvidenceTimestamp(i.created_at || ""); }).filter(Number.isFinite);
   if (!times.length) return "oldest age Unknown";
@@ -3495,15 +3417,15 @@ function oldestAge(items) {
 }
 
 function overviewFirstRun(home) {
-  const detected = detectedAgentSummary(home);
-  const unwrapped = unprotectedHarnesses(home) || [];
-  const reason = detected.known
-    ? (detected.count ? String(detected.count) + " agent harness" + (detected.count === 1 ? "" : "es") + " detected, none protected" : "No harness was detected")
-    : detected.reason + ", none protected";
+  const unwrapped = unprotectedHarnesses(home);
+  const detectedHarnesses = Array.isArray(unwrapped) ? unwrapped : [];
+  const reason = detectedHarnesses.length
+    ? String(detectedHarnesses.length) + " agent harness" + (detectedHarnesses.length === 1 ? "" : "es") + " detected, none protected"
+    : "No harness was detected";
   return '<section class="overview-empty" data-overview-first-run="1">' +
     '<h2>No agents protected yet</h2>' +
     '<p>' + escHtml(sentenceCase(reason) + ". Evidence read " + (loadedSourceReadAge("/api/posture/home") || "is current only after the first check") + ".") + '</p>' +
-    (unwrapped.length ? '<p class="muted">' + escHtml(unwrapped.map(function (u) { return u.harness || "unknown harness"; }).join(", ")) + '</p>' : '') +
+    (detectedHarnesses.length ? '<p class="muted">' + escHtml(detectedHarnesses.map(function (u) { return u.harness || "unknown harness"; }).join(", ")) + '</p>' : '') +
     '<a class="btn btn-primary" href="#agents">Protect an agent</a>' +
   '</section>';
 }
@@ -3521,7 +3443,7 @@ function overviewDecisionRow(item) {
     : '<a class="btn btn-sm" href="#approvals" data-overview-review="' + escHtml(item.item_id) + '">Review in Approvals</a>';
   const agentCell = agentId
     ? '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a>'
-    : '<span>fortress-wide</span>';
+    : '<span>agent not named</span>';
   return '<tr><td><span class="mono">' + escHtml(tier) + '</span></td><td>' + agentCell + '</td>' +
     '<td class="mono">' + escHtml(item.operation_category || "approval") + '</td><td>' + escHtml(text) + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
 }
@@ -3535,7 +3457,7 @@ function renderOverviewDecisionQueue() {
     return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Unknown</span></h3></div>' +
       '<div class="overview-empty"><h3>Approvals hidden</h3><p>Approval queue is hidden until you paste the operator token. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p><a class="btn" href="#approvals">Open Approvals</a></div></section>';
   }
-  const all = overviewHeldItems(null).slice().sort(function (a, b) {
+  const all = heldApprovalItems(null).slice().sort(function (a, b) {
     return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
   });
   const shown = all.slice(0, OVERVIEW_DECISION_LIMIT);
@@ -3546,80 +3468,6 @@ function renderOverviewDecisionQueue() {
   return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
     '<a href="#approvals">all approvals</a></div><div class="overview-table-scroll"><table class="overview-table overview-table-decisions"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting</th><th></th></tr></thead><tbody>' +
     shown.map(overviewDecisionRow).join("") + '</tbody></table></div></section>';
-}
-
-function displayArgValue(args, kind) {
-  const found = (args || []).find(function (a) { return a && a.kind === kind; });
-  return found ? found.value : null;
-}
-
-function digestWindow(home) {
-  const d = (home && home.digest) || {};
-  const start = parseEvidenceTimestamp(d.window_start || "");
-  const end = parseEvidenceTimestamp(d.window_end || "");
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return { served: false, start: null, end: null, label: "window not served" };
-  return { served: true, start: start, end: end, label: "window " + clockTime(d.window_start) + " to " + clockTime(d.window_end) };
-}
-function clockTime(iso) {
-  const t = parseEvidenceTimestamp(iso || "");
-  if (!Number.isFinite(t)) return "Unknown";
-  const d = new Date(t);
-  return String(d.getHours()).padStart(OVERVIEW_CLOCK_PAD_WIDTH, "0") + ":" + String(d.getMinutes()).padStart(OVERVIEW_CLOCK_PAD_WIDTH, "0");
-}
-function blockedDestinationCounts(home) {
-  const windowInfo = digestWindow(home);
-  const counts = new Map();
-  state.inbox.forEach(function (item) {
-    // Invariant: destination rows come only from typed blocked_egress inbox items; activity rows do not carry destinations and mix allowed egress with blocks.
-    if (item.kind !== "blocked_egress") return;
-    const itemTime = parseEvidenceTimestamp(item.created_at || "");
-    if (windowInfo.served && (!Number.isFinite(itemTime) || itemTime < windowInfo.start || itemTime > windowInfo.end)) return;
-    const dest = item.destination_category || displayArgValue(item.display_template_args, "destination_category") || "destination not served";
-    const key = String(dest);
-    if (!counts.has(key)) counts.set(key, { destination: key, count: 0, agents: new Map(), last: item.created_at || null });
-    const row = counts.get(key);
-    row.count += 1;
-    row.agents.set(item.agent_id || "Unknown", true);
-    if (item.created_at && (!row.last || (parseEvidenceTimestamp(item.created_at) || 0) > (parseEvidenceTimestamp(row.last) || 0))) row.last = item.created_at;
-  });
-  return Array.from(counts.values()).map(function (row) {
-    const agents = Array.from(row.agents.keys());
-    return { destination: row.destination, count: row.count, agent: agents.length === 1 ? agents[0] : agents.length + " agents", last: row.last };
-  }).sort(function (a, b) { return b.count - a.count; });
-}
-
-function renderOverviewEgressPanel(home) {
-  const d = home.digest || {};
-  const windowInfo = digestWindow(home);
-  const blocksKnown = typeof d.kernel_blocks === "number";
-  const allowsKnown = typeof d.kernel_allows === "number";
-  const total = blocksKnown && allowsKnown ? d.kernel_blocks + d.kernel_allows : null;
-  const countLine = blocksKnown && allowsKnown
-    ? '<p class="muted"><strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(total) + ' observed outbound connections blocked; ' + escHtml(d.kernel_allows) + ' allowed. ' + escHtml(sentenceCase(windowInfo.label)) + '.</p>'
-    : '<p class="muted">Egress counts are Not evaluated because blocked and allowed kernel counts were not both served. This is not zero traffic.</p>';
-  let destinationBody;
-  let footer = "";
-  const destinationsKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
-  const destinations = destinationsKnown ? blockedDestinationCounts(home) : [];
-  const shown = destinations.slice(0, OVERVIEW_BLOCKED_DESTINATION_LIMIT);
-  if (!sourceLoaded(HUB + "/inbox")) {
-    destinationBody = '<tr><td colspan="4" class="muted">Not evaluated: ' + escHtml(overviewSourceReason(HUB + "/inbox", "blocked egress inbox")) + '.</td></tr>';
-  } else if (state.inboxRedacted) {
-    destinationBody = '<tr><td colspan="4" class="muted">Blocked destination inbox is hidden until you paste the operator token. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</td></tr>';
-  } else if (shown.length) {
-    destinationBody = shown.map(function (r) {
-        return '<tr><td class="mono">' + escHtml(r.destination) + '</td><td>' + escHtml(r.agent) + '</td><td>' + escHtml(r.count) + '</td><td class="mono muted">' + escHtml(r.last ? relTimeFromIso(r.last) : "Unknown") + '</td></tr>';
-      }).join("");
-    if (destinations.length > OVERVIEW_BLOCKED_DESTINATION_LIMIT) footer = '<p class="muted">showing ' + escHtml(shown.length) + ' of ' + escHtml(destinations.length) + ' blocked destinations · <a href="#activity">full screen</a></p>';
-  } else {
-    destinationBody = '<tr><td colspan="4" class="muted">No blocked destinations in this window. Inbox read ' + escHtml(loadedSourceReadAge(HUB + "/inbox") || "now") + '.</td></tr>';
-  }
-  return '<section class="card"><div class="card-head-row"><h3>Egress enforcement <span class="count-age">' + escHtml(windowInfo.label) + '</span></h3><a href="#enforcement">enforcement</a></div>' +
-    '<div class="overview-kpis"><div><dt>Blocked</dt><dd>' + (blocksKnown ? escHtml(d.kernel_blocks) : '<span class="unknown-value">Unknown</span>') + '</dd></div>' +
-    '<div><dt>Allowed</dt><dd>' + (allowsKnown ? escHtml(d.kernel_allows) : '<span class="unknown-value">Unknown</span>') + '</dd></div></div>' +
-    countLine +
-    '<div class="overview-table-scroll"><table class="overview-table overview-table-egress"><thead><tr><th>Blocked destination</th><th>Agent</th><th>Count</th><th>Last</th></tr></thead><tbody>' + destinationBody + '</tbody></table></div>' +
-    footer + '</section>';
 }
 
 function severityClass(level) {
@@ -3767,7 +3615,7 @@ function renderPostureScreen() {
     '<div class="page-head"><div>' +
       '<p class="eyebrow">Overview</p>' +
       '<h1>Overview</h1>' +
-      '<p class="sub">What needs attention now. Counts stay Unknown until their source answers, and green requires current enforcement evidence.</p>' +
+      '<p class="sub">What needs attention now. Each tile names the served source it reads; Unknown means the source has not answered.</p>' +
     '</div></div>';
   if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
@@ -3782,17 +3630,11 @@ function renderPostureScreen() {
     : '';
   if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
     const below = [];
-    if (sourceLoaded(HUB + "/inbox") && !state.inboxRedacted && overviewHeldItems(null).length) below.push(renderOverviewDecisionQueue());
+    if (sourceLoaded(HUB + "/inbox") && !state.inboxRedacted && heldApprovalItems(null).length) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
     return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + below.join("") + '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
-  const detected = detectedAgentSummary(home);
-  const protectedTotal = protectedAgentCount(home);
-  const requestedKnown = typeof home.protection_requested_count === "number";
-  const requested = requestedKnown ? home.protection_requested_count : null;
-  const confirmed = enforcementConfirmedCount(home);
-  const servedConfirmed = typeof home.enforcement_confirmed_count === "number" ? home.enforcement_confirmed_count : null;
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
   const vaultNotice = vaultProvision === "not_yet_walled"
     ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
@@ -3812,7 +3654,7 @@ function renderPostureScreen() {
           ? overviewChip("warn", "NOT INSTALLED", wallAge || "not installed")
           : overviewChip("unknown", "UNKNOWN", wallAge || "no evidence");
   const pendingKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
-  const pending = pendingKnown ? overviewHeldItems(null) : [];
+  const pending = pendingKnown ? heldApprovalItems(null) : [];
   const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
   // Invariant: the chain tile has three states from the served verdict. VERIFIED needs a parseable check age; findings are bad; suffix-only stays partial rather than green.
   const chainVerified = digest.chain_verified === true && Number.isFinite(chainWindowEnd);
@@ -3823,29 +3665,12 @@ function renderPostureScreen() {
       : digest.chain_verdict === "verified_suffix_only"
       ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
       : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
-  const detectedValue = detected.known
-    ? escHtml(protectedTotal) + " " + overviewSmall("of " + detected.count + " detected")
-    : overviewChip("unknown", "Unknown", detected.reason);
-  const confirmedValue = requestedKnown && confirmed > requested
-    ? overviewChip("warn", String(confirmed), "of " + requested + " requested")
-    : requestedKnown
-    ? escHtml(confirmed) + " " + overviewSmall("of " + requested + " requested")
-    : overviewChip("unknown", "Unknown", "requested count not served");
-  const confirmedTone = requestedKnown && confirmed > requested ? "warn" : "";
-  const confirmedEvidence = [
-    "posture read " + escHtml(loadedSourceReadAge("/api/posture/home") || "Unknown"),
-    servedConfirmed !== null && servedConfirmed !== confirmed ? "server reports " + escHtml(servedConfirmed) : "",
-    confirmedTone ? "counts disagree" : "",
-    '<a href="#agents">Agents</a>'
-  ].filter(Boolean).join(" · ");
   const metricCards =
     '<div class="overview-tiles" aria-label="At a glance">' +
-      overviewTile("Protected agents", detectedValue, detected.known ? "protection applied · " + escHtml(loadedSourceReadAge("/api/posture/home") || "posture read Unknown") + ' · <a href="#agents">agents</a>' : escHtml(detected.reason) + ' · <a href="#agents">Agents</a>', "#agents") +
-      overviewTile("Enforcement confirmed", confirmedValue, confirmedEvidence, "#agents") +
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
-      overviewTile("Audit chain", chainChip, (digest.entry_count !== undefined ? escHtml(digest.entry_count) + " entries" : "entry count not served") + " · " + (Number.isFinite(chainWindowEnd) ? "checked " + escHtml(relTimeFromIso(digest.window_end)) : "last check Not evaluated"), "#activity") +
+      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? "checked " + escHtml(relTimeFromIso(digest.window_end)) : "last check Not evaluated", "#activity") +
     '</div>';
   return [
     '<section class="overview-page">',
@@ -3854,12 +3679,9 @@ function renderPostureScreen() {
       metricCards,
       vaultNotice,
       renderOverviewDecisionQueue(),
-      '<div class="overview-two">',
-        renderOverviewEgressPanel(home),
-        renderOverviewFindingsPanel(),
-      '</div>',
+      renderOverviewFindingsPanel(),
       renderOverviewAgentsTable(),
-      '<p class="muted">Counts on this page name the source that answered. Unknown is never counted as protected, and green appears only inside the freshness window.</p>',
+      '<p class="muted">Overview values come directly from served posture, approval, Sentinel and roster reads. Unknown remains explicit when a source has not answered.</p>',
     '</section>'
   ].join("");
 }

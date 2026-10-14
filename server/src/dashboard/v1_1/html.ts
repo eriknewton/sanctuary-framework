@@ -1899,7 +1899,7 @@ body {
 /* Slice 3 Overview: dense security-console composition. Every capped list
    prints "showing M of N" in its own panel so bounded rendering cannot hide
    queue depth, findings or rows. */
-.overview-page { --overview-tile-min: 154px; --overview-decision-table-min: 640px; --overview-egress-table-min: 520px; --overview-agent-table-min: 820px; display: flex; flex-direction: column; gap: 16px; }
+.overview-page { --overview-tile-min: 154px; --overview-decision-table-min: 640px; --overview-agent-table-min: 820px; display: flex; flex-direction: column; gap: 16px; }
 .overview-tiles { container-type: inline-size; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--overview-tile-min)), 1fr)); gap: 10px; }
 .overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: inherit; text-decoration: none; }
 .overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; text-decoration: none; }
@@ -1909,12 +1909,9 @@ body {
 .overview-tile .ot-evidence { margin-top: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
 .overview-tile .ot-evidence a { color: var(--indigo); text-decoration: none; }
 .overview-tile .ot-evidence a:hover { text-decoration: underline; }
-.overview-two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
-@media (max-width: 1100px) { .overview-two { grid-template-columns: minmax(0, 1fr); } }
 .overview-table-scroll { overflow-x: auto; }
 .overview-table { width: 100%; border-collapse: collapse; min-width: 0; font-size: var(--text-sm); }
 .overview-table-decisions { min-width: var(--overview-decision-table-min); }
-.overview-table-egress { min-width: var(--overview-egress-table-min); }
 .overview-table-agents { min-width: var(--overview-agent-table-min); }
 .overview-table-agents th:first-child, .overview-table-agents td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); }
 .overview-table th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em; }
@@ -1923,10 +1920,6 @@ body {
 .overview-table .mono { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); }
 .overview-table .muted { color: var(--ink-3); }
 .overview-table .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
-.overview-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.overview-kpis div { border: 1px solid var(--rule); border-radius: 8px; padding: 10px; background: var(--paper-2); }
-.overview-kpis dt { color: var(--ink-3); font-size: var(--text-xs); margin: 0; }
-.overview-kpis dd { margin: 2px 0 0; font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; }
 .overview-list { display: flex; flex-direction: column; }
 .overview-list .item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
 .overview-list .item:last-child { border-bottom: 0; }
