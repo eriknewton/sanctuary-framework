@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { createServer } from "node:net";
+import { createServer, type AddressInfo } from "node:net";
 import {
+  chmod,
   rm,
   mkdir,
   mkdtemp,
@@ -49,6 +50,11 @@ const OPERATOR_TOKEN_FILE_MODE = 0o600;
 const CLI_READY_TIMEOUT_MS = 10_000;
 // 5_000 ms bounds child teardown so a failed CLI test cannot leak a server.
 const CLI_EXIT_TIMEOUT_MS = 5_000;
+// Must match HOLD_FOR_SIGNAL_ENV and HOLD_FOR_SIGNAL_LINE in server/scripts/demo/seed-fortress.ts.
+const DEMO_SEED_HOLD_ENV = "SANCTUARY_DEMO_SEED_HOLD_FOR_SIGNAL";
+const DEMO_SEED_HOLD_LINE = /^Demo seeding is holding for a signal\.$/m;
+// 0o500 = owner read and search without write, so entries inside the directory cannot be unlinked.
+const LOCKED_DIRECTORY_MODE = 0o500;
 
 interface PathSnapshotEntry {
   kind: "dir" | "file";
@@ -204,12 +210,27 @@ async function bindPort(port: number): Promise<ReturnType<typeof createServer>> 
   servers.push(server);
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
+    // port-discipline: ignore - binds the exact port the demo used to prove stop released it; a fresh port proves nothing
     server.listen(port, "127.0.0.1", () => {
       server.off("error", rejectListen);
       resolveListen();
     });
   });
   return server;
+}
+
+// Holds an OS-assigned port open so a child told to use it fails to start its dashboard.
+async function occupyEphemeralPort(): Promise<number> {
+  const server = createServer();
+  servers.push(server);
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+  return (server.address() as AddressInfo).port;
 }
 
 function statusCell(status: "seeded" | "not_available"): string {
@@ -239,7 +260,7 @@ async function pathExists(path: string): Promise<boolean> {
   return (await stat(path).catch(() => null)) !== null;
 }
 
-async function spawnCli(args: string[]): Promise<CliRun> {
+async function spawnCli(args: string[], extraEnv: Record<string, string> = {}): Promise<CliRun> {
   const fakeHome = await makeFakeOperatorHome();
   const child = spawn(process.execPath, ["--import", "tsx", "scripts/demo/seed-fortress.ts", ...args], {
     cwd: process.cwd(),
@@ -250,6 +271,7 @@ async function spawnCli(args: string[]): Promise<CliRun> {
       SANCTUARY_CUSTODY_LOCK_ROOT: join(fakeHome, "c"),
       SANCTUARY_DASHBOARD_AUTO_OPEN: "false",
       SANCTUARY_PASSPHRASE: PASSPHRASE,
+      ...extraEnv,
     },
   });
   const run: CliRun = {
@@ -608,16 +630,53 @@ describe("seedDemoFortress", () => {
     expect(await pathExists(run.home!)).toBe(false);
   });
 
-  it("keeps an interrupted root only when --keep is explicit", async () => {
-    const run = await spawnCli(["--port", String(await getFreePort()), "--keep"]);
+  it.each(["SIGINT", "SIGTERM"] as const)("exits with the interruption code and removes the root when %s arrives during seeding", async (signal) => {
+    const run = await spawnCli(["--port", String(await getFreePort())], { [DEMO_SEED_HOLD_ENV]: "1" });
     try {
-      await waitForOutput(run, /^Demo HOME: /m);
+      await waitForOutput(run, DEMO_SEED_HOLD_LINE);
+      run.child.kill(signal);
+      // POSIX interruption codes are 128 + SIGINT (2) or SIGTERM (15).
+      expect(await waitForExit(run)).toEqual({ code: 128 + (signal === "SIGINT" ? 2 : 15), signal: null });
+      expect(run.stderr).toContain(`Demo seeding was interrupted by ${signal}.`);
+      expect(run.stderr).not.toContain("Demo stopped after ready.");
+      expect(run.stdout).not.toContain("Dashboard URL:");
+      expect(await pathExists(run.home!)).toBe(false);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  it("keeps an interrupted root only when --keep is explicit", async () => {
+    const run = await spawnCli(["--port", String(await getFreePort()), "--keep"], { [DEMO_SEED_HOLD_ENV]: "1" });
+    try {
+      await waitForOutput(run, DEMO_SEED_HOLD_LINE);
       run.child.kill("SIGINT");
-      const exit = await waitForExit(run);
-      expect(exit.signal).toBeNull();
-      expect(run.stderr).toMatch(/Demo (seeding was interrupted by SIGINT|stopped after ready)\./);
+      expect(await waitForExit(run)).toEqual({ code: 128 + 2, signal: null });
+      expect(run.stderr).toContain("Demo seeding was interrupted by SIGINT.");
       expect(await pathExists(run.home!)).toBe(true);
     } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("reports a root it cannot remove and keeps the interruption exit code", async () => {
+    const run = await spawnCli(["--port", String(await getFreePort())], { [DEMO_SEED_HOLD_ENV]: "1" });
+    let locked: string | undefined;
+    try {
+      await waitForOutput(run, DEMO_SEED_HOLD_LINE);
+      locked = join(run.home!, "locked");
+      await mkdir(locked);
+      await writeFile(join(locked, "pinned"), "held open by a read-only parent\n");
+      await chmod(locked, LOCKED_DIRECTORY_MODE);
+      run.child.kill("SIGINT");
+      expect(await waitForExit(run)).toEqual({ code: 128 + 2, signal: null });
+      expect(run.stderr).toContain("Demo seeding was interrupted by SIGINT.");
+      expect(run.stderr).toContain(`Could not remove demo root ${run.home}: `);
+      expect(await pathExists(run.home!)).toBe(true);
+    } finally {
+      if (locked) await chmod(locked, DEMO_DIRECTORY_MODE).catch(() => undefined);
       await cleanupOwned();
     }
     expect(await pathExists(run.home!)).toBe(false);
@@ -661,9 +720,63 @@ describe("seedDemoFortress", () => {
     expect(await pathExists(home)).toBe(false);
   });
 
+  it("refuses teardown of a root whose pid file is not a pid and leaves it intact", async () => {
+    const home = ownedDemoRoot();
+    await writeFile(join(home, DEMO_PID_FILE_BASENAME), "not-a-pid\n");
+    try {
+      const run = await spawnCli(["--teardown", home]);
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stderr).toContain("refusing to teardown demo root with invalid pid: ");
+      expect(await pathExists(join(home, DEMO_PID_FILE_BASENAME))).toBe(true);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(home)).toBe(false);
+  });
+
+  it("refuses teardown of a temp directory the seeder did not name", async () => {
+    const foreign = await mkdtemp(join(demoTempParent(), "sanctuary-demo-foreign-"));
+    roots.add(foreign);
+    try {
+      const run = await spawnCli(["--teardown", foreign]);
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stderr.trim()).toBe("refusing to teardown a path not created by the demo seeder");
+      expect(await pathExists(foreign)).toBe(true);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(foreign)).toBe(false);
+  });
+
+  it("refuses teardown of a demo-named directory nested inside a demo root", async () => {
+    const home = ownedDemoRoot();
+    const nested = join(home, "sdf-nested");
+    await mkdir(nested);
+    try {
+      const run = await spawnCli(["--teardown", nested]);
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stderr.trim()).toBe("refusing to teardown a path not created by the demo seeder");
+      expect(await pathExists(nested)).toBe(true);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(home)).toBe(false);
+  });
+
+  it.each([[["--teardown"]], [["--teardown", "--keep"]]])("refuses %j without a path and starts no demo", async (args) => {
+    const run = await spawnCli(args);
+    try {
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stderr).toContain("--teardown needs the demo root path.");
+      expect(run.stdout).not.toContain("Demo HOME:");
+      expect(run.home).toBeUndefined();
+    } finally {
+      await cleanupOwned();
+    }
+  });
+
   it.each([false, true])("owns root cleanup on dashboard startup error (keep=%s)", async (keep) => {
-    const port = await getFreePort();
-    await bindPort(port);
+    const port = await occupyEphemeralPort();
     const run = await spawnCli(["--port", String(port), ...(keep ? ["--keep"] : [])]);
     try {
       await waitForOutput(run, /^Demo HOME: /m);

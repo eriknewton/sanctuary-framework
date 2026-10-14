@@ -79,6 +79,11 @@ export interface SeedDemoFortressOptions {
   now?: () => Date;
   /** Cancellation waits for in-flight work before releasing resources and the root. */
   signal?: AbortSignal;
+  /**
+   * Awaited once, after every seeded record is written and before the dashboard is constructed.
+   * The CLI uses it to hold seeding open for a signal so interruption is reachable on purpose.
+   */
+  holdBeforeDashboard?: () => Promise<void>;
 }
 
 export interface SeededDemoItem {
@@ -438,6 +443,7 @@ export async function seedDemoFortress(
     const apiBaseUrl = `http://${HOST}:${port}`;
     let pendingApprovalIds: string[] = [];
 
+    await options.holdBeforeDashboard?.();
     options.signal?.throwIfAborted();
     if (options.startDashboard !== false) {
       dashboard = new DashboardApprovalChannel({

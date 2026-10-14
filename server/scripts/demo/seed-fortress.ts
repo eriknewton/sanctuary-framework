@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 import { readFile, realpath, rm } from "node:fs/promises";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   DEMO_PID_FILE_BASENAME,
@@ -16,6 +16,12 @@ import {
 // POSIX shells report interruption as 128 plus the signal number (SIGINT = 2, SIGTERM = 15).
 const SIGINT_EXIT_CODE = 128 + 2;
 const SIGTERM_EXIT_CODE = 128 + 15;
+// Test hook: when set to "1", seeding holds after its last record and before the dashboard until a signal arrives.
+const HOLD_FOR_SIGNAL_ENV = "SANCTUARY_DEMO_SEED_HOLD_FOR_SIGNAL";
+// Must match DEMO_SEED_HOLD_LINE in server/test/demo/seed-fortress.test.ts.
+const HOLD_FOR_SIGNAL_LINE = "Demo seeding is holding for a signal.";
+// Any ref'd interval keeps the event loop alive while the hold waits; the value only sets how often it wakes.
+const HOLD_KEEPALIVE_MS = 60_000;
 
 function usage(): string {
   return [
@@ -34,10 +40,8 @@ function argValue(args: string[], name: string): string | undefined {
 async function teardown(target: string): Promise<void> {
   const resolved = await realpath(resolve(target));
   const tmpRoot = await realpath(demoTempParent());
-  if (
-    !basename(resolved).startsWith(DEMO_TEMP_PREFIX) ||
-    !resolved.startsWith(`${tmpRoot}${sep}`)
-  ) {
+  // The seeder creates each root as a direct child of the temp parent, so nothing deeper is ever its own.
+  if (!basename(resolved).startsWith(DEMO_TEMP_PREFIX) || dirname(resolved) !== tmpRoot) {
     throw new Error("refusing to teardown a path not created by the demo seeder");
   }
   // Must match the DEMO_PID_FILE_BASENAME writer in seed-fortress-lib.ts.
@@ -69,8 +73,12 @@ async function main(): Promise<void> {
     console.log(usage());
     return;
   }
-  const teardownTarget = argValue(args, "--teardown");
-  if (teardownTarget) {
+  if (args.includes("--teardown")) {
+    const teardownTarget = argValue(args, "--teardown");
+    // A bare --teardown is a usage error, never a request to start a demo.
+    if (!teardownTarget || teardownTarget.startsWith("--")) {
+      throw new Error(`--teardown needs the demo root path.\n${usage()}`);
+    }
     await teardown(teardownTarget);
     return;
   }
@@ -101,6 +109,15 @@ async function main(): Promise<void> {
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
   const onNormalStop = () => { phase = "stopping"; requestStop(); };
+  const holdBeforeDashboard = process.env[HOLD_FOR_SIGNAL_ENV] === "1"
+    ? () => new Promise<void>((resolveHold) => {
+      const keepAlive = setInterval(() => undefined, HOLD_KEEPALIVE_MS);
+      const release = () => { clearInterval(keepAlive); resolveHold(); };
+      console.log(HOLD_FOR_SIGNAL_LINE);
+      if (controller.signal.aborted) release();
+      else controller.signal.addEventListener("abort", release, { once: true });
+    })
+    : undefined;
 
   // Synchronous creation and handler installation leave no event-loop gap before root ownership is armed.
   const home = createDemoRoot();
@@ -115,6 +132,7 @@ async function main(): Promise<void> {
       startDashboard: true,
       removeOnStop: !keep,
       signal: controller.signal,
+      holdBeforeDashboard,
     });
     phase = "ready";
     console.log(`Dashboard URL: ${seeded.dashboardUrl}`);
@@ -141,6 +159,10 @@ async function main(): Promise<void> {
       try {
         // force makes library error cleanup and CLI ownership idempotent without ignoring removal failures.
         if (!keep) await rm(home, { recursive: true, force: true });
+      } catch (error) {
+        // A removal failure is reported without replacing an earlier error or the interruption exit code.
+        console.error(`Could not remove demo root ${home}: ${error instanceof Error ? error.message : String(error)}`);
+        if (!process.exitCode) process.exitCode = 1;
       } finally {
         process.off("SIGINT", onSigint);
         process.off("SIGTERM", onSigterm);
