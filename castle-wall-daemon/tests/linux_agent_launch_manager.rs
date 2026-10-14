@@ -184,10 +184,19 @@ impl Fixture {
             fs::copy(source, dest).unwrap();
             fs::set_permissions(dest, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        for unit in [WALL, "sanctuary-agent@.service", WORKSPACE_MOUNT_UNIT] {
+        // The mount unit's repo copy has a portable name; it installs as WORKSPACE_MOUNT_UNIT.
+        // Must match MOUNT_SOURCE in packaging/ubuntu/install-layout.py.
+        for (unit, source) in [
+            (WALL, WALL),
+            ("sanctuary-agent@.service", "sanctuary-agent@.service"),
+            (
+                WORKSPACE_MOUNT_UNIT,
+                "var-lib-sanctuary-agent-workspace.mount.source",
+            ),
+        ] {
             let dest = Path::new("/run/systemd/system").join(unit);
             assert!(!dest.exists());
-            fs::copy(f.source.join("systemd").join(unit), dest).unwrap();
+            fs::copy(f.source.join("systemd").join(source), dest).unwrap();
         }
         write(
             ENV_PATH,

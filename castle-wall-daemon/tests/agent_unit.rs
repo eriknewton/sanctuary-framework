@@ -587,10 +587,12 @@ fn install_target_and_every_security_directive_are_exact() {
 
 #[test]
 fn workspace_mount_is_mandatory_and_has_the_entire_fixed_budget() {
-    // Must match WORKSPACE_MOUNT_UNIT in src/linux_install/contract.rs.
-    const WORKSPACE_MOUNT_UNIT: &str = "var-lib-sanctuary\\x2dagent\\x2dworkspace.mount";
-    let text =
-        std::fs::read_to_string(crate_root().join("systemd").join(WORKSPACE_MOUNT_UNIT)).unwrap();
+    // The repo copy has a portable file name; it installs as WORKSPACE_MOUNT_UNIT.
+    // Must match MOUNT_SOURCE in packaging/ubuntu/install-layout.py.
+    let text = std::fs::read_to_string(
+        crate_root().join("systemd/var-lib-sanctuary-agent-workspace.mount.source"),
+    )
+    .unwrap();
     let lines: Vec<_> = text
         .lines()
         .filter(|s| !s.is_empty() && !s.starts_with('#'))

@@ -390,6 +390,7 @@ async def main():
    - target_url: "https://verascore.ai/api/publish"
    - This signs the payload with your Ed25519 key and publishes
      your team's reputation to the public registry
+     (from Sanctuary 1.9.0 the operator approves this before anything is sent)
 7. Run sanctuary/sovereignty_audit for your final posture
 8. Check sanctuary/governor_status for final governance stats
 9. Store the team report in state_write with key 'final_team_report'

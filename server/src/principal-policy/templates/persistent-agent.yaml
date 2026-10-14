@@ -9,6 +9,7 @@
 #   - state_delete with secure_delete (3-pass overwrite — unrecoverable)
 #   - reputation_import (external trust injection)
 #   - governor_reset (resets all rate limiting)
+#   - reputation_publish (sends a signed report to Verascore; data leaves the machine)
 #
 # Tier 2 (approval on anomaly):
 #   - reputation_record (new attestation — but only on anomaly)
@@ -19,7 +20,7 @@
 #     identity_verify, identity_list, identity_set_primary,
 #     all context_gate_* tools, all handshake_* tools, shr_generate, shr_verify,
 #     sovereignty_audit, all disclosure_* tools, all proof_* tools, all zk_* tools,
-#     reputation_query, reputation_query_weighted, reputation_publish,
+#     reputation_query, reputation_query_weighted,
 #     bootstrap_create_escrow, bootstrap_provide_guarantee,
 #     sanctuary_bootstrap, policy_status, export_identity_bundle,
 #     link_to_human, sign_challenge, l2_hardening_status, l2_verify_isolation,
@@ -38,6 +39,9 @@ tiers:
       - identity_sign
       - identity_rotate
       - governor_reset
+      # Data leaves the machine only with explicit operator intent; must match
+      # reputation_publish in DEFAULT_POLICY.tier1_always_approve (loader.ts).
+      - reputation_publish
     rules:
       - match: "state_delete"
         condition: "params.secure_delete == true"

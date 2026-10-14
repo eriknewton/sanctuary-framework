@@ -152,7 +152,8 @@ describe("sanctuary meta-tools", () => {
       expect((result.tier1 as string[])).toContain("sanctuary_bootstrap");
       expect((result.tier1 as string[])).toContain("sanctuary_policy_status");
       expect((result.tier3 as string[])).toContain("state_read");
-      expect((result.tier3 as string[])).toContain("reputation_publish");
+      expect((result.tier1 as string[])).toContain("reputation_publish");
+      expect((result.tier3 as string[])).not.toContain("reputation_publish");
       expect((result.tier3 as string[])).not.toContain("sanctuary_policy_status");
       const counts = result.counts as { tier1: number; tier3: number };
       expect(counts.tier1).toBe((result.tier1 as string[]).length);

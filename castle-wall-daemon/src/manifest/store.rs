@@ -353,6 +353,10 @@ impl ManifestStore {
         self.current_snapshot.as_ref()
     }
 
+    pub(crate) fn expected_fortress_id(&self) -> &str {
+        &self.expected_fortress_id
+    }
+
     /// Verify and derive the next manifest generation without changing the
     /// live policy. The returned value owns the exact bytes and snapshot that
     /// [`Self::commit_prepared_reload`] later installs, so a policy rewrite

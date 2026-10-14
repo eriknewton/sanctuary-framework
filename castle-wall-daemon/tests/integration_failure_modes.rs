@@ -55,6 +55,7 @@ use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
+use castle_wall_daemon::decision::OutcomeEvidence;
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
 use castle_wall_daemon::ipc::auth::{handshake_signing_bytes, CHALLENGE_NONCE_BYTES};
 use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
@@ -394,9 +395,24 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     write_bad_signature_manifest(&config.policy_dir, &signing);
 
     let handle = boot(config).expect("boot is best-effort on first manifest load");
+    let wal = handle.wal_writer().expect("wal").clone();
+    let egress_rows = || {
+        wal.lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry
+                    .event_canonical_json
+                    .contains("\"operation\":\"egress_")
+            })
+            .count()
+    };
+    let baseline_egress_rows = egress_rows();
 
     let request = EvaluationRequest {
-        agent_id: "agent-1".to_string(),
+        agent_id: nftables::confined_agent_id(TEST_AGENT_UID),
         agent_template: "claude-code".to_string(),
         dest_host: Some("api.anthropic.com".to_string()),
         dest_ip: Some("104.18.0.1".to_string()),
@@ -406,15 +422,27 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
     };
     let outcome = handle.evaluate_attempt(&request).expect("evaluate");
 
+    assert!(matches!(outcome.evidence, OutcomeEvidence::Unattributed));
     assert!(matches!(
-        outcome.verdict,
+        outcome.verdict(),
         Verdict::Deny {
             reason: DeniedReason::DefaultDeny
         }
     ));
-    assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
-    assert!(outcome.event_canonical_json.contains("\"default_deny\""));
+    assert!(outcome.wal_seq().is_none());
+    assert!(outcome.event_canonical_json().is_none());
+    assert_eq!(
+        egress_rows(),
+        baseline_egress_rows,
+        "unattributed first evaluation writes no egress WAL row"
+    );
     let _ = handle.stop();
+    // Ring-only writes are witnessed by daemon.rs's own unit test, not here.
+    assert_eq!(
+        egress_rows(),
+        baseline_egress_rows,
+        "stop after unattributed first evaluation writes no egress WAL row"
+    );
 }
 
 // ---- F-2 runtime daemon crash: kernel rules persist -----------------------

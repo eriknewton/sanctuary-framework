@@ -1095,7 +1095,10 @@ export function createReputationTools(
       description:
         "Publish sovereignty data to Verascore using the supplied or DID-derived agent id; " +
         "payload is Ed25519-signed; the Verascore API response determines profile " +
-        "existence/acceptance.",
+        "existence/acceptance. " +
+        // Must match the reputation_publish entry in
+        // DEFAULT_POLICY.tier1_always_approve (src/principal-policy/loader.ts).
+        "Tier 1: requires operator approval, because the signed report leaves this machine.",
       inputSchema: {
         type: "object",
         properties: {
