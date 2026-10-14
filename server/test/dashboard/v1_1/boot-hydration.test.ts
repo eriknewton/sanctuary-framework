@@ -117,7 +117,7 @@ describe("dashboard bounded independent hydration", () => {
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -143,7 +143,9 @@ describe("dashboard bounded independent hydration", () => {
         "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", ...evidence }, agents: [{ agent_id: "fixture", enforcement_active: "active", ...evidence }] }),
       });
       await settle();
-      expect.soft(h.main.innerHTML, timestamp).not.toContain(">Enforcing</span>");
+      // fail-before-exempt: protective-render plant recorded in the slice 3b evidence.
+      // Overview uses an uppercase chip word, so this catches stale and invalid evidence.
+      expect.soft(h.main.innerHTML, timestamp).not.toContain(">ENFORCING");
       expect.soft(runInContext("homeFreshnessTimer", h.context), timestamp).toBeNull();
       runInContext('state.route = "agents"; rerender()', h.context);
       expect.soft(h.main.innerHTML, timestamp).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
@@ -175,7 +177,7 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
     expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
   });
 
@@ -538,7 +540,9 @@ describe("dashboard bounded independent hydration", () => {
       "/api/anomaly/findings",
     ]));
     expect(runInContext('sourceRead("/api/anomaly/findings").state', h.context)).toBe("state_LOADING");
-    expect(h.main.innerHTML).not.toContain("No open anomaly findings.");
+    // fail-before-exempt: checked-empty render plant recorded in the slice 3b evidence.
+    // The loading Overview must not retain its current checked-empty Sentinel copy.
+    expect(h.main.innerHTML).not.toContain("No open Sentinel findings");
   });
   it("keeps later rule details unavailable when the shared deadline runs out", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/auto-trigger/rules": () => response({ data: { rules: [{ rule_id: "first" }, { rule_id: "later" }] } }), "/api/auto-trigger/rules/first": pending });
@@ -777,7 +781,7 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).not.toContain("1 agents.");
     runInContext('state.route = "posture"; rerender()', h.context);
     // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
-    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {

@@ -7,7 +7,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import {
-  handlePostureRoute,
+  buildHome, handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
   POSTURE_AGENT_PATH_PREFIX,
@@ -913,4 +913,26 @@ describe("GET /api/posture/fleet — Fleet Console Slice 1 route", () => {
     expect(res.status).toBe(503);
     expect((await res.json()).error).toBe("posture_unavailable");
   });
+});
+
+
+describe("Overview protection snapshot", () => {
+  it("counts requested records plus unprotected harnesses from one registry read", async () => {
+    const first = [wrappedAgent("a", "claude-code"), { ...wrappedAgent("b", "claude-code"), status: "unwrapping" as const }];
+    let reads = 0;
+    const home = await buildHome(baseDeps(newLog(), first, { listAgents: () => ++reads === 1 ? first : [] }));
+    expect(home.protection_detected_count).toBe(3);
+    expect(home.protection_requested_count).toBe(1);
+    expect(reads).toBe(1);
+    expect(home.agents.map(row => row.agent_id)).toEqual(["a", "b"]);
+    expect(home.unwrapped.unwrapped.map(row => row.harness)).toEqual(["cursor"]);
+  });
+  for (const records of [[], [wrappedAgent("a", "cursor")], [wrappedAgent("a", "cursor"), wrappedAgent("b", "cursor")]]) {
+    it(`does not count registered harnesses twice with ${records.length} records`, async () => {
+      const home = await buildHome(baseDeps(newLog(), records));
+      expect(home.protection_detected_count).toBe(records.length || 1);
+      expect(home.protection_requested_count).toBeLessThanOrEqual(home.protection_detected_count);
+      expect(home.unwrapped.unwrapped).toHaveLength(records.length ? 0 : 1);
+    });
+  }
 });
