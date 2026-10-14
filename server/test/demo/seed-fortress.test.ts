@@ -137,6 +137,16 @@ function ownedDemoRoot(): string {
   return home;
 }
 
+// The shared cleanup owns the restore, registered before the directory exists, so a timeout that runs afterEach
+// before a test's finally still makes the owned root removable; a restore only in a finally would run after the
+// memoized removal had already failed.
+async function lockOwnedDirectory(path: string): Promise<void> {
+  stops.push(() => chmod(path, DEMO_DIRECTORY_MODE).catch(() => undefined));
+  await mkdir(path);
+  await writeFile(join(path, "pinned"), "held open by a read-only parent\n");
+  await chmod(path, LOCKED_DIRECTORY_MODE);
+}
+
 function seedOwned(home: string, options: SeedDemoFortressOptions) {
   const pending = seedDemoFortress(home, options);
   // Register before awaiting: afterEach also owns resources produced by a late seed completion.
@@ -676,13 +686,7 @@ describe("seedDemoFortress", () => {
     const run = await spawnCli(["--port", String(await getFreePort())], { [DEMO_SEED_HOLD_ENV]: "1" });
     try {
       await waitForOutput(run, DEMO_SEED_HOLD_LINE);
-      const locked = join(run.home!, "locked");
-      await mkdir(locked);
-      await writeFile(join(locked, "pinned"), "held open by a read-only parent\n");
-      // The shared cleanup owns the restore, so a timeout that runs afterEach before this test's finally still
-      // makes the root removable; a restore only in the finally would run after the memoized removal failed.
-      stops.push(() => chmod(locked, DEMO_DIRECTORY_MODE).catch(() => undefined));
-      await chmod(locked, LOCKED_DIRECTORY_MODE);
+      await lockOwnedDirectory(join(run.home!, "locked"));
       run.child.kill("SIGINT");
       // POSIX interruption code: 128 + SIGINT (2).
       expect(await waitForExit(run)).toEqual({ code: 128 + 2, signal: null });
@@ -693,6 +697,14 @@ describe("seedDemoFortress", () => {
       await cleanupOwned();
     }
     expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  // fail-before-exempt: protects the locked-directory restore's place in the shared cleanup and passes on the base by construction; its witness is a planted change that moves the restore out of the shared cleanup, which must turn this test red.
+  it.skipIf(process.getuid?.() === 0)("the shared cleanup restores a locked directory before it removes the owned root", async () => {
+    const root = ownedDemoRoot();
+    await lockOwnedDirectory(join(root, "locked"));
+    await cleanupOwned();
+    expect(await pathExists(root)).toBe(false);
   });
 
   it("refuses teardown while the recorded demo pid is live and permits it after exit", async () => {
