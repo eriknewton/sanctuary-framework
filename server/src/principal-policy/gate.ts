@@ -31,6 +31,7 @@ import {
   NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
   NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
   NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
+  NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS,
 } from "./loader.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
@@ -77,6 +78,10 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
+  // Verascore publish: a Tier 3 listing in an on-disk policy was written by
+  // Sanctuary's own pre-1.9.0 default, not chosen by the operator, so it is
+  // not honored (see the set's comment in loader.ts).
+  ...NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS,
 ] as const;
 
 /**

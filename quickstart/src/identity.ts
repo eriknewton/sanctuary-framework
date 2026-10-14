@@ -67,3 +67,30 @@ export function signBytes(
   const sig = ed25519.sign(message, priv);
   return toBase64url(sig);
 }
+
+/**
+ * True when `value` is a usable saved identity: the three string fields are
+ * present, the private key derives the public key, and the DID is the one
+ * that public key encodes. A saved file that fails this is left untouched by
+ * the caller (never repaired or overwritten in place).
+ */
+export function isValidIdentity(value: unknown): value is QuickstartIdentity {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (
+    typeof v.did !== "string" ||
+    typeof v.publicKey !== "string" ||
+    typeof v.privateKey !== "string"
+  ) {
+    return false;
+  }
+  try {
+    const pub = fromBase64url(v.publicKey);
+    const derived = ed25519.getPublicKey(fromBase64url(v.privateKey));
+    return (
+      toBase64url(derived) === v.publicKey && publicKeyToDid(pub) === v.did
+    );
+  } catch {
+    return false;
+  }
+}

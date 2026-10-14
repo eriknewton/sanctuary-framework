@@ -357,6 +357,7 @@ Publish your agent's Sovereignty Health Report to [Verascore](https://verascore.
    - target_url: "https://verascore.ai/api/publish"
    - The tool will sign the payload with your Ed25519 key
    - DID verification ensures only you can publish your reputation
+   - From Sanctuary 1.9.0 this call waits for operator approval before anything is sent
 3. Your agent now has a public, verifiable reputation page on verascore.ai
 """
 ```
@@ -387,7 +388,7 @@ You are a research coordinator managing three subagents.
 
 4. Export portable reputation for inter-agent negotiation:
    - Call sanctuary/reputation_export to create a signed artifact
-   - Publish to Verascore via sanctuary/reputation_publish
+   - Publish to Verascore via sanctuary/reputation_publish (from Sanctuary 1.9.0 the operator approves it first)
 """
 ```
 

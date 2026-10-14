@@ -124,7 +124,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 **Uninstall.** `sanctuary uninstall` removes Sanctuary's installed enforcement footprint and preserves the fortress state, keys, passphrase custody, recovery material, and audit log; it refuses `--remove-operator-data` by design, and it reports any residue that needs sudo, the Castle Wall host app, or a reboot rather than reporting a clean uninstall while that residue remains. `sanctuary protect --unwrap` restores the original harness config from `~/.sanctuary/backup/` and removes nothing else. Enforcement footprint: `uninstall`. Harness config: `--unwrap`. Operator data stays in place under both.
 
-`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption and publishes to verascore.ai by default. It is not Sanctuary's custody path and is not needed to install Sanctuary.
+`@sanctuary-framework/quickstart` on npm is a separate demo package for the Verascore publish flow: it keeps its demo key in a local file outside the fortress encryption. From quickstart 0.2.0 (unreleased; 0.1.x publishes on every run) it publishes to verascore.ai only when you choose to: it shows the request and asks first in a terminal, publishes without asking only with `--publish`, and never publishes with `--no-publish` or when run without a terminal. It is not Sanctuary's custody path and is not needed to install Sanctuary.
 
 ---
 

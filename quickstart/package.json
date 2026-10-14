@@ -1,7 +1,7 @@
 {
   "name": "@sanctuary-framework/quickstart",
-  "version": "0.1.0",
-  "description": "Zero-friction agent onboarding for Sanctuary Framework. Generate an Ed25519 identity and publish a sovereign agent profile to Verascore in under 60 seconds.",
+  "version": "0.2.0",
+  "description": "Zero-friction agent onboarding for Sanctuary Framework. Generate a local Ed25519 identity in seconds and, only if you choose, publish a signed agent profile to Verascore.",
   "type": "module",
   "bin": {
     "sanctuary-quickstart": "./dist/index.js"
