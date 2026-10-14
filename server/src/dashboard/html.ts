@@ -1,5 +1,5 @@
 /**
- * Sanctuary Dashboard — Single-Page HTML
+ * Sanctuary Dashboard: Single-Page HTML
  *
  * Hero shield + four layer cards + live activity feed + approval queue +
  * audit trail. Vanilla HTML/CSS/JS in one string, matching the convention
@@ -10,6 +10,8 @@
  */
 
 import type { ProtectionSnapshot } from "./aggregator.js";
+import { CONSOLE_FONT_FACE_CSS } from "./design-fonts.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "./design-tokens.js";
 import {
   PROTECTION_HERO_COPY,
   protectionHeroCopyForLight,
@@ -39,6 +41,13 @@ function escHtml(value: unknown): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+// must match shieldStatusMarkForLight in this file's embedded client script.
+function shieldStatusMark(light: string): string {
+  if (light === "green") return "M85 102 L96 113 L118 90";
+  if (light === "yellow") return "M100 78 L122 120 L78 120 Z";
+  return "M84 84 L116 116 M116 84 L84 116";
 }
 
 function layerCard(
@@ -244,35 +253,24 @@ export function renderDashboardHTML(options: DashboardHTMLOptions): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sanctuary — Sovereignty Dashboard</title>
+<title>Sanctuary: Sovereignty Dashboard</title>
+<script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
-:root {
-  --bg: #07080c;
-  --bg-2: #0f1220;
-  --surface: #131729;
-  --surface-2: #1a1f36;
-  --border: #26304d;
-  --border-strong: #39436a;
-  --ink: #eef1fb;
-  --ink-dim: #b9c0dc;
-  --ink-mute: #7e86a8;
-  --indigo: #6e7bff;
-  --indigo-deep: #3b4ad8;
-  --green: #3ee08f;
-  --green-deep: #168a4d;
-  --amber: #f1c05a;
-  --red: #ff6b7a;
-  --violet: #a77bff;
-  --radius: 14px;
-  --radius-sm: 8px;
-  --shadow: 0 14px 42px rgba(3, 6, 19, 0.45);
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
+/* Slice 2b: this page reads the server's design tokens and bundled faces
+   (design-tokens.ts, design-fonts.ts), the same block the console shell
+   interpolates, and follows the console's light or dark choice through the
+   head bootstrap above. It declares no palette, font stack or radius of its
+   own. State marks carry a shape per state as well as a hue (circle pass,
+   triangle warn, square fault, hollow dotted ring unknown), and a control's
+   edge is --ink-3, which clears 3:1 on every fill in both themes. */
+${CONSOLE_FONT_FACE_CSS}
+${PAPER_INK_ROOT_TOKENS_CSS}
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; min-height: 100vh; -webkit-font-smoothing: antialiased; }
-body { background: radial-gradient(circle at 50% -200px, rgba(110, 123, 255, 0.18), transparent 60%), var(--bg); }
-a { color: var(--indigo); text-decoration: none; }
+html, body { background: var(--paper); color: var(--ink); font-family: var(--sans); min-height: 100vh; -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
 button { font: inherit; cursor: pointer; }
+:is(a, button, summary):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 32px 120px; }
 
@@ -281,8 +279,9 @@ button { font: inherit; cursor: pointer; }
   display: flex;
   justify-content: space-between;
   align-items: center;
-  color: var(--ink-mute);
-  font-size: 12px;
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   margin-bottom: 8px;
@@ -290,13 +289,11 @@ button { font: inherit; cursor: pointer; }
 .meta-row .mode-pill {
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--rule);
   background: var(--surface);
-  font-family: var(--mono);
   text-transform: none;
   letter-spacing: 0;
-  font-size: 11px;
-  color: var(--ink-dim);
+  color: var(--ink-2);
 }
 
 /* ── Hero ─────────────────────────────────────────────────────── */
@@ -306,69 +303,35 @@ button { font: inherit; cursor: pointer; }
   align-items: center;
   text-align: center;
   padding: 48px 24px 56px;
-  border-radius: 22px;
-  background:
-    radial-gradient(circle at 50% 0%, rgba(62, 224, 143, 0.08), transparent 70%),
-    linear-gradient(180deg, var(--bg-2) 0%, var(--surface) 100%);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow);
+  border-radius: var(--rad-lg);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   margin-bottom: 32px;
-  position: relative;
-  overflow: hidden;
 }
-.hero::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(circle at 50% 100%, rgba(110, 123, 255, 0.10), transparent 60%);
-  pointer-events: none;
-}
-.shield {
-  width: 200px;
-  height: 200px;
-  position: relative;
-  filter: drop-shadow(0 16px 32px rgba(62, 224, 143, 0.18));
-  animation: hero-in 600ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-@keyframes hero-in {
-  from { opacity: 0; transform: translateY(12px) scale(0.96); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
+.shield { width: 200px; height: 200px; position: relative; }
 .shield svg { width: 100%; height: 100%; display: block; }
-.shield.green .shield-ring { stroke: var(--green); }
-.shield.green .shield-core { fill: rgba(62, 224, 143, 0.14); }
-.shield.green .shield-mark { stroke: var(--green); }
-.shield.yellow .shield-ring { stroke: var(--amber); }
-.shield.yellow .shield-core { fill: rgba(241, 192, 90, 0.14); }
-.shield.yellow .shield-mark { stroke: var(--amber); }
-.shield.red .shield-ring { stroke: var(--red); }
-.shield.red .shield-core { fill: rgba(255, 107, 122, 0.16); }
-.shield.red .shield-mark { stroke: var(--red); }
-.shield .shield-ring {
-  fill: none;
-  stroke-width: 3;
-  stroke-dasharray: 600;
-  stroke-dashoffset: 0;
-  transform-origin: center;
-  transition: stroke 320ms ease;
-}
-.shield .shield-ring-bg { fill: none; stroke: rgba(255, 255, 255, 0.06); stroke-width: 3; }
-.shield .shield-mark { fill: none; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; transition: stroke 320ms ease; }
+.shield .shield-core { fill: transparent; }
+.shield.green .shield-ring, .shield.green .shield-mark { stroke: var(--sage); }
+.shield.green .shield-core { fill: var(--sage-bg); }
+.shield.yellow .shield-ring, .shield.yellow .shield-mark { stroke: var(--ochre); }
+.shield.yellow .shield-core { fill: var(--ochre-bg); }
+.shield.red .shield-ring, .shield.red .shield-mark { stroke: var(--rust); }
+.shield.red .shield-core { fill: var(--rust-bg); }
+.shield .shield-ring { fill: none; stroke-width: 3; }
+.shield .shield-ring-bg { fill: none; stroke: var(--rule); stroke-width: 3; }
+.shield .shield-mark { fill: none; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
 
 .hero h1 {
+  font-family: var(--display);
   font-size: 40px;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.02em;
   margin-top: 28px;
-  position: relative;
-  z-index: 1;
 }
 .hero .hero-sub {
   margin-top: 10px;
-  color: var(--ink-dim);
-  font-size: 15px;
-  position: relative;
-  z-index: 1;
+  color: var(--ink-2);
+  font-size: var(--text-md);
 }
 .identity-line {
   margin-top: 22px;
@@ -377,26 +340,23 @@ button { font: inherit; cursor: pointer; }
   gap: 10px;
   padding: 10px 18px;
   border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(19, 23, 41, 0.7);
+  border: 1px solid var(--rule);
+  background: var(--surface-2);
   font-family: var(--mono);
-  font-size: 13px;
-  color: var(--ink-dim);
-  position: relative;
-  z-index: 1;
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
-.identity-line .name { color: var(--ink); font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif; letter-spacing: 0; }
-.identity-line .sep { color: var(--ink-mute); }
-.identity-line .did { color: var(--violet); }
+.identity-line .name { color: var(--ink); font-weight: 600; font-family: var(--sans); letter-spacing: 0; }
+.identity-line .sep { color: var(--ink-3); }
+.identity-line .did { color: var(--ink-2); }
 .identity-line .primary-flag {
   padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(110, 123, 255, 0.16);
+  background: var(--indigo-bg);
   color: var(--indigo);
-  font-size: 11px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif;
 }
 
 /* ── Layer grid ───────────────────────────────────────────────── */
@@ -411,70 +371,73 @@ button { font: inherit; cursor: pointer; }
 
 .layer-card {
   padding: 20px;
-  border-radius: var(--radius);
+  border-radius: var(--rad-lg);
   background: var(--surface);
-  border: 1px solid var(--border);
-  transition: border 220ms ease, transform 220ms ease;
+  border: 1px solid var(--rule);
 }
-.layer-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
-
+.layer-card:hover { border-color: var(--rule-2); }
 .layer-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
-.layer-dot { width: 12px; height: 12px; border-radius: 50%; margin-top: 6px; background: var(--ink-mute); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04); }
-.layer-full .layer-dot { background: var(--green); box-shadow: 0 0 0 3px rgba(62, 224, 143, 0.18); }
-.layer-degraded .layer-dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(241, 192, 90, 0.18); }
-.layer-compromised .layer-dot { background: var(--red); box-shadow: 0 0 0 3px rgba(255, 107, 122, 0.18); }
-.layer-head h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim); margin-bottom: 4px; }
-.layer-headline { font-size: 15px; color: var(--ink); line-height: 1.35; }
+/* One shape per layer state: the pass circle (full), the warn triangle
+   (degraded), the fault square (compromised), and the hollow dotted unknown
+   ring for any state this page does not know. The headline names it too. */
+.layer-dot { width: 12px; height: 12px; flex: none; margin-top: 6px; box-sizing: border-box; border-radius: 50%; background: transparent; border: 2px dotted var(--slate); }
+.layer-full .layer-dot { background: var(--sage); border: 0; }
+.layer-degraded .layer-dot { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.layer-compromised .layer-dot { background: var(--rust); border: 0; border-radius: 0; }
+.layer-head h3 { font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-2); margin-bottom: 4px; }
+.layer-headline { font-size: var(--text-md); color: var(--ink); line-height: 1.35; }
 
 .layer-detail { display: flex; flex-direction: column; gap: 8px; }
-.layer-detail > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
-.layer-detail dt { color: var(--ink-mute); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
-.layer-detail dd { color: var(--ink-dim); text-align: right; font-family: var(--mono); font-size: 12px; }
+.layer-detail > div { display: flex; justify-content: space-between; gap: 12px; font-size: var(--text-sm); }
+.layer-detail dt { color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; font-size: var(--text-xs); }
+.layer-detail dd { color: var(--ink-2); text-align: right; font-family: var(--mono); font-size: var(--text-sm); }
 
-.layer-cta { margin-top: 6px; text-align: center; padding: 16px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); }
+.layer-cta { margin-top: 6px; text-align: center; padding: 16px; border-radius: var(--rad); background: var(--paper-2); border: 1px solid var(--rule); }
 .score-block { display: flex; flex-direction: column; gap: 2px; }
-.score-value { font-size: 28px; font-weight: 650; color: var(--green); letter-spacing: -0.02em; }
-.score-label { font-size: 11px; text-transform: uppercase; color: var(--ink-mute); letter-spacing: 0.08em; }
-.claim-block { font-size: 13px; color: var(--violet); }
+/* The score is a number, not a verdict: it wears the ink, never the pass hue. */
+.score-value { font-family: var(--display); font-size: 28px; font-weight: 600; color: var(--ink); letter-spacing: -0.02em; }
+.score-label { font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; color: var(--ink-3); letter-spacing: 0.08em; }
+.claim-block { font-size: var(--text-sm); }
 
 /* ── L4 evidence widget (v0.9.1) ──────────────────────────────── */
-.l4-evidence { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.l4-evidence { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--rule); }
 .l4-evidence-summary { gap: 6px; margin-bottom: 10px; }
 .l4-evidence-summary dt { font-size: 10px; }
-.l4-evidence-summary dd { font-size: 11px; }
+.l4-evidence-summary dd { font-size: var(--text-xs); }
 .l4-deg-list { list-style: none; display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-.l4-deg { padding: 8px 10px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); font-size: 12px; }
+.l4-deg { padding: 8px 10px; border-radius: var(--rad); background: var(--paper-2); border: 1px solid var(--rule); font-size: var(--text-sm); }
 .l4-deg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 3px; }
-.l4-deg-code { font-family: var(--mono); font-size: 11px; color: var(--ink); letter-spacing: 0.02em; }
-.l4-deg-sev { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-mute); }
-.l4-deg-warning { border-color: rgba(241, 192, 90, 0.4); }
-.l4-deg-warning .l4-deg-sev { color: var(--amber); }
-.l4-deg-critical { border-color: rgba(255, 107, 122, 0.5); }
-.l4-deg-critical .l4-deg-sev { color: var(--red); }
+.l4-deg-code { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink); letter-spacing: 0.02em; }
+.l4-deg-sev { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); }
+.l4-deg-warning { border-color: var(--ochre-line); }
+.l4-deg-warning .l4-deg-sev { color: var(--ochre); }
+.l4-deg-critical { border-color: var(--rust-line); }
+.l4-deg-critical .l4-deg-sev { color: var(--rust); }
 .l4-deg-info .l4-deg-sev { color: var(--indigo); }
-.l4-deg-desc { color: var(--ink-dim); line-height: 1.35; font-size: 11px; }
-.l4-deg-mit { color: var(--ink-mute); line-height: 1.35; font-size: 10px; margin-top: 3px; font-style: italic; }
+.l4-deg-desc { color: var(--ink-2); line-height: 1.35; font-size: var(--text-xs); }
+.l4-deg-mit { color: var(--ink-3); line-height: 1.35; font-size: 10px; margin-top: 3px; font-style: italic; }
 
 /* ── Section headers ─────────────────────────────────────────── */
 .section { margin-bottom: 28px; }
 .section h2 {
-  font-size: 13px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  color: var(--ink-dim);
+  color: var(--ink-2);
   margin-bottom: 12px;
   display: flex;
   align-items: center;
   gap: 12px;
 }
-.section h2 .count {
+.section h2 .count, details.audit-details summary .count {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   padding: 2px 8px;
   border-radius: 999px;
   background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--ink-mute);
+  border: 1px solid var(--rule);
+  color: var(--ink-3);
   text-transform: none;
   letter-spacing: 0;
 }
@@ -484,95 +447,98 @@ button { font: inherit; cursor: pointer; }
 .approval {
   padding: 16px;
   background: var(--surface);
-  border: 1px solid var(--amber);
-  border-radius: var(--radius);
-  box-shadow: 0 0 0 1px rgba(241, 192, 90, 0.18);
-  animation: fade-up 260ms ease both;
+  border: 1px solid var(--ochre);
+  border-radius: var(--rad-lg);
 }
-@keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-.approval-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 14px; }
-.tier-chip { padding: 2px 8px; border-radius: 999px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; font-family: -apple-system, Inter, sans-serif; }
-.tier-chip.tier-1 { background: rgba(255, 107, 122, 0.16); color: var(--red); }
-.tier-chip.tier-2 { background: rgba(241, 192, 90, 0.16); color: var(--amber); }
-.approval-reason { font-size: 13px; color: var(--ink-dim); margin-bottom: 12px; }
+.approval-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: var(--text-base); }
+.tier-chip { padding: 2px 8px; border-radius: 999px; font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+.tier-chip.tier-1 { background: var(--rust-bg); color: var(--rust); }
+.tier-chip.tier-2 { background: var(--ochre-bg); color: var(--ochre); }
+.approval-reason { font-size: var(--text-sm); color: var(--ink-2); margin-bottom: 12px; }
 .approval-actions { display: flex; gap: 8px; }
 .btn {
   padding: 7px 14px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface-2);
+  border-radius: var(--rad);
+  border: 1px solid var(--ink-3);
+  background: var(--surface);
   color: var(--ink);
-  font-size: 13px;
-  transition: all 160ms ease;
+  font-size: var(--text-sm);
 }
-.btn:hover { border-color: var(--border-strong); background: #202641; }
-.btn-allow { background: var(--green-deep); border-color: var(--green-deep); color: white; }
-.btn-allow:hover { background: #1ba25b; border-color: #1ba25b; }
-.btn-deny { background: transparent; border-color: var(--red); color: var(--red); }
-.btn-deny:hover { background: rgba(255, 107, 122, 0.1); border-color: var(--red); }
+.btn:hover { border-color: var(--ink-2); background: var(--surface-2); }
+.btn-allow { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.btn-allow:hover { background: var(--ink-2); border-color: var(--ink-2); }
+/* Deny is the danger style: bad text and a bad-hue edge, never a red fill. */
+.btn-deny { background: transparent; border-color: var(--rust); color: var(--rust); }
+.btn-deny:hover { background: var(--rust-bg); border-color: var(--rust); }
 
 /* ── Tables ──────────────────────────────────────────────────── */
-.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--border); }
-.panel-head h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-dim); }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad-lg); overflow: hidden; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--rule); }
+.panel-head h3 { font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-2); }
 .privacy-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-.privacy-metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; }
-.privacy-metric dt { color: var(--ink-mute); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
-.privacy-metric dd { color: var(--ink); font-size: 22px; font-weight: 700; }
-.privacy-metric dd.small { font-size: 13px; font-weight: 500; color: var(--ink-dim); line-height: 1.35; overflow-wrap: anywhere; }
+.privacy-metric { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad); padding: 14px 16px; }
+.privacy-metric dt { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+.privacy-metric dd { color: var(--ink); font-family: var(--display); font-size: 22px; font-weight: 600; }
+.privacy-metric dd.small { font-family: var(--sans); font-size: var(--text-sm); font-weight: 500; color: var(--ink-2); line-height: 1.35; overflow-wrap: anywhere; }
 .privacy-classes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-.privacy-chip { border: 1px solid var(--border); color: var(--ink-dim); border-radius: 999px; padding: 4px 8px; font-size: 12px; background: rgba(255,255,255,0.03); }
+.privacy-chip { border: 1px solid var(--rule); color: var(--ink-2); border-radius: 999px; padding: 4px 8px; font-size: var(--text-sm); background: var(--surface-2); }
 .filter-row { display: flex; gap: 6px; }
 .filter-row button {
   padding: 4px 10px;
-  font-size: 11px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
   border-radius: 999px;
   background: transparent;
-  border: 1px solid var(--border);
-  color: var(--ink-mute);
+  border: 1px solid var(--ink-3);
+  color: var(--ink-2);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  transition: all 140ms ease;
 }
-.filter-row button.active, .filter-row button:hover { color: var(--ink); border-color: var(--border-strong); background: var(--surface-2); }
+.filter-row button:hover { color: var(--ink); border-color: var(--ink-2); background: var(--surface-2); }
+/* The chosen filter is the ink fill, not a shade of the same edge, so it
+   reads without color. */
+.filter-row button.active { color: var(--paper); border-color: var(--ink); background: var(--ink); }
 
 table { width: 100%; border-collapse: collapse; }
-th, td { padding: 10px 18px; text-align: left; font-size: 13px; border-bottom: 1px solid var(--border); }
-th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-mute); font-weight: 500; background: var(--bg-2); }
+th, td { padding: 10px 18px; text-align: left; font-size: var(--text-sm); border-bottom: 1px solid var(--rule); }
+th { font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); font-weight: 500; background: var(--paper-2); }
 tr:last-child td { border-bottom: none; }
-tr.empty td { text-align: center; color: var(--ink-mute); padding: 32px 18px; }
-.mono { font-family: var(--mono); font-size: 12px; }
-.time { color: var(--ink-mute); white-space: nowrap; }
-.tier { text-align: center; font-family: var(--mono); font-size: 11px; font-weight: 600; }
-.tier-1 { color: var(--red); }
-.tier-2 { color: var(--amber); }
-.tier-3 { color: var(--green); }
-.result { font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
-.result-allowed, .result-success { color: var(--green); }
-.result-denied, .result-failure { color: var(--red); }
+tr.empty td { text-align: center; color: var(--ink-3); padding: 32px 18px; }
+.mono { font-family: var(--mono); font-size: var(--text-sm); }
+.time { color: var(--ink-3); white-space: nowrap; }
+.tier { text-align: center; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; }
+.tier-1 { color: var(--rust); }
+.tier-2 { color: var(--ochre); }
+.tier-3 { color: var(--sage); }
+.result { font-family: var(--mono); font-size: var(--text-sm); text-transform: uppercase; letter-spacing: 0.06em; }
+.result-allowed, .result-success { color: var(--sage); }
+.result-denied, .result-failure { color: var(--rust); }
 .result-approved { color: var(--indigo); }
-.result-pending { color: var(--amber); }
-.layer-pill { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-dim); display: inline-block; }
+.result-pending { color: var(--ochre); }
+.layer-pill { font-family: var(--mono); font-size: var(--text-xs); padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); display: inline-block; }
 
 /* ── Upstream servers ────────────────────────────────────────── */
 .server-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
-.server-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
-.server-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-mute); }
-.server-row.state-connected .server-dot { background: var(--green); }
-.server-row.state-connecting .server-dot { background: var(--amber); }
-.server-row.state-disconnected .server-dot, .server-row.state-error .server-dot { background: var(--red); }
-.server-meta { margin-left: auto; font-size: 12px; color: var(--ink-mute); font-family: var(--mono); }
+.server-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad); font-size: var(--text-sm); }
+/* One shape per connection state: the pass circle (connected), the warn
+   triangle (connecting), the fault square (disconnected or error), the
+   hollow dotted unknown ring for anything else. The state word follows. */
+.server-dot { width: 8px; height: 8px; flex: none; box-sizing: border-box; border-radius: 50%; background: transparent; border: 1.5px dotted var(--slate); }
+.server-row.state-connected .server-dot { background: var(--sage); border: 0; }
+.server-row.state-connecting .server-dot { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.server-row.state-disconnected .server-dot, .server-row.state-error .server-dot { background: var(--rust); border: 0; border-radius: 0; }
+.server-meta { margin-left: auto; font-size: var(--text-sm); color: var(--ink-3); font-family: var(--mono); }
 
-.empty-block { padding: 18px; color: var(--ink-mute); text-align: center; font-size: 13px; background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+.empty-block { padding: 18px; color: var(--ink-3); text-align: center; font-size: var(--text-sm); background: var(--surface); border: 1px dashed var(--rule-2); border-radius: var(--rad); }
 
 /* ── Audit collapsible ───────────────────────────────────────── */
-details.audit-details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+details.audit-details { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad-lg); overflow: hidden; }
 details.audit-details summary { cursor: pointer; list-style: none; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; }
 details.audit-details summary::-webkit-details-marker { display: none; }
-details.audit-details summary h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-dim); }
-details.audit-details summary .caret { color: var(--ink-mute); font-family: var(--mono); }
+details.audit-details summary h3 { font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-2); }
+details.audit-details summary .caret { color: var(--ink-3); font-family: var(--mono); }
 details.audit-details[open] .caret { transform: rotate(90deg); display: inline-block; }
-details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 12px; border-bottom: 1px solid var(--border); }
+details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 12px; border-bottom: 1px solid var(--rule); }
 </style>
 </head>
 <body>
@@ -587,9 +553,9 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
       <svg viewBox="0 0 200 200" aria-hidden="true">
         <circle class="shield-ring-bg" cx="100" cy="100" r="92"></circle>
         <circle class="shield-ring" cx="100" cy="100" r="92"></circle>
-        <circle class="shield-core" cx="100" cy="100" r="80" fill="rgba(255,255,255,0.02)"></circle>
+        <circle class="shield-core" cx="100" cy="100" r="80" fill="none"></circle>
         <path class="shield-mark" d="M100 52 L132 68 L132 108 C132 130 118 144 100 150 C82 144 68 130 68 108 L68 68 Z"></path>
-        <path class="shield-mark" d="M85 102 L96 113 L118 90"></path>
+        <path class="shield-mark" id="shield-status-mark" d="${escHtml(shieldStatusMark(overall.light))}"></path>
       </svg>
     </div>
     <h1 id="hero-copy">${escHtml(heroCopy)}</h1>
@@ -705,12 +671,20 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   function heroCopyForLight(light) {
     return light === "green" ? HERO_COPY_TEXT : NON_GREEN_HERO_COPY_TEXT;
   }
+  // must match shieldStatusMark in server/src/dashboard/html.ts.
+  function shieldStatusMarkForLight(light) {
+    if (light === "green") return "M85 102 L96 113 L118 90";
+    if (light === "yellow") return "M100 78 L122 120 L78 120 Z";
+    return "M84 84 L116 116 M116 84 L84 116";
+  }
 
   function renderShield(light, headline) {
     const shield = document.getElementById("shield");
     if (!shield) return;
     shield.classList.remove("green", "yellow", "red");
     shield.classList.add(light);
+    const mark = document.getElementById("shield-status-mark");
+    if (mark) mark.setAttribute("d", shieldStatusMarkForLight(light));
     document.getElementById("hero-copy").textContent = heroCopyForLight(light);
     document.getElementById("hero-sub").textContent = headline;
   }

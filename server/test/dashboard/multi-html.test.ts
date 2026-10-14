@@ -9,6 +9,9 @@
 
 import { describe, it, expect } from "vitest";
 import { renderMultiAgentHTML } from "../../src/dashboard/multi-html.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../../src/dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../../src/dashboard/design-fonts.js";
+import { cssRules, inlineStyle, ownStyleProblems } from "./console-style-helpers.js";
 import type {
   MultiTenantSnapshot,
   MultiTenantTenantRow,
@@ -57,7 +60,10 @@ describe("renderMultiAgentHTML", () => {
     const html = renderMultiAgentHTML({ snapshot: snapshot() });
     expect(html).toContain("Multi-Agent Overview");
     expect(html).toContain("No tenants found");
-    expect(html).toContain("sanctuary wrap");
+    // Retargeted (slice 2b): retired vocabulary. The user-facing verb is
+    // Protect, and `sanctuary protect` runs the same command as the old name.
+    expect(html).toContain("sanctuary protect");
+    expect(html).not.toMatch(/sanctuary wrap\b/);
   });
 
   it("renders a running tenant with a deep-link to its dashboard", () => {
@@ -200,5 +206,36 @@ describe("renderMultiAgentHTML", () => {
 
     const html2 = renderMultiAgentHTML({ snapshot: snapshot() });
     expect(html2).toContain("0 tenants discovered");
+  });
+});
+
+// Slice 2b: the multi-agent overview reads the console design system (the
+// server tokens and the bundled faces), and its status pills carry a shape
+// beside the word.
+describe("renderMultiAgentHTML reads the console design system", () => {
+  const shared = { fonts: CONSOLE_FONT_FACE_CSS, tokens: PAPER_INK_ROOT_TOKENS_CSS };
+
+  it("carries the token block, the bundled faces and the theme bootstrap, and no palette or font of its own", () => {
+    for (const tenants of [[], [row({ name: "a", running: true }), row({ name: "b" })]]) {
+      const html = renderMultiAgentHTML({ snapshot: snapshot(tenants) });
+      expect(ownStyleProblems(html, shared)).toEqual([]);
+      expect(html).toContain(`<script>${THEME_BOOTSTRAP_SCRIPT}</script>`);
+      expect(html).toMatch(/font-family: var\(--sans\)/);
+    }
+  });
+
+  it("its title and heading have no em-dash", () => {
+    const html = renderMultiAgentHTML({ snapshot: snapshot() });
+    expect(html).toContain("<title>Sanctuary: Multi-Agent Overview</title>");
+    expect(html).not.toMatch(/<h1[^>]*>[^<]*\u2014/);
+  });
+
+  it("the running, stopped, unconfirmed and empty pills each carry their own mark shape", () => {
+    const rules = cssRules(inlineStyle(renderMultiAgentHTML({ snapshot: snapshot() })));
+    const decls = (sel: string) => new Map(rules.filter((r) => r.selector === sel).flatMap((r) => r.decls));
+    const shapes = [".pill-running::before", ".pill-stopped::before", ".pill-unconfirmed::before", ".pill-empty::before"]
+      .map((s) => ["clip-path", "border-radius", "height"].map((k) => decls(s).get(k) ?? "").join("|"));
+    for (const s of shapes) expect(s).not.toBe("||");
+    expect(new Set(shapes).size).toBe(4);
   });
 });
