@@ -287,7 +287,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(html).toContain("waiting approvals hidden");
   });
 
-  it("the approval queue's element id exists once on the Approvals screen", async () => {
+  it("the approval queue's element id lives only on the Approvals screen", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
@@ -295,9 +295,10 @@ describe("slice 2 shell wired consumers", () => {
     const doc = h.el.main!.innerHTML + h.el.fortress!.innerHTML;
     expect(doc.match(/id="approval-queue"/g) ?? []).toHaveLength(1);
     expect(h.el.main!.innerHTML).toContain('id="approval-queue"');
-    // Beside Talk's full page the column shows, and carries the queue.
+    // The right rail links to Approvals and no longer duplicates the queue controls.
     h.navigate("dashboard");
-    expect(h.el.fortress!.innerHTML).toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).not.toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).toContain("Open Approvals");
   });
 
   it("the Enforcement egress line shows an absent kernel count as Unknown, never 0", async () => {
@@ -464,7 +465,81 @@ describe("slice 2 shell wired consumers", () => {
     // is unchanged. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");
+    expect(main).toContain("Allow always asks Sanctuary to add a standing rule through the existing policy-change path; if that path is not configured, it is disabled and your policy is unchanged.");
+  });
+
+  it("Approvals renders grouped waiting and decided rows with filters and a selected drawer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", operation_category: "state_export", created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "decided-1", operation_category: "state_export", created_at: "2026-10-14T15:30:00.000Z", resolved: true, resolution: { action: "approve", decided_by: "Erik", audit_entry_id: "1,271", decided_at: "2026-10-14T15:35:00.000Z" } },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("State:");
+    expect(main).toContain("Agent:");
+    expect(main).toContain("Tier:");
+    expect(main).toContain("Category:");
+    expect(main).toContain("Waiting on you");
+    expect(main).toContain("oldest wait");
+    expect(main).toContain("Decided");
+    expect(main).toContain("showing 2 of 2");
+    expect(main).toContain("Selected approval");
+    expect(main).toContain("What it wants to do");
+    expect(main).toContain("Why it is held");
+    expect(main).toContain("If you decide");
+    expect(main).toContain("recorded in the audit log");
+    expect(main).toContain("entry 1,271");
+  });
+
+  it("Approvals drawer renders hostile agent context as literal unverified text", async () => {
+    vi.useFakeTimers();
+    const hostile = '<img src=x onerror="alert(1)">';
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }, { kind: "agent_context", value: hostile }] },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Agent-supplied text. Not verified. Shown as data.");
+    expect(main).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(main).not.toContain(hostile);
+  });
+
+  it("Approvals disables the standing-rule checkbox when policy activation is unavailable", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({}, 503)),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Always allow is unavailable");
+    expect(main).toContain("Policy engine is not configured on this fortress.");
+    expect(main).toContain('data-action="approval-always-allow" disabled');
+    expect(main).not.toContain('data-action="inbox-promote"');
+  });
+
+  it("Approvals drawer buttons still use the existing inbox decision path", async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", operation_category: "state_export" }] } })),
+      "/api/hub/inbox/wait-1/approve": () => { calls.push("/api/hub/inbox/wait-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+      "/api/hub/inbox/wait-1/deny": () => { calls.push("/api/hub/inbox/wait-1/deny"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain('data-approval-primary="wait-1" data-action="inbox-approve"');
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
+    await settle();
+    expect(calls).toEqual(["/api/hub/inbox/wait-1/approve", "/api/hub/inbox/wait-1/deny"]);
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
