@@ -120,6 +120,8 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield yellow"/);
+    expect(html).toContain('id="shield-status-mark" d="M100 78 L122 120 L78 120 Z"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
   });
 
   it("applies the correct shield color class for red status", () => {
@@ -129,6 +131,8 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield red"/);
+    expect(html).toContain('id="shield-status-mark" d="M84 84 L116 116 M116 84 L84 116"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
   });
 
   it("renders the hero copy from the exported HERO_COPY constant", () => {

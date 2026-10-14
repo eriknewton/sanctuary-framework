@@ -26,7 +26,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  redirected: false,
+  type: "basic",
+  json: async () => body,
+  ...init,
+});
 const never = () => new Promise<never>(() => {});
 const home = (digest: Record<string, unknown> = {}) => ({
   origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest,
@@ -41,14 +48,25 @@ const emptyData = { data: { configured: false, surfaces: [], agents: [], items: 
 class FakeElement {
   attrs: Record<string, string>;
   parentElement: FakeElement | null = null;
-  innerHTML = "";
-  textContent = "";
+  tagName: string;
+  private children: Array<FakeElement | FakeText> = [];
+  private html = "";
+  private text = "";
   className = "";
   hidden = false;
   disabled = false;
   value = "";
   private classes = new Set<string>();
-  constructor(attrs: Record<string, string> = {}) { this.attrs = { ...attrs }; }
+  constructor(attrs: Record<string, string> = {}, tagName = "DIV") { this.attrs = { ...attrs }; this.tagName = tagName.toUpperCase(); }
+  get innerHTML() { return this.children.length ? this.children.map((c) => c.outerHTML).join("") : this.html; }
+  set innerHTML(value: string) { this.html = String(value); this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((c) => c.textContent).join("") : this.text; }
+  set textContent(value: string) { this.text = String(value); this.html = escapeHtml(String(value)); this.children = []; }
+  get outerHTML() {
+    const merged = this.className ? { ...this.attrs, class: this.className } : this.attrs;
+    const attrs = Object.entries(merged).map(([k, v]) => ` ${k}="${escapeHtml(v)}"`).join("");
+    return `<${this.tagName.toLowerCase()}${attrs}>${this.innerHTML}</${this.tagName.toLowerCase()}>`;
+  }
   classList = {
     add: (...n: string[]) => n.forEach((c) => this.classes.add(c)),
     remove: (...n: string[]) => n.forEach((c) => this.classes.delete(c)),
@@ -63,14 +81,34 @@ class FakeElement {
   querySelector() { return null; }
   querySelectorAll() { return []; }
   contains() { return false; }
+  appendChild(child: FakeElement | FakeText) { this.children.push(child); return child; }
+  append(...children: Array<FakeElement | FakeText | string>) {
+    children.forEach((child) => this.appendChild(typeof child === "string" ? new FakeText(child) : child));
+  }
+  replaceChildren(...children: Array<FakeElement | FakeText | string>) {
+    this.children = [];
+    this.html = "";
+    this.text = "";
+    this.append(...children);
+  }
   focus() {}
 }
+class FakeText {
+  textContent: string;
+  constructor(value: string) { this.textContent = String(value); }
+  get outerHTML() { return escapeHtml(this.textContent); }
+}
 class FakeInput extends FakeElement {}
+
+function escapeHtml(raw: string) {
+  return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
 const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
+  "machines-summary", "machines-age", "machines-list",
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
@@ -87,6 +125,8 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     document: {
       getElementById: (id: string) => el[id] || (id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: "/api/hub" }) } : null),
       addEventListener: (name: string, fn: (ev: unknown) => void) => { docListeners[name] = fn; },
+      createElement: (tagName: string) => new FakeElement({}, tagName),
+      createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [], activeElement: null,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
@@ -477,6 +517,8 @@ describe("slice 2b shell wired consumers", () => {
   });
   const textOf = (html: string) => html.replace(/<[^>]*>/g, " ").replace(/&[a-z#0-9]+;/gi, " ");
   const attrsOf = (html: string) => [...html.matchAll(/\s(?:title|aria-label|placeholder)="([^"]*)"/g)].map((m) => m[1]!);
+  const machinesHtml = (h: ReturnType<typeof boot>) =>
+    h.el["machines-summary"]!.innerHTML + h.el["machines-list"]!.innerHTML;
 
   it("Machines renders the saved fleet with its denominator and check age, and an unanswered machine is Unknown, never online", async () => {
     vi.useFakeTimers();
@@ -486,7 +528,7 @@ describe("slice 2b shell wired consumers", () => {
     });
     const h = boot({
       "http://fixture/api/health": (init) => { probes.push({ url: "http://fixture", init }); return Promise.resolve(response({ ok: true })); },
-      "http://build-1.fixture:3501/api/health": (init) => { probes.push({ url: "build-1", init }); return Promise.resolve(response({ ok: false }, 503)); },
+      "http://build-1.fixture:3501/api/health": (init) => { probes.push({ url: "build-1", init }); return Promise.resolve(response({ ok: false })); },
       "http://mba.fixture:3501/api/health": (init) => { probes.push({ url: "mba", init }); return abortable(init); },
     }, storage([
       { name: "build-1", url: "http://build-1.fixture:3501" },
@@ -496,17 +538,17 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("machines");
     await settle();
-    let html = h.el.main!.innerHTML;
+    let html = machinesHtml(h);
     // This machine joins the three saved ones: four in the denominator.
-    expect(html).toContain("1 of 4 machines online · 1 checking · 1 not healthy · 1 Unknown");
+    expect(html).toContain("1 of 4 machines online · showing 3 of 4 machines · 1 checking · 1 not healthy · 1 Unknown");
     expect(html).toMatch(/checked \d+s ago/);
     vi.advanceTimersByTime(3000);
     await settle();
-    html = h.el.main!.innerHTML;
-    expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
+    html = machinesHtml(h);
+    expect(html).toContain("1 of 4 machines online · showing 3 of 4 machines · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
     expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
     expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
-    expect(html).toContain('data-machine-url="http://mba.fixture:3501"><span class="state-chip unknown"');
+    expect(html).toContain('<strong>erik-mba</strong><small class="mono">http://mba.fixture:3501</small>');
     // No non-web address reaches an href or a probe, and no probe carries a
     // credential to another machine.
     expect(html).not.toMatch(/href="javascript:/i);
@@ -517,16 +559,40 @@ describe("slice 2b shell wired consumers", () => {
     }
     // The rail item lights for the screen, and /fleet stays one click away.
     expect(runInContext("ROUTE_RAIL_PARENT.machines", h.context)).toBe("machines");
-    expect(html).toContain('href="/fleet"');
+    expect(h.el.main!.innerHTML).toContain('href="/fleet"');
   });
 
-  it("Check again starts a new round and a slow answer from the old round never repaints a machine", async () => {
+  it.each([
+    ["2xx ok true", response({ ok: true }), "Online", "state-chip good"],
+    ["2xx ok false", response({ ok: false }), "Not healthy", "state-chip bad"],
+    ["503 ok true", response({ ok: true }, 503), "Unknown", "state-chip unknown"],
+    ["500 ok false", response({ ok: false }, 500), "Unknown", "state-chip unknown"],
+    ["missing ok", response({}), "Unknown", "state-chip unknown"],
+    ["non-boolean ok", response({ ok: "yes" }), "Unknown", "state-chip unknown"],
+    ["redirect", response({ ok: true }, 200, { redirected: true }), "Unknown", "state-chip unknown"],
+    ["opaque redirect", response({ ok: true }, 0, { type: "opaqueredirect" }), "Unknown", "state-chip unknown"],
+    ["malformed json", { ok: true, status: 200, redirected: false, type: "basic", json: async () => { throw new Error("bad json"); } }, "Unknown", "state-chip unknown"],
+  ])("probe outcome table maps %s to %s", async (_label, health, word, cls) => {
+    vi.useFakeTimers();
+    const h = boot({ "http://fixture/api/health": () => Promise.resolve(health) }, storage([]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain(word);
+    expect(html).toContain(cls);
+    if (word === "Unknown") expect(html).toContain("0 of 1 machine online · 1 Unknown");
+  });
+
+  it("Check again aborts the previous probe wave and a slow answer from the old round never repaints a machine", async () => {
     vi.useFakeTimers();
     let release: (v: unknown) => void = () => {};
     let calls = 0;
+    let aborts = 0;
     const h = boot({
-      "http://fixture/api/health": () => {
+      "http://fixture/api/health": (init) => {
         calls++;
+        init?.signal?.addEventListener("abort", () => { aborts++; });
         if (calls === 1) return new Promise((r) => { release = r; });
         return Promise.reject(new Error("refused"));
       },
@@ -534,14 +600,83 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("machines");
     await settle();
-    expect(h.el.main!.innerHTML).toContain("0 of 1 machine online · 1 checking");
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 checking");
     h.click({ "data-action": "machines-recheck" });
     await settle();
-    expect(h.el.main!.innerHTML).toContain("0 of 1 machine online · 1 Unknown");
+    expect(aborts).toBeGreaterThan(0);
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 Unknown");
     release(response({ ok: true }));
     await settle();
-    expect(h.el.main!.innerHTML).toContain("0 of 1 machine online · 1 Unknown");
-    expect(h.el.main!.innerHTML).not.toContain("state-chip good");
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 Unknown");
+    expect(machinesHtml(h)).not.toContain("state-chip good");
+  });
+
+  it("Machines treats hostile saved entries as text and never probes or links non-web addresses", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([
+        { name: '<img src=x onerror=alert(1)>', url: 'http://safe.fixture:3501/console?name="><script>alert(1)</script>' },
+        { name: '"><script>alert(1)</script>', url: "javascript:alert(1)" },
+        { name: "data payload", url: "data:text/html,<script>alert(1)</script>" },
+        { name: "mixed scheme", url: "JaVaScRiPt:alert(1)" },
+      ]),
+      fetch: (url: string, init?: RequestInit) => {
+        fetched.push(url);
+        if (url === "http://fixture/api/health" || url === "http://safe.fixture:3501/api/health") return Promise.resolve(response({ ok: true }));
+        return Promise.resolve(response(emptyData, 200, { init }));
+      },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(h.el["machines-list"]!.textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
+    expect(html).not.toMatch(/<(?:img|script)\b/i);
+    expect(html).not.toMatch(/\sonerror="/i);
+    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/"]);
+    expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
+    expect(html.match(/Not a web address/g) ?? []).toHaveLength(3);
+  });
+
+  it("a long saved list is listed but only the named cap is probed", async () => {
+    vi.useFakeTimers();
+    const saved = Array.from({ length: 2500 }, (_, i) => ({ name: `build-${i}`, url: `http://build-${i}.fixture:3501` }));
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage(saved),
+      fetch: (url: string) => {
+        fetched.push(url);
+        return Promise.resolve(response({ ok: true }));
+      },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
+    expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
+    expect(machinesHtml(h)).toContain(`showing ${limit} of 2501 machines`);
+    expect(h.el["machines-list"]!.textContent).toContain("build-2499");
+    expect(h.el["machines-list"]!.textContent).toContain("Unprobed");
+  });
+
+  it("duplicate host-port entries share one probed row and path addresses are described as host checks", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([
+        { name: "with path", url: "http://build.fixture:3501/tenant/a" },
+        { name: "duplicate path", url: "http://build.fixture:3501/tenant/b" },
+      ]),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(fetched.filter((url) => url === "http://build.fixture:3501/api/health")).toHaveLength(1);
+    expect(machinesHtml(h)).toContain("2 of 2 machines online");
+    expect(h.el["machines-list"]!.textContent).toContain("host health check");
   });
 
   it("the Sentinels line is Unknown without a Sentinel report, however many agents are on the roster", async () => {
@@ -558,7 +693,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(m![2]).toBe("Unknown");
   });
 
-  it("no rendered screen shows the retired wrap vocabulary, and the agent controls say Lock down and Remove protection", async () => {
+  it("the exercised shell screens avoid retired wrap vocabulary, and the agent controls say Lock down and Remove protection", async () => {
     vi.useFakeTimers();
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
     const capabilities = { can_pause: true, can_resume: true, can_restart: true, can_lockdown: true, can_unwrap: false };

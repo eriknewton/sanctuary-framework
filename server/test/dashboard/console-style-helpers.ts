@@ -156,6 +156,10 @@ export const FOREIGN_FONT_NAMES = [
   "monospace", "sans-serif",
 ];
 
+function literalRegExp(raw: string): string {
+  return raw.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+}
+
 /** What a page that reads the console design system must not carry in its
  *  own CSS (its inline style minus the shared font-face and token blocks):
  *  a color literal (a palette of its own), a foreign font name, a remote
@@ -169,7 +173,7 @@ export function ownStyleProblems(html: string, shared: { fonts: string; tokens: 
   const own = style.split(shared.fonts).join("").split(shared.tokens).join("").replace(/\/\*[\s\S]*?\*\//g, "");
   for (const m of own.matchAll(/#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\(/g)) problems.push(`color literal ${m[0]}`);
   for (const name of FOREIGN_FONT_NAMES) {
-    if (new RegExp(`(^|[\\s,:"'])${name.replace(/[-]/g, "\\-")}([\\s,;"']|$)`, "m").test(own)) problems.push(`names font ${name}`);
+    if (new RegExp(`(^|[\\s,:"'])${literalRegExp(name)}([\\s,;"']|$)`, "m").test(own)) problems.push(`names font ${name}`);
   }
   if (/@import|url\(\s*["']?https?:/i.test(own) || /fonts\.googleapis|fonts\.gstatic/i.test(html)) problems.push("loads a remote font or stylesheet");
   if (/gradient\(/i.test(own)) problems.push("paints a gradient");

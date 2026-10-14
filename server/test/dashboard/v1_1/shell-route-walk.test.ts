@@ -44,7 +44,7 @@ function clientInMinimalDom() {
     },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
     sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Date,
-    Element: class {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
+    Element: class {}, setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     // Reads never settle: every screen renders its honest not-loaded state.
     fetch: pending,

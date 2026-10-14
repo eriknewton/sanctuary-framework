@@ -361,11 +361,14 @@ describe("v1.1 dashboard shell HTML", () => {
     const navMatch = html.match(/<nav id="sidebar-nav"[^>]*>[\s\S]*?<\/nav>/);
     expect(navMatch).toBeTruthy();
     expect(navMatch![0]).toMatch(/<a href="#machines" data-route="machines"[^>]*>[\s\S]*?Machines/);
-    expect(html).toContain('<a class="scope-fleet" href="#machines"');
+    expect(html).toContain('<a class="scope-fleet" href="#machines" data-action="set-route" data-route="machines"');
+    expect(html).toContain("Fleet: machines saved in this browser");
     const client = getClientScript();
     const screen = client.match(/function renderMachinesScreen\(\)[\s\S]*?\n\}\n/);
     expect(screen, "renderMachinesScreen").toBeTruthy();
     expect(screen![0]).toContain('<a href="/fleet">Fleet Switcher</a>');
+    expect(screen![0]).toContain("<h1>Machines saved in this browser.</h1>");
+    expect(screen![0]).not.toContain("Every machine" + " you run.");
   });
 
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {

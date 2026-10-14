@@ -43,6 +43,12 @@ function escHtml(value: unknown): string {
     .replace(/'/g, "&#039;");
 }
 
+function shieldStatusMark(light: string): string {
+  if (light === "green") return "M85 102 L96 113 L118 90";
+  if (light === "yellow") return "M100 78 L122 120 L78 120 Z";
+  return "M84 84 L116 116 M116 84 L84 116";
+}
+
 function layerCard(
   layer:
     | ProtectionSnapshot["layers"]["l1"]
@@ -548,7 +554,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         <circle class="shield-ring" cx="100" cy="100" r="92"></circle>
         <circle class="shield-core" cx="100" cy="100" r="80" fill="none"></circle>
         <path class="shield-mark" d="M100 52 L132 68 L132 108 C132 130 118 144 100 150 C82 144 68 130 68 108 L68 68 Z"></path>
-        <path class="shield-mark" d="M85 102 L96 113 L118 90"></path>
+        <path class="shield-mark" id="shield-status-mark" d="${escHtml(shieldStatusMark(overall.light))}"></path>
       </svg>
     </div>
     <h1 id="hero-copy">${escHtml(heroCopy)}</h1>
@@ -664,12 +670,19 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   function heroCopyForLight(light) {
     return light === "green" ? HERO_COPY_TEXT : NON_GREEN_HERO_COPY_TEXT;
   }
+  function shieldStatusMarkForLight(light) {
+    if (light === "green") return "M85 102 L96 113 L118 90";
+    if (light === "yellow") return "M100 78 L122 120 L78 120 Z";
+    return "M84 84 L116 116 M116 84 L84 116";
+  }
 
   function renderShield(light, headline) {
     const shield = document.getElementById("shield");
     if (!shield) return;
     shield.classList.remove("green", "yellow", "red");
     shield.classList.add(light);
+    const mark = document.getElementById("shield-status-mark");
+    if (mark) mark.setAttribute("d", shieldStatusMarkForLight(light));
     document.getElementById("hero-copy").textContent = heroCopyForLight(light);
     document.getElementById("hero-sub").textContent = headline;
   }

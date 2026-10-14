@@ -194,8 +194,8 @@ a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .path { color: var(--ink-3); font-size: var(--text-xs); }
 .muted { color: var(--ink-3); }
 /* Status pills carry a shape as well as a hue and a word: running is the
-   pass circle, stopped and port-answered-not-confirmed the warn triangle,
-   empty the neutral dash. */
+   pass circle, stopped is a square, port-answered-not-confirmed is the warn
+   triangle, and empty is the neutral dash. */
 .pill {
   display: inline-flex;
   align-items: center;
@@ -210,7 +210,8 @@ a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .pill-running { background: var(--sage-bg); color: var(--sage); }
 .pill-running::before { border-radius: 50%; }
 .pill-stopped, .pill-unconfirmed { background: var(--ochre-bg); color: var(--ochre); }
-.pill-stopped::before, .pill-unconfirmed::before { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.pill-stopped::before { border-radius: 0; }
+.pill-unconfirmed::before { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .pill-empty { background: var(--surface-2); color: var(--ink-3); }
 .pill-empty::before { height: 2px; border-radius: 1px; }
 footer {

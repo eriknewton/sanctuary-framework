@@ -412,7 +412,7 @@ body {
 .glyph.online { background: var(--sage); border: 0; }
 .glyph.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .glyph.away { background: var(--rust); border: 0; border-radius: 0; }
-.glyph.offline { background: var(--locked); border: 0; border-radius: 3px; }
+.glyph.offline { background: var(--locked); border: 0; border-radius: 1px; }
 .toast {
   position: fixed; bottom: 16px; right: 16px;
   background: var(--ink); color: var(--paper); padding: 8px 12px;
@@ -1023,7 +1023,7 @@ body {
 .state-dot.live { background: var(--sage); border: 0; }
 .state-dot.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .state-dot.off { background: var(--rust); border: 0; border-radius: 0; }
-.state-dot.locked { background: var(--locked); border: 0; border-radius: 3px; }
+.state-dot.locked { background: var(--locked); border: 0; border-radius: 1px; }
 .agent-last {
   font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3);
 }
@@ -1833,8 +1833,8 @@ body {
 .ambient-stat .l { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
 /* Slice 2b: the Evidence filter form. Each filter is a field with its label
    above the control in the label style, in a grid that wraps, so no label
-   runs into its neighbour's control. 150px fits the widest option label
-   ("Recovery prompt") beside its native caret at the --text-sm size. */
+   runs into its neighbour's control. 150px fits the widest raw option value
+   ("sentinel_finding") beside its native caret at the --text-sm size. */
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .filter-bar { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2) var(--space-3); margin: 0 0 var(--space-3); }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
@@ -1873,11 +1873,13 @@ body {
 }
 .state-chip i { display: inline-block; width: 8px; height: 8px; box-sizing: border-box; flex: none; }
 .state-chip.good { color: var(--sage); background: var(--sage-bg); border-color: var(--sage-line); }
-.state-chip.good i { background: currentColor; border-radius: 50%; }
-.state-chip.bad { color: var(--rust); background: var(--rust-bg); border-color: var(--rust-line); }
-.state-chip.bad i { background: currentColor; }
+.state-chip.good i { background: var(--sage); border-radius: 50%; }
+.state-chip.bad { color: var(--rust); background: var(--rust-bg); border-color: var(--rust); }
+.state-chip.bad i { background: var(--rust); }
+.state-chip.checking { color: var(--slate); background: var(--slate-bg); border-color: var(--slate); }
+.state-chip.checking i { background: transparent; border: 1.5px solid var(--slate); border-radius: 0; }
 .state-chip.unknown { color: var(--slate); background: var(--slate-bg); border: 1px dashed var(--slate-line); }
-.state-chip.unknown i { border: 1.5px dotted currentColor; border-radius: 50%; }
+.state-chip.unknown i { background: transparent; border: 1.5px dotted var(--slate); border-radius: 50%; }
 
 `;
 
@@ -2089,7 +2091,7 @@ export function renderDashboardV11Html(
             <button type="button" class="btn btn-sm" data-action="copy-fortress-id" data-fortress-id="${escHtml(fortressId)}" title="Copy machine id">Copy id</button>
           </div>
           <div id="agent-switcher-options"></div>
-          <a class="scope-fleet" href="#machines" title="Every machine saved in this browser, each with its health check">Fleet: every machine you run</a>
+          <a class="scope-fleet" href="#machines" data-action="set-route" data-route="machines" title="Every machine saved in this browser, each with its health check">Fleet: machines saved in this browser</a>
         </div>
       </div>
       <div class="search-wrap" data-search>

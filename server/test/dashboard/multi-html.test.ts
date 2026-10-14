@@ -230,12 +230,12 @@ describe("renderMultiAgentHTML reads the console design system", () => {
     expect(html).not.toMatch(/<h1[^>]*>[^<]*\u2014/);
   });
 
-  it("the running, stopped and empty pills each carry their own mark shape", () => {
+  it("the running, stopped, unconfirmed and empty pills each carry their own mark shape", () => {
     const rules = cssRules(inlineStyle(renderMultiAgentHTML({ snapshot: snapshot() })));
     const decls = (sel: string) => new Map(rules.filter((r) => r.selector === sel).flatMap((r) => r.decls));
-    const shapes = [".pill-running::before", ".pill-stopped::before, .pill-unconfirmed::before", ".pill-empty::before"]
+    const shapes = [".pill-running::before", ".pill-stopped::before", ".pill-unconfirmed::before", ".pill-empty::before"]
       .map((s) => ["clip-path", "border-radius", "height"].map((k) => decls(s).get(k) ?? "").join("|"));
     for (const s of shapes) expect(s).not.toBe("||");
-    expect(new Set(shapes).size).toBe(3);
+    expect(new Set(shapes).size).toBe(4);
   });
 });

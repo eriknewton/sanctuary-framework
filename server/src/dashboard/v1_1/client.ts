@@ -1147,36 +1147,52 @@ const __renderCache = { route: null, html: null };
 // F8 fix: capture focused-input identity + caret position so an SSE-
 // triggered rerender during typing does not clobber the operator's typing
 // experience. innerHTML replacement creates new DOM nodes; we re-find the
-// equivalent input by data-action + optional data-agent-id and restore focus
-// + selection range. Shared by #main and the Talk panel, the two containers
-// whose inputs a rerender rewrites.
+// equivalent input or route control by data-action, href and optional
+// data-agent-id and restore focus. Shared by #main and the Talk panel, the
+// two containers whose inputs a rerender rewrites.
 function captureInputFocus(container) {
   const active = document.activeElement;
-  if (
-    active && (!container.contains || container.contains(active)) &&
-    active.tagName === "INPUT" &&
-    ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 &&
-    typeof active.getAttribute === "function" &&
-    active.getAttribute("data-action")
-  ) {
+  if (!active || (container.contains && !container.contains(active)) || typeof active.getAttribute !== "function") return null;
+  if (active.tagName === "INPUT" && ["text", "search", "email", "url", "tel", "password"].indexOf(active.type || "text") >= 0 && active.getAttribute("data-action")) {
     return {
+      kind: "input",
       action: active.getAttribute("data-action"),
       agentId: active.getAttribute("data-agent-id"),
+      itemId: active.getAttribute("data-item-id"),
       selectionStart: active.selectionStart,
       selectionEnd: active.selectionEnd
+    };
+  }
+  if ((active.tagName === "BUTTON" || active.tagName === "A") && (active.getAttribute("data-action") || active.getAttribute("href"))) {
+    return {
+      kind: "control",
+      action: active.getAttribute("data-action"),
+      href: active.getAttribute("href"),
+      agentId: active.getAttribute("data-agent-id"),
+      itemId: active.getAttribute("data-item-id")
     };
   }
   return null;
 }
 function restoreInputFocus(container, focus) {
   if (!focus || !container.querySelector) return;
-  let sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
+  // Decision controls disappear and reappear on different queue rows as the
+  // inbox changes. Restoring them by selector can move focus to the wrong
+  // decision, so only stable route controls and text inputs are restored.
+  if (focus.kind === "control" && focus.itemId) return;
+  let sel;
+  if (focus.kind === "input") sel = 'input[data-action="' + escCssAttr(focus.action) + '"]';
+  else if (focus.action) sel = '[data-action="' + escCssAttr(focus.action) + '"]';
+  else if (focus.href) sel = 'a[href="' + escCssAttr(focus.href) + '"]';
+  else return;
   if (focus.agentId) sel += '[data-agent-id="' + focus.agentId + '"]';
+  if (focus.itemId) sel += '[data-item-id="' + escCssAttr(focus.itemId) + '"]';
   const el = container.querySelector(sel);
   if (el && typeof el.focus === "function") {
     try {
       el.focus();
       if (
+        focus.kind === "input" &&
         typeof el.setSelectionRange === "function" &&
         focus.selectionStart != null &&
         focus.selectionEnd != null
@@ -1267,6 +1283,7 @@ function renderMain() {
     __renderCache.html = nextHtml;
     didWrite = true;
   }
+  if (state.route === "machines") hydrateMachinesScreen();
   // Finding DDD (v1.2.0-rc.4): bring the latest concierge message into
   // the viewport when (a) the operator just sent a message
   // (pendingScroll flag set in onConciergeSend), or (b) the operator
@@ -3957,6 +3974,9 @@ const FLEET_STORAGE_KEY = "sanctuary_fleet_machines";
 // answer before they stop waiting.
 const FLEET_PROBE_DEADLINE_SECONDS = 3;
 const FLEET_PROBE_DEADLINE_MS = FLEET_PROBE_DEADLINE_SECONDS * DASHBOARD_MILLISECONDS_PER_SECOND;
+// 25 probes = the visible current machine plus two dozen saved peers, which
+// bounds one Check-again wave while leaving enough rows for a real small fleet.
+const FLEET_PROBED_MACHINE_LIMIT = 25;
 // The check age is rewritten once a second while the screen shows, so the
 // age on screen is never more than one second younger than the probe round.
 const FLEET_AGE_TICK_MS = DASHBOARD_MILLISECONDS_PER_SECOND;
@@ -3968,15 +3988,17 @@ const FLEET_PROBE = {
   CHECKING: "state_CHECKING",
   ONLINE: "state_ONLINE",
   NOT_HEALTHY: "state_NOT_HEALTHY",
-  UNKNOWN: "state_UNKNOWN"
+  UNKNOWN: "state_UNKNOWN",
+  UNPROBED: "state_UNPROBED"
 };
 const FLEET_PROBE_VIEW = {
-  state_CHECKING: { word: "Checking", cls: "unknown" },
+  state_CHECKING: { word: "Checking", cls: "checking" },
   state_ONLINE: { word: "Online", cls: "good" },
   state_NOT_HEALTHY: { word: "Not healthy", cls: "bad" },
-  state_UNKNOWN: { word: "Unknown", cls: "unknown" }
+  state_UNKNOWN: { word: "Unknown", cls: "unknown" },
+  state_UNPROBED: { word: "Unprobed", cls: "unknown" }
 };
-const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null };
+const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null };
 
 // Only an http or https address becomes a link or a probe target: the list
 // is operator-typed text in browser storage, and a javascript: or data:
@@ -3984,7 +4006,7 @@ const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ag
 function fleetHttpUrl(raw) {
   try {
     const u = new URL(String(raw));
-    return u.protocol === "http:" || u.protocol === "https:" ? u.origin : null;
+    return u.protocol === "http:" || u.protocol === "https:" ? u : null;
   } catch (e) { return null; }
 }
 
@@ -4002,32 +4024,62 @@ function fleetMachines() {
   const seen = {};
   const list = [];
   saved.forEach(function (m) {
-    if (!m || typeof m.url !== "string" || !m.url || seen[m.url]) return;
-    seen[m.url] = true;
-    list.push({ name: typeof m.name === "string" && m.name ? m.name : m.url, url: m.url, origin: fleetHttpUrl(m.url), current: m.url === here });
+    if (!m || typeof m.url !== "string" || !m.url) return;
+    const web = fleetHttpUrl(m.url);
+    const key = web ? web.origin : "raw:" + m.url;
+    if (seen[key]) return;
+    seen[key] = true;
+    list.push({
+      name: typeof m.name === "string" && m.name ? m.name : m.url,
+      url: m.url,
+      origin: web ? web.origin : null,
+      probeUrl: web ? web.origin + "/api/health" : null,
+      current: web ? web.origin === here : m.url === here,
+      capped: false
+    });
   });
   // The machine serving this console is always in the list, under the name
   // the scope trigger shows for it, so the denominator never omits it.
-  if (!list.some(function (m) { return m.current; })) list.unshift({ name: config.tenantName || "This machine", url: here, origin: fleetHttpUrl(here), current: true });
+  if (!list.some(function (m) { return m.current; })) {
+    const selfUrl = fleetHttpUrl(here);
+    list.unshift({ name: config.tenantName || "This machine", url: here, origin: selfUrl ? selfUrl.origin : null, probeUrl: selfUrl ? selfUrl.origin + "/api/health" : null, current: true, capped: false });
+  }
+  let probeSlots = 0;
+  list.forEach(function (m) {
+    if (!m.origin) return;
+    probeSlots++;
+    // The cap is enforced on web addresses only: non-web entries are never
+    // probe candidates, so they cannot consume probe slots.
+    m.capped = probeSlots > FLEET_PROBED_MACHINE_LIMIT;
+  });
   return list;
 }
 
 // One liveness probe. It never carries the operator bearer or a cookie: a
 // machine in a browser-stored list must never receive this machine's
 // credential, and /api/health needs none.
-async function probeFleetMachine(origin) {
-  if (!origin) return FLEET_PROBE.UNKNOWN;
-  const controller = new AbortController();
-  const timer = setTimeout(function () { controller.abort(); }, FLEET_PROBE_DEADLINE_MS);
+async function probeFleetMachine(machine, signal) {
+  if (!machine.origin || machine.capped) return machine.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.UNKNOWN;
   try {
-    const resp = await fetch(origin + "/api/health", { signal: controller.signal, credentials: "omit", cache: "no-store" });
+    const resp = await fetch(machine.probeUrl, { signal: signal, credentials: "omit", cache: "no-store", redirect: "manual" });
+    // A health result is trusted only when the named web origin answered a
+    // non-redirecting 2xx response. Error pages and redirects are not a
+    // machine-health answer, even if their body happens to contain ok.
+    if (!resp || !resp.ok || resp.redirected || resp.type === "opaqueredirect") return FLEET_PROBE.UNKNOWN;
     const body = await resp.json();
-    return body && body.ok === true ? FLEET_PROBE.ONLINE : FLEET_PROBE.NOT_HEALTHY;
+    return body && body.ok === true ? FLEET_PROBE.ONLINE : body && body.ok === false ? FLEET_PROBE.NOT_HEALTHY : FLEET_PROBE.UNKNOWN;
   } catch (e) {
     return FLEET_PROBE.UNKNOWN;
-  } finally {
-    clearTimeout(timer);
   }
+}
+
+function scheduleFleetPaint() {
+  if (state.route !== "machines" || fleet.paintScheduled) return;
+  fleet.paintScheduled = true;
+  Promise.resolve().then(function () {
+    fleet.paintScheduled = false;
+    if (state.route === "machines") renderMain();
+  });
 }
 
 // A probe round. A result from an older round never overwrites a newer
@@ -4035,20 +4087,29 @@ async function probeFleetMachine(origin) {
 async function probeFleetMachines() {
   const round = ++fleet.round;
   const machines = fleetMachines();
+  if (fleet.controller) fleet.controller.abort();
+  const controller = new AbortController();
+  fleet.controller = controller;
+  const timer = setTimeout(function () { controller.abort(); }, FLEET_PROBE_DEADLINE_MS);
   fleet.roundStartedAt = Date.now();
   fleet.roundDone = false;
+  fleet.machines = machines;
   fleet.probes = {};
-  machines.forEach(function (m) { fleet.probes[m.url] = FLEET_PROBE.CHECKING; });
+  machines.forEach(function (m) {
+    fleet.probes[m.url] = !m.origin ? FLEET_PROBE.UNKNOWN : m.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.CHECKING;
+  });
   if (state.route === "machines") renderMain();
-  await Promise.all(machines.map(async function (m) {
-    const result = await probeFleetMachine(m.origin);
+  await Promise.all(machines.filter(function (m) { return m.origin && !m.capped; }).map(async function (m) {
+    const result = await probeFleetMachine(m, controller.signal);
     if (round !== fleet.round) return;
     fleet.probes[m.url] = result;
-    if (state.route === "machines") renderMain();
+    scheduleFleetPaint();
   }));
+  clearTimeout(timer);
   if (round !== fleet.round) return;
   fleet.roundDone = true;
-  if (state.route === "machines") renderMain();
+  if (fleet.controller === controller) fleet.controller = null;
+  scheduleFleetPaint();
 }
 
 // The fleet count with its denominator and its check age. The age is the
@@ -4058,18 +4119,22 @@ function fleetSummary(machines) {
   const total = machines.length;
   const noun = total === 1 ? " machine" : " machines";
   if (!fleet.roundStartedAt) return { text: "Not checked yet: 0 of " + total + noun + " checked", age: "" };
-  let online = 0, unknown = 0, notHealthy = 0, checking = 0;
+  let online = 0, unknown = 0, notHealthy = 0, checking = 0, unprobed = 0, probeable = 0;
   machines.forEach(function (m) {
+    if (m.origin && !m.capped) probeable++;
     const s = fleet.probes[m.url] || FLEET_PROBE.UNKNOWN;
     if (s === FLEET_PROBE.ONLINE) online++;
     else if (s === FLEET_PROBE.NOT_HEALTHY) notHealthy++;
     else if (s === FLEET_PROBE.CHECKING) checking++;
+    else if (s === FLEET_PROBE.UNPROBED) unprobed++;
     else unknown++;
   });
   const parts = [online + " of " + total + noun + " online"];
+  if (probeable < total) parts.push("showing " + probeable + " of " + total + noun);
   if (checking) parts.push(checking + " checking");
   if (notHealthy) parts.push(notHealthy + " not healthy");
   if (unknown) parts.push(unknown + " Unknown");
+  if (unprobed) parts.push(unprobed + " unprobed");
   return { text: parts.join(" · "), age: "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago" };
 }
 
@@ -4085,40 +4150,89 @@ function scheduleFleetAgeTick() {
 }
 
 function renderMachinesScreen() {
-  const machines = fleetMachines();
-  const summary = fleetSummary(machines);
-  const rows = machines.map(function (m) {
-    const s = fleet.roundStartedAt ? (fleet.probes[m.url] || FLEET_PROBE.UNKNOWN) : FLEET_PROBE.UNKNOWN;
-    const view = FLEET_PROBE_VIEW[s];
-    const why = s === FLEET_PROBE.UNKNOWN
-      ? "No answer to the health check within " + FLEET_PROBE_DEADLINE_SECONDS + " seconds, or an answer that was not the health check. This is not proof the machine is down."
-      : s === FLEET_PROBE.NOT_HEALTHY ? "The machine answered its health check and did not report ok."
-      : s === FLEET_PROBE.ONLINE ? "The machine's dashboard answered its health check with ok."
-      : "The health check is in flight.";
-    const open = m.current
-      ? '<span class="machine-here">This machine</span>'
-      : m.origin ? '<a class="btn" href="' + escHtml(m.origin) + '/" rel="noopener">Open console</a>'
-      : '<span class="muted">Not a web address</span>';
-    return '<div class="machine-row" data-machine-url="' + escHtml(m.url) + '">' +
-      '<span class="state-chip ' + view.cls + '" title="' + escHtml(why) + '"><i aria-hidden="true"></i>' + escHtml(view.word) + '</span>' +
-      '<div class="machine-id"><strong>' + escHtml(m.name) + '</strong><small class="mono">' + escHtml(m.url) + '</small></div>' +
-      open +
-    '</div>';
-  }).join("");
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Machines</p>',
-        '<h1>Every machine you run.</h1>',
-        '<p class="sub">The machines saved in this browser, each checked with its dashboard\'s health check. Online means the dashboard answered; it is not a statement about that machine\'s protection. Add or remove machines on the <a href="/fleet">Fleet Switcher</a>.</p>',
+        '<h1>Machines saved in this browser.</h1>',
+        '<p class="sub">The machines saved in this browser, each checked at its host health check. Online means the host answered; it is not a statement about that machine\'s protection. Add or remove machines on the <a href="/fleet">Fleet Switcher</a>.</p>',
       '</div></div>',
       '<section class="card">',
-        '<div class="card-head-row"><h3>Fleet <span class="count-age">' + escHtml(summary.text) + (summary.age ? ' · <span id="machines-age">' + escHtml(summary.age) + '</span>' : '') + '</span></h3>',
+        '<div class="card-head-row"><h3>Fleet <span class="count-age" id="machines-summary"></span></h3>',
         '<button type="button" class="btn" data-action="machines-recheck">Check again</button></div>',
-        '<div class="machine-list">' + rows + '</div>',
+        '<div class="machine-list" id="machines-list"></div>',
       '</section>',
     '</section>'
   ].join("");
+}
+
+function appendText(parent, text) {
+  parent.appendChild(document.createTextNode(String(text)));
+}
+
+function makeTextElement(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  appendText(el, text);
+  return el;
+}
+
+function hydrateMachinesScreen() {
+  const summaryEl = document.getElementById("machines-summary");
+  const listEl = document.getElementById("machines-list");
+  if (!summaryEl || !listEl) return;
+  const machines = fleet.roundStartedAt && fleet.machines ? fleet.machines : fleetMachines();
+  const summary = fleetSummary(machines);
+  summaryEl.replaceChildren(document.createTextNode(summary.text));
+  if (summary.age) {
+    appendText(summaryEl, " · ");
+    const age = makeTextElement("span", "", summary.age);
+    age.setAttribute("id", "machines-age");
+    summaryEl.appendChild(age);
+  }
+  const rows = machines.map(function (m, index) {
+    const s = fleet.roundStartedAt ? (fleet.probes[m.url] || FLEET_PROBE.UNKNOWN) : FLEET_PROBE.UNKNOWN;
+    const view = FLEET_PROBE_VIEW[s] || FLEET_PROBE_VIEW.state_UNKNOWN;
+    const row = document.createElement("div");
+    row.className = "machine-row";
+    row.setAttribute("data-machine-index", String(index));
+    const why = !m.origin
+      ? "Unknown: this saved address is not a web address, so it was not linked or checked."
+      : s === FLEET_PROBE.UNPROBED
+        ? "Unknown: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
+        : s === FLEET_PROBE.UNKNOWN
+          ? "Unknown: no answer to the health check within " + FLEET_PROBE_DEADLINE_SECONDS + " seconds, or an answer that was not the health check. This is not proof the machine is down."
+          : s === FLEET_PROBE.NOT_HEALTHY ? "The machine answered its health check with ok false."
+          : s === FLEET_PROBE.ONLINE ? "The machine answered its health check with ok true. This says only that the host answered." : "The health check is in flight.";
+    const chip = document.createElement("span");
+    chip.className = "state-chip " + view.cls;
+    chip.setAttribute("title", why);
+    const mark = document.createElement("i");
+    mark.setAttribute("aria-hidden", "true");
+    chip.appendChild(mark);
+    appendText(chip, view.word);
+    row.appendChild(chip);
+    const id = document.createElement("div");
+    id.className = "machine-id";
+    const name = makeTextElement("strong", "", m.name);
+    const address = makeTextElement("small", "mono", m.url);
+    id.appendChild(name);
+    id.appendChild(address);
+    if (m.origin) id.appendChild(makeTextElement("small", "mono", "host health check"));
+    row.appendChild(id);
+    if (m.current) {
+      row.appendChild(makeTextElement("span", "machine-here", "This machine"));
+    } else if (m.origin) {
+      const open = makeTextElement("a", "btn", "Open console");
+      open.setAttribute("href", m.origin + "/");
+      open.setAttribute("rel", "noopener");
+      row.appendChild(open);
+    } else {
+      row.appendChild(makeTextElement("span", "muted", "Not a web address"));
+    }
+    return row;
+  });
+  listEl.replaceChildren.apply(listEl, rows);
 }
 
 // ── Hub API actions ────────────────────────────────────────────────────
@@ -5353,7 +5467,13 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "template-bind" && agentId) return void onTemplateBind(agentId);
-  if (action === "set-route" && route) { location.hash = route; return; }
+  if (action === "set-route" && route) {
+    state.agentScope.switcherOpen = false;
+    location.hash = "#" + route;
+    setRoute(route);
+    renderTopbar();
+    return;
+  }
   if (action === "machines-recheck") { void probeFleetMachines(); return; }
   if (action === "show-details" && itemId) {
     const i = state.inbox.find(function (x) { return x.item_id === itemId; });

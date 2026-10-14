@@ -144,6 +144,8 @@ const MARK_FAMILIES: MarkFamily[] = [
     } },
   { name: "auto-trigger trend bar", base: ".trend-bar",
     states: { other: null, good: ".trend-bar.good", warn: ".trend-bar.warn" } },
+  { name: "machine health chip", base: ".state-chip i",
+    states: { unknown: ".state-chip.unknown i", checking: ".state-chip.checking i", online: ".state-chip.good i", notHealthy: ".state-chip.bad i" } },
 ];
 
 function declsOf(selector: string): Map<string, string> {
@@ -222,6 +224,13 @@ describe("each state mark family reads in monochrome", () => {
     }
   });
 
+  it("locked marks keep hard corners and the Not healthy chip uses the full rust stroke", () => {
+    expect(declsOf(".glyph.offline").get("border-radius")).toBe("1px");
+    expect(declsOf(".state-dot.locked").get("border-radius")).toBe("1px");
+    expect(declsOf(".state-chip.bad").get("border-color")).toBe("var(--rust)");
+    expect(getClientScript()).toContain('state_CHECKING: { word: "Checking", cls: "checking" }');
+  });
+
 });
 
 describe("layout rules the slice holds", () => {
@@ -237,5 +246,7 @@ describe("layout rules the slice holds", () => {
     expect(by(".search input").get("width")).toBe("0");
     expect(by(".search-wrap:focus-within .search").get("position")).toBe("absolute");
     expect(by(".search-wrap:focus-within .search input").get("width")).toBe("auto");
+    expect(css).toContain("@media (max-width: 1240px)");
+    expect(css).toContain(".topbar .btn.btn-talk .btn-label { display: none; }");
   });
 });
