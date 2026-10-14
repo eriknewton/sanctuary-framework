@@ -1828,11 +1828,6 @@ body {
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
 }
 .approval-drawer-sec p { margin: 0; color: var(--ink); }
-.approval-drawer-sec .agentctx { color: var(--ink-2); overflow-wrap: anywhere; }
-.approval-drawer-sec .unv {
-  margin-top: 6px; color: var(--ink-3); font-family: var(--mono);
-  font-size: var(--text-xs);
-}
 .approval-effects {
   display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2);
 }
@@ -1854,11 +1849,6 @@ body {
 .approval-decide label {
   color: var(--ink-3); font-family: var(--mono); font-size: 10px;
   letter-spacing: 0.08em; text-transform: uppercase;
-}
-.approval-decide textarea {
-  min-height: 58px; resize: vertical; border: 1px solid var(--ink-3);
-  border-radius: var(--rad); background: var(--paper); color: var(--ink);
-  font-family: var(--sans); font-size: var(--text-sm); padding: 8px 10px;
 }
 .approval-standing {
   display: flex; gap: var(--space-2); align-items: flex-start;
