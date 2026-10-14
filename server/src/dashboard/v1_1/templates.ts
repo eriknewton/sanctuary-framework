@@ -27,6 +27,34 @@ import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
 // Must match ACTIVITY_TEMPLATE_NAMESPACES in client.ts, injected from hub/constants.ts.
 const ACTIVITY_TEMPLATE_NAMESPACES = Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES);
 
+// Categories whose sentence only says an event of that kind was recorded, so it holds for every operation the hub
+// files there. The other category sentences assert an actor or an outcome (an operator approval or denial, traffic
+// that left, a decision, a lifecycle change, a change applied) that an operation in the category need not carry: the
+// hub files by substring and catch-all rules, so views and refusals land there too.
+const ACTIVITY_CATEGORIES_WITH_GENERAL_SENTENCES: ReadonlyArray<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES> = [
+  "privacy",
+  "handoff",
+  "other",
+];
+
+/**
+ * The registered sentence an operation-suffixed activity id renders through, keyed by its category namespace: the
+ * category's own sentence where that sentence is true of every operation in it, the generic audit sentence otherwise.
+ * Must match ACTIVITY_FALLBACK_TEMPLATES in client.ts, which is injected from this map.
+ */
+export const ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    (Object.keys(HUB_ACTIVITY_TEMPLATE_NAMESPACES) as Array<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES>).map(
+      (category) => [
+        HUB_ACTIVITY_TEMPLATE_NAMESPACES[category],
+        ACTIVITY_CATEGORIES_WITH_GENERAL_SENTENCES.includes(category)
+          ? HUB_ACTIVITY_TEMPLATE_NAMESPACES[category]
+          : HUB_ACTIVITY_TEMPLATE_NAMESPACES.other,
+      ],
+    ),
+  ),
+);
+
 /**
  * Render-context flags pass through to the template fn so a single template
  * id can produce slightly different strings for inbox cards versus the
@@ -257,9 +285,10 @@ export function renderTemplate(
 ): string {
   let renderer = TEMPLATES[templateId];
   if (!renderer && typeof templateId === "string") {
-    // The hub serves operation-suffixed ids; the dashboard registers sentences per category.
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category. An operation renders its
+    // category's sentence only where that sentence is true of every operation the hub files there.
     const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => templateId.startsWith(`${prefix}.`));
-    if (namespace) renderer = TEMPLATES[namespace];
+    if (namespace) renderer = TEMPLATES[ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE[namespace]];
   }
   if (!renderer) {
     return `[unrecognized template: ${templateId}]`;

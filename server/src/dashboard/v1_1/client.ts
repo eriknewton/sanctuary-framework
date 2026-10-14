@@ -29,6 +29,7 @@
 
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
+import { ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE } from "./templates.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -747,13 +748,16 @@ const TEMPLATES = {
 
 // Must match ACTIVITY_TEMPLATE_NAMESPACES in templates.ts, sourced from hub/constants.ts.
 const ACTIVITY_TEMPLATE_NAMESPACES = ${JSON.stringify(Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES))};
+// Must match ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE in templates.ts, injected from it when the script is built.
+const ACTIVITY_FALLBACK_TEMPLATES = ${JSON.stringify(ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE)};
 
 function renderTemplate(id, args) {
   let fn = TEMPLATES[id];
   if (!fn && typeof id === "string") {
-    // The hub serves operation-suffixed ids; the dashboard registers sentences per category.
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category. An operation renders its
+    // category's sentence only where that sentence is true of every operation the hub files there.
     const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => id.startsWith(prefix + "."));
-    if (namespace) fn = TEMPLATES[namespace];
+    if (namespace) fn = TEMPLATES[ACTIVITY_FALLBACK_TEMPLATES[namespace]];
   }
   if (!fn) return "[unrecognized template: " + id + "]";
   try { return fn(args || []); } catch (e) { return "[template render failed: " + id + "]"; }
