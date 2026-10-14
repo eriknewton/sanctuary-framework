@@ -21,6 +21,7 @@
  * These are server-side rendered-script / CSS-shape assertions; the
  * full route round-trip is exercised by inspect-routes coverage.
  */
+// fail-before-exempt: this change edits click-target comment prose only here; the agent-row control labels are asserted in shell-wired-consumers.test.ts.
 
 import { describe, expect, it } from "vitest";
 import {

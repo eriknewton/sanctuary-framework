@@ -7,6 +7,7 @@
  *  - Coverage assertion: every Tier 1 operation_category, every privacy
  *    event kind, every blocked_egress reason class has a registered entry.
  */
+// fail-before-exempt: the mirror parity checks added here pass whenever both mirrors already agree, as they do on main; they fail when one mirror is edited alone.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -23,13 +24,33 @@ import type { HubDisplayTemplateArg } from "../../../src/contracts/v1.1/hub-even
  * is plain TS-as-string; there is no importable client TEMPLATES export).
  * Evaluating the real object literal, rather than regex-matching entry
  * spellings, means any entry syntax that parses contributes its key, so a
- * differently-written entry cannot evade the parity check. The entry
- * VALUES are arrow functions that are never invoked here, so no client
- * helper stubs are needed; slicing failures throw rather than returning
+ * differently-written entry cannot evade the parity check. Rendering tests
+ * invoke those arrow functions through the client's own `arg` helper, sliced
+ * from the same embedded script; slicing failures throw rather than returning
  * an empty set (fail-loud, never a vacuous pass).
  */
 function extractClientTemplateIds(): string[] {
   return Object.keys(extractClientTemplates()).sort();
+}
+
+function extractClientArg(): (args: Array<{ kind: string; value: unknown }>, kind: string, fallback?: string) => string {
+  const script = getClientScript();
+  const marker = "function arg(args, kind, fallback) {";
+  const start = script.indexOf(marker);
+  if (start === -1) {
+    throw new Error("client arg helper not found in embedded script");
+  }
+  const endMarker = "\n}\n\n// Cross-file contract:";
+  const end = script.indexOf(endMarker, start);
+  if (end === -1) {
+    throw new Error("client arg helper close brace not found");
+  }
+  const fnText = script.slice(start, end + 2);
+  return new Function(`"use strict"; ${fnText}; return arg;`)() as (
+    args: Array<{ kind: string; value: unknown }>,
+    kind: string,
+    fallback?: string,
+  ) => string;
 }
 
 function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
@@ -50,10 +71,7 @@ function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
   const evaluated = new Function(
     "arg",
     `"use strict"; return (${objectLiteral});`,
-  )((args: Array<{ kind: string; value: unknown }>, kind: string, fallback = "(unknown)") => {
-    const found = args.find((a) => a.kind === kind);
-    return found ? String(found.value) : fallback;
-  }) as Record<string, (args: unknown[]) => string>;
+  )(extractClientArg()) as Record<string, (args: unknown[]) => string>;
   if (Object.keys(evaluated).length === 0) {
     throw new Error("client TEMPLATES map evaluated to an empty object");
   }
@@ -249,12 +267,39 @@ describe("v1.1 dashboard template registry", () => {
       "approval_pending.tier1.exit_bundle_rekey",
       "approval_pending.tier1.sanctuary_export_identity_bundle",
     ];
-    const drifted = shared
+    const driftedWithArgs = shared
       .filter((id) => clientTemplates[id](args) !== renderTemplate(id, args, { surface: "activity" }))
       .sort();
-    expect(drifted).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT].sort());
+    expect(driftedWithArgs).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT].sort());
+
+    // Missing-argument parity has its own drift list because fallback wording
+    // is a separate contract from populated slot rendering.
+    const KNOWN_CLIENT_TEMPLATE_DRIFT_WITH_MISSING_ARGS = [
+      "activity.config",
+      "activity.lifecycle",
+      "approval_pending.tier1.exit_bundle_import",
+      "approval_pending.tier1.exit_bundle_rekey",
+      "approval_pending.tier1.sanctuary_export_identity_bundle",
+    ];
+    const driftedWithMissingArgs = shared
+      .filter((id) => clientTemplates[id]([]) !== renderTemplate(id, [], { surface: "activity" }))
+      .sort();
+    expect(driftedWithMissingArgs).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT_WITH_MISSING_ARGS].sort());
 
     const clientStatus = extractClientStatusMap();
+    const serverStatusKeys = Object.keys(STATUS_MAPPING).sort();
+    const clientStatusKeys = Object.keys(clientStatus).sort();
+    const missingFromClientStatus = serverStatusKeys.filter((key) => !clientStatusKeys.includes(key));
+    const clientOnlyStatusKeys = clientStatusKeys.filter((key) => !serverStatusKeys.includes(key));
+    const KNOWN_CLIENT_ONLY_STATUS_KEYS: string[] = [];
+    expect(
+      missingFromClientStatus,
+      `status keys registered on the server but missing from the client mirror: ${missingFromClientStatus.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      clientOnlyStatusKeys,
+      `status keys in the client mirror with no server status table entry: ${clientOnlyStatusKeys.join(", ")}`,
+    ).toEqual(KNOWN_CLIENT_ONLY_STATUS_KEYS);
     const statusDrift = (Object.keys(STATUS_MAPPING) as Array<keyof typeof STATUS_MAPPING>)
       .filter((key) => clientStatus[key]?.label !== STATUS_MAPPING[key].label || clientStatus[key]?.glyph !== STATUS_MAPPING[key].glyph)
       .map((key) => ({ key, client: clientStatus[key], server: STATUS_MAPPING[key] }));

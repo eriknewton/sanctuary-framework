@@ -14,6 +14,7 @@
  * These are server-side rendered-HTML / CSS-shape assertions; visual
  * verification at multiple desktop widths is operator-side at acceptance.
  */
+// fail-before-exempt: this change edits comment prose only here; the agent-row control labels are asserted in shell-wired-consumers.test.ts.
 
 import { describe, expect, it } from "vitest";
 import { renderDashboardV11Html, getClientScript } from "../../../src/dashboard/v1_1/index.js";

@@ -739,6 +739,8 @@ function renderTemplate(id, args) {
 }
 
 // ── Status mapping ─────────────────────────────────────────────────────
+// Table-level pin: must match STATUS_MAPPING in status-mapping.ts. Enforced
+// by the status parity guard in test/dashboard/v1_1/templates.test.ts.
 const STATUS_MAP = {
   active: { label: "Protected", glyph: "online" },
   paused: { label: "Paused", glyph: "idle" },
@@ -991,6 +993,7 @@ function renderTopbar() {
   btn.classList.remove("tier1-pending", "tier1-partial", "tier1-engaged");
   btn.disabled = false;
   if (t1.state === "pending") {
+    // Must match TIER1_BUTTON_COPY.lockdown.pending in status-mapping.ts.
     btn.textContent = "Awaiting approval";
     btn.classList.add("tier1-pending");
     btn.disabled = true;
@@ -2933,6 +2936,20 @@ function heldApprovalItems(scope) {
   });
 }
 
+const AGENT_CONTROL_LABELS = {
+  pause: "Pause",
+  resume: "Resume",
+  restart: "Restart",
+  // Must match the agent-row menu literal below and TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts.
+  lockdown: "Lock down",
+  // Must match the agent-row menu literal below and TIER1_BUTTON_COPY.unwrap.idle in status-mapping.ts.
+  unwrap: "Remove protection"
+};
+
+function agentControlLabel(action) {
+  return AGENT_CONTROL_LABELS[action] || "This control";
+}
+
 // Wave 1: the fortress-column agents card and Recognition Layer health card
 // previously lived on the right rail. They are real surfaces (agent
 // lifecycle controls + did:web rotation), so they were relocated to the
@@ -2949,15 +2966,15 @@ function renderFortressAgentsCard() {
           { action: "pause", label: "Pause", enabled: !!c.can_pause },
           { action: "resume", label: "Resume", enabled: !!c.can_resume },
           { action: "restart", label: "Restart", enabled: !!c.can_restart },
-          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
-          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
+          { action: "lockdown", label: "Lock down", enabled: !!c.can_lockdown, tier1: true },
+          { action: "unwrap", label: "Remove protection", enabled: !!c.can_unwrap, tier1: true }
         ];
         const disabledTipByAction = {
           pause: "Sanctuary does not control this agent's process, so pause is not available.",
           resume: "Sanctuary does not control this agent's process, so resume is not available.",
           restart: "Sanctuary does not control this agent's process, so restart is not available.",
           lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
-          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
+          unwrap: "Removing protection from the dashboard is not available yet; an unsupported request is refused before any approval is queued."
         };
         const buttons = menuItems.map(function (mi) {
           const tip = mi.enabled
@@ -4457,20 +4474,21 @@ async function onLockdownClick() {
 }
 
 async function onAgentControl(agentId, action) {
+  const label = agentControlLabel(action);
   try {
     const r = await api("/agents/" + encodeURIComponent(agentId) + "/" + action, { method: "POST", body: {} });
     if (r.data && r.data.status === "approval_pending") {
       toast("Approval pending. See inbox.", "info");
     } else {
-      toast(action + " applied to " + agentId, "info");
+      toast('"' + label + '" applied to ' + agentId, "info");
     }
     await fetchAll(true);
     rerender();
   } catch (e) {
     if (e.status === 422) {
-      toast("Sanctuary cannot apply " + action + " for this agent: " + e.message, "error");
+      toast('Sanctuary cannot apply "' + label + '" for this agent: ' + e.message, "error");
     } else {
-      toast(action + " failed: " + e.message, "error");
+      toast('"' + label + '" failed: ' + e.message, "error");
     }
   }
 }

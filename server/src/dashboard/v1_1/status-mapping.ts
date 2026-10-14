@@ -33,7 +33,8 @@ export interface UiStatusEntry {
 /**
  * Canonical mapping table per the binding addendum section 1.3. Verifiers
  * (tests, code-review checklists) may treat this as fixed. Drift is a UI
- * regression.
+ * regression. Table-level pin: must match STATUS_MAP in client.ts. Enforced
+ * by the status parity guard in test/dashboard/v1_1/templates.test.ts.
  */
 export const STATUS_MAPPING: Record<HubAgentStatus, UiStatusEntry> = {
   active: { backend: "active", label: "Running", glyph: "online" },
@@ -120,7 +121,9 @@ export interface Tier1ButtonCopy {
  * `operation_category` enum on `HubApprovalPendingItem`.
  */
 export const TIER1_BUTTON_COPY: Record<string, Tier1ButtonCopy> = {
-  // Must match the lockdown state labels in renderTopbar in client.ts.
+  // Must match renderTopbar's idle, pending, partial, and engaged states in
+  // client.ts; idle also matches AGENT_CONTROL_LABELS.lockdown there.
+  // cancelled has no console consumer because a deny returns the button to idle.
   lockdown: {
     idle: "Lock down",
     pending: "Awaiting approval",
@@ -128,6 +131,9 @@ export const TIER1_BUTTON_COPY: Record<string, Tier1ButtonCopy> = {
     engaged: "Locked down",
     cancelled: "Not locked down",
   },
+  // idle must match AGENT_CONTROL_LABELS.unwrap in client.ts. The in-progress
+  // word for this action is STATUS_MAPPING.unwrapping above; engaged and
+  // cancelled have no console consumer yet.
   unwrap: {
     idle: "Remove protection",
     pending: "Approval pending",
