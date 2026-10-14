@@ -122,7 +122,7 @@ describe("first-class tool surfacing", () => {
       expect(instructions.toLowerCase()).not.toContain("unbypassable");
       expect(instructions.toLowerCase()).not.toContain("block");
       // The bounds paragraph is appended, whole, after the catalog: platforms
-      // with the patched-host qualifier on the enforcement sentence, the three
+      // with the macOS and Ubuntu platform bounds on enforcement, the three
       // tiers with Tier 1 waiting on a human, the never-claimed line, and the
       // evidence URL. Four entries, zero em-dashes; the README copy is enforced
       // by test/structure/server-bounds-copied-from-readme.test.ts.
@@ -131,7 +131,8 @@ describe("first-class tool surfacing", () => {
       for (const sentence of Object.values(SERVER_BOUNDS)) {
         expect(instructions).toContain(sentence);
       }
-      expect(SERVER_BOUNDS.platforms).toContain("on a patched host");
+      expect(SERVER_BOUNDS.platforms).toContain("macOS: proven.");
+      expect(SERVER_BOUNDS.platforms).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
       expect(SERVER_BOUNDS.platforms).toContain("Windows");
       expect(SERVER_BOUNDS.tiers).toContain("Tier 1");
       expect(SERVER_BOUNDS.evidence).toContain(ASSURANCE_MATRIX_URL);
