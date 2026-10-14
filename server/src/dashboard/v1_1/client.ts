@@ -669,10 +669,11 @@ function arg(args, kind, fallback) {
 // "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES = {
   "approval_pending.tier1.lockdown": (a) => "Cut agent " + arg(a,"agent_id") + "'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
-  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+  "approval_pending.tier1.fortress_lockdown": () => "Lock down approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
   "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
+  // Must match "approval_pending.tier1.unwrap" in templates.ts.
+  "approval_pending.tier1.unwrap": (a) => "Request to remove protection from agent " + arg(a,"agent_id") + ". This build refuses unsupported removals before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -743,7 +744,8 @@ const STATUS_MAP = {
   paused: { label: "Paused", glyph: "idle" },
   restarting: { label: "Restarting", glyph: "idle" },
   locked_down: { label: "Locked down", glyph: "offline" },
-  unwrapping: { label: "Unwrapping", glyph: "idle" },
+  // Must match STATUS_MAPPING.unwrapping in status-mapping.ts.
+  unwrapping: { label: "Removing protection", glyph: "idle" },
   error: { label: "Error", glyph: "away" },
   unknown: { label: "Unknown", glyph: "unknown" }
 };
@@ -982,7 +984,7 @@ function renderTopbar() {
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
-  // Lockdown button reflects the approved handler's reported outcome.
+  // Lock down button reflects the approved handler's reported outcome.
   const btn = document.getElementById("btn-lockdown");
   if (!btn) return;
   const t1 = state.tier1.lockdown;
@@ -993,17 +995,16 @@ function renderTopbar() {
     btn.classList.add("tier1-pending");
     btn.disabled = true;
   } else if (t1.state === "partial") {
-    btn.textContent = "Lockdown partial";
+    // Must match TIER1_BUTTON_COPY.lockdown.partial in status-mapping.ts.
+    btn.textContent = "Partly locked down";
     btn.classList.add("tier1-partial");
   } else if (t1.state === "engaged") {
-    btn.textContent = "Lockdown ON";
+    // Must match TIER1_BUTTON_COPY.lockdown.engaged in status-mapping.ts.
+    btn.textContent = "Locked down";
     btn.classList.add("tier1-engaged");
     btn.disabled = true;
   } else {
-    // The idle label is the ratified verb "Lock down" (slice 2 top bar).
-    // TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts still reads
-    // "Lockdown": that table is frozen this slice and has no runtime
-    // consumer; reconciling it is a named follow-up, not a silent drift.
+    // Must match TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts.
     btn.textContent = "Lock down";
   }
   renderAgentSwitcher();
@@ -1105,7 +1106,7 @@ function renderPostureSeal() {
     // Must match the Lock down button title in html.ts and the
     // approval_pending.tier1.fortress_lockdown template: network access is
     // revoked for confined agents, and agents keep running and local access.
-    sub = "Lockdown revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
+    sub = "Lock down revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
     sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
@@ -2948,15 +2949,15 @@ function renderFortressAgentsCard() {
           { action: "pause", label: "Pause", enabled: !!c.can_pause },
           { action: "resume", label: "Resume", enabled: !!c.can_resume },
           { action: "restart", label: "Restart", enabled: !!c.can_restart },
-          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
-          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
+          { action: "lockdown", label: "Lock down", enabled: !!c.can_lockdown, tier1: true },
+          { action: "unwrap", label: "Remove protection", enabled: !!c.can_unwrap, tier1: true }
         ];
         const disabledTipByAction = {
           pause: "Sanctuary does not control this agent's process, so pause is not available.",
           resume: "Sanctuary does not control this agent's process, so resume is not available.",
           restart: "Sanctuary does not control this agent's process, so restart is not available.",
           lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
-          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
+          unwrap: "Protection removal is not implemented yet; unsupported removals are refused before approval is queued."
         };
         const buttons = menuItems.map(function (mi) {
           const tip = mi.enabled
@@ -4450,7 +4451,7 @@ async function onLockdownClick() {
     if (e.status === 404) {
       toast("Fortress-level lockdown endpoint not yet wired. Use per-agent lockdown.", "error");
     } else {
-      toast("Lockdown request failed: " + e.message, "error");
+      toast("Lock down request failed: " + e.message, "error");
     }
   }
 }
@@ -4495,11 +4496,11 @@ async function onInboxAction(itemId, action) {
         state.tier1.lockdown.state = "engaged";
       } else if (action === "approve" && payload.outcome === "partial") {
         state.tier1.lockdown.state = "partial";
-        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
+        toast("Partly locked down. At least one confined agent did not confirm a live stop.", "info");
       } else {
         state.tier1.lockdown.state = "idle";
         if (action === "approve" && payload.outcome) {
-          toast("Lockdown outcome: " + payload.outcome + ".", "error");
+          toast("Lock down outcome: " + payload.outcome + ".", "error");
         }
       }
       renderTopbar();

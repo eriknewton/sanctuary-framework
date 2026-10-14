@@ -44,7 +44,12 @@ export const STATUS_MAPPING: Record<HubAgentStatus, UiStatusEntry> = {
     label: "Locked down",
     glyph: "offline",
   },
-  unwrapping: { backend: "unwrapping", label: "Unwrapping", glyph: "idle" },
+  // Must match STATUS_MAP.unwrapping in client.ts.
+  unwrapping: {
+    backend: "unwrapping",
+    label: "Removing protection",
+    glyph: "idle",
+  },
   error: { backend: "error", label: "Error", glyph: "away" },
   unknown: { backend: "unknown", label: "Unknown", glyph: "unknown" },
 };
@@ -115,18 +120,19 @@ export interface Tier1ButtonCopy {
  * `operation_category` enum on `HubApprovalPendingItem`.
  */
 export const TIER1_BUTTON_COPY: Record<string, Tier1ButtonCopy> = {
+  // Must match the lockdown state labels in renderTopbar in client.ts.
   lockdown: {
-    idle: "Lockdown",
+    idle: "Lock down",
     pending: "Awaiting approval",
-    partial: "Lockdown partial",
-    engaged: "Lockdown ON",
-    cancelled: "Lockdown not engaged",
+    partial: "Partly locked down",
+    engaged: "Locked down",
+    cancelled: "Not locked down",
   },
   unwrap: {
-    idle: "Unwrap",
+    idle: "Remove protection",
     pending: "Approval pending",
-    engaged: "Unwrapped",
-    cancelled: "Unwrap denied",
+    engaged: "Protection removed",
+    cancelled: "Removal denied",
   },
   policy_change: {
     idle: "Edit policy",

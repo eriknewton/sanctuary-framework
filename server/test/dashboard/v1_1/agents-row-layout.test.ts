@@ -3,7 +3,7 @@
  *
  * The right-pane Agents widget renders one row per agent with: status
  * glyph, agent_id, status pill, and 5 action buttons (Pause, Resume,
- * Restart, Lockdown, Unwrap). At v1.1.6, all five children sat on a
+ * Restart, Lock down, Remove protection). At v1.1.6, all five children sat on a
  * single flex row, so on the structurally narrow `.fortress` sidebar the
  * agent_id text and pill visually overlapped the action buttons.
  *

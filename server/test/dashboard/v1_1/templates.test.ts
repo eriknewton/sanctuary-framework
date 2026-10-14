@@ -14,6 +14,8 @@ import {
   listRegisteredTemplateIds,
 } from "../../../src/dashboard/v1_1/templates.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { STATUS_MAPPING } from "../../../src/dashboard/v1_1/status-mapping.js";
+import type { HubDisplayTemplateArg } from "../../../src/contracts/v1.1/hub-events.js";
 
 /**
  * Extracts the key set of the client's `TEMPLATES` mirror map by
@@ -27,6 +29,10 @@ import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
  * an empty set (fail-loud, never a vacuous pass).
  */
 function extractClientTemplateIds(): string[] {
+  return Object.keys(extractClientTemplates()).sort();
+}
+
+function extractClientTemplates(): Record<string, (args: unknown[]) => string> {
   const script = getClientScript();
   const marker = "const TEMPLATES = {";
   const start = script.indexOf(marker);
@@ -41,13 +47,38 @@ function extractClientTemplateIds(): string[] {
   // between the marker and the close brace is the literal's body.
   const objectLiteral =
     "{" + script.slice(start + marker.length, end) + "\n}";
-  const evaluated = new Function(`"use strict"; return (${objectLiteral});`)() as
-    Record<string, unknown>;
-  const ids = Object.keys(evaluated);
-  if (ids.length === 0) {
+  const evaluated = new Function(
+    "arg",
+    `"use strict"; return (${objectLiteral});`,
+  )((args: Array<{ kind: string; value: unknown }>, kind: string, fallback = "(unknown)") => {
+    const found = args.find((a) => a.kind === kind);
+    return found ? String(found.value) : fallback;
+  }) as Record<string, (args: unknown[]) => string>;
+  if (Object.keys(evaluated).length === 0) {
     throw new Error("client TEMPLATES map evaluated to an empty object");
   }
-  return ids.sort();
+  return evaluated;
+}
+
+function extractClientStatusMap(): Record<string, { label: string; glyph: string }> {
+  const script = getClientScript();
+  const marker = "const STATUS_MAP = {";
+  const start = script.indexOf(marker);
+  if (start === -1) {
+    throw new Error("client STATUS_MAP not found in embedded script");
+  }
+  const end = script.indexOf("\n};", start);
+  if (end === -1) {
+    throw new Error("client STATUS_MAP close brace not found");
+  }
+  const objectLiteral =
+    "{" + script.slice(start + marker.length, end) + "\n}";
+  const evaluated = new Function(`"use strict"; return (${objectLiteral});`)() as
+    Record<string, { label: string; glyph: string }>;
+  if (Object.keys(evaluated).length === 0) {
+    throw new Error("client STATUS_MAP evaluated to an empty object");
+  }
+  return evaluated;
 }
 
 describe("v1.1 dashboard template registry", () => {
@@ -192,9 +223,25 @@ describe("v1.1 dashboard template registry", () => {
     ).toEqual([]);
   });
 
+  it("keeps mirrored removal copy values in client and server parity", () => {
+    const args: HubDisplayTemplateArg[] = [
+      { kind: "agent_id", value: "agent-alpha" },
+    ];
+    const clientTemplates = extractClientTemplates();
+    const serverTemplate = renderTemplate("approval_pending.tier1.unwrap", args);
+    const clientTemplate =
+      clientTemplates["approval_pending.tier1.unwrap"]?.(args) ?? "";
+    expect(clientTemplate).toBe(serverTemplate);
+
+    const clientStatus = extractClientStatusMap().unwrapping;
+    expect(clientStatus).toBeDefined();
+    expect(clientStatus.label).toBe(STATUS_MAPPING.unwrapping.label);
+    expect(clientStatus.glyph).toBe(STATUS_MAPPING.unwrapping.glyph);
+  });
+
   it("renders the fortress lockdown approval template with consequences", () => {
     const out = renderTemplate("approval_pending.tier1.fortress_lockdown", []);
-    expect(out).toContain("Lockdown approval pending");
+    expect(out).toContain("Lock down approval pending");
     expect(out).toContain("revokes network access");
     expect(out).not.toContain("writes are blocked");
     expect(out).not.toContain("[unrecognized template");
