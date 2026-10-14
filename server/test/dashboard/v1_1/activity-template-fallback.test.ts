@@ -94,7 +94,7 @@ describe("activity template namespace fallback", () => {
     expect(namespaces.sort()).toEqual(Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES).sort());
   });
 
-  // fail-before-exempt: exact-id precedence and unknown-id boundaries already hold on base.
+  // Exact-id precedence and the unknown-id boundary already hold on main; these cases pin them under the fallback.
   it("keeps an exact operation sentence ahead of its category sentence", async () => {
     const entry = await feedEntry("agent_lockdown_engaged");
     const expected = "Network access revoked for agent (unknown).";
