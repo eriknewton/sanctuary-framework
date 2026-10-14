@@ -2487,6 +2487,45 @@ describe("slice 6a Agents wired consumers", () => {
     expect(calls).toEqual(["research-agent"]);
     expect(runInContext("agentReachPendingId", h.context)).toBeNull();
   });
+
+  it("6a r2 an agent opened from another route while a read holds admission is read next", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.navigate("agents");
+    // The open-agent handler queues the read before it assigns the hash, and a browser fires hashchange in a later
+    // task; this harness fires it synchronously, so the queue step runs here on its own while the route is #agents.
+    runInContext('state.selectedAgentId = "second-agent"; void loadAgentReach("second-agent")', h.context);
+    finish(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent", "second-agent"]);
+    h.navigate("agent-detail"); await settle();
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
+    expect(html).toContain('<div class="mono">docs.example.test');
+  });
+
+  it("6a r2 leaving detail with a queued subject returns its placeholder to unread", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => new Promise(resolve => { finish = resolve; }),
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    h.navigate("overview");
+    finish(response(sc.reach)); await settle();
+    h.navigate("agent-detail"); await settle();
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).toContain("Reach not read yet.");
+    expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
+  });
 });
 
 describe("Approvals round-one decision and evidence states", () => {

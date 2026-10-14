@@ -32,6 +32,7 @@ import {
   STATUS_PILL_CSS,
   THEME_BOOTSTRAP_SCRIPT,
 } from "./posture-html-shared.js";
+import { LEGACY_LAYER_NAMES } from "../dashboard/legacy-layer-names.js";
 
 export function renderPostureEvidenceHTML(): string {
   return `<!DOCTYPE html>
@@ -45,9 +46,11 @@ export function renderPostureEvidenceHTML(): string {
   ${CONSOLE_FONT_FACE_CSS}
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  html[data-theme="dark"] { color-scheme: dark; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.5 var(--sans);
   }
   header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
@@ -70,7 +73,7 @@ export function renderPostureEvidenceHTML(): string {
   .err { color: var(--rust); }
   code {
     background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
-    font-size: 12px;
+    font-family: var(--mono); font-size: 12px;
   }
   .findings-banner {
     background: var(--rust-bg); border: 1px solid var(--rust);
@@ -78,7 +81,7 @@ export function renderPostureEvidenceHTML(): string {
     color: var(--rust);
   }
   .findings-banner h3 { margin: 0 0 8px; font-size: 13px; }
-  .finding-item { font-size: 12px; margin: 4px 0; font-family: monospace; }
+  .finding-item { font-size: 12px; margin: 4px 0; font-family: var(--mono); }
   .filters {
     display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
     align-items: flex-end;
@@ -86,7 +89,7 @@ export function renderPostureEvidenceHTML(): string {
   .filter-group { display: flex; flex-direction: column; gap: 4px; }
   .filter-group label { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .3px; }
   .filter-group input, .filter-group select {
-    background: var(--surface-2); border: 1px solid var(--rule); color: var(--ink);
+    background: var(--surface-2); border: 1px solid var(--ink-3); color: var(--ink);
     padding: 5px 8px; border-radius: 6px; font-size: 13px; min-width: 140px;
   }
   .filter-group input:focus, .filter-group select:focus {
@@ -113,12 +116,12 @@ export function renderPostureEvidenceHTML(): string {
   }
   table.entries tr:last-child td { border-bottom: 0; }
   table.entries tr:hover td { background: var(--surface-2); }
-  .ts { white-space: nowrap; font-family: monospace; font-size: 11px; color: var(--ink-3); }
-  .op { font-family: monospace; }
+  .ts { white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .op { font-family: var(--mono); }
   .details-toggle { cursor: pointer; color: var(--indigo); font-size: 11px; user-select: none; }
   .details-block {
     display: none; margin-top: 4px; background: var(--paper); border: 1px solid var(--rule);
-    border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 11px;
+    border-radius: 4px; padding: 6px 8px; font-family: var(--mono); font-size: 11px;
     white-space: pre-wrap; word-break: break-all; color: var(--ink-3); max-width: 480px;
   }
   .footer {
@@ -156,10 +159,9 @@ export function renderPostureEvidenceHTML(): string {
           <label>Layer</label>
           <select id="f-layer">
             <option value="">any</option>
-            <option value="l1">l1 - Castle Wall (Boundary)</option>
-            <option value="l2">l2 - Sentinels (Operational)</option>
-            <option value="l3">l3 - Charter (Selective Disclosure)</option>
-            <option value="l4">l4 - Heralds (Verifiable Reputation)</option>
+            ${Object.entries(LEGACY_LAYER_NAMES)
+              .map(([token, name]) => `<option value="${token}">${name}</option>`)
+              .join("")}
           </select>
         </div>
         <div class="filter-group">
@@ -247,9 +249,14 @@ export function renderPostureEvidenceHTML(): string {
     try { return JSON.stringify(v, null, 2); } catch { return String(v); }
   }
 
+  var LEGACY_LAYER_NAMES = ${JSON.stringify(LEGACY_LAYER_NAMES)};
   function layerPill(layer) {
-    var label = esc(layer);
-    return '<span class="pill neutral">' + label + "</span>";
+    var raw = String(layer == null ? "" : layer);
+    var label = Object.prototype.hasOwnProperty.call(LEGACY_LAYER_NAMES, raw)
+      ? LEGACY_LAYER_NAMES[raw]
+      : null;
+    return '<span class="pill neutral" title="' + esc(raw) + '">' +
+      esc(label || raw) + "</span>";
   }
 
   function resultPill(result) {

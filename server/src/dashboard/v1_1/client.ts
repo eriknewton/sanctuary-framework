@@ -901,8 +901,12 @@ const TIME_RANGE_ROUTES = ["activity"];
 // route-walk test asserts this for every hash id but "dashboard".
 const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "machines", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
-  // A queued reach read belongs to the open detail route, never to a remembered selection.
-  if (route !== "agent-detail") agentReachPendingId = null;
+  // A queued reach read belongs to the open detail route, never to a remembered selection; a cleared subject was
+  // never read, so its loading placeholder returns to unread rather than claiming a read in progress.
+  if (route !== "agent-detail") {
+    if (agentReachPendingId && state.agentReach.agentId === agentReachPendingId && state.agentReach.state === "state_LOADING") state.agentReach = { state: "state_UNREAD", agentId: null, data: null, readAt: 0 };
+    agentReachPendingId = null;
+  }
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
@@ -1886,8 +1890,9 @@ async function loadAgentReach(agentId) {
       agentReachInFlight--;
       const next = agentReachPendingId;
       agentReachPendingId = null;
-      // The pending subject reads once admission is free, and only while its detail is still open.
-      if (next && state.route === "agent-detail" && next === state.selectedAgentId) void loadAgentReach(next);
+      // setRoute clears this slot whenever the detail route closes, so a subject still pending here belongs to an open
+      // or opening detail page: an open from another route queues the read before its hashchange lands.
+      if (next && next === state.selectedAgentId) void loadAgentReach(next);
     }
   })();
   try {
