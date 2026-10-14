@@ -699,7 +699,8 @@ describe("seedDemoFortress", () => {
     expect(await pathExists(run.home!)).toBe(false);
   });
 
-  // fail-before-exempt: protects the locked-directory restore's place in the shared cleanup and passes on the base by construction; its witness is a planted change that moves the restore out of the shared cleanup, which must turn this test red.
+  // fail-before-exempt: pins the locked-directory restore's place in the shared cleanup, so it passes on the base by
+  // construction; its witness is a planted change that removes the restore from the shared cleanup and turns it red.
   it.skipIf(process.getuid?.() === 0)("the shared cleanup restores a locked directory before it removes the owned root", async () => {
     const root = ownedDemoRoot();
     await lockOwnedDirectory(join(root, "locked"));
