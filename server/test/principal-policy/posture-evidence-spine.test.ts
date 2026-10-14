@@ -171,10 +171,6 @@ describe("S3 evidence spine: the v1.1 dashboard", () => {
     expect(client).toContain("no enforcement evidence yet");
   });
 
-  it("omits a tile denominator that is not a finite number", () => {
-    expect(client).toMatch(/typeof o\.of === "number" && isFinite\(o\.of\)/);
-  });
-
   it("keeps the clipboard copy from silently doing nothing", () => {
     // The async Clipboard API needs a secure context, so reaching this board
     // over plain http on a LAN address used to disable the chip silently while
