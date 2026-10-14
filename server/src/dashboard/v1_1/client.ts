@@ -1444,14 +1444,14 @@ function agentInitials(agentId) {
 // The state dot beside an agent's state word, one shape per state so it
 // reads in monochrome: active is the pass circle, locked down the hollow
 // locked square, an error the fault square, Unknown the hollow unknown ring,
-// and known transitional states (paused, restarting, being removed) the warn triangle.
+// and known transitional states (paused, restarting, unwrapping) the warn triangle.
 // An agent with no current evidence is Unknown, never painted as working.
 function agentStateClass(status) {
   if (status === "active") return "live";
   if (status === "locked_down") return "locked";
   if (status === "error") return "off";
   if (!status || status === "unknown") return "unknown";
-  if (status === "paused" || status === "restarting" || status === "removing") return "idle";
+  if (status === "paused" || status === "restarting" || status === "unwrapping") return "idle";
   return "unknown";
 }
 // The inspect pane's state pill wears the same state as the dot inside it.
@@ -4004,7 +4004,7 @@ const FLEET_PROBE_VIEW = {
   state_ONLINE: { word: "Online", cls: "good" },
   state_NOT_HEALTHY: { word: "Not healthy", cls: "bad" },
   state_UNKNOWN: { word: "Unknown", cls: "unknown" },
-  state_UNPROBED: { word: "Unprobed", cls: "unknown" }
+  state_UNPROBED: { word: "Unchecked", cls: "unknown" }
 };
 const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {} };
 
@@ -4147,11 +4147,10 @@ function fleetSummary(machines) {
     else unknown++;
   });
   const parts = [online + " of " + total + noun + " online"];
-  if (unprobed) parts.push("checking " + probeable + " of " + total + noun + "; the rest are listed unchecked");
+  if (unprobed) parts.push((fleet.roundDone && !checking ? "checked " : "checking ") + probeable + " of " + total + noun + "; the rest are listed unchecked");
   if (checking) parts.push(checking + " checking");
   if (notHealthy) parts.push(notHealthy + " not healthy");
   if (unknown) parts.push(unknown + " Unknown");
-  if (unprobed) parts.push(unprobed + " unprobed");
   return { text: parts.join(" · "), age: "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago" };
 }
 
@@ -4247,7 +4246,10 @@ function makeMachineRow(machine, index) {
     row.appendChild(makeTextElement("span", "machine-here", "This machine"));
   } else if (machine.origin) {
     const open = makeTextElement("a", "btn", "Open console");
-    open.setAttribute("href", machine.url);
+    const parsed = fleetHttpUrl(machine.url);
+    // The link uses the same parsed web address as the probe, so browser URL
+    // normalization cannot retarget the operator to this console.
+    if (parsed) open.setAttribute("href", parsed.href);
     open.setAttribute("rel", "noopener");
     row.appendChild(open);
   } else {
@@ -4264,12 +4266,19 @@ function paintMachinesScreen() {
   updateMachinesSummary(summaryEl, machines);
   const pending = fleet.paintRows || {};
   fleet.paintRows = {};
+  const focus = captureInputFocus(listEl);
   Object.keys(pending).forEach(function (url) {
     const index = machines.findIndex(function (m) { return m.url === url; });
     if (index < 0 || !listEl.querySelector) return;
-    const oldRow = listEl.querySelector('[data-machine-url="' + escCssAttr(url) + '"]');
+    let oldRow;
+    try {
+      // Row lookup is by the generated numeric index; saved machine addresses
+      // can contain selector-hostile control characters.
+      oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+    } catch (e) { return; }
     if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
   });
+  restoreInputFocus(listEl, focus);
 }
 
 function hydrateMachinesScreen() {

@@ -4,7 +4,9 @@
  * filters all render from a given snapshot.
  */
 
+// fail-before-exempt: this change strengthens the existing shield-mark pin to run the client update path for each light; server/src/dashboard/html.ts is unchanged here, so the test passes on the base by design.
 import { describe, it, expect } from "vitest";
+import { runInNewContext } from "node:vm";
 import { renderDashboardHTML, HERO_COPY } from "../../src/dashboard/html.js";
 import type { ProtectionSnapshot } from "../../src/dashboard/aggregator.js";
 import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../../src/dashboard/design-tokens.js";
@@ -143,9 +145,24 @@ describe("renderDashboardHTML", () => {
     }));
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
     expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
-    const clientFn = html.match(/function shieldStatusMarkForLight\(light\) \{([\s\S]*?)\n  \}/)![1]!;
+    const clientFns = html.match(/function shieldStatusMarkForLight\(light\) \{[\s\S]*?\n  \}\n\n  function renderShield\(light, headline\) \{[\s\S]*?\n  \}/)![0]!;
     for (const light of lights) {
-      expect(clientFn, light).toContain(serverMarks.get(light));
+      const updatedMark = runInNewContext(`
+        const writes = [];
+        const classList = { remove() {}, add() {} };
+        const document = {
+          getElementById: function (id) {
+            if (id === "shield") return { classList };
+            if (id === "shield-status-mark") return { setAttribute: function (key, value) { if (key === "d") writes.push(value); } };
+            return { textContent: "" };
+          }
+        };
+        function heroCopyForLight() { return "copy"; }
+        ${clientFns}
+        renderShield(${JSON.stringify(light)}, "headline");
+        writes[0];
+      `) as string;
+      expect(updatedMark, light).toBe(serverMarks.get(light));
     }
   });
 

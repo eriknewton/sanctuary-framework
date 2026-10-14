@@ -45,6 +45,8 @@ const heldItem = {
 };
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
+let fakeActiveElement: unknown = null;
+
 class FakeElement {
   attrs: Record<string, string>;
   parentElement: FakeElement | null = null;
@@ -80,9 +82,16 @@ class FakeElement {
   removeAttribute(name: string) { delete this.attrs[name]; }
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
+  private matches(selector: string) {
+    const tag = selector.match(/^[a-z]+/i)?.[0]?.toUpperCase();
+    if (tag && this.tagName !== tag) return false;
+    const attrs = [...selector.matchAll(/\[([^=\]]+)="([^"]*)"\]/g)];
+    if (!attrs.length) return false;
+    return attrs.every((m) => this.attrs[m[1]!] === m[2]);
+  }
   querySelector(selector: string): FakeElement | null {
-    const attr = selector.match(/^\[([^=]+)="([^"]*)"\]$/);
-    if (attr && this.attrs[attr[1]!] === attr[2]) return this;
+    if (/[\f\n\r]/.test(selector)) throw new SyntaxError("invalid selector");
+    if (this.matches(selector)) return this;
     for (const child of this.children) {
       if (child instanceof FakeElement) {
         const found: FakeElement | null = child.querySelector(selector);
@@ -91,8 +100,19 @@ class FakeElement {
     }
     return null;
   }
-  querySelectorAll() { return []; }
-  contains() { return false; }
+  querySelectorAll(selector: string): FakeElement[] {
+    if (/[\f\n\r]/.test(selector)) throw new SyntaxError("invalid selector");
+    const found: FakeElement[] = [];
+    if (this.matches(selector)) found.push(this);
+    for (const child of this.children) {
+      if (child instanceof FakeElement) found.push(...child.querySelectorAll(selector));
+    }
+    return found;
+  }
+  contains(target: unknown): boolean {
+    if (target === this) return true;
+    return this.children.some((child) => child instanceof FakeElement && child.contains(target));
+  }
   appendChild(child: FakeElement | FakeText) {
     if (child instanceof FakeElement) child.parentElement = this;
     this.children.push(child);
@@ -108,7 +128,7 @@ class FakeElement {
     this.text = "";
     this.append(...children);
   }
-  focus() {}
+  focus() { fakeActiveElement = this; }
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
     const index = this.parentElement.children.indexOf(this);
@@ -136,6 +156,7 @@ const SHELL_IDS = [
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+  fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
@@ -163,7 +184,9 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
       createElement: (tagName: string) => new FakeElement({}, tagName),
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
-      querySelectorAll: () => [], activeElement: null,
+      querySelectorAll: () => [],
+      get activeElement() { return fakeActiveElement; },
+      set activeElement(value: unknown) { fakeActiveElement = value; },
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
     window: { addEventListener: (name: string, fn: () => void) => { winListeners[name] = fn; } },
@@ -577,6 +600,8 @@ describe("slice 2b shell wired consumers", () => {
     let html = machinesHtml(h);
     // This machine joins the three saved ones: four in the denominator.
     expect(html).toContain("1 of 4 machines online · 1 checking · 1 not healthy · 1 Unknown");
+    // Retargeted (slice 2b): the summary used to include a cap-only
+    // "showing" clause; all rows are now listed, so that copy would lie.
     expect(html).not.toContain("showing");
     expect(html).toMatch(/checked \d+s ago/);
     vi.advanceTimersByTime(3000);
@@ -674,7 +699,9 @@ describe("slice 2b shell wired consumers", () => {
     expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
     expect(html).not.toMatch(/<(?:img|script)\b/i);
     expect(html).not.toMatch(/\sonerror="/i);
-    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"]);
+    // The only href keeps the parsed web address; hostile non-web entries
+    // remain text, and the saved path is not silently retargeted to root.
+    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=%22%3E%3Cscript%3Ealert(1)%3C/script%3E"]);
     expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
     expect(html.match(/Not a web address/g) ?? []).toHaveLength(3);
   });
@@ -695,9 +722,9 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
     expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
-    expect(machinesHtml(h)).toContain(`checking ${limit} of 2501 machines; the rest are listed unchecked`);
+    expect(machinesHtml(h)).toContain(`checked ${limit} of 2501 machines; the rest are listed unchecked`);
     expect(h.el["machines-list"]!.textContent).toContain("build-2499");
-    expect(h.el["machines-list"]!.textContent).toContain("Unprobed");
+    expect(h.el["machines-list"]!.textContent).toContain("Unchecked");
     expect(h.el["machines-list"]!.replaceCount).toBe(1);
   });
 
@@ -734,6 +761,61 @@ describe("slice 2b shell wired consumers", () => {
     expect(machinesHtml(h)).toContain("2 of 2 machines online");
     expect(h.el["machines-list"]!.textContent).toContain("host health check");
     expect(machinesHtml(h)).toContain('href="http://build.fixture:3501/tenant/a"');
+  });
+
+  it("Open console uses the parsed machine address", async () => {
+    vi.useFakeTimers();
+    const h = boot({}, {
+      ...storage([{ name: "peer", url: "http:peer:3501" }]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(machinesHtml(h)).toContain('href="http://peer:3501/"');
+  });
+
+  it("a row repaint keeps focus on its Open console link", async () => {
+    vi.useFakeTimers();
+    let releasePeer: (value: unknown) => void = () => {};
+    const h = boot({
+      "http://peer.fixture:3501/api/health": () => new Promise((resolve) => { releasePeer = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "peer", url: "http://peer.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const link = h.el["machines-list"]!.querySelector('[href="http://peer.fixture:3501/"]');
+    expect(link).toBeTruthy();
+    link!.focus();
+    releasePeer(response({ ok: true }));
+    await settle();
+    expect((runInContext("document.activeElement && document.activeElement.getAttribute('href')", h.context))).toBe("http://peer.fixture:3501/");
+    expect(runInContext("document.getElementById('machines-list').contains(document.activeElement)", h.context)).toBe(true);
+  });
+
+  it("one selector-hostile machine row does not stop the rest of the paint batch", async () => {
+    vi.useFakeTimers();
+    let releaseHostile: (value: unknown) => void = () => {};
+    let releaseNormal: (value: unknown) => void = () => {};
+    const hostile = "http://bad.fixture:3501/\fline\nbreak";
+    const h = boot({
+      "http://bad.fixture:3501/api/health": () => new Promise((resolve) => { releaseHostile = resolve; }),
+      "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "hostile", url: hostile }, { name: "normal", url: "http://normal.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    releaseHostile(response({ ok: true }));
+    releaseNormal(response({ ok: false }));
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain('data-machine-url="' + hostile + '"');
+    expect(html).toContain('data-machine-url="http://normal.fixture:3501/"');
+    expect(html).toContain("Online");
+    expect(html).toContain("Not healthy");
+    expect(html).not.toContain("Checking");
   });
 
   it("a Fleet link click changes route once and starts one probe wave", async () => {
@@ -814,6 +896,7 @@ describe("slice 2b shell wired consumers", () => {
       "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [
         { agent_id: "no-evidence", status: "active", harness: "h", model_provider },
         { agent_id: "paused-one", status: "paused", harness: "h", model_provider },
+        { agent_id: "unwrapping-one", status: "unwrapping", harness: "h", model_provider },
         { agent_id: "locked-one", status: "locked_down", harness: "h", model_provider },
         { agent_id: "off-enum", status: "mystery", harness: "h", model_provider },
       ] } })),
@@ -825,6 +908,8 @@ describe("slice 2b shell wired consumers", () => {
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
+    expect(dot("unwrapping-one")![1]).toBe("idle");
+    expect(dot("unwrapping-one")![2]).toBe("Unwrapping");
     expect(dot("locked-one")![1]).toBe("locked");
     expect(dot("off-enum")![1]).toBe("unknown");
     // The inspect pane's pill wears the same Unknown tone as its dot, and
@@ -834,6 +919,13 @@ describe("slice 2b shell wired consumers", () => {
     expect(pane).toContain('<span class="pill tone-unknown"><span class="state-dot unknown"');
     expect(pane).toContain('<div class="timeline-item"><div class="ts">');
     expect(pane).not.toContain("timeline-item ok");
+    runInContext(`state.chat.inspect.panelByAgentId["unwrapping-one"] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" }; state.selectedAgentId = "unwrapping-one";`, h.context);
+    const unwrappingPane = runInContext(`renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === "unwrapping-one"; }))`, h.context) as string;
+    const unwrappingDetail = runInContext("renderAgentDetail()", h.context) as string;
+    const fortressCard = runInContext("renderFortressAgentsCard()", h.context) as string;
+    expect(unwrappingPane).toContain('<span class="pill tone-degraded"><span class="state-dot idle"');
+    expect(unwrappingDetail).toContain('<dt>Status</dt><dd><span class="glyph idle"></span> Unwrapping</dd>');
+    expect(fortressCard).toMatch(/data-agent-id="unwrapping-one"[\s\S]*?<span class="glyph idle"/);
   });
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {
