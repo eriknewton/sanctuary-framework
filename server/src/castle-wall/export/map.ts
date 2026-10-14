@@ -66,7 +66,7 @@ const REDACTED_SENTINEL = "[redacted]";
 
 /** Control-character class the source distress sanitizer strips; re-applied at the boundary. */
 // eslint-disable-next-line no-control-regex
-const CONTROL_CHARS = /[\u0000-\u001F\u007F]+/g;
+export const CONTROL_CHARS = /[\u0000-\u001F\u007F]+/g;
 
 export type EnforcementEventMapOptions = AuditAttributionOptions;
 
@@ -104,21 +104,21 @@ function destinationObject(details: Record<string, unknown> | undefined): Record
  * OR the flat `dest_host` (producer-signed body); both are agent-supplied
  * metadata. Returns null when neither is a non-empty string.
  */
-function destinationHostOf(details: Record<string, unknown> | undefined): string | null {
+export function destinationHostOf(details: Record<string, unknown> | undefined): string | null {
   const dest = destinationObject(details);
   const nested = dest ? dest.host : undefined;
   if (typeof nested === "string" && nested.length > 0) return nested;
   return readString(details, "dest_host");
 }
 
-function destinationIpOf(details: Record<string, unknown> | undefined): string | null {
+export function destinationIpOf(details: Record<string, unknown> | undefined): string | null {
   const dest = destinationObject(details);
   const nested = dest ? dest.ip : undefined;
   if (typeof nested === "string" && nested.length > 0) return nested;
   return readString(details, "dest_ip");
 }
 
-function destinationPortOf(details: Record<string, unknown> | undefined): number | null {
+export function destinationPortOf(details: Record<string, unknown> | undefined): number | null {
   const dest = destinationObject(details);
   const nested = dest ? dest.port : undefined;
   if (typeof nested === "number" && Number.isFinite(nested) && Number.isInteger(nested)) {
