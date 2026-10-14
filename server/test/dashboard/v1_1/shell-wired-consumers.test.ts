@@ -48,7 +48,7 @@ const heldItem = {
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
 let fakeActiveElement: unknown = null;
-let setAttributeThrowFor: { name: string; value: string } | null = null;
+let setAttributeThrowFor: { name: string; value: string; persistent?: boolean } | null = null;
 
 class FakeElement {
   attrs: Record<string, string>;
@@ -81,9 +81,12 @@ class FakeElement {
     has: (c: string) => this.classes.has(c),
   };
   getAttribute(name: string) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name]! : null; }
+  get title() { return this.attrs.title ?? ""; }
+  set title(value: string) { this.attrs.title = String(value); }
+  get lastChild(): FakeElement | FakeText | null { return this.children.at(-1) ?? null; }
   setAttribute(name: string, value: string) {
     if (setAttributeThrowFor && setAttributeThrowFor.name === name && setAttributeThrowFor.value === String(value)) {
-      setAttributeThrowFor = null;
+      if (!setAttributeThrowFor.persistent) setAttributeThrowFor = null;
       throw new Error("fixture row build failed");
     }
     this.attrs[name] = String(value);
@@ -92,6 +95,7 @@ class FakeElement {
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
   private matches(selector: string) {
+    if (/^\.[\w-]+$/.test(selector)) return this.className.split(/\s+/).includes(selector.slice(1));
     const tag = selector.match(/^[a-z]+/i)?.[0]?.toUpperCase();
     if (tag && this.tagName !== tag) return false;
     const attrs = [...selector.matchAll(/\[([^=\]]+)="([^"]*)"\]/g)];
@@ -1011,7 +1015,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(machinesHtml(h)).not.toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip good"/);
   });
 
-  it("a row build failure leaves that row visible and still restores focus after another row repaints", async () => {
+  it("a persistent row build failure marks the existing chip and restores focus after another row repaints", async () => {
     vi.useFakeTimers();
     let releaseBroken: (value: unknown) => void = () => {};
     let releaseNormal: (value: unknown) => void = () => {};
@@ -1028,7 +1032,11 @@ describe("slice 2b shell wired consumers", () => {
     const normalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
     expect(normalLink).toBeTruthy();
     normalLink!.focus();
-    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl };
+    const oldRow = h.el["machines-list"]!.querySelector('[data-machine-url="http://broken.fixture:3501/"]')!;
+    const oldChip = oldRow.querySelector(".state-chip")!;
+    const chipAttributeWrite = vi.spyOn(oldChip, "setAttribute");
+    const rowSwap = vi.spyOn(oldRow, "replaceWith");
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl, persistent: true };
     releaseBroken(response({ ok: true }));
     releaseNormal(response({ ok: false }));
     await settle();
@@ -1040,6 +1048,12 @@ describe("slice 2b shell wired consumers", () => {
     expect(brokenRow).toContain('class="state-chip unknown"');
     expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
     expect(brokenRow).not.toContain("Checking");
+    expect(h.el["machines-list"]!.querySelector('[data-machine-url="http://broken.fixture:3501/"]')).toBe(oldRow);
+    expect(oldRow.querySelector(".state-chip")).toBe(oldChip);
+    expect(chipAttributeWrite).not.toHaveBeenCalled();
+    expect(rowSwap).not.toHaveBeenCalled();
+    expect(h.el["machines-summary"]!.textContent).toContain("2 of 3 machines online");
+    expect(h.el["machines-summary"]!.textContent).not.toContain("checking");
     expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/normal\.fixture:3501\/"[^>]*><span [^>]*class="state-chip bad"/);
   });
 
@@ -1063,6 +1077,95 @@ describe("slice 2b shell wired consumers", () => {
     expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
     expect(machineRowHtml(html, normalUrl)).toContain('class="state-chip good"');
     expect(h.el["machines-summary"]!.textContent).toContain("machines online");
+  });
+
+  it("persistent first-visit failures draw a fixed-text placeholder row and still render the other rows and restore focus", async () => {
+    vi.useFakeTimers();
+    const brokenUrl = "http://broken.fixture:3501/";
+    const normalUrl = "http://normal.fixture:3501/";
+    const returnedRow = vi.fn();
+    const h = boot({
+      "http://broken.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://normal.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, { ...storage([{ name: "broken", url: brokenUrl }, { name: "normal", url: normalUrl }]), returnedRow });
+    await settle();
+    runInContext(`const originalGuardedRow = guardedMachineRow;
+      guardedMachineRow = function (machine, index) {
+        const row = originalGuardedRow(machine, index);
+        returnedRow(machine.url, row);
+        return row;
+      };`, h.context);
+    // The fake does not parse main.innerHTML; delegate its restored-link lookup
+    // to the hydrated list, as the real main element does through its children.
+    const priorLink = new FakeElement({ href: normalUrl }, "a");
+    h.el.main!.appendChild(priorLink);
+    h.el.main!.querySelectorAll = (selector) => h.el["machines-list"]!.querySelectorAll(selector);
+    priorLink.focus();
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl, persistent: true };
+    expect(() => h.navigate("machines")).not.toThrow();
+    const fallback = returnedRow.mock.calls.find(([url]) => url === brokenUrl)?.[1];
+    // If both constructors fail, the guard returns a placeholder row of fixed
+    // text, so the list still shows one entry per counted machine.
+    expect(fallback).toBeInstanceOf(FakeElement);
+    expect(fallback.className).toBe("machine-row");
+    expect(fallback.textContent).toBe("One machine could not be shown; use Check again.");
+    expect(fallback.textContent).not.toContain("broken");
+    expect(machinesHtml(h)).toContain("One machine could not be shown; use Check again.");
+    const normalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(normalLink).toBeTruthy();
+    expect(fakeActiveElement).toBe(normalLink);
+    expect(h.el["machines-list"]!.replaceCount).toBe(1);
+    expect(h.el["machines-summary"]!.textContent).toContain("3 checking");
+    await settle();
+    expect(machineRowHtml(machinesHtml(h), normalUrl)).toContain('class="state-chip good"');
+    expect(machineRowHtml(machinesHtml(h), "http://fixture")).toContain('class="state-chip good"');
+    expect(h.el["machines-summary"]!.textContent).toContain("3 of 3 machines online");
+    expect(fakeActiveElement).toBe(h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]'));
+  });
+
+  it.each(["missing index", "throwing index lookup"])("paint rebuilds once after %s and restores focus to the new link", async (trigger) => {
+    vi.useFakeTimers();
+    let releaseControl: (value: unknown) => void = () => {};
+    let releaseNormal: (value: unknown) => void = () => {};
+    const controlUrl = "http://control.fixture:3501/\fpath";
+    const normalUrl = "http://normal.fixture:3501/";
+    const h = boot({
+      "http://control.fixture:3501/api/health": () => new Promise((resolve) => { releaseControl = resolve; }),
+      "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "control", url: controlUrl }, { name: "normal", url: normalUrl }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const list = h.el["machines-list"]!;
+    const oldRow = list.querySelector('[data-machine-index="1"]')!;
+    expect(oldRow.textContent).toContain("Checking");
+    oldRow.removeAttribute("data-machine-index");
+    if (trigger === "throwing index lookup") {
+      // A DOM lookup exception reaches the outer catch's distinct rebuild.
+      vi.spyOn(list, "querySelector").mockImplementationOnce(() => { throw new Error("fixture lookup failed"); });
+    }
+    const oldLink = list.querySelectorAll('[href="http://normal.fixture:3501/"]')[0]!;
+    oldLink.focus();
+    const buildsBefore = list.replaceCount;
+    releaseControl(response({ ok: true }));
+    releaseNormal(response({ ok: false }));
+    await settle();
+    const newRow = list.querySelector('[data-machine-index="1"]')!;
+    expect(newRow).toBeTruthy();
+    expect(newRow).not.toBe(oldRow);
+    expect(newRow.getAttribute("data-machine-url")).toBe(controlUrl);
+    expect(newRow.querySelector(".state-chip")!.className).toBe("state-chip good");
+    expect(newRow.textContent).toContain("Online");
+    expect(list.textContent).not.toContain("Checking");
+    expect(list.replaceCount - buildsBefore).toBe(1);
+    expect(machineRowHtml(machinesHtml(h), normalUrl)).toContain('class="state-chip bad"');
+    const newLink = list.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(newLink).toBeTruthy();
+    expect(newLink).not.toBe(oldLink);
+    expect(fakeActiveElement).toBe(newLink);
+    expect(list.contains(fakeActiveElement)).toBe(true);
   });
 
   it("a Fleet link click changes route once and starts one probe wave", async () => {
@@ -1136,6 +1239,13 @@ describe("slice 2b shell wired consumers", () => {
     expect(html).not.toMatch(/signed receipt|tool-call cycle/);
   });
 
+  // One glyph-to-mark table for both agent mark tests below, so the dot and tone they expect cannot drift apart.
+  const GLYPH_TO_MARK: Record<string, { dot: string; tone: string }> = {
+    online: { dot: "live", tone: "tone-verified" }, idle: { dot: "idle", tone: "tone-degraded" },
+    offline: { dot: "locked", tone: "tone-locked" }, away: { dot: "off", tone: "tone-unverified" },
+    unknown: { dot: "unknown", tone: "tone-unknown" },
+  };
+
   it("an agent without current evidence wears the Unknown mark, never a working state's mark", async () => {
     vi.useFakeTimers();
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
@@ -1156,10 +1266,8 @@ describe("slice 2b shell wired consumers", () => {
       return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
     };
     const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
-    (h.context as Record<string, unknown>).__agentStatus = "unwrapping";
-    const unwrappingDot = runInContext("agentStateClass(__agentStatus)", h.context) as string;
-    const unwrappingGlyph = runInContext("STATUS_MAP[__agentStatus].glyph", h.context) as string;
-    const unwrappingTone = runInContext("AGENT_STATE_PILL_TONE[agentStateClass(__agentStatus)] || 'tone-unknown'", h.context) as string;
+    const unwrappingGlyph = STATUS_MAPPING.unwrapping.glyph;
+    const { dot: unwrappingDot, tone: unwrappingTone } = GLYPH_TO_MARK[unwrappingGlyph]!;
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
@@ -1199,11 +1307,10 @@ describe("slice 2b shell wired consumers", () => {
     h.navigate("agents");
     const tableStatuses = Object.keys(STATUS_MAPPING).sort();
     expect([...HUB_AGENT_STATUSES].sort()).toEqual(tableStatuses);
-    const glyphToDot: Record<string, string> = { online: "live", idle: "idle", offline: "locked", away: "off", unknown: "unknown" };
     for (const status of HUB_AGENT_STATUSES) {
       const id = `agent-${status}`;
       const expectedGlyph = STATUS_MAPPING[status].glyph;
-      const expectedDot = glyphToDot[expectedGlyph];
+      const expectedDot = GLYPH_TO_MARK[expectedGlyph]!.dot;
       (h.context as Record<string, unknown>).__agentStatus = status;
       (h.context as Record<string, unknown>).__agentId = id;
       expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);

@@ -4111,6 +4111,7 @@ const FLEET_PROBE_VIEW = {
   state_UNPROBED: { word: "Unchecked", cls: "unknown" }
 };
 const FLEET_ROW_UPDATE_REASON = "Unknown: this row could not be updated; use Check again.";
+const FLEET_ROW_DRAW_FAILED = "One machine could not be shown; use Check again.";
 const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {}, rowUpdateFailed: {} };
 
 // Only an http or https address becomes a link or a probe target: the list
@@ -4394,14 +4395,34 @@ function guardedMachineRow(machine, index) {
   try { return makeMachineRow(machine, index); }
   catch (e) {
     fleet.rowUpdateFailed[machine.url] = true;
-    return makeMachineUpdateFallbackRow(machine, index);
+    try { return makeMachineUpdateFallbackRow(machine, index); }
+    catch (fallbackError) {
+      // A row whose fallback also fails still takes its place in the list as
+      // fixed text that reads no machine field, so the list never silently
+      // shows fewer machines than the summary counts; if even that fails, an
+      // empty node keeps the other rows and the focus restore running.
+      try {
+        const placeholder = document.createElement("div");
+        placeholder.className = "machine-row";
+        placeholder.appendChild(makeTextElement("span", "muted", FLEET_ROW_DRAW_FAILED));
+        return placeholder;
+      } catch (placeholderError) {
+        return document.createTextNode("");
+      }
+    }
   }
 }
 
-function replaceMachineWithFallback(oldRow, machine, index) {
+function replaceMachineWithFallback(oldRow) {
   try {
-    if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineUpdateFallbackRow(machine, index));
-  } catch (e) { /* ignore a DOM fallback failure; the guarded rebuild still protects full renders */ }
+    const chip = oldRow && oldRow.querySelector(".state-chip");
+    if (!chip) return;
+    // Reuse the chip and its mark so a repeated row-construction failure cannot
+    // leave Checking behind or discard the operator's focused link.
+    chip.className = "state-chip unknown";
+    chip.title = FLEET_ROW_UPDATE_REASON;
+    if (chip.lastChild) chip.lastChild.textContent = "Unknown";
+  } catch (e) { /* A failed in-place mark leaves the existing row; other rows and focus restore still run. */ }
 }
 
 function rebuildMachinesList(listEl, machines) {
@@ -4437,7 +4458,7 @@ function paintMachinesScreen() {
           catch (e) { oldRow = null; }
           if (oldRow) {
             fleet.rowUpdateFailed[url] = true;
-            replaceMachineWithFallback(oldRow, machines[index], index);
+            replaceMachineWithFallback(oldRow);
             return;
           }
         }
@@ -4449,7 +4470,7 @@ function paintMachinesScreen() {
           return;
         }
         if (fleet.rowUpdateFailed[url]) {
-          replaceMachineWithFallback(oldRow, machines[index], index);
+          replaceMachineWithFallback(oldRow);
           return;
         }
         if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
@@ -4457,7 +4478,7 @@ function paintMachinesScreen() {
         // A finished probe must never leave an old Checking chip behind; that
         // would claim work is still in flight after the answer arrived.
         if (index >= 0) fleet.rowUpdateFailed[url] = true;
-        if (oldRow && index >= 0) replaceMachineWithFallback(oldRow, machines[index], index);
+        if (oldRow && index >= 0) replaceMachineWithFallback(oldRow);
         else if (!rebuilt) {
           rebuilt = true;
           rebuildMachinesList(listEl, machines);
