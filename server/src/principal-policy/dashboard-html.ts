@@ -3570,7 +3570,10 @@ export function generateFleetSwitcherHTML(options: {
       try {
         const stored = localStorage.getItem(STORAGE_KEY);
         return stored === null ? [] : JSON.parse(stored);
-      } catch { return []; }
+      } catch {
+        // An unreadable saved value is preserved until an explicit Add replaces it.
+        return null;
+      }
     }
 
     function saveMachines(machines) {
@@ -3591,6 +3594,8 @@ export function generateFleetSwitcherHTML(options: {
 
     function acceptedDashboardUrl(value) {
       try {
+        // Explicit authority forms resolve to the same machine with or without a page base.
+        if (!/^https?:[/][/]/i.test(value)) return null;
         const parsed = new URL(value);
         return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? value : null;
       } catch {

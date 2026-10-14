@@ -172,6 +172,44 @@ test("fleet switcher add form preserves stored entries outside the visible list"
   }
 });
 
+test("fleet switcher keeps shorthand addresses view-only and refuses them in Add", async ({ page }) => {
+  const fleet = await startFleetSwitcher();
+  try {
+    await page.addInitScript((key) => {
+      localStorage.setItem(key, JSON.stringify([{ name: "Shorthand", url: "http:foo" }]));
+    }, STORAGE_KEY);
+    await page.goto(`${fleet.url}/fleet`);
+    const card = page.locator(".machine-card").filter({ hasText: "Shorthand" });
+    await expect(card.getByRole("link", { name: "Open Console" })).toHaveCount(0);
+    await expect(card).toContainText("Not checked");
+    for (const address of ["http:foo", "https:foo"]) {
+      await page.locator("#machine-name").fill("New shorthand");
+      await page.locator("#machine-url").fill(address);
+      await page.getByRole("button", { name: "Add Machine" }).click();
+      await expect(page.locator("#form-hint")).toHaveText("Enter an http or https address.");
+      const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) || "[]"), STORAGE_KEY);
+      expect(stored.some((entry: { name: string }) => entry.name === "New shorthand")).toBe(false);
+    }
+  } finally {
+    await fleet.stop();
+  }
+});
+
+test("fleet switcher preserves unreadable saved bytes on load", async ({ page }) => {
+  const fleet = await startFleetSwitcher();
+  try {
+    for (const value of ["", "[{\"name\":\"a\""]) {
+      await page.goto(`${fleet.url}/fleet`);
+      await page.evaluate(({ key, bytes }) => localStorage.setItem(key, bytes), { key: STORAGE_KEY, bytes: value });
+      await page.reload();
+      await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY)).toBe(value);
+      await expect(page.locator("#machine-list .machine-card")).toHaveCount(0);
+    }
+  } finally {
+    await fleet.stop();
+  }
+});
+
 test("fleet switcher leaves a non-list storage root unchanged on load", async ({ page }) => {
   const fleet = await startFleetSwitcher();
   try {
