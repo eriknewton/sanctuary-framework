@@ -135,6 +135,20 @@ describe("renderDashboardHTML", () => {
     expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
   });
 
+  it("the client shield update path uses the same mark paths as the server render", () => {
+    const lights = ["green", "yellow", "red"] as const;
+    const serverMarks = new Map(lights.map((light) => {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot({ overall: { status: "healthy", light, headline: "x" } }) });
+      return [light, html.match(/id="shield-status-mark" d="([^"]+)"/)![1]!] as const;
+    }));
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
+    const clientFn = html.match(/function shieldStatusMarkForLight\(light\) \{([\s\S]*?)\n  \}/)![1]!;
+    for (const light of lights) {
+      expect(clientFn, light).toContain(serverMarks.get(light));
+    }
+  });
+
   it("renders the hero copy from the exported HERO_COPY constant", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
     expect(html).toContain(`<h1 id="hero-copy">${HERO_COPY}</h1>`);

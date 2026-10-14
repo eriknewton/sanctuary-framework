@@ -43,6 +43,7 @@ function escHtml(value: unknown): string {
     .replace(/'/g, "&#039;");
 }
 
+// must match shieldStatusMarkForLight in this file's embedded client script.
 function shieldStatusMark(light: string): string {
   if (light === "green") return "M85 102 L96 113 L118 90";
   if (light === "yellow") return "M100 78 L122 120 L78 120 Z";
@@ -670,6 +671,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   function heroCopyForLight(light) {
     return light === "green" ? HERO_COPY_TEXT : NON_GREEN_HERO_COPY_TEXT;
   }
+  // must match shieldStatusMark in server/src/dashboard/html.ts.
   function shieldStatusMarkForLight(light) {
     if (light === "green") return "M85 102 L96 113 L118 90";
     if (light === "yellow") return "M100 78 L122 120 L78 120 Z";

@@ -56,6 +56,7 @@ class FakeElement {
   hidden = false;
   disabled = false;
   value = "";
+  replaceCount = 0;
   private classes = new Set<string>();
   constructor(attrs: Record<string, string> = {}, tagName = "DIV") { this.attrs = { ...attrs }; this.tagName = tagName.toUpperCase(); }
   get innerHTML() { return this.children.length ? this.children.map((c) => c.outerHTML).join("") : this.html; }
@@ -63,6 +64,7 @@ class FakeElement {
   get textContent() { return this.children.length ? this.children.map((c) => c.textContent).join("") : this.text; }
   set textContent(value: string) { this.text = String(value); this.html = escapeHtml(String(value)); this.children = []; }
   get outerHTML() {
+    if (this.tagName === "FRAGMENT") return this.innerHTML;
     const merged = this.className ? { ...this.attrs, class: this.className } : this.attrs;
     const attrs = Object.entries(merged).map(([k, v]) => ` ${k}="${escapeHtml(v)}"`).join("");
     return `<${this.tagName.toLowerCase()}${attrs}>${this.innerHTML}</${this.tagName.toLowerCase()}>`;
@@ -78,20 +80,42 @@ class FakeElement {
   removeAttribute(name: string) { delete this.attrs[name]; }
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
-  querySelector() { return null; }
+  querySelector(selector: string): FakeElement | null {
+    const attr = selector.match(/^\[([^=]+)="([^"]*)"\]$/);
+    if (attr && this.attrs[attr[1]!] === attr[2]) return this;
+    for (const child of this.children) {
+      if (child instanceof FakeElement) {
+        const found: FakeElement | null = child.querySelector(selector);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
   querySelectorAll() { return []; }
   contains() { return false; }
-  appendChild(child: FakeElement | FakeText) { this.children.push(child); return child; }
+  appendChild(child: FakeElement | FakeText) {
+    if (child instanceof FakeElement) child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
   append(...children: Array<FakeElement | FakeText | string>) {
     children.forEach((child) => this.appendChild(typeof child === "string" ? new FakeText(child) : child));
   }
   replaceChildren(...children: Array<FakeElement | FakeText | string>) {
+    this.replaceCount++;
     this.children = [];
     this.html = "";
     this.text = "";
     this.append(...children);
   }
   focus() {}
+  replaceWith(next: FakeElement | FakeText) {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index < 0) return;
+    if (next instanceof FakeElement) next.parentElement = this.parentElement;
+    this.parentElement.children[index] = next;
+  }
 }
 class FakeText {
   textContent: string;
@@ -113,19 +137,31 @@ const SHELL_IDS = [
 
 function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
   const el: Record<string, FakeElement> = {};
-  for (const id of SHELL_IDS) el[id] = new FakeElement();
+  for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
   // The rail pill sits inside its rail link, which carries the sentence.
   const railLink = new FakeElement();
   el["rail-approvals-count"]!.parentElement = railLink;
   const docListeners: Record<string, (ev: unknown) => void> = {};
   const winListeners: Record<string, () => void> = {};
-  const location = { hash: "", search: "", origin: "http://fixture" };
+  let locationHash = "";
+  const location = {
+    get hash() { return locationHash; },
+    set hash(value: string) {
+      const next = String(value);
+      const changed = next !== locationHash;
+      locationHash = next;
+      if (changed && winListeners.hashchange) winListeners.hashchange();
+    },
+    search: "",
+    origin: "http://fixture",
+  };
   const context = createContext({
     document: {
       getElementById: (id: string) => el[id] || (id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: "/api/hub" }) } : null),
       addEventListener: (name: string, fn: (ev: unknown) => void) => { docListeners[name] = fn; },
       createElement: (tagName: string) => new FakeElement({}, tagName),
+      createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [], activeElement: null,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
@@ -143,7 +179,7 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     ...extraGlobals,
   });
   runInContext(getClientScript(), context);
-  const navigate = (route: string) => { location.hash = "#" + route; winListeners.hashchange!(); };
+  const navigate = (route: string) => { location.hash = "#" + route; };
   const click = (attrs: Record<string, string>, inside: string[] = []) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
@@ -540,15 +576,18 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     let html = machinesHtml(h);
     // This machine joins the three saved ones: four in the denominator.
-    expect(html).toContain("1 of 4 machines online · showing 3 of 4 machines · 1 checking · 1 not healthy · 1 Unknown");
+    expect(html).toContain("1 of 4 machines online · 1 checking · 1 not healthy · 1 Unknown");
+    expect(html).not.toContain("showing");
     expect(html).toMatch(/checked \d+s ago/);
     vi.advanceTimersByTime(3000);
     await settle();
     html = machinesHtml(h);
-    expect(html).toContain("1 of 4 machines online · showing 3 of 4 machines · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
+    expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
     expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
     expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
-    expect(html).toContain('<strong>erik-mba</strong><small class="mono">http://mba.fixture:3501</small>');
+    // This binds the unanswered mba row to its own Unknown chip; aggregate
+    // chip counts alone would miss a row-to-state swap.
+    expect(html).toMatch(/data-machine-url="http:\/\/mba\.fixture:3501"[^>]*><span [^>]*class="state-chip unknown"/);
     // No non-web address reaches an href or a probe, and no probe carries a
     // credential to another machine.
     expect(html).not.toMatch(/href="javascript:/i);
@@ -635,7 +674,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
     expect(html).not.toMatch(/<(?:img|script)\b/i);
     expect(html).not.toMatch(/\sonerror="/i);
-    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/"]);
+    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"]);
     expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
     expect(html.match(/Not a web address/g) ?? []).toHaveLength(3);
   });
@@ -656,9 +695,26 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
     expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
-    expect(machinesHtml(h)).toContain(`showing ${limit} of 2501 machines`);
+    expect(machinesHtml(h)).toContain(`checking ${limit} of 2501 machines; the rest are listed unchecked`);
     expect(h.el["machines-list"]!.textContent).toContain("build-2499");
     expect(h.el["machines-list"]!.textContent).toContain("Unprobed");
+    expect(h.el["machines-list"]!.replaceCount).toBe(1);
+  });
+
+  it("this machine stays inside the probe cap even when saved after twenty-five peers", async () => {
+    vi.useFakeTimers();
+    const saved = Array.from({ length: 25 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }));
+    saved.push({ name: "self saved late", url: "http://fixture/path" });
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage(saved),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(fetched.filter((url) => url === "http://fixture/api/health")).toHaveLength(1);
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/fixture\/path"[^>]*><span [^>]*class="state-chip good"/);
   });
 
   it("duplicate host-port entries share one probed row and path addresses are described as host checks", async () => {
@@ -677,6 +733,24 @@ describe("slice 2b shell wired consumers", () => {
     expect(fetched.filter((url) => url === "http://build.fixture:3501/api/health")).toHaveLength(1);
     expect(machinesHtml(h)).toContain("2 of 2 machines online");
     expect(h.el["machines-list"]!.textContent).toContain("host health check");
+    expect(machinesHtml(h)).toContain('href="http://build.fixture:3501/tenant/a"');
+  });
+
+  it("a Fleet link click changes route once and starts one probe wave", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([{ name: "build", url: "http://build.fixture:3501" }]),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.click({ "data-action": "set-route", "data-route": "machines" });
+    await settle();
+    expect(runInContext("state.route", h.context)).toBe("machines");
+    expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual([
+      "http://build.fixture:3501/api/health",
+      "http://fixture/api/health",
+    ]);
   });
 
   it("the Sentinels line is Unknown without a Sentinel report, however many agents are on the roster", async () => {
@@ -741,6 +815,7 @@ describe("slice 2b shell wired consumers", () => {
         { agent_id: "no-evidence", status: "active", harness: "h", model_provider },
         { agent_id: "paused-one", status: "paused", harness: "h", model_provider },
         { agent_id: "locked-one", status: "locked_down", harness: "h", model_provider },
+        { agent_id: "off-enum", status: "mystery", harness: "h", model_provider },
       ] } })),
     });
     await settle();
@@ -751,6 +826,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
     expect(dot("locked-one")![1]).toBe("locked");
+    expect(dot("off-enum")![1]).toBe("unknown");
     // The inspect pane's pill wears the same Unknown tone as its dot, and
     // an activity row without a verdict wears the neutral mark, not a pass.
     runInContext(`state.chat.inspect.panelByAgentId["no-evidence"] = { recent_activity: [{ emitted_at: "2026-10-13T00:00:00.000Z", display_template_id: "activity.egress", display_template_args: [] }], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" };`, h.context);

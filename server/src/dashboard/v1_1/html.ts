@@ -403,7 +403,7 @@ body {
 /* Agent status glyphs (STATUS_MAP glyph names), one shape per state so a
    state reads in monochrome, after the design's glyph vocabulary: the pass
    circle (online), the warn triangle (idle: paused, restarting, being
-   removed), the fault square (away: an error), the locked rounded square
+   removed), the fault square (away: an error), the hollow solid locked square
    (offline: locked down, the violet --locked status, never the fault red),
    and the hollow dotted unknown ring (unknown, and any name not mapped).
    Every glyph paints a status hue at full weight, never the disabled
@@ -412,7 +412,7 @@ body {
 .glyph.online { background: var(--sage); border: 0; }
 .glyph.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .glyph.away { background: var(--rust); border: 0; border-radius: 0; }
-.glyph.offline { background: var(--locked); border: 0; border-radius: 1px; }
+.glyph.offline { background: transparent; border: 2px solid var(--locked); border-radius: 0; }
 .toast {
   position: fixed; bottom: 16px; right: 16px;
   background: var(--ink); color: var(--paper); padding: 8px 12px;
@@ -1012,7 +1012,7 @@ body {
 }
 /* Agent state dots (agentStateClass in client.ts), one shape per state:
    the pass circle (live), the warn triangle (idle), the fault square (off:
-   an error), the locked rounded square (locked) and the hollow dotted
+   an error), the hollow solid locked square (locked) and the hollow dotted
    unknown ring (unknown and the default). The word sits beside every dot.
    No pulse: the design allows no motion on a state mark. */
 .state-dot {
@@ -1023,7 +1023,7 @@ body {
 .state-dot.live { background: var(--sage); border: 0; }
 .state-dot.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .state-dot.off { background: var(--rust); border: 0; border-radius: 0; }
-.state-dot.locked { background: var(--locked); border: 0; border-radius: 1px; }
+.state-dot.locked { background: transparent; border: 2px solid var(--locked); border-radius: 0; }
 .agent-last {
   font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3);
 }
@@ -1738,6 +1738,7 @@ body {
 .boot-placeholder h2 { margin: 0 0 6px; font-family: var(--serif); font-weight: 500; }
 .boot-placeholder p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
 .card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.card-head-row .btn { white-space: nowrap; }
 .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--text-sm); user-select: none; }
 .story-toggle input { margin: 0; }
 .story-line { margin: 4px 0; }
@@ -1865,8 +1866,9 @@ body {
 .machine-here { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); white-space: nowrap; }
 .machine-row .btn { text-decoration: none; white-space: nowrap; }
 /* The probe chip: state as shape, hue and word together. Online is the
-   pass circle; Not healthy the fault square; Unknown and Checking the
-   hollow dotted ring in the slate unknown hue, never the pass hue. */
+   pass circle; Not healthy the fault square; Unknown the hollow dotted
+   ring and Checking the hollow solid square in the slate unknown hue,
+   never the pass hue. */
 .state-chip {
   justify-self: start; display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px;
   border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: nowrap;

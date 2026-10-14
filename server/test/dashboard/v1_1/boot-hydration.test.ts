@@ -277,6 +277,44 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('let focused = false; document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : key === "data-read" ? "/api/posture/home" : null; } }; document.getElementById("main").querySelector = function (selector) { return selector.includes("retry-panel") && selector.includes("data-read") ? { focus: function () { focused = true; } } : null; }; state.posture.homeError = "new error"; rerender()', h.context);
     expect(runInContext('focused', h.context)).toBe(false);
   });
+  it("restores a stable control only when the selector has exactly one match", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      let focused = null;
+      document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : null; } };
+      const first = { focus: function () { focused = "first"; } };
+      const second = { focus: function () { focused = "second"; } };
+      document.getElementById("main").querySelector = function () { return first; };
+      document.getElementById("main").querySelectorAll = function () { return [first, second]; };
+      state.posture.homeError = "ambiguous";
+      rerender();
+    `, h.context);
+    expect(runInContext("focused", h.context)).toBeNull();
+    runInContext(`
+      document.getElementById("main").querySelectorAll = function () { return [{ focus: function () { focused = "only"; } }]; };
+      rerender();
+    `, h.context);
+    expect(runInContext("focused", h.context)).toBe("only");
+  });
+  it("escapes agent ids before building a focus-restore selector", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      let selectorSeen = null;
+      document.activeElement = {
+        tagName: "BUTTON",
+        getAttribute: function (key) {
+          return key === "data-action" ? "agent-pause" : key === "data-agent-id" ? 'bad"] [data-action="other' : null;
+        }
+      };
+      document.getElementById("main").querySelector = function (selector) { selectorSeen = selector; return null; };
+      document.getElementById("main").querySelectorAll = function (selector) { selectorSeen = selector; return []; };
+      state.posture.homeError = "escape";
+      rerender();
+    `, h.context);
+    const selector = runInContext("selectorSeen", h.context) as string;
+    expect(selector).toContain('[data-action="agent-pause"]');
+    expect(selector).not.toContain('bad"] [data-action="other');
+  });
   it("fresh home evidence expires before a current read and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
     const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();

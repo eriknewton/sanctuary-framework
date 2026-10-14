@@ -20,6 +20,7 @@ import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import {
   CONSOLE_FILLS,
   NON_TEXT_FLOOR,
+  contrast,
   cssRules,
   inlineStyle,
   minRatio,
@@ -174,9 +175,11 @@ function shapeOf(d: Map<string, string>): string {
   const border = d.get("border") ?? "0";
   const style = d.get("border-style") ?? (border.match(/\b(solid|dotted|dashed)\b/)?.[1] ?? "none");
   const hollow = (d.get("background") ?? "") === "transparent";
+  const radius = d.get("border-radius") ?? "0";
+  const radiusClass = radius === "50%" || radius === "999px" ? "round" : "square";
   return [
     `clip:${d.get("clip-path") ?? "none"}`,
-    `radius:${d.get("border-radius") ?? "0"}`,
+    `radius:${radiusClass}`,
     `w:${d.get("width") ?? "?"}`,
     `h:${d.get("height") ?? "?"}`,
     `edge:${border === "0" ? "none" : style}`,
@@ -215,6 +218,23 @@ describe("each state mark family reads in monochrome", () => {
     });
   }
 
+  it("machine chip marks clear 3:1 against their own chip tints in both themes", () => {
+    const pairs = [
+      ["online", ".state-chip.good i", "sage-bg"],
+      ["not healthy", ".state-chip.bad i", "rust-bg"],
+      ["unknown", ".state-chip.unknown i", "slate-bg"],
+      ["checking", ".state-chip.checking i", "slate-bg"],
+    ] as const;
+    for (const [name, selector, fill] of pairs) {
+      const token = paintOf(effective({ name: "machine chip", base: ".state-chip i", states: { mark: selector } }, "mark"));
+      expect(token, name).toBeTruthy();
+      for (const theme of ["light", "dark"] as const) {
+        const ratio = contrast(tokens[theme][token!]!, tokens[theme][fill]!);
+        expect(ratio, `${name} mark var(--${token}) on --${fill} (${theme})`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+      }
+    }
+  });
+
   it("the Unknown state of every family that has one is the hollow dotted slate ring", () => {
     for (const family of MARK_FAMILIES) {
       if (!("unknown" in family.states)) continue;
@@ -224,9 +244,11 @@ describe("each state mark family reads in monochrome", () => {
     }
   });
 
-  it("locked marks keep hard corners and the Not healthy chip uses the full rust stroke", () => {
-    expect(declsOf(".glyph.offline").get("border-radius")).toBe("1px");
-    expect(declsOf(".state-dot.locked").get("border-radius")).toBe("1px");
+  it("locked marks are hollow solid squares and the Not healthy chip uses the full rust stroke", () => {
+    expect(declsOf(".glyph.offline").get("background")).toBe("transparent");
+    expect(declsOf(".glyph.offline").get("border")).toMatch(/solid var\(--locked\)/);
+    expect(declsOf(".state-dot.locked").get("background")).toBe("transparent");
+    expect(declsOf(".state-dot.locked").get("border")).toMatch(/solid var\(--locked\)/);
     expect(declsOf(".state-chip.bad").get("border-color")).toBe("var(--rust)");
     expect(getClientScript()).toContain('state_CHECKING: { word: "Checking", cls: "checking" }');
   });
@@ -248,5 +270,10 @@ describe("layout rules the slice holds", () => {
     expect(by(".search-wrap:focus-within .search input").get("width")).toBe("auto");
     expect(css).toContain("@media (max-width: 1240px)");
     expect(css).toContain(".topbar .btn.btn-talk .btn-label { display: none; }");
+  });
+
+  it("the card head keeps action buttons on one line at the measured narrow widths", () => {
+    const buttonRule = declsOf(".card-head-row .btn");
+    expect(buttonRule.get("white-space")).toBe("nowrap");
   });
 });
