@@ -4170,6 +4170,11 @@ function renderApprovalsScreen() {
   ].join("");
   const others = state.agentScope.selectedAgentId ? heldApprovalItems(null).length : 0;
   const noFilterMatch = all.length > 0 && filtered.length === 0;
+  // One inbox read returns at most APPROVAL_QUEUE_ITEM_CAP items of every kind and serves no total,
+  // so a full page means held operations past it may exist; the counts above cover the loaded page only.
+  const pageFullNotice = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP
+    ? '<p class="muted" data-inbox-page-full="1">The inbox read returned a full page of ' + APPROVAL_QUEUE_ITEM_CAP + ' items; held operations beyond it are not shown here.</p>'
+    : "";
   const body = capped.length ? '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
     noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
     others > 0
@@ -4193,6 +4198,7 @@ function renderApprovalsScreen() {
       '</div></div>',
       filterBar,
       '<p class="muted">Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
+      pageFullNotice,
       '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected, { filteredOut: noFilterMatch, waiting: allWaitingCount, total: all.length, otherAgents: others, agent: state.agentScope.selectedAgentId }) + '</div>',
     '</section>'
   ].join("");
