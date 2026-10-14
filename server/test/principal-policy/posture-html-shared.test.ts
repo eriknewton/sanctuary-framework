@@ -132,7 +132,7 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
       expect(html).not.toContain("\u2014");
       expect(html).not.toContain("&mdash;");
       const text = html
-        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+        .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, " ")
         .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
         .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ");

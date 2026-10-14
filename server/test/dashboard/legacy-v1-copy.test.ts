@@ -12,7 +12,7 @@ const LAYER_ENTRIES = [
 
 function visibleText(html: string): string {
   return html
-    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, " ")
     .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")

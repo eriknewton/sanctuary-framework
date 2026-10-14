@@ -7,7 +7,7 @@ import { renderPostureEvidenceHTML } from "../../src/principal-policy/posture-ev
 import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
 
 function inlineScripts(html: string): string[] {
-  return [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)]
+  return [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\b[^>]*>/gi)]
     .map((match) => match[1] ?? "");
 }
 
