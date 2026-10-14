@@ -4062,9 +4062,22 @@ function renderApprovalRow(item, selectedId) {
   '</tr>';
 }
 
-function renderApprovalDrawer(item) {
+function renderApprovalDrawer(item, empty) {
   if (!item) {
-    return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>No approvals waiting</h3><p>0 of 0 held operations are waiting on you. Queue checked ' + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + '.</p><a class="btn" href="#activity">Open Evidence</a></div></aside>';
+    // Only an empty scope with nothing waiting elsewhere earns "No approvals waiting"; when a
+    // filter or the agent scope hides rows, the drawer says what still waits, never a calm zero.
+    const e = empty || {};
+    const checkedAt = "Queue checked " + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + ".";
+    let title = "No approvals waiting";
+    let line = "0 of 0 held operations are waiting on you. " + checkedAt;
+    if (e.filteredOut) {
+      title = "Nothing selected";
+      line = "No held operation matches these filters. " + escHtml(e.waiting) + " of " + escHtml(e.total) + " held operations in this scope are waiting on you. " + checkedAt;
+    } else if (e.otherAgents > 0) {
+      title = "Nothing selected";
+      line = "Nothing waiting for " + escHtml(e.agent || "this agent") + ". " + escHtml(e.otherAgents) + " of " + escHtml(e.otherAgents) + " held operations wait on other agents. " + checkedAt;
+    }
+    return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + title + '</h3><p>' + line + '</p><a class="btn" href="#activity">Open Evidence</a></div></aside>';
   }
   const agent = approvalAgentId(item);
   const op = approvalOperation(item);
@@ -4180,7 +4193,7 @@ function renderApprovalsScreen() {
       '</div></div>',
       filterBar,
       '<p class="muted">Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
-      '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected) + '</div>',
+      '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected, { filteredOut: noFilterMatch, waiting: allWaitingCount, total: all.length, otherAgents: others, agent: state.agentScope.selectedAgentId }) + '</div>',
     '</section>'
   ].join("");
 }
