@@ -1,99 +1,124 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="en" data-theme="dark">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{ page.title | default: site.title }}</title>
-  <meta name="description" content="{{ page.description | default: site.description }}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% assign page_title = page.title | default: site.title %}
+  {% if page.layout == 'post' %}
+  {% assign page_title = page_title | append: ' | Sanctuary Protocol' %}
+  {% assign description = page.description | default: page.excerpt | default: site.description | strip_html | truncatewords: 50 %}
+  {% else %}
+  {% assign description = page.description | default: site.description %}
+  {% endif %}
+  <title>{{ page_title | escape }}</title>
+  <meta name="description" content="{{ description | strip_html | escape }}">
   <meta name="author" content="Erik Newton">
-  <meta name="theme-color" content="#0b1326">
-  <meta property="og:title" content="{{ page.title | default: site.title }}">
-  <meta property="og:description" content="{{ page.description | default: site.description }}">
-  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#0b0f17">
+  <meta property="og:title" content="{{ page_title | escape }}">
+  <meta property="og:description" content="{{ description | strip_html | escape }}">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
-  <meta property="og:site_name" content="Sanctuary Protocol">
-
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
-
-  <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
-
+  <meta property="og:site_name" content="Sanctuary">
+  <meta property="og:type" content="{% if page.layout == 'post' %}article{% else %}website{% endif %}">
+  {% if page.layout == 'post' %}
+  <meta property="article:author" content="Erik Newton">
+  <meta property="article:published_time" content="{{ page.date | date_to_xmlschema }}">
+  {% endif %}
+  {% if page.image %}
+  <meta property="og:image" content="{{ page.image | absolute_url }}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="{{ page.image | absolute_url }}">
+  {% endif %}
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ddb7ff'/%3E%3Cstop offset='1' stop-color='%234fdbc8'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M16 2 30 16 16 30 2 16z'/%3E%3C/svg%3E">
+  <link rel="canonical" href="{{ page.url | absolute_url }}">
+  <link rel="alternate" type="application/atom+xml" title="Sanctuary Journal" href="{{ '/feed.xml' | relative_url }}">
+  <link rel="preload" href="{{ '/assets/fonts/Manrope-wght.latin.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ '/assets/fonts/SpaceGrotesk-wght.latin.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
+  <script>
+    // A query parameter keeps a chosen theme across site links without browser storage.
+    document.documentElement.dataset.theme = new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark';
+  </script>
 </head>
 <body>
-
 <a class="skip" href="#main">Skip to content</a>
-
-<nav class="nav" aria-label="Primary">
-  <div class="nav__inner">
-    <a class="nav__brand" href="{{ '/' | relative_url }}">
-      <span class="nav__brand-mark" aria-hidden="true"></span>
-      Sanctuary
-    </a>
-    <div class="nav__links">
-      <a href="{{ '/' | relative_url }}#layers">Architecture</a>
-      <a href="{{ '/' | relative_url }}#quickstart">Quickstart</a>
+<header class="topbar">
+  <div class="container header-inner">
+    <a class="brand" href="{{ '/' | relative_url }}"><span class="brand-mark" aria-hidden="true"></span>Sanctuary</a>
+    <nav class="desktop-nav" aria-label="Primary">
+      <a href="{{ '/how-it-works/' | relative_url }}">How it works</a>
+      <a href="{{ '/evidence/' | relative_url }}">Evidence</a>
       <a href="{{ '/blog/' | relative_url }}">Journal</a>
       <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
-    </div>
-    <div class="nav__actions">
-      <a class="btn btn--secondary btn--sm" href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
-      <a class="btn btn--primary btn--sm" href="https://github.com/eriknewton/sanctuary-framework">Install</a>
-    </div>
+    </nav>
+    <a class="button header-install" href="{{ '/install/' | relative_url }}">Install</a>
+    <button class="theme" type="button" hidden>Light theme</button>
+    <details class="mobile-menu">
+      <summary>Menu</summary>
+      <nav aria-label="Mobile">
+        <a href="{{ '/how-it-works/' | relative_url }}">How it works</a>
+        <a href="{{ '/evidence/' | relative_url }}">Evidence</a>
+        <a href="{{ '/blog/' | relative_url }}">Journal</a>
+        <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+      </nav>
+    </details>
   </div>
-</nav>
-
-<main id="main">
-  <section class="section container">
-    {{ content }}
-  </section>
+</header>
+<main id="main" class="container {% unless page.wide %}document prose{% endunless %}" tabindex="-1">
+  {{ content }}
 </main>
-
 <footer class="footer">
   <div class="container">
-    <div class="footer__grid">
-      <div class="footer__brand">
-        <a class="nav__brand" href="{{ '/' | relative_url }}">
-          <span class="nav__brand-mark" aria-hidden="true"></span>
-          Sanctuary
-        </a>
-        <p>A sovereignty substrate for AI agents: operating-system enforcement is live on macOS today, and the Ubuntu 24.04 (x86-64) fresh-install per-account signed-policy claim is proven within the Assurance Matrix bounds; Windows is roadmap, with portable reputation and current bounds in the Assurance Matrix.</p>
-      </div>
-      <div class="footer__col">
-        <h5>Project</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a></li>
-          <li><a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/README.md">Docs</a></li>
-        </ul>
-      </div>
-      <div class="footer__col">
-        <h5>Architecture</h5>
-        <ul>
-          <li><a href="{{ '/' | relative_url }}#layers">Castle Architecture</a></li>
-          <li><a href="{{ '/' | relative_url }}#harnesses">Harness support</a></li>
-          <li><a href="{{ '/blog/' | relative_url }}">Journal</a></li>
-        </ul>
-      </div>
-      <div class="footer__col">
-        <h5>Legal</h5>
-        <ul>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a></li>
-          <li><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/GOVERNANCE.md">Governance</a></li>
-        </ul>
-      </div>
+    <div class="footer-top">
+      <p class="footer-title">Sanctuary · By Erik Newton</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="{{ '/install/' | relative_url }}">Install</a>
+        <a href="{{ '/evidence/' | relative_url }}">Evidence</a>
+        <a href="{{ '/agent-guided-install.html' | relative_url }}">Agent guide</a>
+        <a href="{{ '/llms.txt' | relative_url }}">Agent overview</a>
+        <a href="https://github.com/eriknewton/sanctuary-framework">GitHub</a>
+        <a href="https://www.npmjs.com/package/@sanctuary-framework/mcp-server">npm</a>
+        <a href="{{ '/blog/' | relative_url }}">Journal</a>
+        <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/SECURITY.md">Security policy</a>
+        <a href="https://github.com/eriknewton/sanctuary-framework/blob/main/LICENSE">License</a>
+      </nav>
     </div>
-    <div class="footer__bottom">
-      <div>&copy; {{ 'now' | date: "%Y" }} Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
-      <div class="footer__status">
-        <span class="footer__status-dot" aria-hidden="true"></span>
-        <span>live on npm</span>
-      </div>
-    </div>
+    <p class="copyright">© {{ 'now' | date: "%Y" }} Erik Newton. Code: Apache-2.0. Specification: CC-BY-4.0.</p>
   </div>
 </footer>
-
+<script>
+(function () {
+  const root = document.documentElement;
+  const toggle = document.querySelector('.theme');
+  function updateTheme(value) {
+    root.dataset.theme = value;
+    toggle.textContent = value === 'dark' ? 'Light theme' : 'Dark theme';
+    toggle.setAttribute('aria-label', 'Switch to ' + (value === 'dark' ? 'light' : 'dark') + ' theme');
+    document.querySelector('meta[name="theme-color"]').content = value === 'dark' ? '#0b0f17' : '#f4f6fa';
+    document.querySelectorAll('a[href]').forEach(function (link) {
+      const url = new URL(link.href, location.href);
+      // Only HTML navigation carries the preference; raw agent documents retain their URLs.
+      if (url.origin === location.origin && (url.pathname.endsWith('/') || url.pathname.endsWith('.html'))) {
+        if (value === 'light') url.searchParams.set('theme', 'light');
+        else url.searchParams.delete('theme');
+        link.href = url.href;
+      }
+    });
+  }
+  toggle.hidden = false;
+  updateTheme(root.dataset.theme);
+  toggle.addEventListener('click', function () {
+    const value = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    updateTheme(value);
+    const url = new URL(location.href);
+    if (value === 'light') url.searchParams.set('theme', 'light');
+    else url.searchParams.delete('theme');
+    history.replaceState(null, '', url);
+  });
+  document.addEventListener('keydown', function (event) {
+    const menu = document.querySelector('.mobile-menu');
+    if (event.key === 'Escape' && menu.open) { menu.open = false; menu.querySelector('summary').focus(); }
+  });
+})();
+</script>
 </body>
 </html>

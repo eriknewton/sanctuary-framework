@@ -1,0 +1,15 @@
+---
+layout: default
+title: Evidence | Sanctuary
+description: Dated platform records, their artifacts and their bounds.
+permalink: /evidence/
+wide: true
+---
+<header class="page-header"><p class="eyebrow">Evidence</p><h1>Read what was demonstrated.</h1><p class="lead">These are dated records from specific machines and builds. Read each result with its scope and artifact before relying on it.</p></header>
+{% include platform-evidence.html heading="Platform records" %}
+
+<section class="section prose"><h2>Artifacts and current scope</h2>
+<p>The macOS reboot record identifies signed and notarized build v876, source <code>75a48c5794b5</code>. The Ubuntu record identifies package <code>castle-wall-linux-0.1.0-1</code>; <a href="https://github.com/eriknewton/sanctuary-framework/releases/tag/castle-wall-linux-0.1.0-1">read its release and verification assets</a>. A newer version does not inherit this proof simply by carrying a newer version number.</p>
+<p><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md">The Assurance Matrix</a> is the current record for each capability’s evidence and bounds, including the limits on encryption, approvals, audit, wrapping and exit.</p>
+<p><a href="/assurance-matrix.json">Machine-readable matrix</a> · <a href="/.well-known/product-facts.json">Product facts</a> · <a href="/llms.txt">Agent overview</a></p>
+</section>

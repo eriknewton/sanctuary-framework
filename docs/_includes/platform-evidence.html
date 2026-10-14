@@ -1,0 +1,14 @@
+<section class="section" id="evidence" aria-labelledby="provisioning-title"><div class="section-heading"><span class="section-index">01</span><h2 id="provisioning-title">{{ include.heading | default: "What has been demonstrated" }}</h2><span class="section-head-note">Dated public records</span></div><table class="proof-table" role="table"><colgroup><col><col><col><col></colgroup><thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">Platform</th><th scope="col" role="columnheader">Demonstration and scope</th><th scope="col" role="columnheader">Date</th><th scope="col" role="columnheader">Record</th></tr>
+</thead><tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">macOS</th><td role="cell">
+<p>Rules signed by the person running the machine continued to allow and block destinations for individual user accounts through five of five attended reboots. The June 22, 2026 record covers one Mac running Tahoe 26.5.1 and the drilled signed and notarized build v876.</p>
+<p class="qualification">This evidence does not establish unattended reboot survival or an audited per-rule, per-flow trail.</p>
+</td><td class="date" role="cell"><span class="mobile-label">Record date: </span><time datetime="2026-06-22">2026-06-22</time></td><td role="cell"><a href="/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.html" class="record-link">Read the macOS drill</a></td></tr>
+
+<tr role="row"><th scope="row" role="rowheader">Ubuntu 24.04, <span class="architecture">x86-64</span></th><td role="cell">
+<p>Blocked destinations stay blocked and allowed ones connect through five reboots on three fresh servers, with the evidence checked by two independent reviewers. On Ubuntu 24.04 (x86-64), this proves a fresh install of the shipped package enforces a signed operator policy per user account: rules approved and signed by the person running the machine.</p>
+<p class="qualification">The proof covers the package identified in the October 4, 2026 record; other distributions, architectures and real-agent harnesses remain unproven.</p>
+<p class="qualification">DNS, DNS over HTTPS, DNS over TLS and hostname paths remain outside that proof.</p>
+</td><td class="date" role="cell"><span class="mobile-label">Record date: </span><time datetime="2026-10-04">2026-10-04</time></td><td role="cell"><a href="/audit/castle-wall-linux-install-grade-drill-2026-10-04.html" class="record-link">Read the Ubuntu drill</a></td></tr>
+</tbody></table></section>
