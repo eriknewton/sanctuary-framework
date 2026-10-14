@@ -6,6 +6,9 @@ const DEADLINE_MS = 5 * 1000; // UI responsiveness budget, not evidence freshnes
 const home = {
   origin_machine: "fixture-mac",
   agents: [{ agent_id: "fixture", status: "active", harness: "codex", policy_protected: false, enforcement_active: "unknown" }],
+  // Overview detected counts require the served unprotected-harness list; this
+  // fixture is intentionally not the first-run path.
+  unwrapped: { origin_machine: "fixture-mac", detection_method: "config_file_presence", unwrapped: [] },
   castle_wall: { arm_state: "unknown" },
   digest: {},
   protection_requested_count: 1,
@@ -112,7 +115,8 @@ describe("dashboard bounded independent hydration", () => {
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
-    expect(h.main.innerHTML).toMatch(/Approvals waiting[\s\S]*?Not evaluated/);
+    // Pins the Approvals waiting tile, not a later queue empty state.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -169,8 +173,9 @@ describe("dashboard bounded independent hydration", () => {
     for (let i = 0; i < 96; i++) await runInContext('api("/agents/detail-' + i + '").catch(function () {})', h.context);
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
-    expect(h.main.innerHTML).toMatch(/Approvals waiting[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(21); // The fixed source inventory has twenty-one entries.
+    // Pins the Approvals waiting tile, not a later queue empty state.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -767,6 +772,7 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("1 agent. Click one");
     expect(h.main.innerHTML).not.toContain("1 agents.");
     runInContext('state.route = "posture"; rerender()', h.context);
+    // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
     expect(h.main.innerHTML).toContain("UNKNOWN");
     expect(h.main.innerHTML).not.toContain("status active");
   });

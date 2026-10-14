@@ -283,8 +283,10 @@ describe("v1.1 dashboard shell HTML", () => {
     // folded in without adding a duplicate API surface.
     expect(client).toContain("Needs your decision");
     expect(client).toContain("Egress enforcement");
-    expect(client).toContain("Findings");
-    expect(client).toContain("Agents");
+    // Retargeted (slice 3 round 2): pins the Overview findings panel renderer, not a generic label.
+    expect(client).toContain("function renderOverviewFindingsPanel");
+    // Retargeted (slice 3 round 2): pins the Overview agents table renderer, not a generic label.
+    expect(client).toContain("function renderOverviewAgentsTable");
   });
 
   it("the seal click-to-expand routes into the full Posture detail", () => {

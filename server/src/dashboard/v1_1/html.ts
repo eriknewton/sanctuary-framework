@@ -482,9 +482,16 @@ body {
 .template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
 .template-card { background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--rad); padding: 14px; min-height: 132px; }
 .template-card-head { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); margin-bottom: 12px; }
-.severity { border-radius: 999px; padding: 2px 9px; font-family: var(--mono); font-size: var(--text-xs); font-weight: 700; }
+.severity { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 9px; font-family: var(--mono); font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; }
+.severity b { width: 4px; height: 14px; border-radius: 2px; display: inline-block; }
 .severity.low { color: var(--sage); background: var(--sage-bg); }
 .severity.medium { color: var(--ochre); background: var(--ochre-bg); }
+.severity.high, .severity.critical { color: var(--rust); background: var(--rust-bg); }
+.severity.info { color: var(--slate); background: var(--slate-bg); }
+.severity.low b { background: var(--sage); }
+.severity.medium b { background: var(--ochre); }
+.severity.high b, .severity.critical b { background: var(--rust); }
+.severity.info b { background: var(--slate); }
 .template-id { background: var(--paper-3); border-radius: var(--rad); padding: 2px 7px; color: var(--ink-3); }
 .template-card h3 { font-size: var(--text-lg); margin: 0 0 6px; }
 .template-card p { color: var(--ink-3); margin: 0; font-size: var(--text-md); }
@@ -1870,8 +1877,8 @@ body {
    ring and Checking the hollow solid square in the slate unknown hue,
    never the pass hue. */
 .state-chip {
-  justify-self: start; display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px;
-  border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: nowrap;
+  justify-self: start; display: inline-flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px;
+  border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: normal; flex-wrap: wrap;
 }
 .state-chip i { display: inline-block; width: 8px; height: 8px; box-sizing: border-box; flex: none; }
 .state-chip.good { color: var(--sage); background: var(--sage-bg); border-color: var(--sage-line); }
@@ -1892,33 +1899,34 @@ body {
 /* Slice 3 Overview: dense security-console composition. Every capped list
    prints "showing M of N" in its own panel so bounded rendering cannot hide
    queue depth, findings or rows. */
-.overview-page { display: flex; flex-direction: column; gap: 16px; }
-.overview-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-@media (min-width: 980px) { .overview-tiles { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
-.overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); }
-.overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.overview-page { --overview-tile-min: 154px; --overview-decision-table-min: 640px; --overview-egress-table-min: 520px; --overview-agent-table-min: 820px; display: flex; flex-direction: column; gap: 16px; }
+.overview-tiles { container-type: inline-size; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--overview-tile-min)), 1fr)); gap: 10px; }
+.overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: inherit; text-decoration: none; }
+.overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; text-decoration: none; }
+.overview-tile .ot-label:hover { color: var(--indigo); text-decoration: underline; }
 .overview-tile .ot-value { font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; line-height: 1.1; }
 .overview-tile .ot-value small { font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; }
 .overview-tile .ot-evidence { margin-top: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
 .overview-tile .ot-evidence a { color: var(--indigo); text-decoration: none; }
 .overview-tile .ot-evidence a:hover { text-decoration: underline; }
 .overview-two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
-@media (max-width: 1100px) { .overview-two { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .overview-two { grid-template-columns: minmax(0, 1fr); } }
 .overview-table-scroll { overflow-x: auto; }
-.overview-table { width: 100%; border-collapse: collapse; min-width: 760px; font-size: var(--text-sm); }
+.overview-table { width: 100%; border-collapse: collapse; min-width: 0; font-size: var(--text-sm); }
+.overview-table-decisions { min-width: var(--overview-decision-table-min); }
+.overview-table-egress { min-width: var(--overview-egress-table-min); }
+.overview-table-agents { min-width: var(--overview-agent-table-min); }
+.overview-table-agents th:first-child, .overview-table-agents td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); }
 .overview-table th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em; }
 .overview-table td { padding: 10px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
 .overview-table tr:last-child td { border-bottom: 0; }
 .overview-table .mono { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); }
 .overview-table .muted { color: var(--ink-3); }
-.overview-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
+.overview-table .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
 .overview-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .overview-kpis div { border: 1px solid var(--rule); border-radius: 8px; padding: 10px; background: var(--paper-2); }
 .overview-kpis dt { color: var(--ink-3); font-size: var(--text-xs); margin: 0; }
 .overview-kpis dd { margin: 2px 0 0; font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; }
-.overview-bars { display: flex; align-items: flex-end; gap: 3px; height: 54px; margin-top: 10px; }
-.overview-bars i { flex: 1; min-width: 2px; border-radius: 2px 2px 0 0; background: var(--chart-allowed); opacity: 0.7; }
-.overview-bars i.blocked { background: var(--chart-blocked); opacity: 0.95; }
 .overview-list { display: flex; flex-direction: column; }
 .overview-list .item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
 .overview-list .item:last-child { border-bottom: 0; }
