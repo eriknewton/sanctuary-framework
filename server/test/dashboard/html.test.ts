@@ -173,15 +173,12 @@ describe("renderDashboardHTML", () => {
         };
         let snapshot;
         function wireApprovalButtons() {}
-        function renderActivity() {}
-        function renderApprovals() {}
-        function renderPrivacy() {}
-        function renderAudit() {}
         function currentAuditFilter() { return "all"; }
         function heroCopyForLight() { return "copy"; }
+        // clientFns contains the real renderActivity, renderApprovals, renderPrivacy, and renderAudit declarations; renderAll runs those here.
         ${clientFns}
         renderAll({
-          overall: { light: ${JSON.stringify(light)}, headline: "headline" },
+          overall: { light: __light, headline: "headline" },
           mode: "fixture",
           server_version: "test",
           agent: { display_name: "agent", did_fingerprint: "did" },
@@ -191,9 +188,9 @@ describe("renderDashboardHTML", () => {
           audit: [],
         });
         ({ dWrites, classCalls, classes: Array.from(classes).sort() });
-      `) as { dWrites: string[]; classCalls: [string, string[]][]; classes: string[] };
-      expect(result.classCalls, light).toContainEqual(["remove", ["green", "yellow", "red"]]);
-      expect(result.classCalls, light).toContainEqual(["add", [light]]);
+      `, { __light: light }) as { dWrites: string[]; classCalls: [string, string[]][]; classes: string[] };
+      expect(result.classCalls.filter(([kind]) => kind === "remove"), light).toEqual([["remove", ["green", "yellow", "red"]]]);
+      expect(result.classCalls.filter(([kind]) => kind === "add"), light).toEqual([["add", [light]]]);
       expect(result.classes, light).toEqual([light]);
       expect(result.dWrites, light).toEqual([serverMarks.get(light)]);
     }

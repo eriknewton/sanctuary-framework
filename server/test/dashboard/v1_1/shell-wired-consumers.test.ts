@@ -82,7 +82,10 @@ class FakeElement {
   };
   getAttribute(name: string) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name]! : null; }
   setAttribute(name: string, value: string) {
-    if (setAttributeThrowFor && setAttributeThrowFor.name === name && setAttributeThrowFor.value === String(value)) throw new Error("fixture row build failed");
+    if (setAttributeThrowFor && setAttributeThrowFor.name === name && setAttributeThrowFor.value === String(value)) {
+      setAttributeThrowFor = null;
+      throw new Error("fixture row build failed");
+    }
     this.attrs[name] = String(value);
   }
   removeAttribute(name: string) { delete this.attrs[name]; }
@@ -645,6 +648,28 @@ describe("slice 2b shell wired consumers", () => {
   const attrsOf = (html: string) => [...html.matchAll(/\s(?:title|aria-label|placeholder)="([^"]*)"/g)].map((m) => m[1]!);
   const machinesHtml = (h: ReturnType<typeof boot>) =>
     h.el["machines-summary"]!.innerHTML + h.el["machines-list"]!.innerHTML;
+  const escapedAttr = (value: string) => escapeHtml(value);
+  const rowSlice = (html: string, rowOpen: string, marker: string) => {
+    const markerIndex = html.indexOf(marker);
+    expect(markerIndex, marker).toBeGreaterThanOrEqual(0);
+    const start = html.lastIndexOf(rowOpen, markerIndex);
+    expect(start, rowOpen).toBeGreaterThanOrEqual(0);
+    const next = html.indexOf(rowOpen, markerIndex + marker.length);
+    return html.slice(start, next < 0 ? html.length : next);
+  };
+  const machineRowHtml = (html: string, url: string) => {
+    const marker = `data-machine-url="${escapedAttr(url)}"`;
+    const markerIndex = html.indexOf(marker);
+    expect(markerIndex, marker).toBeGreaterThanOrEqual(0);
+    const start = html.lastIndexOf("<div ", markerIndex);
+    expect(start, "machine row start").toBeGreaterThanOrEqual(0);
+    const next = html.indexOf("<div data-machine-index=", markerIndex + marker.length);
+    return html.slice(start, next < 0 ? html.length : next);
+  };
+  const agentListRowHtml = (html: string, id: string) =>
+    rowSlice(html, '<div class="agent-row', `data-agent-id="${escapedAttr(id)}"`);
+  const fortressAgentRowHtml = (html: string, id: string) =>
+    rowSlice(html, '<div class="row agent-row"', `data-agent-row="${escapedAttr(id)}"`);
 
   it("Machines renders the saved fleet with its denominator and check age, and an unanswered machine is Unknown, never online", async () => {
     vi.useFakeTimers();
@@ -674,11 +699,14 @@ describe("slice 2b shell wired consumers", () => {
     vi.advanceTimersByTime(3000);
     await settle();
     html = machinesHtml(h);
+    // Once the probe deadline passes, no row can keep claiming an in-flight check.
     expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
     expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
     expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
-    expect(h.el["machines-list"]!.textContent).toContain("erik-mba");
-    expect(h.el["machines-list"]!.textContent).toContain("http://mba.fixture:3501");
+    const mbaRow = machineRowHtml(html, "http://mba.fixture:3501");
+    // The saved display name must stay above the saved address in its row;
+    // otherwise the row can look like an origin-only fallback.
+    expect(mbaRow).toMatch(/<strong>erik-mba<\/strong><small class="mono">http:\/\/mba\.fixture:3501<\/small>/);
     // This binds the unanswered mba row to its own Unknown chip; aggregate
     // chip counts alone would miss a row-to-state swap.
     expect(html).toMatch(/data-machine-url="http:\/\/mba\.fixture:3501"[^>]*><span [^>]*class="state-chip unknown"/);
@@ -793,7 +821,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
     // The capped-round summary is past tense only after every in-cap probe
     // answered, and must not restore the old second count for capped rows.
-    expect(machinesHtml(h)).toContain(`checked ${limit} of 2501 machines; the rest are listed unchecked`);
+    expect(machinesHtml(h)).toContain(`checked ${limit} of 2501 machines with a web address; the rest are listed unchecked`);
     expect(machinesHtml(h)).not.toContain("unprobed");
     expect(h.el["machines-list"]!.textContent).toContain("build-2499");
     // The row chip uses the same word as the summary; "Unprobed" was an
@@ -815,7 +843,7 @@ describe("slice 2b shell wired consumers", () => {
     h.navigate("machines");
     await settle();
     const html = machinesHtml(h);
-    expect(html).toContain(`checking ${limit} of ${limit + 2} machines; the rest are listed unchecked`);
+    expect(html).toContain(`checking ${limit} of ${limit + 2} machines with a web address; the rest are listed unchecked`);
     expect(html).not.toContain(`${limit} checking`);
     expect(html).not.toContain("unprobed");
   });
@@ -845,9 +873,11 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     overLimit.navigate("machines");
     await settle();
-    expect(machinesHtml(overLimit)).toContain(`checked ${limit} of ${limit + 1} machines; the rest are listed unchecked`);
+    expect(machinesHtml(overLimit)).toContain(`checked ${limit} of ${limit + 1} machines with a web address; the rest are listed unchecked`);
     expect(machinesHtml(overLimit)).toContain("1 Unknown");
-    expect(machinesHtml(overLimit)).not.toContain(`checked ${limit} of ${limit + 2} machines; the rest are listed unchecked`);
+    // The cap denominator counts web addresses only; this catches a non-web
+    // saved row being swept into "the rest are listed unchecked".
+    expect(machinesHtml(overLimit)).not.toContain(`checked ${limit} of ${limit + 2} machines with a web address; the rest are listed unchecked`);
   });
 
   it("an empty saved list has no cap clause", async () => {
@@ -974,7 +1004,10 @@ describe("slice 2b shell wired consumers", () => {
     peerRow!.removeAttribute("data-machine-index");
     releasePeer(response({ ok: true }));
     await settle();
-    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip checking"/);
+    const row = machineRowHtml(machinesHtml(h), "http://peer.fixture:3501/");
+    expect(row).toContain('class="state-chip unknown"');
+    expect(row).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(row).not.toContain("Checking");
     expect(machinesHtml(h)).not.toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip good"/);
   });
 
@@ -1003,8 +1036,33 @@ describe("slice 2b shell wired consumers", () => {
     expect(newNormalLink).toBeTruthy();
     expect(newNormalLink).not.toBe(normalLink);
     expect(fakeActiveElement).toBe(newNormalLink);
-    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/broken\.fixture:3501\/"[^>]*><span [^>]*class="state-chip checking"/);
+    const brokenRow = machineRowHtml(machinesHtml(h), brokenUrl);
+    expect(brokenRow).toContain('class="state-chip unknown"');
+    expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(brokenRow).not.toContain("Checking");
     expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/normal\.fixture:3501\/"[^>]*><span [^>]*class="state-chip bad"/);
+  });
+
+  it("a failed row build on first visit leaves the rest of the machine list rendered", async () => {
+    vi.useFakeTimers();
+    const brokenUrl = "http://broken.fixture:3501/";
+    const normalUrl = "http://normal.fixture:3501/";
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl };
+    const h = boot({
+      "http://broken.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://normal.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "broken saved name", url: brokenUrl }, { name: "normal", url: normalUrl }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    const brokenRow = machineRowHtml(html, brokenUrl);
+    expect(brokenRow).toContain("broken saved name");
+    expect(brokenRow).toContain('class="state-chip unknown"');
+    expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(machineRowHtml(html, normalUrl)).toContain('class="state-chip good"');
+    expect(h.el["machines-summary"]!.textContent).toContain("machines online");
   });
 
   it("a Fleet link click changes route once and starts one probe wave", async () => {
@@ -1093,12 +1151,19 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("agents");
     const html = h.el.main!.innerHTML;
-    const dot = (id: string) => html.match(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ([^"]+)"></span>([^<]*)</span>`));
+    const dot = (id: string) => {
+      const row = agentListRowHtml(html, id);
+      return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
+    };
     const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
+    (h.context as Record<string, unknown>).__agentStatus = "unwrapping";
+    const unwrappingDot = runInContext("agentStateClass(__agentStatus)", h.context) as string;
+    const unwrappingGlyph = runInContext("STATUS_MAP[__agentStatus].glyph", h.context) as string;
+    const unwrappingTone = runInContext("AGENT_STATE_PILL_TONE[agentStateClass(__agentStatus)] || 'tone-unknown'", h.context) as string;
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
-    expect(dot("unwrapping-one")![1]).toBe("idle");
+    expect(dot("unwrapping-one")![1]).toBe(unwrappingDot);
     expect(dot("unwrapping-one")![2]).toBe(unwrappingLabel);
     expect(dot("locked-one")![1]).toBe("locked");
     expect(dot("off-enum")![1]).toBe("unknown");
@@ -1113,9 +1178,9 @@ describe("slice 2b shell wired consumers", () => {
     const unwrappingPane = runInContext(`renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === "unwrapping-one"; }))`, h.context) as string;
     const unwrappingDetail = runInContext("renderAgentDetail()", h.context) as string;
     const fortressCard = runInContext("renderFortressAgentsCard()", h.context) as string;
-    expect(unwrappingPane).toContain('<span class="pill tone-degraded"><span class="state-dot idle"');
-    expect(unwrappingDetail).toContain(`<dt>Status</dt><dd><span class="glyph idle"></span> ${unwrappingLabel}</dd>`);
-    expect(fortressCard).toMatch(/data-agent-id="unwrapping-one"[\s\S]*?<span class="glyph idle"/);
+    expect(unwrappingPane).toContain(`<span class="pill ${unwrappingTone}"><span class="state-dot ${unwrappingDot}"`);
+    expect(unwrappingDetail).toContain(`<dt>Status</dt><dd><span class="glyph ${unwrappingGlyph}"></span> ${unwrappingLabel}</dd>`);
+    expect(fortressAgentRowHtml(fortressCard, "unwrapping-one")).toContain(`<span class="glyph ${unwrappingGlyph}"`);
   });
 
   it("every wire agent status agrees with the status table mark in each agent view", async () => {
@@ -1139,18 +1204,19 @@ describe("slice 2b shell wired consumers", () => {
       const id = `agent-${status}`;
       const expectedGlyph = STATUS_MAPPING[status].glyph;
       const expectedDot = glyphToDot[expectedGlyph];
-      expect(runInContext(`STATUS_MAP[${JSON.stringify(status)}].glyph`, h.context), status).toBe(expectedGlyph);
-      expect(runInContext(`agentStateClass(${JSON.stringify(status)})`, h.context), status).toBe(expectedDot);
+      (h.context as Record<string, unknown>).__agentStatus = status;
+      (h.context as Record<string, unknown>).__agentId = id;
+      expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);
+      expect(runInContext("agentStateClass(__agentStatus)", h.context), status).toBe(expectedDot);
       const listHtml = h.el.main!.innerHTML;
-      expect(listHtml, status).toMatch(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ${expectedDot}"></span>`));
-      runInContext(`state.chat.inspect.panelByAgentId[${JSON.stringify(id)}] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: "2026-10-14T00:00:00.000Z" }; state.selectedAgentId = ${JSON.stringify(id)};`, h.context);
-      const agentExpr = `state.agents.find(function (a) { return a.agent_id === ${JSON.stringify(id)}; })`;
-      const pane = runInContext(`renderAgentInspectPanel(${agentExpr})`, h.context) as string;
+      expect(agentListRowHtml(listHtml, id), status).toContain(`<span class="state-dot ${expectedDot}"></span>`);
+      runInContext("state.chat.inspect.panelByAgentId[__agentId] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: '2026-10-14T00:00:00.000Z' }; state.selectedAgentId = __agentId;", h.context);
+      const pane = runInContext("renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === __agentId; }))", h.context) as string;
       const detail = runInContext("renderAgentDetail()", h.context) as string;
       const fortress = runInContext("renderFortressAgentsCard()", h.context) as string;
       expect(pane, status).toContain(`<span class="state-dot ${expectedDot}"`);
       expect(detail, status).toContain(`<span class="glyph ${expectedGlyph}"></span>`);
-      expect(fortress, status).toMatch(new RegExp(`data-agent-row="${id}"[\\s\\S]*?<span class="glyph ${expectedGlyph}"`));
+      expect(fortressAgentRowHtml(fortress, id), status).toContain(`<span class="glyph ${expectedGlyph}"`);
     }
   });
 

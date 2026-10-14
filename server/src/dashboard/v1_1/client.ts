@@ -4024,7 +4024,8 @@ const FLEET_PROBE_VIEW = {
   state_UNKNOWN: { word: "Unknown", cls: "unknown" },
   state_UNPROBED: { word: "Unchecked", cls: "unknown" }
 };
-const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {} };
+const FLEET_ROW_UPDATE_REASON = "Unknown: this row could not be updated; use Check again.";
+const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {}, rowUpdateFailed: {} };
 
 // Only an http or https address becomes a link or a probe target: the list
 // is operator-typed text in browser storage, and a javascript: or data:
@@ -4130,6 +4131,7 @@ async function probeFleetMachines() {
   fleet.machines = machines;
   fleet.probes = {};
   fleet.paintRows = {};
+  fleet.rowUpdateFailed = {};
   machines.forEach(function (m) {
     fleet.probes[m.url] = !m.origin ? FLEET_PROBE.UNKNOWN : m.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.CHECKING;
   });
@@ -4168,9 +4170,9 @@ function fleetSummary(machines) {
   if (unprobed) {
     const cappedWebTotal = probeable + unprobed;
     const cappedNoun = cappedWebTotal === 1 ? " machine" : " machines";
-    // Tense follows live work: "checking" appears only while at least one
-    // in-cap probe is still in flight, otherwise the cap summary is past tense.
-    parts.push((checking ? "checking " : "checked ") + probeable + " of " + cappedWebTotal + cappedNoun + "; the rest are listed unchecked");
+    // The cap denominator counts web addresses only; non-web rows keep their
+    // own Unknown reason and must not be folded into the unchecked remainder.
+    parts.push((checking ? "checking " : "checked ") + probeable + " of " + cappedWebTotal + cappedNoun + " with a web address; the rest are listed unchecked");
   }
   if (checking && !unprobed) parts.push(checking + " checking");
   if (notHealthy) parts.push(notHealthy + " not healthy");
@@ -4271,8 +4273,8 @@ function makeMachineRow(machine, index) {
   } else if (machine.origin) {
     const open = makeTextElement("a", "btn", "Open console");
     const parsed = fleetHttpUrl(machine.url);
-    // The link uses the same parsed web address as the probe, so browser URL
-    // normalization cannot retarget the operator to this console.
+    // The link uses the same parsed web address as the probe, so a loosely
+    // written address cannot resolve as a path on this console.
     if (parsed) open.setAttribute("href", parsed.href);
     open.setAttribute("rel", "noopener");
     row.appendChild(open);
@@ -4280,6 +4282,48 @@ function makeMachineRow(machine, index) {
     row.appendChild(makeTextElement("span", "muted", "Not a web address"));
   }
   return row;
+}
+
+function makeMachineUpdateFallbackRow(machine, index) {
+  const row = document.createElement("div");
+  row.className = "machine-row";
+  row.setAttribute("data-machine-index", String(index));
+  row.setAttribute("data-machine-url", machine.url);
+  const chip = document.createElement("span");
+  chip.className = "state-chip unknown";
+  chip.setAttribute("title", FLEET_ROW_UPDATE_REASON);
+  const mark = document.createElement("i");
+  mark.setAttribute("aria-hidden", "true");
+  chip.appendChild(mark);
+  appendText(chip, "Unknown");
+  row.appendChild(chip);
+  const id = document.createElement("div");
+  id.className = "machine-id";
+  id.appendChild(makeTextElement("strong", "", machine.name || machine.url));
+  row.appendChild(id);
+  return row;
+}
+
+function guardedMachineRow(machine, index) {
+  try { return makeMachineRow(machine, index); }
+  catch (e) {
+    fleet.rowUpdateFailed[machine.url] = true;
+    return makeMachineUpdateFallbackRow(machine, index);
+  }
+}
+
+function replaceMachineWithFallback(oldRow, machine, index) {
+  try {
+    if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineUpdateFallbackRow(machine, index));
+  } catch (e) { /* ignore a DOM fallback failure; the guarded rebuild still protects full renders */ }
+}
+
+function rebuildMachinesList(listEl, machines) {
+  const frag = document.createDocumentFragment();
+  machines.forEach(function (m, index) {
+    frag.appendChild(guardedMachineRow(m, index));
+  });
+  listEl.replaceChildren(frag);
 }
 
 function paintMachinesScreen() {
@@ -4292,15 +4336,47 @@ function paintMachinesScreen() {
   fleet.paintRows = {};
   const focus = captureInputFocus(listEl);
   try {
+    let rebuilt = false;
     Object.keys(pending).forEach(function (url) {
+      let oldRow = null;
+      let index = -1;
       try {
-        const index = machines.findIndex(function (m) { return m.url === url; });
+        index = machines.findIndex(function (m) { return m.url === url; });
         if (index < 0 || !listEl.querySelector) return;
         // Row lookup is by the generated numeric index; saved machine addresses
         // can contain control characters that are not safe selector text.
-        const oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+        oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+        if (!oldRow) {
+          try { oldRow = listEl.querySelector('[data-machine-url="' + escCssAttr(machines[index].url) + '"]'); }
+          catch (e) { oldRow = null; }
+          if (oldRow) {
+            fleet.rowUpdateFailed[url] = true;
+            replaceMachineWithFallback(oldRow, machines[index], index);
+            return;
+          }
+        }
+        if (!oldRow) {
+          if (!rebuilt) {
+            rebuilt = true;
+            rebuildMachinesList(listEl, machines);
+          }
+          return;
+        }
+        if (fleet.rowUpdateFailed[url]) {
+          replaceMachineWithFallback(oldRow, machines[index], index);
+          return;
+        }
         if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
-      } catch (e) { return; }
+      } catch (e) {
+        // A finished probe must never leave an old Checking chip behind; that
+        // would claim work is still in flight after the answer arrived.
+        if (index >= 0) fleet.rowUpdateFailed[url] = true;
+        if (oldRow && index >= 0) replaceMachineWithFallback(oldRow, machines[index], index);
+        else if (!rebuilt) {
+          rebuilt = true;
+          rebuildMachinesList(listEl, machines);
+        }
+      }
     });
   } finally {
     // restoreInputFocus enforces the exactly-one-match rule, so a replaced
@@ -4317,7 +4393,7 @@ function hydrateMachinesScreen() {
   updateMachinesSummary(summaryEl, machines);
   const frag = document.createDocumentFragment();
   machines.forEach(function (m, index) {
-    frag.appendChild(makeMachineRow(m, index));
+    frag.appendChild(guardedMachineRow(m, index));
   });
   listEl.replaceChildren(frag);
 }
