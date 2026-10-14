@@ -17,6 +17,8 @@ import type { Task } from "../../src/operational/task-coordination/index.js";
 import { persistStoredIdentity } from "../util/persist-stored-identity.js";
 
 const controller: HubAgentController = {
+  // This task-inbox fixture exercises no agent control actions.
+  supports() { return false; },
   async pause() {
     return "paused";
   },

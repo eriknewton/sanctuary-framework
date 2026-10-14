@@ -330,6 +330,10 @@ function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
 
+// This export-only fixture supports no controls; declaration merging preserves the diagnostic baseline above.
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = () => false;
+
 class StringSink extends Writable {
   buffer = "";
   override _write(

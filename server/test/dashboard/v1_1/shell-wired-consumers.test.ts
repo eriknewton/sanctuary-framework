@@ -22,6 +22,7 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
@@ -34,6 +35,7 @@ const response = (body: unknown, status = 200, init: Record<string, unknown> = {
   redirected: false,
   type: "basic",
   json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
   ...init,
 });
 const never = () => new Promise<never>(() => {});
@@ -162,7 +164,7 @@ const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
-  "machines-summary", "machines-age", "machines-list",
+  "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
@@ -179,7 +181,7 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   const location = {
     get hash() { return locationHash; },
     set hash(value: string) {
-      const next = String(value);
+      const next = String(value).startsWith("#") ? String(value) : "#" + String(value);
       const changed = next !== locationHash;
       locationHash = next;
       if (changed && winListeners.hashchange) winListeners.hashchange();
@@ -201,7 +203,7 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     },
     window: { addEventListener: (name: string, fn: () => void) => { winListeners[name] = fn; } },
     location, sessionStorage: { getItem: () => null, setItem() {} },
-    URLSearchParams, URL, AbortController, Date, Element: FakeElement, HTMLInputElement: FakeInput,
+    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     fetch: (url: string, init?: RequestInit) => {
@@ -424,8 +426,8 @@ describe("slice 2 shell wired consumers", () => {
 
     const messages = runInContext("capturedToasts.map(function (toast) { return toast.message; })", h.context) as string[];
     expect(messages).toHaveLength(2);
-    expect(messages[0]).toContain('Sanctuary cannot apply "Remove protection" for this agent: unsupported request refused');
-    expect(messages[1]).toContain('"Remove protection" failed: controller unavailable');
+    expect(messages[0]).toContain('Sanctuary cannot apply "Remove protection" for this agent.');
+    expect(messages[1]).toContain('"Remove protection" failed. Try again.');
     for (const message of messages) {
       expect(message).toContain("Remove protection");
       expect(message).not.toMatch(/wrap/i);
@@ -667,7 +669,7 @@ describe("slice 2b shell wired consumers", () => {
     return html.slice(start, next < 0 ? html.length : next);
   };
   const agentListRowHtml = (html: string, id: string) =>
-    rowSlice(html, '<div class="agent-row', `data-agent-id="${escapedAttr(id)}"`);
+    rowSlice(html, '<tr>', `data-agent-id="${escapedAttr(id)}"`);
   const fortressAgentRowHtml = (html: string, id: string) =>
     rowSlice(html, '<div class="row agent-row"', `data-agent-row="${escapedAttr(id)}"`);
 
@@ -1116,7 +1118,7 @@ describe("slice 2b shell wired consumers", () => {
       h.navigate(route);
       await settle();
       const html = h.el.main!.innerHTML;
-      expect(textOf(html), route).not.toMatch(retired);
+      expect(textOf(html) + h.el["toast-host"]!.textContent, route).not.toMatch(retired);
       for (const a of attrsOf(html)) expect(a, route).not.toMatch(retired);
     }
     h.navigate("activity");
@@ -1151,22 +1153,17 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("agents");
     const html = h.el.main!.innerHTML;
-    const dot = (id: string) => {
-      const row = agentListRowHtml(html, id);
-      return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
-    };
+    const chip = (id: string) => agentListRowHtml(html, id);
     const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
-    (h.context as Record<string, unknown>).__agentStatus = "unwrapping";
-    const unwrappingDot = runInContext("agentStateClass(__agentStatus)", h.context) as string;
-    const unwrappingGlyph = runInContext("STATUS_MAP[__agentStatus].glyph", h.context) as string;
-    const unwrappingTone = runInContext("AGENT_STATE_PILL_TONE[agentStateClass(__agentStatus)] || 'tone-unknown'", h.context) as string;
-    expect(dot("no-evidence")![1]).toBe("unknown");
-    expect(dot("no-evidence")![2]).toBe("Unknown");
-    expect(dot("paused-one")![1]).toBe("idle");
-    expect(dot("unwrapping-one")![1]).toBe(unwrappingDot);
-    expect(dot("unwrapping-one")![2]).toBe(unwrappingLabel);
-    expect(dot("locked-one")![1]).toBe("locked");
-    expect(dot("off-enum")![1]).toBe("unknown");
+    const unwrappingDot = "idle";
+    const unwrappingGlyph = "idle";
+    const unwrappingTone = "tone-degraded";
+    expect(chip("no-evidence")).toContain('state-chip unknown');
+    expect(chip("no-evidence")).toContain("UNKNOWN");
+    expect(chip("paused-one")).toContain("PAUSED");
+    expect(chip("unwrapping-one")).toContain(unwrappingLabel.toUpperCase());
+    expect(chip("locked-one")).toContain('state-chip locked');
+    expect(chip("off-enum")).toContain('state-chip unknown');
     // The inspect pane's pill wears the same Unknown tone as its dot, and
     // an activity row without a verdict wears the neutral mark, not a pass.
     runInContext(`state.chat.inspect.panelByAgentId["no-evidence"] = { recent_activity: [{ emitted_at: "2026-10-13T00:00:00.000Z", display_template_id: "activity.egress", display_template_args: [] }], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" };`, h.context);
@@ -1209,7 +1206,7 @@ describe("slice 2b shell wired consumers", () => {
       expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);
       expect(runInContext("agentStateClass(__agentStatus)", h.context), status).toBe(expectedDot);
       const listHtml = h.el.main!.innerHTML;
-      expect(agentListRowHtml(listHtml, id), status).toContain(`<span class="state-dot ${expectedDot}"></span>`);
+      expect(agentListRowHtml(listHtml, id), status).toContain(status === "active" ? "RUNNING" : STATUS_MAPPING[status].label.toUpperCase());
       runInContext("state.chat.inspect.panelByAgentId[__agentId] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: '2026-10-14T00:00:00.000Z' }; state.selectedAgentId = __agentId;", h.context);
       const pane = runInContext("renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === __agentId; }))", h.context) as string;
       const detail = runInContext("renderAgentDetail()", h.context) as string;
@@ -1691,4 +1688,279 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("no activity reported");
     expect(html).not.toContain("CONFIRMED · <span>0s ago");
   });
+});
+
+
+describe("slice 6a Agents wired consumers", () => {
+  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}) => {
+    vi.useFakeTimers();
+    const sc = agentsScenario(name);
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: sc.agents } })),
+      "/api/posture/home": () => Promise.resolve(response(sc.home)),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: sc.inbox } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: sc.activity } })),
+      "/api/hub/policies": () => Promise.resolve(response({ data: { policies: sc.policies } })),
+      "/api/posture/reach/research-agent": () => Promise.resolve(response(sc.reach)),
+      ...overrides,
+    });
+    await settle();
+    h.navigate("agents");
+    return { h, sc };
+  };
+  const detail = (h: Awaited<ReturnType<typeof start>>["h"]) => h.click({ "data-action": "open-agent", "data-agent-id": "research-agent" });
+
+  it("6a inventory reuses the Overview table and shows evidence-bearing tiles", async () => {
+    const { h } = await start();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('class="overview-table overview-table-agents"');
+    for (const label of ["Total", "Protected of detected", "Ownerless", "At risk", "Policy template", "Reach (allowed of requested)"]) expect(html).toContain(label);
+    expect(html).toContain("1 of 1");
+    expect(html).toContain("Not evaluated");
+    expect(html).toContain("roster read");
+    const inventory = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1];
+    h.navigate("posture");
+    expect(h.el.main!.innerHTML).toContain(inventory);
+  });
+
+  it("6a inventory filters, sorts and pages the shared table with a bounded page", async () => {
+    const sc = agentsScenario();
+    const agents = Array.from({ length: 53 }, (_, i) => ({ ...sc.agents[0]!, agent_id: `agent-${String(i).padStart(2, "0")}`, harness: i % 2 ? "hermes" : "claude_code", status: i % 2 ? "paused" : "active" }));
+    const { h } = await start("protected", { "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })) });
+    expect(h.el.main!.innerHTML).toContain("showing 25 of 53");
+    h.click({ "data-action": "agents-page", "data-page": "1" });
+    expect(h.el.main!.innerHTML).toContain("agent-25");
+    expect(h.el.main!.innerHTML).not.toContain('data-agent-id="agent-00"');
+    const change = (action: string, value: string) => { const el = new FakeElement({ "data-action": action }, "SELECT"); el.value = value; h.change(el); };
+    change("agents-harness", "hermes");
+    change("agents-state", "paused");
+    expect(h.el.main!.innerHTML).toContain("showing 25 of 26");
+    change("agents-sort", "name-desc");
+    const rows = h.el.main!.innerHTML;
+    expect(rows.indexOf('data-agent-id="agent-51"')).toBeLessThan(rows.indexOf('data-agent-id="agent-49"'));
+    expect(rows).not.toContain('data-agent-id="agent-00"');
+  });
+
+  it("6a missing sources keep all inventory counts Unknown and stale protection is never green", async () => {
+    const { h } = await start("unknown");
+    expect(h.el.main!.innerHTML).toContain("Protected of detected");
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    detail(h);
+    expect(h.el.main!.innerHTML).toContain('aria-label="Standing"');
+    expect(h.el.main!.innerHTML).toContain("UNKNOWN");
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    const missing = await start("unknown", { "/api/hub/agents": () => Promise.reject(new Error("offline")) });
+    expect(missing.h.el.main!.innerHTML).toContain("Total");
+    expect(missing.h.el.main!.innerHTML).not.toContain("0 of 0");
+    const sc = agentsScenario();
+    const evidence = { ...sc.home.agents![0]!, enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 };
+    const fresh = await start("protected", { "/api/posture/home": () => Promise.resolve(response({ ...sc.home, agents: [evidence] })) });
+    detail(fresh.h); await settle();
+    expect(fresh.h.el.main!.innerHTML).toContain('state-chip good');
+    // A one-second fixture window plus one millisecond proves autonomous header/Standing expiry.
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(fresh.h.el.main!.innerHTML).not.toContain('state-chip good');
+    expect(fresh.h.el.main!.innerHTML).toContain("UNKNOWN");
+  });
+
+  it("6a empty fortress has one first-run action and no inventory wall of zeros", async () => {
+    const { h } = await start("empty");
+    expect(h.el.main!.innerHTML).toContain('data-agents-first-run');
+    expect(h.el.main!.innerHTML).toContain("sanctuary protect");
+    expect(h.el.main!.innerHTML.match(/class="btn"/g)).toHaveLength(1);
+    expect(h.el.main!.innerHTML).not.toContain('class="overview-tiles"');
+  });
+
+  it("6a entity header shares every lifecycle label and keeps unsupported controls disabled", async () => {
+    const { h } = await start(); detail(h);
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('aria-label="Breadcrumb"');
+    expect(html).toContain('aria-label="Agent sections"');
+    expect(html).toContain("Lock down this agent");
+    expect(html).toContain("Rotate identity");
+    expect(html).toContain("Tier 1");
+    expect(html).toMatch(/data-action="agent-unwrap"[^>]*disabled[^>]*>Remove protection/);
+    expect(html).toMatch(/data-action="agent-pause"[^>]*disabled/);
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) {
+      const label = runInContext(`agentControlLabel("${action}")`, h.context) as string;
+      expect(html).toContain(label);
+      expect(runInContext("renderFortressAgentsCard()", h.context)).toContain(label);
+    }
+  });
+
+  for (const [tab, text] of [["overview", "Standing"], ["approvals", "This agent's approvals"], ["activity", "Recent activity"], ["policy", "Effective reach"], ["identity", "Fingerprint"], ["memory", "Memory inventory unavailable"], ["evidence", "Agent evidence"]]) {
+    it(`6a ${tab} tab consumes its served source or states the specific gap`, async () => {
+      const { h } = await start("pending-tier1"); detail(h);
+      h.click({ "data-action": "agent-tab", "data-tab": tab! });
+      await settle();
+      const html = h.el.main!.innerHTML;
+      expect(html).toContain(`data-agent-tab="${tab}"`);
+      expect(html).toContain(text);
+      if (tab === "policy") {
+        for (const lane of ["May reach", "Asks you first", "Never"]) expect(html).toContain(lane);
+        expect(html).toContain("Research policy");
+        expect(html).toContain("version Unknown");
+      }
+      if (tab === "identity") expect(html).toContain("Operator-held");
+      if (tab === "activity" || tab === "evidence") {
+        expect(html).toContain("Castle Wall");
+        expect(html).toContain('state-chip bad');
+        expect(html).toContain("entry-1");
+        expect(html).toContain("showing 1 of 1");
+      }
+    });
+  }
+
+  it("6a agent approvals and inspect allow only Tier 2 inline and use the existing decision path", async () => {
+    const sc = agentsScenario("pending-tier1");
+    const items = [sc.approval, { ...sc.approval, item_id: "missing", tier: undefined }, { ...sc.approval, item_id: "tier2", tier: "tier2" }];
+    const calls: string[] = [];
+    const { h } = await start("pending-tier1", {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/inbox/tier2/approve": () => { calls.push("approve"); return Promise.resolve(response({ data: {} })); },
+      "/api/hub/inbox/tier2/deny": () => { calls.push("deny"); return Promise.resolve(response({ data: {} })); },
+    });
+    (h.context as Record<string, unknown>).__items = items;
+    runInContext('state.chat.inspect.panelByAgentId["research-agent"] = { pending_approvals: __items, recent_activity: [], opened_at: new Date().toISOString() }', h.context);
+    detail(h); h.click({ "data-action": "agent-tab", "data-tab": "approvals" });
+    const inspect = runInContext("renderAgentInspectPanel(state.agents[0])", h.context) as string;
+    for (const html of [h.el.main!.innerHTML, inspect]) {
+      for (const id of ["held-agent", "missing"]) expect(html).not.toMatch(new RegExp(`data-action="inbox-(approve|deny)" data-item-id="${id}"`));
+      expect(html.match(/href="#approvals">Review in Approvals/g)).toHaveLength(2);
+      expect(html).toContain('data-action="inbox-approve" data-item-id="tier2">Allow once');
+      expect(html).toContain('data-action="inbox-deny" data-item-id="tier2">Deny');
+    }
+    for (const action of ["approve", "deny"]) { h.click({ "data-action": `inbox-${action}`, "data-item-id": "tier2" }); await settle(); }
+    expect(calls).toEqual(["approve", "deny"]);
+  });
+
+  it("6a controls preserve frozen routes and Tier 1 remains pending until Approvals", async () => {
+    const sc = agentsScenario();
+    const calls: string[] = [];
+    const routes: Record<string, () => unknown> = {};
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) routes[`/api/hub/agents/research-agent/${action}`] = () => { calls.push(action); return Promise.resolve(response({ data: { status: action === "lockdown" || action === "unwrap" ? "approval_pending" : "active" } })); };
+    const all = { ...sc.agents[0]!, capabilities: Object.fromEntries(Object.keys(sc.agents[0]!.capabilities).map(k => [k, true])) };
+    const { h } = await start("protected", { ...routes, "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [all] } })) });
+    detail(h);
+    expect(h.el.main!.innerHTML).toContain('class="agent-entity-actions"');
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) { h.click({ "data-action": `agent-${action}`, "data-agent-id": "research-agent" }); await settle(); }
+    expect(calls).toEqual(["pause", "resume", "restart", "lockdown", "unwrap"]);
+    expect(h.el["toast-host"]!.textContent).toContain("Approval pending");
+  });
+
+  for (const status of [422, 500]) it(`6a ${status} control failure toast uses only the operator label`, async () => {
+    const { h } = await start("protected", {
+      "/api/hub/agents/research-agent/unwrap": () => Promise.resolve(response({ ok: false, error: "HubCapabilityError", detail: "capability not supported: agent_control_unwrap_unsupported_operator_decision_pending" }, status)),
+    });
+    h.click({ "data-action": "agent-unwrap", "data-agent-id": "research-agent" }); await settle();
+    const toast = h.el["toast-host"]!.textContent;
+    expect(toast).toContain("Remove protection");
+    expect(toast).not.toMatch(/wrap|HubCapabilityError|capability not supported/i);
+  });
+
+  it("6a hostile labels stay text and identity never enumerates secret fields", async () => {
+    const sc = agentsScenario();
+    const hostile = '<img src=x onerror="hostile()">';
+    const agent = { ...sc.agents[0]!, agent_id: hostile, private_key: "SECRET-MATERIAL", fingerprint: "SECRET-FINGERPRINT" };
+    const { h } = await start("protected", { "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [agent] } })) });
+    h.click({ "data-action": "open-agent", "data-agent-id": hostile });
+    h.click({ "data-action": "agent-tab", "data-tab": "identity" });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-agent-tab="identity"');
+    expect(html).toContain("&lt;img");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("SECRET-");
+    expect(html).not.toContain("private_key");
+  });
+  it("6a reach retains one bounded projection and rejects oversized destination input", async () => {
+    const sc = agentsScenario();
+    let payload = { ...sc.reach, unrelated: "DO-NOT-RETAIN" };
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => Promise.resolve(response(payload)) });
+    detail(h); await settle();
+    expect(runInContext("JSON.stringify(state.agentReach)", h.context)).not.toContain("DO-NOT-RETAIN");
+    // 257 exceeds the 256 configured-destination budget for one detail read.
+    payload = { ...payload, destinations: Array.from({ length: 257 }, () => sc.reach.destinations[0]!) };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    // 2049 exceeds the 2048-character destination/rule budget.
+    payload = { ...payload, destinations: [{ ...sc.reach.destinations[0]!, destination: "x".repeat(2049) }] };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    // More than two MiB must be rejected even when the destination list itself is small.
+    payload = { ...payload, destinations: sc.reach.destinations, unrelated: "x".repeat(2 * 1024 * 1024 + 1) };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+  });
+
+  it("6a reach admission stays bounded through timeout waves and ignores late completion", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    let calls = 0;
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => { calls++; return new Promise(resolve => { finish = resolve; }); } });
+    detail(h); await settle();
+    // Three waves of twenty clicks cross the five-second deadline with fetch ignoring abort.
+    for (let wave = 0; wave < 3; wave++) {
+      await vi.advanceTimersByTimeAsync(5001);
+      for (let click = 0; click < 20; click++) h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" });
+      await settle();
+    }
+    expect(calls).toBe(1);
+    finish(response(sc.reach)); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(calls).toBe(2);
+    finish(response(sc.reach)); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+  });
+
+  it("6a reach expires without interaction and does not retain old policy destinations", async () => {
+    const { h } = await start(); detail(h); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    // One minute plus one millisecond crosses the configured-read freshness window.
+    await vi.advanceTimersByTimeAsync(60 * 1000 + 1);
+    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    expect(h.el.main!.innerHTML).not.toContain("docs.example.test");
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+  });
+
+  it("6a failed detail sources clear prior reach and label each unavailable source", async () => {
+    let failed = false;
+    const sc = agentsScenario();
+    const { h } = await start("protected", {
+      "/api/posture/reach/research-agent": () => Promise.resolve(response(failed ? { error: "offline" } : sc.reach, failed ? 503 : 200)),
+      "/api/hub/inbox": () => Promise.reject(new Error("offline")),
+      "/api/hub/activity": () => Promise.reject(new Error("offline")),
+      "/api/hub/policies": () => Promise.reject(new Error("offline")),
+      "/api/posture/home": () => Promise.reject(new Error("offline")),
+    });
+    detail(h); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    failed = true;
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    const html = h.el.main!.innerHTML;
+    for (const label of ["Reach unavailable", "Approvals Unknown", "Activity Unknown", "Policy summary Unknown", "UNKNOWN"]) expect(html).toContain(label);
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain('state-chip good');
+    expect(html).toContain("Reach read failed");
+  });
+
+  it("6a reach reads configured destinations, caps each lane, escapes names and rejects a different subject", async () => {
+    const sc = agentsScenario();
+    const hostile = '<img src=x onerror="tool()">';
+    const reach = { ...sc.reach, destinations: Array.from({ length: 55 }, (_, i) => ({ destination: hostile + i, disposition: "allow", enforcing_layer: "castle_wall", rule_id: `r${i}` })) };
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => Promise.resolve(response(reach)) });
+    detail(h); await settle(); h.click({ "data-action": "agent-tab", "data-tab": "policy" });
+    expect(h.el.main!.innerHTML).toContain("&lt;img");
+    expect(h.el.main!.innerHTML).not.toContain("<img");
+    expect(h.el.main!.innerHTML).toContain("showing 20 of 55");
+    expect(h.el.main!.innerHTML).toContain("Configured; enforcement not confirmed");
+    expect(h.el.main!.innerHTML).toContain("requested hosts Unknown");
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    reach.agent_id = "other-agent";
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    expect(h.el.main!.innerHTML).not.toContain("&lt;img");
+  });
+
 });

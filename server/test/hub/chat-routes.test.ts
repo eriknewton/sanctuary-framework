@@ -79,6 +79,7 @@ function makeAgent(): LocalAgentRecord {
 }
 
 class StubController implements HubAgentController {
+  supports(): boolean { return true; }
   async pause(_id: string): Promise<HubAgentStatus> {
     return "paused";
   }

@@ -274,7 +274,7 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(client).toContain("/posture/evidence");
     // The source-backed Overview tiles that remain after slice 3 subtraction are folded in.
     expect(client).not.toContain("Protected agents");
-    expect(client).not.toContain("Enforcement confirmed");
+    expect(client.match(/function renderPostureScreen\(\)[\s\S]*?\n\}\n/)![0]).not.toContain("Enforcement confirmed");
     expect(client).toContain("Castle Wall");
     expect(client).toContain("Approvals waiting");
     expect(client).toContain("Open Sentinel findings");

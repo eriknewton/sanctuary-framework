@@ -223,6 +223,10 @@ function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
 
+// Support only the drill controls; declaration merging preserves the diagnostic baseline above.
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = action => ["pause", "resume", "lockdown"].includes(action);
+
 describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
   let rig: DrillRig;
 

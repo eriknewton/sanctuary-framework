@@ -270,6 +270,10 @@ function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
 
+// This fake implements every control; keep its probe below the pinned diagnostic location.
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = () => true;
+
 // ═════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════

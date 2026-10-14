@@ -81,15 +81,15 @@ function buildSeedRecord(agentId: string): LocalAgentRecord {
 describe("v1.1 Agents empty-state canary (Finding Z regression)", () => {
   it("renderAgentsList guards the empty-state branch on !state.agents.length", () => {
     const script = getClientScript();
-    // The guard structure: `if (!state.agents.length) return '<h1>Agents</h1><p ...empty...>';`
+    // The guard structure: `if (loaded && !state.agents.length) return '<h1>Agents</h1><p ...empty...>';`
     // The empty-state copy is acceptable in the source as long as it's
     // gated behind this check. A regression that drops the guard would
     // render the empty-state alongside or instead of agent rows.
     expect(script).toMatch(
-      /function renderAgentsList\(\)\s*\{[^}]*if\s*\(\s*!state\.agents\.length\s*\)\s*return\s*['"]<h1>Agents<\/h1>/,
+      /function renderAgentsList\(\)\s*\{[^}]*if\s*\(\s*loaded\s*&&\s*!state\.agents\.length\s*\)\s*return\s*['"]<h1>Agents<\/h1>/,
     );
     // Pin the negation: the empty-state copy points operators at protect.
-    expect(script).toContain("No protected agents yet.");
+    expect(script).toContain("No protected agents yet");
   });
 
   describe("populated registry path (proves Z's persistence is intact)", () => {
