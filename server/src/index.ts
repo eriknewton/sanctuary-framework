@@ -1151,7 +1151,7 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
-  // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
+  // 14d2. Create SIEM Export tools (Tier 1: CEF, OCSF, ECS, and raw Cortex events for XDM modeling)
   const { tools: siemTools } = createSIEMTools(auditLog, currentSessionBinding);
 
   // 14e. Initialize Sovereignty Profile store. Its context_gating subsection is

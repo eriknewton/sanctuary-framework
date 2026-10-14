@@ -5,9 +5,9 @@
  * at the CLIENT-SCRIPT level, that the tunability affordances issue only
  * operator-bearer-gated requests and never a weaker path:
  *
- *  1. The "Always allow" promote button on an approval tile emits
+ *  1. The "Always allow" promote button in the approval drawer emits
  *     data-action="inbox-promote" and the dispatcher routes it to
- *     onInboxPromote, which runs the compile -> activate flow through
+ *     approval first, then onInboxPromote runs compile -> activate through
  *     policyApi() (which sends the sessionStorage bearer). It is NOT routed
  *     through the generic /inbox/:id/<action> path.
  *  2. The plain-English policy view is fetched via policyApi("/current"),
@@ -22,22 +22,27 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { renderApprovalFixture } from "./approval-render-fixture.js";
 
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
 describe("tunability promote: the client routes 'Always allow' through the gated policyApi path", () => {
   const src = getClientScript();
 
-  it("the approval tile emits a promote button with data-action=inbox-promote", () => {
-    expect(src).toContain("function renderApprovalTile");
-    expect(src).toContain('data-action="inbox-promote"');
+  it("the live drawer emits the selected standing action and its fortress scope", () => {
+    const html = renderApprovalFixture(true);
+    expect(html).toContain('class="card approval-drawer"');
+    expect(html).toContain('data-action="inbox-promote"');
+    expect(html).toContain("Always allow this operation for every agent on this fortress.");
+    expect(src).not.toContain("function renderApprovalTile");
   });
 
   it("inbox-promote is dispatched to onInboxPromote, NOT the generic /inbox/:id path", () => {
     // The dispatcher intercepts inbox-promote before the generic inbox-*
     // slice that posts to /inbox/:id/<action>.
     expect(src).toContain('action === "inbox-promote"');
-    expect(src).toContain("onInboxPromote(itemId)");
+    expect(src).toContain("state_APPROVINGAlwaysAllow(itemId)");
+    expect(src).toContain("onInboxPromote(itemId, op)");
   });
 
   it("onInboxPromote runs compile -> activate through policyApi (the operator-bearer path)", () => {

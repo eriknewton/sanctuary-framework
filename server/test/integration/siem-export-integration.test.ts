@@ -358,7 +358,7 @@ describe("SIEM Export Integration", () => {
       expect(tool.description).toContain("CEF");
       expect(tool.description).toContain("OCSF");
       expect(tool.description).toContain("ECS");
-      expect(tool.description).toContain("XDM");
+      expect(tool.description).toContain("raw Cortex events for XDM modeling");
     });
 
     it("should have properly typed input schema", () => {

@@ -1785,15 +1785,22 @@ body {
 .approval-filters {
   display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
 }
+/* The Approvals artboard's main column is fluid (canvas/Approvals.dc.html, .main). Under the shell's
+   880px reading cap the queue beside the 420px drawer had about 440px, so its waiting and decision
+   columns scrolled out of view at 1280 and 1440. */
+.concierge-wrap.approvals-wide { max-width: none; }
 .approval-layout {
   display: grid; grid-template-columns: minmax(0, 1fr) 420px;
   gap: var(--space-4); align-items: start;
 }
 .approval-table-wrap { overflow-x: auto; }
+/* No minimum width, as on the artboard: the reason column wraps so every column stays in view;
+   the wrapper still scrolls if a long unbroken value cannot wrap. */
 .approval-table {
-  width: 100%; border-collapse: collapse; min-width: 760px;
+  width: 100%; border-collapse: collapse;
   font-size: var(--text-sm);
 }
+.approval-table td:first-child, .approval-table td:nth-child(5), .approval-table .btn { white-space: nowrap; }
 .approval-table th {
   text-align: left; color: var(--ink-3); font-family: var(--mono);
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
@@ -1805,8 +1812,9 @@ body {
 }
 .approval-table tr.sel td {
   background: var(--indigo-bg);
-  box-shadow: inset 2px 0 0 var(--indigo);
 }
+/* The 2px selection marker is the design-system stroke-marker, drawn once per row. */
+.approval-table tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--indigo); }
 .approval-table .sect td {
   background: var(--surface-2); color: var(--ink-2);
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
@@ -1837,6 +1845,8 @@ body {
 }
 .approval-effects strong { display: block; margin-bottom: 4px; }
 .approval-effects p { color: var(--ink-2); font-size: var(--text-sm); }
+/* Ten characters in "Allow once", plus the button insets, keep Cancel in the same hit area. */
+.approval-tier1-step { min-inline-size: calc(10ch + 2 * var(--space-4)); }
 .approval-tier-note {
   margin: 12px 16px 0; padding: 10px;
   border: 1px solid var(--ochre-line); border-radius: var(--rad);
@@ -1864,8 +1874,12 @@ body {
 }
 .approval-empty h3 { margin: 6px 0; }
 .approval-empty p { margin: 0 0 12px; }
-@media (max-width: 1100px) {
-  .approval-layout { grid-template-columns: 1fr; }
+/* Beside the 420px drawer the queue column is the viewport less about 742px (the 232px rail, the page padding,
+   the drawer and its gap: 538px at 1280), and the table's columns need about 654px, so below 1400px the drawer
+   moves under the queue, as the Evidence record pane does below 1200px. A zero minimum keeps long cells inside
+   the column. */
+@media (max-width: 1400px) {
+  .approval-layout { grid-template-columns: minmax(0, 1fr); }
   .approval-drawer { position: static; }
 }
 .ambient-posture {
