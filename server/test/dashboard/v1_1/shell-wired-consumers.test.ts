@@ -11,13 +11,30 @@
  * rest Unknown. A capability with no consumer reaching it is not shipped, so
  * these drive the boot path and the event listeners rather than a renderer in
  * isolation.
+ *
+ * Slice 2b adds: Machines inside the shell (the saved fleet with its
+ * denominator and check age, an unanswered machine Unknown and never counted
+ * online, no credential on a probe, no non-web address linked); the Sentinels
+ * layer line Unknown without a Sentinel report; the agent controls and every
+ * other rendered screen free of the retired wrap vocabulary; the Policies
+ * subtitle saying only what the edit path does; agent state marks that keep
+ * Unknown apart from a working state; the Evidence filter form as labelled
+ * fields; activity rows without a verdict wearing no pass mark; and the
+ * auto-trigger trend naming each bar shape in words.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  redirected: false,
+  type: "basic",
+  json: async () => body,
+  ...init,
+});
 const never = () => new Promise<never>(() => {});
 const home = (digest: Record<string, unknown> = {}) => ({
   origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest,
@@ -32,14 +49,27 @@ const emptyData = { data: { configured: false, surfaces: [], agents: [], items: 
 class FakeElement {
   attrs: Record<string, string>;
   parentElement: FakeElement | null = null;
-  innerHTML = "";
-  textContent = "";
+  tagName: string;
+  private children: Array<FakeElement | FakeText> = [];
+  private html = "";
+  private text = "";
   className = "";
   hidden = false;
   disabled = false;
   value = "";
+  replaceCount = 0;
   private classes = new Set<string>();
-  constructor(attrs: Record<string, string> = {}) { this.attrs = { ...attrs }; }
+  constructor(attrs: Record<string, string> = {}, tagName = "DIV") { this.attrs = { ...attrs }; this.tagName = tagName.toUpperCase(); }
+  get innerHTML() { return this.children.length ? this.children.map((c) => c.outerHTML).join("") : this.html; }
+  set innerHTML(value: string) { this.html = String(value); this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((c) => c.textContent).join("") : this.text; }
+  set textContent(value: string) { this.text = String(value); this.html = escapeHtml(String(value)); this.children = []; }
+  get outerHTML() {
+    if (this.tagName === "FRAGMENT") return this.innerHTML;
+    const merged = this.className ? { ...this.attrs, class: this.className } : this.attrs;
+    const attrs = Object.entries(merged).map(([k, v]) => ` ${k}="${escapeHtml(v)}"`).join("");
+    return `<${this.tagName.toLowerCase()}${attrs}>${this.innerHTML}</${this.tagName.toLowerCase()}>`;
+  }
   classList = {
     add: (...n: string[]) => n.forEach((c) => this.classes.add(c)),
     remove: (...n: string[]) => n.forEach((c) => this.classes.delete(c)),
@@ -51,33 +81,89 @@ class FakeElement {
   removeAttribute(name: string) { delete this.attrs[name]; }
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
-  querySelector() { return null; }
+  querySelector(selector: string): FakeElement | null {
+    const attr = selector.match(/^\[([^=]+)="([^"]*)"\]$/);
+    if (attr && this.attrs[attr[1]!] === attr[2]) return this;
+    for (const child of this.children) {
+      if (child instanceof FakeElement) {
+        const found: FakeElement | null = child.querySelector(selector);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
   querySelectorAll() { return []; }
   contains() { return false; }
+  appendChild(child: FakeElement | FakeText) {
+    if (child instanceof FakeElement) child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+  append(...children: Array<FakeElement | FakeText | string>) {
+    children.forEach((child) => this.appendChild(typeof child === "string" ? new FakeText(child) : child));
+  }
+  replaceChildren(...children: Array<FakeElement | FakeText | string>) {
+    this.replaceCount++;
+    this.children = [];
+    this.html = "";
+    this.text = "";
+    this.append(...children);
+  }
   focus() {}
+  replaceWith(next: FakeElement | FakeText) {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index < 0) return;
+    if (next instanceof FakeElement) next.parentElement = this.parentElement;
+    this.parentElement.children[index] = next;
+  }
+}
+class FakeText {
+  textContent: string;
+  constructor(value: string) { this.textContent = String(value); }
+  get outerHTML() { return escapeHtml(this.textContent); }
 }
 class FakeInput extends FakeElement {}
+
+function escapeHtml(raw: string) {
+  return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
 const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
+  "machines-summary", "machines-age", "machines-list",
 ];
 
-function boot(overrides: Record<string, () => unknown> = {}) {
+function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
   const el: Record<string, FakeElement> = {};
-  for (const id of SHELL_IDS) el[id] = new FakeElement();
+  for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
   // The rail pill sits inside its rail link, which carries the sentence.
   const railLink = new FakeElement();
   el["rail-approvals-count"]!.parentElement = railLink;
   const docListeners: Record<string, (ev: unknown) => void> = {};
   const winListeners: Record<string, () => void> = {};
-  const location = { hash: "", search: "", origin: "http://fixture" };
+  let locationHash = "";
+  const location = {
+    get hash() { return locationHash; },
+    set hash(value: string) {
+      const next = String(value);
+      const changed = next !== locationHash;
+      locationHash = next;
+      if (changed && winListeners.hashchange) winListeners.hashchange();
+    },
+    search: "",
+    origin: "http://fixture",
+  };
   const context = createContext({
     document: {
       getElementById: (id: string) => el[id] || (id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: "/api/hub" }) } : null),
       addEventListener: (name: string, fn: (ev: unknown) => void) => { docListeners[name] = fn; },
+      createElement: (tagName: string) => new FakeElement({}, tagName),
+      createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
+      createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [], activeElement: null,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
@@ -86,14 +172,15 @@ function boot(overrides: Record<string, () => unknown> = {}) {
     URLSearchParams, URL, AbortController, Date, Element: FakeElement, HTMLInputElement: FakeInput,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
-    fetch: (url: string) => {
+    fetch: (url: string, init?: RequestInit) => {
       const path = url.replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, "");
-      if (overrides[path]) return overrides[path]!();
+      if (overrides[path]) return overrides[path]!(init);
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
+    ...extraGlobals,
   });
   runInContext(getClientScript(), context);
-  const navigate = (route: string) => { location.hash = "#" + route; winListeners.hashchange!(); };
+  const navigate = (route: string) => { location.hash = "#" + route; };
   const click = (attrs: Record<string, string>, inside: string[] = []) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
@@ -435,8 +522,11 @@ describe("slice 2 shell wired consumers", () => {
       { ...heldItem, item_id: "held-a", agent_id: "fixture-agent-a" },
       { ...heldItem, item_id: "held-b", agent_id: "fixture-agent-b" },
     ];
-    // Both agents are served, so the scope menu's own reconciliation (which
-    // resets a scope naming an unknown agent) runs against a real roster.
+    // Both agents are served, so the scope names an agent on the roster. The
+    // scope menu's reconciliation (which resets a scope naming an unknown
+    // agent) does not run here: this fake page has no #agent-switcher-label
+    // or #agent-switcher-menu, so renderAgentSwitcher returns before it. The
+    // scope holds because the click sets it, which is what this test pins.
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
     const agents = [{ agent_id: "fixture-agent-a", status: "active", model_provider }, { agent_id: "fixture-agent-b", status: "active", model_provider }];
     const h = boot({
@@ -507,5 +597,327 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("fixture-agent-b");
     expect(h.el.main!.innerHTML).not.toContain("fixture-agent-a");
     expect(h.el["search-results"]!.hidden).toBe(true);
+  });
+});
+
+describe("slice 2b shell wired consumers", () => {
+  const FLEET_KEY = "sanctuary_fleet_machines";
+  const storage = (saved: unknown) => ({
+    localStorage: {
+      getItem: (k: string) => (k === FLEET_KEY ? JSON.stringify(saved) : null),
+      setItem: () => { throw new Error("the shell must never write localStorage"); },
+      removeItem: () => { throw new Error("the shell must never write localStorage"); },
+    },
+  });
+  const textOf = (html: string) => html.replace(/<[^>]*>/g, " ").replace(/&[a-z#0-9]+;/gi, " ");
+  const attrsOf = (html: string) => [...html.matchAll(/\s(?:title|aria-label|placeholder)="([^"]*)"/g)].map((m) => m[1]!);
+  const machinesHtml = (h: ReturnType<typeof boot>) =>
+    h.el["machines-summary"]!.innerHTML + h.el["machines-list"]!.innerHTML;
+
+  it("Machines renders the saved fleet with its denominator and check age, and an unanswered machine is Unknown, never online", async () => {
+    vi.useFakeTimers();
+    const probes: Array<{ url: string; init?: RequestInit }> = [];
+    const abortable = (init?: RequestInit) => new Promise((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+    const h = boot({
+      "http://fixture/api/health": (init) => { probes.push({ url: "http://fixture", init }); return Promise.resolve(response({ ok: true })); },
+      "http://build-1.fixture:3501/api/health": (init) => { probes.push({ url: "build-1", init }); return Promise.resolve(response({ ok: false })); },
+      "http://mba.fixture:3501/api/health": (init) => { probes.push({ url: "mba", init }); return abortable(init); },
+    }, storage([
+      { name: "build-1", url: "http://build-1.fixture:3501" },
+      { name: "erik-mba", url: "http://mba.fixture:3501" },
+      { name: "not-a-web-address", url: "javascript:alert(1)" },
+    ]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    let html = machinesHtml(h);
+    // This machine joins the three saved ones: four in the denominator.
+    expect(html).toContain("1 of 4 machines online · 1 checking · 1 not healthy · 1 Unknown");
+    expect(html).not.toContain("showing");
+    expect(html).toMatch(/checked \d+s ago/);
+    vi.advanceTimersByTime(3000);
+    await settle();
+    html = machinesHtml(h);
+    expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
+    expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
+    expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
+    // This binds the unanswered mba row to its own Unknown chip; aggregate
+    // chip counts alone would miss a row-to-state swap.
+    expect(html).toMatch(/data-machine-url="http:\/\/mba\.fixture:3501"[^>]*><span [^>]*class="state-chip unknown"/);
+    // No non-web address reaches an href or a probe, and no probe carries a
+    // credential to another machine.
+    expect(html).not.toMatch(/href="javascript:/i);
+    expect(probes.map((p) => p.url).sort()).toEqual(["build-1", "http://fixture", "mba"]);
+    for (const p of probes) {
+      expect(p.init?.credentials, p.url).toBe("omit");
+      expect(JSON.stringify(p.init?.headers ?? {}), p.url).not.toMatch(/authorization/i);
+    }
+    // The rail item lights for the screen, and /fleet stays one click away.
+    expect(runInContext("ROUTE_RAIL_PARENT.machines", h.context)).toBe("machines");
+    expect(h.el.main!.innerHTML).toContain('href="/fleet"');
+  });
+
+  it.each([
+    ["2xx ok true", response({ ok: true }), "Online", "state-chip good"],
+    ["2xx ok false", response({ ok: false }), "Not healthy", "state-chip bad"],
+    ["503 ok true", response({ ok: true }, 503), "Unknown", "state-chip unknown"],
+    ["500 ok false", response({ ok: false }, 500), "Unknown", "state-chip unknown"],
+    ["missing ok", response({}), "Unknown", "state-chip unknown"],
+    ["non-boolean ok", response({ ok: "yes" }), "Unknown", "state-chip unknown"],
+    ["redirect", response({ ok: true }, 200, { redirected: true }), "Unknown", "state-chip unknown"],
+    ["opaque redirect", response({ ok: true }, 0, { type: "opaqueredirect" }), "Unknown", "state-chip unknown"],
+    ["malformed json", { ok: true, status: 200, redirected: false, type: "basic", json: async () => { throw new Error("bad json"); } }, "Unknown", "state-chip unknown"],
+  ])("probe outcome table maps %s to %s", async (_label, health, word, cls) => {
+    vi.useFakeTimers();
+    const h = boot({ "http://fixture/api/health": () => Promise.resolve(health) }, storage([]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain(word);
+    expect(html).toContain(cls);
+    if (word === "Unknown") expect(html).toContain("0 of 1 machine online · 1 Unknown");
+  });
+
+  it("Check again aborts the previous probe wave and a slow answer from the old round never repaints a machine", async () => {
+    vi.useFakeTimers();
+    let release: (v: unknown) => void = () => {};
+    let calls = 0;
+    let aborts = 0;
+    const h = boot({
+      "http://fixture/api/health": (init) => {
+        calls++;
+        init?.signal?.addEventListener("abort", () => { aborts++; });
+        if (calls === 1) return new Promise((r) => { release = r; });
+        return Promise.reject(new Error("refused"));
+      },
+    }, storage([]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 checking");
+    h.click({ "data-action": "machines-recheck" });
+    await settle();
+    expect(aborts).toBeGreaterThan(0);
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 Unknown");
+    release(response({ ok: true }));
+    await settle();
+    expect(machinesHtml(h)).toContain("0 of 1 machine online · 1 Unknown");
+    expect(machinesHtml(h)).not.toContain("state-chip good");
+  });
+
+  it("Machines treats hostile saved entries as text and never probes or links non-web addresses", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([
+        { name: '<img src=x onerror=alert(1)>', url: 'http://safe.fixture:3501/console?name="><script>alert(1)</script>' },
+        { name: '"><script>alert(1)</script>', url: "javascript:alert(1)" },
+        { name: "data payload", url: "data:text/html,<script>alert(1)</script>" },
+        { name: "mixed scheme", url: "JaVaScRiPt:alert(1)" },
+      ]),
+      fetch: (url: string, init?: RequestInit) => {
+        fetched.push(url);
+        if (url === "http://fixture/api/health" || url === "http://safe.fixture:3501/api/health") return Promise.resolve(response({ ok: true }));
+        return Promise.resolve(response(emptyData, 200, { init }));
+      },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(h.el["machines-list"]!.textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
+    expect(html).not.toMatch(/<(?:img|script)\b/i);
+    expect(html).not.toMatch(/\sonerror="/i);
+    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"]);
+    expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
+    expect(html.match(/Not a web address/g) ?? []).toHaveLength(3);
+  });
+
+  it("a long saved list is listed but only the named cap is probed", async () => {
+    vi.useFakeTimers();
+    const saved = Array.from({ length: 2500 }, (_, i) => ({ name: `build-${i}`, url: `http://build-${i}.fixture:3501` }));
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage(saved),
+      fetch: (url: string) => {
+        fetched.push(url);
+        return Promise.resolve(response({ ok: true }));
+      },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
+    expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
+    expect(machinesHtml(h)).toContain(`checking ${limit} of 2501 machines; the rest are listed unchecked`);
+    expect(h.el["machines-list"]!.textContent).toContain("build-2499");
+    expect(h.el["machines-list"]!.textContent).toContain("Unprobed");
+    expect(h.el["machines-list"]!.replaceCount).toBe(1);
+  });
+
+  it("this machine stays inside the probe cap even when saved after twenty-five peers", async () => {
+    vi.useFakeTimers();
+    const saved = Array.from({ length: 25 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }));
+    saved.push({ name: "self saved late", url: "http://fixture/path" });
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage(saved),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(fetched.filter((url) => url === "http://fixture/api/health")).toHaveLength(1);
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/fixture\/path"[^>]*><span [^>]*class="state-chip good"/);
+  });
+
+  it("duplicate host-port entries share one probed row and path addresses are described as host checks", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([
+        { name: "with path", url: "http://build.fixture:3501/tenant/a" },
+        { name: "duplicate path", url: "http://build.fixture:3501/tenant/b" },
+      ]),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(fetched.filter((url) => url === "http://build.fixture:3501/api/health")).toHaveLength(1);
+    expect(machinesHtml(h)).toContain("2 of 2 machines online");
+    expect(h.el["machines-list"]!.textContent).toContain("host health check");
+    expect(machinesHtml(h)).toContain('href="http://build.fixture:3501/tenant/a"');
+  });
+
+  it("a Fleet link click changes route once and starts one probe wave", async () => {
+    vi.useFakeTimers();
+    const fetched: string[] = [];
+    const h = boot({}, {
+      ...storage([{ name: "build", url: "http://build.fixture:3501" }]),
+      fetch: (url: string) => { fetched.push(url); return Promise.resolve(response({ ok: true })); },
+    });
+    await settle();
+    h.click({ "data-action": "set-route", "data-route": "machines" });
+    await settle();
+    expect(runInContext("state.route", h.context)).toBe("machines");
+    expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual([
+      "http://build.fixture:3501/api/health",
+      "http://fixture/api/health",
+    ]);
+  });
+
+  it("the Sentinels line is Unknown without a Sentinel report, however many agents are on the roster", async () => {
+    vi.useFakeTimers();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [{ agent_id: "a1", status: "active", model_provider }, { agent_id: "a2", status: "active", model_provider }] } })),
+    });
+    await settle();
+    h.navigate("enforcement");
+    const m = h.el.main!.innerHTML.match(/<span class="(pp-dot[^"]*)"><\/span><span class="pp-k">Sentinels watching agents<\/span><span class="pp-v">([^<]*)<\/span>/);
+    expect(m, "Sentinels line").toBeTruthy();
+    expect(m![1]).toBe("pp-dot unknown");
+    expect(m![2]).toBe("Unknown");
+  });
+
+  it("the exercised shell screens avoid retired wrap vocabulary, and the agent controls say Lock down and Remove protection", async () => {
+    vi.useFakeTimers();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const capabilities = { can_pause: true, can_resume: true, can_restart: true, can_lockdown: true, can_unwrap: false };
+    const agents = [
+      { agent_id: "a1", status: "active", harness: "fixture-harness", model_provider, capabilities },
+      { agent_id: "a2", status: "paused", harness: "fixture-harness", model_provider, capabilities: { ...capabilities, can_unwrap: true } },
+    ];
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })),
+    });
+    await settle();
+    const routes = ["posture", "approvals", "agents", "machines", "enforcement", "findings", "activity", "policy", "integrations", "settings",
+      "dashboard", "attestation", "health", "auto-trigger", "intelligence", "privacy", "honeypot", "coordination", "exit-drill"];
+    const retired = /\b(un)?wrap(s|ped|ping)?\b/i;
+    for (const route of routes) {
+      h.navigate(route);
+      await settle();
+      const html = h.el.main!.innerHTML;
+      expect(textOf(html), route).not.toMatch(retired);
+      for (const a of attrsOf(html)) expect(a, route).not.toMatch(retired);
+    }
+    h.navigate("activity");
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="agent-unwrap" data-agent-id="a1" disabled title="Removing protection from the dashboard is not available yet; an unsupported request is refused before any approval is queued.">Remove protection</button>');
+    expect(html).toContain('data-action="agent-lockdown" data-agent-id="a1" title="Tier 1: requires inbox approval.">Lock down</button>');
+  });
+
+  it("the Policies subtitle says only what the edit path does", async () => {
+    vi.useFakeTimers();
+    const h = boot();
+    await settle();
+    h.navigate("policy");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("A template change waits for your approval; approving it records the new template on the agent, and your decision either way is written to your audit log.");
+    expect(html).not.toMatch(/signed receipt|tool-call cycle/);
+  });
+
+  it("an agent without current evidence wears the Unknown mark, never a working state's mark", async () => {
+    vi.useFakeTimers();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [
+        { agent_id: "no-evidence", status: "active", harness: "h", model_provider },
+        { agent_id: "paused-one", status: "paused", harness: "h", model_provider },
+        { agent_id: "locked-one", status: "locked_down", harness: "h", model_provider },
+        { agent_id: "off-enum", status: "mystery", harness: "h", model_provider },
+      ] } })),
+    });
+    await settle();
+    h.navigate("agents");
+    const html = h.el.main!.innerHTML;
+    const dot = (id: string) => html.match(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ([^"]+)"></span>([^<]*)</span>`));
+    expect(dot("no-evidence")![1]).toBe("unknown");
+    expect(dot("no-evidence")![2]).toBe("Unknown");
+    expect(dot("paused-one")![1]).toBe("idle");
+    expect(dot("locked-one")![1]).toBe("locked");
+    expect(dot("off-enum")![1]).toBe("unknown");
+    // The inspect pane's pill wears the same Unknown tone as its dot, and
+    // an activity row without a verdict wears the neutral mark, not a pass.
+    runInContext(`state.chat.inspect.panelByAgentId["no-evidence"] = { recent_activity: [{ emitted_at: "2026-10-13T00:00:00.000Z", display_template_id: "activity.egress", display_template_args: [] }], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" };`, h.context);
+    const pane = runInContext(`renderAgentInspectPanel(state.agents[0])`, h.context) as string;
+    expect(pane).toContain('<span class="pill tone-unknown"><span class="state-dot unknown"');
+    expect(pane).toContain('<div class="timeline-item"><div class="ts">');
+    expect(pane).not.toContain("timeline-item ok");
+  });
+
+  it("the Evidence filter form renders each filter as a labelled field", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    await settle();
+    h.navigate("activity");
+    const html = h.el.main!.innerHTML;
+    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter the inbox">([\s\S]*?)<\/div>/);
+    expect(bar, "filter bar").toBeTruthy();
+    const labels = [...bar![1]!.matchAll(/<label class="field"><span class="field-label">([^<]+)<\/span><(input|select) class="input"/g)].map((m) => m[1]);
+    expect(labels).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    expect(bar![1]).not.toContain("<br>");
+  });
+
+  it("the auto-trigger trend names each bar shape with its count", async () => {
+    vi.useFakeTimers();
+    const h = boot();
+    await settle();
+    const out = runInContext(`renderAutoTriggerTrend([
+      { outcome: "auto_proceeded", observed_at: "2026-10-13T00:00:00.000Z" },
+      { outcome: "operator_approved", observed_at: "2026-10-13T00:01:00.000Z" },
+      { outcome: "operator_canceled", observed_at: "2026-10-13T00:02:00.000Z" },
+      { outcome: "awaiting_operator", observed_at: "2026-10-13T00:03:00.000Z" }
+    ])`, h.context) as string;
+    expect(out.match(/<span class="trend-bar (good|warn|pending)"/g)).toHaveLength(4);
+    expect(textOf(out).replace(/\s+/g, " ").trim()).toBe("2 went ahead 1 stopped 1 other");
   });
 });
