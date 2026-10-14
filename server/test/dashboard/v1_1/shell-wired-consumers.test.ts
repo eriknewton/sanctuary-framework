@@ -224,6 +224,8 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     fetch: (url: string, init?: RequestInit) => {
       const path = url.replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, "");
       if (overrides[path]) return overrides[path]!(init);
+      // Standing-rule tests require a valid policy view; malformed policy data now fails the whole read.
+      if (path === "/api/policy/current") return Promise.resolve(response({ data: { view: { lines: [] } } }));
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
     ...extraGlobals,
@@ -556,7 +558,7 @@ describe("slice 2 shell wired consumers", () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
-      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { lines: [] } } })),
     });
     await settle();
     h.navigate("approvals");
@@ -2675,7 +2677,7 @@ describe("Approvals round-one decision and evidence states", () => {
       vi.useFakeTimers();
       const h = boot({
         "/api/hub/inbox": inbox([{ ...tier2, ...(mode === "tier1" ? { tier: "tier1" } : mode === "other" ? { operation_category: "other" } : {}) }]),
-        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { sections: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
+        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { lines: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
       });
       await settle();
       h.navigate("approvals");
@@ -2953,7 +2955,7 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
     const h = await mfpBoot("policy");
     const html = h.el.main!.innerHTML;
     expect(html).toContain('data-mfp-policy');
-    for (const label of ['What agents may reach', 'What asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
+    for (const label of ['What agents may reach', 'Always asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
     expect(html).toContain('export your saved state off the machine');
     expect(html).toContain('data-action="template-picker-open"');
     expect(html).not.toContain('state-chip good');
@@ -3083,4 +3085,185 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
       expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
     }
   });
+
+  // Round 2: public read behavior and reachable per-item controls.
+  const r2Sources = [
+    { route: 'machines', path: '/api/fleet/roster', key: 'roster', unknown: 'Fleet roster Unknown', old: 'Build box', read: 'fetchMfpRead("/api/fleet/roster", "roster")' },
+    { route: 'findings', path: '/api/sentinels/findings', key: 'findings', unknown: 'Sentinel findings Unknown', old: 'alert outbound observation', read: 'fetchMfpRead("/api/sentinels/findings", "findings")' },
+    { route: 'policy', path: '/api/policy/current', key: 'policy', unknown: 'Policy Unknown', old: 'export your saved state off the machine', read: 'readPolicyView()' },
+  ];
+  function r2Body(key: string, label?: string) {
+    const s = mfpScenario();
+    if (label) { s.roster.nodes[0]!.label = label; s.findings[0]!.summary = label; s.policy.lines[0]!.text = label; }
+    return key === 'roster' ? s.roster : { data: key === 'findings' ? { findings: s.findings } : { view: s.policy } };
+  }
+  function r2Retry(h: Awaited<ReturnType<typeof mfpBoot>>, path: string) {
+    const button = h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + path + '"]');
+    expect(button, 'rendered retry for ' + path).not.toBeNull();
+    h.click(button!.attrs);
+  }
+  for (const source of r2Sources) {
+    it('6b r2 retries a rejected ' + source.key + ' read exactly once', async () => {
+      const read = vi.fn(() => Promise.reject(new Error('offline')));
+      const h = await mfpBoot(source.route, undefined, { [source.path]: read });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      const before = read.mock.calls.length;
+      r2Retry(h, source.path); await settle();
+      expect(read.mock.calls.length).toBe(before + 1);
+    });
+    it('6b r2 rejects malformed ' + source.key + ' records with a retry control', async () => {
+      const body = source.key === 'roster' ? { available: true, nodes: [null] }
+        : { data: source.key === 'findings' ? { findings: [null] } : { view: { lines: [null] } } };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 drops the ' + source.key + ' snapshot and total after refresh failure', async () => {
+      let failed = false;
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body(source.key))) });
+      expect(h.el.main!.innerHTML).toContain(source.old);
+      failed = true;
+      h.click({ 'data-action': 'retry-panel', 'data-read': source.path }); await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain(source.old);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(0);
+      expect(runInContext(source.key === 'policy' ? 'state.policyView.view' : 'state.mfp.' + source.key, h.context)).toEqual(source.key === 'findings' ? [] : null);
+    });
+    it('6b r2 times out the ' + source.key + ' read with a retry control', async () => {
+      const h = await mfpBoot(source.route, undefined, { [source.path]: never });
+      await vi.advanceTimersByTimeAsync(runInContext('DASHBOARD_READ_DEADLINE_MS + 1', h.context));
+      await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).toContain('Read timed out');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 rejects an oversized ' + source.key + ' body with a retry control', async () => {
+      // Padding exceeds the two MiB body budget without relying on a field-length validator.
+      const body = { ...r2Body(source.key), padding: 'x'.repeat(2 * 1024 * 1024) };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    for (const outcome of ['success', 'failure']) {
+      it('6b r2 ignores older ' + source.key + ' ' + outcome + ' after the newer read loads', async () => {
+        let wave = false;
+        const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+        const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+        wave = true;
+        const a = runInContext(source.read, h.context); await settle();
+        const b = runInContext(source.read, h.context); await settle();
+        expect(pending).toHaveLength(2);
+        pending[1]!.resolve(response(r2Body(source.key, 'newer snapshot'))); await b; await settle();
+        if (outcome === 'success') pending[0]!.resolve(response(r2Body(source.key, 'older snapshot')));
+        else pending[0]!.reject(new Error('old failure'));
+        await a; await settle();
+        runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).toContain('newer snapshot');
+        expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+        expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+      });
+    }
+  }
+  it('6b r2 closes a selected finding through failure and recovery', async () => {
+    let failed = false;
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true; h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    failed = false; r2Retry(h, '/api/sentinels/findings'); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+    expect(runInContext('state.mfp.findingId', h.context)).toBeNull();
+  });
+  it('6b r2 renders only server severity values and keeps all five legend words', async () => {
+    const h = await mfpBoot('findings', s => {
+      s.findings = ['critical', 'low', 'high', 'medium', 'other', 'info', 'warn', 'alert'].map((severity, i) => ({ ...s.findings[0]!, severity, finding_id: 'severity-' + i, summary: 'Observation ' + i })) as never;
+    });
+    const html = h.el.main!.innerHTML;
+    const legend = html.match(/<div class="mfp-legend"[\s\S]*?<\/div>/)![0];
+    for (const word of ['Critical', 'High', 'Medium', 'Low', 'Info']) expect(legend).toContain('>' + word + '<');
+    expect(html).toContain('Critical and Low are display levels not emitted');
+    const rows = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1]!;
+    for (let i = 0; i < 5; i++) {
+      const row = rows.split('</tr>').find(row => row.includes('Observation ' + i))!;
+      expect(row).toContain('UNKNOWN');
+      expect(row).not.toMatch(/mfp-severity|>Critical<|>High<|>Medium<|>Low<|>Info</);
+    }
+    expect(rows.indexOf('Observation 5')).toBeLessThan(rows.indexOf('Observation 0'));
+    expect(rows).not.toMatch(/>Critical<|>Low</);
+  });
+  for (const agent of [null, '', undefined]) {
+    it('6b r2 leaves unserved agent scope unknown for ' + String(agent), async () => {
+      const h = await mfpBoot('findings', s => { s.findings = [{ ...s.findings[0]!, agent_id: agent }] as never; });
+      expect(h.el.main!.innerHTML).toContain('Unknown · agent not served');
+      h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-info' });
+      const drawer = h.el.main!.innerHTML.match(/<aside class="mfp-drawer"[\s\S]*?<\/aside>/)![0];
+      expect(drawer).toContain('Unknown · agent not served');
+      expect(h.el.main!.innerHTML).not.toContain('Fortress-wide');
+    });
+  }
+  it('6b r2 distinguishes unevaluable and proven untrusted nodes', async () => {
+    const h = await mfpBoot('machines', s => { s.roster.nodes = [false, true].map((trust_evaluable, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state: 'untrusted', trust_evaluable })); });
+    expect(h.el.main!.innerHTML).toMatch(/state-chip warn[^>]*><i[^>]*><\/i>NOT EVALUATED/);
+    expect(h.el.main!.innerHTML).toContain('Trust could not be evaluated; treated as untrusted');
+    expect(h.el.main!.innerHTML).toMatch(/state-chip bad[^>]*><i[^>]*><\/i>UNTRUSTED/);
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+  });
+  it('6b r2 rejects a nonboolean trust evaluation flag', async () => {
+    const h = await mfpBoot('machines', s => { Object.assign(s.roster.nodes[0]!, { trust_evaluable: 'false' }); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Build box');
+    expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="/api/fleet/roster"]')).not.toBeNull();
+  });
+  it('6b r2 uses the shared policy heading and template severities', async () => {
+    const h = await mfpBoot('policy');
+    expect(h.el.main!.innerHTML).toContain('<h3>Always asks you first</h3>');
+    expect(h.el.main!.innerHTML).not.toContain('What asks you first');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity medium">MEDIUM</span>');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity low">LOW</span>');
+  });
+  it('6b r2 leaves an empty policy read without a pager', async () => {
+    const h = await mfpBoot('policy', s => { s.policy.lines = []; });
+    const panel = h.el.main!.innerHTML.split('data-mfp-policy')[1]!.split('Channel templates')[0]!;
+    expect(panel).toContain('No policy lines returned');
+    expect(panel).not.toContain('Showing 0 of 0');
+    expect(panel).not.toContain('mfp-pager');
+  });
+  for (const list of [
+    { key: 'rules', route: 'auto-trigger', path: '/api/auto-trigger/rules', field: 'rules', row: (i: number) => ({ rule_id: 'rule-' + i, history: [] }), marker: 'rule-26', controls: ['auto-trigger-threshold-save'] },
+    { key: 'recommendations', route: 'auto-trigger', path: '/api/auto-trigger/recommendations', field: 'recommendations', row: (i: number) => ({ rule_id: 'recommendation-' + i }), marker: 'recommendation-26', controls: ['auto-trigger-accept', 'auto-trigger-reject'] },
+    { key: 'credentialTraps', route: 'honeypot', path: '/api/honeypot/credential-traps', field: 'traps', row: (i: number) => ({ fake_credential_name: 'credential-' + i }), marker: 'credential-26', controls: [] },
+    { key: 'toolTraps', route: 'honeypot', path: '/api/honeypot/tool-traps', field: 'traps', row: (i: number) => ({ fake_tool_name: 'tool-' + i }), marker: 'tool-26', controls: [] },
+  ]) {
+    it('6b r2 pages all ' + list.key + ' on both folded screens and the standalone route', async () => {
+      const rows = Array.from({ length: 26 }, (_, i) => list.row(i + 1)); // One beyond the 25-row page.
+      const h = await mfpBoot('findings', undefined, { [list.path]: () => Promise.resolve(response({ data: { [list.field]: rows } })) });
+      // Rule detail hydration is serial, so drain its bounded fixture wave before paging.
+      for (let i = 0; i < rows.length; i++) await settle();
+      for (const route of ['findings', 'policy', list.route]) {
+        runInContext('state.mfp.pages.' + list.key + ' = 0', h.context);
+        h.navigate(route); await settle(); runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).not.toContain(list.marker);
+        expect(h.el.main!.querySelector('[data-action="mfp-page"][data-list="' + list.key + '"][data-step="1"]')).not.toBeNull();
+        h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        for (const action of list.controls) expect(h.el.main!.innerHTML).toContain('data-action="' + action + '" data-rule-id="' + list.marker + '"');
+        runInContext('state.mfp.pages.' + list.key + ' = 999; rerender()', h.context); // Deliberately beyond the last page.
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        expect(runInContext('state.mfp.pages.' + list.key, h.context)).toBe(1);
+      }
+      // Per-item controls remain reachable beyond the main snapshot cap too.
+      const extra = Array.from({ length: 501 }, (_, i) => list.row(i + 1));
+      h.context.r2Rows = extra;
+      const target = list.route === 'honeypot' ? 'state.honeypot.' + list.key : 'state.autoTrigger.' + list.key;
+      runInContext(target + ' = r2Rows; state.mfp.pages.' + list.key + ' = 19; rerender()', h.context);
+      h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+      expect(h.el.main!.innerHTML).toContain(list.marker.replace('26', '501'));
+      expect(h.el.main!.innerHTML).toContain('Page 21 of 21');
+      expect(h.el.main!.innerHTML).not.toContain('Only the first 500');
+    });
+  }
+
 });

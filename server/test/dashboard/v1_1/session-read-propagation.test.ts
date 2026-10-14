@@ -50,7 +50,8 @@ function loadClient(options: {
         }
         return { ok: true, status: 200, json: async () => ({ session_id: options.streamSession ?? "" }) };
       }
-      return { ok: true, status: 200, json: async () => ({ data: { findings: [], agents: [], rules: [], view: {} } }) };
+      // Policy reads consume bytes before JSON, as a real fetch response does.
+      return new Response(JSON.stringify({ data: { findings: [], agents: [], rules: [], view: {} } }), { status: 200 });
     },
     EventSource: class {
       constructor(url: string) { streams.push(url); }

@@ -14,7 +14,11 @@ const home = {
   protection_requested_count: 1,
   enforcement_confirmed_count: 0,
 };
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+// Policy reads share the pre-decode byte budget, so fixtures expose the same stream as fetch.
+const response = (body: unknown, status = 200) => ({
+  ok: status === 200, status, json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
+});
 const pending = () => new Promise<never>(() => {});
 function testElement() {
   const classes = new Set<string>();
@@ -55,7 +59,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
   const context = createContext({
     document: { getElementById: (id: string) => elements[id] || (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null), addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
-    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Element, Date,
+    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, TextDecoder, Element, Date,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, EventSource: class { listeners: Record<string, (event: { data: string }) => void> = {}; constructor() { streams.push(this); } close() {} addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; } },
     fetch: (url: string) => {
       urls.push(url);

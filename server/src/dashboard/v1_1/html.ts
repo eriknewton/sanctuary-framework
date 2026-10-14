@@ -2055,6 +2055,7 @@ body {
 .mfp-pager, .mfp-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .mfp-pager { margin: 12px 0; color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono); }
 .mfp-queue-grid, .mfp-policy-grid { display: grid; gap: 16px; min-width: 0; }
+/* 420px gives the evidence drawer the same reading width as the approval drawer. */
 .mfp-queue-grid.has-selection { grid-template-columns: minmax(0, 1fr) minmax(0, 420px); }
 .mfp-policy-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
 .mfp-queue-grid > *, .mfp-policy-grid > * { min-width: 0; }
