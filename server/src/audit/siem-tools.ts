@@ -25,7 +25,8 @@ import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.j
 
 export type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
 
-export const SIEM_EXPORT_FORMATS = ["cef", "ocsf", "ecs", "xdm"] as const;
+// The schema and validator share this list; runtime mutation must not change accepted formats.
+export const SIEM_EXPORT_FORMATS = Object.freeze(["cef", "ocsf", "ecs", "xdm"] as const);
 
 function isSIEMExportFormat(value: string): value is SIEMExportFormat {
   return (SIEM_EXPORT_FORMATS as readonly string[]).includes(value);
@@ -45,7 +46,7 @@ export function createSIEMTools(
     {
       name: "audit_export_siem",
       description:
-        "Export the caller's own redacted audit view in CEF, OCSF, ECS, or XDM for SIEM ingestion. " +
+        "Export the caller's own redacted audit view in CEF, OCSF, ECS, or raw Cortex events for XDM modeling and SIEM ingestion. " +
         "Raw policy tier, rule ids, system-owned gate entries, and approve-vs-auto distinctions " +
         "are not included; Tier 1 approval still required (bulk audit export).",
       inputSchema: {

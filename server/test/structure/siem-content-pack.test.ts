@@ -12,6 +12,7 @@ import { extname, join, relative } from "node:path";
 import {
   SIEM_ECS_FIELD_MAPPING,
   SIEM_XDM_FIELD_MAPPING,
+  SIEM_XDM_FIELD_HOMES,
 } from "../../src/audit/siem-formatter.js";
 
 const repoRoot = join(__dirname, "..", "..", "..");
@@ -25,20 +26,10 @@ const expectedPackFiles = [
   "integrations/siem/elastic/ecs-field-mapping.json",
 ] as const;
 
-const xdmFieldHomes = [
-  "_time",
-  "xdm.event.type",
-  "xdm.event.description",
-  "xdm.event.operation",
-  "xdm.event.operation_sub_type",
-  "xdm.event.outcome",
-  "xdm.event.is_completed",
-  "xdm.observer.product",
-  "xdm.observer.vendor",
-  "xdm.source.user.username",
-  "sanctuary.audit.decision",
-  "sanctuary.audit.result",
-] as const;
+// Null explicitly means no home; it never enters the allowed field-name set.
+const xdmFieldHomes = Object.values(SIEM_XDM_FIELD_HOMES).filter(
+  (field) => field !== null
+);
 
 type ParsedPackFile = {
   relativePath: string;
@@ -65,8 +56,11 @@ function readJson(path: string): unknown {
 function parsePackFile(repoPath: string): ParsedPackFile {
   const absolutePath = join(repoRoot, repoPath);
   const relativePath = relative(packRoot, absolutePath);
-  const text = readFileSync(absolutePath, "utf8");
-  const ext = extname(absolutePath);
+  return parsePackText(relativePath, readFileSync(absolutePath, "utf8"));
+}
+
+function parsePackText(relativePath: string, text: string): ParsedPackFile {
+  const ext = extname(relativePath);
   if (ext === ".json") {
     return { relativePath, ext, text, document: JSON.parse(text) };
   }
@@ -137,19 +131,57 @@ function elasticMappingFields(): string[] {
   return mapping.fields;
 }
 
-function cortexMappingFields(): { rawFields: string[]; xdmFields: string[] } {
-  const mapping = readJson(join(packRoot, "cortex-xdm", "xdm-field-mapping.json")) as {
-    raw_fields: string[];
-    mapping: Array<{ raw_field: string; xdm_field: string }>;
-  };
+type CortexMapping = {
+  raw_fields: string[];
+  mapping: Array<{ raw_field: string; xdm_field: string | null; note?: string }>;
+};
+
+function readCortexMapping(): CortexMapping {
+  return readJson(join(packRoot, "cortex-xdm", "xdm-field-mapping.json")) as CortexMapping;
+}
+
+function cortexMappingFields(mapping = readCortexMapping()): { rawFields: string[]; xdmFields: string[] } {
   const expectedRawFields = Object.values(SIEM_XDM_FIELD_MAPPING).sort();
   expect(mapping.raw_fields.sort()).toEqual(expectedRawFields);
   expect(mapping.mapping.map((entry) => entry.raw_field).sort()).toEqual(expectedRawFields);
-  expect(mapping.mapping.map((entry) => entry.xdm_field).sort()).toEqual([...xdmFieldHomes].sort());
+  // Key/home pairs must agree: independent sets would accept swapped meanings.
+  expect(mapping.mapping.map(({ raw_field, xdm_field }) => [raw_field, xdm_field]).sort())
+    .toEqual(Object.entries(SIEM_XDM_FIELD_HOMES).sort());
+  for (const row of mapping.mapping) {
+    if (row.xdm_field === null) {
+      expect(row.note).toBe("no standard XDM home; keep as a raw dataset field");
+    }
+  }
   return {
     rawFields: mapping.raw_fields,
-    xdmFields: mapping.mapping.map((entry) => entry.xdm_field),
+    xdmFields: mapping.mapping.map((entry) => entry.xdm_field).filter((field): field is string => field !== null),
   };
+}
+
+function expectReadmeFields(text: string, fields: readonly string[]): void {
+  const tokens = new Set(collectMarkdownReferences(text));
+  for (const field of fields) {
+    expect(tokens.has(field), `README mapping table should name ${field}`).toBe(true);
+  }
+}
+
+function checkPackFile(file: ParsedPackFile): void {
+  const ecsAllowed = new Set(Object.values(SIEM_ECS_FIELD_MAPPING));
+  const xdmAllowed = new Set([...Object.values(SIEM_XDM_FIELD_MAPPING), ...xdmFieldHomes]);
+  const rootAllowed = new Set([...ecsAllowed, ...xdmAllowed]);
+  if (file.relativePath === "README.md") {
+    expectFieldsAllowed(collectMarkdownReferences(file.text), rootAllowed, file.relativePath);
+  } else if (file.relativePath === "elastic/README.md") {
+    expectFieldsAllowed(collectMarkdownReferences(file.text), ecsAllowed, file.relativePath);
+  } else if (file.relativePath === "elastic/ecs-field-mapping.json") {
+    expectFieldsAllowed(collectObjectReferences(file.document), ecsAllowed, file.relativePath);
+  } else if (file.relativePath === "cortex-xdm/README.md") {
+    expectFieldsAllowed(collectMarkdownReferences(file.text), xdmAllowed, file.relativePath);
+  } else if (file.relativePath === "cortex-xdm/xdm-field-mapping.json") {
+    expectFieldsAllowed(collectObjectReferences(file.document), xdmAllowed, file.relativePath);
+  } else {
+    throw new Error(`No SIEM mapping reference guard matched ${file.relativePath}`);
+  }
 }
 
 describe("SIEM field mappings", () => {
@@ -178,64 +210,71 @@ describe("SIEM field mappings", () => {
   it("checks mapping files by full-set equality against formatter constants", () => {
     elasticMappingFields();
     const cortex = cortexMappingFields();
-    const rootReadme = readFileSync(join(packRoot, "README.md"), "utf8");
-    for (const field of [
+    const rootReadme = readFileSync(join(packRoot, "README.md"), "utf8")
+      .split("\n").filter((line) => line.startsWith("|")).join("\n");
+    expectReadmeFields(rootReadme, [
       ...Object.values(SIEM_ECS_FIELD_MAPPING),
       ...Object.values(SIEM_XDM_FIELD_MAPPING),
       ...cortex.xdmFields,
-    ]) {
-      expect(rootReadme, `README mapping table should name ${field}`).toContain(field);
-    }
+    ]);
   });
 
   it("references only fields present in each vendor family's field table", () => {
-    const ecsAllowed = new Set(Object.values(SIEM_ECS_FIELD_MAPPING));
-    const cortex = cortexMappingFields();
-    const xdmAllowed = new Set([...cortex.rawFields, ...cortex.xdmFields]);
-    const rootAllowed = new Set([...ecsAllowed, ...xdmAllowed]);
     const files = gitPackFiles().map(parsePackFile);
 
-    for (const file of files) {
-      if (file.relativePath === "README.md") {
-        expectFieldsAllowed(collectMarkdownReferences(file.text), rootAllowed, file.relativePath);
-      } else if (file.relativePath === "elastic/README.md") {
-        expectFieldsAllowed(collectMarkdownReferences(file.text), ecsAllowed, file.relativePath);
-      } else if (file.relativePath === "elastic/ecs-field-mapping.json") {
-        expectFieldsAllowed(collectObjectReferences(file.document), ecsAllowed, file.relativePath);
-      } else if (file.relativePath === "cortex-xdm/README.md") {
-        expectFieldsAllowed(collectMarkdownReferences(file.text), xdmAllowed, file.relativePath);
-      } else if (file.relativePath === "cortex-xdm/xdm-field-mapping.json") {
-        expectFieldsAllowed(collectObjectReferences(file.document), xdmAllowed, file.relativePath);
+    for (const file of files) checkPackFile(file);
+  });
+
+  it("rejects planted bad field references through every file dispatch", () => {
+    for (const path of expectedPackFiles) {
+      const file = parsePackFile(path);
+      if (file.ext === ".json") {
+        const document = file.document as Record<string, unknown>;
+        document.fields = ["event.not_a_real_field"];
+        file.text = JSON.stringify(document);
       } else {
-        throw new Error(`No SIEM mapping reference guard matched ${file.relativePath}`);
+        file.text += "\nchart `event.not_a_real_field`";
       }
+      // The planted name itself must be the refusal, not some other throw on the way.
+      expect(() => checkPackFile(parsePackText(file.relativePath, file.text)), path)
+        .toThrow(/references event\.not_a_real_field/);
     }
   });
 
-  it("rejects planted bad field references in every remaining handled file type", () => {
-    const ecsAllowed = new Set(Object.values(SIEM_ECS_FIELD_MAPPING));
-    const xdmAllowed = new Set([
-      ...Object.values(SIEM_XDM_FIELD_MAPPING),
-      ...xdmFieldHomes,
-    ]);
+  it("requires whole README field tokens", () => {
+    expect(() => expectReadmeFields("`xdm.event.type`", ["event.type"])).toThrow();
+    expect(() => expectReadmeFields("`event.type`", ["event.type"])).not.toThrow();
+  });
 
-    expect(() => expectFieldsAllowed(["event.not_a_real_field"], ecsAllowed, "json")).toThrow();
-    expect(() =>
-      expectFieldsAllowed(
-        collectObjectReferences({
-          raw_fields: ["sanctuary_not_a_real_field"],
-          mapping: [{ raw_field: "sanctuary_not_a_real_field", xdm_field: "_time" }],
-        }),
-        xdmAllowed,
-        "json"
-      )
-    ).toThrow();
-    expect(() =>
-      expectFieldsAllowed(
-        collectMarkdownReferences("chart `event.not_a_real_field`"),
-        ecsAllowed,
-        "md"
-      )
-    ).toThrow();
+  it("rejects swapped raw-to-home pairs", () => {
+    const mapping = readCortexMapping();
+    const operation = mapping.mapping.find((row) => row.raw_field === "sanctuary_event_operation")!;
+    const outcome = mapping.mapping.find((row) => row.raw_field === "sanctuary_event_outcome")!;
+    [operation.xdm_field, outcome.xdm_field] = [outcome.xdm_field, operation.xdm_field];
+    expect(() => cortexMappingFields(mapping)).toThrow();
+  });
+
+  it("keeps unmapped custom values as raw fields with null homes", () => {
+    const mapping = readCortexMapping();
+    for (const field of ["sanctuary_audit_decision", "sanctuary_audit_result"]) {
+      expect(mapping.mapping.find((row) => row.raw_field === field)).toEqual({
+        raw_field: field,
+        xdm_field: null,
+        note: "no standard XDM home; keep as a raw dataset field",
+      });
+    }
+    expect(collectObjectReferences({ xdm_field: null })).toEqual([]);
+  });
+
+  it("rejects an unknown extension through file dispatch", () => {
+    expect(() => checkPackFile(parsePackText("elastic/planted.yaml", "fields: []")))
+      .toThrow("Unhandled SIEM mapping extension for elastic/planted.yaml");
+  });
+
+  it("rejects unmatched files through file dispatch", () => {
+    for (const path of ["elastic/planted.md", "cortex-xdm/planted.json"]) {
+      expect(() => checkPackFile(parsePackText(path, path.endsWith(".json") ? "{}" : "`event.action`")))
+        .toThrow(`No SIEM mapping reference guard matched ${path}`);
+    }
   });
 });

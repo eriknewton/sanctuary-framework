@@ -59,8 +59,9 @@ import type { AgentAuditView } from "../operational/agent-audit-redaction.js";
  * operation. Deliberately 2-valued: the approve-vs-auto-allow distinction is a
  * POLICY TIER signal (did the operation need human approval?), which is exactly
  * what property #11 forbids leaking, so it is collapsed. This is NOT the raw
- * operator gate decision; it is derived from the allowlisted `decision` value
- * (the agent's own observed outcome) and the entry `result`.
+ * operator gate decision. Export paths pass no decision, so the exported coarse
+ * decision is derived from the result alone. The optional decision parameter in
+ * agentDecision is kept for other callers.
  */
 export type AgentDecision = "allow" | "deny";
 
@@ -99,10 +100,32 @@ export const SIEM_XDM_FIELD_MAPPING = {
 } as const;
 
 /**
- * Normalize the agent-safe coarse outcome from the allowlisted `decision` value
- * (if present) and the entry `result`. A `failure` result, or an allowlisted
- * `decision` beginning with "deny"/"drop"/"block", maps to "deny"; everything
- * else (including an explicit "allow"/"approve"/"auto-allow") maps to "allow".
+ * Proposed XDM destinations for each exported raw key; null means no standard
+ * XDM home, so the value stays in the raw dataset. Consumers compare pairs,
+ * not separate sets of keys and homes, to preserve each value's meaning.
+ * Must match mapping in integrations/siem/cortex-xdm/xdm-field-mapping.json.
+ * Field-name agreement is repo-local evidence, not a live tenant import drill.
+ */
+export const SIEM_XDM_FIELD_HOMES = Object.freeze({
+  [SIEM_XDM_FIELD_MAPPING.timestamp]: "_time",
+  [SIEM_XDM_FIELD_MAPPING.eventType]: "xdm.event.type",
+  [SIEM_XDM_FIELD_MAPPING.eventDescription]: "xdm.event.description",
+  [SIEM_XDM_FIELD_MAPPING.eventOperation]: "xdm.event.operation",
+  [SIEM_XDM_FIELD_MAPPING.eventOperationSubType]: "xdm.event.operation_sub_type",
+  [SIEM_XDM_FIELD_MAPPING.eventOutcome]: "xdm.event.outcome",
+  [SIEM_XDM_FIELD_MAPPING.eventIsCompleted]: "xdm.event.is_completed",
+  [SIEM_XDM_FIELD_MAPPING.observerProduct]: "xdm.observer.product",
+  [SIEM_XDM_FIELD_MAPPING.observerVendor]: "xdm.observer.vendor",
+  [SIEM_XDM_FIELD_MAPPING.sourceUserUsername]: "xdm.source.user.username",
+  [SIEM_XDM_FIELD_MAPPING.sanctuaryDecision]: null,
+  [SIEM_XDM_FIELD_MAPPING.sanctuaryResult]: null,
+} as const satisfies Record<(typeof SIEM_XDM_FIELD_MAPPING)[keyof typeof SIEM_XDM_FIELD_MAPPING], string | null>);
+
+/**
+ * Export paths pass no decision, so the exported coarse decision is derived
+ * from the result alone: failure maps to deny, success to allow. The optional
+ * decision parameter is kept for other callers; recognized deny/drop/block or
+ * allow/approve/auto prefixes take precedence over the result for those calls.
  */
 export function agentDecision(
   view: AgentAuditView,
@@ -368,7 +391,8 @@ export interface XDMObject {
  * Format an agent-facing audit view as Cortex raw-event JSON for XDM modeling.
  *
  * Raw keys deliberately avoid the `xdm.*` namespace; the field mapping file
- * lists the XDM homes for these fields, including `xdm.source.user.username`.
+ * lists proposed XDM homes from SIEM_XDM_FIELD_HOMES. Null homes keep
+ * sanctuary_audit_decision and sanctuary_audit_result as raw dataset fields.
  */
 export function formatAsXDM(view: AgentAuditView): XDMObject {
   const decision = agentDecision(view);
