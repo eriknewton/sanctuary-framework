@@ -272,19 +272,20 @@ describe("v1.1 dashboard shell HTML", () => {
     // The per-agent drill-down and the Evidence view stay reachable.
     expect(client).toContain("/posture/agent/");
     expect(client).toContain("/posture/evidence");
-    // The six named metric cards from the posture board are folded in.
-    expect(client).toContain("Protection requested");
-    expect(client).toContain("Enforcement confirmed");
+    // The source-backed Overview tiles that remain after slice 3 subtraction are folded in.
+    expect(client).not.toContain("Protected agents");
+    expect(client).not.toContain("Enforcement confirmed");
     expect(client).toContain("Castle Wall");
     expect(client).toContain("Approvals waiting");
-    expect(client).toContain("Open anomalies");
+    expect(client).toContain("Open Sentinel findings");
     expect(client).toContain("Audit chain");
-    // Today's story + the plain-summary toggle are folded in (apostrophe is
-    // emitted as the &#39; entity so the raw client string is plain).
-    expect(client).toContain("Today&#39;s story");
-    expect(client).toContain("posture-story-plain");
-    // Anomaly findings list is folded in.
-    expect(client).toContain("Anomaly findings");
+    // The decision queue, findings list, and agents table are folded in without adding a duplicate API surface.
+    expect(client).toContain("Needs your decision");
+    expect(client).not.toContain("Egress enforcement");
+    // Retargeted (slice 3 round 2): pins the Overview findings panel renderer, not a generic label.
+    expect(client).toContain("function renderOverviewFindingsPanel");
+    // Retargeted (slice 3 round 2): pins the Overview agents table renderer, not a generic label.
+    expect(client).toContain("function renderOverviewAgentsTable");
   });
 
   it("the seal click-to-expand routes into the full Posture detail", () => {
