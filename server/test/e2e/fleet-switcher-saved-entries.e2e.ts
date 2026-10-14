@@ -136,3 +136,105 @@ test("fleet switcher add form accepts only http and https addresses", async ({ p
     await fleet.stop();
   }
 });
+
+test("fleet switcher add form preserves stored entries outside the visible list", async ({
+  page,
+}) => {
+  const fleet = await startFleetSwitcher();
+  const validEntry = { name: "Visible", url: `${fleet.url}/visible` };
+  const rawEntries = [null, { name: 1 }, validEntry];
+  try {
+    await page.addInitScript(
+      ({ key, value }) => {
+        localStorage.setItem(key, JSON.stringify(value));
+      },
+      { key: STORAGE_KEY, value: rawEntries },
+    );
+    await page.goto(`${fleet.url}/fleet`);
+
+    await page.locator("#machine-name").fill("Added");
+    await page.locator("#machine-url").fill(`${fleet.url}/added`);
+    await page.getByRole("button", { name: "Add Machine" }).click();
+
+    const stored = await page.evaluate((key) => {
+      return JSON.parse(localStorage.getItem(key) || "[]") as unknown[];
+    }, STORAGE_KEY);
+    expect(stored).toEqual(
+      expect.arrayContaining([
+        null,
+        { name: 1 },
+        expect.objectContaining(validEntry),
+        expect.objectContaining({ name: "Added", url: `${fleet.url}/added` }),
+      ]),
+    );
+  } finally {
+    await fleet.stop();
+  }
+});
+
+test("fleet switcher leaves a non-list storage root unchanged on load", async ({ page }) => {
+  const fleet = await startFleetSwitcher();
+  try {
+    await page.addInitScript((key) => {
+      localStorage.setItem(key, "{}");
+    }, STORAGE_KEY);
+
+    await page.goto(`${fleet.url}/fleet`);
+
+    const stored = await page.evaluate((key) => {
+      return localStorage.getItem(key);
+    }, STORAGE_KEY);
+    expect(stored).toBe("{}");
+  } finally {
+    await fleet.stop();
+  }
+});
+
+test("fleet switcher removes the selected saved address with an apostrophe", async ({
+  page,
+}) => {
+  const fleet = await startFleetSwitcher();
+  const apostropheEntry = { name: "OBrien", url: `${fleet.url}/o'brien` };
+  const otherEntry = { name: "Other", url: `${fleet.url}/other` };
+  try {
+    await page.addInitScript(
+      ({ key, value }) => {
+        localStorage.setItem(key, JSON.stringify(value));
+      },
+      { key: STORAGE_KEY, value: [apostropheEntry, otherEntry] },
+    );
+
+    await page.goto(`${fleet.url}/fleet`);
+    await page
+      .locator(".machine-card", { hasText: apostropheEntry.url })
+      .locator(".btn-remove")
+      .click();
+
+    const stored = await page.evaluate((key) => {
+      return JSON.parse(localStorage.getItem(key) || "[]") as Array<{ url: string }>;
+    }, STORAGE_KEY);
+    expect(stored.some((entry) => entry.url === apostropheEntry.url)).toBe(false);
+    expect(stored.some((entry) => entry.url === otherEntry.url)).toBe(true);
+  } finally {
+    await fleet.stop();
+  }
+});
+
+test("fleet switcher Open Console links stay in the current tab", async ({ page }) => {
+  const fleet = await startFleetSwitcher();
+  const entry = { name: "Loopback", url: fleet.url };
+  try {
+    await page.addInitScript(
+      ({ key, value }) => {
+        localStorage.setItem(key, JSON.stringify(value));
+      },
+      { key: STORAGE_KEY, value: [entry] },
+    );
+
+    await page.goto(`${fleet.url}/fleet`);
+
+    await expect(page.locator("a.btn-open").first()).not.toHaveAttribute("target", /.*/);
+  } finally {
+    await fleet.stop();
+  }
+});

@@ -3568,8 +3568,8 @@ export function generateFleetSwitcherHTML(options: {
 
     function loadStoredMachines() {
       try {
-        const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-        return Array.isArray(parsed) ? parsed : [];
+        const stored = localStorage.getItem(STORAGE_KEY);
+        return stored === null ? [] : JSON.parse(stored);
       } catch { return []; }
     }
 
@@ -3585,7 +3585,8 @@ export function generateFleetSwitcherHTML(options: {
     }
 
     function loadMachines() {
-      return loadStoredMachines().filter(isSavedMachine);
+      const stored = loadStoredMachines();
+      return Array.isArray(stored) ? stored.filter(isSavedMachine) : [];
     }
 
     function acceptedDashboardUrl(value) {
@@ -3643,15 +3644,20 @@ export function generateFleetSwitcherHTML(options: {
         alert('A machine with this URL already exists.');
         return;
       }
-      machines.push({ name, url, added: new Date().toISOString() });
-      saveMachines(machines);
+      const stored = loadStoredMachines();
+      const nextMachines = Array.isArray(stored) ? stored : [];
+      nextMachines.push({ name, url, added: new Date().toISOString() });
+      saveMachines(nextMachines);
       nameEl.value = '';
       urlEl.value = '';
       render();
     }
 
     function removeMachine(url) {
-      const machines = loadStoredMachines().filter(m => !(isSavedMachine(m) && m.url === url));
+      const stored = loadStoredMachines();
+      const machines = Array.isArray(stored)
+        ? stored.filter(m => !(isSavedMachine(m) && m.url === url))
+        : [];
       saveMachines(machines);
       render();
     }
@@ -3752,6 +3758,7 @@ export function generateFleetSwitcherHTML(options: {
     // Auto-add current machine if not in list
     (function autoAddCurrent() {
       const stored = loadStoredMachines();
+      if (!Array.isArray(stored)) return;
       const machines = stored.filter(isSavedMachine);
       const origin = location.origin;
       if (!machines.some(m => m.url === origin)) {
