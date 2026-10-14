@@ -6728,7 +6728,7 @@ export function wrappedAgentId(platform: AgentPlatform, storagePath: string): st
   return `${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`;
 }
 
-function buildLocalAgentRecord(input: {
+export function buildLocalAgentRecord(input: {
   storagePath: string;
   platform: AgentPlatform;
 }): LocalAgentRecord {
