@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds a consistency check between the module map's barrel-count claims and the module tree; the base tree already satisfies it, so it passes against pre-fix source by construction. It guards against future drift and asserts no new product behavior.
 /**
  * Codebase-conventions structural gate (durability "teeth").
  *
