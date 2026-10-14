@@ -7,7 +7,7 @@ permalink: /install/
 
 # Install Sanctuary
 
-Choose the setup you intend to use. The full agent-guided profile currently requires macOS and Hermes; the memory profile is the cooperative path for harnesses supported by Protect.
+Start with the memory profile for the cooperative path supported by Protect, or choose the full agent-guided profile on macOS with Hermes. The full profile has separate operating-system setup and consent requirements. Choose your profile below, then let the agent follow the installation contract.
 
 [macOS with Hermes: full setup](#macos-with-hermes-full-setup) · [MCP configuration: cooperative setup](#cooperative-setup-for-an-existing-mcp-harness) · [Ubuntu 24.04 package install](#ubuntu-2404-x86-64)
 

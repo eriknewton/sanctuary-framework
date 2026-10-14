@@ -1,45 +1,30 @@
 ---
 layout: default
-title: Sanctuary | Choose what your agent can reach
-description: Set limits on your AI agent’s network access. Read the bounded macOS and Ubuntu 24.04 x86-64 evidence, then choose your installation path.
+title: Sanctuary | Secure, private AI
+description: Open-source security and privacy for AI agents. Explore the full product story, current capabilities and the fleet direction.
 wide: true
 ---
-<section class="hero" aria-labelledby="hero-title"><div class="hero-copy"><p class="eyebrow">Open source · Apache-2.0</p><h1 id="hero-title">Choose what your agent can reach.</h1><p class="lead">Sanctuary lets you set limits on your AI agent’s network access.</p>
-<p class="platform-line">For macOS and Ubuntu 24.04 x86-64 Linux. Ubuntu proof covers a fresh install of the recorded package and rules for individual user accounts; other distributions, DNS and hostname paths, and real-agent harnesses remain unproven.</p><div class="actions"><a href="/install/" class="button">Choose your setup</a><a href="#evidence">Read the evidence</a></div><p class="agent-link">Installing for someone else? <a href="/agent-guided-install.html">Start with the agent guide.</a></p></div>
-</section>
+<section class="hero" aria-labelledby="hero-title"><div class="hero-copy"><p class="eyebrow">Secure, private AI · Open source · Apache-2.0</p><h1 id="hero-title">One dashboard to secure them all.</h1><p class="lead">Sanctuary brings agent security, private memory, query privacy, approvals and verifiable records into one open-source product. Start with your own assistant; the goal is one console for an entire fleet.</p>
+<p class="platform-line">Start with a supported setup on macOS or Ubuntu 24.04 x86-64. Protection depends on the profile and platform; the evidence below shows what has been demonstrated.</p><div class="actions"><a href="/install/" class="button">Get started</a><a href="/how-it-works/" class="text-link">Explore Sanctuary</a></div><p class="agent-link">Let your agent guide the setup. <a href="/agent-guided-install.html">Read the agent installation guide.</a></p></div></section>
 
-{% include platform-evidence.html %}
+<section class="section" id="layers" aria-labelledby="layers-title"><div class="section-heading"><span class="section-index">01</span><h2 id="layers-title">Your agent will know you better than you know yourself.</h2></div>
+<div class="boundary-content"><div><h3>Make sure that stays between you.</h3><p>The more useful an agent becomes, the more of your life it holds: your work, your history, your preferences. Sanctuary is built around keeping that relationship secure and private, with the rules and the data under your control.</p></div>
+<div><p>The wall is one part of that story. Memory custody, private queries, approval policies, an activity record and data portability belong in the same product. The goal is one place to manage them across every agent and machine you run.</p><a href="/how-it-works/" class="text-link">See how the parts fit together</a></div></div></section>
 
-<section class="section" id="layers" aria-labelledby="layers-title"><div class="section-heading"><span class="section-index">02</span><h2 id="layers-title">Where the boundary sits</h2></div>
-<div class="boundary-content"><div><h3>Your rules, enforced by the operating system.</h3><p>On macOS, within the proven scope, enforcement does not depend on the agent’s cooperation.</p></div>
-<div><p>The macOS operating-system wall requires a separate signed app, system extension and privileged setup; adding Sanctuary to an MCP configuration does not complete that setup.</p><a href="/install/" class="text-link">See the installation paths</a></div></div></section>
-
-<section class="section scope-layout" id="harnesses" aria-labelledby="harnesses-title"><div><div class="section-heading"><span class="section-index">03</span><h2 id="harnesses-title">Read the scope before installing</h2></div><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md" class="text-link">Read the full Assurance Matrix</a></div><table class="scope-table"><thead>
-<tr><th scope="col">Area</th><th scope="col">Current evidence</th></tr>
-</thead><tbody>
-<tr><th scope="row">State encryption</th><td>
-<p>AES-GCM tamper rejection and initialization-vector uniqueness are test-proven; those tests do not establish hardware-backed key custody.</p>
-</td></tr>
-
-<tr><th scope="row">Approval policy</th><td>
-<p>The policy engine and refusal behavior when an approval channel is unreachable are test-proven; an end-to-end drill across all approval channels remains unproven.</p>
-</td></tr>
-
-<tr><th scope="row">Agent wrapping</th><td>
-<p>Partial: representative configuration paths are tested; every harness version and non-MCP tool surface are not covered.</p>
-</td></tr>
-
-<tr><th scope="row">Audit chain</th><td>
-<p>Partial: external verification proof remains outstanding.</p>
-</td></tr>
-
-<tr><th scope="row">Exit</th><td>
-<p>Partial: the complete export and import guarantee remains unproven.</p>
-</td></tr>
+<section class="section scope-layout" id="harnesses" aria-labelledby="harnesses-title"><div><div class="section-heading"><span class="section-index">02</span><h2 id="harnesses-title">Your agents. Your data. Your rules.</h2></div><p>Start with your own assistant. Grow toward a fleet without giving up control of its security, privacy or data.</p><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md" class="text-link">Read the evidence for each capability</a></div><table class="scope-table"><thead><tr><th scope="col">What you control</th><th scope="col">How Sanctuary helps</th></tr></thead><tbody>
+<tr><th scope="row">Your agents and machines</th><td><p>Start with your own agent. The destination is one console across your agents, machines and data; fleet enrollment and cross-machine policy management remain part of the work ahead.</p></td></tr>
+<tr><th scope="row">The security boundary</th><td><p>Set a signed destination policy for an agent’s own operating-system account. The wall enforces that policy below the agent on the demonstrated macOS and Ubuntu setups.</p></td></tr>
+<tr><th scope="row">Private memory</th><td><p>Keep the memory you entrust to Sanctuary in an encrypted vault, with custody requirements for each supported platform.</p></td></tr>
+<tr><th scope="row">Queries to outside models</th><td><p>In Sanctuary’s query path, identifying headers are stripped by default. With your consent, a classifier running locally rewrites personal details before the query leaves the machine.</p></td></tr>
+<tr><th scope="row">Actions that need your approval</th><td><p>Choose when a tool call routed through Sanctuary can run automatically and when it must wait for your approval.</p></td></tr>
+<tr><th scope="row">A record you can check</th><td><p>Keep an activity record you can inspect. Checkpoints are signed where a signing identity is available, with an offline verifier; independent audit-chain proof remains in progress.</p></td></tr>
+<tr><th scope="row">Data you can take with you</th><td><p>Export and import tools are available for fortress state and memory. Complete exit, migration and erasure guarantees remain in progress.</p></td></tr>
+<tr><th scope="row">The tools you work with</th><td><p>Setup integrations include Claude Code, Hermes, OpenClaw, Cursor and Cline, with partial wrapping coverage. Mastra is fixture-tested only. Operator-cloud deployment is roadmapped. A plugin host provides an extension point; named third-party security integrations remain a separate goal.</p></td></tr>
 </tbody></table></section>
 
-<section class="section" id="quickstart" aria-labelledby="cta-title"><div class="install-panel"><div><p class="eyebrow" id="quickstart-title">Begin with your setup</p><h2 id="cta-title">Install Sanctuary</h2></div>
-<div><p>Choose your operating system and harness in the install guide. Read the prerequisites before running a command.</p><div class="actions"><a href="/install/" class="button">Open the install guide</a></div>
-<div class="actions"><a href="/llms.txt">Agent-readable overview</a><a href="https://github.com/eriknewton/sanctuary-framework">Source on GitHub</a></div></div></div></section>
+{% include platform-evidence.html index="03" heading="Read the platform evidence" %}
 
-<section class="section founder" id="journal" aria-labelledby="journal-title"><h2 id="journal-title">Why I am building this</h2><div class="founder-copy"><p>An agent can become part of how you think and work. I want the person relying on it to decide the terms of that relationship. That is the reason I am building Sanctuary.</p><span class="byline">Erik Newton</span><a href="/blog/" class="text-link">Read the journal</a></div></section>
+<section class="section" id="quickstart" aria-labelledby="cta-title"><div class="install-panel"><div><p class="eyebrow" id="quickstart-title">Begin with your own agent</p><h2 id="cta-title">Get started with Sanctuary</h2></div>
+<div><p>Choose a supported memory or full profile in the install guide. Let your agent follow the supported setup steps; you handle platform consent, approved privileged actions and your private recovery keys.</p><div class="actions"><a href="/install/" class="button">Choose your setup</a></div><div class="actions"><a href="/llms.txt">Agent-readable overview</a><a href="https://github.com/eriknewton/sanctuary-framework">Source on GitHub</a></div></div></div></section>
+
+<section class="section founder" id="journal" aria-labelledby="journal-title"><h2 id="journal-title">Why I am building this</h2><div class="founder-copy"><p>AI agents can become companions, colleagues and part of how we think. I am building Sanctuary so that relationship can be secure and private, with memory and data that belong to the person relying on the agent, and the freedom to move between tools and providers.</p><span class="byline">Erik Newton</span><a href="/blog/" class="text-link">Read the journal</a></div></section>
