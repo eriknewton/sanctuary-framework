@@ -1,6 +1,6 @@
 # Sanctuary Framework Plugin
 
-The cooperative control panel for your AI agents, as a Cowork/Claude Code plugin. Open source, created by Erik Newton. Operating-system enforcement is a separate arming step outside this plugin: live on a patched macOS host, proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped. Every claim traces to the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
+The cooperative control panel for your AI agents, as a Cowork/Claude Code plugin. Open source, created by Erik Newton. Operating-system enforcement is a separate arming step outside this plugin: live on macOS, proven on Linux for Ubuntu 24.04 (x86-64) only, Windows roadmapped. Every claim traces to the [Assurance Matrix](https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md).
 
 ## What it does
 
