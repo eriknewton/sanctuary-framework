@@ -1874,8 +1874,11 @@ body {
 }
 .approval-empty h3 { margin: 6px 0; }
 .approval-empty p { margin: 0 0 12px; }
-/* 1100px is the design-system stacked-pair breakpoint; a zero minimum keeps long cells inside the column. */
-@media (max-width: 1100px) {
+/* Beside the 420px drawer the queue column is the viewport less about 742px (the 232px rail, the page padding,
+   the drawer and its gap: 538px at 1280), and the table's columns need about 654px, so below 1400px the drawer
+   moves under the queue, as the Evidence record pane does below 1200px. A zero minimum keeps long cells inside
+   the column. */
+@media (max-width: 1400px) {
   .approval-layout { grid-template-columns: minmax(0, 1fr); }
   .approval-drawer { position: static; }
 }
