@@ -24,9 +24,10 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
+import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
-import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
+import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { TypeAliasDeclaration, UnionTypeNode, LiteralTypeNode, StringLiteral } from "typescript";
@@ -55,9 +56,13 @@ const home = (digest: Record<string, unknown> = {}) => ({
 });
 const heldItem = {
   item_id: "item-1", kind: "approval_pending", tier: "tier1", agent_id: "fixture-agent",
-  display_template_id: "approval_pending.tier1.lockdown", display_template_args: {}, resolved: false,
+  display_template_id: "approval_pending.tier1.lockdown", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }], resolved: false,
+  created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "lockdown",
 };
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
+
+let fakeActiveElement: unknown = null;
+let setAttributeThrowFor: { name: string; value: string } | null = null;
 
 class FakeElement {
   attrs: Record<string, string>;
@@ -92,13 +97,26 @@ class FakeElement {
     has: (c: string) => this.classes.has(c),
   };
   getAttribute(name: string) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name]! : null; }
-  setAttribute(name: string, value: string) { this.attrs[name] = String(value); }
+  setAttribute(name: string, value: string) {
+    if (setAttributeThrowFor && setAttributeThrowFor.name === name && setAttributeThrowFor.value === String(value)) {
+      setAttributeThrowFor = null;
+      throw new Error("fixture row build failed");
+    }
+    this.attrs[name] = String(value);
+  }
   removeAttribute(name: string) { delete this.attrs[name]; }
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
+  private matches(selector: string) {
+    const tag = selector.match(/^[a-z]+/i)?.[0]?.toUpperCase();
+    if (tag && this.tagName !== tag) return false;
+    const attrs = [...selector.matchAll(/\[([^=\]]+)="([^"]*)"\]/g)];
+    if (!attrs.length) return false;
+    return attrs.every((m) => this.attrs[m[1]!] === m[2]);
+  }
   querySelector(selector: string): FakeElement | null {
-    const attr = selector.match(/^\[([^=]+)="([^"]*)"\]$/);
-    if (attr && this.attrs[attr[1]!] === attr[2]) return this;
+    if (/[\f\n\r]/.test(selector)) throw new SyntaxError("invalid selector");
+    if (this.matches(selector)) return this;
     for (const child of this.children) {
       if (child instanceof FakeElement) {
         const found: FakeElement | null = child.querySelector(selector);
@@ -107,8 +125,19 @@ class FakeElement {
     }
     return null;
   }
-  querySelectorAll() { return []; }
-  contains() { return false; }
+  querySelectorAll(selector: string): FakeElement[] {
+    if (/[\f\n\r]/.test(selector)) throw new SyntaxError("invalid selector");
+    const found: FakeElement[] = [];
+    if (this.matches(selector)) found.push(this);
+    for (const child of this.children) {
+      if (child instanceof FakeElement) found.push(...child.querySelectorAll(selector));
+    }
+    return found;
+  }
+  contains(target: unknown): boolean {
+    if (target === this) return true;
+    return this.children.some((child) => child instanceof FakeElement && child.contains(target));
+  }
   appendChild(child: FakeElement | FakeText) {
     if (child instanceof FakeElement) child.parentElement = this;
     this.children.push(child);
@@ -130,14 +159,16 @@ class FakeElement {
     this.text = "";
     this.append(...children);
   }
-  focus() {}
+  focus() { fakeActiveElement = this; }
   click() {}
+  remove() {}
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
     const index = this.parentElement.children.indexOf(this);
     if (index < 0) return;
     if (next instanceof FakeElement) next.parentElement = this.parentElement;
     this.parentElement.children[index] = next;
+    this.parentElement = null;
   }
 }
 class FakeText {
@@ -155,10 +186,11 @@ const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
-  "machines-summary", "machines-age", "machines-list",
+  "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+  fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
@@ -193,7 +225,9 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       },
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
-      querySelectorAll: () => [], activeElement: null,
+      querySelectorAll: () => [],
+      get activeElement() { return fakeActiveElement; },
+      set activeElement(value: unknown) { fakeActiveElement = value; },
       body,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
@@ -226,7 +260,10 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
   return { el, railLink, context, navigate, click, type, change, input, requests, downloads };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  setAttributeThrowFor = null;
+  vi.useRealTimers();
+});
 
 describe("slice 2 shell wired consumers", () => {
   it("the rail pill and the bell read Unknown before the queue loads, never a zero", async () => {
@@ -265,7 +302,7 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the time range is disabled with its reason off Evidence and enabled on Evidence", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     const range = h.el["time-range"]!;
     expect(range.disabled).toBe(true);
@@ -322,7 +359,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(html).toContain("waiting approvals hidden");
   });
 
-  it("the approval queue's element id exists once on the Approvals screen", async () => {
+  it("the approval queue's element id lives only on the Approvals screen", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
@@ -330,9 +367,10 @@ describe("slice 2 shell wired consumers", () => {
     const doc = h.el.main!.innerHTML + h.el.fortress!.innerHTML;
     expect(doc.match(/id="approval-queue"/g) ?? []).toHaveLength(1);
     expect(h.el.main!.innerHTML).toContain('id="approval-queue"');
-    // Beside Talk's full page the column shows, and carries the queue.
+    // The right rail links to Approvals and no longer duplicates the queue controls.
     h.navigate("dashboard");
-    expect(h.el.fortress!.innerHTML).toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).not.toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).toContain("Open Approvals");
   });
 
   it("the Enforcement egress line shows an absent kernel count as Unknown, never 0", async () => {
@@ -358,16 +396,16 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the Approvals and seal copy claim only what the paths do", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Charter holds are recorded in the audit log by the gate; nothing signs
-    // a decision with an operator key, and other held items are not
-    // audit-appended on their path.
+    // Ordinary hub inbox decisions resolve in the inbox store; only Charter
+    // holds go through the operator audit queue.
     expect(main).not.toContain("operator key");
     expect(main).not.toContain("Every decision is signed");
-    expect(main).toContain("A decision on a Charter hold is recorded in your audit log");
+    expect(main).toContain("recorded in this inbox");
+    expect(main).toContain('href="#activity">Evidence</a>');
     // Lockdown revokes network access for confined agents; agents keep running.
     runInContext('state.posture.sealOpen = true; state.tier1.lockdown.state = "engaged"; renderTopbar();', h.context);
     const pop = h.el["posture-seal-pop"]!.innerHTML;
@@ -515,18 +553,247 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
   });
 
-  it("the Approvals subtitle promises no signed policy and says Allow always is refused when the engine is not configured", async () => {
+  it("the Approvals subtitle says where each decision is recorded", async () => {
     vi.useFakeTimers();
     const h = boot();
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Allow always asks the policy engine to compile and activate a standing
-    // rule; where the engine is not configured it is refused and the policy
-    // is unchanged. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.");
+  });
+
+  it("Approvals names Charter and hub decision records without inferring an operator outcome", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const items = [
+      { ...heldItem, item_id: "charter.approval.wait", tier: "tier2", agent_id: "agent-c", operation_category: "state_export", resolved: false, created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "hub-wait", tier: "tier2", agent_id: "agent-h", operation_category: "state_import", resolved: false, created_at: "2026-10-14T16:40:00.000Z" },
+      { ...heldItem, item_id: "charter.approval.decided", tier: "tier2", agent_id: "agent-c", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:45:00.000Z", resolution_payload: { outcome: "engaged" } },
+      { ...heldItem, item_id: "hub-decided", tier: "tier2", agent_id: "agent-h", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:46:00.000Z", resolution_payload: { outcome: "engaged" } },
+    ];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    let main = h.el.main!.innerHTML;
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.");
+    expect(main).toContain("Waiting on you · 2 of 2");
+    expect(main).toMatch(/data-approval-row="charter\.approval\.wait"[\s\S]*?recorded in your audit log/);
+    expect(main).toMatch(/data-approval-row="hub-wait"[\s\S]*?recorded in this inbox/);
+    expect(main).toMatch(/data-approval-row="charter\.approval\.decided"[\s\S]*?DECIDED[\s\S]*?outcome in your audit log[\s\S]*?href="#activity">Evidence<\/a>/);
+    expect(main).toMatch(/data-approval-row="hub-decided"[\s\S]*?DECIDED[\s\S]*?outcome not reported by the inbox/);
+    expect(main).not.toMatch(/ALLOWED ONCE|DENIED|ALWAYS ALLOW/);
+    h.click({ "data-action": "approval-select", "data-item-id": "hub-wait" });
+    main = h.el.main!.innerHTML;
+    expect(main).toMatch(/If you decide[\s\S]*?recorded in this inbox[\s\S]*?Decision recorded in this inbox/);
+  });
+
+  it("Approvals uses plain operator copy for always allow and never renders route paths", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    runInContext("state.approvals.alwaysAllow = true; rerender();", h.context);
+    const main = h.el.main!.innerHTML;
+    expect(main).not.toContain("/api/");
+    expect(main).toContain("Allow always asks the policy engine to compile a standing rule for state_export, then activates it with your operator token.");
+    expect(main).toContain("Either step can be refused; your policy changes only if both succeed.");
+    expect(main).toContain("Later matching operations stop asking only if the policy engine accepts both steps.");
+  });
+
+  it("Approvals renders grouped waiting and decided rows with served fields only", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", operation_category: "state_export", created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "decided-1", operation_category: "state_import", created_at: "2026-10-14T15:30:00.000Z", resolved: true, resolved_at: "2026-10-14T15:35:00.000Z" },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("State");
+    expect(main).toContain("Agent");
+    expect(main).toContain("Tier");
+    expect(main).toContain("Category");
+    expect(main).toContain("Waiting on you");
+    expect(main).toContain("oldest wait");
+    expect(main).toContain("Decided");
+    expect(main).toContain("showing 2 of 2");
+    expect(main).toContain("Selected approval");
+    expect(main).toContain("What it wants to do");
+    expect(main).toContain("Why it is held");
+    expect(main).toContain("If you decide");
+    expect(main).toContain("recorded in this inbox");
+    expect(main).toContain("outcome not reported by the inbox");
+    expect(main).toContain("Decided at");
+    expect(main).not.toContain("Context the agent gave");
+    expect(main).not.toContain("Note for the audit record");
+    expect(main).not.toContain("server reported this hold");
+  });
+
+  it("Approvals renders hostile served typed args as literal text", async () => {
+    vi.useFakeTimers();
+    const hostile = '<img src=x onerror="alert(1)">';
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", agent_id: hostile, display_template_args: [{ kind: "agent_id", value: hostile }] },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(main).not.toContain(hostile);
+    expect(main).not.toContain("Agent-supplied text");
+  });
+
+  it("Approvals disables the standing-rule checkbox when policy activation is unavailable", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({}, 503)),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Always allow is unavailable");
+    expect(main).toContain("Policy engine is not configured on this fortress.");
+    expect(main).toContain('data-action="approval-always-allow" disabled');
+    expect(main).not.toContain('data-action="inbox-promote"');
+  });
+
+  it("Tier 1 approvals require drawer confirmation while Tier 2 keeps inline decisions", async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+        { ...heldItem, item_id: "tier1-1", tier: "tier1", operation_category: "state_export" },
+        { ...heldItem, item_id: "tier2-1", tier: "tier2", operation_category: "state_delete" },
+      ] } })),
+      "/api/hub/inbox/tier1-1/approve": () => { calls.push("/api/hub/inbox/tier1-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier1-1", resolved: true } } })); },
+      "/api/hub/inbox/tier2-1/approve": () => { calls.push("/api/hub/inbox/tier2-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier2-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    let html = h.el.main!.innerHTML;
+    expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
+    expect(html).toContain('data-action="inbox-approve" data-item-id="tier2-1"');
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual([]);
+    html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1"');
+    expect(html).toContain("Confirm state_export");
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual(["/api/hub/inbox/tier1-1/approve"]);
+  });
+
+  it("Approvals drawer buttons still use the existing inbox decision path with empty bodies", async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/hub/inbox/wait-1/approve": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/approve", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+      "/api/hub/inbox/wait-1/deny": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/deny", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain('data-approval-primary="wait-1" data-action="inbox-approve"');
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
+    await settle();
+    expect(calls).toEqual([
+      { url: "/api/hub/inbox/wait-1/approve", body: "{}" },
+      { url: "/api/hub/inbox/wait-1/deny", body: "{}" },
+    ]);
+  });
+
+  it("Approvals filters narrow rows and counts after the left rail agent scope", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "a-wait", tier: "tier1", agent_id: "agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "b-wait", tier: "tier2", agent_id: "agent-b", operation_category: "state_delete", resolved: false },
+      { ...heldItem, item_id: "a-decided", tier: "tier2", agent_id: "agent-a", operation_category: "state_import", resolved: true, resolved_at: "2026-10-14T16:50:00.000Z" },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 3 of 3");
+    const stateSelect = new FakeElement({ "data-action": "approval-filter-state" }, "select");
+    stateSelect.value = "waiting";
+    h.change(stateSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 2 of 3");
+    const tierSelect = new FakeElement({ "data-action": "approval-filter-tier" }, "select");
+    tierSelect.value = "tier2";
+    h.change(tierSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 3");
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_export";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+    expect(h.el.main!.innerHTML).toContain("Left rail agent scope applies first");
+  });
+
+  it("Approvals cap reports showing M of N past the loaded inbox page cap", async () => {
+    vi.useFakeTimers();
+    const items = Array.from({ length: 101 }, (_, index) => ({
+      ...heldItem,
+      item_id: `item-${index}`,
+      tier: "tier2",
+      agent_id: `agent-${index}`,
+      operation_category: "state_export",
+      resolved: false,
+    }));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 100 of 101");
+    expect(h.el.main!.innerHTML).toContain("cap 100");
+  });
+
+  it("Approvals says a full inbox page may hide more held operations, and says nothing when the page is not full", async () => {
+    vi.useFakeTimers();
+    // One inbox read returns at most 100 items of every kind and no total (HUB_INBOX_DEFAULT_LIMIT).
+    const page = (approvals: number, others: number) => [
+      ...Array.from({ length: approvals }, (_, index) => ({ ...heldItem, item_id: `held-${index}`, tier: "tier2", operation_category: "state_export", resolved: false })),
+      ...Array.from({ length: others }, (_, index) => ({ item_id: `egress-${index}`, kind: "blocked_egress", agent_id: "agent-a", created_at: "2026-10-14T16:00:00.000Z", resolved: false, destination_category: "paste-site", display_template_id: "blocked_egress.egress_policy_deny", display_template_args: [] })),
+    ];
+    const full = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 40) } })) });
+    await settle();
+    full.navigate("approvals");
+    expect(full.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(full.el.main!.innerHTML).toContain('data-inbox-page-full="1"');
+    expect(full.el.main!.innerHTML).toContain("The inbox read returned a full page of 100 items; held operations beyond it are not shown here.");
+    const partial = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 39) } })) });
+    await settle();
+    partial.navigate("approvals");
+    expect(partial.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(partial.el.main!.innerHTML).not.toContain('data-inbox-page-full="1"');
+  });
+
+  it("refused decisions show the refusal and repaint from server state", async () => {
+    vi.useFakeTimers();
+    let inboxItems: Array<Record<string, unknown>> = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: false }];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+      "/api/hub/inbox/wait-1/approve": () => {
+        inboxItems = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: true, resolved_at: "2026-10-14T16:59:00.000Z" }];
+        return Promise.resolve(response({ error: "operator session required" }, 401));
+      },
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    expect(h.el.main!.innerHTML).toContain("Decided at");
+    expect(h.el.main!.innerHTML).toContain("outcome not reported by the inbox");
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
@@ -633,6 +900,37 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).not.toContain("Nothing waiting on you.");
   });
 
+  it("the empty Approvals drawer states what still waits behind a filter or the agent scope, never a calm zero", async () => {
+    vi.useFakeTimers();
+    const items = [
+      { ...heldItem, item_id: "held-a", tier: "tier2", agent_id: "fixture-agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "held-b", tier: "tier2", agent_id: "fixture-agent-b", operation_category: "state_delete", resolved: false },
+    ];
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = ["fixture-agent-a", "fixture-agent-b", "fixture-agent-c"].map((agent_id) => ({ agent_id, status: "active", model_provider }));
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    // The drawer is the last block of the layout, so everything from its class on is the drawer.
+    const drawer = () => { const html = h.el.main!.innerHTML; return html.slice(html.indexOf("card approval-drawer")); };
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_import";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    expect(drawer()).toContain("2 of 2 held operations in this scope are waiting on you");
+    categorySelect.value = "";
+    h.change(categorySelect);
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait on other agents");
+  });
+
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })) });
@@ -675,6 +973,28 @@ describe("slice 2b shell wired consumers", () => {
   const attrsOf = (html: string) => [...html.matchAll(/\s(?:title|aria-label|placeholder)="([^"]*)"/g)].map((m) => m[1]!);
   const machinesHtml = (h: ReturnType<typeof boot>) =>
     h.el["machines-summary"]!.innerHTML + h.el["machines-list"]!.innerHTML;
+  const escapedAttr = (value: string) => escapeHtml(value);
+  const rowSlice = (html: string, rowOpen: string, marker: string) => {
+    const markerIndex = html.indexOf(marker);
+    expect(markerIndex, marker).toBeGreaterThanOrEqual(0);
+    const start = html.lastIndexOf(rowOpen, markerIndex);
+    expect(start, rowOpen).toBeGreaterThanOrEqual(0);
+    const next = html.indexOf(rowOpen, markerIndex + marker.length);
+    return html.slice(start, next < 0 ? html.length : next);
+  };
+  const machineRowHtml = (html: string, url: string) => {
+    const marker = `data-machine-url="${escapedAttr(url)}"`;
+    const markerIndex = html.indexOf(marker);
+    expect(markerIndex, marker).toBeGreaterThanOrEqual(0);
+    const start = html.lastIndexOf("<div ", markerIndex);
+    expect(start, "machine row start").toBeGreaterThanOrEqual(0);
+    const next = html.indexOf("<div data-machine-index=", markerIndex + marker.length);
+    return html.slice(start, next < 0 ? html.length : next);
+  };
+  const agentListRowHtml = (html: string, id: string) =>
+    rowSlice(html, '<div class="agent-row', `data-agent-id="${escapedAttr(id)}"`);
+  const fortressAgentRowHtml = (html: string, id: string) =>
+    rowSlice(html, '<div class="row agent-row"', `data-agent-row="${escapedAttr(id)}"`);
 
   it("Machines renders the saved fleet with its denominator and check age, and an unanswered machine is Unknown, never online", async () => {
     vi.useFakeTimers();
@@ -697,14 +1017,21 @@ describe("slice 2b shell wired consumers", () => {
     let html = machinesHtml(h);
     // This machine joins the three saved ones: four in the denominator.
     expect(html).toContain("1 of 4 machines online · 1 checking · 1 not healthy · 1 Unknown");
+    // Retargeted (slice 2b): the summary used to include a cap-only
+    // "showing" clause; all rows are now listed, so that copy would lie.
     expect(html).not.toContain("showing");
     expect(html).toMatch(/checked \d+s ago/);
     vi.advanceTimersByTime(3000);
     await settle();
     html = machinesHtml(h);
+    // Once the probe deadline passes, no row can keep claiming an in-flight check.
     expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
     expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
     expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
+    const mbaRow = machineRowHtml(html, "http://mba.fixture:3501");
+    // The saved display name must stay above the saved address in its row;
+    // otherwise the row can look like an origin-only fallback.
+    expect(mbaRow).toMatch(/<strong>erik-mba<\/strong><small class="mono">http:\/\/mba\.fixture:3501<\/small>/);
     // This binds the unanswered mba row to its own Unknown chip; aggregate
     // chip counts alone would miss a row-to-state swap.
     expect(html).toMatch(/data-machine-url="http:\/\/mba\.fixture:3501"[^>]*><span [^>]*class="state-chip unknown"/);
@@ -770,7 +1097,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(machinesHtml(h)).not.toContain("state-chip good");
   });
 
-  it("Machines treats hostile saved entries as text and never probes or links non-web addresses", async () => {
+  it("Machines treats saved entries with script-like text as text and never probes or links non-web addresses", async () => {
     vi.useFakeTimers();
     const fetched: string[] = [];
     const h = boot({}, {
@@ -794,7 +1121,9 @@ describe("slice 2b shell wired consumers", () => {
     expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
     expect(html).not.toMatch(/<(?:img|script)\b/i);
     expect(html).not.toMatch(/\sonerror="/i);
-    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"]);
+    // The only href keeps the parsed web address; non-web entries
+    // remain text, and the saved path is not silently retargeted to root.
+    expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=%22%3E%3Cscript%3Ealert(1)%3C/script%3E"]);
     expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
     expect(html.match(/Not a web address/g) ?? []).toHaveLength(3);
   });
@@ -815,10 +1144,78 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
     expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
-    expect(machinesHtml(h)).toContain(`checking ${limit} of 2501 machines; the rest are listed unchecked`);
+    // The capped-round summary is past tense only after every in-cap probe
+    // answered, and must not restore the old second count for capped rows.
+    expect(machinesHtml(h)).toContain(`checked ${limit} of 2501 machines with a web address; the rest are listed unchecked`);
+    expect(machinesHtml(h)).not.toContain("unprobed");
     expect(h.el["machines-list"]!.textContent).toContain("build-2499");
-    expect(h.el["machines-list"]!.textContent).toContain("Unprobed");
+    // The row chip uses the same word as the summary; "Unprobed" was an
+    // internal state name and is not operator copy.
+    expect(h.el["machines-list"]!.textContent).toContain("Unchecked");
+    expect(attrsOf(machinesHtml(h)).some((value) => value.startsWith("Unchecked"))).toBe(true);
     expect(h.el["machines-list"]!.replaceCount).toBe(1);
+  });
+
+  it("a capped round with the named limit still in flight does not double-count checking rows", async () => {
+    vi.useFakeTimers();
+    const limitProbe = boot();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", limitProbe.context));
+    const h = boot({}, {
+      ...storage(Array.from({ length: limit + 1 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }))),
+      fetch: () => new Promise(() => {}),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain(`checking ${limit} of ${limit + 2} machines with a web address; the rest are listed unchecked`);
+    expect(html).not.toContain(`${limit} checking`);
+    expect(html).not.toContain("unprobed");
+  });
+
+  it("the cap phrase uses the named web-address count at the 25 and 26 row boundaries", async () => {
+    vi.useFakeTimers();
+    const limitProbe = boot();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", limitProbe.context));
+    const atLimit = boot({}, {
+      ...storage(Array.from({ length: limit - 1 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }))),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    atLimit.navigate("machines");
+    await settle();
+    expect(Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", atLimit.context))).toBe(limit);
+    expect(machinesHtml(atLimit)).toContain(`${limit} of ${limit} machines online`);
+    expect(machinesHtml(atLimit)).not.toContain("the rest are listed unchecked");
+
+    const overLimit = boot({}, {
+      ...storage([
+        ...Array.from({ length: limit }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` })),
+        { name: "plain text", url: "not-a-web-address" },
+      ]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    overLimit.navigate("machines");
+    await settle();
+    expect(machinesHtml(overLimit)).toContain(`checked ${limit} of ${limit + 1} machines with a web address; the rest are listed unchecked`);
+    expect(machinesHtml(overLimit)).toContain("1 Unknown");
+    // The cap denominator counts web addresses only; this catches a non-web
+    // saved row being swept into "the rest are listed unchecked".
+    expect(machinesHtml(overLimit)).not.toContain(`checked ${limit} of ${limit + 2} machines with a web address; the rest are listed unchecked`);
+  });
+
+  it("an empty saved list has no cap clause", async () => {
+    vi.useFakeTimers();
+    const h = boot({}, {
+      ...storage([]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(machinesHtml(h)).toContain("1 of 1 machine online");
+    expect(machinesHtml(h)).not.toContain("the rest are listed unchecked");
   });
 
   it("this machine stays inside the probe cap even when saved after twenty-five peers", async () => {
@@ -854,6 +1251,143 @@ describe("slice 2b shell wired consumers", () => {
     expect(machinesHtml(h)).toContain("2 of 2 machines online");
     expect(h.el["machines-list"]!.textContent).toContain("host health check");
     expect(machinesHtml(h)).toContain('href="http://build.fixture:3501/tenant/a"');
+  });
+
+  it("Open console uses the parsed machine address", async () => {
+    vi.useFakeTimers();
+    const h = boot({}, {
+      ...storage([{ name: "peer", url: "http:peer:3501" }]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(machinesHtml(h)).toContain('href="http://peer:3501/"');
+  });
+
+  it("a row repaint keeps focus on its Open console link", async () => {
+    vi.useFakeTimers();
+    let releasePeer: (value: unknown) => void = () => {};
+    const h = boot({
+      "http://peer.fixture:3501/api/health": () => new Promise((resolve) => { releasePeer = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "peer", url: "http://peer.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const link = h.el["machines-list"]!.querySelector('[href="http://peer.fixture:3501/"]');
+    expect(link).toBeTruthy();
+    link!.focus();
+    releasePeer(response({ ok: true }));
+    await settle();
+    const newLink = h.el["machines-list"]!.querySelector('[href="http://peer.fixture:3501/"]');
+    expect(newLink).toBeTruthy();
+    expect(newLink).not.toBe(link);
+    expect(h.el["machines-list"]!.contains(link)).toBe(false);
+    expect((runInContext("document.activeElement && document.activeElement.getAttribute('href')", h.context))).toBe("http://peer.fixture:3501/");
+    expect(fakeActiveElement).toBe(newLink);
+    expect(runInContext("document.getElementById('machines-list').contains(document.activeElement)", h.context)).toBe(true);
+  });
+
+  it("a saved address with control characters does not stop the rest of the paint batch", async () => {
+    vi.useFakeTimers();
+    let releaseControlAddress: (value: unknown) => void = () => {};
+    let releaseNormal: (value: unknown) => void = () => {};
+    const controlAddress = "http://bad.fixture:3501/\fline\nbreak";
+    const h = boot({
+      "http://bad.fixture:3501/api/health": () => new Promise((resolve) => { releaseControlAddress = resolve; }),
+      "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "control chars", url: controlAddress }, { name: "normal", url: "http://normal.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    releaseControlAddress(response({ ok: true }));
+    releaseNormal(response({ ok: false }));
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain('data-machine-url="' + controlAddress + '"');
+    expect(html).toContain('data-machine-url="http://normal.fixture:3501/"');
+    expect(html).toContain("Online");
+    expect(html).toContain("Not healthy");
+    expect(html).not.toContain("Checking");
+  });
+
+  it("each painted row carries its generated index and repaint lookup uses it", async () => {
+    vi.useFakeTimers();
+    let releasePeer: (value: unknown) => void = () => {};
+    const h = boot({
+      "http://peer.fixture:3501/api/health": () => new Promise((resolve) => { releasePeer = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "peer", url: "http://peer.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect([...machinesHtml(h).matchAll(/data-machine-index="(\d+)"/g)].map((m) => Number(m[1]))).toEqual([0, 1]);
+    const peerRow = h.el["machines-list"]!.querySelector('[data-machine-url="http://peer.fixture:3501/"]');
+    expect(peerRow?.getAttribute("data-machine-index")).toBe("1");
+    peerRow!.removeAttribute("data-machine-index");
+    releasePeer(response({ ok: true }));
+    await settle();
+    const row = machineRowHtml(machinesHtml(h), "http://peer.fixture:3501/");
+    expect(row).toContain('class="state-chip unknown"');
+    expect(row).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(row).not.toContain("Checking");
+    expect(machinesHtml(h)).not.toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip good"/);
+  });
+
+  it("a row build failure leaves that row visible and still restores focus after another row repaints", async () => {
+    vi.useFakeTimers();
+    let releaseBroken: (value: unknown) => void = () => {};
+    let releaseNormal: (value: unknown) => void = () => {};
+    const brokenUrl = "http://broken.fixture:3501/";
+    const normalUrl = "http://normal.fixture:3501/";
+    const h = boot({
+      "http://broken.fixture:3501/api/health": () => new Promise((resolve) => { releaseBroken = resolve; }),
+      "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "broken", url: brokenUrl }, { name: "normal", url: normalUrl }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const normalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(normalLink).toBeTruthy();
+    normalLink!.focus();
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl };
+    releaseBroken(response({ ok: true }));
+    releaseNormal(response({ ok: false }));
+    await settle();
+    const newNormalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(newNormalLink).toBeTruthy();
+    expect(newNormalLink).not.toBe(normalLink);
+    expect(fakeActiveElement).toBe(newNormalLink);
+    const brokenRow = machineRowHtml(machinesHtml(h), brokenUrl);
+    expect(brokenRow).toContain('class="state-chip unknown"');
+    expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(brokenRow).not.toContain("Checking");
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/normal\.fixture:3501\/"[^>]*><span [^>]*class="state-chip bad"/);
+  });
+
+  it("a failed row build on first visit leaves the rest of the machine list rendered", async () => {
+    vi.useFakeTimers();
+    const brokenUrl = "http://broken.fixture:3501/";
+    const normalUrl = "http://normal.fixture:3501/";
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl };
+    const h = boot({
+      "http://broken.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://normal.fixture:3501/api/health": () => Promise.resolve(response({ ok: true })),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "broken saved name", url: brokenUrl }, { name: "normal", url: normalUrl }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    const brokenRow = machineRowHtml(html, brokenUrl);
+    expect(brokenRow).toContain("broken saved name");
+    expect(brokenRow).toContain('class="state-chip unknown"');
+    expect(brokenRow).toContain('title="Unknown: this row could not be updated; use Check again."');
+    expect(machineRowHtml(html, normalUrl)).toContain('class="state-chip good"');
+    expect(h.el["machines-summary"]!.textContent).toContain("machines online");
   });
 
   it("a Fleet link click changes route once and starts one probe wave", async () => {
@@ -934,6 +1468,7 @@ describe("slice 2b shell wired consumers", () => {
       "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [
         { agent_id: "no-evidence", status: "active", harness: "h", model_provider },
         { agent_id: "paused-one", status: "paused", harness: "h", model_provider },
+        { agent_id: "unwrapping-one", status: "unwrapping", harness: "h", model_provider },
         { agent_id: "locked-one", status: "locked_down", harness: "h", model_provider },
         { agent_id: "off-enum", status: "mystery", harness: "h", model_provider },
       ] } })),
@@ -941,10 +1476,20 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("agents");
     const html = h.el.main!.innerHTML;
-    const dot = (id: string) => html.match(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ([^"]+)"></span>([^<]*)</span>`));
+    const dot = (id: string) => {
+      const row = agentListRowHtml(html, id);
+      return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
+    };
+    const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
+    (h.context as Record<string, unknown>).__agentStatus = "unwrapping";
+    const unwrappingDot = runInContext("agentStateClass(__agentStatus)", h.context) as string;
+    const unwrappingGlyph = runInContext("STATUS_MAP[__agentStatus].glyph", h.context) as string;
+    const unwrappingTone = runInContext("AGENT_STATE_PILL_TONE[agentStateClass(__agentStatus)] || 'tone-unknown'", h.context) as string;
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
+    expect(dot("unwrapping-one")![1]).toBe(unwrappingDot);
+    expect(dot("unwrapping-one")![2]).toBe(unwrappingLabel);
     expect(dot("locked-one")![1]).toBe("locked");
     expect(dot("off-enum")![1]).toBe("unknown");
     // The inspect pane's pill wears the same Unknown tone as its dot, and
@@ -954,6 +1499,50 @@ describe("slice 2b shell wired consumers", () => {
     expect(pane).toContain('<span class="pill tone-unknown"><span class="state-dot unknown"');
     expect(pane).toContain('<div class="timeline-item"><div class="ts">');
     expect(pane).not.toContain("timeline-item ok");
+    runInContext(`state.chat.inspect.panelByAgentId["unwrapping-one"] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" }; state.selectedAgentId = "unwrapping-one";`, h.context);
+    const unwrappingPane = runInContext(`renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === "unwrapping-one"; }))`, h.context) as string;
+    const unwrappingDetail = runInContext("renderAgentDetail()", h.context) as string;
+    const fortressCard = runInContext("renderFortressAgentsCard()", h.context) as string;
+    expect(unwrappingPane).toContain(`<span class="pill ${unwrappingTone}"><span class="state-dot ${unwrappingDot}"`);
+    expect(unwrappingDetail).toContain(`<dt>Status</dt><dd><span class="glyph ${unwrappingGlyph}"></span> ${unwrappingLabel}</dd>`);
+    expect(fortressAgentRowHtml(fortressCard, "unwrapping-one")).toContain(`<span class="glyph ${unwrappingGlyph}"`);
+  });
+
+  it("every wire agent status agrees with the status table mark in each agent view", async () => {
+    vi.useFakeTimers();
+    const now = new Date().toISOString();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = HUB_AGENT_STATUSES.map((status) => ({ agent_id: `agent-${status}`, status, harness: "h", model_provider }));
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+      "/api/posture/home": () => Promise.resolve(response({
+        ...home(),
+        agents: [{ agent_id: "agent-active", enforcement_active: "active", last_enforcement_evidence_at: now, freshness_window_ms: 60000 }],
+      })),
+    });
+    await settle();
+    h.navigate("agents");
+    const tableStatuses = Object.keys(STATUS_MAPPING).sort();
+    expect([...HUB_AGENT_STATUSES].sort()).toEqual(tableStatuses);
+    const glyphToDot: Record<string, string> = { online: "live", idle: "idle", offline: "locked", away: "off", unknown: "unknown" };
+    for (const status of HUB_AGENT_STATUSES) {
+      const id = `agent-${status}`;
+      const expectedGlyph = STATUS_MAPPING[status].glyph;
+      const expectedDot = glyphToDot[expectedGlyph];
+      (h.context as Record<string, unknown>).__agentStatus = status;
+      (h.context as Record<string, unknown>).__agentId = id;
+      expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);
+      expect(runInContext("agentStateClass(__agentStatus)", h.context), status).toBe(expectedDot);
+      const listHtml = h.el.main!.innerHTML;
+      expect(agentListRowHtml(listHtml, id), status).toContain(`<span class="state-dot ${expectedDot}"></span>`);
+      runInContext("state.chat.inspect.panelByAgentId[__agentId] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: '2026-10-14T00:00:00.000Z' }; state.selectedAgentId = __agentId;", h.context);
+      const pane = runInContext("renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === __agentId; }))", h.context) as string;
+      const detail = runInContext("renderAgentDetail()", h.context) as string;
+      const fortress = runInContext("renderFortressAgentsCard()", h.context) as string;
+      expect(pane, status).toContain(`<span class="state-dot ${expectedDot}"`);
+      expect(detail, status).toContain(`<span class="glyph ${expectedGlyph}"></span>`);
+      expect(fortressAgentRowHtml(fortress, id), status).toContain(`<span class="glyph ${expectedGlyph}"`);
+    }
   });
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {

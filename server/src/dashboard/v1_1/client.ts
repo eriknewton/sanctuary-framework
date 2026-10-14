@@ -254,6 +254,12 @@ const state = {
     filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
     snoozeDialog: null
   },
+  approvals: {
+    selectedId: null,
+    alwaysAllow: false,
+    confirmingTier1Id: null,
+    filters: { state: "all", agent: "", tier: "both", category: "" }
+  },
   activity: [],
   evidence: {
     view: null,
@@ -398,6 +404,7 @@ function shortTime(iso) {
 }
 
 function promptForOperatorToken() {
+  if (!window.prompt) return false;
   const entered = window.prompt("Operator token required for this action.");
   if (!entered || !entered.trim()) return false;
   TOKEN = entered.trim();
@@ -918,7 +925,7 @@ function setRoute(route) {
   // Tunability UX: entering the Policy surface loads the LIVE plain-English
   // policy from the operator-bearer-gated GET /api/policy/current. Fired
   // fire-and-forget; loadPolicyView rerenders when the view arrives.
-  if (route === "policy") void loadPolicyView();
+  if (route === "policy" || route === "approvals") void loadPolicyView();
   // Machines probes on every entry, as the Fleet Switcher does on load, and
   // keeps its check age current while it shows.
 }
@@ -948,7 +955,7 @@ async function readPolicyView() {
           : (e.message || "Could not load policy.");
   } finally {
     state.policyView.loading = false;
-    if (state.route === "policy") rerender();
+    if (state.route === "policy" || state.route === "approvals") rerender();
   }
 }
 
@@ -1473,14 +1480,14 @@ function agentInitials(agentId) {
 // The state dot beside an agent's state word, one shape per state so it
 // reads in monochrome: active is the pass circle, locked down the hollow
 // locked square, an error the fault square, Unknown the hollow unknown ring,
-// and known transitional states (paused, restarting, being removed) the warn triangle.
+// and known transitional states (paused, restarting, unwrapping) the warn triangle.
 // An agent with no current evidence is Unknown, never painted as working.
 function agentStateClass(status) {
   if (status === "active") return "live";
   if (status === "locked_down") return "locked";
   if (status === "error") return "off";
   if (!status || status === "unknown") return "unknown";
-  if (status === "paused" || status === "restarting" || status === "removing") return "idle";
+  if (status === "paused" || status === "restarting" || status === "unwrapping") return "idle";
   return "unknown";
 }
 // The inspect pane's state pill wears the same state as the dot inside it.
@@ -3349,11 +3356,11 @@ function renderFortress() {
   const pending = pendingApprovalItems();
   const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
   const countCls = queueCount ? "count" : "count zero";
-  // The Approvals screen renders this same queue body in the main column, and
-  // the fortress column is hidden there (route-full), so the column skips it:
-  // the queue's element ids and its approve/deny controls exist once in the
-  // document. Every other route keeps rendering it here, hidden or shown.
-  const queueBody = state.route === "approvals" ? "" : renderApprovalQueueBody();
+  let approvalSummary;
+  if (!sourceLoaded(HUB + "/inbox")) approvalSummary = renderSourceRead(HUB + "/inbox");
+  else if (state.inboxRedacted) approvalSummary = '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>';
+  else if (pending.length) approvalSummary = '<div class="queue-empty"><span class="qe-warn"></span>' + escHtml(queueCount) + ' held operations waiting. <a href="#approvals">Open Approvals</a>.</div>';
+  else approvalSummary = '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3382,7 +3389,7 @@ function renderFortress() {
   fortress.innerHTML = [
       '<div class="rail-section">',
       '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + queueCount + '</span></div>',
-      queueBody,
+      approvalSummary,
     '</div>',
     '<div class="rail-section">',
       '<div class="rail-section-label">Right now</div>',
@@ -4287,6 +4294,10 @@ function renderSearchResults() {
 // Unknown with a Retry until the queue read loads, the redacted notice when
 // approvals are hidden, the Allow once / Deny / Allow always tiles, or the
 // earned empty state.
+const APPROVAL_QUEUE_ITEM_CAP = 100; // 100 matches HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts, the one page this client reads.
+// Must match CHARTER_APPROVAL_ITEM_ID_PREFIX in server/src/hub/charter-approval-bridge.ts.
+const CHARTER_APPROVAL_ITEM_ID_PREFIX = "charter.approval.";
+
 function renderApprovalQueueBody() {
   const pending = pendingApprovalItems();
   if (!sourceLoaded(HUB + "/inbox")) return renderSourceRead(HUB + "/inbox");
@@ -4303,23 +4314,244 @@ function renderApprovalQueueBody() {
   return '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
 }
 
+function approvalItemsForScreen() {
+  const scope = state.agentScope.selectedAgentId;
+  return state.inbox.filter(function (i) {
+    if (i.kind !== "approval_pending") return false;
+    if (i.tier !== "tier1" && i.tier !== "tier2") return false;
+    if (scope && (i.agent_id || "") !== scope) return false;
+    return true;
+  });
+}
+
+function approvalArg(item, names, fallback) {
+  const args = item && item.display_template_args;
+  if (!Array.isArray(args)) return fallback || "";
+  for (let i = 0; i < args.length; i++) {
+    if (names.indexOf(args[i].kind) >= 0) return String(args[i].value);
+  }
+  return fallback || "";
+}
+
+function approvalAgentId(item) {
+  return item.agent_id || approvalArg(item, ["agent_id"], "this fortress");
+}
+
+function approvalOperation(item) {
+  return item.operation_category || String(item.display_template_id || "").split(".").pop() || "approval";
+}
+
+function approvalText(item) {
+  return renderTemplate(item.display_template_id, item.display_template_args);
+}
+
+function approvalHoldReason(item) {
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  return approvalOperation(item) + " is a " + tier + " operation under the operator policy.";
+}
+
+function isCharterApprovalItem(item) {
+  return !!(item && typeof item.item_id === "string" && item.item_id.indexOf(CHARTER_APPROVAL_ITEM_ID_PREFIX) === 0);
+}
+
+function approvalRecordLine(item) {
+  return isCharterApprovalItem(item) ? "recorded in your audit log" : "recorded in this inbox";
+}
+
+function approvalOutcomeLine(item) {
+  return isCharterApprovalItem(item) ? "outcome in your audit log" : "outcome not reported by the inbox";
+}
+
+function approvalPolicyUnavailableReason() {
+  if (state.policyView.loadError) return state.policyView.loadError;
+  const read = sourceRead(POLICY + "/current");
+  if (read && read.state === "state_FAILED") return read.error || "Policy engine is not configured on this fortress.";
+  if (read && read.state === "state_NOT_SERVED") return read.error || DASHBOARD_MODE_NOT_SERVED_MESSAGE;
+  if (state.policyView.loading || (read && read.state === "state_LOADING")) return "Checking the policy-change path.";
+  if (!sourceLoaded(POLICY + "/current")) return "Checking the policy-change path.";
+  return "";
+}
+
+function approvalStandingState(item) {
+  const op = promotableOperation(item);
+  if (!op) return { enabled: false, reason: "Always allow is unavailable for this operation." };
+  if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
+  const unavailable = approvalPolicyUnavailableReason();
+  if (unavailable) return { enabled: false, reason: unavailable };
+  return { enabled: true, reason: "Allow always asks the policy engine to compile a standing rule for " + op + ", then activates it with your operator token. Either step can be refused; your policy changes only if both succeed." };
+}
+
+function renderApprovalRow(item, selectedId) {
+  const selected = item.item_id === selectedId;
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const created = item.created_at || "";
+  const age = created ? relTimeFromIso(created) : "age unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  if (item.resolved) {
+    // The inbox serves no operator decision outcome, so the screen never
+    // infers allow or deny from agent-control result fields.
+    const outcomeLine = approvalOutcomeLine(item);
+    return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+      '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+      '<td><strong>' + escHtml(agent) + '</strong></td>' +
+      '<td class="mono">' + escHtml(op) + '</td>' +
+      '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+      '<td class="mono muted">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
+      '<td><span class="state-chip neutral"><i aria-hidden="true"></i>DECIDED</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
+    '</tr>';
+  }
+  const decisionCell = item.tier === "tier1"
+    ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>'
+    : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>';
+  return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+    '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+    '<td><strong>' + escHtml(agent) + '</strong></td>' +
+    '<td class="mono">' + escHtml(op) + '</td>' +
+    '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+    '<td class="mono">' + escHtml(age) + '</td>' +
+    '<td>' + decisionCell + '</td>' +
+  '</tr>';
+}
+
+function renderApprovalDrawer(item, empty) {
+  if (!item) {
+    // Only an empty scope with nothing waiting elsewhere earns "No approvals waiting"; when a
+    // filter or the agent scope hides rows, the drawer says what still waits, never a calm zero.
+    const e = empty || {};
+    const checkedAt = "Queue checked " + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + ".";
+    let title = "No approvals waiting";
+    let line = "0 of 0 held operations are waiting on you. " + checkedAt;
+    if (e.filteredOut) {
+      title = "Nothing selected";
+      line = "No held operation matches these filters. " + escHtml(e.waiting) + " of " + escHtml(e.total) + " held operations in this scope are waiting on you. " + checkedAt;
+    } else if (e.otherAgents > 0) {
+      title = "Nothing selected";
+      line = "Nothing waiting for " + escHtml(e.agent || "this agent") + ". " + escHtml(e.otherAgents) + " of " + escHtml(e.otherAgents) + " held operations wait on other agents. " + checkedAt;
+    }
+    return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + title + '</h3><p>' + line + '</p><a class="btn" href="#activity">Open Evidence</a></div></aside>';
+  }
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  const standing = approvalStandingState(item);
+  const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
+  const primaryAction = checked ? "inbox-promote" : "inbox-approve";
+  const primaryLabel = checked ? "Allow always" : "Allow once";
+  const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
+    (checked ? " checked" : "") + (standing.enabled ? "" : " disabled") + '><span>' +
+    (standing.enabled ? "Always allow this operation for this agent. " : "Always allow is unavailable. ") +
+    '<strong>' + escHtml(standing.reason) + '</strong></span></label>';
+  const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
+  const primaryButton = item.resolved ? "" : (item.tier === "tier1" && !checked
+    ? (tier1Confirming
+      ? '<button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '">Confirm ' + escHtml(op) + '</button>'
+      : '<button class="btn btn-primary" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>')
+    : '<button class="btn btn-primary" data-approval-primary="' + escHtml(item.item_id) + '" data-action="' + primaryAction + '" data-item-id="' + escHtml(item.item_id) + '">' + primaryLabel + '</button>');
+  const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>';
+  const standingEffect = checked
+    ? "Later matching operations stop asking only if the policy engine accepts both steps."
+    : "The next matching operation asks again.";
+  const allowCopy = checked
+    ? standingEffect
+    : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
+  const tier1Note = item.tier === "tier1" && !item.resolved
+    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + escHtml(op) + '. Both send the same approval.</div>'
+    : "";
+  return '<aside class="card approval-drawer" aria-label="Selected approval">' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? "DECIDED" : "WAITING") + '</span></div><h3>Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
+    // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
+    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>Allow once</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
+    tier1Note +
+    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + '</div><p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
+  '</aside>';
+}
+
+function approvalFilterOptions(items, field, current) {
+  const seen = {};
+  items.forEach(function (item) {
+    const value = field === "agent" ? approvalAgentId(item) : approvalOperation(item);
+    if (value) seen[value] = true;
+  });
+  return Object.keys(seen).sort().map(function (value) {
+    return '<option value="' + escHtml(value) + '"' + (current === value ? " selected" : "") + '>' + escHtml(value) + '</option>';
+  }).join("");
+}
+
+function filterApprovalItems(items) {
+  const f = state.approvals.filters || {};
+  return items.filter(function (item) {
+    if (f.state === "waiting" && item.resolved) return false;
+    if (f.state === "decided" && !item.resolved) return false;
+    if (f.agent && approvalAgentId(item) !== f.agent) return false;
+    if (f.tier === "tier1" && item.tier !== "tier1") return false;
+    if (f.tier === "tier2" && item.tier !== "tier2") return false;
+    if (f.category && approvalOperation(item) !== f.category) return false;
+    return true;
+  });
+}
+
 function renderApprovalsScreen() {
-  const w = approvalWaitingSummary();
-  const countLine = w.known
-    ? '<span class="count-age">' + escHtml(w.sentence) + '</span>'
-    : '<span class="count-age">Unknown until the approval queue loads</span>';
-  // The fortress column renders the same queue beside Talk's full page; on
-  // this screen it skips the queue body (renderFortress), so the queue's
-  // element ids exist once in the document.
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approval data is Unknown until the queue read loads.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  if (state.inboxRedacted) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  const all = approvalItemsForScreen();
+  const filtered = filterApprovalItems(all);
+  const capped = filtered.slice(0, APPROVAL_QUEUE_ITEM_CAP);
+  const allWaitingCount = all.filter(function (i) { return !i.resolved; }).length;
+  const waiting = capped.filter(function (i) { return !i.resolved; }).sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const decided = capped.filter(function (i) { return !!i.resolved; });
+  const selectedId = capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
+    ? state.approvals.selectedId
+    : (waiting[0] || capped[0] || {}).item_id || null;
+  state.approvals.selectedId = selectedId;
+  const selected = capped.find(function (i) { return i.item_id === selectedId; }) || null;
+  const oldest = waiting.length && waiting[0].created_at ? relTimeFromIso(waiting[0].created_at) : "none waiting";
+  const rows = [
+    waiting.length ? '<tr class="sect"><td colspan="6">Waiting on you · ' + waiting.length + ' of ' + allWaitingCount + ' · oldest wait ' + escHtml(oldest) + '</td></tr>' : "",
+    waiting.map(function (i) { return renderApprovalRow(i, selectedId); }).join(""),
+    decided.length ? '<tr class="sect"><td colspan="6">Decided · showing ' + decided.length + ' of ' + filtered.filter(function (i) { return !!i.resolved; }).length + '</td></tr>' : "",
+    decided.map(function (i) { return renderApprovalRow(i, selectedId); }).join("")
+  ].join("");
+  const others = state.agentScope.selectedAgentId ? heldApprovalItems(null).length : 0;
+  const noFilterMatch = all.length > 0 && filtered.length === 0;
+  // One inbox read returns at most APPROVAL_QUEUE_ITEM_CAP items of every kind and serves no total,
+  // so a full page means held operations past it may exist; the counts above cover the loaded page only.
+  const pageFullNotice = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP
+    ? '<p class="muted" data-inbox-page-full="1">The inbox read returned a full page of ' + APPROVAL_QUEUE_ITEM_CAP + ' items; held operations beyond it are not shown here.</p>'
+    : "";
+  const body = capped.length ? '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+    noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
+    others > 0
+      ? '<div class="queue-empty" data-scoped-empty="1">Nothing waiting for ' + escHtml(state.agentScope.selectedAgentId || "this agent") +
+        '. ' + others + ' of ' + others + ' held operations wait on other agents; choose All agents in the scope menu to see them.</div>'
+      : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  const f = state.approvals.filters;
+  const filterBar = '<div class="approval-filters" role="group" aria-label="Filter approvals">' +
+      '<label class="filter-field">State<select class="input" data-action="approval-filter-state"><option value="all"' + (f.state === "all" ? " selected" : "") + '>All</option><option value="waiting"' + (f.state === "waiting" ? " selected" : "") + '>Waiting</option><option value="decided"' + (f.state === "decided" ? " selected" : "") + '>Decided</option></select></label>' +
+      '<label class="filter-field">Agent<select class="input" data-action="approval-filter-agent"><option value="">All</option>' + approvalFilterOptions(all, "agent", f.agent) + '</select></label>' +
+      '<label class="filter-field">Tier<select class="input" data-action="approval-filter-tier"><option value="both"' + (f.tier === "both" ? " selected" : "") + '>Tier 1 and Tier 2</option><option value="tier1"' + (f.tier === "tier1" ? " selected" : "") + '>Tier 1</option><option value="tier2"' + (f.tier === "tier2" ? " selected" : "") + '>Tier 2</option></select></label>' +
+      '<label class="filter-field">Category<select class="input" data-action="approval-filter-category"><option value="">All</option>' + approvalFilterOptions(all, "category", f.category) + '</select></label>' +
+      '<span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span>' +
+    '</div>';
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+        '<p class="sub">A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
       '</div></div>',
-      '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
-      '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',
+      filterBar,
+      '<p class="muted">Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
+      pageFullNotice,
+      '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected, { filteredOut: noFilterMatch, waiting: allWaitingCount, total: all.length, otherAgents: others, agent: state.agentScope.selectedAgentId }) + '</div>',
     '</section>'
   ].join("");
 }
@@ -4460,9 +4692,10 @@ const FLEET_PROBE_VIEW = {
   state_ONLINE: { word: "Online", cls: "good" },
   state_NOT_HEALTHY: { word: "Not healthy", cls: "bad" },
   state_UNKNOWN: { word: "Unknown", cls: "unknown" },
-  state_UNPROBED: { word: "Unprobed", cls: "unknown" }
+  state_UNPROBED: { word: "Unchecked", cls: "unknown" }
 };
-const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {} };
+const FLEET_ROW_UPDATE_REASON = "Unknown: this row could not be updated; use Check again.";
+const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {}, rowUpdateFailed: {} };
 
 // Only an http or https address becomes a link or a probe target: the list
 // is operator-typed text in browser storage, and a javascript: or data:
@@ -4568,6 +4801,7 @@ async function probeFleetMachines() {
   fleet.machines = machines;
   fleet.probes = {};
   fleet.paintRows = {};
+  fleet.rowUpdateFailed = {};
   machines.forEach(function (m) {
     fleet.probes[m.url] = !m.origin ? FLEET_PROBE.UNKNOWN : m.capped ? FLEET_PROBE.UNPROBED : FLEET_PROBE.CHECKING;
   });
@@ -4603,11 +4837,16 @@ function fleetSummary(machines) {
     else unknown++;
   });
   const parts = [online + " of " + total + noun + " online"];
-  if (unprobed) parts.push("checking " + probeable + " of " + total + noun + "; the rest are listed unchecked");
-  if (checking) parts.push(checking + " checking");
+  if (unprobed) {
+    const cappedWebTotal = probeable + unprobed;
+    const cappedNoun = cappedWebTotal === 1 ? " machine" : " machines";
+    // The cap denominator counts web addresses only; non-web rows keep their
+    // own Unknown reason and must not be folded into the unchecked remainder.
+    parts.push((checking ? "checking " : "checked ") + probeable + " of " + cappedWebTotal + cappedNoun + " with a web address; the rest are listed unchecked");
+  }
+  if (checking && !unprobed) parts.push(checking + " checking");
   if (notHealthy) parts.push(notHealthy + " not healthy");
   if (unknown) parts.push(unknown + " Unknown");
-  if (unprobed) parts.push(unprobed + " unprobed");
   return { text: parts.join(" · "), age: "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago" };
 }
 
@@ -4658,7 +4897,7 @@ function machineStatusReason(machine, status) {
   return !machine.origin
     ? "Unknown: this saved address is not a web address, so it was not linked or checked."
     : status === FLEET_PROBE.UNPROBED
-      ? "Unknown: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
+      ? "Unchecked: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
       : status === FLEET_PROBE.UNKNOWN
         ? "Unknown: no answer to the health check within " + FLEET_PROBE_DEADLINE_SECONDS + " seconds, or an answer that was not the health check. This is not proof the machine is down."
         : status === FLEET_PROBE.NOT_HEALTHY ? "The machine answered its health check with ok false."
@@ -4703,13 +4942,58 @@ function makeMachineRow(machine, index) {
     row.appendChild(makeTextElement("span", "machine-here", "This machine"));
   } else if (machine.origin) {
     const open = makeTextElement("a", "btn", "Open console");
-    open.setAttribute("href", machine.url);
+    const parsed = fleetHttpUrl(machine.url);
+    // The link uses the same parsed web address as the probe, so a loosely
+    // written address cannot resolve as a path on this console.
+    if (parsed) open.setAttribute("href", parsed.href);
     open.setAttribute("rel", "noopener");
     row.appendChild(open);
   } else {
     row.appendChild(makeTextElement("span", "muted", "Not a web address"));
   }
   return row;
+}
+
+function makeMachineUpdateFallbackRow(machine, index) {
+  const row = document.createElement("div");
+  row.className = "machine-row";
+  row.setAttribute("data-machine-index", String(index));
+  row.setAttribute("data-machine-url", machine.url);
+  const chip = document.createElement("span");
+  chip.className = "state-chip unknown";
+  chip.setAttribute("title", FLEET_ROW_UPDATE_REASON);
+  const mark = document.createElement("i");
+  mark.setAttribute("aria-hidden", "true");
+  chip.appendChild(mark);
+  appendText(chip, "Unknown");
+  row.appendChild(chip);
+  const id = document.createElement("div");
+  id.className = "machine-id";
+  id.appendChild(makeTextElement("strong", "", machine.name || machine.url));
+  row.appendChild(id);
+  return row;
+}
+
+function guardedMachineRow(machine, index) {
+  try { return makeMachineRow(machine, index); }
+  catch (e) {
+    fleet.rowUpdateFailed[machine.url] = true;
+    return makeMachineUpdateFallbackRow(machine, index);
+  }
+}
+
+function replaceMachineWithFallback(oldRow, machine, index) {
+  try {
+    if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineUpdateFallbackRow(machine, index));
+  } catch (e) { /* ignore a DOM fallback failure; the guarded rebuild still protects full renders */ }
+}
+
+function rebuildMachinesList(listEl, machines) {
+  const frag = document.createDocumentFragment();
+  machines.forEach(function (m, index) {
+    frag.appendChild(guardedMachineRow(m, index));
+  });
+  listEl.replaceChildren(frag);
 }
 
 function paintMachinesScreen() {
@@ -4720,12 +5004,55 @@ function paintMachinesScreen() {
   updateMachinesSummary(summaryEl, machines);
   const pending = fleet.paintRows || {};
   fleet.paintRows = {};
-  Object.keys(pending).forEach(function (url) {
-    const index = machines.findIndex(function (m) { return m.url === url; });
-    if (index < 0 || !listEl.querySelector) return;
-    const oldRow = listEl.querySelector('[data-machine-url="' + escCssAttr(url) + '"]');
-    if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
-  });
+  const focus = captureInputFocus(listEl);
+  try {
+    let rebuilt = false;
+    Object.keys(pending).forEach(function (url) {
+      let oldRow = null;
+      let index = -1;
+      try {
+        index = machines.findIndex(function (m) { return m.url === url; });
+        if (index < 0 || !listEl.querySelector) return;
+        // Row lookup is by the generated numeric index; saved machine addresses
+        // can contain control characters that are not safe selector text.
+        oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+        if (!oldRow) {
+          try { oldRow = listEl.querySelector('[data-machine-url="' + escCssAttr(machines[index].url) + '"]'); }
+          catch (e) { oldRow = null; }
+          if (oldRow) {
+            fleet.rowUpdateFailed[url] = true;
+            replaceMachineWithFallback(oldRow, machines[index], index);
+            return;
+          }
+        }
+        if (!oldRow) {
+          if (!rebuilt) {
+            rebuilt = true;
+            rebuildMachinesList(listEl, machines);
+          }
+          return;
+        }
+        if (fleet.rowUpdateFailed[url]) {
+          replaceMachineWithFallback(oldRow, machines[index], index);
+          return;
+        }
+        if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
+      } catch (e) {
+        // A finished probe must never leave an old Checking chip behind; that
+        // would claim work is still in flight after the answer arrived.
+        if (index >= 0) fleet.rowUpdateFailed[url] = true;
+        if (oldRow && index >= 0) replaceMachineWithFallback(oldRow, machines[index], index);
+        else if (!rebuilt) {
+          rebuilt = true;
+          rebuildMachinesList(listEl, machines);
+        }
+      }
+    });
+  } finally {
+    // restoreInputFocus enforces the exactly-one-match rule, so a replaced
+    // row can regain focus without moving the operator to a sibling control.
+    restoreInputFocus(listEl, focus);
+  }
 }
 
 function hydrateMachinesScreen() {
@@ -4736,7 +5063,7 @@ function hydrateMachinesScreen() {
   updateMachinesSummary(summaryEl, machines);
   const frag = document.createDocumentFragment();
   machines.forEach(function (m, index) {
-    frag.appendChild(makeMachineRow(m, index));
+    frag.appendChild(guardedMachineRow(m, index));
   });
   listEl.replaceChildren(frag);
 }
@@ -5399,12 +5726,14 @@ async function onInboxAction(itemId, action) {
     }
     rerender();
   } catch (e) {
+    await fetchAll(true);
     // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
     if (e.status === 409) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
     }
+    rerender();
   }
 }
 
@@ -6028,6 +6357,28 @@ document.addEventListener("click", function (ev) {
     if (i) toast("Template: " + i.display_template_id);
     return;
   }
+  if (action === "approval-select" && itemId) {
+    state.approvals.selectedId = itemId;
+    state.approvals.alwaysAllow = false;
+    state.approvals.confirmingTier1Id = null;
+    return rerender();
+  }
+  if (action === "approval-always-allow") {
+    state.approvals.alwaysAllow = !!tgt.checked;
+    state.approvals.confirmingTier1Id = null;
+    return rerender();
+  }
+  if (action === "approval-start-tier1-allow" && itemId) {
+    // Tier 1 decisions stay two-step in the drawer so a row click cannot
+    // turn into execution. The confirm control below is the only client path
+    // that reaches the existing inbox approve route for Tier 1.
+    state.approvals.confirmingTier1Id = itemId;
+    return rerender();
+  }
+  if (action === "approval-confirm-tier1-allow" && itemId) {
+    state.approvals.confirmingTier1Id = null;
+    return void onInboxAction(itemId, "approve");
+  }
   if (action === "inbox-select" && itemId) {
     state.inboxOps.selected[itemId] = tgt.checked;
     return rerender();
@@ -6158,8 +6509,17 @@ document.addEventListener("change", function (ev) {
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
   else if (action === "evidence-filter-layer") return setEvidenceFilter("layer", tgt.value);
   else if (action === "evidence-filter-result") return setEvidenceFilter("result", tgt.value);
+  else if (action === "approval-filter-state") state.approvals.filters.state = tgt.value === "waiting" || tgt.value === "decided" ? tgt.value : "all";
+  else if (action === "approval-filter-agent") state.approvals.filters.agent = tgt.value;
+  else if (action === "approval-filter-tier") state.approvals.filters.tier = tgt.value === "tier1" || tgt.value === "tier2" ? tgt.value : "both";
+  else if (action === "approval-filter-category") state.approvals.filters.category = tgt.value;
   else return;
-  saveInboxPrefs();
+  if (action.indexOf("inbox-filter-") === 0) saveInboxPrefs();
+  if (action.indexOf("approval-filter-") === 0) {
+    state.approvals.selectedId = null;
+    state.approvals.alwaysAllow = false;
+    state.approvals.confirmingTier1Id = null;
+  }
   rerender();
 });
 
