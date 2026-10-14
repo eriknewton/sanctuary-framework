@@ -482,9 +482,16 @@ body {
 .template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
 .template-card { background: var(--surface-2); border: 1px solid var(--rule); border-radius: var(--rad); padding: 14px; min-height: 132px; }
 .template-card-head { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); margin-bottom: 12px; }
-.severity { border-radius: 999px; padding: 2px 9px; font-family: var(--mono); font-size: var(--text-xs); font-weight: 700; }
+.severity { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 9px; font-family: var(--mono); font-size: var(--text-xs); font-weight: 700; text-transform: uppercase; }
+.severity b { width: 4px; height: 14px; border-radius: 2px; display: inline-block; }
 .severity.low { color: var(--sage); background: var(--sage-bg); }
 .severity.medium { color: var(--ochre); background: var(--ochre-bg); }
+.severity.high, .severity.critical { color: var(--rust); background: var(--rust-bg); }
+.severity.info { color: var(--slate); background: var(--slate-bg); }
+.severity.low b { background: var(--sage); }
+.severity.medium b { background: var(--ochre); }
+.severity.high b, .severity.critical b { background: var(--rust); }
+.severity.info b { background: var(--slate); }
 .template-id { background: var(--paper-3); border-radius: var(--rad); padding: 2px 7px; color: var(--ink-3); }
 .template-card h3 { font-size: var(--text-lg); margin: 0 0 6px; }
 .template-card p { color: var(--ink-3); margin: 0; font-size: var(--text-md); }
@@ -1673,36 +1680,6 @@ body {
 .posture-seal-pop .pp-more:hover { text-decoration: underline; }
 
 /* Posture screen (one-surface fold): the full posture detail folded in. */
-/* S3: six tiles, so the column count is chosen to divide evenly (3+3 or 2+2+2)
- * rather than left to auto-fit, which orphaned the sixth tile on its own row at
- * common widths once the evidence spine made each tile taller. */
-.posture-metrics {
-  display: grid; grid-template-columns: repeat(2, 1fr);
-  gap: 10px; margin: 8px 0 4px;
-}
-@media (min-width: 760px) { .posture-metrics { grid-template-columns: repeat(3, 1fr); } }
-.posture-metric {
-  display: flex; flex-direction: column; gap: 4px; padding: 12px;
-  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2);
-}
-.posture-metric .pm-v { font-size: var(--text-xl); font-family: var(--serif); font-variant-numeric: tabular-nums; }
-.posture-metric .pm-l {
-  font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-/* S3 evidence spine: the denominator, freshness stamp, and evidence link that
- * hang off a posture tile. The denominator sits beside the value in a lighter
- * sans so the number still reads first; the freshness stamp is mono because it
- * is a measurement; the evidence link is informational indigo, never a status
- * hue, so it can never be misread as a state signal. An absent freshness stamp
- * takes the slate unknown tone (.none), never a pass or a warning colour. */
-/* Deliberately NOT scoped under .posture-metric: the same spine treatment is
- * reused by Today's story footer, which lives outside a tile. The pm- prefix
- * already makes these names unique. */
-.pm-of {
-  font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3);
-  margin-left: 4px; font-weight: 400;
-}
 .pm-foot {
   margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
   justify-content: space-between; gap: 8px; flex-wrap: wrap;
@@ -1739,8 +1716,6 @@ body {
 .boot-placeholder p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
 .card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .card-head-row .btn { white-space: nowrap; }
-.story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--text-sm); user-select: none; }
-.story-toggle input { margin: 0; }
 .story-line { margin: 4px 0; }
 .evidence { margin-top: 8px; font-size: var(--text-sm); }
 .evidence a { color: var(--indigo); text-decoration: none; }
@@ -1870,18 +1845,62 @@ body {
    ring and Checking the hollow solid square in the slate unknown hue,
    never the pass hue. */
 .state-chip {
-  justify-self: start; display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px;
-  border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: nowrap;
+  justify-self: start; display: inline-flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 8px;
+  border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: normal; flex-wrap: wrap;
 }
 .state-chip i { display: inline-block; width: 8px; height: 8px; box-sizing: border-box; flex: none; }
 .state-chip.good { color: var(--sage); background: var(--sage-bg); border-color: var(--sage-line); }
 .state-chip.good i { background: var(--sage); border-radius: 50%; }
 .state-chip.bad { color: var(--rust); background: var(--rust-bg); border-color: var(--rust); }
 .state-chip.bad i { background: var(--rust); }
+.state-chip.warn { color: var(--ochre); background: var(--ochre-bg); border-color: var(--ochre-line); }
+.state-chip.warn i { background: var(--ochre); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .state-chip.checking { color: var(--slate); background: var(--slate-bg); border-color: var(--slate); }
 .state-chip.checking i { background: transparent; border: 1.5px solid var(--slate); border-radius: 0; }
 .state-chip.unknown { color: var(--slate); background: var(--slate-bg); border: 1px dashed var(--slate-line); }
 .state-chip.unknown i { background: transparent; border: 1.5px dotted var(--slate); border-radius: 50%; }
+.state-chip.neutral { color: var(--color-status-neutral); background: var(--color-status-neutral-bg); border-color: var(--color-status-neutral-line); }
+.state-chip.neutral i { width: 8px; height: 2px; background: var(--color-status-neutral); border-radius: 1px; }
+.state-chip.locked { color: var(--locked); background: var(--locked-bg); border-color: var(--locked-line); }
+.state-chip.locked i { background: var(--locked); border-radius: 2px; }
+
+/* Slice 3 Overview: dense security-console composition. Every capped list
+   prints "showing M of N" in its own panel so bounded rendering cannot hide
+   queue depth, findings or rows. */
+.overview-page {
+  --overview-tile-min: 154px;
+  --overview-decision-table-min: 640px; /* 640 = 6 decision columns at the compact operator-console floor. */
+  --overview-agent-table-min: 820px; /* 820 = 9 agent columns including the sticky identity column. */
+  display: flex; flex-direction: column; gap: 16px;
+}
+.overview-tiles { container-type: inline-size; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--overview-tile-min)), 1fr)); gap: 10px; }
+.overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: inherit; text-decoration: none; }
+.overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; text-decoration: none; }
+.overview-tile .ot-label:hover { color: var(--indigo); text-decoration: underline; }
+.overview-tile .ot-value { font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; line-height: 1.1; }
+.overview-tile .ot-evidence { margin-top: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.overview-tile .ot-evidence a { color: var(--indigo); text-decoration: none; }
+.overview-tile .ot-evidence a:hover { text-decoration: underline; }
+.overview-table-scroll { overflow-x: auto; }
+.overview-table { width: 100%; border-collapse: collapse; min-width: 0; font-size: var(--text-sm); }
+.overview-table-decisions { min-width: var(--overview-decision-table-min); }
+.overview-table-agents { min-width: var(--overview-agent-table-min); }
+.overview-table-agents th:first-child, .overview-table-agents td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); }
+.overview-table th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em; }
+.overview-table td { padding: 10px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+.overview-table tr:last-child td { border-bottom: 0; }
+.overview-table .mono { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); }
+.overview-table .muted { color: var(--ink-3); }
+.overview-table .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
+.overview-list { display: flex; flex-direction: column; }
+.overview-list .item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.overview-list .item:last-child { border-bottom: 0; }
+.overview-list .item .body { flex: 1; min-width: 0; }
+.overview-list .item .title { font-weight: 600; }
+.overview-list .item .detail { color: var(--ink-3); font-size: var(--text-xs); margin-top: 2px; }
+.overview-empty { padding: 16px; border: 1px dashed var(--rule-2); border-radius: 8px; background: var(--surface); }
+.overview-empty h2, .overview-empty h3 { margin: 0 0 6px; }
+.overview-empty p { margin: 0 0 10px; color: var(--ink-2); }
 
 `;
 

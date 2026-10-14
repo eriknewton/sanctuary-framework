@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only deletes the pin on the removed Overview metric tile; no assertion is added or changed, so nothing here can fail at the base.
 import { describe, expect, it } from "vitest";
 import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
 import {
@@ -169,10 +170,6 @@ describe("S3 evidence spine: the v1.1 dashboard", () => {
 
   it("renders an explicit no-evidence state for the wall tile", () => {
     expect(client).toContain("no enforcement evidence yet");
-  });
-
-  it("omits a tile denominator that is not a finite number", () => {
-    expect(client).toMatch(/typeof o\.of === "number" && isFinite\(o\.of\)/);
   });
 
   it("keeps the clipboard copy from silently doing nothing", () => {

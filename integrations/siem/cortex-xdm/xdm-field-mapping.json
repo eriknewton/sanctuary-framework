@@ -1,0 +1,35 @@
+{
+  "name": "sanctuary-audit-xdm-raw-fields",
+  "format": "xdm",
+  "verified_by": "repo schema and fixture tests for field names and raw-to-home pairs only",
+  "contract": "mapping must match SIEM_XDM_FIELD_HOMES in server/src/audit/siem-formatter.ts",
+  "dataset": "sanctuary_audit_raw",
+  "raw_fields": [
+    "sanctuary_time",
+    "sanctuary_event_type",
+    "sanctuary_event_description",
+    "sanctuary_event_operation",
+    "sanctuary_event_operation_sub_type",
+    "sanctuary_event_outcome",
+    "sanctuary_event_is_completed",
+    "sanctuary_observer_product",
+    "sanctuary_observer_vendor",
+    "sanctuary_source_user_username",
+    "sanctuary_audit_decision",
+    "sanctuary_audit_result"
+  ],
+  "mapping": [
+    { "raw_field": "sanctuary_time", "xdm_field": "_time" },
+    { "raw_field": "sanctuary_event_type", "xdm_field": "xdm.event.type" },
+    { "raw_field": "sanctuary_event_description", "xdm_field": "xdm.event.description" },
+    { "raw_field": "sanctuary_event_operation", "xdm_field": "xdm.event.operation" },
+    { "raw_field": "sanctuary_event_operation_sub_type", "xdm_field": "xdm.event.operation_sub_type" },
+    { "raw_field": "sanctuary_event_outcome", "xdm_field": "xdm.event.outcome" },
+    { "raw_field": "sanctuary_event_is_completed", "xdm_field": "xdm.event.is_completed" },
+    { "raw_field": "sanctuary_observer_product", "xdm_field": "xdm.observer.product" },
+    { "raw_field": "sanctuary_observer_vendor", "xdm_field": "xdm.observer.vendor" },
+    { "raw_field": "sanctuary_source_user_username", "xdm_field": "xdm.source.user.username" },
+    { "raw_field": "sanctuary_audit_decision", "xdm_field": null, "note": "no standard XDM home; keep as a raw dataset field" },
+    { "raw_field": "sanctuary_audit_result", "xdm_field": null, "note": "no standard XDM home; keep as a raw dataset field" }
+  ]
+}
