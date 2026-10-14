@@ -1,0 +1,30 @@
+{
+  "description": "Sanctuary audit ECS export ingest pipeline. Repo-verified only; no live Elastic tenant drill in this slice.",
+  "processors": [
+    {
+      "set": {
+        "field": "event.dataset",
+        "value": "sanctuary.audit",
+        "if": "ctx.event != null && ctx.event.dataset == null"
+      }
+    },
+    {
+      "set": {
+        "field": "event.module",
+        "value": "sanctuary",
+        "if": "ctx.event != null && ctx.event.module == null"
+      }
+    }
+  ],
+  "fields": [
+    "@timestamp",
+    "event.dataset",
+    "event.module",
+    "event.action",
+    "event.outcome",
+    "event.type",
+    "event.severity",
+    "sanctuary.audit.decision",
+    "sanctuary.audit.result"
+  ]
+}

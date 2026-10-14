@@ -1,0 +1,13 @@
+{
+  "name": "Sanctuary deny burst",
+  "description": "Template correlation rule for repeated deny outcomes. Tune the threshold in the tenant.",
+  "dataset": "sanctuary_audit_raw",
+  "severity": "LOW",
+  "query": "dataset = sanctuary_audit_raw | filter sanctuary.audit.decision = \"deny\" | comp count() as deny_count by xdm.source.identity.username | filter deny_count >= 5",
+  "fields": [
+    "_time",
+    "xdm.source.identity.username",
+    "sanctuary.audit.decision",
+    "xdm.event.operation"
+  ]
+}

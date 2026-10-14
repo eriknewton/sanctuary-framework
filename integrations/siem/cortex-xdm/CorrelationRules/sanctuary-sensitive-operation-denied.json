@@ -1,0 +1,14 @@
+{
+  "name": "Sanctuary sensitive operation denied",
+  "description": "Flags denied identity, state deletion, or reputation import operations.",
+  "dataset": "sanctuary_audit_raw",
+  "severity": "MEDIUM",
+  "query": "dataset = sanctuary_audit_raw | filter sanctuary.audit.decision = \"deny\" and xdm.event.operation in (\"identity_sign\", \"state_delete\", \"reputation_import\")",
+  "fields": [
+    "_time",
+    "xdm.event.operation",
+    "xdm.event.outcome",
+    "sanctuary.audit.decision",
+    "sanctuary.audit.result"
+  ]
+}

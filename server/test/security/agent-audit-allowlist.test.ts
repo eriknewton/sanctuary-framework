@@ -380,7 +380,7 @@ describe("agent-audit-allowlist: audit_export_siem (MED-1, MED-3)", () => {
     await new Promise((r) => setTimeout(r, 50));
     const tool = siemTool(auditLog, "ag-siem");
 
-    for (const format of ["cef", "ocsf"] as const) {
+    for (const format of ["cef", "ocsf", "ecs", "xdm"] as const) {
       const res = await tool.handler({ format });
       const whole = res.content.map((c: { text: string }) => c.text).join("\n");
       expect(whole).not.toContain("tier=");

@@ -4,6 +4,8 @@
  * Formats audit log entries in standard security event formats:
  * - CEF (Common Event Format)
  * - OCSF (Open Cybersecurity Schema Framework)
+ * - ECS (Elastic Common Schema)
+ * - XDM (Cortex Data Model)
  *
  * Used by the agent-callable `audit_export_siem` tool to export events to Splunk,
  * Datadog, and other SIEMs.
@@ -21,6 +23,38 @@
  * correlation) is a legitimate operator need but belongs behind an operator
  * approval gate; re-tiering `audit_export_siem` to Tier-1 is flagged as a
  * recommendation for the operator (see siem-tools.ts).
+ *
+ * ECS mapping table (source -> exported field):
+ * - constant -> ecs.version
+ * - view.timestamp -> @timestamp
+ * - constant -> event.kind
+ * - constant -> event.category
+ * - agentDecision(view) -> event.type
+ * - constant -> event.module
+ * - constant -> event.dataset
+ * - constant -> event.provider
+ * - view.operation -> event.action
+ * - view.result -> event.outcome
+ * - agentDecision(view) -> event.severity
+ * - constant -> service.name
+ * - constant -> service.type
+ * - constant -> user.id
+ * - agentDecision(view) -> sanctuary.audit.decision
+ * - view.result -> sanctuary.audit.result
+ *
+ * XDM mapping table (source -> exported field):
+ * - view.timestamp -> _time
+ * - constant -> xdm.event.type
+ * - view.operation -> xdm.event.description
+ * - view.operation -> xdm.event.operation
+ * - agentDecision(view) -> xdm.event.operation_sub_type
+ * - view.result -> xdm.event.outcome
+ * - view.result -> xdm.event.is_completed
+ * - constant -> xdm.observer.product
+ * - constant -> xdm.observer.vendor
+ * - constant -> xdm.source.identity.username
+ * - agentDecision(view) -> sanctuary.audit.decision
+ * - view.result -> sanctuary.audit.result
  */
 
 import type { AgentAuditView } from "../operational/agent-audit-redaction.js";
@@ -36,6 +70,40 @@ import type { AgentAuditView } from "../operational/agent-audit-redaction.js";
  * (the agent's own observed outcome) and the entry `result`.
  */
 export type AgentDecision = "allow" | "deny";
+
+export const SIEM_ECS_FIELD_MAPPING = {
+  ecsVersion: "ecs.version",
+  timestamp: "@timestamp",
+  eventKind: "event.kind",
+  eventCategory: "event.category",
+  eventType: "event.type",
+  eventModule: "event.module",
+  eventDataset: "event.dataset",
+  eventProvider: "event.provider",
+  eventAction: "event.action",
+  eventOutcome: "event.outcome",
+  eventSeverity: "event.severity",
+  serviceName: "service.name",
+  serviceType: "service.type",
+  userId: "user.id",
+  sanctuaryDecision: "sanctuary.audit.decision",
+  sanctuaryResult: "sanctuary.audit.result",
+} as const;
+
+export const SIEM_XDM_FIELD_MAPPING = {
+  timestamp: "_time",
+  eventType: "xdm.event.type",
+  eventDescription: "xdm.event.description",
+  eventOperation: "xdm.event.operation",
+  eventOperationSubType: "xdm.event.operation_sub_type",
+  eventOutcome: "xdm.event.outcome",
+  eventIsCompleted: "xdm.event.is_completed",
+  observerProduct: "xdm.observer.product",
+  observerVendor: "xdm.observer.vendor",
+  sourceIdentityUsername: "xdm.source.identity.username",
+  sanctuaryDecision: "sanctuary.audit.decision",
+  sanctuaryResult: "sanctuary.audit.result",
+} as const;
 
 /**
  * Normalize the agent-safe coarse outcome from the allowlisted `decision` value
@@ -205,5 +273,123 @@ export function formatAsOCSF(view: AgentAuditView, safeDecision?: string): OCSFO
         version: "0.7.0",
       },
     },
+  };
+}
+
+// ── ECS (Elastic Common Schema) Formatter ───────────────────────────────
+
+export interface ECSObject {
+  "@timestamp": string;
+  ecs: { version: string };
+  event: {
+    kind: "event";
+    category: ["configuration"];
+    type: ["allowed"] | ["denied"];
+    module: "sanctuary";
+    dataset: "sanctuary.audit";
+    provider: "sanctuary-mcp";
+    action: string;
+    outcome: "success" | "failure";
+    severity: 1 | 8;
+  };
+  service: { name: "sanctuary-mcp"; type: "mcp" };
+  user: { id: "self" };
+  sanctuary: {
+    audit: {
+      decision: AgentDecision;
+      result: "success" | "failure";
+    };
+  };
+}
+
+function agentToECSSeverity(decision: AgentDecision): 1 | 8 {
+  return decision === "deny" ? 8 : 1;
+}
+
+/**
+ * Format an agent-facing audit view as ECS (Elastic Common Schema).
+ *
+ * The object uses standard ECS fields where a direct home exists; Sanctuary's
+ * coarse allow/deny projection is duplicated under `sanctuary.audit.decision`
+ * because ECS has no exact field for the collapsed gate decision. The formatter
+ * consumes only the redacted agent view and never raw audit details.
+ */
+export function formatAsECS(view: AgentAuditView, safeDecision?: string): ECSObject {
+  const decision = agentDecision(view, safeDecision);
+
+  return {
+    "@timestamp": view.timestamp,
+    ecs: {
+      version: "8.11.0",
+    },
+    event: {
+      kind: "event",
+      category: ["configuration"],
+      type: decision === "deny" ? ["denied"] : ["allowed"],
+      module: "sanctuary",
+      dataset: "sanctuary.audit",
+      provider: "sanctuary-mcp",
+      action: view.operation,
+      outcome: view.result,
+      severity: agentToECSSeverity(decision),
+    },
+    service: {
+      name: "sanctuary-mcp",
+      type: "mcp",
+    },
+    user: {
+      // The export is already scoped to the caller's own identity; a fixed
+      // sentinel keeps the raw agent DID out of the SIEM record.
+      id: "self",
+    },
+    sanctuary: {
+      audit: {
+        decision,
+        result: view.result,
+      },
+    },
+  };
+}
+
+// ── XDM (Cortex Data Model) Formatter ───────────────────────────────────
+
+export interface XDMObject {
+  _time: number;
+  "xdm.event.type": "application";
+  "xdm.event.description": string;
+  "xdm.event.operation": string;
+  "xdm.event.operation_sub_type": AgentDecision;
+  "xdm.event.outcome": "success" | "failure";
+  "xdm.event.is_completed": true;
+  "xdm.observer.product": "Sanctuary Framework";
+  "xdm.observer.vendor": "Erik Newton";
+  "xdm.source.identity.username": "self";
+  "sanctuary.audit.decision": AgentDecision;
+  "sanctuary.audit.result": "success" | "failure";
+}
+
+/**
+ * Format an agent-facing audit view as Cortex Data Model shaped JSON.
+ *
+ * XDM fields are emitted as dotted keys because Cortex data model rules map raw
+ * JSON fields into the system schema. The Sanctuary namespace carries only the
+ * coarse decision/result values already exposed by CEF and OCSF.
+ */
+export function formatAsXDM(view: AgentAuditView, safeDecision?: string): XDMObject {
+  const decision = agentDecision(view, safeDecision);
+
+  return {
+    _time: new Date(view.timestamp).getTime(),
+    "xdm.event.type": "application",
+    "xdm.event.description": `Sanctuary ${view.operation}`,
+    "xdm.event.operation": view.operation,
+    "xdm.event.operation_sub_type": decision,
+    "xdm.event.outcome": view.result,
+    "xdm.event.is_completed": true,
+    "xdm.observer.product": "Sanctuary Framework",
+    "xdm.observer.vendor": "Erik Newton",
+    "xdm.source.identity.username": "self",
+    "sanctuary.audit.decision": decision,
+    "sanctuary.audit.result": view.result,
   };
 }

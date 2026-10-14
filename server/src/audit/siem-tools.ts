@@ -2,7 +2,7 @@
  * Sanctuary MCP Server — SIEM Export Tool
  *
  * Registers the audit_export_siem MCP tool that exports audit log entries
- * in standard SIEM formats (CEF and OCSF).
+ * in standard SIEM formats (CEF, OCSF, ECS, and XDM).
  *
  * Tier 1: Operator approval required. SIEM forwarding is an operator function;
  * the export bulk-decrypts audit events across all principals, each carrying its
@@ -15,8 +15,18 @@
 import type { ToolDefinition } from "../router.js";
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { SessionBinding } from "../agent-native/safety-base.js";
-import { formatAsCEF, formatAsOCSF, agentDecision } from "./siem-formatter.js";
+import {
+  formatAsCEF,
+  formatAsECS,
+  formatAsOCSF,
+  formatAsXDM,
+  agentDecision,
+} from "./siem-formatter.js";
 import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
+
+type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
+
+const SIEM_EXPORT_FORMATS: SIEMExportFormat[] = ["cef", "ocsf", "ecs", "xdm"];
 
 export function createSIEMTools(
   auditLog: AuditLog,
@@ -31,17 +41,17 @@ export function createSIEMTools(
     {
       name: "audit_export_siem",
       description:
-        "Export the caller's own redacted audit view in CEF or OCSF (for SIEMs such as Splunk or " +
-        "Datadog). Raw policy tier, rule ids, system/gate entries, and approve-vs-auto distinctions " +
+        "Export the caller's own redacted audit view in CEF, OCSF, ECS, or XDM for SIEM ingestion. " +
+        "Raw policy tier, rule ids, system/gate entries, and approve-vs-auto distinctions " +
         "are not included; Tier 1 approval still required (bulk audit export).",
       inputSchema: {
         type: "object",
         properties: {
           format: {
             type: "string",
-            enum: ["cef", "ocsf"],
+            enum: SIEM_EXPORT_FORMATS,
             description:
-              'Output format: "cef" (Common Event Format, newline-delimited) or "ocsf" (Open Cybersecurity Schema Framework, JSON array)',
+              'Output format: "cef" (Common Event Format, newline-delimited), "ocsf" (Open Cybersecurity Schema Framework, JSON array), "ecs" (Elastic Common Schema, JSON array), or "xdm" (Cortex Data Model, JSON array)',
           },
           since: {
             type: "string",
@@ -90,14 +100,14 @@ export function createSIEMTools(
       },
       handler: async (args) => {
         // Parse and validate inputs
-        const format = String(args.format || "").toLowerCase();
-        if (format !== "cef" && format !== "ocsf") {
+        const format = String(args.format || "").toLowerCase() as SIEMExportFormat;
+        if (!SIEM_EXPORT_FORMATS.includes(format)) {
           return {
             content: [
               {
                 type: "text" as const,
                 text: JSON.stringify({
-                  error: "Invalid format. Must be 'cef' or 'ocsf'.",
+                  error: "Invalid format. Must be 'cef', 'ocsf', 'ecs', or 'xdm'.",
                 }),
               },
             ],
@@ -266,11 +276,21 @@ export function createSIEMTools(
             formatAsCEF(redactAuditEntryForAgent(entry))
           );
           output = cefLines.join("\n");
-        } else {
+        } else if (format === "ocsf") {
           const ocsfObjects = filtered.map((entry: AuditEntry) =>
             formatAsOCSF(redactAuditEntryForAgent(entry))
           );
           output = JSON.stringify(ocsfObjects, null, 2);
+        } else if (format === "ecs") {
+          const ecsObjects = filtered.map((entry: AuditEntry) =>
+            formatAsECS(redactAuditEntryForAgent(entry))
+          );
+          output = JSON.stringify(ecsObjects, null, 2);
+        } else {
+          const xdmObjects = filtered.map((entry: AuditEntry) =>
+            formatAsXDM(redactAuditEntryForAgent(entry))
+          );
+          output = JSON.stringify(xdmObjects, null, 2);
         }
 
         return {
@@ -294,7 +314,7 @@ export function createSIEMTools(
                 note:
                   format === "cef"
                     ? `${filtered.length} CEF events (newline-delimited). Each line is a complete CEF event.`
-                    : `${filtered.length} OCSF objects in JSON array format.`,
+                    : `${filtered.length} ${format.toUpperCase()} objects in JSON array format.`,
               }),
             },
             {

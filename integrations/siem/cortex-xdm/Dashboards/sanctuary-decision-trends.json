@@ -1,0 +1,19 @@
+{
+  "name": "Sanctuary Decision Trends",
+  "description": "Coarse allow and deny trends for XDM-shaped Sanctuary audit exports.",
+  "dataset": "sanctuary_audit_raw",
+  "widgets": [
+    {
+      "type": "line",
+      "title": "Decision trend",
+      "query": "dataset = sanctuary_audit_raw | comp count() by bin(_time, 1h), sanctuary.audit.decision",
+      "fields": ["_time", "sanctuary.audit.decision"]
+    },
+    {
+      "type": "table",
+      "title": "Recent denied operations",
+      "query": "dataset = sanctuary_audit_raw | filter sanctuary.audit.decision = \"deny\" | fields _time, xdm.event.operation, xdm.event.outcome, sanctuary.audit.result",
+      "fields": ["_time", "xdm.event.operation", "xdm.event.outcome", "sanctuary.audit.result"]
+    }
+  ]
+}

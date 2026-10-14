@@ -16,7 +16,7 @@
  *      module.
  *
  * Plus the SIEM export path (siem-formatter / siem-tools) that renders audit
- * entries as CEF/OCSF for Splunk, Datadog, and QRadar, and the reset-history
+ * entries as CEF/OCSF/ECS/XDM for SIEM ingestion, and the reset-history
  * continuity helper that re-commits post-nuke reset markers into the
  * freshly-rebuilt audit log on boot.
  */
