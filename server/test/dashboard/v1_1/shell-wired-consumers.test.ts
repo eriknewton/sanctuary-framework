@@ -1764,10 +1764,12 @@ describe("slice 5 Evidence wired consumers", () => {
 
   it("exports JSON through api with the operator token and keeps unavailable exports disabled with reasons", async () => {
     const blobs: Blob[] = [];
+    const exportedEntry = { timestamp: now, layer: "l1", operation: "egress", identity_id: "research-agent", result: "failure" };
     const h = await bootEvidence(evidencePayload(), {
       "/api/audit-log": (init) => {
         expect(init?.headers).toMatchObject({ Authorization: "Bearer operator-token" });
-        return Promise.resolve(response({ entries: [] }));
+        // Retargeted to the served shape: handleAuditLog answers with an entry array, not an object.
+        return Promise.resolve(response([exportedEntry]));
       },
     }, {
       sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
@@ -1784,7 +1786,55 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
     expect(h.downloads).toHaveLength(1);
     expect((h.downloads[0] as unknown as { download: string }).download).toBe("sanctuary-audit-log.json");
-    expect(JSON.parse(await blobs[0]!.text())).toEqual({ entries: [] });
+    expect(JSON.parse(await blobs[0]!.text())).toEqual([exportedEntry]);
+  });
+
+  it("the JSON export names its bound and reports an empty audit log read instead of downloading a file", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response([])),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    expect(h.el.main!.innerHTML).toContain("JSON: latest 50 audit entries");
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.requests.some((r) => r.url === "/api/audit-log?limit=50")).toBe(true);
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("downloaded");
+  });
+
+  it("a result filter says it checks only the most recent page while the count covers every result", async () => {
+    const h = await bootEvidence(evidencePayload({ total: 120 }));
+    expect(h.el.main!.innerHTML).not.toContain("data-evidence-result-scope");
+    const result = new FakeElement({ "data-action": "evidence-filter-result" }, "SELECT");
+    result.value = "failure"; h.change(result);
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(h.requests.at(-1)!.url).toContain("result=failure");
+    expect(html).toContain("showing 2 of 120");
+    expect(html).toContain("The result filter checks the 50 most recent entries in the window; 120 counts entries of every result.");
+  });
+
+  it("the Evidence inbox decides only Tier 2 approvals inline and sends Tier 1 and unknown tiers to Approvals", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const inboxItems = [
+      { ...heldItem, item_id: "t1", tier: "tier1", created_at: "2026-10-14T16:50:00.000Z" },
+      { ...heldItem, item_id: "t2", tier: "tier2", created_at: "2026-10-14T16:51:00.000Z" },
+      { ...heldItem, item_id: "tx", tier: undefined, created_at: "2026-10-14T16:52:00.000Z" },
+    ];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2"');
+    expect(html).toContain('data-action="inbox-deny" data-item-id="t2"');
+    for (const id of ["t1", "tx"]) {
+      expect(html).not.toContain('data-action="inbox-approve" data-item-id="' + id + '"');
+      expect(html).not.toContain('data-action="inbox-deny" data-item-id="' + id + '"');
+      expect(html).toContain('href="#approvals" data-evidence-review="' + id + '">Review in Approvals</a>');
+    }
   });
 
   it("keeps the old Activity inbox, agent, Recognition and batch controls on Evidence", async () => {

@@ -3196,6 +3196,9 @@ const EVIDENCE_DETAIL_VALUE_MAX_CHARS = 240; // 240 = four 60-char lines in the 
 const EVIDENCE_RAW_RECORD_MAX_CHARS = 6000; // 6000 = about 100 60-char lines, enough for inspection without unbounded DOM growth.
 const EVIDENCE_DETAIL_KEY_LIMIT = EVIDENCE_PAGE_SIZE; // One record gets at most the same row budget as one audit page.
 const EVIDENCE_FINDING_DISPLAY_LIMIT = 5; // Five findings fit in the strip before the table leaves the first viewport.
+// Must match the limit default in handleAuditLog in server/src/principal-policy/dashboard.ts: the audit
+// log read serves the most recent entries up to this limit, so the export says it is that bound.
+const EVIDENCE_JSON_EXPORT_LIMIT = 50;
 
 function evidenceLayerName(layer) {
   return EVIDENCE_LAYER_NAMES[layer] || "Unknown";
@@ -3522,7 +3525,7 @@ function renderEvidenceDrawer(entry) {
 
 function renderEvidenceExports() {
   return '<section class="card evidence-export"><h3>Export</h3><div class="toolbar">' +
-    '<button class="btn" data-action="evidence-export-json">JSON audit log</button>' +
+    '<button class="btn" data-action="evidence-export-json">JSON: latest ' + EVIDENCE_JSON_EXPORT_LIMIT + ' audit entries</button>' +
     '<button class="btn" disabled title="CEF export is available from the audit_export_siem tool, not from this dashboard yet.">CEF unavailable from this dashboard</button>' +
     '<button class="btn" disabled title="Compliance bundle export is Tier 1 through compliance_generate_eu_ai_act_bundle, not from this dashboard yet.">Compliance bundle unavailable from this dashboard</button>' +
     '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
@@ -3548,6 +3551,11 @@ function renderActivityScreen() {
   if (!shown[state.evidence.selectedIndex]) state.evidence.selectedIndex = 0;
   const selected = shown[state.evidence.selectedIndex] || null;
   const total = view && typeof view.total === "number" ? view.total : "Unknown";
+  // buildEvidence applies the page limit before the result filter and serves total before both, so a
+  // result filter narrows only the most recent page, and the count says so.
+  const resultScopeLine = state.evidence.filters.result
+    ? '<p class="muted" data-evidence-result-scope="1">The result filter checks the ' + EVIDENCE_PAGE_SIZE + ' most recent entries in the window; ' + escHtml(total) + ' counts entries of every result.</p>'
+    : "";
   const searchedLine = state.evidence.filters.query
     ? "searching the " + entries.length + " entries loaded"
     : "search is local to the " + entries.length + " entries loaded";
@@ -3557,7 +3565,7 @@ function renderActivityScreen() {
       : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
     : "";
   const table = sourceLoaded("/api/posture/evidence")
-    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(total) + '</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + ' · ' + escHtml(searchedLine) + '</span></div>' +
+    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(total) + '</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + ' · ' + escHtml(searchedLine) + '</span></div>' + resultScopeLine +
       (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Result</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
     : '<section class="panel evidence-entries" aria-label="Entries"><div class="overview-empty"><h3>Entries Unknown</h3><p>The server verification read has not loaded entries.</p></div></section>';
   const operations = renderEvidenceOperationsSection();
@@ -3653,9 +3661,14 @@ function renderEvidenceOperationsSection() {
     function renderInboxRow(i) {
       var text = renderTemplate(i.display_template_id, i.display_template_args);
       var actions = inboxActions(i);
-      var buttons = actions.map(function (act) {
-        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-      }).join("");
+      // Invariant: as on the Overview, a held approval is decided inline only at Tier 2; every other
+      // served tier links to Approvals, where a Tier 1 decision takes the drawer's two steps.
+      var reviewInApprovals = i.kind === "approval_pending" && i.tier !== "tier2";
+      var buttons = reviewInApprovals
+        ? '<a class="btn" href="#approvals" data-evidence-review="' + escHtml(i.item_id) + '">Review in Approvals</a>'
+        : actions.map(function (act) {
+          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
+        }).join("");
       var tierBadge = i.kind === "approval_pending"
         ? '<span class="pill">' + escHtml(i.tier) + '</span>'
         : '<span class="pill">' + escHtml(i.kind) + '</span>';
@@ -5872,9 +5885,16 @@ async function onExitExportStart() {
 
 async function onEvidenceJsonExport() {
   try {
-    const body = await api("/api/audit-log", { method: "GET" });
+    const body = await api("/api/audit-log?limit=" + EVIDENCE_JSON_EXPORT_LIMIT, { method: "GET" });
+    // The audit log read answers with an entry array, and with an empty array both for an empty log and
+    // for a log it could not read, so an empty answer is reported as no entries, never as a downloaded log.
+    if (!Array.isArray(body)) throw new Error("the audit log read did not return entries");
+    if (!body.length) {
+      toast("No audit entries were returned, so nothing was exported. The audit log read returns none both for an empty log and for a log it could not read.", "info");
+      return;
+    }
     downloadJsonFile(body, "sanctuary-audit-log.json");
-    toast("Audit log JSON export downloaded.", "info");
+    toast("Downloaded the latest " + body.length + " audit entries as JSON (at most " + EVIDENCE_JSON_EXPORT_LIMIT + ").", "info");
   } catch (e) {
     toast("Audit log JSON export failed: " + (e && e.message ? e.message : "unknown"), "error");
   }
