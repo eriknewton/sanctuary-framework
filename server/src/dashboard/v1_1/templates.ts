@@ -101,8 +101,9 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
+  // Must match "approval_pending.tier1.unwrap" in client.ts.
   "approval_pending.tier1.unwrap": (a) =>
-    `Unwrap request for agent ${arg(a, "agent_id")}. This build refuses unsupported unwraps before approval is queued.`,
+    `Request to remove protection from agent ${arg(a, "agent_id")}. This build refuses unsupported removals before approval is queued.`,
   "approval_pending.tier1.policy_change": (a) =>
     `Bind agent ${arg(a, "agent_id")} to policy ${arg(a, "policy_id")}.`,
   "approval_pending.tier1.policy_change_template": (a) =>
