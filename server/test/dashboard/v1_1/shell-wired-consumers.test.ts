@@ -28,7 +28,30 @@ import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import type { TypeAliasDeclaration, UnionTypeNode, LiteralTypeNode, StringLiteral, TypeLiteralNode, PropertySignature, Identifier } from "typescript";
+const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
+import type { AuditChainVerdictStatus } from "../../../src/operational/audit-log.js";
+
+// Read the source union at runtime: vitest does not typecheck test files.
+function unionValues(name: string) {
+  const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
+  return (alias.type as UnionTypeNode).types.map((node) => ((node as LiteralTypeNode).literal as StringLiteral).text).sort();
+}
+
+// The `status` literal of each member of an object-type union such as SealedRegionVerdict.
+function unionStatusValues(name: string) {
+  const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
+  return (alias.type as UnionTypeNode).types.map((node) => {
+    const member = (node as TypeLiteralNode).members.find((m) => m.name && (m.name as Identifier).text === "status") as PropertySignature;
+    return ((member.type as LiteralTypeNode).literal as StringLiteral).text;
+  }).sort();
+}
 
 const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
   ok: status >= 200 && status < 300,
@@ -67,6 +90,7 @@ class FakeElement {
   checked = false;
   value = "";
   replaceCount = 0;
+  style: Record<string, string> = {};
   private classes = new Set<string>();
   constructor(attrs: Record<string, string> = {}, tagName = "DIV") { this.attrs = { ...attrs }; this.tagName = tagName.toUpperCase(); }
   get innerHTML() { return this.children.length ? this.children.map((c) => c.outerHTML).join("") : this.html; }
@@ -143,6 +167,12 @@ class FakeElement {
     this.children.push(child);
     return child;
   }
+  removeChild(child: FakeElement | FakeText) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    if (child instanceof FakeElement) child.parentElement = null;
+    return child;
+  }
   append(...children: Array<FakeElement | FakeText | string>) {
     children.forEach((child) => this.appendChild(typeof child === "string" ? new FakeText(child) : child));
   }
@@ -154,6 +184,7 @@ class FakeElement {
     this.append(...children);
   }
   focus() { fakeActiveElement = this; }
+  click() {}
   remove() {}
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
@@ -182,11 +213,13 @@ const SHELL_IDS = [
   "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
-function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
   fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
+  const body = new FakeElement({}, "BODY");
+  const downloads: FakeElement[] = [];
   // The rail pill sits inside its rail link, which carries the sentence.
   const railLink = new FakeElement();
   el["rail-approvals-count"]!.parentElement = railLink;
@@ -204,26 +237,35 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     search: "",
     origin: "http://fixture",
   };
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
   const context = createContext({
     document: {
       getElementById: (id: string) => el[id] || (id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: "/api/hub" }) } : null),
       addEventListener: (name: string, fn: (ev: unknown) => void) => { docListeners[name] = fn; },
-      createElement: (tagName: string) => new FakeElement({}, tagName),
+      createElement: (tagName: string) => {
+        const node = new FakeElement({}, tagName);
+        if (tagName === "a") node.click = () => { downloads.push(node); };
+        return node;
+      },
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [],
       get activeElement() { return fakeActiveElement; },
       set activeElement(value: unknown) { fakeActiveElement = value; },
+      body,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
     window: { addEventListener: (name: string, fn: () => void) => { winListeners[name] = fn; } },
     location, sessionStorage: { getItem: () => null, setItem() {} },
-    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput,
+    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput, Blob,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     fetch: (url: string, init?: RequestInit) => {
       const path = url.replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, "");
-      if (overrides[path]) return overrides[path]!(init);
+      requests.push({ url: path, init });
+      if (overrides[path]) return overrides[path]!(init, path);
+      const bare = path.split("?")[0]!;
+      if (overrides[bare]) return overrides[bare]!(init, path);
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
     ...extraGlobals,
@@ -233,7 +275,8 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   const click = (attrs: Record<string, string>, inside: string[] = [], checked = false) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
-    target.checked = checked;
+    // Both forms stay: slice 5's tests pass `checked: "true"` in attrs, slice 4's pass the third argument.
+    target.checked = checked || attrs.checked === "true";
     docListeners.click!({ target });
   };
   const clickRenderedButton = (action: string) => {
@@ -246,7 +289,8 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
   const change = (target: FakeElement) => docListeners.change!({ target });
-  return { el, railLink, context, navigate, click, clickRenderedButton, type, change };
+  const input = (action: string, value: string) => { const target = new FakeInput({ "data-action": action }); target.value = value; docListeners.input!({ target }); };
+  return { el, railLink, context, navigate, click, clickRenderedButton, type, change, input, requests, downloads };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => {
@@ -519,6 +563,33 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("activity");
     expect(h.el.main!.innerHTML).toContain("Nothing pending.");
+  });
+
+  it("Evidence says entries are Unknown when the verification read has not answered", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-10T12:00:00Z"));
+    const h = boot({ "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")) });
+    await settle();
+    const select = new FakeElement({ "data-action": "time-range" }) as FakeElement & { tagName: string };
+    select.tagName = "SELECT";
+    select.value = "24h";
+    h.navigate("activity");
+    // The operator picks the 24 hours range in the top bar.
+    h.change(select);
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Entries Unknown");
+    expect(main).toContain("Chain verification Unknown");
+    expect(main).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("Evidence says no entries match only after the server evidence read loads", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })),
+    });
+    await settle();
+    h.navigate("activity");
+    expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
   });
 
   it("the Approvals subtitle says where each decision is recorded", async () => {
@@ -1628,14 +1699,19 @@ describe("slice 2b shell wired consumers", () => {
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })),
+    });
     await settle();
     h.navigate("activity");
     const html = h.el.main!.innerHTML;
-    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter the inbox">([\s\S]*?)<\/div>/);
+    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter evidence entries">([\s\S]*?)<\/div>/);
     expect(bar, "filter bar").toBeTruthy();
     const labels = [...bar![1]!.matchAll(/<label class="field"><span class="field-label">([^<]+)<\/span><(input|select) class="input"/g)].map((m) => m[1]);
-    expect(labels).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    // The activity route's first filter bar is now the Evidence query bar; the kept inbox bar's six labels are
+    // pinned in "keeps the old Activity inbox, agent, Recognition and batch controls on Evidence".
+    expect(labels).toEqual(["Layer", "Agent", "Event", "Result", "From"]);
+    expect(bar![1]).toContain("Query");
     expect(bar![1]).not.toContain("<br>");
   });
 
@@ -1652,6 +1728,549 @@ describe("slice 2b shell wired consumers", () => {
     expect(out.match(/<span class="trend-bar (good|warn|pending)"/g)).toHaveLength(4);
     expect(textOf(out).replace(/\s+/g, " ").trim()).toBe("2 went ahead 1 stopped 1 other");
   });
+});
+
+describe("slice 5 Evidence wired consumers", () => {
+  const now = "2026-10-14T17:00:00.000Z";
+  const evidencePayload = (overrides: Record<string, unknown> = {}) => ({
+    origin_machine: "fixture-mac",
+    // Served oldest first, as AuditLog.query returns its most recent page; the table lists it newest first.
+    entries: [
+      {
+        timestamp: "2026-10-14T16:57:00.000Z",
+        layer: "l2",
+        identity_id: "sentinel-agent",
+        operation: "sentinel_finding",
+        result: "success",
+        details: { summary: "Finding opened" },
+      },
+      {
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer: "l1",
+        identity_id: "research-agent",
+        operation: "egress",
+        result: "failure",
+        details: {
+          destination: "198.51.100.23:8080",
+          rule_id: "policy-v41/rule-2",
+          agent_saw: "<script>alert(1)</script>",
+          event_text: "<img src=x onerror=alert(1)>",
+        },
+      },
+    ],
+    total: 2,
+    integrity_findings: [],
+    chain_verdict: "verified",
+    sealed_region: { status: "not_present" },
+    ...overrides,
+  });
+  const bootEvidence = async (
+    evidence: Record<string, unknown> = evidencePayload(),
+    overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {},
+    extraGlobals: Record<string, unknown> = {},
+  ) => {
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response(evidence)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      ...overrides,
+    }, extraGlobals);
+    await settle();
+    h.navigate("activity");
+    await settle();
+    return h;
+  };
+
+  it("renders every audit-chain verdict in its own words, plus failed and missing reads", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+
+    const cases: Record<AuditChainVerdictStatus, { body: Record<string, unknown>; text: string }> = {
+      verified: { body: evidencePayload(), text: "CHAIN VERIFIED" },
+      verified_suffix_only: { body: evidencePayload({ chain_verdict: "verified_suffix_only", sealed_region: { status: "unreadable", note: "operator privilege cannot read sealed region" } }), text: "RECENT ENTRIES VERIFIED" },
+      findings: { body: evidencePayload({ chain_verdict: "findings", integrity_findings: [{ kind: "entry_hash_mismatch", message: "entry mismatch" }] }), text: "INTEGRITY FINDINGS" },
+      key_unavailable: { body: evidencePayload({ chain_verdict: "key_unavailable" }), text: "NOT VERIFIED" },
+    };
+    expect(Object.keys(cases).sort()).toEqual(unionValues("AuditChainVerdictStatus"));
+    for (const status of Object.keys(cases) as AuditChainVerdictStatus[]) {
+      const h = await bootEvidence(cases[status].body);
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain(cases[status].text);
+      if (status !== "verified") expect(html).not.toContain("CHAIN VERIFIED");
+      expect(html, status).toContain("sealed region:");
+      // The read's age is stated on every verdict, never as a verification time.
+      expect(html, status).toContain("age of this read:");
+      expect(html, status).not.toContain("last verified");
+      expect(html, status).not.toContain("signer");
+      expect(html, status).not.toContain("head <span");
+    }
+    const failed = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")),
+    });
+    expect(failed.el.main!.innerHTML).toContain("Chain verification Unknown");
+    expect(failed.el.main!.innerHTML).toContain("verification offline");
+    const missing = await bootEvidence(evidencePayload(), { "/api/posture/evidence": never });
+    expect(missing.el.main!.innerHTML).toContain("Chain verification Unknown");
+    expect(missing.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("a served finding reads as INTEGRITY FINDINGS under any served verdict, and the findings line covers the whole chain", async () => {
+    for (const status of ["verified", "verified_suffix_only", "key_unavailable"] as const) {
+      const h = await bootEvidence(evidencePayload({ chain_verdict: status, integrity_findings: [{ kind: "entry_hash_mismatch", message: "entry mismatch" }] }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("INTEGRITY FINDINGS");
+      expect(html, status).not.toContain("CHAIN VERIFIED");
+      expect(html, status).not.toContain("RECENT ENTRIES VERIFIED");
+    }
+    const clean = await bootEvidence(evidencePayload());
+    expect(clean.el.main!.innerHTML).toContain("integrity findings reported for the whole chain");
+    expect(clean.el.main!.innerHTML).not.toContain("findings in window");
+  });
+
+  it("words every served sealed region status, over the full SealedRegionVerdict union", async () => {
+    const statuses = unionStatusValues("SealedRegionVerdict");
+    expect(statuses.length).toBeGreaterThan(0);
+    for (const status of statuses) {
+      const h = await bootEvidence(evidencePayload({ sealed_region: { status, entries_verified: 3, note: "fixture note", expected_tip: 9, highest_present: 7, sequence: 4 } }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("sealed region: ");
+      expect(html, status).not.toContain("sealed region: Unknown");
+    }
+    const unknown = await bootEvidence(evidencePayload({ sealed_region: { status: "not_a_served_status" } }));
+    expect(unknown.el.main!.innerHTML).toContain("sealed region: Unknown");
+  });
+
+  it("renders only served entry fields and result words, never chain verdict words as entry results", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: [
+        {
+          timestamp: "2026-10-14T16:58:00.000Z",
+          layer: "l3",
+          operation: "proof_commitment",
+          identity_id: "",
+          result: "success",
+          details: { summary: "served field only" },
+        },
+      ],
+      total: 1,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("agent not named");
+    expect(html).toContain("proof_commitment");
+    expect(html).toContain("Success");
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table).not.toMatch(/VERIFIED|BROKEN|Verdict/);
+    expect(table).toContain("<th>Result</th>");
+    expect(html).not.toContain("<td><span class=\"row\">fortress</span></td>");
+    expect(html).not.toContain("<th>Seq</th>");
+    expect(html).not.toContain("<th>Seal</th>");
+  });
+
+  it("the Evidence subtitle names the audit log and claims neither completeness nor tamper evidence", async () => {
+    const h = await bootEvidence(evidencePayload());
+    const sub = h.el.main!.innerHTML.match(/<p class="eyebrow">Evidence<\/p>[\s\S]*?<p class="sub">([^<]*)<\/p>/)?.[1] ?? "";
+    expect(sub).toContain("audit log");
+    // Integrity is the strip's to state from the served verdict, and inbox decisions are not in this log.
+    expect(sub).not.toMatch(/tamper|everything/i);
+  });
+
+  it("maps layer names to frozen tokens and sends every server filter as the route param", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: ["l1", "l2", "l3", "l4"].map((layer) => ({
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer,
+        identity_id: "agent-" + layer,
+        operation: "event-" + layer,
+        result: "success",
+        details: {},
+      })),
+      total: 4,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Castle Wall");
+    expect(html).toContain("Sentinels");
+    expect(html).toContain("Charter");
+    expect(html).toContain("Heralds");
+    const layers = { l1: "Castle Wall", l2: "Sentinels", l3: "Charter", l4: "Heralds" };
+    const routeSource = readFileSync(new URL("../../../src/principal-policy/posture-routes.ts", import.meta.url), "utf8");
+    const servedLayers = JSON.parse("[" + routeSource.match(/const validLayers = \[([^\]]+)\]/)![1] + "]");
+    expect(Object.keys(layers).sort()).toEqual(servedLayers.sort());
+    for (const [token, name] of Object.entries(layers)) {
+      h.navigate("activity?layer=" + token);
+      await settle();
+      expect(h.el.main!.innerHTML).toContain('value="' + token + '" selected>' + name);
+      expect(h.requests.at(-1)!.url).toContain("layer=" + token);
+      const select = new FakeElement({ "data-action": "evidence-filter-layer" }, "SELECT");
+      select.value = ""; h.change(select); await settle();
+      select.value = token; h.change(select); await settle();
+      expect(runInContext("location.hash", h.context)).toContain("layer=" + token);
+      expect(h.requests.at(-1)!.url).toContain("layer=" + token);
+    }
+    h.input("evidence-filter-agent", "agent-alpha");
+    h.input("evidence-filter-event", "egress");
+    const result = new FakeElement({ "data-action": "evidence-filter-result" }, "SELECT");
+    result.value = "failure"; h.change(result);
+    h.input("evidence-filter-from", "2026-10-14");
+    await settle();
+    const request = new URL(h.requests.at(-1)!.url, "http://fixture");
+    // The From date is the operator's calendar date, so it is sent as that date's local midnight.
+    expect(Object.fromEntries(request.searchParams)).toEqual({ layer: "l4", agent: "agent-alpha", operation_type: "egress", result: "failure", since: new Date(2026, 9, 14).toISOString(), limit: "50" });
+    h.navigate("activity"); await settle();
+    expect(h.requests.at(-1)!.url).toBe("/api/posture/evidence?limit=50");
+  });
+
+  it("the top-bar time range narrows the entries read, and the later of it and the From date starts the window", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-14T17:00:30.000Z"));
+    const h = await bootEvidence(evidencePayload());
+    expect(h.el.main!.innerHTML).toContain("Time range: all time");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    // The range start is rounded down to the minute.
+    const rangeStart = "2026-10-13T17:00:00.000Z";
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(rangeStart);
+    expect(h.el.main!.innerHTML).toContain("Time range: the last 24 hours");
+    h.input("evidence-filter-from", "2026-10-14");
+    await settle();
+    const later = new Date(Math.max(new Date(2026, 9, 14).getTime(), Date.parse(rangeStart))).toISOString();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(later);
+    h.input("evidence-filter-from", "");
+    range.value = "all"; h.change(range);
+    await settle();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since")).toBe(false);
+  });
+
+  it("drops a From value that is not a real calendar date instead of sending a window that matches nothing", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const h = await bootEvidence(evidencePayload());
+    for (const bad of ["garbage", "2026-02-30", "2026-1-5"]) {
+      h.navigate("activity?from=" + encodeURIComponent(bad));
+      await settle();
+      expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since"), bad).toBe(false);
+      expect(h.el.main!.innerHTML, bad).toContain("From: Any");
+      expect(h.el.main!.innerHTML, bad).not.toContain("From: " + bad);
+    }
+  });
+
+  it("narrows free-text search only over the loaded page and keeps total as the served window count", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: [
+        { timestamp: "2026-10-14T16:57:00.000Z", layer: "l2", identity_id: "two", operation: "other_event", result: "failure", details: { summary: "hay" } },
+        { timestamp: "2026-10-14T16:58:00.000Z", layer: "l1", identity_id: "one", operation: "matched_event", result: "success", details: { summary: "needle" } },
+      ],
+      total: 99,
+    });
+    const before = h.requests.length;
+    h.input("evidence-filter-query", "needle");
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(h.requests.length).toBe(before);
+    expect(html).toContain("showing 1 of 99");
+    expect(html).toContain("searching the 2 entries loaded");
+    expect(html).toContain("matched_event");
+    expect(html).not.toContain("other_event");
+    expect(html).toContain("entries in the served window before page limit and result filter");
+  });
+
+  it("renders hostile details as text and makes no per-entry seal claim when seal fields are absent", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).not.toContain("<img src=x onerror=alert(1)>");
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("Per-entry seal data is not served by this read");
+    expect(html).not.toContain("link ok");
+    expect(html).not.toContain("authenticity verified");
+    expect(html).not.toContain("broken");
+  });
+
+  it("exports JSON through api with the operator token and keeps unavailable exports disabled with reasons", async () => {
+    const blobs: Blob[] = [];
+    const exportedEntry = { timestamp: now, layer: "l1", operation: "egress", identity_id: "research-agent", result: "failure" };
+    const servedBody = { entries: [exportedEntry], total: 1, integrity_findings: [] };
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": (init) => {
+        expect(init?.headers).toMatchObject({ Authorization: "Bearer operator-token" });
+        // Must match the served shape pinned in test/principal-policy/dashboard-audit-log-route-shape.test.ts:
+        // with an audit log wired, handleAuditLog answers with the AuditLog.query result object.
+        return Promise.resolve(response(servedBody));
+      },
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL(blob: Blob) { blobs.push(blob); return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="evidence-export-json"');
+    expect(html).toContain("CEF export is available from the audit_export_siem tool");
+    expect(html).toContain("Compliance bundle export is Tier 1");
+    expect(html).toContain('href="#exit-drill"');
+    expect(html).toContain('href="/posture/evidence"');
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
+    expect(h.downloads).toHaveLength(1);
+    expect((h.downloads[0] as unknown as { download: string }).download).toBe("sanctuary-audit-log.json");
+    expect(JSON.parse(await blobs[0]!.text())).toEqual(servedBody);
+    expect(h.el["toast-host"]!.innerHTML).toContain("Downloaded the latest 1 audit entry as JSON");
+  });
+
+  it("the JSON export reports a served result object with no entries as no entries, never as a downloaded log", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response({ entries: [], total: 0, integrity_findings: [] })),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("export failed");
+  });
+
+  it("the JSON export names its bound and reports an empty audit log read instead of downloading a file", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response([])),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    expect(h.el.main!.innerHTML).toContain("JSON: latest 50 audit entries");
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
+    // The label's bound is the audit log route's own default limit, read from its source.
+    const dashboardSource = readFileSync(new URL("../../../src/principal-policy/dashboard.ts", import.meta.url), "utf8");
+    const routeDefault = dashboardSource.match(/private handleAuditLog\(url: URL[^]*?searchParams\.get\("limit"\) \?\? "(\d+)"/)![1];
+    expect(h.el.main!.innerHTML).toContain("JSON: latest " + routeDefault + " audit entries");
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("downloaded");
+  });
+
+  it("a result filter says it checks only the most recent page while the count covers every result", async () => {
+    const h = await bootEvidence(evidencePayload({ total: 120 }));
+    expect(h.el.main!.innerHTML).not.toContain("data-evidence-result-scope");
+    const result = new FakeElement({ "data-action": "evidence-filter-result" }, "SELECT");
+    result.value = "failure"; h.change(result);
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(h.requests.at(-1)!.url).toContain("result=failure");
+    expect(html).toContain("showing 2 of 120");
+    expect(html).toContain("The result filter checks the 50 most recent entries in the window; 120 counts entries of every result.");
+  });
+
+  it("the Evidence inbox decides only Tier 2 approvals inline and sends Tier 1 and unknown tiers to Approvals", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const inboxItems = [
+      { ...heldItem, item_id: "t1", tier: "tier1", created_at: "2026-10-14T16:50:00.000Z" },
+      { ...heldItem, item_id: "t2", tier: "tier2", created_at: "2026-10-14T16:51:00.000Z" },
+      { ...heldItem, item_id: "tx", tier: undefined, created_at: "2026-10-14T16:52:00.000Z" },
+    ];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2"');
+    expect(html).toContain('data-action="inbox-deny" data-item-id="t2"');
+    // The one-time decision reads the same as on the Overview and the Approvals screen.
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2">Allow once</button>');
+    expect(html).not.toContain(">Approve</button>");
+    for (const id of ["t1", "tx"]) {
+      expect(html).not.toContain('data-action="inbox-approve" data-item-id="' + id + '"');
+      expect(html).not.toContain('data-action="inbox-deny" data-item-id="' + id + '"');
+      expect(html).toContain('href="#approvals" data-evidence-review="' + id + '">Review in Approvals</a>');
+    }
+  });
+
+  it("keeps the old Activity inbox, agent, Recognition and batch controls on Evidence", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const inboxItems = [
+      { ...heldItem, item_id: "t1", tier: "tier1", created_at: "2026-10-14T16:50:00.000Z" },
+      { ...heldItem, item_id: "t2", tier: "tier2", created_at: "2026-10-14T16:51:00.000Z" },
+      { item_id: "privacy-1", kind: "privacy_event", display_template_id: "privacy_event.filtered", display_template_args: { agent_id: "agent-alpha" }, resolved: false, created_at: "2026-10-14T16:52:00.000Z" },
+    ];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [{ agent_id: "agent-alpha", status: "active", capabilities: { can_pause: true, can_resume: true, can_restart: true, can_lockdown: true } }] } })),
+      "/api/hub/recognition/did-web": () => Promise.resolve(response({ data: { configured: true, identifier: "did:web:example.com", days_until_recommended_rotation: 7, key_history: [] } })),
+      "/api/inbox/unified/batch": (init) => {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve(response({ ok: true }));
+      },
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("This fortress");
+    expect(html).toContain("Inbox");
+    expect(html).toContain("Tier 1 approvals");
+    expect(html).toContain("Tier 2 approvals");
+    expect(html).toContain('class="inbox-group-head">Other</h4>');
+    expect(html).toContain("Inbox (3 of 3)");
+    expect(html).toContain("Agents (1)");
+    const bar = html.match(/aria-label="Filter the inbox">([\s\S]*?)<\/div>/)![1]!;
+    expect([...bar.matchAll(/field-label">([^<]+)/g)].map(m => m[1])).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    expect(html).toContain('data-action="agent-lockdown"');
+    expect(html).toContain("Recognition Layer health");
+    runInContext(`state.inboxOps.selected = { "privacy-1": true }; rerender();`, h.context);
+    const selectedHtml = h.el.main!.innerHTML;
+    expect(selectedHtml).toContain('data-action="inbox-batch-archive"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-dismiss"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-snooze-open"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-delete"');
+    h.click({ "data-action": "inbox-batch-archive" });
+    await settle();
+    expect(h.requests.some((r) => r.url === "/api/inbox/unified/batch")).toBe(true);
+  });
+  it("keeps unknown statuses unknown and bounds findings, details, contributors and raw text", async () => {
+    const unknown = await bootEvidence(evidencePayload({ chain_verdict: "future_status" }));
+    expect(unknown.el.main!.innerHTML).toContain("status was not recognized");
+    expect(unknown.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+    const findings = Array.from({ length: 7 }, (_, i) => ({ kind: "entry_hash_mismatch", message: "finding-" + i + "<script>" + "x".repeat(300) }));
+    const h = await bootEvidence(evidencePayload({ chain_verdict: "verified", integrity_findings: findings }));
+    expect(h.el.main!.innerHTML).toContain("INTEGRITY FINDINGS");
+    expect(h.el.main!.innerHTML).toContain("showing 5 of 7 findings");
+    expect(h.el.main!.innerHTML).toContain("entry_hash_mismatch: finding-0&lt;script&gt;");
+    expect(h.el.main!.innerHTML).not.toContain("finding-5");
+    expect(h.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+    const bounded = await bootEvidence(evidencePayload({ entries: [{ timestamp: now, layer: "l1", operation: "large_record", result: "failure", identity_id: "a", details: { huge: "z".repeat(7000) }, contributors: [{ plugin_id: "fixture-plugin" }] }] }));
+    const pane = bounded.el.main!.innerHTML.match(/<aside class="panel evidence-detail"[\s\S]*?<\/aside>/)![0];
+    expect(pane).toContain("truncated at 240 chars");
+    expect(pane).toContain("truncated at 6000 chars");
+    expect(pane).toContain("contributors</dt>");
+    expect(pane).not.toContain("z".repeat(6001));
+  });
+
+  it("lists the served page newest first and opens the newest entry in the record pane", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table.indexOf("egress")).toBeGreaterThan(-1);
+    expect(table.indexOf("egress")).toBeLessThan(table.indexOf("sentinel_finding"));
+    expect(html).toMatch(/<aside class="panel evidence-detail"[\s\S]*?198\.51\.100\.23:8080/);
+  });
+
+  it("selects each served record through its rendered control", async () => {
+    const h = await bootEvidence();
+    const controls = [...h.el.main!.innerHTML.matchAll(/data-action="evidence-select" data-evidence-index="(\d+)"/g)];
+    expect(controls).toHaveLength(2);
+    h.click({ "data-action": "evidence-select", "data-evidence-index": controls[1]![1]! });
+    expect(h.el.main!.innerHTML).toMatch(/<aside class="panel evidence-detail"[\s\S]*?sentinel_finding/);
+    expect(h.el.main!.innerHTML).toMatch(/<tr class="sel"[^>]*data-evidence-row="1"/);
+  });
+
+  it("distinguishes a server filter with no match from an empty log", async () => {
+    const h = await bootEvidence(evidencePayload({ entries: [], total: 17 }));
+    h.navigate("activity?result=failure"); await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+    expect(h.el.main!.innerHTML).toContain("showing 0 of 17");
+    const empty = await bootEvidence(evidencePayload({ entries: [], total: 0 }));
+    expect(empty.el.main!.innerHTML).toContain("No audit entries in this view");
+    empty.navigate("activity?agent=absent"); await settle();
+    expect(empty.el.main!.innerHTML).toContain("No entries match this view");
+  });
+
+  it("reads a time range that matches nothing as a filtered view, not an empty log", async () => {
+    const h = await bootEvidence(evidencePayload({ entries: [], total: 0 }));
+    expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+    expect(h.el.main!.innerHTML).toContain("0 entries were loaded for the last 24 hours.");
+    expect(h.el.main!.innerHTML).toContain("Clear filters keeps the time range; change it in the top bar.");
+    expect(h.el.main!.innerHTML).not.toContain("No audit entries in this view");
+  });
+
+  it("keeps obsolete filter responses hidden until the latest filtered read completes", async () => {
+    vi.useFakeTimers();
+    let release!: (value: unknown) => void;
+    let filtered = false;
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": (_init, url) => {
+        if (url?.includes("agent=second")) { filtered = true; return new Promise(resolve => { release = resolve; }); }
+        return Promise.resolve(response(evidencePayload()));
+      },
+    });
+    h.input("evidence-filter-agent", "second"); await settle();
+    expect(filtered).toBe(true);
+    expect(h.el.main!.innerHTML).toContain("Entries Unknown");
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Selected entry"');
+    release(response(evidencePayload({ entries: [], total: 0 }))); await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+  });
+
+  it("an older filter's response that settles after the filter changed never publishes its rows", async () => {
+    vi.useFakeTimers();
+    const held: Record<string, (value: unknown) => void> = {};
+    const requested: string[] = [];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": (_init, url) => {
+        const agent = new URL(url!, "http://fixture").searchParams.get("agent");
+        if (agent === "first" || agent === "second") { requested.push(agent); return new Promise(resolve => { held[agent] = resolve; }); }
+        return Promise.resolve(response(evidencePayload()));
+      },
+    });
+    const only = (operation: string) => evidencePayload({ entries: [{ timestamp: "2026-10-14T16:59:00.000Z", layer: "l1", identity_id: "agent-x", operation, result: "success", details: {} }], total: 1 });
+    h.input("evidence-filter-agent", "first"); await settle();
+    h.input("evidence-filter-agent", "second"); await settle();
+    expect(requested).toEqual(["first"]);
+    // The first read settles after the filter moved on: its rows must not appear under the second filter. The
+    // trailing read already marks the source loading, so the screen alone cannot tell; the revision check in
+    // readResponse is what keeps the stale answer out of the view state, so the test reads that state too.
+    held.first!(response(only("first_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+    expect(runInContext("JSON.stringify(state.evidence.view)", h.context)).not.toContain("first_filter_operation");
+    expect(requested).toEqual(["first", "second"]);
+    held.second!(response(only("second_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).toContain("second_filter_operation");
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+  });
+
+  it("restores Inbox unknown and redacted states and the served fortress identity", async () => {
+    vi.useFakeTimers();
+    const h = await bootEvidence(evidencePayload(), { "/api/hub/inbox": never });
+    expect(h.el.main!.innerHTML).toContain("Inbox (Unknown)");
+    expect(h.el.main!.innerHTML).not.toContain("Nothing pending.");
+    runInContext('config.tenantName = "Fixture tenant"; config.fortressId = "fixture-fortress"; config.identityId = "fixture-operator"; rerender();', h.context);
+    expect(h.el.main!.innerHTML).toContain("fixture-operator");
+    expect(h.el.main!.innerHTML).toContain("Fixture tenant");
+    const redacted = await bootEvidence(evidencePayload(), { "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 3 } })) });
+    expect(redacted.el.main!.innerHTML).toContain("Approvals are hidden, not empty");
+  });
+
+  it("restores all Inbox kinds and drives every batch handler from its control", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const kinds = [...HUB_INBOX_KINDS];
+    const items = [...kinds.map(kind => ({ ...heldItem, kind, item_id: kind, created_at: now })), { ...heldItem, item_id: "decided-1", resolved: true, resolved_at: now, created_at: now }];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/inbox/unified/batch": () => Promise.resolve(response({ ok: true })),
+      "/api/hub/inbox/privacy_event/dismiss": () => Promise.resolve(response({ data: {} })),
+    });
+    for (const kind of kinds) expect(h.el.main!.innerHTML).toContain('data-inbox-kind="' + kind + '"');
+    expect(h.el.main!.innerHTML).toContain("Decided approvals");
+    const decided = h.el.main!.innerHTML.match(/data-decided-approval="decided-1"([\s\S]*?)<\/section>/)![1]!;
+    expect(decided).toContain("Resolved");
+    expect(decided).not.toMatch(/data-action="inbox-(approve|deny)/);
+    for (const action of ["archive", "dismiss", "snooze", "delete"]) {
+      expect(h.el.main!.innerHTML).toContain('data-action="inbox-select" data-item-id="privacy_event"');
+      h.click({ "data-action": "inbox-select", "data-item-id": "privacy_event", checked: "true" });
+      const button = "inbox-batch-" + (action === "snooze" ? "snooze-open" : action);
+      expect(h.el.main!.innerHTML).toContain('data-action="' + button + '"');
+      h.click({ "data-action": button });
+      if (action === "snooze") {
+        for (const control of ["inbox-batch-snooze", "inbox-snooze-custom", "inbox-batch-snooze-custom", "inbox-batch-snooze-close"]) expect(h.el.main!.innerHTML).toContain('data-action="' + control + '"');
+        h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+      }
+      await settle();
+      if (action === "dismiss") expect(h.requests.some(r => r.url === "/api/hub/inbox/privacy_event/dismiss" && r.init?.method === "POST")).toBe(true);
+      else expect(h.requests.some(r => r.url === "/api/inbox/unified/batch" && JSON.parse(String(r.init?.body)).action === action)).toBe(true);
+    }
+  });
+
 });
 
 describe("slice 3 Overview wired consumers", () => {
