@@ -1,12 +1,16 @@
 /**
- * Sanctuary Dashboard — Multi-tenant overview HTML
+ * Sanctuary Dashboard: Multi-tenant overview HTML
  *
  * Renders the `/agents` page: a per-tenant table with status pill, passphrase
  * status, last activity, and deep-link into each tenant's own dashboard.
- * Pure-string template consistent with `html.ts` — no client framework, no
- * build step, CSP-friendly.
+ * Pure-string template consistent with `html.ts`: no client framework, no
+ * build step, CSP-friendly. Slice 2b: it reads the server's design tokens and
+ * bundled faces and follows the console's light or dark choice; it declares
+ * no palette or font stack of its own.
  */
 
+import { CONSOLE_FONT_FACE_CSS } from "./design-fonts.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "./design-tokens.js";
 import type {
   MultiTenantSnapshot,
   MultiTenantTenantRow,
@@ -65,13 +69,13 @@ export function renderMultiAgentHTML(options: MultiAgentHTMLOptions): string {
   const { snapshot } = options;
   const rows =
     snapshot.tenants.length === 0
-      ? `<tr class="empty"><td colspan="6">No tenants found — run <code>sanctuary wrap</code> with <code>SANCTUARY_STORAGE_PATH</code> to create one.</td></tr>`
+      ? `<tr class="empty"><td colspan="6">No tenants found. Run <code>sanctuary protect</code> with <code>SANCTUARY_STORAGE_PATH</code> to create one.</td></tr>`
       : snapshot.tenants
           .map((t) => {
             const pill = statusPill(t.probe_state, t.initialized);
             const link = t.dashboard_url
               ? `<a href="${escHtml(t.dashboard_url)}" target="_blank" rel="noopener">${escHtml(t.dashboard_url)}</a>`
-              : `<span class="muted">—</span>`;
+              : `<span class="muted">None</span>`;
             const pp =
               t.passphrase_status === "keychain"
                 ? "Keychain"
@@ -99,27 +103,16 @@ export function renderMultiAgentHTML(options: MultiAgentHTMLOptions): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sanctuary — Multi-Agent Overview</title>
+<title>Sanctuary: Multi-Agent Overview</title>
+<script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
-:root {
-  --bg: #07080c;
-  --bg-2: #0f1220;
-  --surface: #131729;
-  --surface-2: #1a1f36;
-  --border: #26304d;
-  --ink: #eef1fb;
-  --ink-dim: #b9c0dc;
-  --ink-mute: #7e86a8;
-  --accent: #7db4ff;
-  --ok: #5ee4b6;
-  --warn: #f5c371;
-  --muted: #555e80;
-}
+${CONSOLE_FONT_FACE_CSS}
+${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
-  background: var(--bg);
+  font-family: var(--sans);
+  background: var(--paper);
   color: var(--ink);
   padding: 32px;
 }
@@ -128,14 +121,16 @@ header {
   margin: 0 auto 24px;
 }
 h1 {
+  font-family: var(--display);
   font-size: 22px;
+  font-weight: 600;
   margin: 0 0 6px;
   letter-spacing: -0.01em;
 }
 header p {
   margin: 0;
-  color: var(--ink-dim);
-  font-size: 14px;
+  color: var(--ink-2);
+  font-size: var(--text-base);
 }
 .summary {
   display: flex;
@@ -145,11 +140,11 @@ header p {
 }
 .summary .chip {
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--rule);
   border-radius: 999px;
   padding: 6px 14px;
-  font-size: 13px;
-  color: var(--ink-dim);
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
 .summary .chip strong {
   color: var(--ink);
@@ -164,28 +159,29 @@ table {
   width: 100%;
   border-collapse: collapse;
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-lg);
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--text-sm);
 }
 th, td {
   padding: 12px 14px;
   text-align: left;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--rule);
 }
 th {
-  background: var(--surface-2);
-  color: var(--ink-dim);
+  background: var(--paper-2);
+  color: var(--ink-3);
+  font-family: var(--mono);
   font-weight: 500;
-  font-size: 11px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 tr:last-child td { border-bottom: 0; }
 tr.empty td {
   text-align: center;
-  color: var(--ink-mute);
+  color: var(--ink-3);
   padding: 36px 14px;
 }
 td a {
@@ -193,32 +189,44 @@ td a {
   text-decoration: none;
 }
 td a:hover { text-decoration: underline; }
-.mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
-.path { color: var(--ink-mute); font-size: 12px; }
-.muted { color: var(--ink-mute); }
+a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mono { font-family: var(--mono); }
+.path { color: var(--ink-3); font-size: var(--text-xs); }
+.muted { color: var(--ink-3); }
+/* Status pills carry a shape as well as a hue and a word: running is the
+   pass circle, stopped is a square, port-answered-not-confirmed is the warn
+   triangle, and empty is the neutral dash. */
 .pill {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 2px 10px;
   border-radius: 999px;
-  font-size: 12px;
-  font-weight: 500;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
 }
-.pill-running { background: rgba(94, 228, 182, 0.12); color: var(--ok); }
-.pill-stopped { background: rgba(245, 195, 113, 0.12); color: var(--warn); }
-.pill-unconfirmed { background: rgba(245, 195, 113, 0.12); color: var(--warn); }
-.pill-empty { background: rgba(85, 94, 128, 0.2); color: var(--muted); }
+.pill::before { content: ""; width: 8px; height: 8px; flex: none; background: currentColor; }
+.pill-running { background: var(--sage-bg); color: var(--sage); }
+.pill-running::before { border-radius: 50%; }
+.pill-stopped, .pill-unconfirmed { background: var(--ochre-bg); color: var(--ochre); }
+.pill-stopped::before { border-radius: 0; }
+.pill-unconfirmed::before { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.pill-empty { background: var(--surface-2); color: var(--ink-3); }
+.pill-empty::before { height: 2px; border-radius: 1px; }
 footer {
   max-width: 1080px;
   margin: 32px auto 0;
-  color: var(--ink-mute);
-  font-size: 12px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
 }
-code { background: var(--surface-2); padding: 1px 6px; border-radius: 4px; }
+/* calc: the design's 4px small radius, --rad less one 2px step. */
+code { font-family: var(--mono); background: var(--surface-2); padding: 1px 6px; border-radius: calc(var(--rad) - 2px); }
 </style>
 </head>
 <body>
 <header>
-  <h1>Sanctuary — Multi-Agent Overview</h1>
+  <h1>Sanctuary: Multi-Agent Overview</h1>
   <p>${escHtml(snapshot.tenant_count)} tenant${snapshot.tenant_count === 1 ? "" : "s"} discovered on this host · ${escHtml(snapshot.running_count)} running.</p>
   <div class="summary">
     <span class="chip"><strong>Tenants</strong>${escHtml(snapshot.tenant_count)}</span>
@@ -247,8 +255,8 @@ code { background: var(--surface-2); padding: 1px 6px; border-radius: 4px; }
 </table>
 </main>
 <footer>
-  <p>Tenant creation: <code>SANCTUARY_STORAGE_PATH=~/.sanctuary/&lt;name&gt; sanctuary wrap …</code></p>
-  <p>Single-tenant mode still works as before — launch a multi-agent overview only with <code>sanctuary dashboard --multi</code>.</p>
+  <p>Tenant creation: <code>SANCTUARY_STORAGE_PATH=~/.sanctuary/&lt;name&gt; sanctuary protect …</code></p>
+  <p>Single-tenant mode still works as before. Launch a multi-agent overview only with <code>sanctuary dashboard --multi</code>.</p>
 </footer>
 <script id="snapshot-data" type="application/json">${initialSnapshot}</script>
 </body>

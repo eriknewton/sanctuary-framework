@@ -7,6 +7,9 @@
 import { describe, it, expect } from "vitest";
 import { renderDashboardHTML, HERO_COPY } from "../../src/dashboard/html.js";
 import type { ProtectionSnapshot } from "../../src/dashboard/aggregator.js";
+import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../../src/dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../../src/dashboard/design-fonts.js";
+import { cssRules, inlineStyle, ownStyleProblems } from "./console-style-helpers.js";
 
 function makeSnapshot(overrides: Partial<ProtectionSnapshot> = {}): ProtectionSnapshot {
   const base: ProtectionSnapshot = {
@@ -117,6 +120,8 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield yellow"/);
+    expect(html).toContain('id="shield-status-mark" d="M100 78 L122 120 L78 120 Z"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
   });
 
   it("applies the correct shield color class for red status", () => {
@@ -126,6 +131,22 @@ describe("renderDashboardHTML", () => {
       }),
     });
     expect(html).toMatch(/class="shield red"/);
+    expect(html).toContain('id="shield-status-mark" d="M84 84 L116 116 M116 84 L84 116"');
+    expect(html).not.toContain('id="shield-status-mark" d="M85 102 L96 113 L118 90"');
+  });
+
+  it("the client shield update path uses the same mark paths as the server render", () => {
+    const lights = ["green", "yellow", "red"] as const;
+    const serverMarks = new Map(lights.map((light) => {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot({ overall: { status: "healthy", light, headline: "x" } }) });
+      return [light, html.match(/id="shield-status-mark" d="([^"]+)"/)![1]!] as const;
+    }));
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
+    const clientFn = html.match(/function shieldStatusMarkForLight\(light\) \{([\s\S]*?)\n  \}/)![1]!;
+    for (const light of lights) {
+      expect(clientFn, light).toContain(serverMarks.get(light));
+    }
   });
 
   it("renders the hero copy from the exported HERO_COPY constant", () => {
@@ -404,5 +425,45 @@ describe("renderDashboardHTML", () => {
       expect(html).not.toContain("<img src=x");
       expect(html).toContain("&lt;script&gt;");
     });
+  });
+});
+
+// Slice 2b: the pre-v1.1 dashboard reads the console design system (the
+// server tokens and the bundled faces) instead of a system font stack and a
+// palette of its own, and its states read in monochrome.
+describe("renderDashboardHTML reads the console design system", () => {
+  const shared = { fonts: CONSOLE_FONT_FACE_CSS, tokens: PAPER_INK_ROOT_TOKENS_CSS };
+
+  it("carries the token block, the bundled faces and the theme bootstrap, and no palette or font of its own", () => {
+    for (const light of ["green", "yellow", "red"] as const) {
+      const html = renderDashboardHTML({ snapshot: makeSnapshot({ overall: { status: "healthy", light, headline: "x" } }) });
+      expect(ownStyleProblems(html, shared), light).toEqual([]);
+      expect(html, light).toContain(`<script>${THEME_BOOTSTRAP_SCRIPT}</script>`);
+      expect(html, light).toMatch(/font-family: var\(--sans\)/);
+      expect(html, light).toMatch(/var\(--mono\)/);
+    }
+  });
+
+  it("its title has no em-dash", () => {
+    const html = renderDashboardHTML({ snapshot: makeSnapshot() });
+    expect(html).toContain("<title>Sanctuary: Sovereignty Dashboard</title>");
+  });
+
+  it("each layer and upstream-server state wears its own dot shape, so a state never rides on hue alone", () => {
+    const rules = cssRules(inlineStyle(renderDashboardHTML({ snapshot: makeSnapshot() })));
+    const decls = (sel: string) => new Map(rules.filter((r) => r.selector === sel).flatMap((r) => r.decls));
+    const shape = (base: string, state: string | null) => {
+      const d = decls(base);
+      if (state) for (const [k, v] of decls(state)) d.set(k, v);
+      return ["clip-path", "border-radius", "height", "border", "background"].map((k) => k + ":" + (d.get(k) ?? "")).join(" ");
+    };
+    const layer = [null, ".layer-full .layer-dot", ".layer-degraded .layer-dot", ".layer-compromised .layer-dot"].map((s) => shape(".layer-dot", s));
+    expect(new Set(layer.map((x) => x.replace(/background:var\(--[a-z-]+\)/, ""))).size).toBe(layer.length);
+    const server = [null, ".server-row.state-connected .server-dot", ".server-row.state-connecting .server-dot",
+      ".server-row.state-disconnected .server-dot, .server-row.state-error .server-dot"].map((s) => shape(".server-dot", s));
+    expect(new Set(server.map((x) => x.replace(/background:var\(--[a-z-]+\)/, ""))).size).toBe(server.length);
+    // The base state (no evidence of a state) is the hollow dotted slate ring.
+    expect(decls(".layer-dot").get("border")).toMatch(/dotted var\(--slate\)/);
+    expect(decls(".server-dot").get("border")).toMatch(/dotted var\(--slate\)/);
   });
 });
