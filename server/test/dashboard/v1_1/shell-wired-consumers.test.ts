@@ -1566,6 +1566,8 @@ describe("slice 2b shell wired consumers", () => {
     const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter evidence entries">([\s\S]*?)<\/div>/);
     expect(bar, "filter bar").toBeTruthy();
     const labels = [...bar![1]!.matchAll(/<label class="field"><span class="field-label">([^<]+)<\/span><(input|select) class="input"/g)].map((m) => m[1]);
+    // The activity route's first filter bar is now the Evidence query bar; the kept inbox bar's six labels are
+    // pinned in "keeps the old Activity inbox, agent, Recognition and batch controls on Evidence".
     expect(labels).toEqual(["Layer", "Agent", "Event", "Result", "From"]);
     expect(bar![1]).toContain("Query");
     expect(bar![1]).not.toContain("<br>");

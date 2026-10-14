@@ -113,6 +113,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
     runInContext('state.route = "activity"; rerender()', h.context);
     expect(h.main.innerHTML).toContain("Read timed out");
+    // The activity route's screen is now titled Evidence (slice 5); the kept inbox still reports its timed-out read.
     expect(h.main.innerHTML).toContain("Evidence");
     expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
