@@ -4,7 +4,7 @@
  * reconciliation").
  *
  * THE PROBLEM THIS CLOSES: a `DEBT` source comment is not tracked risk until
- * it is reconciled into the private `Open_Defects_Register`. Reconciliation
+ * it is reconciled into the private defect register. Reconciliation
  * needs a stable, unique token per debt so a coordinator-side script can map
  * source to register rows. Before this guard, most `DEBT` markers carried no
  * identifier at all, and the identifier `DEBT-1` was reused as a purely
@@ -46,7 +46,7 @@
  *
  * SCOPE DISCIPLINE (do not weaken): this guard checks TOKEN SHAPE AND
  * UNIQUENESS ONLY. It never reads, imports, or references
- * `Open_Defects_Register` or any other file in the private coordinator repo
+ * the private defect register or any other file in the private coordinator repo
  * — that cross-repo boundary is exactly why this half is public-CI-checkable
  * at all.
  *
