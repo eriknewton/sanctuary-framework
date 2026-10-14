@@ -558,6 +558,7 @@ describe("slice 2 shell wired consumers", () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
       "/api/policy/current": () => Promise.resolve(response({ data: { view: { lines: [] } } })),
     });
     await settle();
@@ -2677,6 +2678,7 @@ describe("Approvals round-one decision and evidence states", () => {
       vi.useFakeTimers();
       const h = boot({
         "/api/hub/inbox": inbox([{ ...tier2, ...(mode === "tier1" ? { tier: "tier1" } : mode === "other" ? { operation_category: "other" } : {}) }]),
+        // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
         "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { lines: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
       });
       await settle();
@@ -2955,6 +2957,7 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
     const h = await mfpBoot("policy");
     const html = h.el.main!.innerHTML;
     expect(html).toContain('data-mfp-policy');
+    // The approval group takes its heading from POLICY_SECTION_TITLES, the same name the rule table uses.
     for (const label of ['What agents may reach', 'Always asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
     expect(html).toContain('export your saved state off the machine');
     expect(html).toContain('data-action="template-picker-open"');
@@ -3166,7 +3169,61 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
         expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
       });
     }
+    it('6b keeps the ' + source.key + ' snapshot for the trailing read when a queued refresh supersedes the read', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      const total = runInContext('state.mfp.totals.' + source.key, h.context);
+      expect(total).toBeGreaterThan(0);
+      wave = true;
+      const job = source.key === 'policy' ? 'policyPanelJob' : 'panelJobs.find(function (job) { return job.paths[0] === ' + JSON.stringify(source.path) + '; })';
+      // Two refreshes, as two stream events queue them: the first starts a read and the second supersedes it.
+      const first = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      const trailing = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      expect(pending).toHaveLength(1);
+      pending[0]!.resolve(response(r2Body(source.key, 'superseded snapshot'))); await first; await settle();
+      expect(runInContext('sourceRead(' + JSON.stringify(source.path) + ').state', h.context)).not.toBe('state_FAILED');
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(total);
+      expect(pending).toHaveLength(2);
+      pending[1]!.resolve(response(r2Body(source.key, 'trailing snapshot'))); await trailing; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain('trailing snapshot');
+      expect(h.el.main!.innerHTML).not.toContain('superseded snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+    });
+    it('6b leaves the ' + source.key + ' read Unknown when an older success lands after a newer failure', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      wave = true;
+      const a = runInContext(source.read, h.context); await settle();
+      const b = runInContext(source.read, h.context); await settle();
+      expect(pending).toHaveLength(2);
+      pending[1]!.reject(new Error('newer failure')); await b; await settle();
+      pending[0]!.resolve(response(r2Body(source.key, 'older snapshot'))); await a; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+    });
   }
+  it('6b keeps an open finding through two activity frames that supersede its read', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    // The activity frame handler queues this refresh through queueStreamRefresh; two frames arrive during one read.
+    const first = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    const second = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    pending[0]!.resolve(response(r2Body('findings'))); await settle();
+    expect(pending).toHaveLength(2);
+    pending[1]!.resolve(response(r2Body('findings'))); await first; await second; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+  });
   it('6b r2 closes a selected finding through failure and recovery', async () => {
     let failed = false;
     const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body('findings'))) });

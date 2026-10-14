@@ -429,6 +429,13 @@ function beginMfpRead(path) {
   return source.generation;
 }
 function currentMfpRead(path, generation) { return sourceRead(path).generation === generation; }
+// Every site that bumps a read's revision also sets that read's state (queuePanel to LOADING and queues the trailing
+// read; a restart to UNREAD; a stop to FAILED), so this refusal means "not mine to publish", never a failed read.
+function supersededByRefresh() {
+  const error = new Error("A newer refresh is pending.");
+  error.supersededByRefresh = true;
+  return error;
+}
 // A rejected race cannot publish late bytes, even if a transport ignores abort.
 // Only GETs use this helper; a mutation timeout must not imply it was undone.
 function readResponse(url, init, deadlineMs, generation) {
@@ -477,7 +484,7 @@ function readResponse(url, init, deadlineMs, generation) {
     // Only the newest read may publish loaded state; an older success carries no current evidence.
     if (generation !== undefined && !currentMfpRead(url, generation)) throw new Error("A newer read replaced this response.");
     // A response admitted before an event or decision cannot publish over its trailing read.
-    if (source && source.revision !== revision) throw new Error("A newer refresh is pending.");
+    if (source && source.revision !== revision) throw supersededByRefresh();
     if (source) { source.state = "state_LOADED"; source.failures = 0; source.nextReadAt = 0; source.status = null; }
     return res;
   }, function (error) {
@@ -972,6 +979,8 @@ async function readPolicyView() {
   } catch (e) {
     // A superseded failure must leave the newer policy and its loaded state intact.
     if (!currentMfpRead(path, generation)) return;
+    // The refresh that superseded this read owns the next policy and already set the read state.
+    if (e && e.supersededByRefresh === true) return;
     if (sourceRead(path).state !== "state_FAILED" && !sourceNotServed(path)) failSource(path, e);
     state.mfp.totals.policy = 0;
     state.policyView.view = null;
@@ -4545,7 +4554,8 @@ function renderMfpFoldedSections() {
   return '<details class="mfp-fold" data-mfp-fold="auto-trigger"' + (state.mfp.folds["auto-trigger"] ? ' open' : '') + '><summary>Auto-trigger</summary>' + renderFoldedSection("Auto-trigger ladder", "Calibration", "auto-trigger", renderAutoTriggerPage()) + '</details>' +
     '<details class="mfp-fold" data-mfp-fold="honeypot"' + (state.mfp.folds.honeypot ? ' open' : '') + '><summary>Honeypots</summary>' + renderFoldedSection("Honeypots", "Honeypot traps.", "honeypot", renderHoneypotPage()) + '</details>';
 }
-// Server severity is preserved in the copy; the display scale maps alert to High and warn to Medium.
+// Only Sentinel wire values carry severity: alert maps to High, warn to Medium and info to Info; any other value reads
+// Unknown.
 function mfpSeverity(value) {
   // Sentinel wire values alone carry severity evidence; display-scale words are not server verdicts.
   return value === "alert" ? "high" : value === "warn" ? "medium" : value === "info" ? "info" : null;
@@ -5127,6 +5137,8 @@ async function fetchMfpRead(path, key) {
   } catch (error) {
     // A superseded failure cannot clear the current snapshot or change its loaded state.
     if (!currentMfpRead(path, generation)) return;
+    // The refresh that superseded this read owns the next snapshot and its selection, and already set the read state.
+    if (error && error.supersededByRefresh === true) return;
     if (sourceRead(path).state !== "state_FAILED" && !sourceNotServed(path)) failSource(path, error);
     state.mfp.totals[key] = 0;
     state.mfp[key] = key === "roster" ? null : [];
