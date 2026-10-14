@@ -87,6 +87,11 @@ import {
 } from "../memory-provenance-bad-signers.js";
 import { memoryGetSuccessFrameUtf8Bytes } from "../memory-tool-projection.js";
 
+export function hermesBridgePassageTextDigest(passageText: string): string {
+  // Must match the approval-ledger comparison in ../../hermes-memory-bridge/approval-ledger.ts.
+  return toBase64url(hash(stringToBytes(passageText)));
+}
+
 /** Document ids minted by this adapter are namespaced under this prefix. */
 export const MEMORY_PASSAGE_DOCUMENT_PREFIX = "mem";
 
@@ -2040,7 +2045,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       passageId: passage.passage_id,
       documentId: prepared.documentId,
       passageTextUtf8,
-      passageTextSha256: toBase64url(hash(passageTextUtf8)),
+      passageTextSha256: hermesBridgePassageTextDigest(prepared.text),
       getFrameUtf8Bytes: memoryGetSuccessFrameUtf8Bytes(passage),
     };
   }

@@ -1,8 +1,9 @@
+// fail-before-exempt: this change adds a consistency check between the module map's barrel-count claims and the module tree; the base tree already satisfies it, so it passes against pre-fix source by construction. It guards against future drift and asserts no new product behavior.
 /**
  * Codebase-conventions structural gate (durability "teeth").
  *
  * The 2026-06-14 professionalization pass made `server/src` legible: a
- * 54-module map (`server/src/README.md`) and a barrel convention (a thin
+ * 64-module map (`server/src/README.md`) and a barrel convention (a thin
  * re-export `index.ts` per module). Those conventions had NO enforcement, so
  * the next PR that adds a module without a map row, or skips its barrel, would
  * silently un-do the work. This gate is the structural layer (mirrors the
@@ -54,7 +55,7 @@ const ALLOWED_BARRELLESS = [
   "v1", // versioned HTTP route surface, not a re-exportable module
 ].sort();
 
-/** Immediate subdirectories of server/src (the 54 module dirs). */
+/** Immediate subdirectories of server/src (the module dirs). */
 function moduleDirs(): string[] {
   return readdirSync(SERVER_SRC, { withFileTypes: true })
     .filter((e) => e.isDirectory())
@@ -102,6 +103,32 @@ function mapModules(): string[] {
     .sort();
 }
 
+function barrelCounts(): { readonly barreled: number; readonly total: number } {
+  const dirs = moduleDirs();
+  return {
+    barreled: dirs.filter((d) => existsSync(join(SERVER_SRC, d, "index.ts"))).length,
+    total: dirs.length,
+  };
+}
+
+function moduleMapText(): string {
+  return readFileSync(MAP_PATH, "utf-8");
+}
+
+function barrelCountClaims(): Array<{ readonly line: number; readonly barreled: number; readonly total: number; readonly text: string }> {
+  return moduleMapText()
+    .split("\n")
+    .flatMap((line, index) => {
+      if (!/(?:barrel|`index\.ts`|index\.ts)/iu.test(line)) return [];
+      return [...line.matchAll(/\b(\d+)\s+of\s+(\d+)\b/gu)].map((match) => ({
+        line: index + 1,
+        barreled: Number(match[1]),
+        total: Number(match[2]),
+        text: line.trim(),
+      }));
+    });
+}
+
 describe("codebase-conventions gate", () => {
   it("module map (server/src/README.md) lists exactly the dirs under server/src", () => {
     const onDisk = moduleDirs();
@@ -145,5 +172,16 @@ describe("codebase-conventions gate", () => {
           ? `  exception(s) that now HAVE a barrel (remove from ALLOWED_BARRELLESS here + update the map's "Barrel convention" count): ${nowBarreled.join(", ")}\n`
           : ""),
     ).toEqual({ newlyUnbarreled: [], nowBarreled: [] });
+  });
+
+  it("keeps every module-map barrel count phrase tied to the computed barrel count", () => {
+    const expected = barrelCounts();
+    const claims = barrelCountClaims();
+
+    expect(claims.length, "Expected at least one barrel count phrase in server/src/README.md.").toBeGreaterThan(0);
+    expect(
+      claims.map(({ line, barreled, total, text }) => ({ line, barreled, total, text })),
+      "Every barrel-related 'N of M' phrase in server/src/README.md must match the tree.",
+    ).toEqual(claims.map(({ line, text }) => ({ line, ...expected, text })));
   });
 });
