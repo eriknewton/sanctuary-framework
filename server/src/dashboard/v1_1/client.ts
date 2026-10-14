@@ -3444,7 +3444,7 @@ function windowCoverageReason(d) {
   switch (d.window_incomplete_reason) {
     case "read_limit": return "window larger than one read";
     case "sealed_region": return "sealed audit region coverage not established";
-    case "retention": return "older entries in the window were removed by retention";
+    case "retention": return "retention removed older entries, so window coverage is not established";
     default: return "window coverage not established";
   }
 }

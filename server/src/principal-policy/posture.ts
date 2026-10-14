@@ -1032,8 +1032,8 @@ export interface AuditDigest {
   origin_machine: string;
   window_start: string;
   window_end: string;
-  /** True only for an uncut query with no nonempty sealed region and an
-   * authenticated retained floor proving no entries since window_start were removed. */
+  /** True only for an uncut query with no nonempty sealed region whose verified view
+   * still holds the chain from its first entry, so retention removed nothing. */
   window_complete: boolean;
   /** Why coverage was not established; null only when window_complete is true.
    * Must match windowCoverageReason in dashboard/v1_1/client.ts. */
@@ -1168,9 +1168,10 @@ async function routineWindowCoverage(
     if (floor.status === "absent") return viewOldestSequence === firstSequence ? null : "coverage_unknown";
     const floorEntry = retained.entries[floor.base_sequence - viewOldestSequence];
     if (!floorEntry) return "coverage_unknown";
-    const floorAt = parseIsoInstantWithOffset(floorEntry.timestamp);
-    // A MAC authenticates the floor, not its age: the oldest entry retention kept must also precede this window.
-    return floorAt === undefined ? "coverage_unknown" : floorAt <= start ? null : "retention";
+    // Entry timestamps are caller-supplied and need not rise with sequence, so no retained entry's time bounds what
+    // retention removed before it. Coverage holds only while the view still reaches the chain's first entry; otherwise
+    // the reason is retention until the audit module serves an authenticated time bound for the pruned prefix.
+    return viewOldestSequence === firstSequence ? null : "retention";
   } catch {
     return "coverage_unknown";
   }

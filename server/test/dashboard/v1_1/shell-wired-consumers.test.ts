@@ -1992,7 +1992,7 @@ describe("round 2 outbound and tile honesty", () => {
     [undefined, undefined, "window completeness not served"], [null, null, "window completeness not served"],
     [-1, null, "window completeness not served"], [false, "read_limit", "window larger than one read"],
     [false, "sealed_region", "sealed audit region coverage not established"],
-    [false, "retention", "older entries in the window were removed by retention"],
+    [false, "retention", "retention removed older entries, so window coverage is not established"],
     [false, "coverage_unknown", "window coverage not established"],
     [false, "unexpected", "window coverage not established"], [false, undefined, "window coverage not established"],
   ] as const) it(`states completeness=${complete} reason=${value}`, async () => {

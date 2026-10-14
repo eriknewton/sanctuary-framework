@@ -159,13 +159,17 @@ describe("round 2 window coverage", () => {
     vi.spyOn(audit, "getAuditChainVerdict").mockResolvedValue({ ...verdict, sealed_region: { status } });
     expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
   });
-  for (const [name, age, complete, reason] of [
-    ["before", DAY + 1, true, null], ["at", DAY, true, null], ["after", DAY - 1, false, "retention"],
-  ] as const) it(`settles rotation ${name} window start`, async () => {
+  // Entry timestamps are caller-supplied and need not rise with sequence, so a floor entry's time never settles a pruned log.
+  for (const [name, age] of [["before", DAY + 1], ["at", DAY], ["after", DAY - 1]] as const) it(`reads a pruned log as retention with its floor entry ${name} window start`, async () => {
     const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
     for (let i = 0; i < 3; i++) await append(audit, i + 1, { timestamp: new Date(NOW - age).toISOString() });
     expect((await audit.authenticatedRotationFloor()).status).toBe("valid");
-    expect(await digest(audit)).toMatchObject({ window_complete: complete, window_incomplete_reason: reason });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention" });
+  });
+  it("covers a log whose authenticated floor is its first entry", async () => {
+    const audit = log(); await append(audit, 1);
+    vi.spyOn(audit, "authenticatedRotationFloor").mockResolvedValue({ status: "valid", base_sequence: 1, base_prev_hash: "unknown" });
+    expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
   });
   it("withholds coverage for an invalid rotation anchor", async () => {
     const audit = log(); await append(audit, 1);
@@ -227,10 +231,10 @@ describe("round 2 coverage read bounds", () => {
     expect(await eagerDigest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
   });
   it("withholds coverage when the retained view is larger than one read", async () => {
-    // Retention keeps entries 2 and 3; entry 2, the floor entry, precedes the window, so the uncut view reads covered.
+    // Retention keeps entries 2 and 3, so the uncut view locates the floor entry and reads retention.
     const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
     for (const [seq, at] of [[1, NOW - DAY - 3], [2, NOW - DAY - 2], [3, NOW - 1000]] as const) await append(audit, seq, { timestamp: new Date(at).toISOString() });
-    expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention" });
     const real = audit.query.bind(audit);
     // A cut drops the oldest entries, so the floor entry's position is lost; only the retained-view read (no since) is cut.
     vi.spyOn(audit, "query").mockImplementation(async (options) => {
