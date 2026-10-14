@@ -3574,7 +3574,9 @@ function renderActivityScreen() {
       '<div class="page-head"><div>',
         '<p class="eyebrow">Evidence</p>',
         '<h1>Evidence</h1>',
-        '<p class="sub">The tamper-evident record of everything the fortress decided. Integrity is shown only from the server verification read.</p>',
+        // The subtitle names the source and makes no completeness or tamper claim: not every decision is
+        // recorded here (inbox decisions stay in the inbox), and integrity is the strip's to state.
+        '<p class="sub">The audit log this fortress keeps. Integrity is shown only from the server verification read.</p>',
       '</div></div>',
       renderEvidenceIntegrity(view),
       renderEvidenceQueryBar(),

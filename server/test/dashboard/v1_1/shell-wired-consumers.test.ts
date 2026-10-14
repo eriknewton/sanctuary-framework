@@ -1683,6 +1683,14 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(html).not.toContain("<th>Seal</th>");
   });
 
+  it("the Evidence subtitle names the audit log and claims neither completeness nor tamper evidence", async () => {
+    const h = await bootEvidence(evidencePayload());
+    const sub = h.el.main!.innerHTML.match(/<p class="eyebrow">Evidence<\/p>[\s\S]*?<p class="sub">([^<]*)<\/p>/)?.[1] ?? "";
+    expect(sub).toContain("audit log");
+    // Integrity is the strip's to state from the served verdict, and inbox decisions are not in this log.
+    expect(sub).not.toMatch(/tamper|everything/i);
+  });
+
   it("maps layer names to frozen tokens and sends every server filter as the route param", async () => {
     const h = await bootEvidence({
       ...evidencePayload(),

@@ -1944,6 +1944,8 @@ body {
 .evidence-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; align-items: start; }
 .evidence-entries { min-width: 0; }
 .evidence-table { min-width: 760px; }
+/* A Result chip stays on one line: wrapped, its mark sat alone above the word. */
+.evidence-table .state-chip { flex-wrap: nowrap; white-space: nowrap; }
 .evidence-table .lay {
   font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2);
   text-transform: uppercase; letter-spacing: 0.06em;
