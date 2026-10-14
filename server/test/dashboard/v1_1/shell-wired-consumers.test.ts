@@ -213,7 +213,7 @@ const SHELL_IDS = [
   "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
-function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}, options: { deferredHashchange?: boolean } = {}) {
   fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
@@ -232,7 +232,11 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       const next = String(value).startsWith("#") ? String(value) : "#" + String(value);
       const changed = next !== locationHash;
       locationHash = next;
-      if (changed && winListeners.hashchange) winListeners.hashchange();
+      if (changed && winListeners.hashchange) {
+        // Browser navigation dispatches after the click task and its microtasks have finished.
+        if (options.deferredHashchange) setTimeout(() => winListeners.hashchange!(), 0);
+        else winListeners.hashchange();
+      }
     },
     search: "",
     origin: "http://fixture",
@@ -287,10 +291,15 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
     const target = new FakeElement(attrs, "BUTTON");
     docListeners.click!({ target });
   };
+  const keydown = (attrs: Record<string, string>, key: string) => {
+    const preventDefault = vi.fn();
+    docListeners.keydown!({ target: new FakeElement(attrs), key, preventDefault });
+    return preventDefault;
+  };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
   const change = (target: FakeElement) => docListeners.change!({ target });
   const input = (action: string, value: string) => { const target = new FakeInput({ "data-action": action }); target.value = value; docListeners.input!({ target }); };
-  return { el, railLink, context, navigate, click, clickRenderedButton, type, change, input, requests, downloads };
+  return { el, railLink, context, navigate, click, clickRenderedButton, keydown, type, change, input, requests, downloads };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => {
@@ -2531,6 +2540,7 @@ describe("slice 3 Overview wired consumers", () => {
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 2 }));
     expect(h.el.main!.innerHTML).toContain("FAILED");
+    // A positive window count remains displayable even though the verdict covers the whole chain.
     expect(h.el.main!.innerHTML).toContain("2 findings");
     expect(h.el.main!.innerHTML).toContain("digest from 0s ago, not verified");
   });
@@ -2722,7 +2732,7 @@ describe("slice 3 Overview wired consumers", () => {
 
 
 describe("slice 6a Agents wired consumers", () => {
-  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}) => {
+  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}, deferredHashchange = false) => {
     vi.useFakeTimers();
     const sc = agentsScenario(name);
     const h = boot({
@@ -2733,9 +2743,10 @@ describe("slice 6a Agents wired consumers", () => {
       "/api/hub/policies": () => Promise.resolve(response({ data: { policies: sc.policies } })),
       "/api/posture/reach/research-agent": () => Promise.resolve(response(sc.reach)),
       ...overrides,
-    });
+    }, {}, { deferredHashchange });
     await settle();
     h.navigate("agents");
+    if (deferredHashchange) await vi.advanceTimersByTimeAsync(0);
     return { h, sc };
   };
   const detail = (h: Awaited<ReturnType<typeof start>>["h"]) => h.click({ "data-action": "open-agent", "data-agent-id": "research-agent" });
@@ -3081,12 +3092,43 @@ describe("slice 6a Agents wired consumers", () => {
 
   it("6a r2 a loaded reach read past its one-minute age reads expired", async () => {
     const { h } = await start();
-    // AGENT_REACH_MAX_AGE_MS is the client's own constant, so the read is exactly one millisecond past its age.
-    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - AGENT_REACH_MAX_AGE_MS - 1 };', h.context);
+    // Two one-minute reach windows make this read two minutes old without firing the expiry timer.
+    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - 2 * AGENT_REACH_MAX_AGE_MS };', h.context);
     h.navigate("agent-detail");
     const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
     expect(html).toContain("Reach read expired after one minute without interaction.");
     expect(html).not.toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  for (const [name, setup, sentence] of [
+    ["stopped", "liveUpdatesStopped = true", "Live updates stopped. Retry to resume."],
+    // Five one-minute reach windows date the read five minutes ahead without moving the test clock.
+    ["future", "state.agentReach.readAt += 5 * AGENT_REACH_MAX_AGE_MS", "Reach read time is ahead of this device's clock, so it is not current."],
+  ]) it(`A1 ${name} reach read names its reason and hides lanes`, async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // The page's stopped-source gate hides the whole detail view, so inspect its reach card with the loaded subject.
+    const html = runInContext(setup + '; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain(escapeHtml(sentence!).replaceAll("'", "&#039;"));
+    expect(html).not.toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  for (const key of ["Enter", " "]) it(`A1 row inspect ${JSON.stringify(key)} resets the tab and reads reach once`, async () => {
+    const { h } = await start();
+    runInContext('state.agentTab = "evidence"', h.context);
+    const prevented = h.keydown({ "data-action": "agent-row-inspect-open", "data-agent-id": "research-agent" }, key);
+    await settle();
+    expect(prevented).toHaveBeenCalledOnce();
+    expect(runInContext("state.agentTab", h.context)).toBe("overview");
+    expect(runInContext("state.selectedAgentId", h.context)).toBe("research-agent");
+    expect(runInContext("state.route", h.context)).toBe("agent-detail");
+    expect(h.requests.filter(r => r.url === "/api/posture/reach/research-agent")).toHaveLength(1);
+    expect(h.requests.filter(r => r.url === "/api/hub/agents/research-agent/inspect/open")).toHaveLength(1);
   });
 
   it("6a r2 unknown hash state selects All states and keeps the roster", async () => {
@@ -3114,6 +3156,7 @@ describe("slice 6a Agents wired consumers", () => {
     expect(runInContext("agentReachPendingId", h.context)).toBeNull();
   });
 
+  // fail-before-exempt: existing queue behavior; plants remove open-agent loadAgentReach or restore route-guard-back.
   it("6a r2 an agent opened from another route while a read holds admission is read next", async () => {
     const sc = agentsScenario();
     let finish!: (value: unknown) => void;
@@ -3122,15 +3165,20 @@ describe("slice 6a Agents wired consumers", () => {
       "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
       "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
       "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
-    });
-    detail(h); await settle();
+    }, true);
+    // Establish the first read through row inspection so the open-agent plant targets only the second open.
+    h.click({ "data-action": "agent-row-inspect-open", "data-agent-id": "research-agent" }); await settle();
+    await vi.advanceTimersByTimeAsync(0);
     h.navigate("agents");
-    // The open-agent handler queues the read before it assigns the hash, and a browser fires hashchange in a later
-    // task; this harness fires it synchronously, so the queue step runs here on its own while the route is #agents.
-    runInContext('state.selectedAgentId = "second-agent"; void loadAgentReach("second-agent")', h.context);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runInContext("state.route", h.context)).toBe("agents");
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" });
+    // Keep hashchange queued while the previous transport releases admission in its microtasks.
+    expect(runInContext("state.route", h.context)).toBe("agents");
     finish(response(sc.reach)); await settle();
     expect(calls).toEqual(["research-agent", "second-agent"]);
-    h.navigate("agent-detail"); await settle();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runInContext("state.route", h.context)).toBe("agent-detail");
     const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
     expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
     expect(html).toContain('<div class="mono">docs.example.test');
@@ -3177,10 +3225,69 @@ async function bootOverview3b(change?: (home: Record<string, any>) => void, scen
 function outboundHtml(h: ReturnType<typeof boot>) {
   return h.el.main!.innerHTML.match(/<section class="card outbound-card">[\s\S]*?<\/section>/)?.[0] ?? "";
 }
+function auditTile(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Audit chain<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
+}
 function protectionTile(h: ReturnType<typeof boot>) {
   return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Protection requested<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
 }
 describe("Overview 3b served evidence", () => {
+  it("A1 mismatched verified flag names chain not verified in both counts", async () => {
+    const h = await bootOverview3b(home => home.digest.chain_verified = false);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      const html = outboundHtml(h);
+      for (const label of ["Blocked", "Allowed"]) {
+        const cell = html.match(new RegExp('<div>' + label + ' ([^]*?)</div>'))![1]!;
+        expect(cell).toContain('class="state-chip unknown overview-chip"');
+        expect(cell).toContain("Not evaluated");
+        expect(cell).toContain("chain not verified");
+      }
+      expect(html).not.toContain("audit check not current");
+      expect(html).not.toContain("last verified");
+      expect(html).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+
+  // fail-before-exempt: existing stale-check copy; plant replaces the audit check not current reason.
+  it("A1 eleven-minute verified check retains its age reason", async () => {
+    const h = await bootOverview3b(undefined, "stale-verified");
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      expect(outboundHtml(h)).toContain("audit check not current");
+      expect(outboundHtml(h)).toContain("last verified 11m ago");
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+
+  it("A1 fail-honest Audit chain chip has no invented zero findings", async () => {
+    const h = await bootOverview3b(undefined, "fail-honest");
+    const tile = auditTile(h);
+    expect(tile).toContain('class="state-chip bad overview-chip"');
+    expect(tile).toContain("FAILED");
+    expect(tile).toContain("chain not verified");
+    expect(tile).not.toContain("0 findings");
+    expect(tile).toContain("not verified");
+  });
+
+  it("A1 Audit chain chip uses the singular for one finding", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { chain_verdict: "findings", chain_verified: false, integrity_finding_count: 1 }));
+    expect(auditTile(h)).toContain("1 finding");
+    expect(auditTile(h)).not.toContain("1 findings");
+    expect(auditTile(h)).toContain("FAILED");
+  });
+
+  it("A1 Audit chain chip withholds every invalid finding count", async () => {
+    // Exercise absent, nonnumeric, negative, fractional, nonfinite, and unsafe integer counts.
+    for (const count of [undefined, null, "2", -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      const h = await bootOverview3b(home => Object.assign(home.digest, { chain_verdict: "findings", chain_verified: false, integrity_finding_count: count }));
+      expect.soft(auditTile(h), String(count)).toContain("chain not verified");
+      expect.soft(auditTile(h), String(count)).not.toContain(" findings");
+      expect.soft(auditTile(h), String(count)).toContain('class="state-chip bad overview-chip"');
+      expect.soft(auditTile(h), String(count)).toContain("FAILED");
+    }
+  });
+
   for (const [name, mutate, reason] of [
     ["findings zeros", (d: any) => Object.assign(d, { chain_verdict: "findings", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
     ["key unavailable", (d: any) => Object.assign(d, { chain_verdict: "key_unavailable", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
@@ -3338,13 +3445,15 @@ describe("round 2 outbound and tile honesty", () => {
     [undefined, undefined, "window completeness not served"], [null, null, "window completeness not served"],
     [-1, null, "window completeness not served"], [false, "read_limit", "window larger than one read"],
     [false, "sealed_region", "sealed audit region coverage not established"],
-    [false, "retention", "retention removed older entries, so window coverage is not established"],
+    // The coverage reason does not establish whether pruning, a legacy prefix, or a racing append caused it.
+    [false, "retention", "the check could not reach the oldest audit entry, so this window is not fully covered"],
     [false, "coverage_unknown", "window coverage not established"],
     [false, "unexpected", "window coverage not established"], [false, undefined, "window coverage not established"],
   ] as const) it(`states completeness=${complete} reason=${value}`, async () => {
     const h = await bootOverview3b(home => Object.assign(home.digest, { window_complete: complete, window_incomplete_reason: value }));
     for (const route of ["posture", "enforcement"]) {
       h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(h.el.main!.innerHTML).not.toContain("retention removed older entries");
       expect(outboundHtml(h)).toContain('class="outbound-reason muted"');
       expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
     }

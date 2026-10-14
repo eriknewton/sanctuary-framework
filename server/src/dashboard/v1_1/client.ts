@@ -1923,10 +1923,32 @@ async function loadAgentReach(agentId) {
     if (revision === agentReachRevision) rerender();
   }
 }
+// Every way of opening an agent row must reset the tab and start its read before navigation and inspection.
+function openAgentRowInspect(agentId) {
+  state.selectedAgentId = agentId;
+  state.agentTab = "overview";
+  void loadAgentReach(agentId);
+  if (location.hash !== "#agent-detail") location.hash = "agent-detail";
+  else setRoute("agent-detail");
+  void onAgentInspectOpen(agentId);
+}
+
 function renderAgentReach(agent) {
   const policy = agentPolicySummary(agent);
   const read = state.agentReach;
-  const reach = !liveUpdatesStopped && read.agentId === agent.agent_id && read.state === "state_LOADED" && Date.now() >= read.readAt && Date.now() - read.readAt < AGENT_REACH_MAX_AGE_MS ? read.data : null;
+  const now = Date.now();
+  // A different subject has no read here, regardless of the stored read's state.
+  let reachState = read.agentId !== agent.agent_id ? "state_UNREAD" : read.state;
+  if (reachState === "state_LOADED" && read.data) {
+    // A stopped stream cannot establish current reach even when its last read is recent.
+    if (liveUpdatesStopped) reachState = "state_STOPPED";
+    // A future read cannot establish freshness against this device's clock.
+    else if (now < read.readAt) reachState = "state_FUTURE";
+    // Configured reach expires at the same one-minute boundary used by the loader.
+    else if (now - read.readAt >= AGENT_REACH_MAX_AGE_MS) reachState = "state_EXPIRED";
+  }
+  // Only a current, matching loaded read may expose destinations; malformed clocks remain withheld.
+  const reach = reachState === "state_LOADED" && !liveUpdatesStopped && now >= read.readAt && now - read.readAt < AGENT_REACH_MAX_AGE_MS ? read.data : null;
   const intro = '<p>' + escHtml(policy ? policy.display_label : "Policy summary Unknown") + ' · ' + escHtml(agent.policy_id || "policy Unknown") + ' · version Unknown · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies") || "Unknown") + '</p>';
   const lanes = [["allow", "May reach"], ["prompt", "Asks you first"], ["deny", "Never"]].map(function (lane) {
     const entries = reach ? reach.destinations.filter(function (d) { return d.disposition === lane[0]; }) : [];
@@ -1937,16 +1959,19 @@ function renderAgentReach(agent) {
   // A configured rule and a fresh read do not prove enforcement; both the scoped reach and posture must confirm it.
   const confirmed = reach && reach.enforcement_confirmed === true && agentEvidenceStatus(agent) === "active";
   // Each read state describes its own evidence; absence never borrows a failure or loading claim.
-  const reachState = read.agentId !== agent.agent_id ? "state_UNREAD" : read.state === "state_LOADED" && !reach && read.data ? "state_EXPIRED" : read.state;
   const descriptions = {
     state_UNREAD: "Reach not read yet.",
     state_LOADING: "Reading this agent's reach.",
     state_EXPIRED: "Reach read expired after one minute without interaction.",
+    state_STOPPED: "Live updates stopped. Retry to resume.",
+    state_FUTURE: "Reach read time is ahead of this device's clock, so it is not current.",
     state_FAILED: "Reach read failed · " + relTimeFromIso(new Date(read.readAt).toISOString()),
     state_LOADED: "The reach source answered without a record for this agent."
   };
+  // Withheld loaded evidence must not leave lanes visible as though they describe current reach.
+  const visibleLanes = ["state_STOPPED", "state_FUTURE", "state_EXPIRED"].includes(reachState) ? "" : lanes;
   const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : descriptions[reachState];
-  return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + lanes +
+  return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + visibleLanes +
     '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? relTimeFromIso(new Date(read.readAt).toISOString()) : "Unknown") + '</p>' +
     '<a class="btn" href="/posture/agent/' + escHtml(encodeURIComponent(agent.agent_id)) + '">All configured reach</a> ' +
     '<button class="btn" data-action="agent-reach-refresh" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh reach</button></section>';
@@ -3984,7 +4009,8 @@ function windowCoverageReason(d) {
   switch (d.window_incomplete_reason) {
     case "read_limit": return "window larger than one read";
     case "sealed_region": return "sealed audit region coverage not established";
-    case "retention": return "retention removed older entries, so window coverage is not established";
+    // This reason establishes missing coverage, not whether pruning, a legacy prefix, or an append caused it.
+    case "retention": return "the check could not reach the oldest audit entry, so this window is not fully covered";
     default: return "window coverage not established";
   }
 }
@@ -3994,7 +4020,8 @@ function renderOutboundConnections(d, overview) {
   // Counts require both a covered window and the same current verified/suffix check as the chip.
   // Continuing paths also require dated reads and safe served counts; all refusals name their missing evidence.
   // Must match the fail-honest returns in buildAuditDigest (principal-policy/posture.ts).
-  const reason = d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only" ? "chain not verified"
+  // Counts and the chip must name the same missing evidence; a mismatched verdict is not a stale verification.
+  const reason = (d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only") || (d.chain_verdict === "verified" && d.chain_verified !== true) ? "chain not verified"
     : windowCoverageReason(d) ? windowCoverageReason(d)
     : !Number.isFinite(parseEvidenceTimestamp(d.window_start)) || !Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? "window not stated"
     : !auditChainCheckCurrent(d) ? "audit check not current"
@@ -4305,12 +4332,15 @@ function renderPostureScreen() {
   // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
   const checkCurrent = auditChainCheckCurrent(digest);
   const chainVerified = digest.chain_verified === true && digest.chain_verdict === "verified" && checkCurrent;
+  // The verdict covers the whole chain, so only a positive safe window count can supply a findings detail.
+  const findingDetail = Number.isSafeInteger(digest.integrity_finding_count) && digest.integrity_finding_count > 0
+    ? digest.integrity_finding_count + (digest.integrity_finding_count === 1 ? " finding" : " findings") : "chain not verified";
   const chainChip = chainVerified
     ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
     : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent
       ? overviewChip("unknown", "UNKNOWN", "last verified " + (Number.isFinite(chainWindowEnd) ? relTimeFromIso(digest.window_end) : "Unknown"))
     : digest.chain_verdict === "findings"
-      ? overviewChip("bad", "FAILED", typeof digest.integrity_finding_count === "number" ? digest.integrity_finding_count + " findings" : "findings")
+      ? overviewChip("bad", "FAILED", findingDetail)
       : digest.chain_verdict === "verified_suffix_only" && checkCurrent
       ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
       : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
@@ -6726,15 +6756,7 @@ document.addEventListener("click", function (ev) {
   // Same component as the Agents-view CTA; the optimistic "Opening..."
   // pane (openingAgentId) renders during the round-trip.
   if (action === "agent-row-inspect-open" && agentId) {
-    state.selectedAgentId = agentId;
-    state.agentTab = "overview";
-    void loadAgentReach(agentId);
-    if (location.hash !== "#agent-detail") {
-      location.hash = "agent-detail";
-    } else {
-      setRoute("agent-detail");
-    }
-    void onAgentInspectOpen(agentId);
+    openAgentRowInspect(agentId);
     return;
   }
   // Keyboard activation for the role="button" agent-row-head: Enter and
@@ -6861,13 +6883,7 @@ document.addEventListener("keydown", function (ev) {
   const agentId = rawTgt.getAttribute("data-agent-id");
   if (!agentId) return;
   ev.preventDefault();
-  state.selectedAgentId = agentId;
-  if (location.hash !== "#agent-detail") {
-    location.hash = "agent-detail";
-  } else {
-    setRoute("agent-detail");
-  }
-  void onAgentInspectOpen(agentId);
+  openAgentRowInspect(agentId);
 });
 
 // Intelligence picker: capture password / text input updates without
