@@ -109,11 +109,12 @@ class FakeElement {
         if (found) return found;
       }
     }
-    // Parse only rendered button attributes for focus assertions; the fake does not lay out HTML.
-    for (const match of this.html.matchAll(/<button\b([^>]*)>/g)) {
-      const attrs = Object.fromEntries([...match[1]!.matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1]!, m[2]!]));
-      const button = new FakeElement(attrs, "button");
-      if (button.matches(selector)) return button;
+    // Parse only rendered button and heading attributes for focus assertions; the fake does not lay out HTML.
+    // Headings are included because the Approvals drawer moves focus to its heading, not to a decision control.
+    for (const match of this.html.matchAll(/<(button|h3)\b([^>]*)>/g)) {
+      const attrs = Object.fromEntries([...match[2]!.matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1]!, m[2]!]));
+      const element = new FakeElement(attrs, match[1]!);
+      if (element.matches(selector)) return element;
     }
     return null;
   }
@@ -549,7 +550,11 @@ describe("slice 2 shell wired consumers", () => {
     const main = h.el.main!.innerHTML;
     expect(main).not.toContain("/api/");
     expect(main).toContain("Always allow this operation for every agent on this fortress.");
-    expect(main).toContain("Writes a standing rule into the signed policy, revocable under Policies.");
+    // The rule is added to the fortress policy and this console cannot remove it, so the note claims neither a
+    // signature nor a revocation path.
+    expect(main).toContain("Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet.");
+    expect(main).not.toContain("signed policy");
+    expect(main).not.toContain("revocable");
     expect(main).toContain("Allow always first allows this request, then asks the policy engine to compile a standing rule for state_export and activate it with your operator token.");
     expect(main).toMatch(/approval-effects[\s\S]*?<strong>Allow always<\/strong>/);
     expect(main).toContain("Either step can be refused; your policy changes only if both succeed.");
@@ -687,6 +692,8 @@ describe("slice 2 shell wired consumers", () => {
     h.change(categorySelect);
     expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+    // Retargeted from the old scope hint text: the scope now applies before the filters, so the queue counts the
+    // scoped rows and the other agent's option and row are gone.
     expect(h.el.main!.innerHTML).toContain("showing 0 of 2");
     expect(h.el.main!.innerHTML).not.toContain('<option value="agent-b"');
     expect(h.el.main!.innerHTML).not.toContain('data-approval-row="b-wait"');
@@ -743,6 +750,7 @@ describe("slice 2 shell wired consumers", () => {
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
     expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
     expect(h.el.main!.innerHTML).toContain("WAITING");
     expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
     expect(h.el.main!.innerHTML).not.toContain("Decided at");
@@ -847,7 +855,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["notify-count"]!.innerHTML).toContain("0 of 2");
     const main = h.el.main!.innerHTML;
     expect(main).toContain('data-scoped-empty="1"');
-    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait outside this agent scope");
+    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
     expect(main).not.toContain("qe-check");
     expect(main).not.toContain("Nothing waiting on you.");
   });
@@ -874,13 +882,14 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
     expect(drawer()).not.toContain("No approvals waiting");
     expect(drawer()).not.toContain("0 of 0 held operations");
-    expect(drawer()).toContain("2 of 2 held operations in this scope are waiting on you");
+    // The count is the waiting holds in scope, with no denominator that would also count decided items.
+    expect(drawer()).toContain("No held operation matches these filters. 2 held operations in this scope are waiting on you.");
     categorySelect.value = "";
     h.change(categorySelect);
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
     expect(drawer()).not.toContain("No approvals waiting");
     expect(drawer()).not.toContain("0 of 0 held operations");
-    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait outside this agent scope");
+    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
   });
 
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
@@ -2009,7 +2018,7 @@ describe("Approvals round-one decision and evidence states", () => {
     const h = boot({ "/api/hub/inbox": inbox(items) });
     await settle();
     h.navigate("approvals");
-    const line = "1 held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.";
+    const line = "1 held item carries a tier this console does not recognize. It is not shown here and cannot be decided from this screen.";
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
       expect(html).toContain(line);
       expect(html).not.toMatch(/qe-check|Nothing waiting on you\.|No approvals waiting|0 of 0 held operations/);
@@ -2026,7 +2035,7 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
-    const line = "Nothing waiting for agent-empty. 1 of 1 held operations wait outside this agent scope; choose All agents in the scope menu to see them.";
+    const line = "Nothing waiting for agent-empty. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
       expect(html).toContain(line);
       expect(html).not.toContain("qe-check");
@@ -2085,6 +2094,11 @@ describe("Approvals round-one decision and evidence states", () => {
       } else {
         expect(drawer(h)).toContain(failure === "none" ? "No approvals waiting" : "DECIDED");
         if (failure !== "none" && failure !== "downgrade confirmed") expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added:");
+        // A declined downgrade reads as one sentence, not a second "no standing rule added" after the first.
+        if (failure === "downgrade cancelled") {
+          expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added: you chose to keep your protection.");
+          expect(h.el["toast-host"]!.innerHTML).not.toContain("no standing rule added");
+        }
       }
       expect(runInContext("state.approvals.alwaysAllow", h.context)).toBe(false);
     });
@@ -2127,6 +2141,28 @@ describe("Approvals round-one decision and evidence states", () => {
       expect(drawer(h)).not.toContain('data-action="inbox-promote"');
     });
   }
+
+  it("Review in drawer moves focus to the drawer heading, never to a decision control", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([heldItem, { ...heldItem, item_id: "item-2", tier: "tier2" }]) });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "approval-select", "data-item-id": "item-1" });
+    const focused = fakeActiveElement as FakeElement;
+    expect(focused.getAttribute("data-approval-drawer-focus")).toBe("1");
+    expect(focused.getAttribute("data-action")).toBeNull();
+    expect(drawer(h)).toContain('<h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3>');
+  });
+
+  it("a Tier 1 drawer says Allow once arms the request and only Confirm sends it", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([heldItem]) });
+    await settle();
+    h.navigate("approvals");
+    const html = drawer(h);
+    expect(html).toContain("Allow once arms this request, and Confirm ");
+    expect(html).not.toContain("Allow once sends this approval");
+  });
 
   it("Tier 1 double-click disarms in the original slot and keeps focus on Cancel", async () => {
     vi.useFakeTimers();
@@ -2238,8 +2274,9 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     h.navigate("approvals");
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
-      expect(html).toContain("1 held items carry a tier this console does not recognize.");
+      expect(html).toContain("1 held item carries a tier this console does not recognize.");
       expect(html).not.toContain("2 held items carry");
+      expect(html).not.toContain("1 held items");
     }
     for (const html of [drawer(h), h.el.fortress!.innerHTML]) expect(html).toContain("No recognized held operation is waiting.");
     expect(h.el.fortress!.innerHTML).not.toContain('<div class="queue-empty"></div>');
@@ -2252,8 +2289,8 @@ describe("Approvals round-one decision and evidence states", () => {
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
-      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operations wait outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
-      expect(html).not.toContain("1 of 1 held operations");
+      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
+      expect(html).not.toContain("1 of 1 held operation");
     }
   });
 

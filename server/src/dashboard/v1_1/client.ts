@@ -3925,7 +3925,9 @@ function approvalQueueEvidence() {
     return i.kind === "approval_pending" && !i.resolved && i.tier !== "tier1" && i.tier !== "tier2";
   }).length;
   const warning = ready && unknown
-    ? '<p class="muted">' + unknown + ' held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.</p>' : "";
+    ? '<p class="muted">' + (unknown === 1
+      ? '1 held item carries a tier this console does not recognize. It is not shown here and cannot be decided from this screen.'
+      : unknown + ' held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.') + '</p>' : "";
   const waiting = pendingApprovalItems().length;
   const outside = heldApprovalItems(null).length - waiting;
   let title = "Nothing selected";
@@ -3935,7 +3937,7 @@ function approvalQueueEvidence() {
   const pageEdge = " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
   if (!ready) line = state.inboxRedacted ? "Approvals are hidden, not empty. Pending count: " + state.inboxRedactedCount + "." : "Approval data is Unknown until the queue read loads.";
   // On a full page the count outside the scope is only a lower bound, and the scoped agent may have holds past the page.
-  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + (full ? "At least " + outside : outside + " of " + outside) + " held operations wait outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
+  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + (full ? "At least " : "") + heldOperationsPhrase(outside, "waits", "wait") + " outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
   else if (full && !waiting) {
     // The inbox serves no total, so a full page cannot rule out a held operation beyond its edge.
     line = state.inbox.some(function (i) { return i.kind === "approval_pending"; }) ? "No recognized held operation is waiting in this page." : "None of the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items is a held operation.";
@@ -3952,7 +3954,7 @@ function approvalQueueEvidence() {
   let summary = emptyHtml;
   if (ready && waiting) {
     // Full-page counts describe only a lower bound, never the fortress total.
-    const count = full ? "At least " + waiting + " held operations waiting (from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items)." : waiting + " held operations waiting.";
+    const count = full ? "At least " + heldOperationsPhrase(waiting) + " waiting (from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items)." : heldOperationsPhrase(waiting) + " waiting.";
     summary = '<div class="queue-empty"><span class="qe-warn"></span>' + escHtml(count) + ' <a href="#approvals">Open Approvals</a>.</div>';
   }
   if (!sourceLoaded(HUB + "/inbox")) summary = renderSourceRead(HUB + "/inbox");
@@ -3960,6 +3962,12 @@ function approvalQueueEvidence() {
   // The badge counts every waiting hold, recognized or not, and on a full page it is only a lower bound.
   const count = (waiting + unknown) + (full ? "+" : "");
   return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned };
+}
+
+// "1 held operation" or "N held operations", with the verb that agrees when one is given.
+function heldOperationsPhrase(n, singularVerb, pluralVerb) {
+  const phrase = n === 1 ? "1 held operation" : n + " held operations";
+  return singularVerb ? phrase + " " + (n === 1 ? singularVerb : pluralVerb) : phrase;
 }
 
 function resetApprovalConsent() {
@@ -4035,7 +4043,9 @@ function approvalStandingState(item) {
   if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
   const unavailable = approvalPolicyUnavailableReason();
   if (unavailable) return { enabled: false, reason: unavailable };
-  return { enabled: true, reason: "Writes a standing rule into the signed policy, revocable under Policies. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
+  // The standing rule is activated into the fortress policy through the policy engine; this console has no
+  // control that removes one, so the note states that bound instead of promising a revocation path.
+  return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
 }
 
 function approvalDecisionDisabled(item) {
@@ -4084,7 +4094,7 @@ function renderApprovalDrawer(item, empty) {
     // Filters can hide loaded holds but cannot establish that no holds exist.
     const title = e.filteredOut ? "Nothing selected" : evidence.title;
     const line = e.filteredOut
-      ? "No held operation matches these filters. " + e.waiting + " of " + e.total + " held operations in this scope are waiting on you."
+      ? "No held operation matches these filters. " + heldOperationsPhrase(e.waiting, "in this scope is", "in this scope are") + " waiting on you."
       : evidence.line;
     return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + escHtml(title) + '</h3><p>' + escHtml(line) + ' Queue checked ' + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + '.</p>' + evidence.warning + '<a class="btn" href="#activity">Open Evidence</a></div></aside>';
   }
@@ -4116,14 +4126,17 @@ function renderApprovalDrawer(item, empty) {
   const standingEffect = checked
     ? "Later matching operations stop asking only if the policy engine accepts both steps."
     : "The next matching operation asks again.";
+  // A Tier 1 Allow once only arms the request; the card says so, matching the note below it.
   const allowCopy = checked
     ? "Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect
-    : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
+    : item.tier === "tier1" && !item.resolved
+      ? "Allow once arms this request, and Confirm " + op + " sends the approval; the decision is " + approvalRecordLine(item) + "."
+      : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
   const tier1Note = item.tier === "tier1" && !item.resolved
     ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + escHtml(op) + '. Only Confirm sends the approval.</div>'
     : "";
   return '<aside class="card approval-drawer" aria-label="Selected approval">' +
-    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? "DECIDED" : "WAITING") + '</span></div><h3>Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? "DECIDED" : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
     // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
     '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
@@ -5330,6 +5343,14 @@ async function onInboxAction(itemId, action) {
   }
 }
 
+// Below the stacking breakpoint the drawer sits under the whole queue, so selecting a row moves focus to
+// the drawer's heading, which brings it into view. The target is a heading, not a decision control, so a
+// stray key press after the click cannot decide.
+function focusApprovalDrawer() {
+  const main = document.getElementById("main");
+  const head = main && main.querySelector('[data-approval-drawer-focus="1"]');
+  if (head && typeof head.focus === "function") head.focus();
+}
 function focusTier1Cancel() {
   const main = document.getElementById("main");
   const cancel = main && main.querySelector('[data-action="approval-cancel-tier1-allow"]');
@@ -5524,7 +5545,7 @@ async function activateStandingRule(draftId, op, force) {
         "This rule would relax your protection so agents can " + op +
         " without asking you. This is recorded in your audit log. Add it anyway?");
       if (ok) return activateStandingRule(draftId, op, true);
-      throw new Error("Kept your protection: no standing rule added.");
+      throw new Error("you chose to keep your protection.");
     }
     if (e.status === 401 || e.status === 403) {
       throw new Error("Operator token required to change policy.");
@@ -6032,7 +6053,8 @@ document.addEventListener("click", function (ev) {
   if (action === "approval-select" && itemId) {
     state.approvals.selectedId = itemId;
     resetApprovalConsent();
-    return rerender();
+    rerender();
+    return focusApprovalDrawer();
   }
   if (action === "approval-always-allow") {
     // An in-flight decision retains its consent state until settlement.
