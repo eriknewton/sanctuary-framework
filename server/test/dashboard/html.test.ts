@@ -4,7 +4,9 @@
  * filters all render from a given snapshot.
  */
 
+// fail-before-exempt: this change strengthens the existing shield-mark pin to run the client update path for each light; server/src/dashboard/html.ts is unchanged here, so the test passes on the base by design.
 import { describe, it, expect } from "vitest";
+import { runInNewContext } from "node:vm";
 import { renderDashboardHTML, HERO_COPY } from "../../src/dashboard/html.js";
 import type { ProtectionSnapshot } from "../../src/dashboard/aggregator.js";
 import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../../src/dashboard/design-tokens.js";
@@ -143,9 +145,54 @@ describe("renderDashboardHTML", () => {
     }));
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
     expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
-    const clientFn = html.match(/function shieldStatusMarkForLight\(light\) \{([\s\S]*?)\n  \}/)![1]!;
+    const clientFns = html.match(/function shieldStatusMarkForLight\(light\) \{[\s\S]*?\n  \}\n\n  function renderShield\(light, headline\) \{[\s\S]*?\n  \}\n\n  function renderActivity[\s\S]*?\n  function currentAuditFilter/)![0]!.replace(/\n  function currentAuditFilter$/, "");
     for (const light of lights) {
-      expect(clientFn, light).toContain(serverMarks.get(light));
+      const result = runInNewContext(`
+        const dWrites = [];
+        const classCalls = [];
+        const classes = new Set(["green", "yellow", "red"]);
+        const ids = {
+          shield: {
+            classList: {
+              remove: function (...names) { classCalls.push(["remove", names]); names.forEach((name) => classes.delete(name)); },
+              add: function (...names) { classCalls.push(["add", names]); names.forEach((name) => classes.add(name)); },
+            },
+          },
+          "shield-status-mark": {
+            setAttribute: function (key, value) { if (key === "d") dWrites.push(value); },
+          },
+          "hero-copy": { textContent: "" },
+          "hero-sub": { textContent: "" },
+          "mode-pill": { textContent: "" },
+          "agent-name": { textContent: "" },
+          "agent-did": { textContent: "" },
+        };
+        const document = {
+          getElementById: function (id) { return ids[id] || { textContent: "", innerHTML: "" }; },
+          querySelector: function () { return null; },
+        };
+        let snapshot;
+        function wireApprovalButtons() {}
+        function currentAuditFilter() { return "all"; }
+        function heroCopyForLight() { return "copy"; }
+        // clientFns contains the real renderActivity, renderApprovals, renderPrivacy, and renderAudit declarations; renderAll runs those here.
+        ${clientFns}
+        renderAll({
+          overall: { light: __light, headline: "headline" },
+          mode: "fixture",
+          server_version: "test",
+          agent: { display_name: "agent", did_fingerprint: "did" },
+          activity: [],
+          pending_approvals: [],
+          privacy: {},
+          audit: [],
+        });
+        ({ dWrites, classCalls, classes: Array.from(classes).sort() });
+      `, { __light: light }) as { dWrites: string[]; classCalls: [string, string[]][]; classes: string[] };
+      expect(result.classCalls.filter(([kind]) => kind === "remove"), light).toEqual([["remove", ["green", "yellow", "red"]]]);
+      expect(result.classCalls.filter(([kind]) => kind === "add"), light).toEqual([["add", [light]]]);
+      expect(result.classes, light).toEqual([light]);
+      expect(result.dWrites, light).toEqual([serverMarks.get(light)]);
     }
   });
 
