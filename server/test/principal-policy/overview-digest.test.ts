@@ -209,39 +209,39 @@ describe("round 2 destination labels", () => {
 });
 
 describe("round 2 coverage read bounds", () => {
-  it("discards a torn stream's first entry before accepting its retry", async () => {
+  // The posture surface builds the digest inside runEagerReads (buildDigest in posture-routes.ts); this mirrors it.
+  const eagerDigest = (audit: AuditLog) => audit.runEagerReads(() => digest(audit));
+  it("settles coverage from the eager view without re-reading the chain from disk", async () => {
     const audit = log(); await append(audit, 1);
-    const [first] = await audit.verifiedChainView();
-    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
-      consumer.onEntry({ ...first!, sequence: 2 });
-      consumer.reset?.();
-      consumer.onEntry(first!);
-    });
+    const stream = vi.spyOn(audit, "streamVerifiedChain"); const view = vi.spyOn(audit, "verifiedChainView");
+    const query = vi.spyOn(audit, "query");
+    expect(await eagerDigest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
+    expect(stream).not.toHaveBeenCalled(); expect(view).not.toHaveBeenCalled();
+    // Must match the retained-view read budget in routineWindowCoverage (posture.ts): the digest cap or the retention cap.
+    expect(query).toHaveBeenCalledWith({ limit: Math.max(50_000, audit.getRetentionConfig().maxEntries) });
+  });
+  it("withholds coverage when the chain head and the retained view disagree", async () => {
+    const audit = log(); await append(audit, 1);
+    // One retained entry under a head at sequence 2 means the oldest retained entry is not the chain's first.
+    vi.spyOn(audit, "getChainHead").mockResolvedValue({ sequence: 2, entry_hash: "unknown" });
+    expect(await eagerDigest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("withholds coverage when the retained view is larger than one read", async () => {
+    // Retention keeps entries 2 and 3; entry 2, the floor entry, precedes the window, so the uncut view reads covered.
+    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
+    for (const [seq, at] of [[1, NOW - DAY - 3], [2, NOW - DAY - 2], [3, NOW - 1000]] as const) await append(audit, seq, { timestamp: new Date(at).toISOString() });
     expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
-  });
-  it("withholds coverage when the accepted stream and query populations disagree", async () => {
-    const audit = log(); await append(audit, 1);
-    const [first] = await audit.verifiedChainView();
-    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
-      consumer.onEntry(first!); consumer.onEntry({ ...first!, sequence: 2 });
+    const real = audit.query.bind(audit);
+    // A cut drops the oldest entries, so the floor entry's position is lost; only the retained-view read (no since) is cut.
+    vi.spyOn(audit, "query").mockImplementation(async (options) => {
+      const result = await real(options);
+      return options.since ? result : { ...result, entries: result.entries.slice(1) };
     });
     expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
   });
-  it("withholds coverage if the routine stream cannot be verified", async () => {
+  it("withholds coverage if the chain head cannot be read", async () => {
     const audit = log(); await append(audit, 1);
-    vi.spyOn(audit, "streamVerifiedChain").mockRejectedValue(new Error("unreadable"));
-    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
-  });
-  it("bounds adversarial coverage reads without retaining the stream", async () => {
-    const audit = log(); await append(audit, 1);
-    const [first] = await audit.verifiedChainView();
-    const cap = 50_000; // Must match DIGEST_QUERY_ENTRY_LIMIT in posture.ts.
-    let calls = 0;
-    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
-      // Twice the budget proves that the consumer stops early, not after the whole stream.
-      for (let i = 0; i < cap * 2; i++) { calls++; consumer.onEntry({ ...first!, sequence: i + 1 }); }
-    });
-    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
-    expect(calls).toBe(cap + 1);
+    vi.spyOn(audit, "getChainHead").mockRejectedValue(new Error("unreadable"));
+    expect(await eagerDigest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
   });
 });

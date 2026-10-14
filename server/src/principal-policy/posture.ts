@@ -44,7 +44,6 @@ import {
   auditChainVerdictUntampered,
   auditChainVerdictSealedUnverifiedAtPrivilege,
   type AuditLog,
-  type VerifiedChainItem,
   type AuditChainVerdict,
   type AuditChainVerdictStatus,
 } from "../operational/audit-log.js";
@@ -1143,37 +1142,35 @@ function blockedDestinationLabel(details: Record<string, unknown> | undefined): 
   return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
 }
 
-/** Settle retention from public authenticated reads without retaining another entry array. */
+/** Settle retention from the eager in-memory view and two cheap public reads; never re-reads the chain from disk. */
 async function routineWindowCoverage(
-  auditLog: AuditLog, windowStart: string, queriedCount: number,
+  auditLog: AuditLog, windowStart: string,
 ): Promise<AuditDigest["window_incomplete_reason"]> {
   try {
     const floor = await auditLog.authenticatedRotationFloor();
     if (floor.status === "invalid") return "coverage_unknown";
-    const retained: { oldest: VerifiedChainItem | null; count: number; inWindow: number } = { oldest: null, count: 0, inWindow: 0 };
     const start = parseIsoInstantWithOffset(windowStart);
     if (start === undefined) return "coverage_unknown";
-    await auditLog.streamVerifiedChain({
-      onEntry(item) {
-        // Keep one entry and cap this consumer's work at the digest read budget; over-budget history is unknown.
-        if (++retained.count > DIGEST_QUERY_ENTRY_LIMIT) throw new Error("coverage read limit");
-        retained.oldest ??= item;
-        // Coverage compares absolute instants; ambiguous or invalid timestamps cannot prove membership.
-        const timestamp = parseIsoInstantWithOffset(item.entry.timestamp);
-        if (timestamp === undefined) throw new Error("coverage timestamp unknown");
-        if (timestamp >= start) retained.inWindow++;
-      },
-      reset() { retained.oldest = null; retained.count = 0; retained.inWindow = 0; },
-    });
-    const oldest = retained.oldest;
-    // Only an accepted stream with the same window population can establish the query's retention coverage.
-    if (!oldest || retained.inWindow !== queriedCount) return "coverage_unknown";
+    // The head is read before the view, so an append between the two reads can only lower the view's computed oldest
+    // sequence; that moves the floor lookup to a newer entry or out of the view, never to an older one.
+    const head = await auditLog.getChainHead();
+    // The posture surface runs this inside runEagerReads, so query serves references into the verified in-memory view;
+    // a full on-disk re-read per board paint or stream push is the load this surface must not pay. The read budget is
+    // raised to the retention cap so a log retained in full is read in full.
+    const retained = await auditLog.query({ limit: Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries) });
+    // The floor entry is found by position, so every entry in the view must be in hand; an empty log has none to prove from.
+    if (retained.entries.length === 0 || retained.entries.length !== retained.total) return "coverage_unknown";
+    // A verified chain is contiguous, so the view's oldest sequence follows from the head and the count. The view may
+    // still hold a prefix that retention pruned on disk, until its next reload; a view that holds less than the disk
+    // (a trimmed in-memory window) leaves the floor entry outside it and reads as unknown.
+    const viewOldestSequence = head.sequence - retained.total + 1;
     const firstSequence = 1; // Audit chains number their first entry at one.
-    if (floor.status === "absent") return oldest.sequence === firstSequence ? null : "coverage_unknown";
-    if (oldest.sequence !== floor.base_sequence) return "coverage_unknown";
-    const oldestAt = parseIsoInstantWithOffset(oldest.entry.timestamp);
-    // A MAC authenticates the floor, not its age: the retained boundary must also precede this window.
-    return oldestAt === undefined ? "coverage_unknown" : oldestAt <= start ? null : "retention";
+    if (floor.status === "absent") return viewOldestSequence === firstSequence ? null : "coverage_unknown";
+    const floorEntry = retained.entries[floor.base_sequence - viewOldestSequence];
+    if (!floorEntry) return "coverage_unknown";
+    const floorAt = parseIsoInstantWithOffset(floorEntry.timestamp);
+    // A MAC authenticates the floor, not its age: the oldest entry retention kept must also precede this window.
+    return floorAt === undefined ? "coverage_unknown" : floorAt <= start ? null : "retention";
   } catch {
     return "coverage_unknown";
   }
@@ -1241,11 +1238,11 @@ export async function buildAuditDigest(
     integrityFindings = result.integrity_findings;
     chainVerdict = await input.auditLog.getAuditChainVerdict();
     // Coverage needs an uncut query, no sealed entries per getAuditChainVerdict,
-    // and authenticatedRotationFloor matched to the oldest streamVerifiedChain entry.
+    // and authenticatedRotationFloor's entry located in the eager view by getChainHead and the retained count.
     // Sealed-region time bounds remain an audit-module follow-up; no nonempty status qualifies.
     windowIncompleteReason = chainVerdict.sealed_region.status !== "not_present" && chainVerdict.sealed_region.status !== "empty" ? "sealed_region"
       : result.entries.length !== result.total ? "read_limit"
-      : await routineWindowCoverage(input.auditLog, windowStart, result.total);
+      : await routineWindowCoverage(input.auditLog, windowStart);
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
