@@ -16,10 +16,10 @@ Sanctuary is open source. I, Erik Newton, write and maintain it.
 ## The short version
 
 - Sanctuary runs on your computer. Its keys, encrypted storage, and audit log stay on your computer.
-- I do not run a server that receives data from Sanctuary. There is no account and no sign-up.
-- With default settings, Sanctuary sends no telemetry, no analytics, no crash reports, and makes no background update checks. The first time the server starts, it prints: "Sanctuary makes no unrequested outbound connection."
-- Some features do send data to other companies or services. Each one stays off until you turn it on or ask for it. They are all listed below, with what they send and to whom.
-- Nothing is sent to Verascore without your confirmation.
+- Sanctuary needs no server of mine to work. There is no account and no sign-up. The one service I run that Sanctuary can send data to is Verascore, covered below.
+- With default settings, Sanctuary sends no telemetry, no analytics, no crash reports, and makes no background update checks. The first time the server starts, it says Sanctuary makes no unrequested outbound connection and tells you how to run an update check yourself.
+- Some features do send data to other companies or services. They send data only after you turn on, configure, or run the relevant feature. They are all listed below, with what they send and to whom.
+- Nothing goes to Verascore unless you approve it, answer yes, pass a publish flag, or turn on a setting that allows it. Each path is listed below.
 - Two things happen outside Sanctuary's own code: npm downloads the package when the plugin starts it, and your AI agent sends what Sanctuary's tools return to the agent's model provider. Both are explained below.
 
 ## What stays on your computer
@@ -41,7 +41,7 @@ Sanctuary's tools hand their results to your AI agent. Anything a tool returns, 
 
 ## Features that send data off your computer
 
-Each feature below is off until you turn it on, configure it, or run the command. Where a feature has a default worth knowing, the default is stated.
+Each data-sending path below is inactive until you turn it on, configure it, or run the command. Where a feature has a default worth knowing, the default is stated.
 
 ### 1. Update checks
 
@@ -53,22 +53,22 @@ Each feature below is off until you turn it on, configure it, or run the command
 
 Verascore (verascore.ai) is a reputation service for AI agents. I run it too, as a separate service with its own [privacy policy](https://verascore.ai/privacy) and [terms](https://verascore.ai/terms). Sanctuary works fully without it.
 
-Nothing is sent to Verascore without your confirmation. Every path below needs one of three things from you: your approval when the tool runs, a setting that only you can turn on, or a yes at the quickstart prompt.
+Nothing goes to Verascore unless you act. Every path below needs something from you: your approval when the tool runs, a setting or flag that only you can turn on, a yes at the quickstart prompt, or your own Principal Policy choice to allow a tool without asking.
 
 A published record is signed by your agent's key and appears on a public profile page for that agent. Your agent's private key is never sent.
 
-- **`sanctuary_bootstrap` tool.** Creates a new agent identity and offers to publish it. Sanctuary asks for your approval before the tool runs. It sends the agent's public identifier (a DID), its public key, its label, and a summary of its security settings. To create an identity without publishing, call it with `publish: false` or set `SANCTUARY_AUTO_PUBLISH_TO_VERASCORE=false`.
+- **`sanctuary_bootstrap` tool.** Creates a new agent identity and offers to publish it. By default, Sanctuary asks for your approval before the tool runs; you can change that in your own Principal Policy file. It sends the agent's public identifier (a DID), its public key, its label, and a summary of its security settings. To create an identity without publishing, call it with `publish: false` or set `SANCTUARY_AUTO_PUBLISH_TO_VERASCORE=false`.
 - **`reputation_publish` tool.** Sends a signed summary of the agent's security posture, or data supplied in the call. Sanctuary asks for your approval every time it runs, whatever your policy file says.
 - **Automatic handshake publishing.** Off by default. If you set `SANCTUARY_AUTO_PUBLISH_HANDSHAKES=true`, a record that a verification handshake took place is published after each one. The other agent's identity is withheld from that record.
-- **Compliance bundles.** The EU AI Act bundle tool publishes a signed summary of the bundle (file names and fingerprints) only when you pass `publish_to_verascore`, and it asks for your approval.
-- **`sanctuary_link_to_human` tool.** Sends an email address you provide to Verascore, which emails that person a login link. Sanctuary asks for your approval first, and its audit log records only the email's domain.
-- **The quickstart command.** `@sanctuary-framework/quickstart` creates an agent identity and then asks whether to publish it. The answer defaults to No. `--publish` answers yes in advance and `--no-publish` answers no. If you publish, it sends the new agent's DID, public key, chosen name, a version string, and a timestamp.
+- **Compliance bundles.** The EU AI Act bundle publishes a signed summary of the bundle (file names and fingerprints) only when you pass `publish_to_verascore` to the MCP tool or `--publish-to-verascore` to the CLI. The tool's publish is confirmed by the approval prompt; the CLI flag is your confirmation.
+- **`sanctuary_link_to_human` tool.** Sends an email address you provide to Verascore, which emails that person a login link. By default, Sanctuary asks for your approval first; you can change that in your own Principal Policy file. Its audit log records only the email's domain.
+- **The quickstart command.** `@sanctuary-framework/quickstart` creates an agent identity and then asks whether to publish it. The answer defaults to No. `--publish` answers yes in advance and `--no-publish` answers no. If you publish, it sends a signed request with the new agent's DID, public key, chosen name, security-settings summary, version string, timestamp, agent ID, signature, and record type.
 
 ### 3. AI model providers for Sanctuary's built-in assistant features
 
-Some Sanctuary features (the setup assistant, risk scoring, a second-pass privacy filter, and policy suggestions) can use a language model. By default each one uses a model running on your own computer, or is switched off.
+Some Sanctuary features (the setup assistant, risk scoring, a second-pass privacy filter, and policy suggestions) can use a language model. By default their primary choice is a model running on your own computer, or the feature is switched off. For the setup assistant and policy suggestions, the default fallback setting may try Venice.ai and then Anthropic, OpenAI, or Google if the local call fails and you have already stored the needed provider key. A per-request local-only setting blocks that fallback for that request.
 
-- **If you choose a hosted provider:** when you pick Venice.ai, Anthropic, OpenAI, or Google Gemini for a feature and enter your API key, Sanctuary sends that provider your key and the text the feature needs (for example, text to summarize or classify). For Anthropic, OpenAI, and Google, Sanctuary runs a redaction step first. Redaction reduces what is sent but can miss paraphrased or contextual personal details.
+- **If you choose or configure a hosted provider:** when you pick Venice.ai, Anthropic, OpenAI, or Google Gemini for a feature and enter your API key, Sanctuary sends that provider your key and the text the feature needs (for example, text to summarize or classify). For Anthropic, OpenAI, and Google, Sanctuary actively runs its second-pass redaction only when you have turned on its privacy filter for hosted models (or smart mode) and accepted the trade-off it explains. Otherwise that step passes the text through unchanged. Redaction reduces what is sent but can miss paraphrased or contextual personal details.
 - **If you set up a local model:** during setup on a terminal, Sanctuary asks before it begins (or proceeds because you passed `--provision-local-intelligence`). If you agree, Sanctuary tells the Ollama app on your computer to download a model, and Ollama downloads it from Ollama's own registry. That download is between you and Ollama.
 
 ### 4. Checking API keys you already have
@@ -83,9 +83,9 @@ If you create the Telegram probe settings file for a chief-of-staff agent, Sanct
 
 You can point Sanctuary at a web address you control for approval requests, approval notifications, and distress signals. All three are off until you configure them, and every message is signed with a secret you choose.
 
-- **Approval requests** contain the operation name, its approval level, the reason approval is needed, and a short summary of the request: text values are cut to 100 characters, fields with names like password, secret, or key are withheld, and nested values are reduced to their size.
-- **Approval notifications** contain the agent, the action (cut to 80 characters), and how urgent it is.
-- **Distress signals** contain an event ID and any short note the agent included.
+- **Approval requests** contain the operation name, its approval level, the reason approval is needed, a timestamp, callback details, timeout, and context for the request. Tier 1 requests include a short argument summary: text values of 100 characters or fewer are included, longer text is shortened, values of fields named like passwords, secrets, private keys, or credentials are withheld, and arrays or objects are summarized by size. Tier 2 anomaly requests can include the namespace or counterparty that triggered the check and the known namespace or counterparty list used for comparison.
+- **Approval notifications** contain an approval entry ID, source harness, source agent ID, action summary (cut to 80 characters), urgency, fortress ID, and timestamp.
+- **Distress signals** contain the distress envelope, its hash, and the signature when available. The envelope includes the actor, reason, severity, timestamp, sequence, event ID, and any note the agent included, cut to 280 characters.
 
 Whoever runs that web address receives these messages.
 
