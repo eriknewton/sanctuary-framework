@@ -1785,15 +1785,22 @@ body {
 .approval-filters {
   display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
 }
+/* The Approvals artboard's main column is fluid (canvas/Approvals.dc.html, .main). Under the shell's
+   880px reading cap the queue beside the 420px drawer had about 440px, so its waiting and decision
+   columns scrolled out of view at 1280 and 1440. */
+.concierge-wrap.approvals-wide { max-width: none; }
 .approval-layout {
   display: grid; grid-template-columns: minmax(0, 1fr) 420px;
   gap: var(--space-4); align-items: start;
 }
 .approval-table-wrap { overflow-x: auto; }
+/* No minimum width, as on the artboard: the reason column wraps so every column stays in view;
+   the wrapper still scrolls if a long unbroken value cannot wrap. */
 .approval-table {
-  width: 100%; border-collapse: collapse; min-width: 760px;
+  width: 100%; border-collapse: collapse;
   font-size: var(--text-sm);
 }
+.approval-table td:first-child, .approval-table td:nth-child(5), .approval-table .btn { white-space: nowrap; }
 .approval-table th {
   text-align: left; color: var(--ink-3); font-family: var(--mono);
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;

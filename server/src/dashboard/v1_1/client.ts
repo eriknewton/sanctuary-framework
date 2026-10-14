@@ -4190,7 +4190,7 @@ function renderApprovalsScreen() {
       '<span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span>' +
     '</div>';
   return [
-    '<section class="concierge-wrap">',
+    '<section class="concierge-wrap approvals-wide">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
