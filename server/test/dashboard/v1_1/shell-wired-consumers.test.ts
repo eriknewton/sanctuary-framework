@@ -1239,6 +1239,13 @@ describe("slice 2b shell wired consumers", () => {
     expect(html).not.toMatch(/signed receipt|tool-call cycle/);
   });
 
+  // One glyph-to-mark table for both agent mark tests below, so the dot and tone they expect cannot drift apart.
+  const GLYPH_TO_MARK: Record<string, { dot: string; tone: string }> = {
+    online: { dot: "live", tone: "tone-verified" }, idle: { dot: "idle", tone: "tone-degraded" },
+    offline: { dot: "locked", tone: "tone-locked" }, away: { dot: "off", tone: "tone-unverified" },
+    unknown: { dot: "unknown", tone: "tone-unknown" },
+  };
+
   it("an agent without current evidence wears the Unknown mark, never a working state's mark", async () => {
     vi.useFakeTimers();
     const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
@@ -1259,13 +1266,8 @@ describe("slice 2b shell wired consumers", () => {
       return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
     };
     const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
-    const glyphToMark: Record<string, { dot: string; tone: string }> = {
-      online: { dot: "live", tone: "tone-verified" }, idle: { dot: "idle", tone: "tone-degraded" },
-      offline: { dot: "locked", tone: "tone-locked" }, away: { dot: "off", tone: "tone-unverified" },
-      unknown: { dot: "unknown", tone: "tone-unknown" },
-    };
     const unwrappingGlyph = STATUS_MAPPING.unwrapping.glyph;
-    const { dot: unwrappingDot, tone: unwrappingTone } = glyphToMark[unwrappingGlyph]!;
+    const { dot: unwrappingDot, tone: unwrappingTone } = GLYPH_TO_MARK[unwrappingGlyph]!;
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
@@ -1305,11 +1307,10 @@ describe("slice 2b shell wired consumers", () => {
     h.navigate("agents");
     const tableStatuses = Object.keys(STATUS_MAPPING).sort();
     expect([...HUB_AGENT_STATUSES].sort()).toEqual(tableStatuses);
-    const glyphToDot: Record<string, string> = { online: "live", idle: "idle", offline: "locked", away: "off", unknown: "unknown" };
     for (const status of HUB_AGENT_STATUSES) {
       const id = `agent-${status}`;
       const expectedGlyph = STATUS_MAPPING[status].glyph;
-      const expectedDot = glyphToDot[expectedGlyph];
+      const expectedDot = GLYPH_TO_MARK[expectedGlyph]!.dot;
       (h.context as Record<string, unknown>).__agentStatus = status;
       (h.context as Record<string, unknown>).__agentId = id;
       expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);
