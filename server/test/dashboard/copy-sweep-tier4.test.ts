@@ -36,10 +36,11 @@ describe("Dashboard copy sweep — Tier 4", () => {
     expect(script).toContain("sanctuary auto-trigger promote");
   });
 
-  // VVVVV: Evidence export controls state unavailable dashboard paths.
-  it("VVVVV: Evidence export controls state unavailable dashboard paths", () => {
-    expect(script).toContain("CEF unavailable from this dashboard");
-    expect(script).toContain("Compliance bundle unavailable from this dashboard");
+  // VVVVV: Approvals inbox has tier grouping headers
+  it("VVVVV: inbox renders tier grouping headers", () => {
+    expect(script).toContain("inbox-group-head");
+    expect(script).toContain("Tier 1 approvals");
+    expect(script).toContain("Tier 2 approvals");
   });
 
   // MMMM: Privacy and Coordination empty states have explanatory copy
@@ -71,9 +72,9 @@ describe("Dashboard copy sweep — Tier 4", () => {
     expect(script).not.toContain('api("/audit-chain/verify"');
   });
 
-  // VVVVV: CSS for Evidence export controls exists in HTML shell
-  it("VVVVV: Evidence export disabled CSS exists in HTML shell", () => {
+  // VVVVV: CSS for inbox group heads exists in HTML shell
+  it("VVVVV: inbox-group-head CSS exists in HTML shell", () => {
     const html = renderDashboardV11Html({ sanctuaryVersion: "1.3.0-test", embedClient: false });
-    expect(html).toContain(".evidence-export .toolbar .btn:disabled");
+    expect(html).toContain(".inbox-group-head");
   });
 });

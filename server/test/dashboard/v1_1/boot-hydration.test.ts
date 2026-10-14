@@ -111,7 +111,9 @@ describe("dashboard bounded independent hydration", () => {
   it("reports a preferences timeout and uses default filters", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
-    expect(runInContext('sourceRead(INBOX_PREFS).error', h.context)).toContain("Read timed out");
+    runInContext('state.route = "activity"; rerender()', h.context);
+    expect(h.main.innerHTML).toContain("Read timed out");
+    expect(h.main.innerHTML).toContain("Evidence");
     expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {

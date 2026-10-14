@@ -27,6 +27,7 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 
 /**
@@ -59,6 +60,15 @@ export const DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR =
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE = "standalone";
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE =
   "Not available in this dashboard mode.";
+
+// Must cover AuditChainVerdictStatus in operational/audit-log.ts; the browser
+// receives this typed map verbatim, and the wired test compares the whole union.
+const EVIDENCE_CHAIN_VERDICTS = {
+  verified: { kind: "good", word: "CHAIN VERIFIED", summary: "Routine entries and any readable sealed region verified clean." },
+  verified_suffix_only: { kind: "warn", word: "RECENT ENTRIES VERIFIED", summary: "Recent entries are verified. The sealed older region could not be verified at this privilege." },
+  findings: { kind: "bad", word: "INTEGRITY FINDINGS", summary: "The server reported integrity findings." },
+  key_unavailable: { kind: "unknown", word: "NOT VERIFIED", summary: "The audit key is not available, so the chain was not verified." },
+} satisfies Record<AuditChainVerdictStatus, { kind: string; word: string; summary: string }>;
 
 const CLIENT_SCRIPT = String.raw`
 "use strict";
@@ -168,6 +178,12 @@ const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute
 function readKey(url) {
   const parsed = new URL(url, location.origin);
   parsed.searchParams.delete("_t"); parsed.searchParams.delete("session");
+  // Filter changes share one bounded read slot; queuePanel invalidates the old revision.
+  if (parsed.pathname === "/api/posture/evidence") {
+    ["agent", "since", "operation_type", "layer", "result", "limit"].forEach(function (key) {
+      parsed.searchParams.delete(key);
+    });
+  }
   return parsed.origin + parsed.pathname + parsed.search;
 }
 function sourceRead(path) { return sourceReads.get(readKey(path)); }
@@ -241,8 +257,8 @@ const state = {
   activity: [],
   evidence: {
     view: null,
-    filters: { query: "", layer: "", agent: "", event: "", verdict: "", from: "", to: "" },
-    selectedSeq: null
+    filters: { query: "", layer: "", agent: "", event: "", result: "", from: "" },
+    selectedIndex: 0
   },
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
@@ -537,10 +553,11 @@ async function api(path, opts, deadlineAt) {
   init.cache = "no-store";
   init.headers["Cache-Control"] = "no-cache";
   init.headers["Pragma"] = "no-cache";
-  let url = HUB + path;
+  // The audit download uses the same bearer and read handling as hub calls.
+  let url = path === "/api/audit-log" ? path : HUB + path;
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") {
-    url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+    url += (url.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
   let res = await dashboardResponse(url, init, deadlineAt);
@@ -3163,55 +3180,66 @@ const EVIDENCE_LAYER_NAMES = {
   l4: "Heralds"
 };
 const EVIDENCE_LAYER_ORDER = ["l1", "l2", "l3", "l4"];
-const EVIDENCE_PAGE_SIZE = 25;
+const EVIDENCE_ROUTE_DEFAULT_LIMIT = 50; // Must match buildEvidence default in principal-policy/posture-routes.ts.
+const EVIDENCE_CHAIN_VERDICTS = ${JSON.stringify(EVIDENCE_CHAIN_VERDICTS)};
+// 50 is the route default limit in buildEvidence, so the first page and the
+// server window have the same bound unless the route changes.
+const EVIDENCE_PAGE_SIZE = EVIDENCE_ROUTE_DEFAULT_LIMIT;
+const EVIDENCE_DETAIL_VALUE_MAX_CHARS = 240; // 240 = four 60-char lines in the drawer key-value column.
+const EVIDENCE_RAW_RECORD_MAX_CHARS = 6000; // 6000 = about 100 60-char lines, enough for inspection without unbounded DOM growth.
+const EVIDENCE_DETAIL_KEY_LIMIT = EVIDENCE_PAGE_SIZE; // One record gets at most the same row budget as one audit page.
+const EVIDENCE_FINDING_DISPLAY_LIMIT = 5; // Five findings fit in the strip before the table leaves the first viewport.
 
 function evidenceLayerName(layer) {
   return EVIDENCE_LAYER_NAMES[layer] || "Unknown";
 }
 
-function evidenceSeq(entry, fallback) {
-  const raw = entry && (entry.sequence !== undefined ? entry.sequence : entry.seq);
-  if (raw === undefined || raw === null || raw === "") return fallback;
-  return raw;
-}
-
 function evidenceTimestamp(entry) {
-  return entry && (entry.timestamp || entry.emitted_at || entry.created_at || entry.ts || "");
+  return entry && entry.timestamp || "";
 }
 
+// Invariant: the Evidence read serves AuditEntry only, so every cell reads a
+// served AuditEntry field or says the value is missing.
 function evidenceAgent(entry) {
-  return entry && (entry.identity_id || entry.agent_id || entry.actor || "fortress");
+  return entry && entry.identity_id || "agent not named";
 }
 
 function evidenceEvent(entry) {
-  return entry && (entry.operation_type || entry.event || entry.category || "audit entry");
+  return entry && entry.operation || "operation not named";
 }
 
-function evidenceVerdict(entry) {
-  const raw = String((entry && (entry.result || entry.verdict || entry.outcome)) || "record").toLowerCase();
-  if (raw === "success" || raw === "allowed" || raw === "verified") return "verified";
-  if (raw === "failure" || raw === "blocked" || raw === "denied") return "broken";
-  if (raw === "held" || raw === "pending") return "held";
-  return raw || "record";
+function evidenceResult(entry) {
+  const raw = String(entry && entry.result || "").toLowerCase();
+  if (raw === "success" || raw === "failure") return raw;
+  return "";
 }
 
-function evidenceHash(entry) {
-  return entry && (entry.hash || entry.entry_hash || entry.audit_hash || "");
+function cappedText(value, maxChars) {
+  var raw;
+  if (value === null) raw = "null";
+  else if (value === undefined) raw = "missing";
+  else if (typeof value === "string") raw = value;
+  else {
+    try { raw = JSON.stringify(value); } catch (_e) { raw = String(value); }
+  }
+  if (raw.length <= maxChars) return raw;
+  return raw.slice(0, maxChars) + "... truncated at " + maxChars + " chars";
 }
 
-function evidencePrevHash(entry) {
-  return entry && (entry.previous_hash || entry.prev_hash || entry.prev || "");
+function evidenceDetailsList(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" && !Array.isArray(entry.details) ? entry.details : null;
+  if (!details) return "";
+  const keys = Object.keys(details).sort();
+  if (!keys.length) return "";
+  return '<dt>Details</dt><dd>showing ' + Math.min(keys.length, EVIDENCE_DETAIL_KEY_LIMIT) + ' of ' + keys.length + ' fields</dd>' + keys.slice(0, EVIDENCE_DETAIL_KEY_LIMIT).map(function (key) {
+    return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+  }).join("");
 }
 
-function shortHash(value) {
-  const raw = String(value || "");
-  if (raw.length <= 18) return raw || "Unknown";
-  return raw.slice(0, 10) + "..." + raw.slice(-6);
-}
-
-function evidenceDetail(entry, key) {
-  const details = entry && entry.details && typeof entry.details === "object" ? entry.details : {};
-  return details[key];
+function evidenceContributorsList(entry) {
+  const contributors = entry && Array.isArray(entry.contributors) ? entry.contributors : [];
+  if (!contributors.length) return "";
+  return '<dt>contributors</dt><dd>' + escHtml(cappedText(contributors, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
 }
 
 function evidenceEntryText(entry) {
@@ -3219,11 +3247,8 @@ function evidenceEntryText(entry) {
   return [
     evidenceEvent(entry),
     evidenceAgent(entry),
-    entry && entry.display_template_id,
-    details.summary,
-    details.event_text,
-    details.destination,
-    details.rule_id,
+    evidenceResult(entry),
+    evidenceLayerName(entry && entry.layer),
     JSON.stringify(details)
   ].filter(Boolean).join(" ");
 }
@@ -3240,9 +3265,8 @@ function evidenceMatchesQuery(entry, query) {
       const value = word.slice(split + 1);
       if (field === "agent") return String(evidenceAgent(entry)).toLowerCase().indexOf(value) >= 0;
       if (field === "layer") return evidenceLayerName(entry.layer).toLowerCase().indexOf(value) >= 0 || String(entry.layer || "").toLowerCase() === value;
-      if (field === "verdict") return evidenceVerdict(entry).toLowerCase().indexOf(value) >= 0;
-      if (field === "seq") return String(evidenceSeq(entry, "")).toLowerCase() === value;
-      if (field === "event" || field === "rule" || field === "dst" || field === "text") return haystack.indexOf(value) >= 0;
+      if (field === "result") return evidenceResult(entry).toLowerCase().indexOf(value) >= 0;
+      if (field === "event" || field === "operation" || field === "text") return haystack.indexOf(value) >= 0;
     }
     return haystack.indexOf(word) >= 0;
   });
@@ -3259,9 +3283,9 @@ function applyEvidenceHashFilters(hash) {
   filters.layer = EVIDENCE_LAYER_NAMES[layer] ? layer : "";
   filters.agent = params.get("agent") || "";
   filters.event = params.get("event") || "";
-  filters.verdict = params.get("verdict") || "";
+  const result = params.get("result") || "";
+  filters.result = result === "success" || result === "failure" ? result : "";
   filters.from = params.get("from") || "";
-  filters.to = params.get("to") || "";
 }
 
 function evidenceHashFromFilters() {
@@ -3271,51 +3295,48 @@ function evidenceHashFromFilters() {
   if (filters.layer) params.set("layer", filters.layer);
   if (filters.agent) params.set("agent", filters.agent);
   if (filters.event) params.set("event", filters.event);
-  if (filters.verdict) params.set("verdict", filters.verdict);
+  if (filters.result) params.set("result", filters.result);
   if (filters.from) params.set("from", filters.from);
-  if (filters.to) params.set("to", filters.to);
   const qs = params.toString();
   return "#activity" + (qs ? "?" + qs : "");
 }
 
 function setEvidenceFilter(name, value) {
   if (!Object.prototype.hasOwnProperty.call(state.evidence.filters, name)) return;
+  const previousUrl = evidenceReadUrl();
   state.evidence.filters[name] = value;
+  state.evidence.selectedIndex = 0;
   const nextHash = evidenceHashFromFilters();
   if (location.hash !== nextHash) location.hash = nextHash;
   else rerender();
+  if (evidenceReadUrl() !== previousUrl) queueEvidenceRead();
+}
+
+function evidenceReadUrl() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.agent) params.set("agent", filters.agent);
+  if (filters.from) params.set("since", filters.from);
+  if (filters.event) params.set("operation_type", filters.event);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.result) params.set("result", filters.result);
+  params.set("limit", String(EVIDENCE_PAGE_SIZE));
+  const qs = params.toString();
+  return "/api/posture/evidence" + (qs ? "?" + qs : "");
+}
+
+function queueEvidenceRead() {
+  const job = panelJobs.find(function (candidate) {
+    return candidate.paths.indexOf("/api/posture/evidence") >= 0;
+  });
+  if (job) { void queuePanel(job); rerender(); }
 }
 
 function filteredEvidenceEntries(entries) {
   const filters = state.evidence.filters;
-  const fromMs = filters.from ? evidenceDateFilterMs(filters.from, false) : null;
-  const toMs = filters.to ? evidenceDateFilterMs(filters.to, true) : null;
   return (entries || []).filter(function (entry) {
-    const ts = parseEvidenceTimestamp(evidenceTimestamp(entry));
-    if (filters.layer && entry.layer !== filters.layer) return false;
-    if (filters.agent && String(evidenceAgent(entry)).toLowerCase().indexOf(filters.agent.toLowerCase()) < 0) return false;
-    if (filters.event && String(evidenceEvent(entry)).toLowerCase().indexOf(filters.event.toLowerCase()) < 0) return false;
-    if (filters.verdict && evidenceVerdict(entry) !== filters.verdict) return false;
-    if (fromMs !== null && Number.isFinite(ts) && ts < fromMs) return false;
-    if (toMs !== null && Number.isFinite(ts) && ts > toMs) return false;
     return evidenceMatchesQuery(entry, filters.query);
   });
-}
-
-function evidenceDateFilterMs(value, endOfDay) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
-  if (!match) return NaN;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const ms = endOfDay ? 999 : 0;
-  const second = endOfDay ? 59 : 0;
-  const minute = endOfDay ? 59 : 0;
-  const hour = endOfDay ? 23 : 0;
-  const stamp = Date.UTC(year, month - 1, day, hour, minute, second, ms);
-  const check = new Date(stamp);
-  if (check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) return NaN;
-  return stamp;
 }
 
 function renderEvidenceStatusChip(kind, word) {
@@ -3391,21 +3412,41 @@ function renderEvidenceIntegrity(view) {
       '</div><div class="ei-facts"><strong>Chain verification Unknown</strong><span>' + escHtml(reason) + '</span></div></section>';
   }
   const findings = Array.isArray(view.integrity_findings) ? view.integrity_findings : [];
-  const verified = view.chain_verdict === "verified" && findings.length === 0;
-  if (verified) {
-    const first = (view.entries || [])[0] || {};
-    return '<section class="evidence-integrity verified"><div class="ei-badge">' + renderEvidenceStatusChip("good", "CHAIN VERIFIED") + '</div>' +
-      '<div class="ei-facts"><span><b>' + escHtml(view.total || 0) + '</b> entries</span><span><b>0</b> integrity findings in window</span>' +
-      '<span>last verified by server read ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span><span>head <span class="mono">' + escHtml(shortHash(evidenceHash(first))) + '</span></span>' +
-      '<span>signer <span class="mono">' + escHtml(first.signer || "operator") + '</span></span></div>' +
-      '<span class="ei-note">Verification result comes from the audit-chain read.</span></section>';
-  }
-  const word = findings.length ? "INTEGRITY FINDING" : "UNKNOWN";
-  const kind = findings.length ? "bad" : "unknown";
-  const reason = findings.length ? findings.length + " integrity findings returned" : "server verification did not return a verified chain";
-  return '<section class="evidence-integrity ' + escHtml(kind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(kind, word) + '</div>' +
-    '<div class="ei-facts"><strong>' + escHtml(reason) + '</strong><span>chain verdict <span class="mono">' + escHtml(view.chain_verdict || "unknown") + '</span></span>' +
-    '<span><b>' + escHtml(view.total || 0) + '</b> entries</span><span><b>' + escHtml(findings.length) + '</b> integrity findings in window</span></div></section>';
+  const total = typeof view.total === "number" ? view.total : "Unknown";
+  const sealed = renderSealedRegion(view.sealed_region);
+  const status = view.chain_verdict;
+  const known = Object.prototype.hasOwnProperty.call(EVIDENCE_CHAIN_VERDICTS, status);
+  // Only the served whole-chain verdict with no findings earns CHAIN VERIFIED.
+  // Continuing paths: verified -> clean; suffix -> qualified; findings -> bad;
+  // key unavailable or an unrecognized verdict -> no verification claim.
+  const verdict = known ? EVIDENCE_CHAIN_VERDICTS[findings.length && status === "verified" ? "findings" : status] : {
+    kind: "unknown", word: "UNKNOWN", summary: "The audit chain status was not recognized or was not served."
+  };
+  const chipKind = verdict.kind;
+  const chipWord = verdict.word;
+  const summary = verdict.summary;
+  const shownFindings = findings.slice(0, EVIDENCE_FINDING_DISPLAY_LIMIT).map(function (finding) {
+    return '<span>' + escHtml(cappedText(finding.kind || "finding", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + ': ' +
+      escHtml(cappedText(finding.message || "message not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</span>';
+  }).join("");
+  const findingCount = findings.length
+    ? '<span>showing ' + escHtml(Math.min(findings.length, EVIDENCE_FINDING_DISPLAY_LIMIT)) + ' of ' + escHtml(findings.length) + ' findings</span>'
+    : '<span><b>0</b> integrity findings in window</span>';
+  return '<section class="evidence-integrity ' + escHtml(chipKind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(chipKind, chipWord) + '</div>' +
+    '<div class="ei-facts"><strong>' + escHtml(summary) + '</strong><span><b>' + escHtml(total) + '</b> entries in the served window before page limit and result filter</span>' +
+    findingCount + '<span>sealed region: ' + escHtml(sealed) + '</span><span>last verified: age of this read ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span>' +
+    shownFindings + '</div></section>';
+}
+
+function renderSealedRegion(sealed) {
+  if (!sealed || typeof sealed !== "object") return "Unknown";
+  if (sealed.status === "not_present") return "no sealed legacy region present";
+  if (sealed.status === "empty") return "sealed legacy region is empty";
+  if (sealed.status === "verified") return "sealed region verified, entries verified " + String(sealed.entries_verified || 0);
+  if (sealed.status === "unreadable") return "sealed older region unreadable at this privilege: " + cappedText(sealed.note || "reason not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS);
+  if (sealed.status === "incomplete") return "sealed region incomplete, highest present " + String(sealed.highest_present || 0) + " of expected tip " + String(sealed.expected_tip || 0);
+  if (sealed.status === "hash_mismatch") return "sealed region hash mismatch at sequence " + String(sealed.sequence || "unknown");
+  return "Unknown";
 }
 
 function renderEvidenceQueryBar() {
@@ -3413,77 +3454,71 @@ function renderEvidenceQueryBar() {
   const layerOptions = ['<option value="">Any</option>'].concat(EVIDENCE_LAYER_ORDER.map(function (token) {
     return '<option value="' + token + '"' + (f.layer === token ? ' selected' : '') + '>' + escHtml(evidenceLayerName(token)) + '</option>';
   })).join("");
-  const verdictOptions = ["", "verified", "broken", "held", "record"].map(function (value) {
+  const resultOptions = ["", "success", "failure"].map(function (value) {
     const label = value ? sentenceCase(value) : "Any";
-    return '<option value="' + escHtml(value) + '"' + (f.verdict === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+    return '<option value="' + escHtml(value) + '"' + (f.result === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
   }).join("");
   const chips = [
     "Layer: " + (f.layer ? evidenceLayerName(f.layer) : "Any"),
     "Agent: " + (f.agent || "Any"),
     "Event: " + (f.event || "Any"),
-    "Verdict: " + (f.verdict ? sentenceCase(f.verdict) : "Any"),
-    "Time: " + (f.from || f.to ? (f.from || "start") + " to " + (f.to || "now") : TIME_RANGE_LABEL[state.timeRange])
+    "Result: " + (f.result ? sentenceCase(f.result) : "Any"),
+    "From: " + (f.from || "Any")
   ].map(function (chip) { return '<span class="evidence-chip">' + escHtml(chip) + '</span>'; }).join("");
   return '<section class="card evidence-query"><div class="filter-bar" role="group" aria-label="Filter evidence entries">' +
-    '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: verdict: rule: dst: seq: or text" value="' + escHtml(f.query) + '"></label>' +
+    '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: result: event: or text" value="' + escHtml(f.query) + '"></label>' +
     '<label class="field"><span class="field-label">Layer</span><select class="input" data-action="evidence-filter-layer">' + layerOptions + '</select></label>' +
     '<label class="field"><span class="field-label">Agent</span><input class="input" data-action="evidence-filter-agent" value="' + escHtml(f.agent) + '"></label>' +
     '<label class="field"><span class="field-label">Event</span><input class="input" data-action="evidence-filter-event" value="' + escHtml(f.event) + '"></label>' +
-    '<label class="field"><span class="field-label">Verdict</span><select class="input" data-action="evidence-filter-verdict">' + verdictOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">Result</span><select class="input" data-action="evidence-filter-result">' + resultOptions + '</select></label>' +
     '<label class="field"><span class="field-label">From</span><input class="input" data-action="evidence-filter-from" type="date" value="' + escHtml(f.from) + '"></label>' +
-    '<label class="field"><span class="field-label">To</span><input class="input" data-action="evidence-filter-to" type="date" value="' + escHtml(f.to) + '"></label>' +
-    '</div><div class="evidence-chips">' + chips + '</div></section>';
+    '</div><div class="evidence-chips">' + chips + '<span class="evidence-chip">Query searches only the entries loaded on this page</span></div></section>';
 }
 
-function renderEvidenceRow(entry, fallback) {
-  const seq = evidenceSeq(entry, fallback);
-  const selected = String(state.evidence.selectedSeq || "") === String(seq);
-  const verdict = evidenceVerdict(entry);
-  return '<tr' + (selected ? ' class="sel"' : '') + ' data-evidence-row="' + escHtml(seq) + '">' +
-    '<td class="mono muted">' + escHtml(seq) + '</td>' +
-    '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry))) + '</td>' +
+function renderEvidenceRow(entry, index) {
+  const selected = state.evidence.selectedIndex === index;
+  const result = evidenceResult(entry);
+  const resultKind = result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown";
+  return '<tr' + (selected ? ' class="sel"' : '') + ' data-evidence-row="' + escHtml(index) + '">' +
+    '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry)) || "timestamp missing") + '</td>' +
     '<td><span class="lay">' + escHtml(evidenceLayerName(entry.layer)) + '</span></td>' +
     '<td><span class="row">' + escHtml(evidenceAgent(entry)) + '</span></td>' +
-    '<td>' + escHtml(evidenceEvent(entry)) + '</td>' +
-    '<td>' + renderEvidenceStatusChip(verdict === "broken" ? "bad" : verdict === "held" ? "warn" : "neutral", verdict.toUpperCase()) + '</td>' +
-    '<td class="mono muted">' + escHtml(shortHash(evidenceHash(entry))) + '</td>' +
+    '<td><button class="btn" data-action="evidence-select" data-evidence-index="' + index + '" aria-pressed="' + selected + '">' + escHtml(evidenceEvent(entry)) + '</button></td>' +
+    '<td>' + renderEvidenceStatusChip(resultKind, result ? sentenceCase(result) : "Missing") + '</td>' +
   '</tr>';
 }
 
-function renderEvidenceDrawer(entry, fallback) {
+function renderEvidenceDrawer(entry) {
   if (!entry) {
-    return '<aside class="panel evidence-detail"><div class="overview-empty"><h3>No record selected</h3><p>Select an entry to inspect its signed record.</p></div></aside>';
+    return '<aside class="panel evidence-detail"><div class="overview-empty"><h3>No record selected</h3><p>Select an entry to inspect the served audit record.</p></div></aside>';
   }
-  const seq = evidenceSeq(entry, fallback);
-  const destination = evidenceDetail(entry, "destination") || evidenceDetail(entry, "dst") || "Unknown";
-  const rule = evidenceDetail(entry, "rule_id") || evidenceDetail(entry, "rule") || "Unknown";
-  const agentSaw = evidenceDetail(entry, "agent_saw") || evidenceDetail(entry, "event_text") || "Not stated";
-  const linkWord = entry.link_verified === true ? "link ok" : "broken";
-  const signerWord = entry.signature_verified === false ? "signature not verified" : "authenticity verified";
-  const verdict = evidenceVerdict(entry);
+  const result = evidenceResult(entry);
+  const details = evidenceDetailsList(entry);
+  const contributors = evidenceContributorsList(entry);
+  const raw = cappedText(entry, EVIDENCE_RAW_RECORD_MAX_CHARS);
   return '<aside class="panel evidence-detail" aria-label="Selected entry">' +
-    '<div class="hd"><div class="t">Entry ' + escHtml(seq) + ' ' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
+    '<div class="hd"><div class="t">' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
     '<div class="sec"><h3>What happened</h3><dl class="kv">' +
+      '<dt>Operation</dt><dd>' + escHtml(evidenceEvent(entry)) + '</dd>' +
       '<dt>Agent</dt><dd>' + escHtml(evidenceAgent(entry)) + '</dd>' +
-      '<dt>Destination</dt><dd><span class="mono">' + escHtml(destination) + '</span></dd>' +
-      '<dt>Verdict</dt><dd>' + renderEvidenceStatusChip(verdict === "broken" ? "bad" : "neutral", verdict.toUpperCase()) + '</dd>' +
-      '<dt>Rule</dt><dd>' + escHtml(rule) + '</dd>' +
-      '<dt>Agent saw</dt><dd><span class="mono">' + escHtml(agentSaw) + '</span></dd>' +
+      '<dt>Layer</dt><dd>' + escHtml(evidenceLayerName(entry.layer)) + '</dd>' +
+      '<dt>Result</dt><dd>' + renderEvidenceStatusChip(result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown", result ? sentenceCase(result) : "Missing") + '</dd>' +
+      '<dt>Time</dt><dd>' + escHtml(evidenceTimestamp(entry) || "timestamp missing") + '</dd>' +
+      details + contributors +
     '</dl></div>' +
     '<div class="sec"><h3>Seal</h3><div class="chain">' +
-      '<div class="lnk"><span class="k">this</span><span class="h">' + escHtml(shortHash(evidenceHash(entry))) + '</span></div>' +
-      '<div class="lnk"><span class="k">prev</span><span class="h">' + escHtml(shortHash(evidencePrevHash(entry))) + ' <span class="' + (entry.link_verified === true ? 'ok' : 'bad') + '">' + escHtml(linkWord) + '</span></span></div>' +
-      '<div class="lnk"><span class="k">signed by</span><span class="h">' + escHtml(entry.signer || "Unknown signer") + ', ' + escHtml(signerWord) + '</span></div>' +
+      '<p class="muted">Per-entry seal data is not served by this read. Chain integrity is the strip above.</p>' +
     '</div></div>' +
-    '<div class="sec"><h3>Raw record</h3><pre class="json">' + escHtml(JSON.stringify(entry, null, 2)) + '</pre></div>' +
+    '<div class="sec"><h3>Raw record</h3><pre class="json">' + escHtml(raw) + '</pre></div>' +
   '</aside>';
 }
 
 function renderEvidenceExports() {
   return '<section class="card evidence-export"><h3>Export</h3><div class="toolbar">' +
-    '<a class="btn" href="/api/audit-log">JSON audit log</a>' +
-    '<button class="btn" disabled title="audit_export_siem exists as an MCP export, but this dashboard has no CEF route.">CEF unavailable from this dashboard</button>' +
-    '<button class="btn" disabled title="compliance_generate_eu_ai_act_bundle is Tier 1 and has no dashboard entry point here.">Compliance bundle unavailable from this dashboard</button>' +
+    '<button class="btn" data-action="evidence-export-json">JSON audit log</button>' +
+    '<button class="btn" disabled title="CEF export is available from the audit_export_siem tool, not from this dashboard yet.">CEF unavailable from this dashboard</button>' +
+    '<button class="btn" disabled title="Compliance bundle export is Tier 1 through compliance_generate_eu_ai_act_bundle, not from this dashboard yet.">Compliance bundle unavailable from this dashboard</button>' +
+    '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
     '<a class="btn" href="#exit-drill">Exit drill</a>' +
   '</div></section>';
 }
@@ -3500,20 +3535,25 @@ function renderEvidenceExports() {
 // home of the panel moved.
 function renderActivityScreen() {
   const view = state.evidence.view;
-  const entries = view && Array.isArray(view.entries) ? view.entries : [];
+  const entries = sourceLoaded("/api/posture/evidence") && view && Array.isArray(view.entries) ? view.entries : [];
   const filtered = filteredEvidenceEntries(entries);
-  if (state.evidence.selectedSeq === null && filtered.length) state.evidence.selectedSeq = evidenceSeq(filtered[0], 1);
-  const selected = filtered.find(function (entry, index) {
-    return String(evidenceSeq(entry, index + 1)) === String(state.evidence.selectedSeq);
-  }) || filtered[0] || null;
   const shown = filtered.slice(0, EVIDENCE_PAGE_SIZE);
+  if (!shown[state.evidence.selectedIndex]) state.evidence.selectedIndex = 0;
+  const selected = shown[state.evidence.selectedIndex] || null;
+  const total = view && typeof view.total === "number" ? view.total : "Unknown";
+  const searchedLine = state.evidence.filters.query
+    ? "searching the " + entries.length + " entries loaded"
+    : "search is local to the " + entries.length + " entries loaded";
   const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
-    ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(entries.length + " entries were read from the server, 0 matched these filters.") + '</p><a class="btn" href="#activity">Clear filters</a></div>'
+    ? entries.length || total > 0 || Object.values(state.evidence.filters).some(Boolean)
+      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(entries.length + " entries were loaded. The active server filters or page-local search have no matches on this page.") + '</p><a class="btn" href="#activity">Clear filters</a></div>'
+      : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
     : "";
   const table = sourceLoaded("/api/posture/evidence")
-    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(filtered.length) + ' matched, ' + escHtml((view && view.total) || entries.length) + ' total</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + '</span></div>' +
-      (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Seq</th><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Verdict</th><th>Seal</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
+    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(total) + '</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + ' · ' + escHtml(searchedLine) + '</span></div>' +
+      (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Result</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
     : '<section class="panel evidence-entries" aria-label="Entries"><div class="overview-empty"><h3>Entries Unknown</h3><p>The server verification read has not loaded entries.</p></div></section>';
+  const operations = renderEvidenceOperationsSection();
   return [
     '<section class="evidence-page">',
       '<div class="page-head"><div>',
@@ -3524,8 +3564,126 @@ function renderActivityScreen() {
       renderEvidenceIntegrity(view),
       renderEvidenceQueryBar(),
       renderSourceRead("/api/posture/evidence"),
-      '<div class="evidence-layout">' + table + renderEvidenceDrawer(selected, 1) + '</div>',
+      '<div class="evidence-layout">' + table + renderEvidenceDrawer(selected) + '</div>',
       renderEvidenceExports(),
+      operations,
+    '</section>'
+  ].join("");
+}
+
+function renderEvidenceDecidedApprovals() {
+  if (!sourceLoaded(HUB + "/inbox")) return "";
+  if (state.inboxRedacted) return '<section class="card"><h3>Decided approvals</h3><p>Approvals are hidden, not empty. Paste the operator token to review them.</p></section>';
+  const decided = state.inbox.filter(function (item) { return item.kind === "approval_pending" && item.resolved; });
+  const shown = filterInbox(decided).slice(0, EVIDENCE_PAGE_SIZE);
+  // Resolution is a served historical fact, never permission to decide the item again.
+  return '<section class="card"><h3>Decided approvals</h3><p class="muted">showing ' + shown.length + ' of ' + decided.length +
+    ' loaded decisions · inbox read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</p>' +
+    (shown.length ? shown.map(function (item) {
+      return '<div class="row" data-decided-approval="' + escHtml(item.item_id) + '"><div class="grow">' +
+        escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '</div>' +
+        renderEvidenceStatusChip("neutral", "Resolved") + '<span class="mono">' + escHtml(item.resolved_at || "resolution time not served") + '</span></div>';
+    }).join("") : '<p class="muted">No decided approvals in this loaded view.</p>') + '</section>';
+}
+
+function renderEvidenceOperationsSection() {
+  const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
+  const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
+  const batchToolbar = selectedIds.length
+    ? '<div class="toolbar" style="margin-bottom:8px;">' +
+        '<span class="pill">' + selectedIds.length + ' selected</span>' +
+        '<button class="btn" data-action="inbox-batch-archive">Archive</button>' +
+        '<button class="btn" data-action="inbox-batch-dismiss">Dismiss</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-open">Snooze</button>' +
+        '<button class="btn btn-danger" data-action="inbox-batch-delete">Delete</button>' +
+      '</div>'
+    : "";
+  const snoozeDialog = state.inboxOps.snoozeDialog
+    ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (MS_PER_HOUR) + '">1h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (4 * MS_PER_HOUR) + '">4h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (24 * MS_PER_HOUR) + '">1d</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (7 * 24 * MS_PER_HOUR) + '">1w</button>' +
+        '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
+        '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
+      '</div></div></div>'
+    : "";
+  // Each filter is a labelled field in a wrapping grid: the label sits above
+  // its control in the label style, so no label runs into its neighbour.
+  const filterField = function (label, control) {
+    return '<label class="field"><span class="field-label">' + label + '</span>' + control + '</label>';
+  };
+  const filterPanel =
+    '<div class="filter-bar" role="group" aria-label="Filter the inbox">' +
+      filterField("Search", '<input class="input" data-action="inbox-filter-search" value="' + escHtml(state.inboxOps.filters.search) + '">') +
+      filterField("Source", '<select class="input" data-action="inbox-filter-source"><option value="">Any</option>' + inboxOption("blocked_egress") + inboxOption("privacy_event") + inboxOption("budget_warning") + inboxOption("recovery_prompt") + inboxOption("agent_error") + inboxOption("approval") + inboxOption("sentinel_finding") + '</select>') +
+      filterField("Severity", '<select class="input" data-action="inbox-filter-severity"><option value="">Any</option>' + inboxOption("info", "severity") + inboxOption("warn", "severity") + inboxOption("alert", "severity") + inboxOption("critical", "severity") + '</select>') +
+      filterField("Agent", '<select class="input" data-action="inbox-filter-agent"><option value="">Any</option>' + inboxAgentOptions() + '</select>') +
+      filterField("From", '<input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '">') +
+      filterField("To", '<input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '">') +
+    '</div>';
+  const redactedNotice = state.inboxRedacted
+    ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
+    : '';
+  var inboxRows;
+  const openItems = state.inbox.filter(function (i) { return !i.resolved; });
+  if (!visibleInbox.length && !openItems.length) {
+    inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
+  } else if (!visibleInbox.length) {
+    // Open items exist but the view shows none: say where they went, so an
+    // empty window never reads as an empty inbox.
+    const anyTime = filterInbox(openItems, true).length;
+    const hiddenByFilters = openItems.length - anyTime;
+    const parts = [];
+    if (anyTime) parts.push(anyTime + (anyTime === 1 ? " older item is" : " older items are") + " outside " + TIME_RANGE_LABEL[state.timeRange]);
+    if (hiddenByFilters) parts.push(hiddenByFilters + (hiddenByFilters === 1 ? " item is" : " items are") + " hidden by your filters");
+    inboxRows = redactedNotice + '<p class="muted">No open items in this view: ' + escHtml(parts.join("; ")) + '.</p>';
+  } else {
+    var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
+    var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
+    var otherItems = visibleInbox.filter(function (i) { return i.kind !== "approval_pending" || (i.tier !== "tier1" && i.tier !== "tier2"); });
+    function renderInboxRow(i) {
+      var text = renderTemplate(i.display_template_id, i.display_template_args);
+      var actions = inboxActions(i);
+      var buttons = actions.map(function (act) {
+        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
+      }).join("");
+      var tierBadge = i.kind === "approval_pending"
+        ? '<span class="pill">' + escHtml(i.tier) + '</span>'
+        : '<span class="pill">' + escHtml(i.kind) + '</span>';
+      return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
+        (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
+        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
+        '<div class="grow">' + escHtml(text) + '</div>' +
+        tierBadge +
+        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
+        '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
+        '</div>';
+    }
+    var sections = [];
+    if (tier1Items.length) sections.push('<h4 class="inbox-group-head">Tier 1 approvals</h4>' + tier1Items.map(renderInboxRow).join("\n"));
+    if (tier2Items.length) sections.push('<h4 class="inbox-group-head">Tier 2 approvals</h4>' + tier2Items.map(renderInboxRow).join("\n"));
+    if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
+    inboxRows = redactedNotice + sections.join("\n");
+  }
+  const total = sourceLoaded(HUB + "/inbox") ? state.inbox.filter(function (i) { return !i.resolved; }).length : "Unknown";
+  // The count states what the filters and the time range left showing, out of
+  // every open item, so a narrowed list never reads as the whole inbox.
+  const inboxCount = sourceLoaded(HUB + "/inbox") ? visibleInbox.length + " of " + total : "Unknown";
+  if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
+  return [
+    '<section class="evidence-ops">',
+      '<section class="card">',
+        '<h3>This fortress</h3>',
+        (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
+        '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
+        '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
+      '</section>',
+      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      renderEvidenceDecidedApprovals(),
+      '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
+      '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
     '</section>'
   ].join("");
 }
@@ -4596,8 +4754,9 @@ const panelJobs = [
   { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
   { paths: ["/api/posture/evidence"], load: async function (deadlineAt) {
-    const sep = "/api/posture/evidence".indexOf("?") >= 0 ? "&" : "?";
-    const res = await readResponse(credentialedReadUrl("/api/posture/evidence" + sep + "_t=" + Date.now(), "GET"), {
+    const url = evidenceReadUrl();
+    const sep = url.indexOf("?") >= 0 ? "&" : "?";
+    const res = await readResponse(credentialedReadUrl(url + sep + "_t=" + Date.now(), "GET"), {
       headers: Object.assign({ "Cache-Control": "no-cache", "Pragma": "no-cache" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
       cache: "no-store"
     }, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()));
@@ -5382,6 +5541,30 @@ async function onExitExportStart() {
   }
 }
 
+async function onEvidenceJsonExport() {
+  try {
+    const body = await api("/api/audit-log", { method: "GET" });
+    downloadJsonFile(body, "sanctuary-audit-log.json");
+    toast("Audit log JSON export downloaded.", "info");
+  } catch (e) {
+    toast("Audit log JSON export failed: " + (e && e.message ? e.message : "unknown"), "error");
+  }
+}
+
+function downloadJsonFile(body, filename) {
+  if (typeof Blob === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) throw new Error("File downloads are not available in this browser.");
+  const blob = new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  a.style.display = "none";
+  if (document.body && document.body.appendChild) document.body.appendChild(a);
+  if (typeof a.click === "function") a.click();
+  if (a.parentElement && a.parentElement.removeChild) a.parentElement.removeChild(a);
+  if (URL.revokeObjectURL) URL.revokeObjectURL(href);
+}
+
 async function onDidWebCompromisedRotation() {
   if (state.recognition.rotating) return;
   state.recognition.rotating = true;
@@ -5538,7 +5721,9 @@ function rerender() {
 function bindHashRoute() {
   function fromHash() {
     const h = (location.hash || "#posture").slice(1);
+    const previousUrl = evidenceReadUrl();
     applyEvidenceHashFilters(h);
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
     setRoute(h.split("?")[0] || "posture");
   }
   window.addEventListener("hashchange", fromHash);
@@ -5766,6 +5951,12 @@ document.addEventListener("click", function (ev) {
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
+  if (action === "evidence-select") {
+    const index = Number(tgt.getAttribute("data-evidence-index"));
+    if (Number.isInteger(index) && index >= 0 && index < EVIDENCE_PAGE_SIZE) state.evidence.selectedIndex = index;
+    return rerender();
+  }
+  if (action === "evidence-export-json") return void onEvidenceJsonExport();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) {
@@ -5865,7 +6056,7 @@ document.addEventListener("click", function (ev) {
   if (action === "inbox-batch-snooze-custom") {
     const input = document.querySelector('[data-action="inbox-snooze-custom"]');
     const raw = input && input.value ? input.value : "";
-    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
+    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + MS_PER_HOUR).toISOString());
   }
   // Tunability UX: promote-to-standing-rule. Intercepted BEFORE the generic
   // inbox-* -> onInboxAction slice below, because promote is NOT an
@@ -5949,8 +6140,6 @@ document.addEventListener("input", function (ev) {
     setEvidenceFilter("event", tgt.value);
   } else if (action === "evidence-filter-from") {
     setEvidenceFilter("from", tgt.value);
-  } else if (action === "evidence-filter-to") {
-    setEvidenceFilter("to", tgt.value);
   }
 });
 
@@ -5968,7 +6157,7 @@ document.addEventListener("change", function (ev) {
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
   else if (action === "evidence-filter-layer") return setEvidenceFilter("layer", tgt.value);
-  else if (action === "evidence-filter-verdict") return setEvidenceFilter("verdict", tgt.value);
+  else if (action === "evidence-filter-result") return setEvidenceFilter("result", tgt.value);
   else return;
   saveInboxPrefs();
   rerender();
