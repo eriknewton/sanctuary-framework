@@ -896,6 +896,21 @@ describe("posture home - folded approval controls", () => {
     expect(state.unavailable).toBe(true);
   });
 
+  it("a failed inbox read (null body) marks approvals unavailable in redirect mode, never an empty queue", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [],
+      null,
+      {
+        standalone_mode: true,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: true, mode: "replace" } },
+      },
+    );
+    expect(state.rows).toEqual([]);
+    expect(state.unavailable).toBe(true);
+  });
+
   it("an inbox body whose data.entries is not an array marks approvals unavailable", () => {
     const helpers = approvalHelpers();
     const state = helpers.buildApprovalState(
@@ -1624,6 +1639,20 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     await h.refreshAuxiliary();
     expect(h.state().locked).toBe(false);
     expect(h.state().unavailable).toBe(true);
+  });
+
+  it("a non-401 inbox failure is unavailable, not locked or empty", async () => {
+    const h = auxHarness(null, { status: 502 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+    expect(h.state().unavailable).toBe(true);
+  });
+
+  it("a 401 inbox failure stays on the locked path, not unavailable", async () => {
+    const h = auxHarness(null, { status: 401 });
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(true);
+    expect(h.state().unavailable).toBe(false);
   });
 
   it("never blocks the rest of the page: the other auxiliary reads still resolve through a denied queue", async () => {
