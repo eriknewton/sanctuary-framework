@@ -3919,8 +3919,9 @@ const CHARTER_APPROVAL_ITEM_ID_PREFIX = "charter.approval.";
 function approvalQueueEvidence() {
   const ready = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
   const full = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP;
+  // A decided item is no longer held, so only waiting items with an unrecognized tier are counted.
   const unknown = state.inbox.filter(function (i) {
-    return i.kind === "approval_pending" && i.tier !== "tier1" && i.tier !== "tier2";
+    return i.kind === "approval_pending" && !i.resolved && i.tier !== "tier1" && i.tier !== "tier2";
   }).length;
   const warning = ready && unknown
     ? '<p class="muted">' + unknown + ' held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.</p>' : "";
@@ -3930,12 +3931,17 @@ function approvalQueueEvidence() {
   let line = "";
   // A partial or redacted read cannot establish an empty queue.
   const earned = ready && !full && !unknown && !waiting && !outside;
+  const pageEdge = " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
   if (!ready) line = state.inboxRedacted ? "Approvals are hidden, not empty. Pending count: " + state.inboxRedactedCount + "." : "Approval data is Unknown until the queue read loads.";
-  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + outside + " of " + outside + " held operations wait outside this agent scope; choose All agents in the scope menu to see them.";
+  // On a full page the count outside the scope is only a lower bound, and the scoped agent may have holds past the page.
+  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + (full ? "At least " + outside : outside + " of " + outside) + " held operations wait outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
   else if (full && !waiting) {
     // The inbox serves no total, so a full page cannot rule out a held operation beyond its edge.
     line = state.inbox.some(function (i) { return i.kind === "approval_pending"; }) ? "No recognized held operation is waiting in this page." : "None of the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items is a held operation.";
-    line += " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
+    line += pageEdge;
+  } else if (unknown && !waiting) {
+    // Unrecognized holds are not shown, so the empty state says what is known instead of rendering blank.
+    line = "No recognized held operation is waiting.";
   } else if (earned) {
     title = "No approvals waiting";
     line = "0 of 0 held operations are waiting on you.";

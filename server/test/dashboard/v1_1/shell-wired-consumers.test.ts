@@ -2229,4 +2229,31 @@ describe("Approvals round-one decision and evidence states", () => {
     h.click({ "data-action": "approval-select", "data-item-id": "export" });
     expect(drawer(h)).toContain("Held for your decision (exit_bundle_export, Tier 1).");
   });
+
+  it("an unrecognized-tier count names only waiting items, and alone it says no recognized hold waits", async () => {
+    vi.useFakeTimers();
+    // A decided item is no longer held, so it must not inflate the waiting count; with no recognized hold
+    // waiting the queue still says so in words rather than leaving an empty notice.
+    const h = boot({ "/api/hub/inbox": inbox([{ ...heldItem, item_id: "decided", tier: "tier9", resolved: true }, { ...heldItem, item_id: "waiting", tier: "tier9" }]) });
+    await settle();
+    h.navigate("approvals");
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain("1 held items carry a tier this console does not recognize.");
+      expect(html).not.toContain("2 held items carry");
+    }
+    for (const html of [drawer(h), h.el.fortress!.innerHTML]) expect(html).toContain("No recognized held operation is waiting.");
+    expect(h.el.fortress!.innerHTML).not.toContain('<div class="queue-empty"></div>');
+  });
+
+  it("a scoped empty on a full page states a lower bound, never an exact count", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([{ ...heldItem, item_id: "charter.approval.one", agent_id: undefined }, ...pageOthers(cap - 1)]) });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operations wait outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
+      expect(html).not.toContain("1 of 1 held operations");
+    }
+  });
 });
