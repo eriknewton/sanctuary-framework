@@ -8616,6 +8616,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handleAuditLog(url: URL, res: ServerResponse): void {
     const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
 
+    // Must match onEvidenceJsonExport in server/src/dashboard/v1_1/client.ts, which reads both shapes this
+    // route serves: the AuditLog.query result object, or an empty array when there is no log or the query fails.
     // AuditLog.query is async, but for the dashboard we return what we can
     if (this.auditLog) {
       this.auditLog.query({ limit }).then((entries) => {

@@ -1943,6 +1943,71 @@ body {
    dark on a dark field, so the field asks for the dark scheme. */
 [data-theme="dark"] .input { color-scheme: dark; }
 
+/* Slice 5 Evidence: chain verification, field syntax, entries and sticky
+   record pane. Green appears only when the server evidence read reports a
+   verified chain; unknown keeps full weight. */
+.evidence-page { display: flex; flex-direction: column; gap: 16px; }
+.evidence-integrity {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  padding: 12px; border: 1px solid var(--rule); border-radius: var(--rad-lg); background: var(--surface);
+}
+.evidence-integrity .ei-badge { flex: none; }
+.evidence-integrity .ei-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; min-width: 0; color: var(--ink-2); font-size: var(--text-sm); }
+.evidence-integrity .ei-facts strong { color: var(--ink); }
+.evidence-integrity .ei-facts > * { min-width: 0; overflow-wrap: anywhere; }
+.evidence-integrity .ei-note { margin-left: auto; color: var(--ink-3); font-size: var(--text-xs); }
+.evidence-query .filter-bar { grid-template-columns: minmax(260px, 2fr) repeat(auto-fill, minmax(126px, 1fr)); margin-bottom: 10px; }
+.evidence-query-field { min-width: 260px; }
+.evidence-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.evidence-chip {
+  display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px;
+  border: 1px solid var(--rule-2); border-radius: 7px; background: var(--surface-2);
+  color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono);
+}
+.evidence-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; align-items: start; }
+.evidence-entries { min-width: 0; }
+.evidence-table { min-width: 760px; }
+/* A Result chip stays on one line: wrapped, its mark sat alone above the word. */
+.evidence-table .state-chip { flex-wrap: nowrap; white-space: nowrap; }
+.evidence-table .lay {
+  font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.evidence-table tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+/* Beside the 400px record pane the entries column is the viewport less about 696px (the 232px rail, the
+   page padding, the pane and its gap), and the table needs about 480px, so below 1200px the Result column
+   scrolled out of view (about 340px at 1024). There the pane moves under the table, as the Approvals
+   drawer does at 1100px. */
+@media (max-width: 1200px) {
+  .evidence-layout { grid-template-columns: minmax(0, 1fr); }
+  .evidence-detail { position: static; }
+}
+.evidence-detail { position: sticky; top: 12px; }
+.evidence-detail .hd { padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
+.evidence-detail .hd .t { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--ink); }
+.evidence-detail .hd .m { margin-top: 3px; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.evidence-detail .sec { padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.evidence-detail .sec:last-child { border-bottom: 0; padding-bottom: 0; }
+.evidence-detail .sec h3 { margin: 0 0 8px; font-size: var(--text-sm); }
+.evidence-detail .kv { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 10px; margin: 0; }
+.evidence-detail .kv dt { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); min-width: 0; overflow-wrap: anywhere; }
+.evidence-detail .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.evidence-detail .chain { display: flex; flex-direction: column; gap: 6px; }
+.evidence-detail .lnk { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px; font-size: var(--text-sm); }
+.evidence-detail .lnk .k { color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; }
+.evidence-detail .lnk .h { font-family: var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+.evidence-detail .ok { color: var(--sage); }
+.evidence-detail .bad { color: var(--rust); }
+.evidence-detail .json {
+  margin: 0; max-height: 320px; overflow: auto; padding: 10px;
+  border: 1px solid var(--rule); border-radius: var(--rad); background: var(--paper);
+  color: var(--ink-2); font-family: var(--mono); font-size: var(--text-xs); white-space: pre-wrap;
+  /* A served value can be one unbroken token (a hash or a long URL); it wraps inside the pane instead of
+     hiding past its right edge behind a sideways scroll. */
+  overflow-wrap: anywhere;
+}
+.evidence-export .toolbar .btn:disabled { color: var(--ink-4); border-style: dashed; cursor: not-allowed; background: var(--surface-2); }
+
 /* Slice 2b: Machines. One row per saved machine: the probe state as a
    shaped chip with its word, the name over its address, and the console
    link. 132px fits the widest chip ("Not healthy" with its glyph). */
