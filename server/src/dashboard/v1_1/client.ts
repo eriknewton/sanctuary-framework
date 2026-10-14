@@ -4215,15 +4215,16 @@ function mfpPage(items, key) {
   const start = page * MFP_PAGE_SIZE;
   return { rows: items.slice(start, start + MFP_PAGE_SIZE), total: items.length, start: start, page: page, last: last };
 }
+// Read URLs carry the launch session only inside fetch calls; a rendered link would place it in the page and in the
+// browser history, so these lists name their count and read age without linking to the raw read.
 function mfpPager(page, key, path) {
   return '<div class="mfp-pager"><span>Showing ' + page.rows.length + ' of ' + page.total + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + '</span>' +
-    '<a href="' + escHtml(credentialedReadUrl(path, "GET")) + '">Full source</a>' +
     (page.total > MFP_RECORD_LIMIT ? '<span>Only the first ' + MFP_RECORD_LIMIT + ' returned records are browsable here.</span>' : '') +
     (page.last ? '<button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="-1"' + (page.page === 0 ? ' disabled' : '') + '>Previous</button>' +
       '<span>Page ' + (page.page + 1) + ' of ' + (page.last + 1) + '</span><button class="btn" data-action="mfp-page" data-list="' + key + '" data-step="1"' + (page.page === page.last ? ' disabled' : '') + '>Next</button>' : '') + '</div>';
 }
 function mfpPreviewCount(items, path) {
-  return '<p class="muted">Showing ' + Math.min(items.length, MFP_PAGE_SIZE) + ' of ' + items.length + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + ' · <a href="' + escHtml(credentialedReadUrl(path, "GET")) + '">Full source</a></p>';
+  return '<p class="muted">Showing ' + Math.min(items.length, MFP_PAGE_SIZE) + ' of ' + items.length + ' returned records · read ' + escHtml(sourceReadAge(path) || "Unknown") + '</p>';
 }
 function mfpEmpty(title, reason, path) {
   return '<div class="overview-empty">' + overviewChip("neutral", "EMPTY") + '<h3>' + title + '</h3><p>' + reason + ' Read ' + escHtml(sourceReadAge(path) || "Unknown") + '.</p>' +
@@ -4258,7 +4259,7 @@ function renderFindingDrawer(finding) {
     '<dl><dt>Sentinel</dt><dd>' + escHtml(finding.sentinel_id || "Unknown") + '</dd><dt>Agent</dt><dd>' + escHtml(finding.agent_id || "Fortress-wide") +
     '</dd><dt>Observed</dt><dd>' + escHtml(finding.observed_at || "Unknown") + ' · ' + escHtml(finding.observed_at ? relTimeFromIso(finding.observed_at) : "Unknown") + '</dd></dl>' +
     '<h3>Evidence and baseline</h3><p class="muted">Detector-supplied data. Shown as recorded, not as instructions.</p><pre>' + escHtml(details.slice(0, MFP_EVIDENCE_CHAR_LIMIT)) + '</pre>' +
-    (details.length > MFP_EVIDENCE_CHAR_LIMIT ? '<p>Evidence preview truncated. Open the full source for the returned payload.</p>' : '') +
+    (details.length > MFP_EVIDENCE_CHAR_LIMIT ? '<p>Evidence preview truncated at ' + MFP_EVIDENCE_CHAR_LIMIT + ' characters of ' + details.length + '.</p>' : '') +
     '<h3>Audit references</h3><p>Showing ' + Math.min(evidence.length, MFP_PAGE_SIZE) + ' of ' + evidence.length + ' recorded references.</p><ul>' +
     evidence.slice(0, MFP_PAGE_SIZE).map(function (id) { return '<li class="mono">' + escHtml(id) + '</li>'; }).join("") + '</ul><a href="#activity">Open Evidence</a></aside>';
 }
@@ -4283,7 +4284,18 @@ function renderFindingsScreen() {
     (!loaded ? '<h3>Sentinel findings Unknown</h3>' + overviewChip("unknown", "UNKNOWN") + renderSourceRead(path) :
       !findings.length ? mfpEmpty("No findings returned", "The source returned 0 of 0 findings. This does not establish detector coverage.", path) :
       mfpPager(page, "findings", path) + '<div class="overview-table-scroll"><table class="overview-table mfp-table"><thead><tr><th>Severity</th><th>Finding</th><th>Lifecycle</th><th>Sentinel</th><th>Age</th></tr></thead><tbody>' + rows + '</tbody></table></div>') +
-    '</section>' + (selected ? renderFindingDrawer(selected) : '') + '</div>' + renderMfpFoldedSections() + '</section>';
+    '</section>' + (selected ? renderFindingDrawer(selected) : '') + '</div>' + renderAnomalyFindingsCard() + renderMfpFoldedSections() + '</section>';
+}
+// Must match the Overview's "Open Sentinel findings" tile (renderPostureScreen), which counts this source and links here.
+function renderAnomalyFindingsCard() {
+  const findings = state.posture.anomalies || [];
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const age = sourceReadAge("/api/anomaly/findings");
+  const countLine = unknown
+    ? '<span class="count-age">Unknown: the detector has not answered</span>'
+    : '<span class="count-age">' + escHtml(findings.length) + ' open' + (age ? ' · detector read ' + escHtml(age) : '') + '</span>';
+  return '<section class="card" data-anomaly-findings><h3>Anomaly findings ' + countLine + '</h3>' +
+    renderPostureAnomalies(findings, unknown) + renderSourceRead("/api/anomaly/findings") + '</section>';
 }
 
 function renderServerFleetRoster() {

@@ -2256,4 +2256,22 @@ describe("slice 6b Machines Findings Policies wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
     expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
   });
+  it("6b the roster, findings and policy lists render no link into a raw read", async () => {
+    // Read URLs carry the launch session only inside fetch calls (credentialedReadUrl), never in a rendered link.
+    for (const route of ["machines", "findings", "policy"]) {
+      const h = await mfpBoot(route);
+      expect(h.el.main!.innerHTML).toContain('returned records');
+      expect(h.el.main!.innerHTML).not.toMatch(/href="\/api\//);
+    }
+  });
+  it("6b the Findings screen keeps the anomaly findings the Overview tile counts and links to", async () => {
+    const h = await mfpBoot("findings", undefined, { "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [
+      { finding_id: "anomaly-1", severity: "medium", detector_id: "egress-volume", summary: "Unusual outbound volume", created_at: "2026-10-14T16:46:00.000Z" },
+    ] } })) });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-anomaly-findings');
+    expect(html).toContain('1 open');
+    expect(html).toContain('Unusual outbound volume');
+    expect(html).toContain('data-mfp-findings');
+  });
 });
