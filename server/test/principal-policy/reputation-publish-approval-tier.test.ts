@@ -1,0 +1,342 @@
+/**
+ * Verascore publishing asks the operator first.
+ *
+ * CAPABILITY. From 1.9.0, `reputation_publish` (the tool that sends a signed
+ * sovereignty report to Verascore) always requires operator approval: the gate
+ * holds every call until the operator approves, so data leaves the machine
+ * only with explicit, confirmed operator intent (AGENTS.md MUST-NEVER #1). It
+ * is force-pinned (`NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS`), so a
+ * `tier3_always_allow` listing does not relax it: earlier releases wrote that
+ * listing into every fortress's policy file at first setup, so it is not
+ * evidence of operator intent. The tool's name, schema and signing behavior
+ * are unchanged.
+ *
+ * WHAT THIS FILE PINS (AGENTS.md rule 4, wired consumer):
+ *   1. A fresh install: the policy file Sanctuary writes on first boot, read
+ *      back through the real loader, places `reputation_publish` in Tier 1,
+ *      and the real `ApprovalGate` classifies it Tier 1 on a first session
+ *      and on an established one.
+ *   2. The real composition root (`createSanctuaryServer`, real `tools/call`):
+ *      a publish is held for operator approval; when the operator declines,
+ *      nothing is sent; when the operator approves, exactly one publish goes
+ *      out.
+ *   3. An existing policy file in the old-release shape (`reputation_publish`
+ *      under `tier3_always_allow`) still loads without error, and the real
+ *      gate still asks the operator: a decline sends nothing, an approval
+ *      sends exactly one publish. The runtime classifier does the same for a
+ *      policy object that never passed through the loader.
+ *   4. A loaded policy that names `reputation_publish` in neither list also
+ *      asks the operator in every session shape, asserted through the real
+ *      gate (`evaluate`) and the real composition root, not through the
+ *      dry-run classifier alone.
+ *
+ * Must match `NON_RELAXABLE_VERASCORE_PUBLISH_TIER1_OPERATIONS` and the
+ * `reputation_publish` entry in `DEFAULT_POLICY.tier1_always_approve`
+ * (src/principal-policy/loader.ts).
+ */
+
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { createSanctuaryServer } from "../../src/index.js";
+import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
+import { BaselineTracker } from "../../src/principal-policy/baseline.js";
+import { ApprovalGate } from "../../src/principal-policy/gate.js";
+import {
+  generateDefaultPolicyYaml,
+  loadPrincipalPolicy,
+  parsePolicy,
+  principalPolicyPath,
+} from "../../src/principal-policy/loader.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  PrincipalPolicy,
+} from "../../src/principal-policy/types.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { generateRandomKey } from "../../src/core/random.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { createTempHome, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
+
+const OP = "reputation_publish";
+
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+let originalFetch: typeof fetch;
+
+beforeEach(async () => {
+  // The real boot path writes config and the policy file under HOME, so HOME
+  // moves to a throwaway directory; the operator's machine is not a fixture.
+  fortressHome = await createTempHome("sanctuary-reputation-publish-tier");
+  originalFetch = globalThis.fetch;
+});
+
+afterEach(async () => {
+  globalThis.fetch = originalFetch;
+  await fortressHome.cleanup();
+});
+
+/** Classify `operation` with the real gate on a first and an established session. */
+async function classifyBothSessions(
+  policy: PrincipalPolicy,
+  operation: string,
+): Promise<{ first: number; established: number }> {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const auditLog = new AuditLog(storage, masterKey);
+  const channel = new CallbackApprovalChannel(async () => {
+    throw new Error("dry-run classification must never reach the approval channel");
+  });
+  const firstSession = new BaselineTracker(storage, masterKey);
+  await firstSession.load();
+  const first = new ApprovalGate(policy, firstSession, channel, auditLog).classifyRiskTier(
+    operation,
+    {},
+  );
+  await firstSession.save();
+  const establishedSession = new BaselineTracker(storage, masterKey);
+  await establishedSession.load();
+  const established = new ApprovalGate(
+    policy,
+    establishedSession,
+    channel,
+    auditLog,
+  ).classifyRiskTier(operation, {});
+  return { first, established };
+}
+
+/** Move one operation between the two list blocks of a rendered policy YAML. */
+function moveOpToTier3(yaml: string, op: string): string {
+  const withoutTier1 = yaml.replace(new RegExp(`^  - ${op}\\n`, "m"), "");
+  return withoutTier1.replace(/^tier3_always_allow:\n/m, `tier3_always_allow:\n  - ${op}\n`);
+}
+
+function removeOp(yaml: string, op: string): string {
+  return yaml.replace(new RegExp(`^  - ${op}\\n`, "gm"), "");
+}
+
+async function writePolicyFile(yaml: string): Promise<string> {
+  await mkdir(fortressHome.defaultFortressPath, { recursive: true, mode: 0o700 });
+  const path = principalPolicyPath(fortressHome.defaultFortressPath);
+  await writeFile(path, yaml, { mode: 0o600 });
+  return path;
+}
+
+async function callServerTool(
+  server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const handler = (
+    server as unknown as { _requestHandlers: Map<string, Function> }
+  )._requestHandlers.get("tools/call");
+  if (!handler) throw new Error("tools/call handler not registered");
+  return await handler(
+    { method: "tools/call" as const, params: { name, arguments: args } },
+    {},
+  );
+}
+
+/** Switch a rendered policy to the embedding-host callback channel, nothing else. */
+function withCallbackChannel(yaml: string): string {
+  return yaml.replace(/approval_channel:\n  type: \w+/, "approval_channel:\n  type: callback");
+}
+
+/**
+ * Drive the REAL gate's `evaluate` (not the dry-run classifier) for one
+ * publish, with a scripted operator. Returns what the operator was asked and
+ * whether the gate let the call through.
+ */
+async function evaluateWithOperator(
+  policy: PrincipalPolicy,
+  session: "first" | "established",
+  decision: ApprovalResponse["decision"],
+): Promise<{ asked: ApprovalRequest[]; allowed: boolean }> {
+  const storage = new MemoryStorage();
+  const masterKey = generateRandomKey();
+  const auditLog = new AuditLog(storage, masterKey);
+  const asked: ApprovalRequest[] = [];
+  const channel = new CallbackApprovalChannel(async (request) => {
+    asked.push(request);
+    return { decision, decided_at: new Date().toISOString(), decided_by: "human" };
+  });
+  const baseline = new BaselineTracker(storage, masterKey);
+  await baseline.load();
+  if (session === "established") {
+    // Persist and reload: the tracker's own definition of a later session.
+    await baseline.save();
+    const established = new BaselineTracker(storage, masterKey);
+    await established.load();
+    expect(established.isFirstSession).toBe(false);
+    const gate = new ApprovalGate(policy, established, channel, auditLog);
+    return { asked, allowed: (await gate.evaluate(OP, { type: "shr" })).allowed };
+  }
+  expect(baseline.isFirstSession).toBe(true);
+  const gate = new ApprovalGate(policy, baseline, channel, auditLog);
+  return { asked, allowed: (await gate.evaluate(OP, { type: "shr" })).allowed };
+}
+
+/**
+ * Boot the real server with the shipped default policy, switched only to the
+ * embedding-host callback channel so the test can play the operator. Every
+ * tier list is the default one, byte for byte.
+ */
+async function bootWithOperator(
+  decision: ApprovalResponse["decision"],
+  policyYaml: string = generateDefaultPolicyYaml(),
+) {
+  await writePolicyFile(withCallbackChannel(policyYaml));
+  const requests: ApprovalRequest[] = [];
+  const { server } = await createSanctuaryServer({
+    storage: new MemoryStorage(),
+    passphrase: TEST_PASSPHRASE,
+    approvalCallback: async (request) => {
+      requests.push(request);
+      return {
+        decision,
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      };
+    },
+  });
+  const published: string[] = [];
+  globalThis.fetch = (async (url: string | URL) => {
+    published.push(String(url));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ success: true }),
+    } as unknown as Response;
+  }) as typeof fetch;
+  await callServerTool(server, "identity_create", { label: "publish-consent" });
+  return { server, requests, published };
+}
+
+describe("reputation_publish requires operator approval under the default policy", () => {
+  it("fresh install: the policy file Sanctuary writes puts it in Tier 1, and the gate agrees on both sessions", async () => {
+    // A fresh fortress directory with no policy file: the first-boot branch
+    // writes the default (it never creates the fortress directory itself).
+    await mkdir(fortressHome.defaultFortressPath, { recursive: true, mode: 0o700 });
+    const loaded = await loadPrincipalPolicy(fortressHome.defaultFortressPath);
+    expect(loaded.tier1_always_approve).toContain(OP);
+    expect(loaded.tier3_always_allow).not.toContain(OP);
+
+    // The file written on first boot is what every later boot reads.
+    const written = parsePolicy(
+      await readFile(principalPolicyPath(fortressHome.defaultFortressPath), "utf-8"),
+    );
+    expect(written.tier1_always_approve).toContain(OP);
+    expect(written.tier3_always_allow).not.toContain(OP);
+
+    expect(await classifyBothSessions(written, OP)).toEqual({ first: 1, established: 1 });
+  });
+
+  it("real composition root: the publish is held for the operator, and a decline sends nothing", async () => {
+    const { server, requests, published } = await bootWithOperator("deny");
+
+    await callServerTool(server, OP, { type: "shr" });
+
+    const held = requests.filter((r) => r.operation.endsWith(OP));
+    expect(held.length, "the gate must ask the operator before publishing").toBe(1);
+    expect(held[0]!.tier).toBe(1);
+    expect(published, "a declined publish must not reach the network").toEqual([]);
+  });
+
+  it("real composition root: an approved publish sends exactly one request", async () => {
+    const { server, requests, published } = await bootWithOperator("approve");
+
+    await callServerTool(server, OP, { type: "shr" });
+
+    expect(requests.filter((r) => r.operation.endsWith(OP)).length).toBe(1);
+    expect(published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
+  });
+
+  it("an existing policy file in the old-release shape (listed under Tier 3) loads, and the real gate still asks the operator", async () => {
+    // The shape every fortress that booted before 1.9.0 carries on disk: the
+    // first-boot writer copied the then-default Tier 3 listing into the file.
+    const oldReleaseShape = moveOpToTier3(generateDefaultPolicyYaml(), OP);
+    // Precondition: on disk it sits under Tier 3 and not under Tier 1.
+    expect(oldReleaseShape).toMatch(new RegExp(`tier3_always_allow:\\n  - ${OP}\\n`));
+    expect(oldReleaseShape.split("tier3_always_allow:")[0]).not.toContain(`  - ${OP}\n`);
+
+    // It loads (no boot failure) and the force-pin moves the operation.
+    await writePolicyFile(oldReleaseShape);
+    const loaded = await loadPrincipalPolicy(fortressHome.defaultFortressPath);
+    expect(loaded.tier1_always_approve).toContain(OP);
+    expect(loaded.tier3_always_allow).not.toContain(OP);
+
+    const declined = await bootWithOperator("deny", oldReleaseShape);
+    await callServerTool(declined.server, OP, { type: "shr" });
+    expect(declined.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(declined.published, "a declined publish must not reach the network").toEqual([]);
+
+    const approved = await bootWithOperator("approve", oldReleaseShape);
+    await callServerTool(approved.server, OP, { type: "shr" });
+    expect(approved.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(approved.published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
+  });
+
+  it("the runtime gate asks the operator even for a policy object that lists it under Tier 3 and never passed through the loader", async () => {
+    const raw: PrincipalPolicy = {
+      ...parsePolicy(generateDefaultPolicyYaml()),
+      tier1_always_approve: [],
+      tier3_always_allow: [OP],
+    };
+    for (const session of ["first", "established"] as const) {
+      for (const decision of ["deny", "approve"] as const) {
+        const { asked, allowed } = await evaluateWithOperator(raw, session, decision);
+        expect(asked.map((r) => r.operation), `${session}/${decision}`).toEqual([OP]);
+        expect(asked[0]!.tier, `${session}/${decision}`).toBe(1);
+        expect(allowed, `${session}/${decision}`).toBe(decision === "approve");
+      }
+    }
+  });
+
+  it("a loaded policy that names it in neither list: the first-session publish waits for the operator (real composition root)", async () => {
+    const neitherTier = removeOp(generateDefaultPolicyYaml(), OP);
+    const loaded = parsePolicy(neitherTier);
+    expect(loaded.tier1_always_approve, "the force-pin adds it back to Tier 1").toContain(OP);
+    expect(
+      loaded.tier3_always_allow,
+      "the defaults merge must not hand it auto-allow",
+    ).not.toContain(OP);
+
+    // A fresh boot is a first session; the publish still waits for the operator.
+    const declined = await bootWithOperator("deny", neitherTier);
+    await callServerTool(declined.server, OP, { type: "shr" });
+    expect(declined.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(declined.published, "a declined publish must not reach the network").toEqual([]);
+
+    const approved = await bootWithOperator("approve", neitherTier);
+    await callServerTool(approved.server, OP, { type: "shr" });
+    expect(approved.requests.filter((r) => r.operation.endsWith(OP))).toHaveLength(1);
+    expect(approved.published.filter((url) => url.endsWith("/api/publish"))).toHaveLength(1);
+  });
+
+  it("a loaded policy that names it in neither list: the real gate asks the operator in every session shape", async () => {
+    const neitherTier = removeOp(generateDefaultPolicyYaml(), OP);
+    const scenarios: Array<{ label: string; policy: PrincipalPolicy; session: "first" | "established" }> = [
+      { label: "first session", policy: parsePolicy(neitherTier), session: "first" },
+      { label: "established session", policy: parsePolicy(neitherTier), session: "established" },
+      {
+        // An operator who switched first-session approval off must not turn
+        // an unlisted publish into an auto-allow on the first session.
+        label: "first session, first_session_policy: allow",
+        policy: parsePolicy(
+          neitherTier.replace(/first_session_policy: \w+/, "first_session_policy: allow"),
+        ),
+        session: "first",
+      },
+    ];
+    for (const { label, policy, session } of scenarios) {
+      expect(policy.tier3_always_allow, label).not.toContain(OP);
+      for (const decision of ["deny", "approve"] as const) {
+        const { asked, allowed } = await evaluateWithOperator(policy, session, decision);
+        expect(asked.map((r) => r.operation), `${label}/${decision}: operator asked`).toEqual([OP]);
+        expect(allowed, `${label}/${decision}: gate decision follows the operator`).toBe(
+          decision === "approve",
+        );
+      }
+    }
+  });
+});

@@ -138,6 +138,7 @@ approval_channel:
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",
+      "reputation_publish",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -179,6 +180,7 @@ approval_channel:
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",
+      "reputation_publish",
     ]);
   });
 
