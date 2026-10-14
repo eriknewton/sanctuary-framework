@@ -330,11 +330,11 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // The inbox serves no entry id, so the Approvals screen may only say the
-    // decision is recorded in the audit log and link to Evidence.
+    // Ordinary hub inbox decisions resolve in the inbox store; only Charter
+    // holds go through the operator audit queue.
     expect(main).not.toContain("operator key");
     expect(main).not.toContain("Every decision is signed");
-    expect(main).toContain("recorded in the audit log");
+    expect(main).toContain("recorded in this inbox");
     expect(main).toContain('href="#activity">Evidence</a>');
     // Lockdown revokes network access for confined agents; agents keep running.
     runInContext('state.posture.sealOpen = true; state.tier1.lockdown.state = "engaged"; renderTopbar();', h.context);
@@ -456,19 +456,57 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("Nothing pending.");
   });
 
-  it("the Approvals subtitle promises no signed policy and says Allow always is refused when the engine is not configured", async () => {
+  it("the Approvals subtitle says where each decision is recorded", async () => {
     vi.useFakeTimers();
     const h = boot();
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Allow always asks the policy engine to compile and activate a standing
-    // rule; unavailable policy reads, Tier 1 and non-promotable categories
-    // disable it. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always requests policy compile and activation");
-    expect(main).toContain("if policy read is unavailable, Tier 1 is selected, or the category cannot be promoted, it is disabled");
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.");
+  });
+
+  it("Approvals names Charter and hub decision records without inferring an operator outcome", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const items = [
+      { ...heldItem, item_id: "charter.approval.wait", tier: "tier2", agent_id: "agent-c", operation_category: "state_export", resolved: false, created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "hub-wait", tier: "tier2", agent_id: "agent-h", operation_category: "state_import", resolved: false, created_at: "2026-10-14T16:40:00.000Z" },
+      { ...heldItem, item_id: "charter.approval.decided", tier: "tier2", agent_id: "agent-c", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:45:00.000Z", resolution_payload: { outcome: "engaged" } },
+      { ...heldItem, item_id: "hub-decided", tier: "tier2", agent_id: "agent-h", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:46:00.000Z", resolution_payload: { outcome: "engaged" } },
+    ];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    let main = h.el.main!.innerHTML;
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.");
+    expect(main).toContain("Waiting on you · 2 of 2");
+    expect(main).toMatch(/data-approval-row="charter\.approval\.wait"[\s\S]*?recorded in your audit log/);
+    expect(main).toMatch(/data-approval-row="hub-wait"[\s\S]*?recorded in this inbox/);
+    expect(main).toMatch(/data-approval-row="charter\.approval\.decided"[\s\S]*?DECIDED[\s\S]*?outcome in your audit log[\s\S]*?href="#activity">Evidence<\/a>/);
+    expect(main).toMatch(/data-approval-row="hub-decided"[\s\S]*?DECIDED[\s\S]*?outcome not reported by the inbox/);
+    expect(main).not.toMatch(/ALLOWED ONCE|DENIED|ALWAYS ALLOW/);
+    h.click({ "data-action": "approval-select", "data-item-id": "hub-wait" });
+    main = h.el.main!.innerHTML;
+    expect(main).toMatch(/If you decide[\s\S]*?recorded in this inbox[\s\S]*?Decision recorded in this inbox/);
+  });
+
+  it("Approvals uses plain operator copy for always allow and never renders route paths", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    runInContext("state.approvals.alwaysAllow = true; rerender();", h.context);
+    const main = h.el.main!.innerHTML;
+    expect(main).not.toContain("/api/");
+    expect(main).toContain("Allow always asks the policy engine to compile a standing rule for state_export, then activates it with your operator token.");
+    expect(main).toContain("Either step can be refused; your policy changes only if both succeed.");
+    expect(main).toContain("Later matching operations stop asking only if the policy engine accepts both steps.");
   });
 
   it("Approvals renders grouped waiting and decided rows with served fields only", async () => {
@@ -493,8 +531,8 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).toContain("What it wants to do");
     expect(main).toContain("Why it is held");
     expect(main).toContain("If you decide");
-    expect(main).toContain("recorded in the audit log");
-    expect(main).toContain("Outcome in audit log");
+    expect(main).toContain("recorded in this inbox");
+    expect(main).toContain("outcome not reported by the inbox");
     expect(main).toContain("Decided at");
     expect(main).not.toContain("Context the agent gave");
     expect(main).not.toContain("Note for the audit record");
@@ -638,7 +676,7 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
     expect(h.el.main!.innerHTML).toContain("Decided at");
-    expect(h.el.main!.innerHTML).toContain("Outcome in audit log");
+    expect(h.el.main!.innerHTML).toContain("outcome not reported by the inbox");
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
