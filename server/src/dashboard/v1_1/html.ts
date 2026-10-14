@@ -1951,6 +1951,14 @@ body {
   text-transform: uppercase; letter-spacing: 0.06em;
 }
 .evidence-table tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+/* Beside the 400px record pane the entries column is the viewport less about 696px (the 232px rail, the
+   page padding, the pane and its gap), and the table needs about 480px, so below 1200px the Result column
+   scrolled out of view (about 340px at 1024). There the pane moves under the table, as the Approvals
+   drawer does at 1100px. */
+@media (max-width: 1200px) {
+  .evidence-layout { grid-template-columns: minmax(0, 1fr); }
+  .evidence-detail { position: static; }
+}
 .evidence-detail { position: sticky; top: 12px; }
 .evidence-detail .hd { padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
 .evidence-detail .hd .t { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--ink); }
