@@ -1,7 +1,8 @@
 {
   "name": "sanctuary-audit-xdm-raw-fields",
   "format": "xdm",
-  "verified_by": "repo schema and fixture tests for field names only",
+  "verified_by": "repo schema and fixture tests for field names and raw-to-home pairs only",
+  "contract": "mapping must match SIEM_XDM_FIELD_HOMES in server/src/audit/siem-formatter.ts",
   "dataset": "sanctuary_audit_raw",
   "raw_fields": [
     "sanctuary_time",
@@ -28,7 +29,7 @@
     { "raw_field": "sanctuary_observer_product", "xdm_field": "xdm.observer.product" },
     { "raw_field": "sanctuary_observer_vendor", "xdm_field": "xdm.observer.vendor" },
     { "raw_field": "sanctuary_source_user_username", "xdm_field": "xdm.source.user.username" },
-    { "raw_field": "sanctuary_audit_decision", "xdm_field": "sanctuary.audit.decision" },
-    { "raw_field": "sanctuary_audit_result", "xdm_field": "sanctuary.audit.result" }
+    { "raw_field": "sanctuary_audit_decision", "xdm_field": null, "note": "no standard XDM home; keep as a raw dataset field" },
+    { "raw_field": "sanctuary_audit_result", "xdm_field": null, "note": "no standard XDM home; keep as a raw dataset field" }
   ]
 }

@@ -22,7 +22,7 @@ import {
   formatAsOCSF,
   formatAsXDM,
 } from "../../src/audit/siem-formatter.js";
-import { createSIEMTools } from "../../src/audit/siem-tools.js";
+import { createSIEMTools, SIEM_EXPORT_FORMATS } from "../../src/audit/siem-tools.js";
 
 type FlatRecord = Record<string, unknown>;
 
@@ -98,6 +98,8 @@ function xdmOperation(obj: ReturnType<typeof formatAsXDM>): string {
 }
 
 describe("ECS and XDM SIEM export parity", () => {
+  // Held, bare deny, missing, and unknown detail decisions have no effect on
+  // the result-only export projection: redaction removes these detail values.
   const entries: AuditEntry[] = [
     fixtureEntry({
       timestamp: "2026-10-14T18:30:00.000Z",
@@ -162,32 +164,39 @@ describe("ECS and XDM SIEM export parity", () => {
     const ecs = entries.map((entry) => formatAsECS(redactAuditEntryForAgent(entry)));
     const xdm = entries.map((entry) => formatAsXDM(redactAuditEntryForAgent(entry)));
 
-    const cefTuples = entries.map((entry, index) => [
-      entry.operation,
-      cefDecision(cef[index]!),
-      cefTimestamp(cef[index]!),
+    const cefTuples = cef.map((line) => [
+      line.match(/\bact=([^ ]+)/)![1],
+      cefDecision(line),
+      cefTimestamp(line),
     ]);
-    const ocsfTuples = entries.map((entry, index) => [
-      entry.operation,
-      ocsfDecision(ocsf[index]!),
-      ocsf[index]!.time,
+    const ocsfTuples = ocsf.map((obj) => [
+      obj.api.operation,
+      ocsfDecision(obj),
+      obj.time,
     ]);
-    const ecsTuples = entries.map((entry, index) => [
-      ecs[index]!.event.action,
-      ecsDecision(ecs[index]!),
-      new Date(ecs[index]!["@timestamp"]!).getTime(),
+    const ecsTuples = ecs.map((obj) => [
+      obj.event.action,
+      ecsDecision(obj),
+      new Date(obj["@timestamp"]!).getTime(),
     ]);
-    const xdmTuples = entries.map((entry, index) => [
-      xdmOperation(xdm[index]!),
-      xdmDecision(xdm[index]!),
-      xdmTimestamp(xdm[index]!),
+    const xdmTuples = xdm.map((obj) => [
+      xdmOperation(obj),
+      xdmDecision(obj),
+      xdmTimestamp(obj),
     ]);
 
+    // Every arm is held to the fixture itself, so a change confined to OCSF, or one shared by all
+    // four formats, still fails here.
+    const expected = entries.map((entry) => [
+      entry.operation,
+      entry.result === "failure" ? "deny" : "allow",
+      Date.parse(entry.timestamp),
+    ]);
     expect({ cef: cefTuples, ocsf: ocsfTuples, ecs: ecsTuples, xdm: xdmTuples }).toEqual({
-      cef: ocsfTuples,
-      ocsf: ocsfTuples,
-      ecs: ocsfTuples,
-      xdm: ocsfTuples,
+      cef: expected,
+      ocsf: expected,
+      ecs: expected,
+      xdm: expected,
     });
   });
 
@@ -242,6 +251,12 @@ describe("ECS and XDM SIEM export parity", () => {
       expect(body).not.toContain("operator-only policy reason");
       expect(body).not.toContain("gate_decision");
     }
+  });
+
+  it("freezes the shared export format list at runtime", () => {
+    expect(Object.isFrozen(SIEM_EXPORT_FORMATS)).toBe(true);
+    expect(() => (SIEM_EXPORT_FORMATS as unknown as string[]).push("planted")).toThrow();
+    expect(SIEM_EXPORT_FORMATS).toEqual(["cef", "ocsf", "ecs", "xdm"]);
   });
 
   it("accepts ecs and xdm tool formats while still rejecting unknown formats", async () => {
