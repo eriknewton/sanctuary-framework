@@ -135,3 +135,113 @@ it("bounds adversarial destination work to the query cap and serves only ten row
   expect(d.kernel_blocks).toBe(count);
   expect(query).toHaveBeenCalledWith({ since: new Date(NOW - DAY).toISOString(), limit: count });
 });
+
+// Coverage consumes the public audit reads, including every sealed verdict arm.
+describe("round 2 window coverage", () => {
+  for (const sealed_region of [
+    { status: "verified", entries_verified: 1, sealed_tip_sequence: 1 },
+    { status: "unreadable", note: "privilege" },
+    { status: "incomplete", expected_tip: 2, highest_present: 1 },
+    { status: "hash_mismatch", sequence: 1, expected: "a", actual: "b" },
+  ] as const) it(`withholds coverage for sealed ${sealed_region.status}`, async () => {
+    const audit = log(); await append(audit, 1);
+    const verdict = await audit.getAuditChainVerdict();
+    vi.spyOn(audit, "getAuditChainVerdict").mockResolvedValue({ ...verdict, sealed_region });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "sealed_region" });
+    const result = await audit.query({});
+    vi.spyOn(audit, "query").mockResolvedValue({ ...result, total: result.total + 1 });
+    // The lane's sealed-region bound holds even when the query is also truncated.
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "sealed_region" });
+  });
+  for (const status of ["not_present", "empty"] as const) it(`covers an unpruned log with sealed ${status}`, async () => {
+    const audit = log(); await append(audit, 1);
+    const verdict = await audit.getAuditChainVerdict();
+    vi.spyOn(audit, "getAuditChainVerdict").mockResolvedValue({ ...verdict, sealed_region: { status } });
+    expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
+  });
+  for (const [name, age, complete, reason] of [
+    ["before", DAY + 1, true, null], ["at", DAY, true, null], ["after", DAY - 1, false, "retention"],
+  ] as const) it(`settles rotation ${name} window start`, async () => {
+    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
+    for (let i = 0; i < 3; i++) await append(audit, i + 1, { timestamp: new Date(NOW - age).toISOString() });
+    expect((await audit.authenticatedRotationFloor()).status).toBe("valid");
+    expect(await digest(audit)).toMatchObject({ window_complete: complete, window_incomplete_reason: reason });
+  });
+  it("withholds coverage for an invalid rotation anchor", async () => {
+    const audit = log(); await append(audit, 1);
+    vi.spyOn(audit, "authenticatedRotationFloor").mockResolvedValue({ status: "invalid" });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("withholds coverage when the authenticated floor disagrees with the retained sequence", async () => {
+    const audit = log(); await append(audit, 1);
+    vi.spyOn(audit, "authenticatedRotationFloor").mockResolvedValue({ status: "valid", base_sequence: 2, base_prev_hash: "unknown" });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("does not infer an unpruned chain from an absent anchor alone", async () => {
+    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: 2 });
+    for (let i = 0; i < 3; i++) await append(audit, i + 1);
+    vi.spyOn(audit, "authenticatedRotationFloor").mockResolvedValue({ status: "absent" });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("keeps an empty log's retention coverage unknown without a first sequence", async () => {
+    expect(await digest(log())).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("names a query cut by its read limit", async () => {
+    const audit = log(); const result = await audit.query({});
+    vi.spyOn(audit, "query").mockResolvedValue({ ...result, total: 1 });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "read_limit" });
+  });
+});
+
+describe("round 2 destination labels", () => {
+  for (const [name, chars] of [
+    ["C1", "\u0080\u0085\u009f"],
+    ["bidirectional", "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"],
+    ["zero width", "\u200b\u200c\u200d\u2060\ufeff"],
+  ] as const) it(`replaces ${name} characters`, async () => {
+    const audit = log(); await append(audit, 1, { host: `a${chars}b` });
+    expect((await digest(audit)).blocked_destinations[0]?.destination).toBe(`a${" ".repeat(chars.length)}b`);
+  });
+  for (const ip of ["::1", undefined]) it(`falls back from an empty host to ${ip ?? "the null bucket"}`, async () => {
+    const audit = log(); await append(audit, 1, { host: " \n\u200b ", ip, port: 443 });
+    expect((await digest(audit)).blocked_destinations[0]?.destination).toBe(ip ? "[::1]:443" : null);
+  });
+});
+
+describe("round 2 coverage read bounds", () => {
+  it("discards a torn stream's first entry before accepting its retry", async () => {
+    const audit = log(); await append(audit, 1);
+    const [first] = await audit.verifiedChainView();
+    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
+      consumer.onEntry({ ...first!, sequence: 2 });
+      consumer.reset?.();
+      consumer.onEntry(first!);
+    });
+    expect(await digest(audit)).toMatchObject({ window_complete: true, window_incomplete_reason: null });
+  });
+  it("withholds coverage when the accepted stream and query populations disagree", async () => {
+    const audit = log(); await append(audit, 1);
+    const [first] = await audit.verifiedChainView();
+    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
+      consumer.onEntry(first!); consumer.onEntry({ ...first!, sequence: 2 });
+    });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("withholds coverage if the routine stream cannot be verified", async () => {
+    const audit = log(); await append(audit, 1);
+    vi.spyOn(audit, "streamVerifiedChain").mockRejectedValue(new Error("unreadable"));
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+  });
+  it("bounds adversarial coverage reads without retaining the stream", async () => {
+    const audit = log(); await append(audit, 1);
+    const [first] = await audit.verifiedChainView();
+    const cap = 50_000; // Must match DIGEST_QUERY_ENTRY_LIMIT in posture.ts.
+    let calls = 0;
+    vi.spyOn(audit, "streamVerifiedChain").mockImplementation(async consumer => {
+      // Twice the budget proves that the consumer stops early, not after the whole stream.
+      for (let i = 0; i < cap * 2; i++) { calls++; consumer.onEntry({ ...first!, sequence: i + 1 }); }
+    });
+    expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+    expect(calls).toBe(cap + 1);
+  });
+});

@@ -3399,7 +3399,7 @@ function loadedSourceReadAge(path) {
 
 function overviewChip(kind, word, detail) {
   return '<span class="state-chip ' + escHtml(kind) + ' overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>' +
-    escHtml(word) + '</span>' + (detail ? '<span class="overview-chip-detail"> · ' + escHtml(detail) + '</span>' : '') + '</span>';
+    escHtml(word) + '</span>' + (detail ? '<span class="overview-chip-detail">' + escHtml(detail) + '</span>' : '') + '</span>';
 }
 
 function overviewTile(label, valueHtml, evidenceHtml, href) {
@@ -3431,17 +3431,42 @@ function auditChainEvidence(digest) {
   return { last_enforcement_evidence_at: digest && digest.window_end, freshness_window_ms: AUDIT_CHAIN_VERIFIED_MAX_AGE_MS };
 }
 
+function auditChainCheckCurrent(digest) {
+  // The chip and counts share both the accepted verdict and its evidence clock.
+  return !!digest && ((digest.chain_verdict === "verified" && digest.chain_verified === true) ||
+    digest.chain_verdict === "verified_suffix_only") && evidenceCurrent(auditChainEvidence(digest));
+}
+
+function windowCoverageReason(d) {
+  // Must match AuditDigest.window_incomplete_reason in principal-policy/posture.ts.
+  if (typeof d.window_complete !== "boolean") return "window completeness not served";
+  if (d.window_complete) return null;
+  switch (d.window_incomplete_reason) {
+    case "read_limit": return "window larger than one read";
+    case "sealed_region": return "sealed audit region coverage not established";
+    case "retention": return "older entries in the window were removed by retention";
+    default: return "window coverage not established";
+  }
+}
+
 function renderOutboundConnections(d, overview) {
   d = d || {};
-  // Positive gate: only verified, complete, dated reads with safe served counts continue.
+  // Counts require both a covered window and the same current verified/suffix check as the chip.
+  // Continuing paths also require dated reads and safe served counts; all refusals name their missing evidence.
   // Must match the fail-honest returns in buildAuditDigest (principal-policy/posture.ts).
   const reason = d.chain_verdict !== "verified" && d.chain_verdict !== "verified_suffix_only" ? "chain not verified"
-    : d.window_complete !== true ? "window larger than one read"
+    : windowCoverageReason(d) ? windowCoverageReason(d)
     : !Number.isFinite(parseEvidenceTimestamp(d.window_start)) || !Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? "window not stated"
+    : !auditChainCheckCurrent(d) ? "audit check not current"
     : !servedCount(d.kernel_blocks) || !servedCount(d.kernel_allows) ? "count not served" : null;
-  const notEvaluated = function (why) { return '<span class="unknown-value">Not evaluated</span> <span class="muted">' + escHtml(why) + '</span>'; };
+  const notEvaluated = function (why) {
+    const age = why === "audit check not current" ? '<span class="outbound-reason muted">last verified ' + escHtml(relTimeFromIso(d.window_end)) + '</span>' : '';
+    return overviewChip("unknown", "Not evaluated") + '<span class="outbound-reason muted">' + escHtml(why) + '</span>' + age;
+  };
   // Continuing paths: Blocked needs the common gate; Allowed additionally needs exactly zero overrides.
-  const allowedReason = reason || (d.kernel_allow_overrides !== 0 ? "some allowed verdicts were overridden after they were recorded" : null);
+  const allowedReason = reason || (!servedCount(d.kernel_allow_overrides) ? "override count not served"
+    : d.kernel_allow_overrides === 1 ? "1 allowed verdict was overridden after it was recorded"
+    : d.kernel_allow_overrides > 0 ? d.kernel_allow_overrides + " allowed verdicts were overridden after they were recorded" : null);
   const counts = '<div class="outbound-counts"><div>Blocked ' + (reason ? notEvaluated(reason) : '<strong>' + escHtml(d.kernel_blocks) + '</strong>') + '</div><div>Allowed ' +
     (allowedReason ? notEvaluated(allowedReason) : '<strong>' + escHtml(d.kernel_allows) + '</strong>') + '</div></div>';
   const windowLabel = Number.isFinite(parseEvidenceTimestamp(d.window_start)) && Number.isFinite(parseEvidenceTimestamp(d.window_end))
@@ -3459,19 +3484,25 @@ function renderOutboundConnections(d, overview) {
     const sum = validRows ? rows.reduce(function (n, row) { return n + row.blocks; }, 0) : NaN;
     const disagree = !validRows || !servedCount(sum) || sum > d.kernel_blocks ||
       !servedCount(d.blocked_destination_count) || d.blocked_destination_count < rows.length ||
-      d.blocked_destination_count > d.kernel_blocks;
+      d.blocked_destination_count > d.kernel_blocks ||
+      (d.kernel_blocks > 0 && (rows.length === 0 || d.blocked_destination_count === 0)) ||
+      (d.blocked_destination_count === rows.length && sum < d.kernel_blocks);
     // Destinations continue only through the count gate plus row-shape and consistency checks.
     if (disagree) destinations = '<p>' + notEvaluated("served destination values disagree") + '</p>';
     else if (d.kernel_blocks === 0) destinations = '<p>No blocked connections in this window</p>';
     else {
       const shown = rows.slice(0, overview ? OVERVIEW_DESTINATION_LIMIT : OUTBOUND_DESTINATION_LIMIT);
       destinations = '<div class="card-head-row"><h4>Blocked destinations <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(d.blocked_destination_count) + '</span></h4>' +
-        (overview ? '<a href="#enforcement">all outbound connections</a>' : d.blocked_destination_count > rows.length ? '<a href="#activity">Open Evidence</a>' : '') + '</div>' +
+        (overview ? '<a href="#enforcement">all outbound connections</a>' : '') + '</div>' +
         '<div class="overview-table-scroll"><table class="overview-table outbound-table"><thead><tr><th>Destination</th><th>Blocks</th><th>Last blocked</th></tr></thead><tbody>' +
         shown.map(function (row) { return '<tr><td>' + escHtml(row.destination === null ? "destination not recorded" : row.destination) + '</td><td>' + escHtml(row.blocks) + '</td><td>' + escHtml(row.last_blocked_at === null ? "Unknown" : shortTime(row.last_blocked_at)) + '</td></tr>'; }).join("") + '</tbody></table></div>';
     }
   }
-  return '<section class="card outbound-card"><h3>Outbound connections</h3>' + counts + windowLabel + destinations + '</section>';
+  // Enforcement always keeps the window's age and evidence destination, including withheld and empty reads.
+  const foot = overview ? '' : '<div class="evidence pm-foot"><span class="pm-fresh">' +
+    (Number.isFinite(parseEvidenceTimestamp(d.window_end)) ? 'window closed ' + escHtml(relTimeFromIso(d.window_end)) : 'window not stated') +
+    '</span><a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>';
+  return '<section class="card outbound-card"><h3>Outbound connections</h3>' + counts + windowLabel + destinations + foot + '</section>';
 }
 
 function postureEvidenceByAgent(home) {
@@ -3628,17 +3659,6 @@ function renderOverviewAgentsTable() {
   return '<section class="card"><div class="card-head-row"><h3>Agents <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(state.agents.length) + ' · <a href="#agents">all agents</a></span></h3><span class="count-age">Reach (allowed of requested)' + (loadedSourceReadAge(HUB + "/policies") ? ' · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies")) : '') + '</span></div>' +
     '<div class="overview-table-scroll"><table class="overview-table overview-table-agents"><thead><tr><th>Agent</th><th>Owner</th><th>Harness</th><th>Policy template</th><th>Reach (allowed of requested)</th><th>Enforcement</th><th>State</th><th>Budget today</th><th>Last activity</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
 }
-// S3 evidence spine for Today's story: how recently the counted window closed,
-// beside the link to the evidence behind the counts. A digest with no
-// window_end says so rather than letting stale counts read as live.
-function postureStoryFoot(d) {
-  const freshText = d && d.window_end ? relTimeFromIso(d.window_end) : "";
-  const fresh = freshText
-    ? '<span class="pm-fresh" title="' + escHtml(d.window_end) + '">window closed ' + escHtml(freshText) + '</span>'
-    : '<span class="pm-fresh none">window not stated</span>';
-  return '<div class="evidence pm-foot">' + fresh +
-    '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>';
-}
 function renderPostureAnomalies(findings, unknown) {
   if (unknown) {
     return '<p class="muted">Open anomaly findings unavailable (the detector is not available). This is not a confirmation of zero findings.</p>';
@@ -3707,7 +3727,7 @@ function renderPostureScreen() {
     const why = state.posture.homeError
       ? 'Protection status unavailable. Overview unavailable. This dashboard could not read the latest posture check. ' + escHtml(state.posture.homeError)
       : 'Protection status unavailable. Overview unavailable. Current posture is Unknown.';
-    return '<section class="overview-page">' + head + renderOverviewProtection(home) +
+    return '<section class="overview-page">' + head + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' +
       '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
@@ -3718,7 +3738,7 @@ function renderPostureScreen() {
     const below = [];
     if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && heldApprovalItems(null).length) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
-    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + renderOverviewProtection(home) + below.join("") + '</section>';
+    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' + below.join("") + '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
@@ -3743,14 +3763,15 @@ function renderPostureScreen() {
   const pending = pendingKnown ? heldApprovalItems(null) : [];
   const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
   // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
-  const chainVerified = digest.chain_verified === true && evidenceCurrent(auditChainEvidence(digest));
+  const checkCurrent = auditChainCheckCurrent(digest);
+  const chainVerified = digest.chain_verified === true && digest.chain_verdict === "verified" && checkCurrent;
   const chainChip = chainVerified
     ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
-    : digest.chain_verified === true
+    : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent
       ? overviewChip("unknown", "UNKNOWN", "last verified " + (Number.isFinite(chainWindowEnd) ? relTimeFromIso(digest.window_end) : "Unknown"))
     : digest.chain_verdict === "findings"
       ? overviewChip("bad", "FAILED", typeof digest.integrity_finding_count === "number" ? digest.integrity_finding_count + " findings" : "findings")
-      : digest.chain_verdict === "verified_suffix_only"
+      : digest.chain_verdict === "verified_suffix_only" && checkCurrent
       ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
       : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
   const metricCards =
@@ -3759,7 +3780,7 @@ function renderPostureScreen() {
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
-      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : digest.chain_verified === true ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
+      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
     '<section class="overview-page">',
@@ -4730,7 +4751,7 @@ async function fetchSovereignty() {
 function postureHomeExpiryAt(home) {
   if (!home) return null;
   // Each agent expires on its own evidence; a machine timestamp cannot extend an agent badge.
-  const expiries = [home.castle_wall, home.digest && home.digest.chain_verified === true ? auditChainEvidence(home.digest) : null].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
+  const expiries = [home.castle_wall, home.digest && (home.digest.chain_verified === true || home.digest.chain_verdict === "verified_suffix_only") ? auditChainEvidence(home.digest) : null].concat(home.agents || []).filter(evidenceCurrent).map(function (evidence) {
     return parseEvidenceTimestamp(evidence.last_enforcement_evidence_at) + Math.min(Number(evidence.freshness_window_ms), SEAL_FRESHNESS_MAX_MS) + SEAL_FRESHNESS_BOUNDARY_OFFSET_MS;
   });
   return expiries.length ? Math.min.apply(null, expiries) : null;

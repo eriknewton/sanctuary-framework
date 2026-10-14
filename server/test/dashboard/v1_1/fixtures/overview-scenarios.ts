@@ -53,8 +53,12 @@ export async function overviewScenarios(now: number) {
   const emptyLog = new AuditLog(new MemoryStorage(), generateRandomKey());
   const noEvidence = { ...await buildHome({ ...deps, auditLog: emptyLog }) } satisfies PostureHome;
   const firstRun = { ...await buildHome({ ...deps, auditLog: emptyLog, listAgents: () => [] }) } satisfies PostureHome;
+  // Explicitly uncovered digest for the lane's shared capture and wired-test scenarios.
+  const uncovered = { ...base, digest: { ...base.digest, window_complete: false,
+    window_incomplete_reason: "sealed_region" } } satisfies PostureHome;
   const scenarios = [
     { name: "healthy", home: healthy }, { name: "fail-honest", home: failHonest },
+    { name: "window-not-covered", home: uncovered },
     { name: "overrides", home: overrides }, { name: "stale-verified", home: stale },
     { name: "first-run-unprotected", home: firstRun }, { name: "no-evidence", home: noEvidence },
   ];

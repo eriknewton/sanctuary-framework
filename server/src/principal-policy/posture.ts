@@ -38,11 +38,13 @@
  * without a live HTTP server or a running daemon.
  */
 
+import { parseIsoInstantWithOffset } from "../core/index.js";
 import {
   auditChainVerdictClaimsClean,
   auditChainVerdictUntampered,
   auditChainVerdictSealedUnverifiedAtPrivilege,
   type AuditLog,
+  type VerifiedChainItem,
   type AuditChainVerdict,
   type AuditChainVerdictStatus,
 } from "../operational/audit-log.js";
@@ -1031,8 +1033,12 @@ export interface AuditDigest {
   origin_machine: string;
   window_start: string;
   window_end: string;
-  /** True only when the query contains every entry since window_start. */
+  /** True only for an uncut query with no nonempty sealed region and an
+   * authenticated retained floor proving no entries since window_start were removed. */
   window_complete: boolean;
+  /** Why coverage was not established; null only when window_complete is true.
+   * Must match windowCoverageReason in dashboard/v1_1/client.ts. */
+  window_incomplete_reason: "read_limit" | "sealed_region" | "retention" | "coverage_unknown" | null;
   /** Later in-window verdict records that prevent an unqualified Allowed count. */
   kernel_allow_overrides: number;
   /** Counted blocks grouped by destination, capped after sorting by frequency. */
@@ -1111,19 +1117,66 @@ const BLOCKED_DESTINATION_SERVED_LIMIT = 10; // Ten rows fit the Enforcement det
 const DESTINATION_HOST_MAX_CHARS = 253; // DNS name maximum.
 const DESTINATION_LABEL_MAX_CHARS = DESTINATION_HOST_MAX_CHARS + 1 + 5; // Host, colon, 5 port digits = 259.
 const DESTINATION_PORT_MAX = 65535; // Maximum unsigned 16-bit port.
+// C1 extends the shared C0/DEL replacement through the Latin-1 control range.
+const DESTINATION_C1_CONTROLS = /[\u0080-\u009f]/g;
+// Unicode direction marks, embeddings/overrides and isolates can reorder visible host text.
+const DESTINATION_BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+// Zero-width spaces/joiners, word joiner and BOM can hide destination differences.
+const DESTINATION_ZERO_WIDTH = /[\u200b-\u200d\u2060\ufeff]/g;
 const ALLOW_OVERRIDE_OPERATION = "egress_verdict_superseded" satisfies CastleWallEventType;
 
 function blockedDestinationLabel(details: Record<string, unknown> | undefined): string | null {
   const host = destinationHostOf(details);
   const ip = destinationIpOf(details);
-  if (host === null && ip === null) return null;
-  const address = (host ?? ip ?? "").replace(CONTROL_CHARS, " ").trim();
+  const clean = (value: string | null) => (value ?? "").replace(CONTROL_CHARS, " ")
+    .replace(DESTINATION_C1_CONTROLS, " ").replace(DESTINATION_BIDI_CONTROLS, " ")
+    .replace(DESTINATION_ZERO_WIDTH, " ").trim();
+  const cleanHost = clean(host);
+  const address = cleanHost || clean(ip);
+  // Invisible-only hosts must not hide a recorded IP or create a blank destination bucket.
+  if (!address) return null;
   // Brackets count toward the same address budget, including malformed untrusted IP text.
-  const label = host === null && address.includes(":")
+  const label = !cleanHost && address.includes(":")
     ? "[" + address.slice(0, DESTINATION_HOST_MAX_CHARS - 2) + "]"
     : address.slice(0, DESTINATION_HOST_MAX_CHARS);
   const port = destinationPortOf(details);
   return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
+}
+
+/** Settle retention from public authenticated reads without retaining another entry array. */
+async function routineWindowCoverage(
+  auditLog: AuditLog, windowStart: string, queriedCount: number,
+): Promise<AuditDigest["window_incomplete_reason"]> {
+  try {
+    const floor = await auditLog.authenticatedRotationFloor();
+    if (floor.status === "invalid") return "coverage_unknown";
+    const retained: { oldest: VerifiedChainItem | null; count: number; inWindow: number } = { oldest: null, count: 0, inWindow: 0 };
+    const start = parseIsoInstantWithOffset(windowStart);
+    if (start === undefined) return "coverage_unknown";
+    await auditLog.streamVerifiedChain({
+      onEntry(item) {
+        // Keep one entry and cap this consumer's work at the digest read budget; over-budget history is unknown.
+        if (++retained.count > DIGEST_QUERY_ENTRY_LIMIT) throw new Error("coverage read limit");
+        retained.oldest ??= item;
+        // Coverage compares absolute instants; ambiguous or invalid timestamps cannot prove membership.
+        const timestamp = parseIsoInstantWithOffset(item.entry.timestamp);
+        if (timestamp === undefined) throw new Error("coverage timestamp unknown");
+        if (timestamp >= start) retained.inWindow++;
+      },
+      reset() { retained.oldest = null; retained.count = 0; retained.inWindow = 0; },
+    });
+    const oldest = retained.oldest;
+    // Only an accepted stream with the same window population can establish the query's retention coverage.
+    if (!oldest || retained.inWindow !== queriedCount) return "coverage_unknown";
+    const firstSequence = 1; // Audit chains number their first entry at one.
+    if (floor.status === "absent") return oldest.sequence === firstSequence ? null : "coverage_unknown";
+    if (oldest.sequence !== floor.base_sequence) return "coverage_unknown";
+    const oldestAt = parseIsoInstantWithOffset(oldest.entry.timestamp);
+    // A MAC authenticates the floor, not its age: the retained boundary must also precede this window.
+    return oldestAt === undefined ? "coverage_unknown" : oldestAt <= start ? null : "retention";
+  } catch {
+    return "coverage_unknown";
+  }
 }
 
 const APPROVAL_RESOLVED_OPERATION = "cross_harness_approval_resolved";
@@ -1152,6 +1205,7 @@ export async function buildAuditDigest(
       window_end: windowEnd,
       // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
       window_complete: false,
+      window_incomplete_reason: "coverage_unknown",
       kernel_allow_overrides: 0,
       blocked_destinations: [],
       blocked_destination_count: 0,
@@ -1168,7 +1222,7 @@ export async function buildAuditDigest(
     };
   }
 
-  let windowComplete: boolean;
+  let windowIncompleteReason: AuditDigest["window_incomplete_reason"];
   let entries;
   let integrityFindings;
   // BLOCKER-1 (round 3): fold the sealed-region verdict into the digest's
@@ -1183,10 +1237,15 @@ export async function buildAuditDigest(
       since: windowStart,
       limit: DIGEST_QUERY_ENTRY_LIMIT,
     });
-    windowComplete = result.entries.length === result.total;
     entries = result.entries;
     integrityFindings = result.integrity_findings;
     chainVerdict = await input.auditLog.getAuditChainVerdict();
+    // Coverage needs an uncut query, no sealed entries per getAuditChainVerdict,
+    // and authenticatedRotationFloor matched to the oldest streamVerifiedChain entry.
+    // Sealed-region time bounds remain an audit-module follow-up; no nonempty status qualifies.
+    windowIncompleteReason = chainVerdict.sealed_region.status !== "not_present" && chainVerdict.sealed_region.status !== "empty" ? "sealed_region"
+      : result.entries.length !== result.total ? "read_limit"
+      : await routineWindowCoverage(input.auditLog, windowStart, result.total);
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
@@ -1196,6 +1255,7 @@ export async function buildAuditDigest(
       window_end: windowEnd,
       // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
       window_complete: false,
+      window_incomplete_reason: "coverage_unknown",
       kernel_allow_overrides: 0,
       blocked_destinations: [],
       blocked_destination_count: 0,
@@ -1375,7 +1435,8 @@ export async function buildAuditDigest(
     origin_machine: input.originMachine,
     window_start: windowStart,
     window_end: windowEnd,
-    window_complete: windowComplete,
+    window_complete: windowIncompleteReason === null,
+    window_incomplete_reason: windowIncompleteReason,
     kernel_allow_overrides: kernelAllowOverrides,
     blocked_destination_count: destinations.size,
     blocked_destinations: [...destinations.values()].sort((a, b) => {
