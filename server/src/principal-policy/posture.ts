@@ -96,6 +96,10 @@ export {
   type ExclusiveEgressMode,
 } from "../egress-gate/posture.js";
 
+import type { CastleWallEventType } from "../castle-wall/audit/events.js";
+import { parseCastleWallSignedCanonicalBody } from "../castle-wall/audit-attribution.js";
+import { destinationHostOf, destinationIpOf, destinationPortOf, CONTROL_CHARS } from "../castle-wall/export/map.js";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -1027,6 +1031,14 @@ export interface AuditDigest {
   origin_machine: string;
   window_start: string;
   window_end: string;
+  /** True only when the query contains every entry since window_start. */
+  window_complete: boolean;
+  /** Later in-window verdict records that prevent an unqualified Allowed count. */
+  kernel_allow_overrides: number;
+  /** Counted blocks grouped by destination, capped after sorting by frequency. */
+  blocked_destinations: Array<{ destination: string | null; blocks: number; last_blocked_at: string | null }>;
+  /** Distinct destinations before the served-row cap, including the null bucket. */
+  blocked_destination_count: number;
   total_operations: number;
   /** Operations whose recorded result was a failure (denials, blocks, errors). */
   failures: number;
@@ -1092,6 +1104,28 @@ export interface BuildAuditDigestInput {
  * `details.decision` field (`approved` / `denied`); kernel block/allow counts
  * from the Castle Wall verdict operations.
  */
+// Bound per-request query, aggregation memory and work for caller-influenced audit history.
+const DIGEST_QUERY_ENTRY_LIMIT = 50_000;
+// Must match OUTBOUND_DESTINATION_LIMIT in dashboard/v1_1/client.ts.
+const BLOCKED_DESTINATION_SERVED_LIMIT = 10; // Ten rows fit the Enforcement detail card.
+const DESTINATION_HOST_MAX_CHARS = 253; // DNS name maximum.
+const DESTINATION_LABEL_MAX_CHARS = DESTINATION_HOST_MAX_CHARS + 1 + 5; // Host, colon, 5 port digits = 259.
+const DESTINATION_PORT_MAX = 65535; // Maximum unsigned 16-bit port.
+const ALLOW_OVERRIDE_OPERATION = "egress_verdict_superseded" satisfies CastleWallEventType;
+
+function blockedDestinationLabel(details: Record<string, unknown> | undefined): string | null {
+  const host = destinationHostOf(details);
+  const ip = destinationIpOf(details);
+  if (host === null && ip === null) return null;
+  const address = (host ?? ip ?? "").replace(CONTROL_CHARS, " ").trim();
+  // Brackets count toward the same address budget, including malformed untrusted IP text.
+  const label = host === null && address.includes(":")
+    ? "[" + address.slice(0, DESTINATION_HOST_MAX_CHARS - 2) + "]"
+    : address.slice(0, DESTINATION_HOST_MAX_CHARS);
+  const port = destinationPortOf(details);
+  return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
+}
+
 const APPROVAL_RESOLVED_OPERATION = "cross_harness_approval_resolved";
 export async function buildAuditDigest(
   input: BuildAuditDigestInput,
@@ -1099,6 +1133,9 @@ export async function buildAuditDigest(
   const now = input.now ?? Date.now();
   const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const windowStart = new Date(now - windowMs).toISOString();
+  // window_end is this build's instant and the verdict is read in this build;
+  // must match AUDIT_CHAIN_VERIFIED_MAX_AGE_MS in dashboard/v1_1/client.ts.
+  // AuditLog's DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS is the eager re-verify backstop.
   const windowEnd = new Date(now).toISOString();
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
   const subjectFortressId =
@@ -1113,6 +1150,11 @@ export async function buildAuditDigest(
       origin_machine: input.originMachine,
       window_start: windowStart,
       window_end: windowEnd,
+      // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
+      window_complete: false,
+      kernel_allow_overrides: 0,
+      blocked_destinations: [],
+      blocked_destination_count: 0,
       total_operations: 0,
       failures: 0,
       kernel_blocks: 0,
@@ -1126,6 +1168,7 @@ export async function buildAuditDigest(
     };
   }
 
+  let windowComplete: boolean;
   let entries;
   let integrityFindings;
   // BLOCKER-1 (round 3): fold the sealed-region verdict into the digest's
@@ -1138,8 +1181,9 @@ export async function buildAuditDigest(
   try {
     const result = await input.auditLog.query({
       since: windowStart,
-      limit: 50_000,
+      limit: DIGEST_QUERY_ENTRY_LIMIT,
     });
+    windowComplete = result.entries.length === result.total;
     entries = result.entries;
     integrityFindings = result.integrity_findings;
     chainVerdict = await input.auditLog.getAuditChainVerdict();
@@ -1150,6 +1194,11 @@ export async function buildAuditDigest(
       origin_machine: input.originMachine,
       window_start: windowStart,
       window_end: windowEnd,
+      // Must match the positive gate in renderOutboundConnections in dashboard/v1_1/client.ts.
+      window_complete: false,
+      kernel_allow_overrides: 0,
+      blocked_destinations: [],
+      blocked_destination_count: 0,
       total_operations: 0,
       failures: 0,
       kernel_blocks: 0,
@@ -1167,6 +1216,9 @@ export async function buildAuditDigest(
   let failures = 0;
   let kernelBlocks = 0;
   let kernelAllows = 0;
+  let kernelAllowOverrides = 0;
+  // At most DIGEST_QUERY_ENTRY_LIMIT buckets per request, discarded after the read.
+  const destinations = new Map<string | null, AuditDigest["blocked_destinations"][number]>();
   let approvalsGranted = 0;
   let approvalsDenied = 0;
   const perAgent = new Map<string, number>();
@@ -1197,6 +1249,9 @@ export async function buildAuditDigest(
       isRecord(entry.details) &&
       entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
         CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
+    // Provenance alone can only suppress Allowed, never increase an enforcement claim.
+    if (hasCastleWallProvenance && entry.operation === ALLOW_OVERRIDE_OPERATION &&
+        Number.isFinite(ts) && ts > now - windowMs && ts <= windowEndMs) kernelAllowOverrides += 1;
     const isCastleWallEnforcementEvidence =
       hasCastleWallProvenance &&
       CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(entry.operation);
@@ -1251,9 +1306,21 @@ export async function buildAuditDigest(
           !isDuplicate;
       }
     }
-    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked")
+    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked") {
       kernelBlocks += 1;
-    else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
+      // Every counted block enters exactly one row and only counted blocks enter;
+      // the sum before the cap equals kernel_blocks under the same evidence gate.
+      // A producer-verified destination describes this signed flow, never stored top-level metadata.
+      const signed = signedAttribution?.basis === "producer_signed_verified";
+      const bodyDetails = signed ? parseCastleWallSignedCanonicalBody(entry.details ?? {})?.details : entry.details;
+      const destination = blockedDestinationLabel(isRecord(bodyDetails) ? bodyDetails : undefined);
+      const capturedAt = signed ? signedAttribution?.signedCapturedAtMs ?? null : ts;
+      const last = capturedAt !== null && Number.isFinite(capturedAt) ? new Date(capturedAt).toISOString() : null;
+      const row = destinations.get(destination) ?? { destination, blocks: 0, last_blocked_at: null };
+      row.blocks += 1;
+      if (last !== null && (row.last_blocked_at === null || last > row.last_blocked_at)) row.last_blocked_at = last;
+      destinations.set(destination, row);
+    } else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
       kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result
@@ -1308,6 +1375,21 @@ export async function buildAuditDigest(
     origin_machine: input.originMachine,
     window_start: windowStart,
     window_end: windowEnd,
+    window_complete: windowComplete,
+    kernel_allow_overrides: kernelAllowOverrides,
+    blocked_destination_count: destinations.size,
+    blocked_destinations: [...destinations.values()].sort((a, b) => {
+      if (a.blocks !== b.blocks) return b.blocks - a.blocks;
+      if (a.last_blocked_at !== b.last_blocked_at) {
+        if (a.last_blocked_at === null) return 1;
+        if (b.last_blocked_at === null) return -1;
+        return a.last_blocked_at > b.last_blocked_at ? -1 : 1;
+      }
+      if (a.destination === b.destination) return 0;
+      if (a.destination === null) return 1;
+      if (b.destination === null) return -1;
+      return a.destination < b.destination ? -1 : 1;
+    }).slice(0, BLOCKED_DESTINATION_SERVED_LIMIT),
     total_operations: totalOperations,
     failures,
     kernel_blocks: kernelBlocks,

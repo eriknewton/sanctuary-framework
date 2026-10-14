@@ -1864,6 +1864,15 @@ body {
 .state-chip.locked { color: var(--locked); background: var(--locked-bg); border-color: var(--locked-line); }
 .state-chip.locked i { background: var(--locked); border-radius: 2px; }
 
+/* Overview and outbound-card chips keep the glyph with its word. */
+.overview-page .overview-chip, .outbound-card .overview-chip { flex-wrap: wrap; border-radius: 6px; /* 6px stays below the tile's 8px corner. */ }
+.overview-chip-head { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.overview-chip-detail { white-space: normal; overflow-wrap: anywhere; }
+.overview-page .overview-tier { white-space: nowrap; }
+.outbound-card .outbound-counts { display: flex; flex-wrap: wrap; gap: 16px; }
+.outbound-card .outbound-table { table-layout: fixed; }
+.outbound-card .outbound-table td { overflow-wrap: anywhere; }
+
 /* Slice 3 Overview: dense security-console composition. Every capped list
    prints "showing M of N" in its own panel so bounded rendering cannot hide
    queue depth, findings or rows. */
