@@ -111,8 +111,8 @@ describe("dashboard bounded independent hydration", () => {
   it("reports a preferences timeout and uses default filters", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
-    runInContext('state.route = "activity"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Read timed out"); expect(runInContext("state.inboxOps.filters.search", h.context)).toBe(""); expect(h.main.innerHTML).toContain("Activity");
+    expect(runInContext('sourceRead(INBOX_PREFS).error', h.context)).toContain("Read timed out");
+    expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
@@ -176,7 +176,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
     expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
+    expect(runInContext("sourceReads.size", h.context)).toBe(21); // The fixed source inventory includes the Evidence verification read.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {

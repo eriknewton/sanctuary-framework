@@ -427,11 +427,10 @@ describe("slice 2 shell wired consumers", () => {
     expect(m![1]).not.toBe("pp-dot");
   });
 
-  it("Evidence names the rows outside the time range instead of saying nothing is pending", async () => {
+  it("Evidence says entries are Unknown when the verification read has not answered", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-10T12:00:00Z"));
-    const old = { ...heldItem, item_id: "old-1", kind: "blocked_egress", tier: undefined, created_at: "2026-03-05T12:00:00Z" };
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [old, { ...old, item_id: "old-2" }] } })) });
+    const h = boot({ "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")) });
     await settle();
     const select = new FakeElement({ "data-action": "time-range" }) as FakeElement & { tagName: string };
     select.tagName = "SELECT";
@@ -440,17 +439,19 @@ describe("slice 2 shell wired consumers", () => {
     // The operator picks the 24 hours range in the top bar.
     h.change(select);
     const main = h.el.main!.innerHTML;
-    expect(main).toContain("Inbox (0 of 2)");
-    expect(main).not.toContain("Nothing pending.");
-    expect(main).toContain("No open items in this view: 2 older items are outside the last 24 hours.");
+    expect(main).toContain("Entries Unknown");
+    expect(main).toContain("Chain verification Unknown");
+    expect(main).not.toContain("CHAIN VERIFIED");
   });
 
-  it("Evidence says Nothing pending only when no item is open", async () => {
+  it("Evidence says no entries match only after the server evidence read loads", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })) });
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "none" } })),
+    });
     await settle();
     h.navigate("activity");
-    expect(h.el.main!.innerHTML).toContain("Nothing pending.");
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
   });
 
   it("the Approvals subtitle promises no signed policy and says Allow always is refused when the engine is not configured", async () => {
@@ -848,9 +849,7 @@ describe("slice 2b shell wired consumers", () => {
       expect(textOf(html), route).not.toMatch(retired);
       for (const a of attrsOf(html)) expect(a, route).not.toMatch(retired);
     }
-    h.navigate("activity");
-    await settle();
-    const html = h.el.main!.innerHTML;
+    const html = runInContext("renderFortressAgentsCard()", h.context) as string;
     expect(html).toContain('data-action="agent-unwrap" data-agent-id="a1" disabled title="Removing protection from the dashboard is not available yet; an unsupported request is refused before any approval is queued.">Remove protection</button>');
     expect(html).toContain('data-action="agent-lockdown" data-agent-id="a1" title="Tier 1: requires inbox approval.">Lock down</button>');
   });
@@ -896,14 +895,17 @@ describe("slice 2b shell wired consumers", () => {
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "none" } })),
+    });
     await settle();
     h.navigate("activity");
     const html = h.el.main!.innerHTML;
-    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter the inbox">([\s\S]*?)<\/div>/);
+    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter evidence entries">([\s\S]*?)<\/div>/);
     expect(bar, "filter bar").toBeTruthy();
     const labels = [...bar![1]!.matchAll(/<label class="field"><span class="field-label">([^<]+)<\/span><(input|select) class="input"/g)].map((m) => m[1]);
-    expect(labels).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    expect(labels).toEqual(["Layer", "Agent", "Event", "Verdict", "From", "To"]);
+    expect(bar![1]).toContain("Query");
     expect(bar![1]).not.toContain("<br>");
   });
 
@@ -919,6 +921,140 @@ describe("slice 2b shell wired consumers", () => {
     ])`, h.context) as string;
     expect(out.match(/<span class="trend-bar (good|warn|pending)"/g)).toHaveLength(4);
     expect(textOf(out).replace(/\s+/g, " ").trim()).toBe("2 went ahead 1 stopped 1 other");
+  });
+});
+
+describe("slice 5 Evidence wired consumers", () => {
+  const now = "2026-10-14T17:00:00.000Z";
+  const evidencePayload = (overrides: Record<string, unknown> = {}) => ({
+    origin_machine: "fixture-mac",
+    entries: [
+      {
+        sequence: 1281,
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer: "l1",
+        identity_id: "research-agent",
+        operation_type: "egress",
+        result: "failure",
+        details: {
+          destination: "198.51.100.23:8080",
+          rule_id: "policy-v41/rule-2",
+          agent_saw: "<script>alert(1)</script>",
+          event_text: "<img src=x onerror=alert(1)>",
+        },
+        hash: "sha256:b02d6f13f7",
+        previous_hash: "sha256:3a91c0e55d",
+        signer: "operator key EN-2026-09",
+        signature_verified: true,
+        link_verified: true,
+      },
+      {
+        sequence: 1280,
+        timestamp: "2026-10-14T16:57:00.000Z",
+        layer: "l2",
+        identity_id: "sentinel-agent",
+        operation_type: "sentinel_finding",
+        result: "success",
+        details: { summary: "Finding opened" },
+        hash: "sha256:aa",
+        previous_hash: "sha256:bb",
+        signer: "sentinel key",
+        signature_verified: true,
+        link_verified: false,
+      },
+    ],
+    total: 2,
+    integrity_findings: [],
+    chain_verdict: "verified",
+    sealed_region: { status: "none" },
+    ...overrides,
+  });
+  const bootEvidence = async (
+    evidence: Record<string, unknown> = evidencePayload(),
+    overrides: Record<string, (init?: RequestInit) => unknown> = {},
+  ) => {
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response(evidence)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      ...overrides,
+    });
+    await settle();
+    h.navigate("activity");
+    await settle();
+    return h;
+  };
+
+  it("renders chain verified only from the server verification read", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const verified = await bootEvidence();
+    expect(verified.el.main!.innerHTML).toContain("CHAIN VERIFIED");
+    expect(verified.el.main!.innerHTML).toContain("<b>2</b> entries");
+    expect(verified.el.main!.innerHTML).toContain("<b>0</b> integrity findings");
+    const unknown = await bootEvidence({ ...evidencePayload(), chain_verdict: "key_unavailable" });
+    expect(unknown.el.main!.innerHTML).toContain("UNKNOWN");
+    expect(unknown.el.main!.innerHTML).toContain("server verification did not return a verified chain");
+    expect(unknown.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("maps every frozen layer token to its Evidence name and filters with tokens in the hash", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: ["l1", "l2", "l3", "l4"].map((layer, i) => ({
+        sequence: 2000 - i,
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer,
+        identity_id: "agent-" + layer,
+        operation_type: "event-" + layer,
+        result: "success",
+        details: {},
+        hash: "sha256:" + layer,
+        previous_hash: "sha256:prev-" + layer,
+        signer: "operator",
+        signature_verified: true,
+        link_verified: true,
+      })),
+      total: 4,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Castle Wall");
+    expect(html).toContain("Sentinels");
+    expect(html).toContain("Charter");
+    expect(html).toContain("Heralds");
+    h.navigate("activity?layer=l3");
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("Layer: Charter");
+    expect(h.el.main!.innerHTML).toContain("event-l3");
+    expect(h.el.main!.innerHTML).not.toContain("event-l1");
+  });
+
+  it("shows broken links as broken and renders hostile event text as text", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("broken");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).not.toContain("<img src=x onerror=alert(1)>");
+    expect(html).not.toContain("<script>alert(1)</script>");
+  });
+
+  it("uses existing export and exit paths, disabling unavailable dashboard exports with reasons", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('href="/api/audit-log"');
+    expect(html).toContain("CEF unavailable from this dashboard");
+    expect(html).toContain("Compliance bundle unavailable from this dashboard");
+    expect(html).toContain('href="#exit-drill"');
+  });
+
+  it("keeps the Evidence page honest when the verification read fails", async () => {
+    const h = await bootEvidence(undefined, {
+      "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")),
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Chain verification Unknown");
+    expect(html).toContain("verification offline");
+    expect(html).not.toContain("CHAIN VERIFIED");
   });
 });
 

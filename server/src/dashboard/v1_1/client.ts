@@ -156,6 +156,7 @@ const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE
 // Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
   INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
+  "/api/posture/evidence",
   HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
   HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config",
   HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
@@ -217,6 +218,7 @@ function validateReadBody(key, body) {
   if (key === readKey(HUB + "/recognition/did-web") && typeof data.configured !== "boolean") return false;
   if (key === readKey(HUB + "/intelligence/status") && !Array.isArray(data.surfaces)) return false;
   if (key === readKey("/api/posture/home") && (!body.castle_wall || !Array.isArray(body.agents) || !body.digest)) return false;
+  if (key === readKey("/api/posture/evidence") && (!Array.isArray(body.entries) || !Array.isArray(body.integrity_findings))) return false;
   if (key === readKey("/api/sovereignty") && (!body.live_enforcement || typeof body.live_enforcement !== "object")) return false;
   return true;
 }
@@ -237,6 +239,11 @@ const state = {
     snoozeDialog: null
   },
   activity: [],
+  evidence: {
+    view: null,
+    filters: { query: "", layer: "", agent: "", event: "", verdict: "", from: "", to: "" },
+    selectedSeq: null
+  },
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
   // Tunability UX: plain-English view of the LIVE Principal Policy, fetched
@@ -468,6 +475,7 @@ function readLabel(path) {
     [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
     ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
     [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
+    ["/api/posture/evidence", "Chain verification"],
     [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
     [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
     [HUB + "/intelligence/status", "Intelligence status"], [HUB + "/intelligence/config", "Intelligence configuration"], [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
@@ -3147,6 +3155,173 @@ function promotableOperation(i) {
   return op;
 }
 
+const EVIDENCE_LAYER_NAMES = {
+  // Must match validLayers in server/src/principal-policy/posture-routes.ts.
+  l1: "Castle Wall",
+  l2: "Sentinels",
+  l3: "Charter",
+  l4: "Heralds"
+};
+const EVIDENCE_LAYER_ORDER = ["l1", "l2", "l3", "l4"];
+const EVIDENCE_PAGE_SIZE = 25;
+
+function evidenceLayerName(layer) {
+  return EVIDENCE_LAYER_NAMES[layer] || "Unknown";
+}
+
+function evidenceSeq(entry, fallback) {
+  const raw = entry && (entry.sequence !== undefined ? entry.sequence : entry.seq);
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  return raw;
+}
+
+function evidenceTimestamp(entry) {
+  return entry && (entry.timestamp || entry.emitted_at || entry.created_at || entry.ts || "");
+}
+
+function evidenceAgent(entry) {
+  return entry && (entry.identity_id || entry.agent_id || entry.actor || "fortress");
+}
+
+function evidenceEvent(entry) {
+  return entry && (entry.operation_type || entry.event || entry.category || "audit entry");
+}
+
+function evidenceVerdict(entry) {
+  const raw = String((entry && (entry.result || entry.verdict || entry.outcome)) || "record").toLowerCase();
+  if (raw === "success" || raw === "allowed" || raw === "verified") return "verified";
+  if (raw === "failure" || raw === "blocked" || raw === "denied") return "broken";
+  if (raw === "held" || raw === "pending") return "held";
+  return raw || "record";
+}
+
+function evidenceHash(entry) {
+  return entry && (entry.hash || entry.entry_hash || entry.audit_hash || "");
+}
+
+function evidencePrevHash(entry) {
+  return entry && (entry.previous_hash || entry.prev_hash || entry.prev || "");
+}
+
+function shortHash(value) {
+  const raw = String(value || "");
+  if (raw.length <= 18) return raw || "Unknown";
+  return raw.slice(0, 10) + "..." + raw.slice(-6);
+}
+
+function evidenceDetail(entry, key) {
+  const details = entry && entry.details && typeof entry.details === "object" ? entry.details : {};
+  return details[key];
+}
+
+function evidenceEntryText(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" ? entry.details : {};
+  return [
+    evidenceEvent(entry),
+    evidenceAgent(entry),
+    entry && entry.display_template_id,
+    details.summary,
+    details.event_text,
+    details.destination,
+    details.rule_id,
+    JSON.stringify(details)
+  ].filter(Boolean).join(" ");
+}
+
+function evidenceMatchesQuery(entry, query) {
+  const trimmed = String(query || "").trim().toLowerCase();
+  if (!trimmed) return true;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const haystack = evidenceEntryText(entry).toLowerCase();
+  return words.every(function (word) {
+    const split = word.indexOf(":");
+    if (split > 0) {
+      const field = word.slice(0, split);
+      const value = word.slice(split + 1);
+      if (field === "agent") return String(evidenceAgent(entry)).toLowerCase().indexOf(value) >= 0;
+      if (field === "layer") return evidenceLayerName(entry.layer).toLowerCase().indexOf(value) >= 0 || String(entry.layer || "").toLowerCase() === value;
+      if (field === "verdict") return evidenceVerdict(entry).toLowerCase().indexOf(value) >= 0;
+      if (field === "seq") return String(evidenceSeq(entry, "")).toLowerCase() === value;
+      if (field === "event" || field === "rule" || field === "dst" || field === "text") return haystack.indexOf(value) >= 0;
+    }
+    return haystack.indexOf(word) >= 0;
+  });
+}
+
+function applyEvidenceHashFilters(hash) {
+  const route = String(hash || "").split("?")[0];
+  if (route !== "activity") return;
+  const qs = String(hash || "").split("?")[1] || "";
+  const params = new URLSearchParams(qs);
+  const filters = state.evidence.filters;
+  filters.query = params.get("q") || "";
+  const layer = params.get("layer") || "";
+  filters.layer = EVIDENCE_LAYER_NAMES[layer] ? layer : "";
+  filters.agent = params.get("agent") || "";
+  filters.event = params.get("event") || "";
+  filters.verdict = params.get("verdict") || "";
+  filters.from = params.get("from") || "";
+  filters.to = params.get("to") || "";
+}
+
+function evidenceHashFromFilters() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.query) params.set("q", filters.query);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.agent) params.set("agent", filters.agent);
+  if (filters.event) params.set("event", filters.event);
+  if (filters.verdict) params.set("verdict", filters.verdict);
+  if (filters.from) params.set("from", filters.from);
+  if (filters.to) params.set("to", filters.to);
+  const qs = params.toString();
+  return "#activity" + (qs ? "?" + qs : "");
+}
+
+function setEvidenceFilter(name, value) {
+  if (!Object.prototype.hasOwnProperty.call(state.evidence.filters, name)) return;
+  state.evidence.filters[name] = value;
+  const nextHash = evidenceHashFromFilters();
+  if (location.hash !== nextHash) location.hash = nextHash;
+  else rerender();
+}
+
+function filteredEvidenceEntries(entries) {
+  const filters = state.evidence.filters;
+  const fromMs = filters.from ? evidenceDateFilterMs(filters.from, false) : null;
+  const toMs = filters.to ? evidenceDateFilterMs(filters.to, true) : null;
+  return (entries || []).filter(function (entry) {
+    const ts = parseEvidenceTimestamp(evidenceTimestamp(entry));
+    if (filters.layer && entry.layer !== filters.layer) return false;
+    if (filters.agent && String(evidenceAgent(entry)).toLowerCase().indexOf(filters.agent.toLowerCase()) < 0) return false;
+    if (filters.event && String(evidenceEvent(entry)).toLowerCase().indexOf(filters.event.toLowerCase()) < 0) return false;
+    if (filters.verdict && evidenceVerdict(entry) !== filters.verdict) return false;
+    if (fromMs !== null && Number.isFinite(ts) && ts < fromMs) return false;
+    if (toMs !== null && Number.isFinite(ts) && ts > toMs) return false;
+    return evidenceMatchesQuery(entry, filters.query);
+  });
+}
+
+function evidenceDateFilterMs(value, endOfDay) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return NaN;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const ms = endOfDay ? 999 : 0;
+  const second = endOfDay ? 59 : 0;
+  const minute = endOfDay ? 59 : 0;
+  const hour = endOfDay ? 23 : 0;
+  const stamp = Date.UTC(year, month - 1, day, hour, minute, second, ms);
+  const check = new Date(stamp);
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) return NaN;
+  return stamp;
+}
+
+function renderEvidenceStatusChip(kind, word) {
+  return '<span class="state-chip ' + escHtml(kind) + '"><i aria-hidden="true"></i>' + escHtml(word) + '</span>';
+}
+
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
@@ -3208,6 +3383,111 @@ function renderFortress() {
   restoreRetryFocus(active, fortress);
 }
 
+function renderEvidenceIntegrity(view) {
+  const read = sourceRead("/api/posture/evidence");
+  if (!sourceLoaded("/api/posture/evidence") || !view) {
+    const reason = read && read.error ? read.error : "server verification has not answered";
+    return '<section class="evidence-integrity unknown"><div class="ei-badge">' + renderEvidenceStatusChip("unknown", "UNKNOWN") +
+      '</div><div class="ei-facts"><strong>Chain verification Unknown</strong><span>' + escHtml(reason) + '</span></div></section>';
+  }
+  const findings = Array.isArray(view.integrity_findings) ? view.integrity_findings : [];
+  const verified = view.chain_verdict === "verified" && findings.length === 0;
+  if (verified) {
+    const first = (view.entries || [])[0] || {};
+    return '<section class="evidence-integrity verified"><div class="ei-badge">' + renderEvidenceStatusChip("good", "CHAIN VERIFIED") + '</div>' +
+      '<div class="ei-facts"><span><b>' + escHtml(view.total || 0) + '</b> entries</span><span><b>0</b> integrity findings in window</span>' +
+      '<span>last verified by server read ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span><span>head <span class="mono">' + escHtml(shortHash(evidenceHash(first))) + '</span></span>' +
+      '<span>signer <span class="mono">' + escHtml(first.signer || "operator") + '</span></span></div>' +
+      '<span class="ei-note">Verification result comes from the audit-chain read.</span></section>';
+  }
+  const word = findings.length ? "INTEGRITY FINDING" : "UNKNOWN";
+  const kind = findings.length ? "bad" : "unknown";
+  const reason = findings.length ? findings.length + " integrity findings returned" : "server verification did not return a verified chain";
+  return '<section class="evidence-integrity ' + escHtml(kind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(kind, word) + '</div>' +
+    '<div class="ei-facts"><strong>' + escHtml(reason) + '</strong><span>chain verdict <span class="mono">' + escHtml(view.chain_verdict || "unknown") + '</span></span>' +
+    '<span><b>' + escHtml(view.total || 0) + '</b> entries</span><span><b>' + escHtml(findings.length) + '</b> integrity findings in window</span></div></section>';
+}
+
+function renderEvidenceQueryBar() {
+  const f = state.evidence.filters;
+  const layerOptions = ['<option value="">Any</option>'].concat(EVIDENCE_LAYER_ORDER.map(function (token) {
+    return '<option value="' + token + '"' + (f.layer === token ? ' selected' : '') + '>' + escHtml(evidenceLayerName(token)) + '</option>';
+  })).join("");
+  const verdictOptions = ["", "verified", "broken", "held", "record"].map(function (value) {
+    const label = value ? sentenceCase(value) : "Any";
+    return '<option value="' + escHtml(value) + '"' + (f.verdict === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  }).join("");
+  const chips = [
+    "Layer: " + (f.layer ? evidenceLayerName(f.layer) : "Any"),
+    "Agent: " + (f.agent || "Any"),
+    "Event: " + (f.event || "Any"),
+    "Verdict: " + (f.verdict ? sentenceCase(f.verdict) : "Any"),
+    "Time: " + (f.from || f.to ? (f.from || "start") + " to " + (f.to || "now") : TIME_RANGE_LABEL[state.timeRange])
+  ].map(function (chip) { return '<span class="evidence-chip">' + escHtml(chip) + '</span>'; }).join("");
+  return '<section class="card evidence-query"><div class="filter-bar" role="group" aria-label="Filter evidence entries">' +
+    '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: verdict: rule: dst: seq: or text" value="' + escHtml(f.query) + '"></label>' +
+    '<label class="field"><span class="field-label">Layer</span><select class="input" data-action="evidence-filter-layer">' + layerOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">Agent</span><input class="input" data-action="evidence-filter-agent" value="' + escHtml(f.agent) + '"></label>' +
+    '<label class="field"><span class="field-label">Event</span><input class="input" data-action="evidence-filter-event" value="' + escHtml(f.event) + '"></label>' +
+    '<label class="field"><span class="field-label">Verdict</span><select class="input" data-action="evidence-filter-verdict">' + verdictOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">From</span><input class="input" data-action="evidence-filter-from" type="date" value="' + escHtml(f.from) + '"></label>' +
+    '<label class="field"><span class="field-label">To</span><input class="input" data-action="evidence-filter-to" type="date" value="' + escHtml(f.to) + '"></label>' +
+    '</div><div class="evidence-chips">' + chips + '</div></section>';
+}
+
+function renderEvidenceRow(entry, fallback) {
+  const seq = evidenceSeq(entry, fallback);
+  const selected = String(state.evidence.selectedSeq || "") === String(seq);
+  const verdict = evidenceVerdict(entry);
+  return '<tr' + (selected ? ' class="sel"' : '') + ' data-evidence-row="' + escHtml(seq) + '">' +
+    '<td class="mono muted">' + escHtml(seq) + '</td>' +
+    '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry))) + '</td>' +
+    '<td><span class="lay">' + escHtml(evidenceLayerName(entry.layer)) + '</span></td>' +
+    '<td><span class="row">' + escHtml(evidenceAgent(entry)) + '</span></td>' +
+    '<td>' + escHtml(evidenceEvent(entry)) + '</td>' +
+    '<td>' + renderEvidenceStatusChip(verdict === "broken" ? "bad" : verdict === "held" ? "warn" : "neutral", verdict.toUpperCase()) + '</td>' +
+    '<td class="mono muted">' + escHtml(shortHash(evidenceHash(entry))) + '</td>' +
+  '</tr>';
+}
+
+function renderEvidenceDrawer(entry, fallback) {
+  if (!entry) {
+    return '<aside class="panel evidence-detail"><div class="overview-empty"><h3>No record selected</h3><p>Select an entry to inspect its signed record.</p></div></aside>';
+  }
+  const seq = evidenceSeq(entry, fallback);
+  const destination = evidenceDetail(entry, "destination") || evidenceDetail(entry, "dst") || "Unknown";
+  const rule = evidenceDetail(entry, "rule_id") || evidenceDetail(entry, "rule") || "Unknown";
+  const agentSaw = evidenceDetail(entry, "agent_saw") || evidenceDetail(entry, "event_text") || "Not stated";
+  const linkWord = entry.link_verified === true ? "link ok" : "broken";
+  const signerWord = entry.signature_verified === false ? "signature not verified" : "authenticity verified";
+  const verdict = evidenceVerdict(entry);
+  return '<aside class="panel evidence-detail" aria-label="Selected entry">' +
+    '<div class="hd"><div class="t">Entry ' + escHtml(seq) + ' ' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
+    '<div class="sec"><h3>What happened</h3><dl class="kv">' +
+      '<dt>Agent</dt><dd>' + escHtml(evidenceAgent(entry)) + '</dd>' +
+      '<dt>Destination</dt><dd><span class="mono">' + escHtml(destination) + '</span></dd>' +
+      '<dt>Verdict</dt><dd>' + renderEvidenceStatusChip(verdict === "broken" ? "bad" : "neutral", verdict.toUpperCase()) + '</dd>' +
+      '<dt>Rule</dt><dd>' + escHtml(rule) + '</dd>' +
+      '<dt>Agent saw</dt><dd><span class="mono">' + escHtml(agentSaw) + '</span></dd>' +
+    '</dl></div>' +
+    '<div class="sec"><h3>Seal</h3><div class="chain">' +
+      '<div class="lnk"><span class="k">this</span><span class="h">' + escHtml(shortHash(evidenceHash(entry))) + '</span></div>' +
+      '<div class="lnk"><span class="k">prev</span><span class="h">' + escHtml(shortHash(evidencePrevHash(entry))) + ' <span class="' + (entry.link_verified === true ? 'ok' : 'bad') + '">' + escHtml(linkWord) + '</span></span></div>' +
+      '<div class="lnk"><span class="k">signed by</span><span class="h">' + escHtml(entry.signer || "Unknown signer") + ', ' + escHtml(signerWord) + '</span></div>' +
+    '</div></div>' +
+    '<div class="sec"><h3>Raw record</h3><pre class="json">' + escHtml(JSON.stringify(entry, null, 2)) + '</pre></div>' +
+  '</aside>';
+}
+
+function renderEvidenceExports() {
+  return '<section class="card evidence-export"><h3>Export</h3><div class="toolbar">' +
+    '<a class="btn" href="/api/audit-log">JSON audit log</a>' +
+    '<button class="btn" disabled title="audit_export_siem exists as an MCP export, but this dashboard has no CEF route.">CEF unavailable from this dashboard</button>' +
+    '<button class="btn" disabled title="compliance_generate_eu_ai_act_bundle is Tier 1 and has no dashboard entry point here.">Compliance bundle unavailable from this dashboard</button>' +
+    '<a class="btn" href="#exit-drill">Exit drill</a>' +
+  '</div></section>';
+}
+
 // Wave 1 (2026-06-30): the Activity screen. The heavy six-field inbox
 // filter panel + the full multi-kind inbox (privacy events, blocked egress,
 // budget warnings, recovery prompts, agent errors, AND the tiered approvals)
@@ -3219,119 +3499,33 @@ function renderFortress() {
 // token-gated paths (onInboxAction -> api()). No behavior change; only the
 // home of the panel moved.
 function renderActivityScreen() {
-  const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
-  const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
-  const batchToolbar = selectedIds.length
-    ? '<div class="toolbar" style="margin-bottom:8px;">' +
-        '<span class="pill">' + selectedIds.length + ' selected</span>' +
-        '<button class="btn" data-action="inbox-batch-archive">Archive</button>' +
-        '<button class="btn" data-action="inbox-batch-dismiss">Dismiss</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze-open">Snooze</button>' +
-        '<button class="btn btn-danger" data-action="inbox-batch-delete">Delete</button>' +
-      '</div>'
+  const view = state.evidence.view;
+  const entries = view && Array.isArray(view.entries) ? view.entries : [];
+  const filtered = filteredEvidenceEntries(entries);
+  if (state.evidence.selectedSeq === null && filtered.length) state.evidence.selectedSeq = evidenceSeq(filtered[0], 1);
+  const selected = filtered.find(function (entry, index) {
+    return String(evidenceSeq(entry, index + 1)) === String(state.evidence.selectedSeq);
+  }) || filtered[0] || null;
+  const shown = filtered.slice(0, EVIDENCE_PAGE_SIZE);
+  const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
+    ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(entries.length + " entries were read from the server, 0 matched these filters.") + '</p><a class="btn" href="#activity">Clear filters</a></div>'
     : "";
-  const snoozeDialog = state.inboxOps.snoozeDialog
-    ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="3600000">1h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="14400000">4h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="86400000">1d</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="604800000">1w</button>' +
-        '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
-        '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
-      '</div></div></div>'
-    : "";
-  // Each filter is a labelled field in a wrapping grid: the label sits above
-  // its control in the label style, so no label runs into its neighbour.
-  const filterField = function (label, control) {
-    return '<label class="field"><span class="field-label">' + label + '</span>' + control + '</label>';
-  };
-  const filterPanel =
-    '<div class="filter-bar" role="group" aria-label="Filter the inbox">' +
-      filterField("Search", '<input class="input" data-action="inbox-filter-search" value="' + escHtml(state.inboxOps.filters.search) + '">') +
-      filterField("Source", '<select class="input" data-action="inbox-filter-source"><option value="">Any</option>' + inboxOption("blocked_egress") + inboxOption("privacy_event") + inboxOption("budget_warning") + inboxOption("recovery_prompt") + inboxOption("agent_error") + inboxOption("approval") + inboxOption("sentinel_finding") + '</select>') +
-      filterField("Severity", '<select class="input" data-action="inbox-filter-severity"><option value="">Any</option>' + inboxOption("info", "severity") + inboxOption("warn", "severity") + inboxOption("alert", "severity") + inboxOption("critical", "severity") + '</select>') +
-      filterField("Agent", '<select class="input" data-action="inbox-filter-agent"><option value="">Any</option>' + inboxAgentOptions() + '</select>') +
-      filterField("From", '<input class="input" data-action="inbox-filter-from" type="date" value="' + escHtml(state.inboxOps.filters.from) + '">') +
-      filterField("To", '<input class="input" data-action="inbox-filter-to" type="date" value="' + escHtml(state.inboxOps.filters.to) + '">') +
-    '</div>';
-  const redactedNotice = state.inboxRedacted
-    ? '<div class="banner-warn" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '. Paste the operator token to review and decide them.</div>'
-    : '';
-  var inboxRows;
-  const openItems = state.inbox.filter(function (i) { return !i.resolved; });
-  if (!visibleInbox.length && !openItems.length) {
-    inboxRows = redactedNotice || '<p class="muted">Nothing pending.</p>';
-  } else if (!visibleInbox.length) {
-    // Open items exist but the view shows none: say where they went, so an
-    // empty window never reads as an empty inbox.
-    const anyTime = filterInbox(openItems, true).length;
-    const hiddenByFilters = openItems.length - anyTime;
-    const parts = [];
-    if (anyTime) parts.push(anyTime + (anyTime === 1 ? " older item is" : " older items are") + " outside " + TIME_RANGE_LABEL[state.timeRange]);
-    if (hiddenByFilters) parts.push(hiddenByFilters + (hiddenByFilters === 1 ? " item is" : " items are") + " hidden by your filters");
-    inboxRows = redactedNotice + '<p class="muted">No open items in this view: ' + escHtml(parts.join("; ")) + '.</p>';
-  } else {
-    var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
-    var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
-    var otherItems = visibleInbox.filter(function (i) { return i.kind !== "approval_pending" || (i.tier !== "tier1" && i.tier !== "tier2"); });
-    function renderInboxRow(i) {
-      var text = renderTemplate(i.display_template_id, i.display_template_args);
-      var actions = inboxActions(i);
-      var buttons = actions.map(function (act) {
-        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-      }).join("");
-      var tierBadge = i.kind === "approval_pending"
-        ? '<span class="pill">' + escHtml(i.tier) + '</span>'
-        : '<span class="pill">' + escHtml(i.kind) + '</span>';
-      return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
-        (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
-        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
-        '<div class="grow">' + escHtml(text) + '</div>' +
-        tierBadge +
-        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
-        '<div style="display:flex;gap:4px;">' + buttons + '</div>' +
-        '</div>';
-    }
-    var sections = [];
-    if (tier1Items.length) sections.push('<h4 class="inbox-group-head">Tier 1 approvals</h4>' + tier1Items.map(renderInboxRow).join("\n"));
-    if (tier2Items.length) sections.push('<h4 class="inbox-group-head">Tier 2 approvals</h4>' + tier2Items.map(renderInboxRow).join("\n"));
-    if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
-    inboxRows = redactedNotice + sections.join("\n");
-  }
-  const total = sourceLoaded(HUB + "/inbox") ? state.inbox.filter(function (i) { return !i.resolved; }).length : "Unknown";
-  // The count states what the filters and the time range left showing, out of
-  // every open item, so a narrowed list never reads as the whole inbox.
-  const inboxCount = sourceLoaded(HUB + "/inbox") ? visibleInbox.length + " of " + total : "Unknown";
-  if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
-  // Export: Exit drill folds in here as an action, beside the two evidence
-  // exports the posture board already links. No new route is served.
-  const exportGroup =
-    '<section class="card export-group"><h3>Export</h3>' +
-      '<p class="muted">Take your evidence, or your whole fortress, with you.</p>' +
-      '<div class="toolbar">' +
-        '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
-        '<a class="btn" href="/api/audit-log">Audit log (JSON)</a>' +
-        '<a class="btn" href="#exit-drill">Exit drill: export the fortress</a>' +
-      '</div>' +
-    '</section>';
+  const table = sourceLoaded("/api/posture/evidence")
+    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(filtered.length) + ' matched, ' + escHtml((view && view.total) || entries.length) + ' total</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + '</span></div>' +
+      (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Seq</th><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Verdict</th><th>Seal</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
+    : '<section class="panel evidence-entries" aria-label="Entries"><div class="overview-empty"><h3>Entries Unknown</h3><p>The server verification read has not loaded entries.</p></div></section>';
   return [
-    '<section class="concierge-wrap">',
+    '<section class="evidence-page">',
       '<div class="page-head"><div>',
-        '<p class="eyebrow">Activity</p>',
-        '<h1>Everything across your fortress.</h1>',
-        '<p class="sub">Approvals, blocked actions, privacy events, and budget warnings, with filters to find one. Approve or deny right here. Anything waiting on you also shows in the rail.</p>',
+        '<p class="eyebrow">Evidence</p>',
+        '<h1>Evidence</h1>',
+        '<p class="sub">The tamper-evident record of everything the fortress decided. Integrity is shown only from the server verification read.</p>',
       '</div></div>',
-      '<section class="card">',
-        '<h3>This fortress</h3>',
-        (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
-        '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
-        '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
-      '</section>',
-      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
-      '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
-      '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
-      exportGroup,
+      renderEvidenceIntegrity(view),
+      renderEvidenceQueryBar(),
+      renderSourceRead("/api/posture/evidence"),
+      '<div class="evidence-layout">' + table + renderEvidenceDrawer(selected, 1) + '</div>',
+      renderEvidenceExports(),
     '</section>'
   ].join("");
 }
@@ -4401,6 +4595,14 @@ const panelJobs = [
   } },
   { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
+  { paths: ["/api/posture/evidence"], load: async function (deadlineAt) {
+    const sep = "/api/posture/evidence".indexOf("?") >= 0 ? "&" : "?";
+    const res = await readResponse(credentialedReadUrl("/api/posture/evidence" + sep + "_t=" + Date.now(), "GET"), {
+      headers: Object.assign({ "Cache-Control": "no-cache", "Pragma": "no-cache" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+      cache: "no-store"
+    }, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()));
+    state.evidence.view = await res.json();
+  } },
   { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
   { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
   { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
@@ -5336,6 +5538,7 @@ function rerender() {
 function bindHashRoute() {
   function fromHash() {
     const h = (location.hash || "#posture").slice(1);
+    applyEvidenceHashFilters(h);
     setRoute(h.split("?")[0] || "posture");
   }
   window.addEventListener("hashchange", fromHash);
@@ -5738,6 +5941,16 @@ document.addEventListener("input", function (ev) {
     state.inboxOps.filters.to = tgt.value;
     saveInboxPrefs();
     rerender();
+  } else if (action === "evidence-filter-query") {
+    setEvidenceFilter("query", tgt.value);
+  } else if (action === "evidence-filter-agent") {
+    setEvidenceFilter("agent", tgt.value);
+  } else if (action === "evidence-filter-event") {
+    setEvidenceFilter("event", tgt.value);
+  } else if (action === "evidence-filter-from") {
+    setEvidenceFilter("from", tgt.value);
+  } else if (action === "evidence-filter-to") {
+    setEvidenceFilter("to", tgt.value);
   }
 });
 
@@ -5754,6 +5967,8 @@ document.addEventListener("change", function (ev) {
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else if (action === "evidence-filter-layer") return setEvidenceFilter("layer", tgt.value);
+  else if (action === "evidence-filter-verdict") return setEvidenceFilter("verdict", tgt.value);
   else return;
   saveInboxPrefs();
   rerender();
