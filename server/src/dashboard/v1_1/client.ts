@@ -669,7 +669,7 @@ function arg(args, kind, fallback) {
 // "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES = {
   "approval_pending.tier1.lockdown": (a) => "Cut agent " + arg(a,"agent_id") + "'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
-  "approval_pending.tier1.fortress_lockdown": () => "Lock down approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+  "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
   "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
   // Must match "approval_pending.tier1.unwrap" in templates.ts.
@@ -1106,7 +1106,7 @@ function renderPostureSeal() {
     // Must match the Lock down button title in html.ts and the
     // approval_pending.tier1.fortress_lockdown template: network access is
     // revoked for confined agents, and agents keep running and local access.
-    sub = "Lock down revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
+    sub = "Lockdown revokes network access for every confined agent; agents keep running and keep local access. Protected is only shown when Castle Wall enforcement has current evidence.";
   } else if (seal.tone === "attention") {
     head = "Protected is not confirmed.";
     sub = "The current enforcement observation is missing, stale, invalid, degraded, or missing a freshness window. Retry the protection evidence read.";
@@ -2949,15 +2949,15 @@ function renderFortressAgentsCard() {
           { action: "pause", label: "Pause", enabled: !!c.can_pause },
           { action: "resume", label: "Resume", enabled: !!c.can_resume },
           { action: "restart", label: "Restart", enabled: !!c.can_restart },
-          { action: "lockdown", label: "Lock down", enabled: !!c.can_lockdown, tier1: true },
-          { action: "unwrap", label: "Remove protection", enabled: !!c.can_unwrap, tier1: true }
+          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
+          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
         ];
         const disabledTipByAction = {
           pause: "Sanctuary does not control this agent's process, so pause is not available.",
           resume: "Sanctuary does not control this agent's process, so resume is not available.",
           restart: "Sanctuary does not control this agent's process, so restart is not available.",
           lockdown: "This agent is not confined to a dedicated uid, so network lockdown is not available.",
-          unwrap: "Protection removal is not implemented yet; unsupported removals are refused before approval is queued."
+          unwrap: "Dashboard unwrap is not implemented yet; unsupported unwraps are refused before approval is queued."
         };
         const buttons = menuItems.map(function (mi) {
           const tip = mi.enabled
@@ -4451,7 +4451,7 @@ async function onLockdownClick() {
     if (e.status === 404) {
       toast("Fortress-level lockdown endpoint not yet wired. Use per-agent lockdown.", "error");
     } else {
-      toast("Lock down request failed: " + e.message, "error");
+      toast("Lockdown request failed: " + e.message, "error");
     }
   }
 }
@@ -4496,11 +4496,11 @@ async function onInboxAction(itemId, action) {
         state.tier1.lockdown.state = "engaged";
       } else if (action === "approve" && payload.outcome === "partial") {
         state.tier1.lockdown.state = "partial";
-        toast("Partly locked down. At least one confined agent did not confirm a live stop.", "info");
+        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
       } else {
         state.tier1.lockdown.state = "idle";
         if (action === "approve" && payload.outcome) {
-          toast("Lock down outcome: " + payload.outcome + ".", "error");
+          toast("Lockdown outcome: " + payload.outcome + ".", "error");
         }
       }
       renderTopbar();

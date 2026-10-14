@@ -98,7 +98,7 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   "approval_pending.tier1.lockdown": (a) =>
     `Cut agent ${arg(a, "agent_id")}'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.`,
   "approval_pending.tier1.fortress_lockdown": () =>
-    "Lock down approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+    "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   "approval_pending.tier1.fortress_exit_bundle_export": () =>
     "Export the entire fortress as a portable exit bundle.",
   // Must match "approval_pending.tier1.unwrap" in client.ts.

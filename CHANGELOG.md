@@ -876,7 +876,7 @@ Hotfix release. Closes three dashboard UX findings (CC, DD, EE) surfaced during 
 ### Fixed
 
 - **Dashboard root path now serves the v1.1 SPA (Finding CC).** Loading `/` and `/dashboard` against the standalone dashboard or the wrap-spawned dashboard now serves the v1.1 SPA. The legacy v1.0 dashboard moves to `/v1.0` (preserved for back-compat); the v1.1 SPA also remains reachable at `/v1.1`. Operators following the wrap-printed URL land on v1.1 directly.
-- **v1.1 Agents widget row layout fixed (Finding DD).** Agent ID + status pill no longer overlap action buttons (Pause / Resume / Restart / Lock down / Remove protection). Always-stacked row: head row contains glyph + agent ID + status pill; second row contains action buttons. Renders correctly at 800 / 1280 / 1440 / 1920 widths without media queries.
+- **v1.1 Agents widget row layout fixed (Finding DD).** Agent ID + status pill no longer overlap action buttons (Pause / Resume / Restart / Lockdown / Unwrap). Always-stacked row: head row contains glyph + agent ID + status pill; second row contains action buttons. Renders correctly at 800 / 1280 / 1440 / 1920 widths without media queries.
 - **v1.1 Dashboard main panel rewritten (Finding EE).** Replaced the half-built `Suggestion to concierge` advisory text input with a "What you can do today" summary card listing the six nav targets (Agents, Policy, Privacy, Coordination, Health, Exit drill) with one-line operator-action descriptors. The half-built chat affordance is retired; direct chat with the concierge ships in v1.2.
 
 ### Added

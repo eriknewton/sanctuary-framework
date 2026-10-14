@@ -83,7 +83,7 @@ describe("v1.1 dashboard inbox six-kind render", () => {
   it("client template registry includes fortress lockdown copy", () => {
     const src = getClientScript();
     expect(src).toContain("approval_pending.tier1.fortress_lockdown");
-    expect(src).toContain("Lock down approval pending");
+    expect(src).toContain("Lockdown approval pending");
     expect(src).not.toContain("[unrecognized template: tier1]");
   });
 });

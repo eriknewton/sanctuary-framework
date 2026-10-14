@@ -223,25 +223,50 @@ describe("v1.1 dashboard template registry", () => {
     ).toEqual([]);
   });
 
-  it("keeps mirrored removal copy values in client and server parity", () => {
+  it("keeps every mirrored client template and status label in parity with the server tables", () => {
+    // Full-set equality (AGENTS.md rule 5): a parity check over one entry cannot
+    // see a drifted sibling. Every template id both registries carry renders the
+    // same text from the same args, and every status key carries the same label
+    // and glyph on both sides.
     const args: HubDisplayTemplateArg[] = [
       { kind: "agent_id", value: "agent-alpha" },
+      { kind: "channel_template_id", value: "channel-beta" },
+      { kind: "destination_category", value: "tool-api" },
+      { kind: "policy_id", value: "policy-delta" },
     ];
     const clientTemplates = extractClientTemplates();
-    const serverTemplate = renderTemplate("approval_pending.tier1.unwrap", args);
-    const clientTemplate =
-      clientTemplates["approval_pending.tier1.unwrap"]?.(args) ?? "";
-    expect(clientTemplate).toBe(serverTemplate);
+    const shared = listRegisteredTemplateIds().filter((id) => id in clientTemplates);
+    expect(shared.length).toBeGreaterThan(0);
+    // The client mirror has no render context and always writes the past-tense
+    // activity wording, so it is compared with the server's activity surface.
+    // Known drift, recorded rather than hidden: these client mirrors omit the
+    // agent or time suffix the server appends. Aligning them is a separate
+    // change; this list must shrink to empty, and a new id here fails the test.
+    const KNOWN_CLIENT_TEMPLATE_DRIFT = [
+      "activity.config",
+      "activity.lifecycle",
+      "approval_pending.tier1.exit_bundle_import",
+      "approval_pending.tier1.exit_bundle_rekey",
+      "approval_pending.tier1.sanctuary_export_identity_bundle",
+    ];
+    const drifted = shared
+      .filter((id) => clientTemplates[id](args) !== renderTemplate(id, args, { surface: "activity" }))
+      .sort();
+    expect(drifted).toEqual([...KNOWN_CLIENT_TEMPLATE_DRIFT].sort());
 
-    const clientStatus = extractClientStatusMap().unwrapping;
-    expect(clientStatus).toBeDefined();
-    expect(clientStatus.label).toBe(STATUS_MAPPING.unwrapping.label);
-    expect(clientStatus.glyph).toBe(STATUS_MAPPING.unwrapping.glyph);
+    const clientStatus = extractClientStatusMap();
+    const statusDrift = (Object.keys(STATUS_MAPPING) as Array<keyof typeof STATUS_MAPPING>)
+      .filter((key) => clientStatus[key]?.label !== STATUS_MAPPING[key].label || clientStatus[key]?.glyph !== STATUS_MAPPING[key].glyph)
+      .map((key) => ({ key, client: clientStatus[key], server: STATUS_MAPPING[key] }));
+    // Known drift: the client labels an active agent "Protected" where the
+    // server table says "Running". Resolving which word the evidence supports
+    // is a separate change; a new drifted key fails this test.
+    expect(statusDrift.map((row) => row.key)).toEqual(["active"]);
   });
 
   it("renders the fortress lockdown approval template with consequences", () => {
     const out = renderTemplate("approval_pending.tier1.fortress_lockdown", []);
-    expect(out).toContain("Lock down approval pending");
+    expect(out).toContain("Lockdown approval pending");
     expect(out).toContain("revokes network access");
     expect(out).not.toContain("writes are blocked");
     expect(out).not.toContain("[unrecognized template");

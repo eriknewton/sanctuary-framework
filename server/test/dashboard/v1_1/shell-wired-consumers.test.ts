@@ -245,11 +245,11 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).not.toContain("operator key");
     expect(main).not.toContain("Every decision is signed");
     expect(main).toContain("A decision on a Charter hold is recorded in your audit log");
-    // Lock down revokes network access for confined agents; agents keep running.
+    // Lockdown revokes network access for confined agents; agents keep running.
     runInContext('state.posture.sealOpen = true; state.tier1.lockdown.state = "engaged"; renderTopbar();', h.context);
     const pop = h.el["posture-seal-pop"]!.innerHTML;
     expect(pop).not.toContain("holds every agent");
-    expect(pop).toContain("Lock down revokes network access for every confined agent; agents keep running and keep local access.");
+    expect(pop).toContain("Lockdown revokes network access for every confined agent; agents keep running and keep local access.");
   });
 
   it("a layer line whose word is Unknown never wears the pass dot, in Enforcement or the seal popover", async () => {
