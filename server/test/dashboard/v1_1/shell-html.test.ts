@@ -110,16 +110,19 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(depth, "unclosed blocks at the end").toBe(0);
   });
 
-  it("the engaged Lock down state keeps the bad text and bad-line border with no fill", () => {
+  it("the engaged Lock down state keeps the bad text and a bad-hue border with no fill", () => {
     // Lock down is the one danger-styled control, and it never paints a red
     // fill, engaged included: an engaged lockdown is a decision on record,
     // not an alarm.
+    // Retargeted (slice 2b): the edge moved from --rust-line to --rust,
+    // because a control edge must clear 3:1 against its fill and --rust-line
+    // measures under 2.1:1 on every fill (shell-contrast.test.ts).
     const css = renderDashboardV11Html({ embedClient: false }).replace(/\/\*[\s\S]*?\*\//g, "");
     const m = css.match(/(?:^|\n)\.btn\.btn-lockdown\.tier1-engaged(?:, [^{]+)? \{([^}]*)\}/);
     expect(m, ".btn.btn-lockdown.tier1-engaged rule").toBeTruthy();
     expect(m![1]).toContain("background: transparent");
     expect(m![1]).toContain("color: var(--rust)");
-    expect(m![1]).toContain("border-color: var(--rust-line)");
+    expect(m![1]).toContain("border-color: var(--rust)");
     expect(m![1]).not.toContain("--rust-bg");
   });
 
@@ -213,11 +216,18 @@ describe("v1.1 dashboard shell HTML", () => {
       fortressId: "fortress-001",
     });
     expect(html).not.toContain("session-token-xyz");
-    expect(html).not.toContain("localStorage");
     // Sovereignty preference is in-memory; sidebar collapse goes to
     // sessionStorage only. Confirm via the embedded client script.
+    // Retargeted (slice 2b): the Machines screen reads the Fleet Switcher's
+    // saved machine list, so the client now carries exactly one
+    // localStorage access, a read of that one key. Nothing is ever written
+    // to localStorage, so no token or state is persisted there.
     const client = getClientScript();
-    expect(client).not.toContain("localStorage");
+    expect(html.match(/localStorage/g) ?? []).toHaveLength(1);
+    expect(client.match(/localStorage/g) ?? []).toHaveLength(1);
+    expect(client).toContain("localStorage.getItem(FLEET_STORAGE_KEY)");
+    expect(client).toContain('const FLEET_STORAGE_KEY = "sanctuary_fleet_machines";');
+    expect(client).not.toMatch(/localStorage\.(setItem|removeItem|clear)|localStorage\[/);
     expect(client).toContain("sessionStorage");
     expect(client).toContain('sessionStorage.getItem("authToken")');
   });
@@ -339,16 +349,23 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(pillsMatch![0]).toContain('data-pill="deployment"');
   });
 
-  it("renders a clickable link to /fleet as the Machines nav item (C1 Finding 4; S2 reorder)", () => {
+  it("the Machines nav item opens the fleet inside the shell, and /fleet stays linked (C1 Finding 4; S2 reorder)", () => {
     const html = renderDashboardV11Html({});
     // S2: the Fleet Switcher moved from a top-bar link to the "Machines" item
     // in the sidebar nav spine. The /fleet route stays reachable, unremoved.
-    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
     // Retargeted (slice 2 shell): the nav now carries aria-label="Primary".
+    // Retargeted (slice 2b): Machines is a shell screen (hash route
+    // "machines") over the Fleet Switcher's reads, so the rail item and the
+    // scope menu's fleet link open it; the /fleet page stays served and the
+    // Machines screen links to it for adding and removing machines.
     const navMatch = html.match(/<nav id="sidebar-nav"[^>]*>[\s\S]*?<\/nav>/);
     expect(navMatch).toBeTruthy();
-    expect(navMatch![0]).toContain('href="/fleet"');
-    expect(navMatch![0]).toContain("Machines");
+    expect(navMatch![0]).toMatch(/<a href="#machines" data-route="machines"[^>]*>[\s\S]*?Machines/);
+    expect(html).toContain('<a class="scope-fleet" href="#machines"');
+    const client = getClientScript();
+    const screen = client.match(/function renderMachinesScreen\(\)[\s\S]*?\n\}\n/);
+    expect(screen, "renderMachinesScreen").toBeTruthy();
+    expect(screen![0]).toContain('<a href="/fleet">Fleet Switcher</a>');
   });
 
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {

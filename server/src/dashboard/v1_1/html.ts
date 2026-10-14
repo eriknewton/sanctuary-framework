@@ -159,10 +159,10 @@ body {
    the search box beside it. */
 .scope {
   display: flex; align-items: center; gap: var(--space-2); height: 34px; max-width: min(360px, 100%); min-width: 0; overflow: hidden;
-  padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--rule-2); border-radius: 8px;
+  padding: 0 var(--space-2) 0 var(--space-3); border: 1px solid var(--ink-3); border-radius: 8px;
   background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
 }
-.scope:hover { border-color: var(--ink-line); }
+.scope:hover { border-color: var(--ink-2); }
 .scope svg { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
 .scope svg:last-child { width: 14px; height: 14px; }
 /* A long machine name gives way with an ellipsis; the trigger's title and
@@ -191,7 +191,7 @@ body {
 .search-wrap { position: relative; flex: 1 16 200px; min-width: 136px; }
 .search {
   display: flex; align-items: center; gap: var(--space-2); height: 34px; padding: 0 var(--space-3);
-  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); color: var(--ink-3);
+  border: 1px solid var(--ink-3); border-radius: 8px; background: var(--paper); color: var(--ink-3);
 }
 .search svg { flex: none; width: 16px; height: 16px; }
 .search input { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--ink); font: inherit; outline: none; }
@@ -225,20 +225,20 @@ body {
    design's radius-control (buttons, rail items, filter chips), written here
    because the server block carries 6px (--rad) and 10px (--rad-lg) only. */
 .range {
-  height: 32px; padding: 0 var(--space-2); border: 1px solid var(--rule-2); border-radius: 7px;
+  height: 32px; padding: 0 var(--space-2); border: 1px solid var(--ink-3); border-radius: 7px;
   background: transparent; color: var(--ink); font: inherit; font-weight: 600; font-size: var(--text-sm); cursor: pointer; flex: none;
 }
 .range:disabled { color: var(--ink-3); cursor: not-allowed; border-style: dashed; }
 .range option { background: var(--surface); color: var(--ink); }
-.topbar .btn { height: 32px; padding: 0 var(--space-3); border-radius: 7px; border-color: var(--rule-2); background: transparent; font-weight: 600; flex: none; white-space: nowrap; }
+.topbar .btn { height: 32px; padding: 0 var(--space-3); border-radius: 7px; border-color: var(--ink-3); background: transparent; font-weight: 600; flex: none; white-space: nowrap; }
 .topbar .btn svg { width: 16px; height: 16px; flex: none; }
 .topbar .btn.btn-talk.active { background: var(--accent-tint-strong); box-shadow: inset 0 -2px 0 var(--accent); }
 .iconbtn {
   width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
-  border: 1px solid var(--rule); border-radius: 8px; background: var(--surface-2); color: var(--ink-2);
+  border: 1px solid var(--ink-3); border-radius: 8px; background: var(--surface-2); color: var(--ink-2);
   cursor: pointer; position: relative; flex: none; font: inherit;
 }
-.iconbtn:hover { color: var(--ink); border-color: var(--rule-2); }
+.iconbtn:hover { color: var(--ink); border-color: var(--ink-2); }
 .iconbtn svg { width: 16px; height: 16px; flex: none; }
 .iconbtn.waiting { width: auto; padding: 0 var(--space-2); }
 /* The waiting badge: the same 18px warn pill as the rail's, with a triangle
@@ -314,24 +314,37 @@ body {
    the fault red: an operator lock is a decision, not a failure. */
 .pill.tone-locked { background: var(--locked-bg); color: var(--locked); border-color: var(--locked-line); }
 .pill.tone-info { background: var(--indigo-bg); color: var(--indigo); border-color: var(--indigo); }
+/* Unknown: the slate unknown hue at full weight with the dashed unknown
+   border, never the pass hue and never a dimmed gray. */
+.pill.tone-unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate-line); }
 .btn {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 4px 10px; border-radius: var(--rad);
-  background: var(--surface); border: 1px solid var(--rule);
+  background: var(--surface); border: 1px solid var(--ink-3);
   font-family: var(--sans); font-size: var(--text-sm); color: var(--ink);
   cursor: pointer;
 }
-.btn:hover:not(:disabled) { background: var(--surface-2); }
+/* Control boundary (slice 2b): a control a person must find has an edge
+   that clears the 3:1 non-text floor against every fill it sits on, in
+   both themes. --ink-3 is the one neutral token that does (4.6:1 or more
+   on every fill, computed from the token values in
+   test/dashboard/v1_1/shell-contrast.test.ts); --rule and --rule-2 measure
+   1.1 to 1.7:1 and stay on dividers and panel edges, which are not
+   controls. Hover steps the edge up to --ink-2. */
+.btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--ink-2); }
 .btn:disabled { color: var(--ink-4); cursor: not-allowed; opacity: 0.7; }
 .btn.btn-primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .btn.btn-primary:hover:not(:disabled) { background: var(--ink-2); }
 .btn.btn-danger { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
-/* Lock down is the one danger-styled control: bad text and the bad-line
-   border, never a red fill (the TopBar preview's one destructive style). */
-.btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust-line); }
-/* Hover and focus keep text and line only: the line steps up to the full
-   bad hue, and still no fill. */
-.btn.btn-lockdown:hover:not(:disabled), .btn.btn-lockdown:focus-visible { background: transparent; border-color: var(--rust); }
+.btn.btn-danger:hover:not(:disabled) { border-color: var(--rust); }
+/* Lock down is the one danger-styled control: bad text and a bad-hue
+   border, never a red fill (the TopBar preview's one destructive style).
+   The edge is the full --rust, not --rust-line: --rust-line measures under
+   2.1:1 on every fill, below the 3:1 floor a control edge must clear. */
+.btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust); }
+/* Hover and focus keep text and line only: the line doubles in weight (an
+   inset second pixel, so the button does not grow), and still no fill. */
+.btn.btn-lockdown:hover:not(:disabled), .btn.btn-lockdown:focus-visible { background: transparent; border-color: var(--rust); box-shadow: inset 0 0 0 1px var(--rust); }
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-partial { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
@@ -339,7 +352,7 @@ body {
    fill: an engaged lockdown is a decision on record, not an alarm. The
    button is disabled while engaged, so full opacity keeps its text at the
    bad hue instead of the faded disabled look. */
-.btn.btn-lockdown.tier1-engaged { background: transparent; color: var(--rust); border-color: var(--rust-line); opacity: 1; }
+.btn.btn-lockdown.tier1-engaged { background: transparent; color: var(--rust); border-color: var(--rust); opacity: 1; }
 .btn.btn-icon {
   padding: 4px 6px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -387,11 +400,19 @@ body {
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: var(--text-sm); }
 .kv dt { color: var(--ink-3); }
 .kv dd { margin: 0; color: var(--ink); }
-.glyph { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-4); }
-.glyph.online { background: var(--sage); }
-.glyph.idle { background: var(--ochre); }
-.glyph.away { background: var(--ochre); opacity: 0.5; }
-.glyph.offline { background: var(--rust); }
+/* Agent status glyphs (STATUS_MAP glyph names), one shape per state so a
+   state reads in monochrome, after the design's glyph vocabulary: the pass
+   circle (online), the warn triangle (idle: paused, restarting, being
+   removed), the fault square (away: an error), the locked rounded square
+   (offline: locked down, the violet --locked status, never the fault red),
+   and the hollow dotted unknown ring (unknown, and any name not mapped).
+   Every glyph paints a status hue at full weight, never the disabled
+   --ink-4, which measures under 3:1 on every fill. */
+.glyph { display: inline-block; width: 8px; height: 8px; box-sizing: border-box; border-radius: 50%; background: transparent; border: 1.5px dotted var(--slate); }
+.glyph.online { background: var(--sage); border: 0; }
+.glyph.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.glyph.away { background: var(--rust); border: 0; border-radius: 0; }
+.glyph.offline { background: var(--locked); border: 0; border-radius: 3px; }
 .toast {
   position: fixed; bottom: 16px; right: 16px;
   background: var(--ink); color: var(--paper); padding: 8px 12px;
@@ -409,7 +430,7 @@ body {
 .chat-msg.operator { align-self: flex-end; background: var(--ink); color: var(--paper); }
 .chat-msg .meta { font-size: 10px; color: var(--ink-3); margin-top: 4px; }
 .composer { display: flex; gap: var(--space-2); padding: var(--space-2); border-top: 1px solid var(--rule); }
-.composer input { flex: 1; padding: 6px 8px; border: 1px solid var(--rule); border-radius: var(--rad); font-family: var(--sans); }
+.composer input { flex: 1; padding: 6px 8px; border: 1px solid var(--ink-3); border-radius: var(--rad); font-family: var(--sans); }
 .wizard-step { padding: 10px; border: 1px solid var(--rule); border-radius: var(--rad); margin-bottom: 8px; background: var(--surface); }
 .wizard-step.active { border-color: var(--ink); }
 .wizard-step.done { background: var(--sage-bg); border-color: var(--sage); }
@@ -433,18 +454,27 @@ body {
 .auto-trigger-rule-head p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
 .rung-badge { border: 1px solid var(--rule-2); border-radius: 999px; padding: 3px 9px; font-family: var(--mono); font-size: var(--text-xs); white-space: nowrap; }
 .auto-trigger-rule-grid { display: grid; grid-template-columns: minmax(140px, 220px) minmax(0, 1fr); gap: var(--space-3); margin-top: var(--space-3); align-items: center; }
-.auto-trigger-trend { min-height: 28px; display: flex; align-items: end; gap: 3px; }
-.trend-bar { width: 7px; height: 24px; border-radius: 2px; background: var(--ink-4); display: inline-block; }
-.trend-bar.good { background: var(--sage); }
-.trend-bar.warn { background: var(--ochre); }
-.trend-bar.pending { background: var(--ink-4); }
+.auto-trigger-trend { min-height: 28px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.trend-bars { display: flex; align-items: flex-end; gap: 3px; min-height: 24px; }
+/* Each outcome is a shape as well as a hue: a tall filled bar went ahead,
+   a short filled bar was stopped, an outline is anything else. The outline
+   is --ink-3 (4.6:1 or more on every fill), not --ink-4 (under 3:1). The
+   legend names each shape with its count. */
+.trend-bar { width: 7px; height: 24px; border-radius: 2px; display: inline-block; box-sizing: border-box; background: transparent; border: 1.5px solid var(--ink-3); }
+.trend-bar.good { background: var(--sage); border: 0; }
+.trend-bar.warn { background: var(--ochre); border: 0; height: 12px; }
+.trend-bar.pending { background: transparent; border: 1.5px solid var(--ink-3); }
+.trend-legend { display: flex; flex-wrap: wrap; gap: 2px 12px; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); }
+.trend-legend span { display: inline-flex; align-items: flex-end; gap: 5px; }
+.trend-legend .trend-bar { width: 6px; height: 12px; }
+.trend-legend .trend-bar.warn { height: 6px; }
 .history-strip { display: flex; flex-wrap: wrap; gap: 5px; min-height: 28px; align-items: center; }
 .history-chip { border: 1px solid var(--rule); border-radius: 999px; padding: 2px 7px; font-family: var(--mono); font-size: var(--text-xs); background: var(--paper-3); }
 .history-chip.auto_proceeded, .history-chip.operator_approved { color: var(--sage); background: var(--sage-bg); }
 .history-chip.operator_canceled, .history-chip.operator_revoked { color: var(--ochre); background: var(--ochre-bg); }
 .auto-trigger-form { display: grid; grid-template-columns: repeat(5, minmax(100px, 1fr)) auto; gap: var(--space-2); margin-top: var(--space-3); align-items: end; }
 .auto-trigger-form label { display: grid; gap: 4px; color: var(--ink-3); font-size: var(--text-xs); font-family: var(--mono); }
-.auto-trigger-form input { width: 100%; box-sizing: border-box; border: 1px solid var(--rule); border-radius: var(--rad); padding: 6px 8px; font: inherit; color: var(--ink); background: var(--surface-2); }
+.auto-trigger-form input { width: 100%; box-sizing: border-box; border: 1px solid var(--ink-3); border-radius: var(--rad); padding: 6px 8px; font: inherit; color: var(--ink); background: var(--surface-2); }
 @media (max-width: 760px) {
   .recommendation-row, .auto-trigger-rule-grid, .auto-trigger-form { grid-template-columns: 1fr; }
   .recommendation-actions { justify-content: flex-start; }
@@ -466,7 +496,7 @@ body {
 .template-cell { font-family: var(--mono); max-width: 180px; overflow-wrap: anywhere; }
 .template-picker { position: absolute; z-index: 20; margin-top: 8px; width: min(420px, calc(100vw - 80px)); background: var(--surface); border: 1px solid var(--rule-2); border-radius: var(--rad); box-shadow: var(--shadow); padding: 10px; }
 .template-picker-options { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
-.template-option { display: grid; grid-template-columns: 18px 1fr; gap: var(--space-2); padding: var(--space-2); border: 1px solid var(--rule); border-radius: var(--rad); background: var(--surface-2); }
+.template-option { display: grid; grid-template-columns: 18px 1fr; gap: var(--space-2); padding: var(--space-2); border: 1px solid var(--ink-3); border-radius: var(--rad); background: var(--surface-2); }
 .template-option small { display: block; color: var(--ink-3); margin-top: 2px; }
 .template-picker-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: 10px; }
 .allow-count { color: var(--sage); font-weight: 700; }
@@ -507,7 +537,7 @@ body {
 .intel-modal h2 { font-family: var(--serif); font-size: var(--text-xl); font-weight: 400; margin: 0 0 8px; }
 .intel-modal-subtitle { color: var(--ink-3); margin: 0 0 18px; font-size: var(--text-base); }
 .intel-option {
-  border: 1px solid var(--rule); border-radius: var(--rad); padding: var(--space-3);
+  border: 1px solid var(--ink-3); border-radius: var(--rad); padding: var(--space-3);
   margin-bottom: 10px; background: var(--surface-2); cursor: pointer;
   display: grid; grid-template-columns: 18px 1fr; gap: 10px; align-items: start;
 }
@@ -517,7 +547,7 @@ body {
 .intel-suboptions { margin-top: 10px; padding: 10px; background: var(--paper-3); border-radius: var(--rad); }
 .intel-suboptions label { display: block; margin: 6px 0; font-size: var(--text-base); }
 .intel-suboptions input[type="text"], .intel-suboptions input[type="password"] {
-  width: 100%; padding: 6px 8px; border: 1px solid var(--rule); border-radius: var(--rad);
+  width: 100%; padding: 6px 8px; border: 1px solid var(--ink-3); border-radius: var(--rad);
   font-family: var(--mono); font-size: var(--text-sm); box-sizing: border-box;
 }
 .intel-modal-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: 18px; }
@@ -644,12 +674,12 @@ body {
   color: var(--rust); margin-bottom: 2px;
 }
 .btn-quiet {
-  background: transparent; border: 1px solid var(--rule);
+  background: transparent; border: 1px solid var(--ink-3);
   padding: 2px 6px; font-size: 11px;
   border-radius: var(--rad); cursor: pointer;
   color: var(--ink-2); font-family: var(--sans);
 }
-.btn-quiet:hover { background: var(--surface-2); color: var(--ink); }
+.btn-quiet:hover { background: var(--surface-2); color: var(--ink); border-color: var(--ink-2); }
 .banner-warn {
   background: var(--ochre-bg); color: var(--ochre); border: 1px solid var(--ochre);
   border-radius: var(--rad); padding: 8px 12px; margin: 8px 0; font-size: var(--text-base);
@@ -660,9 +690,9 @@ body {
 }
 .btn.chip {
   border-radius: 999px; padding: 4px 12px; font-size: var(--text-sm);
-  background: var(--surface-2); border-color: var(--rule);
+  background: var(--surface-2); border-color: var(--ink-3);
 }
-.btn.chip:hover:not(:disabled) { background: var(--paper-3); }
+.btn.chip:hover:not(:disabled) { background: var(--paper-3); border-color: var(--ink-2); }
 /* Finding DDD (v1.2.0-rc.5): the concierge card uses a bounded
  * max-height + the history is the inner scroll container with
  * min-height: 0 (so flex shrink works in WebKit) + the composer is
@@ -815,7 +845,7 @@ body {
 }
 .concierge-suggest {
   background: var(--surface);
-  border: 1px solid var(--rule);
+  border: 1px solid var(--ink-3);
   border-radius: var(--rad);
   padding: 12px 14px;
   font-size: var(--text-base);
@@ -828,7 +858,7 @@ body {
 }
 .concierge-suggest:hover:not(:disabled) {
   background: var(--surface-2);
-  border-color: var(--rule-2);
+  border-color: var(--ink-2);
 }
 .concierge-suggest:disabled {
   cursor: not-allowed; color: var(--ink-4); opacity: 0.7;
@@ -850,12 +880,12 @@ body {
   flex: 1;
   display: flex; align-items: center; gap: var(--space-2);
   padding: 8px 12px;
-  border: 1px solid var(--rule);
+  border: 1px solid var(--ink-3);
   border-radius: var(--rad);
   background: var(--surface);
 }
 .concierge-composer .input-wrap:focus-within {
-  border-color: var(--ink-3);
+  border-color: var(--ink-2);
 }
 .concierge-composer input {
   flex: 1; min-width: 0;
@@ -905,9 +935,13 @@ body {
  * rail, internal scroll, sectioned body) for the agent-detail view.
  */
 .agents-wrap { max-width: 1080px; margin: 0 auto; }
+/* One track: the list is this grid's only child (the inspect pane renders
+   on the agent's own page). The old second 420px track stood empty and
+   narrowed the list until each agent's harness and model line was cut off
+   at 1280px. */
 .agents-layout {
   display: grid;
-  grid-template-columns: 1fr 420px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
@@ -976,17 +1010,20 @@ body {
   font-size: var(--text-xs);
   font-family: var(--mono);
 }
+/* Agent state dots (agentStateClass in client.ts), one shape per state:
+   the pass circle (live), the warn triangle (idle), the fault square (off:
+   an error), the locked rounded square (locked) and the hollow dotted
+   unknown ring (unknown and the default). The word sits beside every dot.
+   No pulse: the design allows no motion on a state mark. */
 .state-dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--ink-4);
+  display: inline-block; flex: none;
+  width: 8px; height: 8px; box-sizing: border-box; border-radius: 50%;
+  background: transparent; border: 1.5px dotted var(--slate);
 }
-.state-dot.live { background: var(--sage); animation: pulse-soft 2.4s ease-in-out infinite; }
-.state-dot.idle { background: var(--ochre); }
-.state-dot.off { background: var(--ink-4); }
-@keyframes pulse-soft {
-  0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
-  50% { box-shadow: 0 0 0 4px transparent; opacity: 0.7; }
-}
+.state-dot.live { background: var(--sage); border: 0; }
+.state-dot.idle { background: var(--ochre); border: 0; border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.state-dot.off { background: var(--rust); border: 0; border-radius: 0; }
+.state-dot.locked { background: var(--locked); border: 0; border-radius: 3px; }
 .agent-last {
   font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3);
 }
@@ -1077,18 +1114,21 @@ body {
   padding: 6px 0 10px;
   font-size: var(--text-sm);
 }
+/* A timeline row with no verdict wears the neutral dash in --ink-3; the
+   pass circle, warn triangle and fault square are kept for rows that
+   carry an observed outcome. 14px puts the 2px dash on the 8px marks'
+   centre line (11px top plus half of 8px, less half of 2px). */
 .timeline-item::before {
   content: "";
   position: absolute;
-  left: -14px; top: 11px;
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: var(--surface);
-  border: 1.5px solid var(--ink-4);
+  left: -14px; top: 14px;
+  width: 8px; height: 2px;
+  border-radius: 1px;
+  background: var(--ink-3);
 }
-.timeline-item.ok::before { border-color: var(--sage); }
-.timeline-item.warn::before { border-color: var(--ochre); }
-.timeline-item.fail::before { border-color: var(--rust); }
+.timeline-item.ok::before { top: 11px; height: 8px; border-radius: 50%; background: var(--sage); }
+.timeline-item.warn::before { top: 11px; height: 8px; border-radius: 0; background: var(--ochre); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.timeline-item.fail::before { top: 11px; height: 8px; border-radius: 0; background: var(--rust); }
 .timeline-item .ts {
   font-family: var(--mono); font-size: 10px;
   color: var(--ink-3);
@@ -1325,6 +1365,10 @@ body {
 .att-agent.verified .mark { background: currentColor; }
 .att-agent.degraded { color: var(--ochre); border-color: var(--ochre); background: var(--ochre-bg); }
 .att-agent.unverified { color: var(--rust); border-color: var(--rust); background: var(--rust-bg); }
+/* Unknown (renderAgentAttestationBadge's neutral): the slate unknown tone
+   with the dashed border and a hollow dotted ring for its mark. */
+.att-agent.neutral { color: var(--slate); border: 1px dashed var(--slate-line); background: var(--slate-bg); }
+.att-agent.neutral .mark { border-style: dotted; border-radius: 50%; }
 .att-agent.unverified .mark {
   background: repeating-linear-gradient(
     45deg, currentColor, currentColor 1px,
@@ -1343,15 +1387,22 @@ body {
   background: var(--paper-3);
   border: 1px solid transparent;
 }
+/* Per-action ticks carry a shape per state as well as a hue: verified the
+   pass circle, degraded the warn triangle, unverified the fault square,
+   neutral (the signer was unreachable) the hollow dotted unknown ring in
+   the slate unknown hue, never the disabled --ink-4. */
 .att-action .tick {
-  width: 6px; height: 6px;
-  border-radius: 1px;
+  width: 7px; height: 7px; box-sizing: border-box;
+  border-radius: 0;
   background: currentColor;
 }
 .att-action.verified { color: var(--sage); }
+.att-action.verified .tick { border-radius: 50%; }
 .att-action.degraded { color: var(--ochre); }
+.att-action.degraded .tick { clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .att-action.unverified { color: var(--rust); }
-.att-action.neutral .tick { background: var(--ink-4); border-radius: 50%; }
+.att-action.neutral { color: var(--slate); }
+.att-action.neutral .tick { background: transparent; border: 1.5px dotted var(--slate); border-radius: 50%; }
 
 /* Custody-provenance badge stub (v1.x). Visibly stubbed with dashed border. */
 .att-custody {
@@ -1366,14 +1417,14 @@ body {
 }
 .att-custody .seal-stub {
   width: 16px; height: 16px;
-  border: 1px dashed var(--ink-4);
+  border: 1px dashed var(--ink-3);
   border-radius: 50%;
   position: relative;
   flex-shrink: 0;
 }
 .att-custody .seal-stub::after {
   content: ""; position: absolute; inset: 4px;
-  border: 1px dashed var(--ink-4);
+  border: 1px dashed var(--ink-3);
   border-radius: 50%;
 }
 .att-custody .stub-tag {
@@ -1432,9 +1483,8 @@ body {
    24-character machine name), the bar first clips or spills at 1290px with neither step, and
    at 1230px with only the first. 1360px and 1240px are those two widths
    plus a margin, so each step is in force before the bar needs it; with
-   both in force nothing clips from 1000px up. Below 1000px the widest
-   states still squeeze the scope past its floors (its own clip keeps the
-   caret off the search box); that range is the narrow layout's to solve. */
+   both in force nothing clips from 1000px up. Below 1000px the narrow
+   step that follows takes over. */
 @media (max-width: 1360px) {
   .topbar { gap: var(--space-2); padding: 0 var(--space-3); }
   .search kbd { display: none; }
@@ -1468,6 +1518,32 @@ body {
      never capped: it keeps its content width, and its short option labels
      ("24 hours", not "Last 24 hours") fit whole at every width. */
   .topbar { gap: calc(var(--space-2) - 2px); }
+}
+/* Narrow layout (slice 2b). With the two steps above in force, the widest
+   fixture state (a 9999-day Attention seal with 140 waiting) still clipped
+   the scope trigger and its caret by up to 117px between 860px and 990px
+   (the round-3 sweep, 10px steps). This step frees more than that: the
+   brand mark goes (28px with its gap; the rail and the page title carry the
+   product), the scope's machine glyph goes (24px; the machine name stays),
+   the search folds to its 34px glyph (70px under its 104px floor) and opens
+   over the bar when it takes focus, and the gaps and side padding tighten
+   (26px). Every control keeps its accessible name and its title; the seal's
+   evidence age and the waiting count are never shed.
+   The open search is 164px = the 34px folded search + a 4px gap + the
+   range at its 88px content width + a 4px gap + Talk at 34px with its label
+   hidden, so it covers the range and Talk while you type and stops 4px short
+   of Lock down, which stays visible and reachable. Measured at 860px and
+   990px in the four round-3 states; a wider field would hide part of Lock
+   down behind it. */
+@media (max-width: 1000px) {
+  .topbar { gap: 4px; padding: 0 var(--space-2); }
+  .brand { display: none; }
+  .scope > svg:first-child { display: none; }
+  .search-wrap { flex: 0 0 34px; min-width: 34px; height: 34px; }
+  .search { gap: 0; padding: 0 8px; }
+  .search input { flex: 0 0 0; width: 0; }
+  .search-wrap:focus-within .search { position: absolute; top: 0; left: 0; z-index: 55; width: 164px; gap: var(--space-2); padding: 0 var(--space-3); }
+  .search-wrap:focus-within .search input { flex: 1 1 auto; width: auto; }
 }
 @media (max-width: 860px) {
   .app, .app.route-full { grid-template-columns: 56px 1fr; }
@@ -1578,9 +1654,13 @@ body {
   border-bottom: 1px dashed var(--rule); font-size: var(--text-base);
 }
 .posture-seal-pop .pp-line:last-child, .enforcement-layers .pp-line:last-child { border-bottom: 0; }
-.posture-seal-pop .pp-dot, .enforcement-layers .pp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
-.posture-seal-pop .pp-dot.warn, .enforcement-layers .pp-dot.warn { background: var(--ochre); }
-.posture-seal-pop .pp-dot.off, .enforcement-layers .pp-dot.off { background: var(--ink-4); }
+.posture-seal-pop .pp-dot, .enforcement-layers .pp-dot { width: 7px; height: 7px; box-sizing: border-box; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
+/* Each layer-line state has its own shape, so the lines read in monochrome:
+   the pass circle, the warn triangle, the neutral dash in --ink-3 for a
+   line with nothing to show (not --ink-4, under 3:1), and the unknown ring
+   below. The word in the value column names the state too. */
+.posture-seal-pop .pp-dot.warn, .enforcement-layers .pp-dot.warn { background: var(--ochre); border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.posture-seal-pop .pp-dot.off, .enforcement-layers .pp-dot.off { background: var(--ink-3); height: 2px; border-radius: 1px; }
 /* Unknown: a hollow dotted slate ring, the unknown pill's mark, never the
    pass fill. */
 .posture-seal-pop .pp-dot.unknown, .enforcement-layers .pp-dot.unknown { background: transparent; border: 1.5px dotted var(--slate); }
@@ -1751,6 +1831,54 @@ body {
 .ambient-stat:not(:last-child) { border-right: 1px solid var(--rule); }
 .ambient-stat .n { font-family: var(--serif); font-size: 19px; line-height: 1; }
 .ambient-stat .l { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
+/* Slice 2b: the Evidence filter form. Each filter is a field with its label
+   above the control in the label style, in a grid that wraps, so no label
+   runs into its neighbour's control. 150px fits the widest option label
+   ("Recovery prompt") beside its native caret at the --text-sm size. */
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.filter-bar { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2) var(--space-3); margin: 0 0 var(--space-3); }
+.field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.field-label { font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+/* 32px: the bar's control height (.range, .topbar .btn). The edge is
+   --ink-3, the control boundary every input wears (see .btn). */
+.input {
+  height: 32px; width: 100%; min-width: 0; box-sizing: border-box; padding: 0 var(--space-2);
+  border: 1px solid var(--ink-3); border-radius: var(--rad); background: var(--surface); color: var(--ink);
+  font-family: var(--sans); font-size: var(--text-sm);
+}
+.input:hover { border-color: var(--ink-2); }
+.input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+/* A native select's arrow and a date field's calendar glyph are painted by
+   the browser in the page's color scheme; in the dark theme they would be
+   dark on a dark field, so the field asks for the dark scheme. */
+[data-theme="dark"] .input { color-scheme: dark; }
+
+/* Slice 2b: Machines. One row per saved machine: the probe state as a
+   shaped chip with its word, the name over its address, and the console
+   link. 132px fits the widest chip ("Not healthy" with its glyph). */
+.machine-list { display: flex; flex-direction: column; }
+.machine-row { display: grid; grid-template-columns: 132px minmax(0, 1fr) auto; gap: var(--space-3); align-items: center; padding: var(--space-3) 0; border-bottom: 1px solid var(--rule); }
+.machine-row:last-child { border-bottom: 0; }
+.machine-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.machine-id strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.machine-id small { font-size: var(--text-xs); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.machine-here { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); white-space: nowrap; }
+.machine-row .btn { text-decoration: none; white-space: nowrap; }
+/* The probe chip: state as shape, hue and word together. Online is the
+   pass circle; Not healthy the fault square; Unknown and Checking the
+   hollow dotted ring in the slate unknown hue, never the pass hue. */
+.state-chip {
+  justify-self: start; display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px;
+  border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: var(--text-xs); font-weight: 600; white-space: nowrap;
+}
+.state-chip i { display: inline-block; width: 8px; height: 8px; box-sizing: border-box; flex: none; }
+.state-chip.good { color: var(--sage); background: var(--sage-bg); border-color: var(--sage-line); }
+.state-chip.good i { background: currentColor; border-radius: 50%; }
+.state-chip.bad { color: var(--rust); background: var(--rust-bg); border-color: var(--rust-line); }
+.state-chip.bad i { background: currentColor; }
+.state-chip.unknown { color: var(--slate); background: var(--slate-bg); border: 1px dashed var(--slate-line); }
+.state-chip.unknown i { border: 1.5px dotted currentColor; border-radius: 50%; }
+
 `;
 
 type NavItem = { id: string; label: string; href?: string; icon?: string; count?: "approvals"; title?: string };
@@ -1772,9 +1900,10 @@ type NavItem = { id: string; label: string; href?: string; icon?: string; count?
  * Route ids are frozen surfaces (posture, agents, policy, activity,
  * dashboard, attestation, health, auto-trigger, intelligence, privacy,
  * honeypot, coordination, exit-drill): only labels, grouping and order move.
- * The new hash ids (approvals, enforcement, findings, integrations,
- * settings) are additive. Machines stays the real /fleet href this slice,
- * never a hash route, so it cannot collide with an SPA id. Out-of-scope
+ * The new hash ids (approvals, machines, enforcement, findings,
+ * integrations, settings) are additive. Machines (slice 2b) is a shell
+ * screen over the Fleet Switcher's own reads; the /fleet page itself stays
+ * served and is linked from that screen. Out-of-scope
  * screens (Federation, Composition, full Recovery) are absent by
  * construction. Castle Wall, Sentinels, Charter and Heralds survive as
  * layer names inside screens and help text, never as rail labels.
@@ -1789,8 +1918,8 @@ export const RAIL_PRIMARY: readonly NavItem[] = [
   // carries the waiting count with its denominator.
   { id: "approvals", label: "Approvals", count: "approvals" },
   { id: "agents", label: "Agents" },
-  // Machines: the Fleet Switcher page, a real href (not a hash route).
-  { id: "machines", label: "Machines", href: "/fleet", title: "Switch between Sanctuary machines" },
+  // Machines: the fleet inside the shell, from the Fleet Switcher's reads.
+  { id: "machines", label: "Machines" },
   { id: "enforcement", label: "Enforcement" },
   { id: "findings", label: "Findings" },
   // Evidence: the activity and audit feed (frozen id "activity").
@@ -1884,8 +2013,9 @@ export function renderDashboardV11Html(
     const iconPath = RAIL_ICON_PATHS[n.icon ?? n.id] ?? "";
     const icon = iconPath ? RAIL_SVG_OPEN + iconPath + "</svg>" : "";
     const label = `<span class="rail-label">${escHtml(n.label)}</span>`;
-    // A href item (Machines -> /fleet) is a full-page link, not a hash route,
-    // so it carries no data-route and never matches the SPA active-highlight.
+    // A href item is a full-page link, not a hash route, so it carries no
+    // data-route and never matches the SPA active-highlight. No rail item
+    // uses one today; Machines became a hash route in slice 2b.
     if (n.href) {
       return `<a href="${escHtml(n.href)}" title="${escHtml(n.title ?? n.label)}">${icon}${label}</a>`;
     }
@@ -1946,7 +2076,7 @@ export function renderDashboardV11Html(
         human alias plus the copyable id chip) and the agent switcher fold
         into this one control. The menu carries the full id with its copy
         control, the protected agents that scope the approvals queue, and the
-        Fleet Switcher link.
+        Machines screen link.
       -->
       <div class="scope-switcher" id="agent-switcher" data-switcher>
         <button type="button" class="scope" id="agent-switcher-trigger" data-action="agent-switcher-toggle" aria-haspopup="true" aria-expanded="false" title="Scope: ${escHtml(machineName)}, fortress ${escHtml(fortressId)}. Choose which protected agent you are steering, or switch machines.">
@@ -1959,7 +2089,7 @@ export function renderDashboardV11Html(
             <button type="button" class="btn btn-sm" data-action="copy-fortress-id" data-fortress-id="${escHtml(fortressId)}" title="Copy machine id">Copy id</button>
           </div>
           <div id="agent-switcher-options"></div>
-          <a class="scope-fleet" href="/fleet" title="Switch between Sanctuary machines">Fleet: every machine you run</a>
+          <a class="scope-fleet" href="#machines" title="Every machine saved in this browser, each with its health check">Fleet: every machine you run</a>
         </div>
       </div>
       <div class="search-wrap" data-search>
