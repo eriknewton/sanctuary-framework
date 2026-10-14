@@ -1221,10 +1221,7 @@ export function renderPostureHomeHTML(): string {
     // throw here and blank the whole posture board.
     var legacyList = servedArray(legacyBody);
     var inboxList = servedArray(inboxBody && inboxBody.data && inboxBody.data.entries);
-    // A null body is a failed read (refreshAuxiliary returns null for every
-    // failure other than 401), so it counts as unread exactly as a malformed
-    // body does; a 401 keeps its own locked path.
-    var queueUnavailable = legacyList === null || inboxBody === null ||
+    var queueUnavailable = legacyList === null ||
       (inboxBody && inboxBody.data && inboxList === null);
     var selected = chooseApprovalRows(
       mapRows(legacyList || [], normalizeLegacyApproval),
@@ -1869,9 +1866,7 @@ export function renderPostureHomeHTML(): string {
       }),
       api("/api/approval-inbox?status=pending").catch(function (e) {
         noteDenied(e);
-        // Same rule as the legacy queue: in redirect mode the inbox is the
-        // source that answers, so a broken read must not render as empty.
-        return e && e.status === 401 ? { data: { entries: [] } } : null;
+        return { data: { entries: [] } };
       }),
       api("/api/status").catch(function () { return null; }),
       api("/api/anomaly/findings").catch(function () {

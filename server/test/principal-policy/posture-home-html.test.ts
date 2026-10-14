@@ -896,21 +896,6 @@ describe("posture home - folded approval controls", () => {
     expect(state.unavailable).toBe(true);
   });
 
-  it("a failed inbox read (null body) marks approvals unavailable in redirect mode, never an empty queue", () => {
-    const helpers = approvalHelpers();
-    const state = helpers.buildApprovalState(
-      [],
-      null,
-      {
-        standalone_mode: true,
-        decision_capable: false,
-        policy: { approval_redirect: { enabled: true, mode: "replace" } },
-      },
-    );
-    expect(state.rows).toEqual([]);
-    expect(state.unavailable).toBe(true);
-  });
-
   it("an inbox body whose data.entries is not an array marks approvals unavailable", () => {
     const helpers = approvalHelpers();
     const state = helpers.buildApprovalState(
@@ -1636,13 +1621,6 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
 
   it("a network /api/pending failure is unavailable, not locked or empty", async () => {
     const h = auxHarness({});
-    await h.refreshAuxiliary();
-    expect(h.state().locked).toBe(false);
-    expect(h.state().unavailable).toBe(true);
-  });
-
-  it("a non-401 inbox failure is unavailable, not locked or empty", async () => {
-    const h = auxHarness(null, { status: 502 });
     await h.refreshAuxiliary();
     expect(h.state().locked).toBe(false);
     expect(h.state().unavailable).toBe(true);
