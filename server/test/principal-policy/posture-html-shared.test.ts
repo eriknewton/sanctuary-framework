@@ -133,7 +133,7 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
       expect(html).not.toContain("&mdash;");
       const text = html
         .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, " ")
-        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+        .replace(/<style\b[\s\S]*?<\/style\b[^>]*>/gi, " ")
         .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ");
       expect(text).not.toMatch(/\bL[1-4]\b/i);
@@ -149,6 +149,22 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
     expect(html).toContain(".pill.unknown::before { content: \"\\25CB\"; }");
     const unknownRule = html.match(/\.pill\.unknown::before \{[^}]+}/)?.[0] ?? "";
     expect(unknownRule).not.toContain("\\25CF");
+  });
+
+  it("the agent reach gap line renders in rust even when it also uses evidence text", () => {
+    const rules = cssRules(inlineStyle(renderPostureAgentHTML()));
+    const evidenceRule = rules.find((rule) => rule.selector === ".evidence");
+    const gapRule = rules.find((rule) => rule.selector === ".evidence.err");
+    expect(gapRule?.decls).toContainEqual(["color", "var(--rust)"]);
+    expect(rules.indexOf(gapRule!)).toBeGreaterThan(rules.indexOf(evidenceRule!));
+  });
+
+  it("the Home reconnecting label uses the same ellipsis character as connecting and loading", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain("Connecting…");
+    expect(html).toContain("Loading…");
+    expect(html).toContain("Reconnecting…");
+    expect(html).not.toContain("Reconnecting...");
   });
 
   it("the posture control edge token clears the 3:1 non-text floor in both themes", () => {

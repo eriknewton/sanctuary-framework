@@ -15,7 +15,7 @@
  * SSE never connects (progressive enhancement). The connection indicator is the
  * honesty surface (#617): "Live" (green dot) is shown ONLY when a fresh frame
  * arrived inside the staleness window; any drop or silence flips it to
- * "Reconnecting..." (amber) while keeping a "last updated <time>" so a stale view
+ * "Reconnecting…" (amber) while keeping a "last updated <time>" so a stale view
  * can never be mistaken for a live green-all-well.
  *
  * The page authenticates via the same loopback/bearer model as the rest of the
@@ -1809,7 +1809,7 @@ export function renderPostureHomeHTML(): string {
       // reconnecting / connecting / stale all read as "reconnecting" amber so a
       // stale screen can never look like a healthy live one.
       el.classList.add("reconnecting");
-      label.textContent = "Reconnecting...";
+      label.textContent = "Reconnecting…";
     }
     updated.textContent = lastFrameAt
       ? " · last updated " + fmtTime(lastFrameAt)
@@ -1860,7 +1860,9 @@ export function renderPostureHomeHTML(): string {
     return Promise.all([
       api("/api/pending").catch(function (e) {
         noteDenied(e);
-        return [];
+        // Non-401 failures mean the queue was unreadable, not empty; only 401
+        // follows the operator-token path.
+        return e && e.status === 401 ? [] : null;
       }),
       api("/api/approval-inbox?status=pending").catch(function (e) {
         noteDenied(e);

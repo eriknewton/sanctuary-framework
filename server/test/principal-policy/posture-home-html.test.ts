@@ -896,6 +896,21 @@ describe("posture home - folded approval controls", () => {
     expect(state.unavailable).toBe(true);
   });
 
+  it("an inbox body whose data.entries is not an array marks approvals unavailable", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [],
+      { data: { entries: {} } },
+      {
+        standalone_mode: false,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.rows).toEqual([]);
+    expect(state.unavailable).toBe(true);
+  });
+
   it("decision POSTs prefer the bearer header and retry once after a 401 prompt", () => {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("function decisionHeaders()");
@@ -1271,7 +1286,7 @@ describe("posture home - a denied approval-queue read renders locked, never empt
       inboxBody: unknown,
       status: unknown,
       queueDenied?: boolean,
-    ) => { rows: unknown[]; locked: boolean; can_decide: boolean };
+    ) => { rows: unknown[]; locked: boolean; unavailable?: boolean; can_decide: boolean };
     renderApprovals: (state: unknown) => void;
     approvalsWaitingValue: (state: unknown) => string | number;
     prompts: number;
@@ -1411,6 +1426,47 @@ describe("posture home - a denied approval-queue read renders locked, never empt
     );
   });
 
+  it("renders the unavailable notice, and NOT the calm empty state, when the queue read failed", () => {
+    const h = renderHarness();
+    const state = h.buildApprovalState(null, { data: { entries: [] } }, NO_STATUS, false);
+    expect(state.unavailable).toBe(true);
+    h.renderApprovals(state);
+    expect(h.el.innerHTML).toContain("Approval queue unavailable");
+    expect(h.el.innerHTML).toContain("data-approvals-unavailable");
+    expect(h.el.innerHTML).not.toContain("Nothing needs you");
+  });
+
+  it("keeps the unavailable notice ABOVE rows another source did answer, so a partial view is never read as the whole", () => {
+    const h = renderHarness();
+    const state = h.buildApprovalState(
+      null,
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      {
+        standalone_mode: true,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: true, mode: "replace" } },
+      },
+      false,
+    );
+    expect(state.rows).toHaveLength(1);
+    h.renderApprovals(state);
+    expect(h.el.innerHTML).toContain("data-approvals-unavailable");
+    expect(h.el.innerHTML).toContain("state export");
+    expect(h.el.innerHTML.indexOf("data-approvals-unavailable")).toBeLessThan(
+      h.el.innerHTML.indexOf("state export"),
+    );
+  });
+
   it('the "Approvals waiting" tile reports LOCKED, never a confident 0, when the read was denied', () => {
     const h = renderHarness();
     expect(String(h.approvalsWaitingValue({ locked: true, rows: [] }))).toContain(
@@ -1419,6 +1475,15 @@ describe("posture home - a denied approval-queue read renders locked, never empt
     // CONTROL: an unlocked state still reports the real count.
     expect(h.approvalsWaitingValue({ locked: false, rows: [1, 2] })).toBe(2);
     expect(h.approvalsWaitingValue({ locked: false, rows: [] })).toBe(0);
+  });
+
+  it('the "Approvals waiting" tile reports UNAVAILABLE, never a confident 0, when the read failed', () => {
+    const h = renderHarness();
+    expect(String(h.approvalsWaitingValue({ unavailable: true, rows: [] }))).toContain(
+      "UNAVAILABLE",
+    );
+    expect(h.approvalsWaitingValue({ unavailable: false, rows: [1, 2] })).toBe(2);
+    expect(h.approvalsWaitingValue({ unavailable: false, rows: [] })).toBe(0);
   });
 
   it("the rendered banner really prints LOCKED for a denied queue (the helper is wired, not dead code)", () => {
@@ -1441,6 +1506,27 @@ describe("posture home - a denied approval-queue read renders locked, never empt
     expect(second.bannerEl.innerHTML).not.toContain("LOCKED");
     expect(second.bannerEl.innerHTML).toContain("Approvals waiting");
   });
+
+  it("the rendered banner really prints UNAVAILABLE for a failed queue read (the helper is wired, not dead code)", () => {
+    const { renderBanner, bannerEl } = bannerHarness();
+    const home = {
+      origin_machine: "home-mac",
+      federation: { available: false, enabled: false, fleet_node_count: 0 },
+      protection_requested_count: 0,
+      enforcement_confirmed_count: 0,
+      castle_wall: { arm_state: "armed" },
+      digest: { chain_verified: true },
+    };
+    renderBanner(home, { rows: [], unavailable: true }, []);
+    expect(bannerEl.innerHTML).toContain("Approvals waiting");
+    expect(bannerEl.innerHTML).toContain("UNAVAILABLE");
+
+    const second = bannerHarness();
+    second.renderBanner(home, { rows: [{}, {}], unavailable: false }, []);
+    expect(second.bannerEl.innerHTML).toContain(
+      '<span class="v">2</span><span class="l">Approvals waiting',
+    );
+  });
 });
 
 /**
@@ -1451,7 +1537,7 @@ describe("posture home - a denied approval-queue read renders locked, never empt
 describe("posture home - refreshAuxiliary distinguishes a denied queue read from an empty one", () => {
   interface AuxHarness {
     refreshAuxiliary: () => Promise<void>;
-    state: () => { locked: boolean; rows: unknown[] };
+    state: () => { locked: boolean; unavailable?: boolean; rows: unknown[] };
   }
 
   /**
@@ -1498,12 +1584,13 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
       return Promise.resolve({ findings: [] });
     };
     const buildApprovalState = (
-      _legacy: unknown,
-      _inbox: unknown,
+      legacy: unknown,
+      inbox: unknown,
       _status: unknown,
       queueDenied?: boolean,
-    ): { locked: boolean; rows: unknown[] } => ({
+    ): { locked: boolean; unavailable: boolean; rows: unknown[] } => ({
       locked: queueDenied === true,
+      unavailable: legacy === null || inbox === null,
       rows: [],
     });
     // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
@@ -1525,10 +1612,18 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     expect(h.state().locked).toBe(false);
   });
 
-  it("a non-401 failure is NOT a lock (a broken request is a retry, not a credential problem)", async () => {
+  it("a non-401 /api/pending failure is unavailable, not locked or empty", async () => {
     const h = auxHarness({ status: 503 });
     await h.refreshAuxiliary();
     expect(h.state().locked).toBe(false);
+    expect(h.state().unavailable).toBe(true);
+  });
+
+  it("a network /api/pending failure is unavailable, not locked or empty", async () => {
+    const h = auxHarness({});
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+    expect(h.state().unavailable).toBe(true);
   });
 
   it("never blocks the rest of the page: the other auxiliary reads still resolve through a denied queue", async () => {

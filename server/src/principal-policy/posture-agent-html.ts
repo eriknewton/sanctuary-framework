@@ -72,6 +72,7 @@ export function renderPostureAgentHTML(): string {
   .err { color: var(--rust); }
   code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
   .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
+  .evidence.err { color: var(--rust); }
   .meta { color: var(--ink-3); font-size: 12px; }
   table.reach { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.reach th { text-align: left; color: var(--ink-3); font-weight: 600; font-size: 11px;
