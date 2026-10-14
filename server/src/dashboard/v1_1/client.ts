@@ -267,12 +267,12 @@ const state = {
   // "Unknown / Attention", never a fabricated "Protected".
   //
   // home / homeError (2026-06-30 one-surface fold): the full posture-home
-  // payload from GET /api/posture/home (metric cards, today's story, anomaly
+  // payload from GET /api/posture/home (today's story, anomaly
   // findings, per-agent rows). Reuses the EXISTING posture data endpoint - the
   // Posture screen folded into this single surface renders from this, and links
   // out to the per-agent drill-down (/posture/agent/:id) and the evidence view
-  // (/posture/evidence). storyPlain toggles the plain-language story summary.
-  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null, storyPlain: false },
+  // (/posture/evidence).
+  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
   },
@@ -3405,10 +3405,6 @@ function overviewTile(label, valueHtml, evidenceHtml, href) {
   '</div>';
 }
 
-function overviewSmall(text) {
-  return '<small>' + escHtml(text) + '</small>';
-}
-
 function postureEvidenceByAgent(home) {
   const map = Object.create(null);
   (home && home.agents || []).forEach(function (row) { if (row && row.agent_id) map[row.agent_id] = row; });
@@ -3438,7 +3434,9 @@ function oldestAge(items) {
 function overviewFirstRun(home) {
   const unwrapped = unprotectedHarnesses(home);
   const detectedHarnesses = Array.isArray(unwrapped) ? unwrapped : [];
-  const reason = detectedHarnesses.length
+  const reason = !Array.isArray(unwrapped)
+    ? "Unprotected-harness list was not served"
+    : detectedHarnesses.length
     ? String(detectedHarnesses.length) + " agent harness" + (detectedHarnesses.length === 1 ? "" : "es") + " detected, none protected"
     : "No harness was detected";
   return '<section class="overview-empty" data-overview-first-run="1">' +
@@ -3634,7 +3632,7 @@ function renderPostureScreen() {
     '<div class="page-head"><div>' +
       '<p class="eyebrow">Overview</p>' +
       '<h1>Overview</h1>' +
-      '<p class="sub">What needs attention now. Each tile names the served source it reads; Unknown means the source has not answered.</p>' +
+      '<p class="sub">What needs attention now. Unknown means a source has not answered or has not proven the value.</p>' +
     '</div></div>';
   if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
@@ -3649,7 +3647,7 @@ function renderPostureScreen() {
     : '';
   if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
     const below = [];
-    if (sourceLoaded(HUB + "/inbox") && !state.inboxRedacted && heldApprovalItems(null).length) below.push(renderOverviewDecisionQueue());
+    if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && heldApprovalItems(null).length) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
     return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + below.join("") + '</section>';
   }
@@ -3689,7 +3687,7 @@ function renderPostureScreen() {
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
       overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
-      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? "checked " + escHtml(relTimeFromIso(digest.window_end)) : "last check Not evaluated", "#activity") +
+      overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : ", not verified") : "last check Not evaluated", "#activity") +
     '</div>';
   return [
     '<section class="overview-page">',
