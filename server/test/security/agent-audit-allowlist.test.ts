@@ -39,7 +39,7 @@ import {
   AGENT_AUDIT_VIEW_FIELDS,
   AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS,
 } from "../../src/operational/agent-audit-redaction.js";
-import { createSIEMTools } from "../../src/audit/siem-tools.js";
+import { SIEM_EXPORT_FORMATS, createSIEMTools } from "../../src/audit/siem-tools.js";
 import { createServer } from "../../src/router.js";
 import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import type { ToolDefinition } from "../../src/router.js";
@@ -366,7 +366,7 @@ describe("agent-audit-allowlist: audit_export_siem (MED-1, MED-3)", () => {
     return t;
   }
 
-  it("never emits tier, agent DID, session id, or free-text reason (CEF + OCSF)", async () => {
+  it("never emits tier, agent DID, session id, or free-text reason in any SIEM format", async () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, generateRandomKey());
     await auditLog.append("l2", "identity_sign", "ag-siem", {
@@ -380,7 +380,7 @@ describe("agent-audit-allowlist: audit_export_siem (MED-1, MED-3)", () => {
     await new Promise((r) => setTimeout(r, 50));
     const tool = siemTool(auditLog, "ag-siem");
 
-    for (const format of ["cef", "ocsf"] as const) {
+    for (const format of SIEM_EXPORT_FORMATS) {
       const res = await tool.handler({ format });
       const whole = res.content.map((c: { text: string }) => c.text).join("\n");
       expect(whole).not.toContain("tier=");
@@ -532,14 +532,14 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
     });
   });
 
-  it("audit_export_siem (CEF + OCSF) emits no raw details / non-allowlisted field", async () => {
+  it("audit_export_siem emits no raw details / non-allowlisted field in any SIEM format", async () => {
     const storage = new MemoryStorage();
     const auditLog = new AuditLog(storage, generateRandomKey());
     await seedLeakyEntry(auditLog, "ag-tripwire");
     await new Promise((r) => setTimeout(r, 50));
     const { tools } = createSIEMTools(auditLog, () => binding("ag-tripwire"));
     const tool = tools.find((x) => x.name === "audit_export_siem")!;
-    for (const format of ["cef", "ocsf"] as const) {
+    for (const format of SIEM_EXPORT_FORMATS) {
       const res = await tool.handler({ format });
       const whole = res.content.map((c: { text: string }) => c.text).join("\n");
       assertNoLeak(whole);
