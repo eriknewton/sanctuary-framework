@@ -236,7 +236,12 @@ const state = {
     filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
     snoozeDialog: null
   },
-  approvals: { selectedId: null, alwaysAllow: false },
+  approvals: {
+    selectedId: null,
+    alwaysAllow: false,
+    confirmingTier1Id: null,
+    filters: { state: "all", agent: "", tier: "both", category: "" }
+  },
   activity: [],
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
@@ -376,6 +381,7 @@ function shortTime(iso) {
 }
 
 function promptForOperatorToken() {
+  if (!window.prompt) return false;
   const entered = window.prompt("Operator token required for this action.");
   if (!entered || !entered.trim()) return false;
   TOKEN = entered.trim();
@@ -3938,7 +3944,7 @@ function renderSearchResults() {
 // Unknown with a Retry until the queue read loads, the redacted notice when
 // approvals are hidden, the Allow once / Deny / Allow always tiles, or the
 // earned empty state.
-const APPROVAL_QUEUE_ITEM_CAP = 50; // One operator decision page: 50 keeps the drawer usable and names the cap.
+const APPROVAL_QUEUE_ITEM_CAP = 100; // 100 matches HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts, the one page this client reads.
 
 function renderApprovalQueueBody() {
   const pending = pendingApprovalItems();
@@ -3988,33 +3994,21 @@ function approvalText(item) {
 }
 
 function approvalHoldReason(item) {
-  return item.hold_reason || item.reason || approvalText(item);
-}
-
-function approvalContext(item) {
-  return approvalArg(item, ["agent_context", "context", "reasoning", "message"], "No agent context was supplied.");
-}
-
-function approvalDecisionMeta(item) {
-  return item.resolution || item.decision || item.resolved_by || {};
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  return approvalOperation(item) + " is a " + tier + " operation under the operator policy.";
 }
 
 function approvalDecisionLabel(item) {
-  const meta = approvalDecisionMeta(item);
-  const raw = String(meta.action || meta.decision || meta.outcome || item.status || "decided").toLowerCase();
-  if (raw.indexOf("deny") >= 0) return "DENIED";
-  if (raw.indexOf("always") >= 0 || raw.indexOf("standing") >= 0) return "ALWAYS ALLOW";
-  if (raw.indexOf("expire") >= 0) return "EXPIRED";
-  if (raw.indexOf("approve") >= 0 || raw.indexOf("allow") >= 0) return "ALLOWED ONCE";
-  return "DECIDED";
+  const payload = item && item.resolution_payload;
+  const outcome = payload && typeof payload.outcome === "string" ? payload.outcome : "";
+  if (outcome === "allowed_once") return "ALLOWED ONCE";
+  if (outcome === "denied") return "DENIED";
+  if (outcome === "always_allow") return "ALWAYS ALLOW";
+  return "Outcome in audit log";
 }
 
 function approvalAuditLine(item) {
-  const meta = approvalDecisionMeta(item);
-  const entry = meta.audit_entry_id || meta.entry_id || item.audit_entry_id || item.entry_id;
-  if (entry) return "entry " + entry;
-  if (item.resolved) return "recorded in the audit log";
-  return "recorded in the audit log after you decide";
+  return "recorded in the audit log";
 }
 
 function approvalPolicyUnavailableReason() {
@@ -4030,16 +4024,17 @@ function approvalPolicyUnavailableReason() {
 function approvalStandingState(item) {
   const op = promotableOperation(item);
   if (!op) return { enabled: false, reason: "Always allow is unavailable for this operation." };
+  if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
   const unavailable = approvalPolicyUnavailableReason();
   if (unavailable) return { enabled: false, reason: unavailable };
-  return { enabled: true, reason: "Writes a standing rule only through the existing policy compile and activate path with the operator bearer." };
+  return { enabled: true, reason: "When checked, Allow always first requests /api/policy/compile for auto-allow " + op + ", then requests /api/policy/drafts/:id/activate with the operator bearer. The server can refuse either request." };
 }
 
 function renderApprovalRow(item, selectedId) {
   const selected = item.item_id === selectedId;
   const agent = approvalAgentId(item);
   const op = approvalOperation(item);
-  const created = item.created_at || item.observed_at || "";
+  const created = item.created_at || "";
   const age = created ? relTimeFromIso(created) : "age unknown";
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
   if (item.resolved) {
@@ -4048,17 +4043,20 @@ function renderApprovalRow(item, selectedId) {
       '<td><strong>' + escHtml(agent) + '</strong></td>' +
       '<td class="mono">' + escHtml(op) + '</td>' +
       '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
-      '<td class="mono muted">' + escHtml(shortTime((approvalDecisionMeta(item).decided_at || item.updated_at || created))) + '</td>' +
-      '<td><span class="state-chip neutral"><i aria-hidden="true"></i>' + escHtml(approvalDecisionLabel(item)) + '</span><div class="muted">' + escHtml(approvalAuditLine(item)) + '</div></td>' +
+      '<td class="mono muted">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
+      '<td><span class="state-chip neutral"><i aria-hidden="true"></i>' + escHtml(approvalDecisionLabel(item)) + '</span><div class="muted">' + escHtml(approvalAuditLine(item)) + ' · <a href="#activity">Evidence</a></div></td>' +
     '</tr>';
   }
+  const decisionCell = item.tier === "tier1"
+    ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button>'
+    : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>';
   return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
     '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
     '<td><strong>' + escHtml(agent) + '</strong></td>' +
     '<td class="mono">' + escHtml(op) + '</td>' +
     '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
     '<td class="mono">' + escHtml(age) + '</td>' +
-    '<td><button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button></td>' +
+    '<td>' + decisionCell + '</td>' +
   '</tr>';
 }
 
@@ -4077,20 +4075,55 @@ function renderApprovalDrawer(item) {
     (checked ? " checked" : "") + (standing.enabled ? "" : " disabled") + '><span>' +
     (standing.enabled ? "Always allow this operation for this agent. " : "Always allow is unavailable. ") +
     '<strong>' + escHtml(standing.reason) + '</strong></span></label>';
-  const primaryButton = item.resolved ? "" : '<button class="btn btn-primary" data-approval-primary="' + escHtml(item.item_id) + '" data-action="' + primaryAction + '" data-item-id="' + escHtml(item.item_id) + '">' + primaryLabel + '</button>';
+  const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
+  const primaryButton = item.resolved ? "" : (item.tier === "tier1" && !checked
+    ? (tier1Confirming
+      ? '<button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '">Confirm ' + escHtml(op) + '</button>'
+      : '<button class="btn btn-primary" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>')
+    : '<button class="btn btn-primary" data-approval-primary="' + escHtml(item.item_id) + '" data-action="' + primaryAction + '" data-item-id="' + escHtml(item.item_id) + '">' + primaryLabel + '</button>');
   const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button>';
   const standingEffect = checked
-    ? "Every later " + op + " by " + agent + " runs without asking after the policy activator accepts the standing rule."
+    ? "The client requests policy compile, then activates that draft with the operator bearer. Future matching operations stop asking only if the server accepts both requests."
     : "The next matching operation asks again.";
+  const allowCopy = checked
+    ? standingEffect
+    : "The approval is sent to the existing inbox approve route and " + approvalAuditLine(item) + ".";
+  const tier1Note = item.tier === "tier1" && !item.resolved
+    ? '<div class="approval-tier-note">Tier 1 requires two explicit client actions here: Allow once, then Confirm ' + escHtml(op) + '. The confirm button uses the same inbox approve route.</div>'
+    : "";
   return '<aside class="card approval-drawer" aria-label="Selected approval">' +
     '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? escHtml(approvalDecisionLabel(item)) : "WAITING") + '</span></div><h3>Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
-    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>The server reported this hold to the operator as: ' + escHtml(approvalHoldReason(item)) + '. The agent receives only the generic refusal if you deny it.</p></div>' +
-    '<div class="approval-drawer-sec"><h4>Context the agent gave</h4><p class="agentctx">' + escHtml(approvalContext(item)) + '</p><p class="unv">Agent-supplied text. Not verified. Shown as data.</p></div>' +
-    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>Allow once</strong><p>The operation runs now, is logged with your decision, and ' + escHtml(standingEffect) + '</p></div><div><strong>Deny</strong><p>The agent receives a generic refusal with no rule detail. Nothing leaves the fortress from this request.</p></div></div></div>' +
-    (item.tier === "tier1" && !item.resolved ? '<div class="approval-tier-note">Tier 1 confirmation stays on the existing approval handler. The drawer does not create a new one-click path.</div>' : "") +
-    '<div class="approval-decide"><label>Note for the audit record (optional)</label><textarea placeholder="Why you decided this way"></textarea>' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + '</div><p class="muted mono">' + escHtml(approvalAuditLine(item)) + '</p></div>' +
+    // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
+    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>Allow once</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>The denial is sent to the existing inbox deny route and ' + escHtml(approvalAuditLine(item)) + '.</p></div></div></div>' +
+    tier1Note +
+    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + '</div><p class="muted mono">Decision ' + escHtml(approvalAuditLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
   '</aside>';
+}
+
+function approvalFilterOptions(items, field, current) {
+  const seen = {};
+  items.forEach(function (item) {
+    const value = field === "agent" ? approvalAgentId(item) : approvalOperation(item);
+    if (value) seen[value] = true;
+  });
+  return Object.keys(seen).sort().map(function (value) {
+    return '<option value="' + escHtml(value) + '"' + (current === value ? " selected" : "") + '>' + escHtml(value) + '</option>';
+  }).join("");
+}
+
+function filterApprovalItems(items) {
+  const f = state.approvals.filters || {};
+  return items.filter(function (item) {
+    if (f.state === "waiting" && item.resolved) return false;
+    if (f.state === "decided" && !item.resolved) return false;
+    if (f.agent && approvalAgentId(item) !== f.agent) return false;
+    if (f.tier === "tier1" && item.tier !== "tier1") return false;
+    if (f.tier === "tier2" && item.tier !== "tier2") return false;
+    if (f.category && approvalOperation(item) !== f.category) return false;
+    return true;
+  });
 }
 
 function renderApprovalsScreen() {
@@ -4101,11 +4134,12 @@ function renderApprovalsScreen() {
     return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
   }
   const all = approvalItemsForScreen();
-  const waiting = all.filter(function (i) { return !i.resolved; }).sort(function (a, b) {
+  const filtered = filterApprovalItems(all);
+  const capped = filtered.slice(0, APPROVAL_QUEUE_ITEM_CAP);
+  const waiting = capped.filter(function (i) { return !i.resolved; }).sort(function (a, b) {
     return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
   });
-  const decided = all.filter(function (i) { return !!i.resolved; });
-  const capped = waiting.concat(decided).slice(0, APPROVAL_QUEUE_ITEM_CAP);
+  const decided = capped.filter(function (i) { return !!i.resolved; });
   const selectedId = capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
     ? state.approvals.selectedId
     : (waiting[0] || capped[0] || {}).item_id || null;
@@ -4115,23 +4149,33 @@ function renderApprovalsScreen() {
   const rows = [
     waiting.length ? '<tr class="sect"><td colspan="6">Waiting on you · ' + waiting.length + ' of ' + all.length + ' · oldest wait ' + escHtml(oldest) + '</td></tr>' : "",
     waiting.map(function (i) { return renderApprovalRow(i, selectedId); }).join(""),
-    decided.length ? '<tr class="sect"><td colspan="6">Decided · showing ' + Math.min(decided.length, Math.max(0, APPROVAL_QUEUE_ITEM_CAP - waiting.length)) + ' of ' + decided.length + '</td></tr>' : "",
-    decided.slice(0, Math.max(0, APPROVAL_QUEUE_ITEM_CAP - waiting.length)).map(function (i) { return renderApprovalRow(i, selectedId); }).join("")
+    decided.length ? '<tr class="sect"><td colspan="6">Decided · showing ' + decided.length + ' of ' + filtered.filter(function (i) { return !!i.resolved; }).length + '</td></tr>' : "",
+    decided.map(function (i) { return renderApprovalRow(i, selectedId); }).join("")
   ].join("");
   const others = state.agentScope.selectedAgentId ? heldApprovalItems(null).length : 0;
+  const noFilterMatch = all.length > 0 && filtered.length === 0;
   const body = capped.length ? '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+    noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
     others > 0
       ? '<div class="queue-empty" data-scoped-empty="1">Nothing waiting for ' + escHtml(state.agentScope.selectedAgentId || "this agent") +
         '. ' + others + ' of ' + others + ' held operations wait on other agents; choose All agents in the scope menu to see them.</div>'
       : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  const f = state.approvals.filters;
+  const filterBar = '<div class="approval-filters" role="group" aria-label="Filter approvals">' +
+      '<label class="filter-field">State<select class="input" data-action="approval-filter-state"><option value="all"' + (f.state === "all" ? " selected" : "") + '>All</option><option value="waiting"' + (f.state === "waiting" ? " selected" : "") + '>Waiting</option><option value="decided"' + (f.state === "decided" ? " selected" : "") + '>Decided</option></select></label>' +
+      '<label class="filter-field">Agent<select class="input" data-action="approval-filter-agent"><option value="">All</option>' + approvalFilterOptions(all, "agent", f.agent) + '</select></label>' +
+      '<label class="filter-field">Tier<select class="input" data-action="approval-filter-tier"><option value="both"' + (f.tier === "both" ? " selected" : "") + '>Tier 1 and Tier 2</option><option value="tier1"' + (f.tier === "tier1" ? " selected" : "") + '>Tier 1</option><option value="tier2"' + (f.tier === "tier2" ? " selected" : "") + '>Tier 2</option></select></label>' +
+      '<label class="filter-field">Category<select class="input" data-action="approval-filter-category"><option value="">All</option>' + approvalFilterOptions(all, "category", f.category) + '</select></label>' +
+      '<span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span>' +
+    '</div>';
   return [
     '<section class="concierge-wrap">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once and Deny use the existing inbox decision path. Allow always asks Sanctuary to add a standing rule through the existing policy-change path; if that path is not configured, it is disabled and your policy is unchanged. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+        '<p class="sub">Each one is held until you decide. Allow once and Deny use the existing inbox decision path. Allow always requests policy compile and activation; if policy read is unavailable, Tier 1 is selected, or the category cannot be promoted, it is disabled. Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
       '</div></div>',
-      '<div class="approval-filters"><span class="pill">State: <strong>Waiting and decided</strong></span><span class="pill">Agent: <strong>' + escHtml(state.agentScope.selectedAgentId || "All agents") + '</strong></span><span class="pill">Tier: <strong>Tier 1 and 2</strong></span><span class="pill">Category: <strong>All categories</strong></span><span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span></div>',
+      filterBar,
       '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected) + '</div>',
     '</section>'
   ].join("");
@@ -5203,12 +5247,14 @@ async function onInboxAction(itemId, action) {
     }
     rerender();
   } catch (e) {
+    await fetchAll(true);
     // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
     if (e.status === 409) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
     }
+    rerender();
   }
 }
 
@@ -5802,11 +5848,24 @@ document.addEventListener("click", function (ev) {
   if (action === "approval-select" && itemId) {
     state.approvals.selectedId = itemId;
     state.approvals.alwaysAllow = false;
+    state.approvals.confirmingTier1Id = null;
     return rerender();
   }
   if (action === "approval-always-allow") {
     state.approvals.alwaysAllow = !!tgt.checked;
+    state.approvals.confirmingTier1Id = null;
     return rerender();
+  }
+  if (action === "approval-start-tier1-allow" && itemId) {
+    // Tier 1 decisions stay two-step in the drawer so a row click cannot
+    // turn into execution. The confirm control below is the only client path
+    // that reaches the existing inbox approve route for Tier 1.
+    state.approvals.confirmingTier1Id = itemId;
+    return rerender();
+  }
+  if (action === "approval-confirm-tier1-allow" && itemId) {
+    state.approvals.confirmingTier1Id = null;
+    return void onInboxAction(itemId, "approve");
   }
   if (action === "inbox-select" && itemId) {
     state.inboxOps.selected[itemId] = tgt.checked;
@@ -5928,8 +5987,17 @@ document.addEventListener("change", function (ev) {
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else if (action === "approval-filter-state") state.approvals.filters.state = tgt.value === "waiting" || tgt.value === "decided" ? tgt.value : "all";
+  else if (action === "approval-filter-agent") state.approvals.filters.agent = tgt.value;
+  else if (action === "approval-filter-tier") state.approvals.filters.tier = tgt.value === "tier1" || tgt.value === "tier2" ? tgt.value : "both";
+  else if (action === "approval-filter-category") state.approvals.filters.category = tgt.value;
   else return;
-  saveInboxPrefs();
+  if (action.indexOf("inbox-filter-") === 0) saveInboxPrefs();
+  if (action.indexOf("approval-filter-") === 0) {
+    state.approvals.selectedId = null;
+    state.approvals.alwaysAllow = false;
+    state.approvals.confirmingTier1Id = null;
+  }
   rerender();
 });
 

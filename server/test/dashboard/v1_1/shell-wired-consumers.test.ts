@@ -42,7 +42,8 @@ const home = (digest: Record<string, unknown> = {}) => ({
 });
 const heldItem = {
   item_id: "item-1", kind: "approval_pending", tier: "tier1", agent_id: "fixture-agent",
-  display_template_id: "approval_pending.tier1.lockdown", display_template_args: {}, resolved: false,
+  display_template_id: "approval_pending.tier1.lockdown", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }], resolved: false,
+  created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "lockdown",
 };
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
@@ -110,6 +111,7 @@ class FakeElement {
     this.append(...children);
   }
   focus() {}
+  remove() {}
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
     const index = this.parentElement.children.indexOf(this);
@@ -133,7 +135,7 @@ const SHELL_IDS = [
   "app", "main", "fortress", "sidebar-pills", "btn-lockdown", "posture-seal", "posture-seal-word",
   "posture-seal-freshness", "posture-seal-pop", "rail-approvals-count", "btn-notifications", "notify-count",
   "time-range", "btn-talk", "talk-panel", "talk-panel-body", "search-results",
-  "machines-summary", "machines-age", "machines-list",
+  "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
 function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
@@ -230,7 +232,7 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the time range is disabled with its reason off Evidence and enabled on Evidence", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     const range = h.el["time-range"]!;
     expect(range.disabled).toBe(true);
@@ -324,16 +326,16 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the Approvals and seal copy claim only what the paths do", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Charter holds are recorded in the audit log by the gate; nothing signs
-    // a decision with an operator key, and other held items are not
-    // audit-appended on their path.
+    // The inbox serves no entry id, so the Approvals screen may only say the
+    // decision is recorded in the audit log and link to Evidence.
     expect(main).not.toContain("operator key");
     expect(main).not.toContain("Every decision is signed");
-    expect(main).toContain("A decision on a Charter hold is recorded in your audit log");
+    expect(main).toContain("recorded in the audit log");
+    expect(main).toContain('href="#activity">Evidence</a>');
     // Lockdown revokes network access for confined agents; agents keep running.
     runInContext('state.posture.sealOpen = true; state.tier1.lockdown.state = "engaged"; renderTopbar();', h.context);
     const pop = h.el["posture-seal-pop"]!.innerHTML;
@@ -461,27 +463,28 @@ describe("slice 2 shell wired consumers", () => {
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
     // Allow always asks the policy engine to compile and activate a standing
-    // rule; where the engine is not configured it is refused and the policy
-    // is unchanged. The subtitle may promise no more than that.
+    // rule; unavailable policy reads, Tier 1 and non-promotable categories
+    // disable it. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always asks Sanctuary to add a standing rule through the existing policy-change path; if that path is not configured, it is disabled and your policy is unchanged.");
+    expect(main).toContain("Allow always requests policy compile and activation");
+    expect(main).toContain("if policy read is unavailable, Tier 1 is selected, or the category cannot be promoted, it is disabled");
   });
 
-  it("Approvals renders grouped waiting and decided rows with filters and a selected drawer", async () => {
+  it("Approvals renders grouped waiting and decided rows with served fields only", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
       { ...heldItem, item_id: "wait-1", operation_category: "state_export", created_at: "2026-10-14T16:30:00.000Z" },
-      { ...heldItem, item_id: "decided-1", operation_category: "state_export", created_at: "2026-10-14T15:30:00.000Z", resolved: true, resolution: { action: "approve", decided_by: "Erik", audit_entry_id: "1,271", decided_at: "2026-10-14T15:35:00.000Z" } },
+      { ...heldItem, item_id: "decided-1", operation_category: "state_import", created_at: "2026-10-14T15:30:00.000Z", resolved: true, resolved_at: "2026-10-14T15:35:00.000Z" },
     ] } })) });
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    expect(main).toContain("State:");
-    expect(main).toContain("Agent:");
-    expect(main).toContain("Tier:");
-    expect(main).toContain("Category:");
+    expect(main).toContain("State");
+    expect(main).toContain("Agent");
+    expect(main).toContain("Tier");
+    expect(main).toContain("Category");
     expect(main).toContain("Waiting on you");
     expect(main).toContain("oldest wait");
     expect(main).toContain("Decided");
@@ -491,27 +494,31 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).toContain("Why it is held");
     expect(main).toContain("If you decide");
     expect(main).toContain("recorded in the audit log");
-    expect(main).toContain("entry 1,271");
+    expect(main).toContain("Outcome in audit log");
+    expect(main).toContain("Decided at");
+    expect(main).not.toContain("Context the agent gave");
+    expect(main).not.toContain("Note for the audit record");
+    expect(main).not.toContain("server reported this hold");
   });
 
-  it("Approvals drawer renders hostile agent context as literal unverified text", async () => {
+  it("Approvals renders hostile served typed args as literal text", async () => {
     vi.useFakeTimers();
     const hostile = '<img src=x onerror="alert(1)">';
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
-      { ...heldItem, item_id: "wait-1", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }, { kind: "agent_context", value: hostile }] },
+      { ...heldItem, item_id: "wait-1", agent_id: hostile, display_template_args: [{ kind: "agent_id", value: hostile }] },
     ] } })) });
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    expect(main).toContain("Agent-supplied text. Not verified. Shown as data.");
     expect(main).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
     expect(main).not.toContain(hostile);
+    expect(main).not.toContain("Agent-supplied text");
   });
 
   it("Approvals disables the standing-rule checkbox when policy activation is unavailable", async () => {
     vi.useFakeTimers();
     const h = boot({
-      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, operation_category: "state_export" }] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, tier: "tier2", operation_category: "state_export" }] } })),
       "/api/policy/current": () => Promise.resolve(response({}, 503)),
     });
     await settle();
@@ -524,13 +531,40 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).not.toContain('data-action="inbox-promote"');
   });
 
-  it("Approvals drawer buttons still use the existing inbox decision path", async () => {
+  it("Tier 1 approvals require drawer confirmation while Tier 2 keeps inline decisions", async () => {
     vi.useFakeTimers();
     const calls: string[] = [];
     const h = boot({
-      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", operation_category: "state_export" }] } })),
-      "/api/hub/inbox/wait-1/approve": () => { calls.push("/api/hub/inbox/wait-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
-      "/api/hub/inbox/wait-1/deny": () => { calls.push("/api/hub/inbox/wait-1/deny"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+        { ...heldItem, item_id: "tier1-1", tier: "tier1", operation_category: "state_export" },
+        { ...heldItem, item_id: "tier2-1", tier: "tier2", operation_category: "state_delete" },
+      ] } })),
+      "/api/hub/inbox/tier1-1/approve": () => { calls.push("/api/hub/inbox/tier1-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier1-1", resolved: true } } })); },
+      "/api/hub/inbox/tier2-1/approve": () => { calls.push("/api/hub/inbox/tier2-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier2-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    let html = h.el.main!.innerHTML;
+    expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
+    expect(html).toContain('data-action="inbox-approve" data-item-id="tier2-1"');
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual([]);
+    html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1"');
+    expect(html).toContain("Confirm state_export");
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual(["/api/hub/inbox/tier1-1/approve"]);
+  });
+
+  it("Approvals drawer buttons still use the existing inbox decision path with empty bodies", async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/hub/inbox/wait-1/approve": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/approve", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+      "/api/hub/inbox/wait-1/deny": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/deny", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
     });
     await settle();
     h.navigate("approvals");
@@ -539,7 +573,72 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
     await settle();
-    expect(calls).toEqual(["/api/hub/inbox/wait-1/approve", "/api/hub/inbox/wait-1/deny"]);
+    expect(calls).toEqual([
+      { url: "/api/hub/inbox/wait-1/approve", body: "{}" },
+      { url: "/api/hub/inbox/wait-1/deny", body: "{}" },
+    ]);
+  });
+
+  it("Approvals filters narrow rows and counts after the left rail agent scope", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "a-wait", tier: "tier1", agent_id: "agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "b-wait", tier: "tier2", agent_id: "agent-b", operation_category: "state_delete", resolved: false },
+      { ...heldItem, item_id: "a-decided", tier: "tier2", agent_id: "agent-a", operation_category: "state_import", resolved: true, resolved_at: "2026-10-14T16:50:00.000Z" },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 3 of 3");
+    const stateSelect = new FakeElement({ "data-action": "approval-filter-state" }, "select");
+    stateSelect.value = "waiting";
+    h.change(stateSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 2 of 3");
+    const tierSelect = new FakeElement({ "data-action": "approval-filter-tier" }, "select");
+    tierSelect.value = "tier2";
+    h.change(tierSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 3");
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_export";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+    expect(h.el.main!.innerHTML).toContain("Left rail agent scope applies first");
+  });
+
+  it("Approvals cap reports showing M of N past the loaded inbox page cap", async () => {
+    vi.useFakeTimers();
+    const items = Array.from({ length: 101 }, (_, index) => ({
+      ...heldItem,
+      item_id: `item-${index}`,
+      tier: "tier2",
+      agent_id: `agent-${index}`,
+      operation_category: "state_export",
+      resolved: false,
+    }));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 100 of 101");
+    expect(h.el.main!.innerHTML).toContain("cap 100");
+  });
+
+  it("refused decisions show the refusal and repaint from server state", async () => {
+    vi.useFakeTimers();
+    let inboxItems: Array<Record<string, unknown>> = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: false }];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+      "/api/hub/inbox/wait-1/approve": () => {
+        inboxItems = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: true, resolved_at: "2026-10-14T16:59:00.000Z" }];
+        return Promise.resolve(response({ error: "operator session required" }, 401));
+      },
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    expect(h.el.main!.innerHTML).toContain("Decided at");
+    expect(h.el.main!.innerHTML).toContain("Outcome in audit log");
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
