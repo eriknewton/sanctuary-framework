@@ -1,0 +1,41 @@
+{
+  "name": "sanctuary-audit-ecs",
+  "format": "ecs",
+  "verified_by": "repo schema and fixture tests only",
+  "fields": [
+    "@timestamp",
+    "ecs.version",
+    "event.kind",
+    "event.category",
+    "event.type",
+    "event.module",
+    "event.dataset",
+    "event.provider",
+    "event.action",
+    "event.outcome",
+    "event.severity",
+    "service.name",
+    "service.type",
+    "user.id",
+    "sanctuary.audit.decision",
+    "sanctuary.audit.result"
+  ],
+  "mapping": [
+    { "sanctuary_field": "@timestamp", "type": "date" },
+    { "sanctuary_field": "ecs.version", "type": "keyword" },
+    { "sanctuary_field": "event.kind", "type": "keyword" },
+    { "sanctuary_field": "event.category", "type": "keyword" },
+    { "sanctuary_field": "event.type", "type": "keyword" },
+    { "sanctuary_field": "event.module", "type": "keyword" },
+    { "sanctuary_field": "event.dataset", "type": "keyword" },
+    { "sanctuary_field": "event.provider", "type": "keyword" },
+    { "sanctuary_field": "event.action", "type": "keyword" },
+    { "sanctuary_field": "event.outcome", "type": "keyword" },
+    { "sanctuary_field": "event.severity", "type": "long" },
+    { "sanctuary_field": "service.name", "type": "keyword" },
+    { "sanctuary_field": "service.type", "type": "keyword" },
+    { "sanctuary_field": "user.id", "type": "keyword" },
+    { "sanctuary_field": "sanctuary.audit.decision", "type": "keyword" },
+    { "sanctuary_field": "sanctuary.audit.result", "type": "keyword" }
+  ]
+}
