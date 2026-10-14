@@ -1940,6 +1940,8 @@ body {
 .mfp-table tr:hover { background: var(--accent-tint-faint); }
 .mfp-table tr.selected { background: var(--indigo-bg); box-shadow: inset 2px 0 var(--accent); }
 .mfp-table .link-btn { text-align: left; overflow-wrap: anywhere; }
+/* A chip in a list cell keeps its mark beside its word: wrapped, the mark sat alone above the word in a narrow column. */
+.mfp-table .state-chip { flex-wrap: nowrap; white-space: nowrap; }
 .mfp-pager, .mfp-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .mfp-pager { margin: 12px 0; color: var(--ink-2); font-size: var(--text-xs); font-family: var(--mono); }
 .mfp-queue-grid, .mfp-policy-grid { display: grid; gap: 16px; min-width: 0; }
