@@ -55,7 +55,7 @@ Crash recovery is entry-granular. A completed `.enc` file is independently decry
 
 Filtering is in memory. The supported filters are `since`, `layer`, `operation_type`, and `limit`; `limit` defaults to 50 and returns the most recent matching entries. There is no on-disk index. Query cost is therefore linear in retained audit-file count on a cold read, bounded by the retention limits.
 
-Operator-facing read paths use this same API. The `monitor_audit_log` MCP tool calls `AuditLog.query()` directly. The `audit_export_siem` tool also queries the audit log, then applies additional export filters and formats results as CEF, OCSF, ECS, or XDM. ECS and XDM mappings are covered by repo-local schema and fixture tests, plus the content pack parse guard under `integrations/siem/`; no live SIEM tenant drill is claimed by those tests. Broker-specific `secrets audit` opens the same fortress storage and queries broker operation entries through the Selective Disclosure broker wrapper.
+Operator-facing read paths use this same API. The `monitor_audit_log` MCP tool calls `AuditLog.query()` directly. The `audit_export_siem` tool also queries the audit log, then applies additional export filters and formats results as CEF, OCSF, ECS, or XDM. ECS and XDM mappings are covered by repo-local schema and fixture tests, plus the field mapping files under `integrations/siem/`; no live SIEM tenant drill is claimed by those tests. Broker-specific `secrets audit` opens the same fortress storage and queries broker operation entries through the Selective Disclosure broker wrapper.
 
 Exit-bundle import does not add recovered audit receipts to `_audit`. The
 exported `artifacts/audit_receipts.json` file is a signed-manifest-pinned

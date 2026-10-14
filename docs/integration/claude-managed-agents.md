@@ -90,8 +90,8 @@ run Sanctuary: one identity per thread agent, or a shared identity via seed.
 
 **SIEM export.** Use `audit_export_siem` to export CEF, OCSF, ECS, or
 XDM-formatted audit events from inside the container. ECS and XDM have
-repo-verified mappings and content-pack files under `integrations/siem/`; run a
-tenant drill before treating either pack as installed evidence.
+repo-verified field mapping files under `integrations/siem/`; run a tenant
+drill before treating either mapping as installed evidence.
 
 ## Troubleshooting
 

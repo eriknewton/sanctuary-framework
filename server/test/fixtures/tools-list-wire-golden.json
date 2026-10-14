@@ -1319,7 +1319,7 @@
               "ecs",
               "xdm"
             ],
-            "description": "Output format: \"cef\" (Common Event Format, newline-delimited), \"ocsf\" (Open Cybersecurity Schema Framework, JSON array), \"ecs\" (Elastic Common Schema, JSON array), or \"xdm\" (Cortex Data Model, JSON array)"
+            "description": "Output format: \"cef\" (Common Event Format, newline-delimited), \"ocsf\" (Open Cybersecurity Schema Framework, JSON array), \"ecs\" (Elastic Common Schema, JSON array), or \"xdm\" (raw Cortex XDR events with sanctuary_* keys for an XDM dataset, JSON array)"
           },
           "since": {
             "type": "string",

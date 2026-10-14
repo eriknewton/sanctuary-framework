@@ -2,14 +2,13 @@
  * Sanctuary MCP Server - SIEM Export Tool
  *
  * Registers the audit_export_siem MCP tool that exports audit log entries
- * in standard SIEM formats (CEF, OCSF, ECS, and XDM).
+ * in standard SIEM formats (CEF, OCSF, ECS, and raw XDM events).
  *
  * Tier 1: Operator approval required. SIEM forwarding is an operator function;
- * the export bulk-decrypts audit events across all principals, each carrying its
- * policy tier and approve/deny decision, so auto-allowing it would hand the agent
- * a policy-inference oracle (no-read invariant, CLAUDE.md #7). The operator IS
- * allowed to see this structure, so the rich SIEM fields are preserved; only the
- * gate changed (Tier 3 → Tier 1; CISO MED-1).
+ * even with the approval gate, this agent-callable tool returns the export body
+ * to the caller. It therefore formats only the caller-scoped, redacted audit view
+ * instead of raw audit details that could reveal policy tiers, rule ids, agent
+ * DIDs, sessions, or free-text policy reasons.
  */
 
 import type { ToolDefinition } from "../router.js";
@@ -56,7 +55,7 @@ export function createSIEMTools(
             type: "string",
             enum: SIEM_EXPORT_FORMATS,
             description:
-              'Output format: "cef" (Common Event Format, newline-delimited), "ocsf" (Open Cybersecurity Schema Framework, JSON array), "ecs" (Elastic Common Schema, JSON array), or "xdm" (Cortex Data Model, JSON array)',
+              'Output format: "cef" (Common Event Format, newline-delimited), "ocsf" (Open Cybersecurity Schema Framework, JSON array), "ecs" (Elastic Common Schema, JSON array), or "xdm" (raw Cortex XDR events with sanctuary_* keys for an XDM dataset, JSON array)',
           },
           since: {
             type: "string",

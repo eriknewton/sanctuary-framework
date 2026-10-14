@@ -1,26 +1,30 @@
-# Cortex XDM Pack
+# Cortex XDM Field Mapping
 
 This pack targets the `audit_export_siem` Cortex raw-event JSON array
 (`format: "xdm"`). The export uses raw keys with a sanctuary_ prefix so they do not
-collide with the modeled XDM namespace; the modeling rule maps those raw
-keys into XDM, including the acting principal at `xdm.source.user.username`.
+collide with the modeled XDM namespace. The mapping file lists where those raw
+keys should land in an XDM dataset, including the acting principal sentinel at
+`xdm.source.user.username`.
 
 Files:
 
-- `ModelingRules/SanctuaryAudit_1_0/SanctuaryAudit_1_0.xif`: modeling rule text that maps the raw exported fields to XDM fields.
-- `ModelingRules/SanctuaryAudit_1_0/SanctuaryAudit_1_0_schema.json`: raw-field schema used by the modeling rule.
-- `ModelingRules/SanctuaryAudit_1_0/SanctuaryAudit_1_0.yml`: content-pack modeling rule descriptor.
-- `CorrelationRules/*.yml`: two correlation-rule templates over the modeled field set.
+- `xdm-field-mapping.json`: raw `sanctuary_*` field mapping for an XDM dataset.
 
-Suggested charts to build after a tenant import drill:
+Suggested detections to build after a tenant import drill:
 
-- deny count over time: `_time`, `sanctuary.audit.decision`
-- operations by outcome: `xdm.event.operation`, `xdm.event.outcome`
-- recent denied operations: `_time`, `xdm.event.operation`, `sanctuary.audit.result`
+- failures by operation over a time window: `sanctuary_time`,
+  `sanctuary_event_operation`, `sanctuary_event_outcome`,
+  `sanctuary_audit_result`, `_time`, `xdm.event.operation`,
+  `xdm.event.outcome`
+- denied operations by coarse decision: `sanctuary_event_operation_sub_type`,
+  `sanctuary_audit_decision`, `xdm.event.operation_sub_type`,
+  `sanctuary.audit.decision`
+- export volume by caller sentinel: `sanctuary_source_user_username`,
+  `xdm.source.user.username`
 
-Verified in this repository: the JSON and YAML files parse, the XIF references
-match the raw and modeled field tables, and formatter fixtures produce the raw
-fields.
+Verified in this repository: the JSON mapping file matches the formatter raw
+field table, README field references stay inside the raw and destination field
+tables, and formatter fixtures produce the raw fields.
 
-Not verified here: importing into a live Cortex tenant, compiling the `.xif`
-inside a tenant repository, loading dashboards, or producing live incidents/cases.
+Not verified here: importing into a live Cortex tenant or producing live
+incidents or cases. No Cortex importable content ships here.

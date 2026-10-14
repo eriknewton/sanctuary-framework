@@ -5,22 +5,17 @@
  * - CEF (Common Event Format)
  * - OCSF (Open Cybersecurity Schema Framework)
  * - ECS (Elastic Common Schema)
- * - XDM (Cortex Data Model)
+ * - XDM raw events (`sanctuary_*` keys for Cortex XDM modeling)
  *
  * Used by the Tier 1 `audit_export_siem` tool to export events for SIEM ingestion.
  *
- * SECURITY (property #11, no-policy-inference; CISO MED-1 2026-06-15): because
- * `audit_export_siem` is a Tier 1 export tool, these formatters consume
+ * SECURITY (property #11, no-policy-inference; CISO MED-1 2026-06-15): this
+ * tool returns the export body to the calling agent, so these formatters consume
  * ONLY the agent-facing ALLOWLIST view of an entry (timestamp, operation, result,
  * has_details). They do NOT read the raw audit `details`, so the policy `tier`,
  * the matched `rule_id`, the agent DID, the session id, and the
  * threshold-bearing free-text `reason` can never ride out through a SIEM record.
  * Severity is derived from `result` only - never from the policy tier.
- *
- * A FULL-FIDELITY operator SIEM export (tier-derived severity, agent DID, session
- * correlation) is a legitimate operator need but belongs behind an operator
- * approval gate; `audit_export_siem` is Tier 1 for that reason (see
- * siem-tools.ts).
  *
  * ECS mapping table (source -> exported field):
  * - constant -> ecs.version
@@ -352,7 +347,7 @@ export function formatAsECS(view: AgentAuditView): ECSObject {
   };
 }
 
-// ── XDM (Cortex Data Model) Formatter ───────────────────────────────────
+// ── XDM Raw-Event Formatter ─────────────────────────────────────────────
 
 export interface XDMObject {
   sanctuary_time: number | null;
@@ -372,8 +367,8 @@ export interface XDMObject {
 /**
  * Format an agent-facing audit view as Cortex raw-event JSON for XDM modeling.
  *
- * Raw keys deliberately avoid the `xdm.*` namespace; Cortex data model rules map
- * these fields into modeled XDM fields, including `xdm.source.user.username`.
+ * Raw keys deliberately avoid the `xdm.*` namespace; the field mapping file
+ * lists the XDM homes for these fields, including `xdm.source.user.username`.
  */
 export function formatAsXDM(view: AgentAuditView): XDMObject {
   const decision = agentDecision(view);

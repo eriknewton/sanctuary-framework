@@ -1,10 +1,10 @@
-# Sanctuary SIEM Content Pack
+# Sanctuary SIEM Field Mappings
 
-This directory contains repo-local SIEM integration content for the redacted
+This directory contains repo-local field mapping files for the redacted
 `audit_export_siem` output formats:
 
-- `elastic/`: Elastic Common Schema field mapping, ingest pipeline, detection-rule templates, and suggested chart fields for `format: "ecs"`.
-- `cortex-xdm/`: Cortex Data Model schema/modeling content and correlation-rule templates for `format: "xdm"`.
+- `elastic/`: Elastic Common Schema field mapping for `format: "ecs"`.
+- `cortex-xdm/`: raw `sanctuary_*` to XDM field mapping for `format: "xdm"`.
 
 ## Mapping
 
@@ -14,20 +14,36 @@ categorization pairing `event.category` with `event.type`; the coarse decision
 is represented as `event.outcome` plus `sanctuary.audit.decision`, so a denied
 decision never reads as allowed.
 
-| Source | ECS field | XDM field |
-| --- | --- | --- |
-| timestamp | `@timestamp` | raw `sanctuary_time`, modeled `_time` |
-| event constants | `event.kind`, `event.category`, `event.type` | raw `sanctuary_event_type`, modeled `xdm.event.type` |
-| operation | `event.action` | raw `sanctuary_event_operation`, modeled `xdm.event.operation` |
-| operation description | `event.action` plus constant `event.provider` | raw `sanctuary_event_description`, modeled `xdm.event.description` |
-| coarse allow or deny | `event.severity`, `sanctuary.audit.decision` | raw `sanctuary_event_operation_sub_type` and `sanctuary_audit_decision`, modeled `xdm.event.operation_sub_type` and `sanctuary.audit.decision` |
-| result | `event.outcome`, `sanctuary.audit.result` | raw `sanctuary_event_outcome`, `sanctuary_event_is_completed`, `sanctuary_audit_result`; modeled `xdm.event.outcome`, `xdm.event.is_completed`, `sanctuary.audit.result` |
-| product identity | `ecs.version`, `event.module`, `event.dataset`, `service.name`, `service.type` | raw `sanctuary_observer_product`, `sanctuary_observer_vendor`; modeled `xdm.observer.product`, `xdm.observer.vendor` |
-| caller identity | `user.id` fixed to self | raw `sanctuary_source_user_username`, modeled `xdm.source.user.username` fixed to self |
+| ECS field | XDM field |
+| --- | --- |
+| `@timestamp` | raw `sanctuary_time`, home `_time` |
+| `event.kind`, `event.category`, `event.type` | raw `sanctuary_event_type`, home `xdm.event.type` |
+| `event.action` | raw `sanctuary_event_operation`, home `xdm.event.operation` |
+| `event.provider` | raw `sanctuary_event_description`, home `xdm.event.description` |
+| `event.severity`, `sanctuary.audit.decision` | raw `sanctuary_event_operation_sub_type` and `sanctuary_audit_decision`, homes `xdm.event.operation_sub_type` and `sanctuary.audit.decision` |
+| `event.outcome`, `sanctuary.audit.result` | raw `sanctuary_event_outcome`, `sanctuary_event_is_completed`, `sanctuary_audit_result`; homes `xdm.event.outcome`, `xdm.event.is_completed`, `sanctuary.audit.result` |
+| `ecs.version`, `event.module`, `event.dataset`, `service.name`, `service.type` | raw `sanctuary_observer_product`, `sanctuary_observer_vendor`; homes `xdm.observer.product`, `xdm.observer.vendor` |
+| `user.id` | raw `sanctuary_source_user_username`, home `xdm.source.user.username` |
 
 No raw policy tier, rule id, agent DID, session id, raw deal terms, key material,
-or free-text policy reason is included. Fields without a standard home stay in
-ECS use the Sanctuary namespace.
+or free-text policy reason is included. Fields without a standard ECS home use
+the `sanctuary.audit.*` namespace. Constant exported fields include
+`ecs.version`, `event.kind`, `event.category`, `event.type`, `event.module`,
+`event.dataset`, `event.provider`, `service.name`, `service.type`, `user.id`,
+`sanctuary_event_type`, `sanctuary_event_is_completed`,
+`sanctuary_observer_product`, `sanctuary_observer_vendor`, and
+`sanctuary_source_user_username`.
+
+## Suggested Detections
+
+- failures by operation over a time window: `@timestamp`, `event.action`,
+  `event.outcome`, `sanctuary.audit.result`, `sanctuary_event_operation`,
+  `sanctuary_event_outcome`, `sanctuary_audit_result`
+- denied operations by coarse decision: `event.severity`,
+  `sanctuary.audit.decision`, `sanctuary_event_operation_sub_type`,
+  `sanctuary_audit_decision`
+- export volume by caller sentinel: `user.id`,
+  `sanctuary_source_user_username`, `service.name`
 
 ## Verification Bound
 
@@ -36,15 +52,14 @@ Verified in this repository:
 - formatter fixture parity across CEF, OCSF, ECS, and XDM
 - safe-decision projection reuse
 - no ECS or XDM field outside the mapping table
-- JSON, NDJSON, YAML, and XIF parsing for this pack
-- content-pack field references resolve to formatter raw fields or modeled fields
+- JSON mapping files and Markdown references name fields from the formatter tables
 
 Not verified here:
 
 - live Elastic tenant import
 - live Cortex XSIAM or Cortex XDR tenant import
-- live dashboards, detections, incidents, or cases
+- live detections, incidents, or cases
 
-These files follow the vendors' documented content shapes and were checked by
-repo tests for shape and field references only. They were not imported into a
-live tenant.
+No importable vendor content ships in this directory. These mapping files were
+checked by repo tests for field names only. They were not imported into a live
+tenant.
