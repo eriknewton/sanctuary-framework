@@ -1797,6 +1797,8 @@ let agentReachController = null;
 let agentReachRevision = 0;
 let agentReachInFlight = 0;
 let agentReachExpiry = null;
+// One pending slot: the newest subject asked for while a read holds admission, never a queue.
+let agentReachPendingId = null;
 async function readAgentReachBody(response) {
   if (!response.ok || !response.body) throw new Error("Reach unavailable");
   const reader = response.body.getReader();
@@ -1820,7 +1822,9 @@ async function loadAgentReach(agentId) {
     if (state.agentReach.agentId !== agentId) {
       ++agentReachRevision;
       agentReachController.abort();
-      state.agentReach = { state: "state_FAILED", agentId: agentId, data: null, readAt: Date.now() };
+      // This subject has not been read yet, so it waits as loading and never reads as a failed read.
+      agentReachPendingId = agentId;
+      state.agentReach = { state: "state_LOADING", agentId: agentId, data: null, readAt: 0 };
       rerender();
     }
     return;
@@ -1844,7 +1848,13 @@ async function loadAgentReach(agentId) {
       const response = await fetch(credentialedReadUrl("/api/posture/reach/" + encodeURIComponent(agentId), "GET"), { headers: headers, cache: "no-store", signal: controller.signal });
       if (controller.signal.aborted) { if (response.body) void response.body.cancel().catch(function () {}); throw new Error("Reach unavailable"); }
       return await readAgentReachBody(response);
-    } finally { agentReachInFlight--; }
+    } finally {
+      agentReachInFlight--;
+      const next = agentReachPendingId;
+      agentReachPendingId = null;
+      // The pending subject reads once admission is free, and only while its detail is still open.
+      if (next && next === state.selectedAgentId) void loadAgentReach(next);
+    }
   })();
   try {
     const data = await Promise.race([transport, expired]);
@@ -1906,8 +1916,8 @@ function renderAgentTimeline(agent, evidenceTab) {
   const entries = sourceLoaded(HUB + "/activity") ? state.activity.filter(function (e) { return e.agent_id === agent.agent_id; }).sort(function (a, b) { return String(b.emitted_at).localeCompare(String(a.emitted_at)); }) : null;
   const href = '#activity?agent=' + encodeURIComponent(agent.agent_id);
   const rows = entries && entries.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (e) {
-    // A category alone does not attest an allow verdict; the historical mark names only a served outcome.
-    const verdict = e.category === "denial" ? ["bad", "DENIED"] : e.category === "approval" ? ["neutral", "APPROVED"] : ["neutral", "RECORDED"];
+    // The approval category also holds requests and denied or resolved decisions, so only a denial names an outcome.
+    const verdict = e.category === "denial" ? ["bad", "DENIED"] : ["neutral", "RECORDED"];
     const layer = e.category === "egress" || /egress/.test(e.display_template_id) ? "Castle Wall" : ["approval", "denial", "policy_decision"].includes(e.category) ? "Charter" : "Layer Unknown";
     return '<div class="agent-event"><time>' + escHtml(relTimeFromIso(e.emitted_at)) + '</time>' + overviewChip(verdict[0], verdict[1]) +
       '<a href="' + escHtml(href) + '" title="Evidence entry ' + escHtml(e.entry_id) + '">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) + '<small>Entry ' + escHtml(e.entry_id) + '</small></a><span class="muted">' + layer + '</span>' +

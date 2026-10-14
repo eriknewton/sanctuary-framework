@@ -1963,4 +1963,36 @@ describe("slice 6a Agents wired consumers", () => {
     expect(h.el.main!.innerHTML).not.toContain("&lt;img");
   });
 
+  it("6a a second agent opened while a reach read holds admission waits as loading, then reads once admission frees", async () => {
+    const sc = agentsScenario();
+    const second = { ...sc.agents[0]!, agent_id: "second-agent" };
+    let finishFirst!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0]!, second] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finishFirst = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    expect(calls).toEqual(["research-agent"]);
+    expect(h.el.main!.innerHTML).not.toContain("Reach read failed");
+    finishFirst(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent", "second-agent"]);
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    expect(h.el.main!.innerHTML).not.toContain("Reach read failed");
+  });
+
+  it("6a an approval-category entry is recorded, never marked approved, since that category also holds denied decisions", async () => {
+    const sc = agentsScenario();
+    const entry = { ...sc.activity[0]!, entry_id: "entry-approval", category: "approval" };
+    const { h } = await start("protected", { "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [entry] } })) });
+    detail(h); await settle();
+    h.click({ "data-action": "agent-tab", "data-tab": "activity" });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Entry entry-approval");
+    expect(html).toContain("RECORDED");
+    expect(html).not.toContain("APPROVED");
+  });
+
 });
