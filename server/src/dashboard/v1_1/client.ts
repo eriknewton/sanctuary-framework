@@ -28,6 +28,7 @@
  */
 
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
+import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -744,8 +745,16 @@ const TEMPLATES = {
   "activity.other": (a) => "Audit event recorded for agent " + arg(a,"agent_id","(fortress)") + "."
 };
 
+// Must match ACTIVITY_TEMPLATE_NAMESPACES in templates.ts, sourced from hub/constants.ts.
+const ACTIVITY_TEMPLATE_NAMESPACES = ${JSON.stringify(Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES))};
+
 function renderTemplate(id, args) {
-  const fn = TEMPLATES[id];
+  let fn = TEMPLATES[id];
+  if (!fn && typeof id === "string") {
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category.
+    const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => id.startsWith(prefix + "."));
+    if (namespace) fn = TEMPLATES[namespace];
+  }
   if (!fn) return "[unrecognized template: " + id + "]";
   try { return fn(args || []); } catch (e) { return "[template render failed: " + id + "]"; }
 }

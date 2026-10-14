@@ -22,6 +22,10 @@
  */
 
 import type { HubDisplayTemplateArg } from "../../contracts/v1.1/hub-events.js";
+import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
+
+// Must match ACTIVITY_TEMPLATE_NAMESPACES in client.ts, injected from hub/constants.ts.
+const ACTIVITY_TEMPLATE_NAMESPACES = Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES);
 
 /**
  * Render-context flags pass through to the template fn so a single template
@@ -251,7 +255,12 @@ export function renderTemplate(
   args: HubDisplayTemplateArg[],
   ctx: TemplateRenderContext = DEFAULT_CTX,
 ): string {
-  const renderer = TEMPLATES[templateId];
+  let renderer = TEMPLATES[templateId];
+  if (!renderer && typeof templateId === "string") {
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category.
+    const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => templateId.startsWith(`${prefix}.`));
+    if (namespace) renderer = TEMPLATES[namespace];
+  }
   if (!renderer) {
     return `[unrecognized template: ${templateId}]`;
   }
