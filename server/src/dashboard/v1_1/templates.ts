@@ -117,7 +117,8 @@ function arg(
  * client.ts.
  */
 function hasArgValue(args: HubDisplayTemplateArg[], kind: HubDisplayTemplateArg["kind"]): boolean {
-  const found = Array.isArray(args) ? args.find((a) => a.kind === kind) : undefined;
+  // A null element is skipped, as the client mirror skips it, so a malformed arg list reaches the diagnostic fallback.
+  const found = Array.isArray(args) ? args.find((a) => Boolean(a) && a.kind === kind) : undefined;
   return found !== undefined && typeof found.value === "string" && found.value.length > 0;
 }
 

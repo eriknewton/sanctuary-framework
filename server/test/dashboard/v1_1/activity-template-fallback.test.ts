@@ -226,6 +226,14 @@ describe("activity template namespace fallback", () => {
     expect(clientRenderer()(id, args)).toBe(`[unrecognized template: ${id}]`);
   });
 
+  it("keeps an operation id with a null agent arg on the diagnostic fallback in both renderers", () => {
+    // A null element is outside the typed contract; both mirrors of hasArgValue skip it rather than throw.
+    const id = `${HUB_ACTIVITY_TEMPLATE_NAMESPACES.other}.${OPERATIONS.other}`;
+    const args = [null] as unknown as HubDisplayTemplateArg[];
+    expect(renderTemplate(id, args)).toBe(`[unrecognized template: ${id}]`);
+    expect(clientRenderer()(id, args)).toBe(`[unrecognized template: ${id}]`);
+  });
+
   it("injects the complete hub namespace set into the client", () => {
     const script = getClientScript();
     const marker = "const ACTIVITY_TEMPLATE_NAMESPACES = ";
