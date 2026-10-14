@@ -7,6 +7,7 @@
  * be checked against it: with an audit log, the `AuditLog.query` result
  * object; without one, an empty array.
  */
+// fail-before-exempt: pins the shape main's audit log route already serves; this change adds no server behavior, so the pin passes before and after by design.
 
 import { describe, it, expect, afterEach } from "vitest";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
