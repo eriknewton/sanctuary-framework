@@ -606,21 +606,28 @@ describe("dashboard bounded independent hydration", () => {
 describe("D5 closure", () => {
   it.each(["approve", "deny"])("keeps the queue visible while %s is pending or rejected", async action => {
     vi.useFakeTimers(); let reject!: (reason: Error) => void;
-    const h = harness({ ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }) }); await settle();
+    const item = { item_id: "fixture", kind: "approval_pending", tier: "tier2", agent_id: "fixture", operation_category: "state_export", resolved: false, display_template_args: [] };
+    const h = harness({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [item, { ...item, item_id: "other" }] } })),
+      ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }),
+    }); await settle();
     runInContext(`
-      let hidden = false;
-      const count = { textContent: "1", classList: { add() {} } };
-      const get = document.getElementById;
-      document.getElementById = id => id === "queue-count" ? count : get(id);
-      const tile = { classList: { add() { hidden = true; } } };
+      state.route = "approvals"; rerender();
       const button = new Element();
       button.getAttribute = key => key === "data-action" ? "inbox-${action}" : key === "data-item-id" ? "fixture" : null;
-      button.closest = selector => selector === ".approval-tile" ? tile : null;
     `, h.context);
-    h.click(runInContext('button', h.context)); await settle();
-    expect(runInContext('count.textContent', h.context)).toBe("1"); expect(runInContext('hidden', h.context)).toBe(false);
-    reject(new Error("fixture rejection")); await settle();
-    expect(runInContext('count.textContent', h.context)).toBe("1"); expect(runInContext('hidden', h.context)).toBe(false);
+    // The live table and fortress count replace the removed tile stub, so these assertions observe actual hydration.
+    const assertQueue = () => {
+      expect(h.main.innerHTML).toContain('data-approval-row="fixture"');
+      expect(h.main.innerHTML).toContain('data-approval-row="other"');
+      expect(h.fortress.innerHTML).toContain('id="queue-count">2</span>');
+    };
+    assertQueue(); h.click(runInContext('button', h.context)); await settle(); assertQueue();
+    const controls = [...h.main.innerHTML.matchAll(/<button\b[^>]*data-action="inbox-(?:approve|deny)"[^>]*>/g)];
+    expect(controls).toHaveLength(2 * (2 + 1)); // Allow and Deny for two rows plus the selected drawer.
+    for (const button of controls) expect(button[0]).toContain('disabled title="Another decision is being sent."');
+    reject(new Error("fixture rejection")); await settle(); assertQueue();
+    expect(h.main.innerHTML).not.toContain('disabled title="Another decision is being sent."');
   });
   it.each(["BUTTON", "INPUT"])("never restores a decision %s onto another inbox row", async tag => {
     vi.useFakeTimers(); const h = harness(); await settle();
