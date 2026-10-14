@@ -25,7 +25,10 @@ export function agentsScenario(name = 'protected', now = Date.now()) {
       last_enforcement_evidence_at: null, freshness_window_ms: 5 * minute,
       verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 }, audit_integrity_ok: false,
       sealed_region_unverified_at_privilege: false, producer_authenticity: 'not_applicable' },
-    digest: { origin_machine: 'fixture-linux', window_start: at(60 * minute), window_end: at(0), total_operations: 1,
+    // Coverage fields take the server's fallback values (posture.ts): this digest claims no complete window.
+    digest: { origin_machine: 'fixture-linux', window_start: at(60 * minute), window_end: at(0),
+      window_complete: false, window_incomplete_reason: 'coverage_unknown', kernel_allow_overrides: 0,
+      blocked_destinations: [], blocked_destination_count: 0, total_operations: 1,
       failures: 1, kernel_blocks: 0, kernel_allows: 0, approvals_granted: 0, approvals_denied: 1, by_agent: [],
       chain_verified: false, chain_verdict: 'findings', integrity_finding_count: 1 },
     unwrapped: { origin_machine: 'fixture-linux', detection_method: 'config_file_presence', unwrapped: [] },
