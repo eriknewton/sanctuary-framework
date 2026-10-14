@@ -395,6 +395,8 @@ describe("Memory Integrity C2 encrypted attachment", () => {
     }
     expect(mutationInventory.sort()).toEqual([
       "exit/v2-memory-archive.ts:putPassagesIfAbsent",
+      // The Hermes memory bridge inserts owner-approved entries; its provenance context is pinned below.
+      "hermes-memory-bridge/bridge-core.ts:insertPassage",
       "sdw/adapters/claude-code-file-adapter.ts:putPassages",
       "sdw/adapters/codex-memory-file-adapter.ts:putPassages",
       "sdw/anthropic-memory-handler.ts:insertPassage",
@@ -409,6 +411,7 @@ describe("Memory Integrity C2 encrypted attachment", () => {
       let found: ts.FunctionLikeDeclaration | undefined;
       const visit = (node: ts.Node): void => {
         if ((ts.isFunctionDeclaration(node) && node.name?.text === name) ||
+            (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) ||
             (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name &&
               node.initializer !== undefined && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer)))) {
           found = ts.isVariableDeclaration(node) ? node.initializer as ts.FunctionLikeDeclaration : node;
@@ -434,6 +437,8 @@ describe("Memory Integrity C2 encrypted attachment", () => {
     expect(factoryProperties("sdw/anthropic-memory-handler.ts", "applyAnthropicMemoryCommand", "anthropicMemoryToolIngress")).toBe(2);
     expect(factoryProperties("sdw/anthropic-memory-handler.ts", "mutateByReplace", "anthropicMemoryToolIngress")).toBe(1);
     expect(factoryProperties("sdw/memory-tools.ts", "createSdwMemoryTools", "memoryInsertIngress")).toBe(1);
+    // Bridge inserts must build their provenance context with the code-owned memory_insert factory, never a caller-supplied one.
+    expect(factoryProperties("hermes-memory-bridge/bridge-core.ts", "startInsert", "memoryInsertIngress")).toBe(1);
     expect(factoryProperties("sdw/adapters/claude-code-file-adapter.ts", "screenClaudeCodeMemorySnapshot", "fileImportIngress")).toBe(1);
     expect(factoryProperties("sdw/adapters/codex-memory-file-adapter.ts", "screenCodexMemorySnapshot", "fileImportIngress")).toBe(1);
     expect(factoryProperties("sdw/memory-transcode.ts", "archiveFileInput", "memoryTranscodeIngress")).toBe(1);
