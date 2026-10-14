@@ -58,7 +58,7 @@ function Topbar({ attestationState = 'verified', showAttestation = true }) {
       </div>
       <div className="topbar-actions">
         <button className="btn btn-quiet" title="Theme">◐</button>
-        <button className="btn btn-danger">Lockdown</button>
+        <button className="btn btn-danger">Lock down</button>
       </div>
     </header>
   );

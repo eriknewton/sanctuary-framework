@@ -25,6 +25,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 
 const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
   ok: status >= 200 && status < 300,
@@ -360,6 +361,63 @@ describe("slice 2 shell wired consumers", () => {
     const pop = h.el["posture-seal-pop"]!.innerHTML;
     expect(pop).not.toContain("holds every agent");
     expect(pop).toContain("Lockdown revokes network access for every confined agent; agents keep running and keep local access.");
+  });
+
+  it("the lockdown top-bar button renders the Tier 1 copy table exactly for every top-bar state", async () => {
+    vi.useFakeTimers();
+    const h = boot();
+    await settle();
+    for (const stateName of ["idle", "pending", "partial", "engaged"] as const) {
+      runInContext(`state.tier1.lockdown.state = ${JSON.stringify(stateName)}; renderTopbar();`, h.context);
+      expect(h.el["btn-lockdown"]!.textContent, stateName).toBe(TIER1_BUTTON_COPY.lockdown[stateName]);
+    }
+  });
+
+  it("agent-row Tier 1 controls render approved labels and removal failures toast with the removal label", async () => {
+    vi.useFakeTimers();
+    const failures = [
+      { status: 422, body: { error: "unsupported request refused" } },
+      { status: 500, body: { error: "controller unavailable" } },
+    ];
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({
+        data: {
+          agents: [{
+            agent_id: "agent-alpha",
+            status: "active",
+            capabilities: { can_lockdown: true, can_unwrap: true },
+          }],
+        },
+      })),
+      "/api/hub/agents/agent-alpha/unwrap": () => {
+        const next = failures.shift()!;
+        return Promise.resolve(response(next.body, next.status));
+      },
+    });
+    await settle();
+    const labelsByAction = runInContext(`
+      const html = renderFortressAgentsCard();
+      Object.fromEntries(
+        Array.from(html.matchAll(/data-action="agent-([^"]+)"[^>]*>([^<]*)<\\/button>/g))
+          .map(function (match) { return [match[1], match[2]]; })
+      );
+    `, h.context) as Record<string, string>;
+
+    expect(labelsByAction.lockdown).toBe(TIER1_BUTTON_COPY.lockdown.idle);
+    expect(labelsByAction.unwrap).toBe(TIER1_BUTTON_COPY.unwrap.idle);
+
+    runInContext("var capturedToasts = []; toast = function (message, kind) { capturedToasts.push({ message, kind }); };", h.context);
+    await runInContext('onAgentControl("agent-alpha", "unwrap")', h.context);
+    await runInContext('onAgentControl("agent-alpha", "unwrap")', h.context);
+
+    const messages = runInContext("capturedToasts.map(function (toast) { return toast.message; })", h.context) as string[];
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toContain('Sanctuary cannot apply "Remove protection" for this agent: unsupported request refused');
+    expect(messages[1]).toContain('"Remove protection" failed: controller unavailable');
+    for (const message of messages) {
+      expect(message).toContain("Remove protection");
+      expect(message).not.toMatch(/wrap/i);
+    }
   });
 
   it("a layer line whose word is Unknown never wears the pass dot, in Enforcement or the seal popover", async () => {
