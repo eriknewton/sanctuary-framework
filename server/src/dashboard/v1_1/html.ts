@@ -1812,8 +1812,9 @@ body {
 }
 .approval-table tr.sel td {
   background: var(--indigo-bg);
-  box-shadow: inset 2px 0 0 var(--indigo);
 }
+/* The 2px selection marker is the design-system stroke-marker, drawn once per row. */
+.approval-table tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--indigo); }
 .approval-table .sect td {
   background: var(--surface-2); color: var(--ink-2);
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
@@ -1844,6 +1845,8 @@ body {
 }
 .approval-effects strong { display: block; margin-bottom: 4px; }
 .approval-effects p { color: var(--ink-2); font-size: var(--text-sm); }
+/* Ten characters in "Allow once", plus the button insets, keep Cancel in the same hit area. */
+.approval-tier1-step { min-inline-size: calc(10ch + 2 * var(--space-4)); }
 .approval-tier-note {
   margin: 12px 16px 0; padding: 10px;
   border: 1px solid var(--ochre-line); border-radius: var(--rad);
@@ -1871,8 +1874,9 @@ body {
 }
 .approval-empty h3 { margin: 6px 0; }
 .approval-empty p { margin: 0 0 12px; }
+/* 1100px is the design-system stacked-pair breakpoint; a zero minimum keeps long cells inside the column. */
 @media (max-width: 1100px) {
-  .approval-layout { grid-template-columns: 1fr; }
+  .approval-layout { grid-template-columns: minmax(0, 1fr); }
   .approval-drawer { position: static; }
 }
 .ambient-posture {

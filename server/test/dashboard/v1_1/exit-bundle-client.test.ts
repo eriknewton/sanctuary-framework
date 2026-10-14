@@ -85,6 +85,8 @@ function makeInboxActionSandbox(): {
   const wrapper = `
     return async function invoke(stateObj, itemId, action, apiReturn) {
       var state = stateObj;
+      state.approvals = { inFlightItemId: null };
+      var resetApprovalConsent = function() {};
       var api = async function() { return apiReturn; };
       var toast = function() {};
       var fetchAll = async function() {};
