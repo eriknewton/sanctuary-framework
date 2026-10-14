@@ -75,6 +75,9 @@ export interface CharterApprovalBridge {
  * hub's own enqueued ids (`task.review.*`, `agent.*`), because the id is the
  * routing key: `HubService.resolveInboxItem` sends anything under this prefix
  * to the bridge and everything else to `HubInboxStore`.
+ *
+ * Must match CHARTER_APPROVAL_ITEM_ID_PREFIX in server/src/dashboard/v1_1/client.ts,
+ * which uses it to say where a decision on a held item is recorded.
  */
 export const CHARTER_APPROVAL_ITEM_ID_PREFIX = "charter.approval.";
 

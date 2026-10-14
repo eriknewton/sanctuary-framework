@@ -261,6 +261,14 @@ describe("layout rules the slice holds", () => {
     expect(d.get("grid-template-columns")).toBe("minmax(0, 1fr)");
   });
 
+  it("below 1400px the Approvals drawer stacks under the queue so the table keeps every column", () => {
+    // 1400 = the table's 654px of columns plus the 742px the rail, padding, 420px drawer and gap take at 1280, rounded up.
+    const stacked = rules.filter((r) => r.media === "@media (max-width: 1400px)");
+    const by = (s: string) => new Map(stacked.filter((r) => r.selector === s).flatMap((r) => r.decls));
+    expect(by(".approval-layout").get("grid-template-columns")).toBe("minmax(0, 1fr)");
+    expect(by(".approval-drawer").get("position")).toBe("static");
+  });
+
   it("below 1000px the top bar drops the brand and collapses search to its icon until focused", () => {
     const narrow = rules.filter((r) => r.media === "@media (max-width: 1000px)");
     const by = (s: string) => new Map(narrow.filter((r) => r.selector === s).flatMap((r) => r.decls));
