@@ -439,10 +439,10 @@ describe("getProtectionSnapshot", () => {
 
   it("echoes the 4-card layer labels so the HTML can match on them", async () => {
     const snap = await getProtectionSnapshot(baseSources());
-    expect(snap.layers.l1.label).toBe("L1 Cognitive");
-    expect(snap.layers.l2.label).toBe("L2 Operational");
-    expect(snap.layers.l3.label).toBe("L3 Disclosure");
-    expect(snap.layers.l4.label).toBe("L4 Reputation");
+    expect(snap.layers.l1.label).toBe("Cognitive");
+    expect(snap.layers.l2.label).toBe("Operational");
+    expect(snap.layers.l3.label).toBe("Selective Disclosure");
+    expect(snap.layers.l4.label).toBe("Verifiable Reputation");
   });
 
   it("flips to red when aggregator sources indicate a compromised L1 via null identity + failure-heavy audit", async () => {
@@ -784,6 +784,16 @@ describe("getProtectionSnapshot", () => {
       expect(snap.overall.light).toBe("yellow");
       expect(snap.overall.headline).toMatch(
         /Castle Wall degraded \(not enforcing\)/
+      );
+    });
+
+    it("names the degraded legacy operational layer in the enforcing no-TEE headline", async () => {
+      const snap = await getProtectionSnapshot(
+        fullConfigSources(stubAuditLog([cwArmEntry()]), { teeAvailable: false })
+      );
+      expect(snap.overall.light).toBe("green");
+      expect(snap.overall.headline).toBe(
+        "Castle Wall enforcing, Operational layer degraded (no TEE on this host)"
       );
     });
   });

@@ -4,6 +4,15 @@ import { renderPostureAgentHTML } from "../../src/principal-policy/posture-agent
 import { renderPostureEvidenceHTML } from "../../src/principal-policy/posture-evidence-html.js";
 import { POSTURE_ROOT_TOKENS_CSS } from "../../src/principal-policy/posture-html-shared.js";
 import { PAPER_INK_ROOT_TOKENS_CSS } from "../../src/dashboard/design-tokens.js";
+import { CONSOLE_FONT_FACE_CSS } from "../../src/dashboard/design-fonts.js";
+import {
+  NON_TEXT_FLOOR,
+  contrast,
+  cssRules,
+  inlineStyle,
+  ownStyleProblems,
+  themeTokens,
+} from "../dashboard/console-style-helpers.js";
 
 /**
  * Extract the first `:root { ... }` custom-property block from a rendered
@@ -88,5 +97,131 @@ describe("posture :root design-token block - one shared source, zero cross-surfa
       // ground; must match --paper in server/src/dashboard/design-tokens.ts).
       expect(html).toContain("--paper: #f4f6fa;");
     }
+  });
+
+  it("all three posture surfaces load the bundled faces and carry no local palette, foreign font, or remote resource", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(ownStyleProblems(html, {
+        fonts: CONSOLE_FONT_FACE_CSS,
+        tokens: PAPER_INK_ROOT_TOKENS_CSS,
+      })).toEqual([]);
+    }
+  });
+
+  it("all three posture surfaces boot dark by default while preserving a stored light choice", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(html).toContain('sessionStorage.getItem("sanctuary-v11-theme") === "light"');
+      expect(html).toContain('setAttribute("data-theme", "dark")');
+    }
+  });
+
+  it("all three posture surfaces render no em dash and no L-numbered layer labels", () => {
+    for (const html of [
+      renderPostureHomeHTML(),
+      renderPostureAgentHTML(),
+      renderPostureEvidenceHTML(),
+    ]) {
+      expect(html).not.toContain("\u2014");
+      expect(html).not.toContain("&mdash;");
+      const text = html
+        .replace(/<script\b[\s\S]*?<\/script\b[^>]*>/gi, " ")
+        .replace(/<style\b[\s\S]*?<\/style\b[^>]*>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ");
+      expect(text).not.toMatch(/\bL[1-4]\b/i);
+    }
+  });
+
+  it("the shared status pills give every state a shape, and Unknown does not wear the pass shape", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain(".pill.green::before { content: \"\\25CF\"; }");
+    expect(html).toContain(".pill.amber::before { content: \"\\25B2\"; }");
+    expect(html).toContain(".pill.red::before { content: \"\\25A0\"; }");
+    expect(html).toContain(".pill.neutral::before { content: \"\\2013\"; }");
+    expect(html).toContain(".pill.unknown::before { content: \"\\25CB\"; }");
+    const unknownRule = html.match(/\.pill\.unknown::before \{[^}]+}/)?.[0] ?? "";
+    expect(unknownRule).not.toContain("\\25CF");
+  });
+
+  it("the agent reach gap line renders in rust even when it also uses evidence text", () => {
+    const rules = cssRules(inlineStyle(renderPostureAgentHTML()));
+    const evidenceRule = rules.find((rule) => rule.selector === ".evidence");
+    const gapRule = rules.find((rule) => rule.selector === ".evidence.err");
+    expect(gapRule?.decls).toContainEqual(["color", "var(--rust)"]);
+    expect(rules.indexOf(gapRule!)).toBeGreaterThan(rules.indexOf(evidenceRule!));
+  });
+
+  it("the Home reconnecting label uses the same ellipsis character as connecting and loading", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain("Connecting…");
+    expect(html).toContain("Loading…");
+    expect(html).toContain("Reconnecting…");
+    expect(html).not.toContain("Reconnecting...");
+  });
+
+  it("the posture control edge token clears the 3:1 non-text floor in both themes", () => {
+    const homeRules = cssRules(inlineStyle(renderPostureHomeHTML()));
+    const evidenceRules = cssRules(inlineStyle(renderPostureEvidenceHTML()));
+    const decl = (rules: ReturnType<typeof cssRules>, selector: string, property: string) =>
+      rules.find((rule) => rule.selector === selector)?.decls.find(([key]) => key === property)?.[1];
+    expect(decl(homeRules, ".fleet-link", "border")).toContain("var(--ink-3)");
+    expect(decl(homeRules, ".approval-actions button", "border")).toContain("var(--ink-3)");
+    expect(decl(homeRules, "button.guided", "border")).toContain("var(--ink-3)");
+    expect(decl(homeRules, ".story-toggle input", "accent-color")).toBe("var(--indigo)");
+    expect(decl(homeRules, "html", "color-scheme")).toBe("light");
+    expect(decl(homeRules, 'html[data-theme="dark"]', "color-scheme")).toBe("dark");
+    expect(decl(evidenceRules, ".filter-group input, .filter-group select", "border")).toContain("var(--ink-3)");
+    expect(renderPostureHomeHTML()).toContain(".pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate); }");
+
+    const tokens = themeTokens();
+    for (const theme of ["light", "dark"] as const) {
+      for (const fill of ["surface", "surface-2", "paper"] as const) {
+        expect(contrast(tokens[theme]["ink-3"]!, tokens[theme][fill]!), `${theme} ${fill}`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+      }
+      expect(contrast(tokens[theme]["slate"]!, tokens[theme]["slate-bg"]!), `${theme} unknown edge`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+      expect(contrast(tokens[theme]["sage"]!, tokens[theme]["surface-2"]!), `${theme} approve edge`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+      expect(contrast(tokens[theme]["rust"]!, tokens[theme]["surface-2"]!), `${theme} deny edge`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+      expect(contrast(tokens[theme]["indigo"]!, tokens[theme]["surface"]!), `${theme} Apply fill`).toBeGreaterThanOrEqual(NON_TEXT_FLOOR);
+    }
+  });
+
+  it("evidence page layer rows render Health Score names while preserving raw tokens as titles", () => {
+    const html = renderPostureEvidenceHTML();
+    const start = html.indexOf("function esc(s)");
+    const end = html.indexOf("function buildQueryParams()");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const entriesPanel = { innerHTML: "" };
+    const document = {
+      getElementById: (id: string) => id === "entries-panel" ? entriesPanel : null,
+    };
+    const ops = ["identity", "gate", "proof", "reputation"];
+    const entries = ["l1", "l2", "l3", "l4"].map((layer, i) => ({
+      timestamp: new Date(Date.UTC(2026, 9, 14, 12, i)).toISOString(),
+      layer,
+      operation: ops[i],
+      result: "success",
+      identity_id: `id-${i}`,
+      details: {},
+    }));
+    const source = `${html.slice(start, end)}
+renderEntries({ entries, total: entries.length });
+return entriesPanel.innerHTML;`;
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const rendered = new Function("document", "entries", "entriesPanel", "window", source)(document, entries, entriesPanel, {}) as string;
+
+    expect(rendered).toContain('title="l1">Cognitive</span>');
+    expect(rendered).toContain('title="l2">Operational</span>');
+    expect(rendered).toContain('title="l3">Selective Disclosure</span>');
+    expect(rendered).toContain('title="l4">Verifiable Reputation</span>');
+    expect(rendered.replace(/<[^>]+>/g, " ")).not.toMatch(/\bL[1-4]\b/i);
   });
 });

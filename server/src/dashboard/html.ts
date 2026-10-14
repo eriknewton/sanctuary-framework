@@ -12,6 +12,7 @@
 import type { ProtectionSnapshot } from "./aggregator.js";
 import { CONSOLE_FONT_FACE_CSS } from "./design-fonts.js";
 import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "./design-tokens.js";
+import { LEGACY_LAYER_NAMES, legacyLayerName } from "./legacy-layer-names.js";
 import {
   PROTECTION_HERO_COPY,
   protectionHeroCopyForLight,
@@ -41,6 +42,21 @@ function escHtml(value: unknown): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function legacyLayerPill(layer: unknown): string {
+  const raw = String(layer ?? "");
+  const label = legacyLayerName(raw);
+  if (!label) {
+    return `<span class="layer-pill neutral" title="${escHtml(raw)}">${escHtml(raw)}</span>`;
+  }
+  return `<span class="layer-pill" title="${escHtml(raw)}">${escHtml(label)}</span>`;
+}
+
+function auditFilterButtons(): string {
+  return (Object.entries(LEGACY_LAYER_NAMES) as Array<[keyof typeof LEGACY_LAYER_NAMES, string]>)
+    .map(([token, name]) => `<button data-filter="${escHtml(token)}">${escHtml(name)}</button>`)
+    .join("");
 }
 
 // must match shieldStatusMarkForLight in this file's embedded client script.
@@ -137,7 +153,7 @@ function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
   const score = l4.layer_score ?? 100;
 
   const summaryLine = `
-    <div><dt>L4 score</dt><dd>${escHtml(score)} / 100</dd></div>
+    <div><dt>${escHtml(LEGACY_LAYER_NAMES.l4)} score</dt><dd>${escHtml(score)} / 100</dd></div>
     <div><dt>Attestations</dt><dd>${escHtml(ev.attestation_count)}</dd></div>
     <div><dt>Verified tiers</dt><dd>${escHtml(tierSovereign)} sovereign · ${escHtml(tierDegraded)} degraded</dd></div>
     <div><dt>Lower tiers</dt><dd>${escHtml(tierSelf)} self · ${escHtml(tierUnverified)} unverified</dd></div>
@@ -219,7 +235,7 @@ export function renderDashboardHTML(options: DashboardHTMLOptions): string {
     : audit
         .map((entry) => `<tr data-kind="${escHtml(entry.layer)}" data-op="${escHtml(entry.operation)}">
           <td class="mono time">${escHtml(new Date(entry.timestamp).toLocaleTimeString())}</td>
-          <td class="layer-pill">${escHtml(entry.layer.toUpperCase())}</td>
+          <td>${legacyLayerPill(entry.layer)}</td>
           <td class="mono">${escHtml(entry.operation)}</td>
           <td class="result-${escHtml(entry.result)}">${escHtml(entry.result)}</td>
         </tr>`)
@@ -626,10 +642,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
       <div class="audit-filters">
         <div class="filter-row" id="audit-filter">
           <button class="active" data-filter="all">All</button>
-          <button data-filter="l1">Cognitive</button>
-          <button data-filter="l2">Operational</button>
-          <button data-filter="l3">Disclosure</button>
-          <button data-filter="l4">Reputation</button>
+          ${auditFilterButtons()}
         </div>
       </div>
       <table>
@@ -662,6 +675,19 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     return String(value)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  }
+  const LEGACY_LAYER_NAMES_CLIENT = ${JSON.stringify(LEGACY_LAYER_NAMES)};
+  function legacyLayerLabel(layer) {
+    return Object.prototype.hasOwnProperty.call(LEGACY_LAYER_NAMES_CLIENT, layer)
+      ? LEGACY_LAYER_NAMES_CLIENT[layer]
+      : null;
+  }
+  function layerPill(layer) {
+    const raw = String(layer == null ? "" : layer);
+    const label = legacyLayerLabel(raw);
+    const text = label || raw;
+    return '<span class="layer-pill' + (label ? '' : ' neutral') + '" title="' +
+      esc(raw) + '">' + esc(text) + '</span>';
   }
   function fmtTime(iso) {
     try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
@@ -753,7 +779,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
     body.innerHTML = visible.map(e => (
       '<tr data-kind="' + esc(e.layer) + '" data-op="' + esc(e.operation) + '">' +
         '<td class="mono time">' + esc(fmtTime(e.timestamp)) + '</td>' +
-        '<td><span class="layer-pill">' + esc(String(e.layer).toUpperCase()) + '</span></td>' +
+        '<td>' + layerPill(e.layer) + '</td>' +
         '<td class="mono">' + esc(e.operation) + '</td>' +
         '<td class="result-' + esc(e.result) + '">' + esc(e.result) + '</td>' +
       '</tr>'

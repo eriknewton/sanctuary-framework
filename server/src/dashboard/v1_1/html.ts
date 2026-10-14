@@ -47,6 +47,15 @@ export interface DashboardV11HtmlOptions {
   embedClient?: boolean;
 }
 
+// Five compact tiles plus four gaps fit one row; below that use three then two.
+const OVERVIEW_TILE_MIN_PX = 154; // Existing compact Overview tile width floor.
+const OVERVIEW_TILE_GAP_PX = 10; // Existing Overview grid spacing.
+const OVERVIEW_TILE_COUNT = 5;
+const OVERVIEW_FULL_ROW_MIN_PX = OVERVIEW_TILE_COUNT * OVERVIEW_TILE_MIN_PX + (OVERVIEW_TILE_COUNT - 1) * OVERVIEW_TILE_GAP_PX;
+// Below three compact tiles plus two gaps, use one column for narrow screens.
+const OVERVIEW_COMPACT_COLUMNS = 3;
+const OVERVIEW_COMPACT_ROW_MIN_PX = OVERVIEW_COMPACT_COLUMNS * OVERVIEW_TILE_MIN_PX + (OVERVIEW_COMPACT_COLUMNS - 1) * OVERVIEW_TILE_GAP_PX;
+
 const STYLES = String.raw`${CONSOLE_FONT_FACE_CSS}
 ${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
@@ -2034,16 +2043,34 @@ body {
 .state-chip.locked { color: var(--locked); background: var(--locked-bg); border-color: var(--locked-line); }
 .state-chip.locked i { background: var(--locked); border-radius: 2px; }
 
+/* Overview and outbound-card chips keep the glyph with its word. */
+.overview-page .overview-chip, .outbound-card .overview-chip { flex-wrap: wrap; border-radius: 6px; /* 6px stays below the tile's 8px corner. */ }
+.overview-chip-head { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.overview-chip-detail { display: block; flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; }
+.overview-page .overview-tier { white-space: nowrap; }
+.outbound-card .outbound-reason { display: block; }
+.outbound-card .outbound-counts { display: flex; flex-wrap: wrap; gap: 16px; }
+.outbound-card .outbound-table { table-layout: fixed; }
+.outbound-card .outbound-table td { overflow-wrap: anywhere; }
+
 /* Slice 3 Overview: dense security-console composition. Every capped list
    prints "showing M of N" in its own panel so bounded rendering cannot hide
    queue depth, findings or rows. */
 .overview-page {
-  --overview-tile-min: 154px;
+  container: overview / inline-size;
+  --overview-tile-min: ${OVERVIEW_TILE_MIN_PX}px;
+  --overview-tile-gap: ${OVERVIEW_TILE_GAP_PX}px;
   --overview-decision-table-min: 640px; /* 640 = 6 decision columns at the compact operator-console floor. */
   --overview-agent-table-min: 820px; /* 820 = 9 agent columns including the sticky identity column. */
   display: flex; flex-direction: column; gap: 16px;
 }
-.overview-tiles { container-type: inline-size; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--overview-tile-min)), 1fr)); gap: 10px; }
+.overview-tiles { container-type: inline-size; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--overview-tile-gap); }
+@container overview (min-width: ${OVERVIEW_COMPACT_ROW_MIN_PX}px) {
+  .overview-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container overview (min-width: ${OVERVIEW_FULL_ROW_MIN_PX}px) {
+  .overview-tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
 .overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: inherit; text-decoration: none; }
 .overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; text-decoration: none; }
 .overview-tile .ot-label:hover { color: var(--indigo); text-decoration: underline; }

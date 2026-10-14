@@ -5737,6 +5737,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
 
         // Print dashboard URL
+        // Must match DASHBOARD_URL_LINE and DASHBOARD_TOKEN_HINT_CHARS in server/test/demo/seed-fortress.test.ts:
+        // the URL line, then one hint line showing the token's first and last four characters.
         process.stderr.write(
           `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
         );
