@@ -87,6 +87,7 @@ describe("dashboard bounded independent hydration", () => {
   it("publishes home without waiting for anomaly findings", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/anomaly/findings": pending }); await settle();
     expect(h.main.innerHTML).toContain("fixture-mac"); expect(h.main.innerHTML).toContain("not a confirmation of zero findings");
+    // Retarget reason: this pins the failed findings read, not a later checked-empty detector state.
     await vi.advanceTimersByTimeAsync(DEADLINE_MS); expect(h.main.innerHTML).toContain("Retry Anomaly findings</button>");
   });
   it.each([401, 403, 500])("shows an honest HTTP %s failure", async (status) => {
@@ -330,6 +331,7 @@ describe("dashboard bounded independent hydration", () => {
   it("fresh home evidence expires before a current read and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
     const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();
+    // Retarget reason: the Overview Castle Wall chip may be green only while the served evidence window is current.
     expect(h.main.innerHTML).toContain(">ENFORCING");
     await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">ENFORCING");
     hang = true; runInContext('void fetchAll()', h.context); await settle();
@@ -500,6 +502,7 @@ describe("dashboard bounded independent hydration", () => {
   it("anomaly 503 stays local and cannot render a checked empty detector", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/anomaly/findings": () => response({}, 503) }); await settle();
     expect(h.main.innerHTML).toContain("fixture-mac"); expect(h.main.innerHTML).not.toContain("detector answered");
+    // Retarget reason: this proves the failed-read branch, not the checked-empty Sentinel copy.
     expect(h.main.innerHTML).toContain("Retry Anomaly findings");
     runInContext('state.route = "agents"; rerender()', h.context); expect(h.main.innerHTML).not.toContain("Anomaly findings");
   });
@@ -521,6 +524,7 @@ describe("dashboard bounded independent hydration", () => {
   it("generic activity events reread privacy, handoff, honeypot, and anomaly panels", async () => {
     vi.useFakeTimers(); let anomalyReads = 0;
     const h = harness({ "/api/anomaly/findings": () => ++anomalyReads === 1 ? response({ data: { findings: [] } }) : pending() }); await settle();
+    // Retarget reason: this is the checked-empty Sentinel branch before the reread starts.
     expect(h.main.innerHTML).toContain("No open Sentinel findings");
     const before = h.calls.length;
     h.streams.at(-1)!.listeners.activity({ data: JSON.stringify({ entry_id: "generic-audit", category: "other", display_template_id: "audit.other" }) });

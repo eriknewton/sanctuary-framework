@@ -1680,36 +1680,6 @@ body {
 .posture-seal-pop .pp-more:hover { text-decoration: underline; }
 
 /* Posture screen (one-surface fold): the full posture detail folded in. */
-/* S3: six tiles, so the column count is chosen to divide evenly (3+3 or 2+2+2)
- * rather than left to auto-fit, which orphaned the sixth tile on its own row at
- * common widths once the evidence spine made each tile taller. */
-.posture-metrics {
-  display: grid; grid-template-columns: repeat(2, 1fr);
-  gap: 10px; margin: 8px 0 4px;
-}
-@media (min-width: 760px) { .posture-metrics { grid-template-columns: repeat(3, 1fr); } }
-.posture-metric {
-  display: flex; flex-direction: column; gap: 4px; padding: 12px;
-  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2);
-}
-.posture-metric .pm-v { font-size: var(--text-xl); font-family: var(--serif); font-variant-numeric: tabular-nums; }
-.posture-metric .pm-l {
-  font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-/* S3 evidence spine: the denominator, freshness stamp, and evidence link that
- * hang off a posture tile. The denominator sits beside the value in a lighter
- * sans so the number still reads first; the freshness stamp is mono because it
- * is a measurement; the evidence link is informational indigo, never a status
- * hue, so it can never be misread as a state signal. An absent freshness stamp
- * takes the slate unknown tone (.none), never a pass or a warning colour. */
-/* Deliberately NOT scoped under .posture-metric: the same spine treatment is
- * reused by Today's story footer, which lives outside a tile. The pm- prefix
- * already makes these names unique. */
-.pm-of {
-  font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3);
-  margin-left: 4px; font-weight: 400;
-}
 .pm-foot {
   margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
   justify-content: space-between; gap: 8px; flex-wrap: wrap;
@@ -1746,8 +1716,6 @@ body {
 .boot-placeholder p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
 .card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .card-head-row .btn { white-space: nowrap; }
-.story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--text-sm); user-select: none; }
-.story-toggle input { margin: 0; }
 .story-line { margin: 4px 0; }
 .evidence { margin-top: 8px; font-size: var(--text-sm); }
 .evidence a { color: var(--indigo); text-decoration: none; }
@@ -2000,13 +1968,17 @@ body {
 /* Slice 3 Overview: dense security-console composition. Every capped list
    prints "showing M of N" in its own panel so bounded rendering cannot hide
    queue depth, findings or rows. */
-.overview-page { --overview-tile-min: 154px; --overview-decision-table-min: 640px; --overview-agent-table-min: 820px; display: flex; flex-direction: column; gap: 16px; }
+.overview-page {
+  --overview-tile-min: 154px;
+  --overview-decision-table-min: 640px; /* 640 = 6 decision columns at the compact operator-console floor. */
+  --overview-agent-table-min: 820px; /* 820 = 9 agent columns including the sticky identity column. */
+  display: flex; flex-direction: column; gap: 16px;
+}
 .overview-tiles { container-type: inline-size; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--overview-tile-min)), 1fr)); gap: 10px; }
 .overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); color: inherit; text-decoration: none; }
 .overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; text-decoration: none; }
 .overview-tile .ot-label:hover { color: var(--indigo); text-decoration: underline; }
 .overview-tile .ot-value { font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; line-height: 1.1; }
-.overview-tile .ot-value small { font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; }
 .overview-tile .ot-evidence { margin-top: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
 .overview-tile .ot-evidence a { color: var(--indigo); text-decoration: none; }
 .overview-tile .ot-evidence a:hover { text-decoration: underline; }

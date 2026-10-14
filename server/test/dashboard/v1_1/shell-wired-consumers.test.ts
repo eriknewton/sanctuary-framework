@@ -1102,6 +1102,11 @@ describe("slice 3 Overview wired consumers", () => {
   const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model", runs_locally: false };
   const unwrapped = { origin_machine: "fixture-mac", detection_method: "config_file_presence", unwrapped: [] };
   const textOnly = (html: string) => html.replace(/<[^>]*>/g, " ").replace(/&[a-z#0-9]+;/gi, " ").replace(/\s+/g, " ").trim();
+  const overviewLimit = (name: string) => {
+    const match = getClientScript().match(new RegExp(`const ${name} = (\\d+);`));
+    if (!match) throw new Error(`Missing ${name}`);
+    return Number(match[1]);
+  };
   const agent = (agent_id: string, overrides: Record<string, unknown> = {}) => ({
     version: "1.1", agent_id, identity_id: "operator-1", harness: "claude_code",
     model_provider, policy_id: "policy-v41", channel_template_id: "request-approve-act",
@@ -1171,9 +1176,12 @@ describe("slice 3 Overview wired consumers", () => {
     });
     await settle();
     const html = h.el.main!.innerHTML;
+    expect(html).toContain("What needs attention now. Unknown means a source has not answered or has not proven the value.");
+    expect(html).not.toContain("Each tile names the served source it reads");
     for (const label of ["Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
       expect(html).toContain(label);
     }
+    expect(html).toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
     expect(html).not.toContain("Protected agents");
     expect(html).not.toContain("Enforcement confirmed");
     expect(html).not.toContain('<a class="overview-tile"');
@@ -1223,6 +1231,7 @@ describe("slice 3 Overview wired consumers", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, { ...overviewHome(), unwrapped: undefined });
+    expect(h.el.main!.innerHTML).toContain("Castle Wall");
     expect(h.el.main!.innerHTML).not.toContain("Protected agents");
     expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
     expect(textOnly(h.el.main!.innerHTML)).not.toContain("of 1 detected");
@@ -1237,6 +1246,7 @@ describe("slice 3 Overview wired consumers", () => {
       agents: [{ agent_id: "research-agent", status: "active", enforcement_active: "active", ...stale }],
     });
     const html = h.el.main!.innerHTML;
+    expect(html).toContain("Castle Wall");
     expect(html).not.toContain("Enforcement confirmed");
     expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(html).not.toContain("server reports 1");
@@ -1248,6 +1258,7 @@ describe("slice 3 Overview wired consumers", () => {
     const body = overviewHome();
     delete (body as Record<string, unknown>).protection_requested_count;
     const h = await bootOverview({}, body);
+    expect(h.el.main!.innerHTML).toContain("Castle Wall");
     expect(h.el.main!.innerHTML).not.toContain("requested count not served");
     expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
     expect(h.el.main!.innerHTML).not.toContain("of 1 requested");
@@ -1257,6 +1268,7 @@ describe("slice 3 Overview wired consumers", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const h = await bootOverview({}, overviewHome({ protection_requested_count: 0 }));
+    expect(h.el.main!.innerHTML).toContain("Castle Wall");
     expect(h.el.main!.innerHTML).not.toContain("Enforcement confirmed");
     expect(h.el.main!.innerHTML).not.toContain("counts disagree");
     expect(h.el.main!.innerHTML).not.toContain("server reports");
@@ -1271,7 +1283,25 @@ describe("slice 3 Overview wired consumers", () => {
     const html = h.el.main!.innerHTML;
     expect(html).toContain("UNKNOWN");
     expect(html).toContain("NOT YET VERIFIED");
+    expect(html).toContain("last check Not evaluated");
     expect(html).not.toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
+  });
+
+  it("Overview state chips cover non-green wall and chain verdicts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const notInstalled = await bootOverview({}, overviewHome({ castle_wall: { arm_state: "not_installed", platform: "macOS kernel", ...evidence } }));
+    expect(notInstalled.el.main!.innerHTML).toContain("NOT INSTALLED");
+    const degraded = await bootOverview({}, overviewHome({ castle_wall: { arm_state: "degraded", platform: "macOS kernel", ...evidence } }));
+    expect(degraded.el.main!.innerHTML).toContain("DEGRADED");
+    const locked = await bootOverview({}, overviewHome({ castle_wall: { arm_state: "locked_down", platform: "macOS kernel", ...evidence } }));
+    expect(locked.el.main!.innerHTML).toContain("LOCKED DOWN");
+    const suffixOnly = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "verified_suffix_only", window_end: "2026-10-14T16:59:00.000Z" }));
+    expect(suffixOnly.el.main!.innerHTML).toContain("SUFFIX ONLY");
+    expect(suffixOnly.el.main!.innerHTML).toContain("digest from 1m ago, not verified");
+    const keyUnavailable = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "key_unavailable", window_end: "2026-10-14T16:59:00.000Z" }));
+    expect(keyUnavailable.el.main!.innerHTML).toContain("NOT YET VERIFIED");
+    expect(keyUnavailable.el.main!.innerHTML).toContain("digest from 1m ago, not verified");
   });
 
   it("Approvals waiting is hidden rather than zero when the queue is redacted", async () => {
@@ -1284,6 +1314,29 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("approval queue hidden; pending count 5");
     expect(html).toContain("Approvals hidden");
     expect(html).not.toContain('data-action="inbox-approve"');
+  });
+
+  it("Overview caps queue, findings and agent rows from the named constants", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const decisionLimit = overviewLimit("OVERVIEW_DECISION_LIMIT");
+    const findingLimit = overviewLimit("OVERVIEW_FINDING_LIMIT");
+    const agentLimit = overviewLimit("OVERVIEW_AGENT_LIMIT");
+    const h = await bootOverview({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: Array.from({ length: agentLimit + 1 }, (_, i) => agent(`agent-${i + 1}`)) } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: Array.from({ length: decisionLimit + 2 }, (_, i) => pending(`tier2-${i + 1}`, "tier2", "research-agent")) } })),
+      "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: Array.from({ length: findingLimit + 1 }, (_, i) => ({
+        finding_id: `finding-${i + 1}`,
+        severity: "medium",
+        detector_id: "egress-volume",
+        summary: `Finding ${i + 1}`,
+        created_at: "2026-10-14T16:46:00.000Z",
+      })) } })),
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain(`showing ${decisionLimit} of ${decisionLimit + 2}`);
+    expect(html).toContain(`showing ${findingLimit} of ${findingLimit + 1}`);
+    expect(html).toContain(`showing ${agentLimit} of ${agentLimit + 1}`);
   });
 
   it("Open Sentinel findings is Not evaluated when the findings read fails", async () => {
@@ -1300,6 +1353,7 @@ describe("slice 3 Overview wired consumers", () => {
     const h = await bootOverview({}, overviewHome({}, { chain_verified: false, chain_verdict: "findings", integrity_finding_count: 2 }));
     expect(h.el.main!.innerHTML).toContain("FAILED");
     expect(h.el.main!.innerHTML).toContain("2 findings");
+    expect(h.el.main!.innerHTML).toContain("digest from 0s ago, not verified");
   });
 
   it("shows the first-run empty state for a fortress with no agents instead of a wall of zeros", async () => {
@@ -1325,9 +1379,46 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("Protect an agent");
     expect(html).toContain("Needs your decision");
     expect(html).toContain("agent not named");
+    expect(html).toContain("<td><span>agent not named</span></td>");
     expect(html).not.toContain("fortress-wide");
     expect(html).toContain("Fortress-wide finding");
     expect(html).not.toContain("Protected agents");
+  });
+
+  it("first-run copy distinguishes unserved and empty unprotected-harness lists", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const firstRunHome = {
+      ...home({ chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: now }),
+      agents: [],
+      castle_wall: { arm_state: "unknown" },
+      digest: {},
+    };
+    const unserved = await bootOverview({ "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [] } })) }, firstRunHome);
+    expect(unserved.el.main!.innerHTML).toContain("Unprotected-harness list was not served");
+    expect(unserved.el.main!.innerHTML).not.toContain("No harness was detected");
+    const servedEmpty = await bootOverview({ "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [] } })) }, {
+      ...firstRunHome,
+      unwrapped,
+    });
+    expect(servedEmpty.el.main!.innerHTML).toContain("No harness was detected");
+  });
+
+  it("first-run still shows a redacted non-empty decision queue", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const h = await bootOverview({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { pending_approvals_redacted: true, pending_approvals_count: 3 } })),
+    }, {
+      ...home({ chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: now }),
+      agents: [],
+      unwrapped,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("No agents protected yet");
+    expect(html).toContain("Approvals hidden");
+    expect(html).toContain("Pending count: 3");
   });
 
   it("inline Overview decisions use the existing inbox path and Tier 1 rows link instead of deciding inline", async () => {
@@ -1350,6 +1441,8 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
     expect(html).not.toContain("Tier unknown");
     expect(html).not.toContain("Tier teir2");
+    expect(h.el["rail-approvals-count"]!.textContent).toBe("2 of 2");
+    expect(html).toMatch(/Approvals waiting<\/a><span class="ot-value">2<\/span>/);
     expect(html).not.toContain('data-overview-review="missing-tier"');
     expect(html).not.toContain('data-overview-review="misspelled-tier"');
     expect(html).not.toContain('data-action="inbox-approve" data-item-id="missing-tier"');
@@ -1388,6 +1481,7 @@ describe("slice 3 Overview wired consumers", () => {
       "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [{ entry_id: "allowed", emitted_at: "2026-10-14T16:20:00.000Z", category: "egress", agent_id: "a", display_template_id: "activity.egress.allowed", display_template_args: [{ kind: "destination_category", value: "allowed-api" }] }] } })),
     });
     const html = h.el.main!.innerHTML;
+    expect(html).toContain("Castle Wall");
     expect(html).not.toContain("Egress enforcement");
     expect(html).not.toContain("dest-one");
     expect(html).not.toContain("2 agents");
@@ -1401,9 +1495,11 @@ describe("slice 3 Overview wired consumers", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(now));
     const unanswered = await bootOverview({ "/api/hub/inbox": () => Promise.reject(new Error("queue down.")) });
+    expect(unanswered.el.main!.innerHTML).toContain("Castle Wall");
     expect(unanswered.el.main!.innerHTML).not.toContain("blocked egress inbox did not answer");
     expect(unanswered.el.main!.innerHTML).not.toContain("Egress enforcement");
     const empty = await bootOverview();
+    expect(empty.el.main!.innerHTML).toContain("Castle Wall");
     expect(empty.el.main!.innerHTML).not.toContain("No blocked destinations in this window");
     expect(empty.el.main!.innerHTML).not.toContain("Egress enforcement");
   });
