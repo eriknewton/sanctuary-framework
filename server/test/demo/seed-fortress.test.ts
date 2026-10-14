@@ -13,13 +13,17 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEMO_AGENT_PLATFORMS,
+  DEMO_DIRECTORY_MODE,
+  DEMO_LABEL_PREFIX,
+  DEMO_PID_FILE_BASENAME,
+  createDemoRoot,
+  type SeedDemoFortressOptions,
   DEMO_POLICY_TEMPLATE_CHANGE_OPERATION,
   DEMO_STATE_EXPORT_OPERATION,
-  DEMO_TEMP_PREFIX,
   demoTempParent,
   seedDemoFortress,
   seededItemsForDemo,
@@ -41,7 +45,7 @@ const CUSTODY_READER_SEPARATOR = ".reader-";
 const CUSTODY_READER_SOCKET_SUFFIX = ".sock";
 const FILE_MODE_BITS = 0o777;
 const OPERATOR_TOKEN_FILE_MODE = 0o600;
-// 10_000 ms gives the real CLI seed enough time to boot on this Mac.
+// 10_000 ms gives the real CLI seed time to boot on a build box or Mac.
 const CLI_READY_TIMEOUT_MS = 10_000;
 // 5_000 ms bounds child teardown so a failed CLI test cannot leak a server.
 const CLI_EXIT_TIMEOUT_MS = 5_000;
@@ -53,32 +57,88 @@ interface PathSnapshotEntry {
 }
 
 const envBeforeFile = { ...process.env };
-const fakeHomes: string[] = [];
-
-function restoreEnvKey(key: string, value: string | undefined): void {
-  if (value === undefined) {
-    delete process.env[key];
-  } else {
-    process.env[key] = value;
-  }
+interface CliRun {
+  child: ChildProcessWithoutNullStreams;
+  stdout: string;
+  stderr: string;
+  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  closed: boolean;
+  home?: string;
 }
 
-afterEach(async () => {
-  restoreEnvKey("HOME", envBeforeFile.HOME);
-  restoreEnvKey("SANCTUARY_STORAGE_PATH", envBeforeFile.SANCTUARY_STORAGE_PATH);
-  restoreEnvKey(
-    "SANCTUARY_DASHBOARD_AUTO_OPEN",
-    envBeforeFile.SANCTUARY_DASHBOARD_AUTO_OPEN,
-  );
-  restoreEnvKey("SANCTUARY_PASSPHRASE", envBeforeFile.SANCTUARY_PASSPHRASE);
-  restoreEnvKey(
-    "SANCTUARY_CUSTODY_LOCK_ROOT",
-    envBeforeFile.SANCTUARY_CUSTODY_LOCK_ROOT,
-  );
-  for (const fakeHome of fakeHomes.splice(0)) {
-    await rm(fakeHome, { recursive: true, force: true });
-  }
+let roots: Set<string>;
+let children: CliRun[];
+let stops: Array<() => Promise<void>>;
+let servers: Array<ReturnType<typeof createServer>>;
+let cleanupPromise: Promise<void> | undefined;
+
+beforeEach(() => {
+  roots = new Set();
+  children = [];
+  stops = [];
+  servers = [];
+  cleanupPromise = undefined;
 });
+
+function restoreEnvKey(key: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
+
+function cleanupOwned(): Promise<void> {
+  cleanupPromise ??= (async () => {
+    const errors: unknown[] = [];
+    try {
+      for (const run of children) {
+        try {
+          if (!run.closed) run.child.kill("SIGKILL");
+          await run.exit;
+        } catch (error) { errors.push(error); }
+      }
+      for (const stop of stops) {
+        try { await stop(); } catch (error) { errors.push(error); }
+      }
+      for (const server of servers) {
+        try { if (server.listening) await closeServer(server); } catch (error) { errors.push(error); }
+      }
+    } finally {
+      try {
+        // Children and servers are reaped first, even when an assertion or timeout interrupted the test.
+        for (const root of roots) {
+          try {
+            await rm(root, { recursive: true, force: true });
+            expect(await pathExists(root), `owned root removed: ${root}`).toBe(false);
+          } catch (error) { errors.push(error); }
+        }
+      } finally {
+        for (const key of ["HOME", "SANCTUARY_STORAGE_PATH", "SANCTUARY_DASHBOARD_AUTO_OPEN", "SANCTUARY_PASSPHRASE", "SANCTUARY_CUSTODY_LOCK_ROOT"]) {
+          restoreEnvKey(key, envBeforeFile[key]);
+        }
+        vi.restoreAllMocks();
+      }
+    }
+    if (errors.length) throw errors[0];
+  })();
+  return cleanupPromise;
+}
+
+afterEach(cleanupOwned);
+
+function ownedDemoRoot(): string {
+  const home = createDemoRoot();
+  roots.add(home);
+  return home;
+}
+
+function seedOwned(home: string, options: SeedDemoFortressOptions) {
+  const pending = seedDemoFortress(home, options);
+  // Register before awaiting: afterEach also owns resources produced by a late seed completion.
+  stops.push(async () => {
+    const seeded = await pending.catch(() => undefined);
+    await seeded?.stop();
+  });
+  return pending;
+}
 
 async function snapshotTree(root: string): Promise<Record<string, PathSnapshotEntry>> {
   const out: Record<string, PathSnapshotEntry> = {};
@@ -106,7 +166,7 @@ async function snapshotTree(root: string): Promise<Record<string, PathSnapshotEn
 
 async function makeFakeOperatorHome(): Promise<string> {
   const fakeHome = await mkdtemp(join(tmpdir(), "sanctuary-demo-fake-home-"));
-  fakeHomes.push(fakeHome);
+  roots.add(fakeHome);
   const fakeSanctuary = join(fakeHome, ".sanctuary", "state");
   await mkdir(fakeSanctuary, { recursive: true });
   await writeFile(
@@ -139,16 +199,9 @@ function assertUnder(root: string, candidate: string): void {
   ).toBe(true);
 }
 
-async function demoRootBasenames(): Promise<string[]> {
-  const entries = await readdir(demoTempParent(), { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith(DEMO_TEMP_PREFIX))
-    .map((entry) => entry.name)
-    .sort();
-}
-
 async function bindPort(port: number): Promise<ReturnType<typeof createServer>> {
   const server = createServer();
+  servers.push(server);
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
     server.listen(port, "127.0.0.1", () => {
@@ -186,58 +239,110 @@ async function pathExists(path: string): Promise<boolean> {
   return (await stat(path).catch(() => null)) !== null;
 }
 
-async function waitForExit(
-  child: ChildProcessWithoutNullStreams,
-): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-  return await new Promise((resolveExit, rejectExit) => {
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      rejectExit(new Error("CLI child did not exit after signal"));
-    }, CLI_EXIT_TIMEOUT_MS);
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      rejectExit(error);
-    });
-    child.once("exit", (code, signal) => {
-      clearTimeout(timeout);
+async function spawnCli(args: string[]): Promise<CliRun> {
+  const fakeHome = await makeFakeOperatorHome();
+  const child = spawn(process.execPath, ["--import", "tsx", "scripts/demo/seed-fortress.ts", ...args], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: fakeHome,
+      SANCTUARY_STORAGE_PATH: join(fakeHome, "storage"),
+      SANCTUARY_CUSTODY_LOCK_ROOT: join(fakeHome, "c"),
+      SANCTUARY_DASHBOARD_AUTO_OPEN: "false",
+      SANCTUARY_PASSPHRASE: PASSPHRASE,
+    },
+  });
+  const run: CliRun = {
+    child, stdout: "", stderr: "", closed: false,
+    exit: Promise.resolve({ code: null, signal: null }),
+  };
+  children.push(run);
+  run.exit = new Promise((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("close", (code, signal) => {
+      run.closed = true;
       resolveExit({ code, signal });
     });
   });
+  // A spawn failure is observed by the waiter and teardown, never an unhandled rejection.
+  void run.exit.catch(() => undefined);
+  child.stdout.on("data", (chunk) => {
+    run.stdout += String(chunk);
+    const home = run.stdout.match(/^Demo HOME: (.+)$/m)?.[1];
+    if (home) {
+      run.home = home;
+      roots.add(home);
+    }
+  });
+  child.stderr.on("data", (chunk) => { run.stderr += String(chunk); });
+  return run;
 }
 
-async function waitForCliReady(
-  child: ChildProcessWithoutNullStreams,
-): Promise<{ stdout: string; stderr: string; home: string; tokenPath: string }> {
-  let stdout = "";
-  let stderr = "";
-  return await new Promise((resolveReady, rejectReady) => {
-    const timeout = setTimeout(() => {
-      rejectReady(new Error(`CLI did not become ready: ${stderr}`));
-    }, CLI_READY_TIMEOUT_MS);
-    const maybeResolve = () => {
-      const tokenPath = stdout.match(/^Operator token file: (.+)$/m)?.[1];
-      const home = stdout.match(/^Demo HOME: (.+)$/m)?.[1];
-      if (tokenPath && home) {
-        clearTimeout(timeout);
-        resolveReady({ stdout, stderr, home, tokenPath });
-      }
+async function waitForOutput(run: CliRun, pattern: RegExp): Promise<void> {
+  await new Promise<void>((resolveReady, rejectReady) => {
+    const finish = (error?: Error) => {
+      clearTimeout(timeout);
+      run.child.stdout.off("data", check);
+      run.child.off("close", closed);
+      if (error) rejectReady(error);
+      else resolveReady();
     };
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      maybeResolve();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      rejectReady(error);
-    });
-    child.once("exit", (code, signal) => {
-      clearTimeout(timeout);
-      rejectReady(new Error(`CLI exited before ready (${signal ?? code}): ${stderr}`));
-    });
+    const check = () => { if (pattern.test(run.stdout)) finish(); };
+    const closed = () => finish(new Error(`CLI exited before expected output: ${run.stderr}`));
+    const timeout = setTimeout(() => finish(new Error(`CLI output timed out: ${run.stderr}`)), CLI_READY_TIMEOUT_MS);
+    run.child.stdout.on("data", check);
+    run.child.once("close", closed);
+    if (run.closed) closed();
+    else check();
   });
+}
+
+async function waitForExit(run: CliRun) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run.exit,
+      new Promise<never>((_, rejectExit) => {
+        timeout = setTimeout(() => {
+          run.child.kill("SIGKILL");
+          rejectExit(new Error("CLI child did not exit in time"));
+        }, CLI_EXIT_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+    if (run.child.killed) await run.exit;
+  }
+}
+
+// Must match the startup banner in DashboardApprovalChannel's listen callback in
+// server/src/principal-policy/dashboard.ts: every dashboard prints its URL line, then one hint line showing
+// the token's first and last four characters.
+const DASHBOARD_TOKEN_HINT_CHARS = 4;
+const DASHBOARD_URL_LINE = /^  Sanctuary Principal Dashboard: http:\/\/127\.0\.0\.1:[0-9]+$/;
+
+function assertNoTokenOutput(token: string, run: CliRun, dashboardStarted: boolean): void {
+  // Every longer substring contains a four-character window, so these checks cover all lengths >= 4.
+  const minimumSubstringLength = 4;
+  expect(token.length).toBeGreaterThan(2 * DASHBOARD_TOKEN_HINT_CHARS + minimumSubstringLength);
+  const hintLine = `  Auth token: ${token.slice(0, DASHBOARD_TOKEN_HINT_CHARS)}...${token.slice(-DASHBOARD_TOKEN_HINT_CHARS)}`;
+  const stderrLines = run.stderr.split("\n");
+  // Only the dashboard's own standard hint line, directly under its URL line, is set aside, and only once.
+  const hintIndexes = stderrLines.flatMap((line, index) =>
+    line === hintLine && index > 0 && DASHBOARD_URL_LINE.test(stderrLines[index - 1]!) ? [index] : []);
+  expect(hintIndexes).toHaveLength(dashboardStarted ? 1 : 0);
+  if (dashboardStarted) {
+    const shown = stderrLines[hintIndexes[0]!]!;
+    expect(shown.includes(token.slice(DASHBOARD_TOKEN_HINT_CHARS, -DASHBOARD_TOKEN_HINT_CHARS))).toBe(false);
+  }
+  const stderrElsewhere = stderrLines.filter((_, index) => !hintIndexes.includes(index)).join("\n");
+  // The CLI's own output is all of stdout plus stderr outside that one line; neither carries a token window.
+  expect(run.stdout).not.toContain("Auth token");
+  for (let index = 0; index <= token.length - minimumSubstringLength; index++) {
+    const fragment = token.slice(index, index + minimumSubstringLength);
+    expect(run.stdout.includes(fragment), "stdout contains no token fragment").toBe(false);
+    expect(stderrElsewhere.includes(fragment), "stderr outside the dashboard hint line contains no token fragment").toBe(false);
+  }
 }
 
 async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
@@ -255,7 +360,9 @@ describe("seedDemoFortress", () => {
     const fakeHomeBefore = await snapshotTree(fakeHome);
     process.env.HOME = fakeHome;
     const port = await getFreePort();
-    const seeded = await seedDemoFortress({
+    const home = ownedDemoRoot();
+    try {
+    const seeded = await seedOwned(home, {
       passphrase: PASSPHRASE,
       port,
       startDashboard: true,
@@ -263,7 +370,6 @@ describe("seedDemoFortress", () => {
       now: () => new Date(DEMO_NOW_ISO),
     });
 
-    try {
       assertUnder(demoTempParent(), seeded.home);
       assertUnder(seeded.home, seeded.storagePath);
       expect(seeded.storagePath.endsWith(`${sep}demo-fortress`)).toBe(true);
@@ -372,7 +478,9 @@ describe("seedDemoFortress", () => {
       const html = await fetch(`${seeded.apiBaseUrl}/v1.1`, {
         headers: { Authorization: `Bearer ${seeded.authToken}` },
       });
-      expect(await html.text()).toContain(seeded.fortressId);
+      const servedLabel = (await html.text()).match(/data-fortress-id="([^"]+)"/)?.[1];
+      expect(servedLabel).toBe(seeded.fortressId);
+      expect(servedLabel?.startsWith(DEMO_LABEL_PREFIX)).toBe(true);
 
       const items = seeded.seededItems;
       expect(items).toEqual(seededItemsForDemo());
@@ -396,18 +504,20 @@ describe("seedDemoFortress", () => {
           statusCell(item.status),
         ]);
       }
-    } finally {
       await seeded.stop();
+      expect(await pathExists(home)).toBe(false);
+      expect(process.env.HOME).toBe(fakeHome);
+      expect(await snapshotTree(fakeHome)).toEqual(fakeHomeBefore);
+    } finally {
+      await cleanupOwned();
     }
-
-    expect(process.env.HOME).toBe(fakeHome);
-    expect(await snapshotTree(fakeHome)).toEqual(fakeHomeBefore);
+    expect(await pathExists(home)).toBe(false);
   });
 
   it("restores environment and removes the minted root when master establishment fails", async () => {
     const fakeHome = await makeFakeOperatorHome();
     const fakeHomeBefore = await snapshotTree(fakeHome);
-    const rootsBefore = await demoRootBasenames();
+    const home = ownedDemoRoot();
     process.env.HOME = fakeHome;
     const port = await getFreePort();
     const originalError = new Error("synthetic master establishment failure");
@@ -419,7 +529,7 @@ describe("seedDemoFortress", () => {
 
     try {
       await expect(
-        seedDemoFortress({
+        seedOwned(home, {
           passphrase: PASSPHRASE,
           port,
           startDashboard: true,
@@ -442,57 +552,127 @@ describe("seedDemoFortress", () => {
         envBeforeFile.SANCTUARY_CUSTODY_LOCK_ROOT,
       );
       expect(await snapshotTree(fakeHome)).toEqual(fakeHomeBefore);
-      expect(await demoRootBasenames()).toEqual(rootsBefore);
-    } finally {
-      establishSpy.mockRestore();
-    }
-
-    const probe = await bindPort(port);
-    try {
+      expect(await pathExists(home)).toBe(false);
+      const probe = await bindPort(port);
       expect(probe.listening).toBe(true);
     } finally {
-      await closeServer(probe);
+      establishSpy.mockRestore();
+      await cleanupOwned();
     }
+    expect(await pathExists(home)).toBe(false);
   });
 
-  it("writes a mode-0600 operator token file without printing the token", async () => {
-    const port = await getFreePort();
-    const child = spawn(
-      process.execPath,
-      ["--import", "tsx", "scripts/demo/seed-fortress.ts", "--port", String(port)],
-      {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          SANCTUARY_PASSPHRASE: PASSPHRASE,
-        },
-      },
-    );
-    let ready:
-      | { stdout: string; stderr: string; home: string; tokenPath: string }
-      | undefined;
+  it("writes a mode-0600 operator token file and prints no token fragment outside the dashboard's standard hint line", async () => {
+    const run = await spawnCli(["--port", String(await getFreePort())]);
     try {
-      ready = await waitForCliReady(child);
-      const token = (await readFile(ready.tokenPath, "utf8")).trim();
-      const tokenStats = await stat(ready.tokenPath);
-      expect(tokenStats.mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
-      expect(token.length).toBeGreaterThan(0);
-      expect(ready.stdout).not.toContain(token);
-      expect(ready.stdout).toContain("Paste the token from that file");
+      await waitForOutput(run, /^Teardown: /m);
+      const tokenPath = run.stdout.match(/^Operator token file: (.+)$/m)![1];
+      const token = (await readFile(tokenPath, "utf8")).trim();
+      expect((await stat(tokenPath)).mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
+      expect(run.stdout).toContain("Paste the token from that file");
+      run.child.kill("SIGTERM");
+      expect(await waitForExit(run)).toEqual({ code: 0, signal: null });
+      assertNoTokenOutput(token, run, true);
+      expect(await pathExists(run.home!)).toBe(false);
     } finally {
-      child.kill("SIGTERM");
-      await waitForExit(child).catch(() => undefined);
+      await cleanupOwned();
     }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
 
-    expect(ready).toBeDefined();
-    if (ready) {
-      const teardown = spawn(
-        process.execPath,
-        ["--import", "tsx", "scripts/demo/seed-fortress.ts", "--teardown", ready.home],
-        { cwd: process.cwd(), env: process.env },
-      );
-      await waitForExit(teardown);
-      expect(await pathExists(ready.home)).toBe(false);
+  it("returns an empty private root before any seeding write", async () => {
+    const home = ownedDemoRoot();
+    try {
+      expect(await readdir(home)).toEqual([]);
+      expect((await stat(home)).mode & FILE_MODE_BITS).toBe(DEMO_DIRECTORY_MODE);
+    } finally {
+      await cleanupOwned();
     }
+    expect(await pathExists(home)).toBe(false);
+  });
+
+  it.each(["SIGINT", "SIGTERM"] as const)("owns root cleanup when %s arrives at the first root announcement", async (signal) => {
+    const run = await spawnCli(["--port", String(await getFreePort())]);
+    try {
+      await waitForOutput(run, /^Demo HOME: /m);
+      run.child.kill(signal);
+      const exit = await waitForExit(run);
+      const interrupted = run.stderr.includes(`Demo seeding was interrupted by ${signal}.`);
+      expect(run.stderr).toMatch(/Demo (seeding was interrupted by SIG(INT|TERM)|stopped after ready)\./);
+      // POSIX interruption codes are 128 + SIGINT (2) or SIGTERM (15).
+      expect(exit).toEqual({ code: interrupted ? 128 + (signal === "SIGINT" ? 2 : 15) : 0, signal: null });
+      expect(await pathExists(run.home!)).toBe(false);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  it("keeps an interrupted root only when --keep is explicit", async () => {
+    const run = await spawnCli(["--port", String(await getFreePort()), "--keep"]);
+    try {
+      await waitForOutput(run, /^Demo HOME: /m);
+      run.child.kill("SIGINT");
+      const exit = await waitForExit(run);
+      expect(exit.signal).toBeNull();
+      expect(run.stderr).toMatch(/Demo (seeding was interrupted by SIGINT|stopped after ready)\./);
+      expect(await pathExists(run.home!)).toBe(true);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  it("refuses teardown while the recorded demo pid is live and permits it after exit", async () => {
+    const run = await spawnCli(["--port", String(await getFreePort()), "--keep"]);
+    try {
+      await waitForOutput(run, /^Teardown: /m);
+      const pidPath = join(run.home!, DEMO_PID_FILE_BASENAME);
+      expect((await stat(pidPath)).mode & FILE_MODE_BITS).toBe(OPERATOR_TOKEN_FILE_MODE);
+      expect((await readFile(pidPath, "utf8")).trim()).toBe(String(run.child.pid));
+      const tokenPath = run.stdout.match(/^Operator token file: (.+)$/m)![1];
+      const token = (await readFile(tokenPath, "utf8")).trim();
+      const refused = await spawnCli(["--teardown", run.home!]);
+      expect((await waitForExit(refused)).code).toBe(1);
+      expect(refused.stderr.trim().split("\n")).toEqual([`refusing to teardown live demo pid ${run.child.pid}: ${run.home}`]);
+      assertNoTokenOutput(token, refused, false);
+      expect(await pathExists(run.home!)).toBe(true);
+      run.child.kill("SIGINT");
+      expect(await waitForExit(run)).toEqual({ code: 0, signal: null });
+      expect(await pathExists(run.home!)).toBe(true);
+      const removed = await spawnCli(["--teardown", run.home!]);
+      expect(await waitForExit(removed)).toEqual({ code: 0, signal: null });
+      expect(await pathExists(run.home!)).toBe(false);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
+  });
+
+  it("permits teardown of a stopped root without a pid file", async () => {
+    const home = ownedDemoRoot();
+    try {
+      const run = await spawnCli(["--teardown", home]);
+      expect(await waitForExit(run)).toEqual({ code: 0, signal: null });
+      expect(await pathExists(home)).toBe(false);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(home)).toBe(false);
+  });
+
+  it.each([false, true])("owns root cleanup on dashboard startup error (keep=%s)", async (keep) => {
+    const port = await getFreePort();
+    await bindPort(port);
+    const run = await spawnCli(["--port", String(port), ...(keep ? ["--keep"] : [])]);
+    try {
+      await waitForOutput(run, /^Demo HOME: /m);
+      expect(await waitForExit(run)).toEqual({ code: 1, signal: null });
+      expect(run.stdout).not.toContain("Dashboard URL:");
+      expect(await pathExists(run.home!)).toBe(keep);
+    } finally {
+      await cleanupOwned();
+    }
+    expect(await pathExists(run.home!)).toBe(false);
   });
 });
