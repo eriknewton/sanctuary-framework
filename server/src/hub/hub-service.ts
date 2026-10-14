@@ -592,10 +592,11 @@ export class HubService {
       lockdown: c.can_lockdown,
     };
     if (!supports[action]) throw new HubCapabilityError(action);
-    // Untyped compositions must also fail closed: no probe is not evidence of executor support.
-    const executorSupports = this.deps.agentController.supports
-      ? await this.deps.agentController.supports(action, record.agent_id)
-      : false;
+    // Must match projectAgentCapabilities above: only an explicit true from the probe is executor support, so a
+    // missing probe, a non-boolean answer or a failed probe refuses before any Tier 1 work is queued.
+    let executorSupports = false;
+    try { executorSupports = (await this.deps.agentController.supports?.(action, record.agent_id)) === true; }
+    catch { /* A failed support probe is not evidence that a control can run. */ }
     if (!executorSupports) {
       const reasonByAction: Record<HubAgentControlAction, string> = {
         pause: "agent_control_pause_unsupported_no_process_handle",

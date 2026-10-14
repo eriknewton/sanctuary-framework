@@ -1910,4 +1910,18 @@ describe("slice 6a composed agent capabilities", () => {
       expect(await read()).toMatchObject({ can_pause: false, can_resume: false, can_restart: false, can_unwrap: false, can_lockdown: false });
     } finally { await rig.stop(); }
   });
+
+  it("6a the control route refuses without an explicit true from the support probe and queues no approval", async () => {
+    const controller = new UnsupportedUnwrapController();
+    const rig = await startRig({ controller });
+    try {
+      const post = (action: string) => fetch(rig.url + HUB_API_PREFIX + "/agents/agent-alpha/" + action, { method: "POST", headers: withAuth({}, rig.authToken) });
+      for (const probe of [undefined, () => "yes", () => { throw new Error("unavailable"); }]) {
+        Object.defineProperty(controller, "supports", { value: probe, configurable: true });
+        expect((await post("lockdown")).status).toBe(422);
+        expect((await post("pause")).status).toBe(422);
+      }
+      expect(rig.service.listInbox().filter(i => i.kind === "approval_pending")).toEqual([]);
+    } finally { await rig.stop(); }
+  });
 });
