@@ -1144,7 +1144,7 @@ function blockedDestinationLabel(details: Record<string, unknown> | undefined): 
 
 /** Settle retention from the eager in-memory view and two cheap public reads; never re-reads the chain from disk. */
 async function routineWindowCoverage(
-  auditLog: AuditLog, windowStart: string,
+  auditLog: AuditLog, windowStart: string, readRetained: (limit: number) => ReturnType<AuditLog["query"]>,
 ): Promise<AuditDigest["window_incomplete_reason"]> {
   try {
     const floor = await auditLog.authenticatedRotationFloor();
@@ -1154,10 +1154,10 @@ async function routineWindowCoverage(
     // The head is read before the view, so an append between the two reads can only lower the view's computed oldest
     // sequence; that moves the floor lookup to a newer entry or out of the view, never to an older one.
     const head = await auditLog.getChainHead();
-    // The posture surface runs this inside runEagerReads, so query serves references into the verified in-memory view;
-    // a full on-disk re-read per board paint or stream push is the load this surface must not pay. The read budget is
-    // raised to the retention cap so a log retained in full is read in full.
-    const retained = await auditLog.query({ limit: Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries) });
+    // The posture surface runs the digest inside runEagerReads, so this read serves references into the verified
+    // in-memory view; a full on-disk re-read per board paint or stream push is the load this surface must not pay. The
+    // read budget is raised to the retention cap so a log retained in full is read in full.
+    const retained = await readRetained(Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries));
     // The floor entry is found by position, so every entry in the view must be in hand; an empty log has none to prove from.
     if (retained.entries.length === 0 || retained.entries.length !== retained.total) return "coverage_unknown";
     // A verified chain is contiguous, so the view's oldest sequence follows from the head and the count. The view may
@@ -1242,7 +1242,9 @@ export async function buildAuditDigest(
     // Sealed-region time bounds remain an audit-module follow-up; no nonempty status qualifies.
     windowIncompleteReason = chainVerdict.sealed_region.status !== "not_present" && chainVerdict.sealed_region.status !== "empty" ? "sealed_region"
       : result.entries.length !== result.total ? "read_limit"
-      : await routineWindowCoverage(input.auditLog, windowStart);
+      // The view read stays in this builder, the caller-wrapped site the eager-read chokepoint registers; the helper
+      // only decides when it runs (after the head read).
+      : await routineWindowCoverage(input.auditLog, windowStart, (limit) => input.auditLog.query({ limit }));
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
