@@ -675,7 +675,8 @@ const TEMPLATES = {
   "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
   // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
   "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
-  "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
+  // Must match "approval_pending.tier1.unwrap" in templates.ts.
+  "approval_pending.tier1.unwrap": (a) => "Request to remove protection from agent " + arg(a,"agent_id") + ". This build refuses unsupported removals before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.exit_bundle_export": (a) => "Export the fortress as a portable bundle. Agent: " + arg(a,"agent_id","all agents") + ".",
@@ -741,12 +742,15 @@ function renderTemplate(id, args) {
 }
 
 // ── Status mapping ─────────────────────────────────────────────────────
+// Table-level pin: must match STATUS_MAPPING in status-mapping.ts. Enforced
+// by the status parity guard in test/dashboard/v1_1/templates.test.ts.
 const STATUS_MAP = {
   active: { label: "Protected", glyph: "online" },
   paused: { label: "Paused", glyph: "idle" },
   restarting: { label: "Restarting", glyph: "idle" },
   locked_down: { label: "Locked down", glyph: "offline" },
-  unwrapping: { label: "Unwrapping", glyph: "idle" },
+  // Must match STATUS_MAPPING.unwrapping in status-mapping.ts.
+  unwrapping: { label: "Removing protection", glyph: "idle" },
   error: { label: "Error", glyph: "away" },
   unknown: { label: "Unknown", glyph: "unknown" }
 };
@@ -989,28 +993,28 @@ function renderTopbar() {
     '<span class="pill" data-pill="mode">mode: ' + escHtml(state.topbarPills.mode) + '</span>',
     renderTopbarAttestationBadge(state.topbarPills.attestation)
   ].join("");
-  // Lockdown button reflects the approved handler's reported outcome.
+  // Lock down button reflects the approved handler's reported outcome.
   const btn = document.getElementById("btn-lockdown");
   if (!btn) return;
   const t1 = state.tier1.lockdown;
   btn.classList.remove("tier1-pending", "tier1-partial", "tier1-engaged");
   btn.disabled = false;
   if (t1.state === "pending") {
+    // Must match TIER1_BUTTON_COPY.lockdown.pending in status-mapping.ts.
     btn.textContent = "Awaiting approval";
     btn.classList.add("tier1-pending");
     btn.disabled = true;
   } else if (t1.state === "partial") {
-    btn.textContent = "Lockdown partial";
+    // Must match TIER1_BUTTON_COPY.lockdown.partial in status-mapping.ts.
+    btn.textContent = "Partly locked down";
     btn.classList.add("tier1-partial");
   } else if (t1.state === "engaged") {
-    btn.textContent = "Lockdown ON";
+    // Must match TIER1_BUTTON_COPY.lockdown.engaged in status-mapping.ts.
+    btn.textContent = "Locked down";
     btn.classList.add("tier1-engaged");
     btn.disabled = true;
   } else {
-    // The idle label is the ratified verb "Lock down" (slice 2 top bar).
-    // TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts still reads
-    // "Lockdown": that table is frozen this slice and has no runtime
-    // consumer; reconciling it is a named follow-up, not a silent drift.
+    // Must match TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts.
     btn.textContent = "Lock down";
   }
   renderAgentSwitcher();
@@ -2994,6 +2998,21 @@ function heldApprovalItems(scope) {
     return true;
   });
 }
+
+const AGENT_CONTROL_LABELS = {
+  pause: "Pause",
+  resume: "Resume",
+  restart: "Restart",
+  // Must match the agent-row menu literal below and TIER1_BUTTON_COPY.lockdown.idle in status-mapping.ts.
+  lockdown: "Lock down",
+  // Must match the agent-row menu literal below and TIER1_BUTTON_COPY.unwrap.idle in status-mapping.ts.
+  unwrap: "Remove protection"
+};
+
+function agentControlLabel(action) {
+  return AGENT_CONTROL_LABELS[action] || "This control";
+}
+
 // Wave 1: the fortress-column agents card and Recognition Layer health card
 // previously lived on the right rail. They are real surfaces (agent
 // lifecycle controls + did:web rotation), so they were relocated to the
@@ -4934,20 +4953,21 @@ async function onLockdownClick() {
 }
 
 async function onAgentControl(agentId, action) {
+  const label = agentControlLabel(action);
   try {
     const r = await api("/agents/" + encodeURIComponent(agentId) + "/" + action, { method: "POST", body: {} });
     if (r.data && r.data.status === "approval_pending") {
       toast("Approval pending. See inbox.", "info");
     } else {
-      toast(action + " applied to " + agentId, "info");
+      toast('"' + label + '" applied to ' + agentId, "info");
     }
     await fetchAll(true);
     rerender();
   } catch (e) {
     if (e.status === 422) {
-      toast("Sanctuary cannot apply " + action + " for this agent: " + e.message, "error");
+      toast('Sanctuary cannot apply "' + label + '" for this agent: ' + e.message, "error");
     } else {
-      toast(action + " failed: " + e.message, "error");
+      toast('"' + label + '" failed: ' + e.message, "error");
     }
   }
 }

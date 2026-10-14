@@ -36,6 +36,11 @@ describe("v1.1 dashboard status mapping", () => {
     expect(STATUS_MAPPING.locked_down.glyph).toBe("offline");
   });
 
+  it("maps unwrapping to Removing protection / idle", () => {
+    expect(STATUS_MAPPING.unwrapping.label).toBe("Removing protection");
+    expect(STATUS_MAPPING.unwrapping.glyph).toBe("idle");
+  });
+
   it("maps error to Error / away", () => {
     expect(STATUS_MAPPING.error.label).toBe("Error");
     expect(STATUS_MAPPING.error.glyph).toBe("away");
