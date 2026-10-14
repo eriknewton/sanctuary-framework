@@ -43,7 +43,7 @@ const heldItem = {
   item_id: "item-1", kind: "approval_pending", tier: "tier1", agent_id: "fixture-agent",
   display_template_id: "approval_pending.tier1.lockdown", display_template_args: {}, resolved: false,
 };
-const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
+const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], budgets: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
 class FakeElement {
   attrs: Record<string, string>;
@@ -861,5 +861,144 @@ describe("slice 2b shell wired consumers", () => {
     ])`, h.context) as string;
     expect(out.match(/<span class="trend-bar (good|warn|pending)"/g)).toHaveLength(4);
     expect(textOf(out).replace(/\s+/g, " ").trim()).toBe("2 went ahead 1 stopped 1 other");
+  });
+});
+
+describe("slice 3 Overview wired consumers", () => {
+  const now = "2026-10-14T17:00:00.000Z";
+  const evidence = { last_enforcement_evidence_at: "2026-10-14T16:59:20.000Z", freshness_window_ms: 10 * 60 * 1000 };
+  const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model", runs_locally: false };
+  const agent = (agent_id: string, overrides: Record<string, unknown> = {}) => ({
+    version: "1.1", agent_id, identity_id: "operator-1", harness: "claude_code",
+    model_provider, policy_id: "policy-v41", channel_template_id: "request-approve-act",
+    status: "active", budget_summary: { daily: { unit: "usd", cap: 10, used: 4.2 }, last_refreshed_at: now },
+    last_activity_at: "2026-10-14T16:58:00.000Z", wrapped_at: "2026-10-14T15:00:00.000Z",
+    capabilities: { can_pause: true, can_resume: true, can_restart: true, can_unwrap: true, can_lockdown: true, can_chat: true, can_change_template: true },
+    ...overrides,
+  });
+  const pending = (item_id: string, tier: "tier1" | "tier2", agent_id: string, operation_category = "state_export") => ({
+    ...heldItem,
+    item_id, tier, agent_id, operation_category,
+    created_at: tier === "tier1" ? "2026-10-14T16:45:00.000Z" : "2026-10-14T16:55:00.000Z",
+    display_template_id: `approval_pending.${tier}.state_export`,
+    display_template_args: [{ kind: "agent_id", value: agent_id }],
+  });
+
+  it("renders the six evidence-bearing tiles, the queue, egress panel and agents table from served sources", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const h = boot({
+      "/api/posture/home": () => Promise.resolve(response({
+        ...home({ kernel_blocks: 3, kernel_allows: 7, chain_verified: true, window_end: "2026-10-14T16:59:00.000Z", entry_count: 1284 }),
+        castle_wall: { arm_state: "armed", platform: "macOS kernel", ...evidence },
+        agents: [
+          { agent_id: "research-agent", status: "active", harness: "claude_code", enforcement_active: "active", policy_protected: true, ...evidence },
+          { agent_id: "doc-reviewer", status: "active", harness: "claude_code", enforcement_active: "active", policy_protected: true, ...evidence },
+        ],
+        protection_requested_count: 2,
+        enforcement_confirmed_count: 2,
+      })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [agent("research-agent"), agent("doc-reviewer")] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+        pending("tier1-1", "tier1", "research-agent"),
+        pending("tier2-1", "tier2", "doc-reviewer"),
+        { ...heldItem, item_id: "block-1", kind: "blocked_egress", agent_id: "research-agent", destination_category: "frontier_model_api", created_at: "2026-10-14T16:50:00.000Z", resolved: false },
+      ] } })),
+      "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [
+        { finding_id: "finding-1", severity: "medium", detector_id: "egress-volume", summary: "Unusual outbound volume", created_at: "2026-10-14T16:46:00.000Z" },
+      ] } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [
+        { entry_id: "a1", emitted_at: "2026-10-14T16:55:00.000Z", category: "egress", agent_id: "research-agent", display_template_id: "blocked_egress.egress_policy_deny", display_template_args: [{ kind: "destination_category", value: "frontier_model_api" }] },
+      ] } })),
+      "/api/hub/policies": () => Promise.resolve(response({ data: { policies: [{ policy_id: "policy-v41", display_label: "Request approve act", bound_at: now, agent_count: 2, channel_template_id: "request-approve-act" }] } })),
+      "/api/hub/budgets": () => Promise.resolve(response({ data: { budgets: [] } })),
+    });
+    await settle();
+    const html = h.el.main!.innerHTML;
+    for (const label of ["Protected agents", "Enforcement confirmed", "Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
+      expect(html).toContain(label);
+    }
+    expect(html).toContain('2 <small>of 2 detected</small>');
+    expect(html).toContain('<a class="overview-tile" href="#agents">');
+    expect(html).toContain('<a class="overview-tile" href="#enforcement">');
+    expect(html).toContain('<a class="overview-tile" href="#approvals">');
+    expect(html).toContain("<strong>3</strong> of 10 observed outbound connections blocked");
+    expect(html).toContain("Needs your decision");
+    expect(html).toContain('data-overview-tier1-review="tier1-1"');
+    expect(html).toContain('data-action="inbox-approve" data-item-id="tier2-1"');
+    expect(html).toContain("Egress enforcement");
+    expect(html).toContain("showing 1 of 1 blocked destination");
+    expect(html).toContain("Agents <span class=\"n\">showing 2 of 2");
+    expect(html).toContain("Reach (allowed of requested)");
+    expect(html).toContain("policy-v41");
+  });
+
+  it("keeps missing and stale Overview sources Unknown or Not evaluated, never green or zero", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const stale = { last_enforcement_evidence_at: "2026-10-14T16:00:00.000Z", freshness_window_ms: 10 * 60 * 1000 };
+    const h = boot({
+      "/api/posture/home": () => Promise.resolve(response({
+        origin_machine: "fixture-mac",
+        agents: [{ agent_id: "stale-agent", enforcement_active: "active", ...stale }],
+        castle_wall: { arm_state: "armed", ...stale },
+        digest: {},
+        protection_requested_count: 1,
+        enforcement_confirmed_count: 1,
+      })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [agent("stale-agent")] } })),
+      "/api/hub/inbox": () => Promise.reject(new Error("no queue")),
+      "/api/anomaly/findings": () => Promise.reject(new Error("no sentinels")),
+      "/api/hub/activity": () => Promise.reject(new Error("no activity")),
+    });
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("UNKNOWN");
+    expect(html).toContain("Not evaluated");
+    expect(html).toContain("approval queue did not answer");
+    expect(html).toContain("Sentinels did not answer");
+    expect(html).toContain("activity read did not answer");
+    expect(html).not.toContain("0 approvals waiting");
+    expect(html).not.toContain("0 open findings");
+    expect(html).not.toContain("ENFORCING");
+  });
+
+  it("shows the first-run empty state for a fortress with no agents instead of a wall of zeros", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const h = boot({
+      "/api/posture/home": () => Promise.resolve(response(home({ chain_verified: true, window_end: now }))),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })),
+      "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [] } })),
+    });
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("No agents protected yet");
+    expect(html).toContain("0 of 0 detected agent harnesses are protected");
+    expect(html).toContain("Protect an agent");
+    expect(html).not.toContain("0 of 0 protected");
+  });
+
+  it("inline Overview decisions use the existing inbox path and Tier 1 rows link instead of deciding inline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [agent("research-agent"), agent("doc-reviewer")] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+        pending("tier1-1", "tier1", "research-agent"),
+        pending("tier2-1", "tier2", "doc-reviewer"),
+      ] } })),
+      "/api/hub/inbox/tier2-1/approve": (init) => { calls.push({ url: "/api/hub/inbox/tier2-1/approve", init }); return Promise.resolve(response({ data: { item: { ...pending("tier2-1", "tier2", "doc-reviewer"), resolved: true } } })); },
+    });
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-overview-tier1-review="tier1-1"');
+    expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
+    h.click({ "data-action": "inbox-approve", "data-item-id": "tier2-1" });
+    await settle();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("/api/hub/inbox/tier2-1/approve");
   });
 });

@@ -1878,10 +1878,56 @@ body {
 .state-chip.good i { background: var(--sage); border-radius: 50%; }
 .state-chip.bad { color: var(--rust); background: var(--rust-bg); border-color: var(--rust); }
 .state-chip.bad i { background: var(--rust); }
+.state-chip.warn { color: var(--ochre); background: var(--ochre-bg); border-color: var(--ochre-line); }
+.state-chip.warn i { background: var(--ochre); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
 .state-chip.checking { color: var(--slate); background: var(--slate-bg); border-color: var(--slate); }
 .state-chip.checking i { background: transparent; border: 1.5px solid var(--slate); border-radius: 0; }
 .state-chip.unknown { color: var(--slate); background: var(--slate-bg); border: 1px dashed var(--slate-line); }
 .state-chip.unknown i { background: transparent; border: 1.5px dotted var(--slate); border-radius: 50%; }
+.state-chip.neutral { color: var(--color-status-neutral); background: var(--color-status-neutral-bg); border-color: var(--color-status-neutral-line); }
+.state-chip.neutral i { width: 8px; height: 2px; background: var(--color-status-neutral); border-radius: 1px; }
+.state-chip.locked { color: var(--locked); background: var(--locked-bg); border-color: var(--locked-line); }
+.state-chip.locked i { background: var(--locked); border-radius: 2px; }
+
+/* Slice 3 Overview: dense security-console composition. Every capped list
+   prints "showing M of N" in its own panel so bounded rendering cannot hide
+   queue depth, findings or rows. */
+.overview-page { display: flex; flex-direction: column; gap: 16px; }
+.overview-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+@media (min-width: 980px) { .overview-tiles { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+.overview-tile { display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); }
+.overview-tile .ot-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.overview-tile .ot-value { font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; line-height: 1.1; }
+.overview-tile .ot-value small { font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3); font-weight: 400; }
+.overview-tile .ot-evidence { margin-top: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.overview-tile .ot-evidence a { color: var(--indigo); text-decoration: none; }
+.overview-tile .ot-evidence a:hover { text-decoration: underline; }
+.overview-two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+@media (max-width: 1100px) { .overview-two { grid-template-columns: 1fr; } }
+.overview-table-scroll { overflow-x: auto; }
+.overview-table { width: 100%; border-collapse: collapse; min-width: 760px; font-size: var(--text-sm); }
+.overview-table th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); color: var(--ink-3); font-family: var(--mono); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.06em; }
+.overview-table td { padding: 10px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+.overview-table tr:last-child td { border-bottom: 0; }
+.overview-table .mono { font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-2); }
+.overview-table .muted { color: var(--ink-3); }
+.overview-table .actions { display: flex; gap: 6px; justify-content: flex-end; }
+.overview-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.overview-kpis div { border: 1px solid var(--rule); border-radius: 8px; padding: 10px; background: var(--paper-2); }
+.overview-kpis dt { color: var(--ink-3); font-size: var(--text-xs); margin: 0; }
+.overview-kpis dd { margin: 2px 0 0; font-family: var(--serif); font-size: var(--text-xl); font-variant-numeric: tabular-nums; }
+.overview-bars { display: flex; align-items: flex-end; gap: 3px; height: 54px; margin-top: 10px; }
+.overview-bars i { flex: 1; min-width: 2px; border-radius: 2px 2px 0 0; background: var(--chart-allowed); opacity: 0.7; }
+.overview-bars i.blocked { background: var(--chart-blocked); opacity: 0.95; }
+.overview-list { display: flex; flex-direction: column; }
+.overview-list .item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.overview-list .item:last-child { border-bottom: 0; }
+.overview-list .item .body { flex: 1; min-width: 0; }
+.overview-list .item .title { font-weight: 600; }
+.overview-list .item .detail { color: var(--ink-3); font-size: var(--text-xs); margin-top: 2px; }
+.overview-empty { padding: 16px; border: 1px dashed var(--rule-2); border-radius: 8px; background: var(--surface); }
+.overview-empty h2, .overview-empty h3 { margin: 0 0 6px; }
+.overview-empty p { margin: 0 0 10px; color: var(--ink-2); }
 
 `;
 

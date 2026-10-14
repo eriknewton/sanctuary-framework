@@ -156,7 +156,7 @@ const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE
 // Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
   INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
-  HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
+  HUB + "/policies", HUB + "/budgets", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
   HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config",
   HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
   AUTO_TRIGGER + "/recommendations", AUTO_TRIGGER + "/details",
@@ -207,6 +207,7 @@ function validateReadBody(key, body) {
     [HUB + "/agents", "agents"], [HUB + "/inbox", "items"],
     [HUB + "/activity", "entries"], [HUB + "/activity?category=privacy", "entries"],
     [HUB + "/activity?category=handoff", "entries"], [HUB + "/policies", "policies"],
+    [HUB + "/budgets", "budgets"],
     [HUB + "/chat/concierge/history", "messages"], [AUTO_TRIGGER + "/rules", "rules"],
     [AUTO_TRIGGER + "/recommendations", "recommendations"], ["/api/anomaly/findings", "findings"],
     ["/api/honeypot/tool-traps", "traps"], ["/api/honeypot/credential-traps", "traps"]
@@ -238,6 +239,7 @@ const state = {
   },
   activity: [],
   policies: [],
+  budgets: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
   // Tunability UX: plain-English view of the LIVE Principal Policy, fetched
   // from the operator-bearer-gated GET /api/policy/current. null until first
@@ -470,6 +472,7 @@ function readLabel(path) {
     [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
     [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
     [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
+    [HUB + "/budgets", "Budgets"],
     [HUB + "/intelligence/status", "Intelligence status"], [HUB + "/intelligence/config", "Intelligence configuration"], [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
     [HUB + "/chat", "Conversation history"], [POLICY, "Operator policy"],
     [AUTO_TRIGGER + "/recommendations", "Recommendations"], [AUTO_TRIGGER + "/details", "Rule details"], [AUTO_TRIGGER, "Auto-trigger"], ["/api/honeypot/tool-traps", "Tool honeypots"], ["/api/honeypot/credential-traps", "Credential honeypots"], ["/api/honeypot", "Honeypots"]
@@ -3389,6 +3392,260 @@ function postureMetricCard(value, label, opts) {
     : "";
   return '<div class="posture-metric"><span class="pm-v">' + value + ofText + '</span><span class="pm-l">' + escHtml(label) + '</span>' + foot + '</div>';
 }
+
+// Slice 3 Overview caps. Each rendered list prints "showing M of N" beside
+// the panel title so the cap bounds client work without hiding the backlog.
+const OVERVIEW_DECISION_LIMIT = 4;
+const OVERVIEW_FINDING_LIMIT = 3;
+const OVERVIEW_BLOCKED_DESTINATION_LIMIT = 3;
+const OVERVIEW_AGENT_LIMIT = 8;
+const OVERVIEW_EGRESS_HOUR_BUCKETS = 24; // Twenty-four one-hour bars make the "last 24h" window legible.
+
+function overviewSourceReason(path, noun) {
+  const read = sourceRead(path);
+  if (sourceNotServed(path)) return noun + " is not served on this host";
+  if (!read || read.state === "state_UNREAD" || read.state === "state_LOADING") return noun + " has not answered yet";
+  if (read.state === "state_FAILED") return noun + " did not answer" + (read.error ? ": " + read.error : "");
+  return noun + " is not evaluated";
+}
+
+function overviewEvidence(path, label, href) {
+  const age = sourceLoaded(path) ? sourceReadAge(path) : null;
+  const text = age ? label + " read " + age : overviewSourceReason(path, label);
+  return escHtml(text) + (href ? ' · <a href="' + escHtml(href) + '">evidence</a>' : '');
+}
+
+function overviewChip(kind, word, detail) {
+  return '<span class="state-chip ' + escHtml(kind) + '"><i aria-hidden="true"></i>' +
+    escHtml(word) + (detail ? ' · <span>' + escHtml(detail) + '</span>' : '') + '</span>';
+}
+
+function overviewTile(label, valueHtml, evidenceHtml, href) {
+  return '<a class="overview-tile" href="' + escHtml(href || "#activity") + '">' +
+    '<span class="ot-label">' + escHtml(label) + '</span>' +
+    '<span class="ot-value">' + valueHtml + '</span>' +
+    '<span class="ot-evidence">' + (typeof evidenceHtml === "string" ? evidenceHtml : (evidenceHtml && evidenceHtml.text) || "") + '</span>' +
+  '</a>';
+}
+
+function overviewSmall(text) {
+  return '<small>' + escHtml(text) + '</small>';
+}
+
+function postureEvidenceByAgent(home) {
+  const map = {};
+  (home && home.agents || []).forEach(function (row) { if (row && row.agent_id) map[row.agent_id] = row; });
+  return map;
+}
+
+function detectedAgentCount(home) {
+  if (sourceLoaded(HUB + "/agents")) return state.agents.length;
+  return ((home && home.agents && home.agents.length) || 0) +
+    ((home && home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
+}
+
+function protectedAgentCount(home) {
+  const evidence = postureEvidenceByAgent(home);
+  const ids = sourceLoaded(HUB + "/agents") ? state.agents.map(function (a) { return a.agent_id; }) : Object.keys(evidence);
+  return ids.filter(function (id) {
+    const row = evidence[id];
+    return row && row.enforcement_active === "active" && evidenceCurrent(row);
+  }).length;
+}
+
+function oldestAge(items) {
+  const times = items.map(function (i) { return parseEvidenceTimestamp(i.created_at || ""); }).filter(Number.isFinite);
+  if (!times.length) return "oldest age Unknown";
+  return "oldest " + durationLabelFromMs(Date.now() - Math.min.apply(null, times)) + " ago";
+}
+
+function overviewFirstRun(home) {
+  const detected = detectedAgentCount(home);
+  return '<section class="overview-empty" data-overview-first-run="1">' +
+    '<h2>No agents protected yet</h2>' +
+    '<p>' + escHtml(protectedAgentCount(home) + " of " + detected + " detected agent harnesses are protected. Evidence read " + (sourceReadAge("/api/posture/home") || "is current only after the first check") + ".") + '</p>' +
+    '<a class="btn btn-primary" href="#agents">Protect an agent</a>' +
+  '</section>';
+}
+
+function overviewDecisionRow(item) {
+  const text = renderTemplate(item.display_template_id, item.display_template_args);
+  const agentId = item.agent_id || "this fortress";
+  const createdAt = parseEvidenceTimestamp(item.created_at || "");
+  const wait = Number.isFinite(createdAt) ? durationLabelFromMs(Date.now() - createdAt) + " ago" : "Unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  const actions = item.tier === "tier1"
+    ? '<a class="btn btn-sm" href="#approvals" data-overview-tier1-review="' + escHtml(item.item_id) + '">Review in Approvals</a>'
+    : '<div class="actions"><button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>' +
+      '<button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button></div>';
+  return '<tr><td><span class="mono">' + escHtml(tier) + '</span></td><td><a href="#agents" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a></td>' +
+    '<td class="mono">' + escHtml(item.operation_category || "approval") + '</td><td>' + escHtml(text) + '</td><td class="mono">' + escHtml(wait) + '</td><td>' + actions + '</td></tr>';
+}
+
+function renderOverviewDecisionQueue() {
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Not evaluated</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals Unknown</h3><p>' + escHtml(overviewSourceReason(HUB + "/inbox", "approval queue")) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/inbox" + '">Retry</button></div></section>';
+  }
+  if (state.inboxRedacted) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">Unknown</span></h3></div>' +
+      '<div class="overview-empty"><h3>Approvals hidden</h3><p>Approvals are hidden until you paste the operator token. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p><a class="btn" href="#approvals">Open Approvals</a></div></section>';
+  }
+  const all = heldApprovalItems(null).slice().sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const shown = all.slice(0, OVERVIEW_DECISION_LIMIT);
+  if (!all.length) {
+    return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">0 of 0 · queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' +
+      '<div class="overview-empty"><h3>No approvals waiting</h3><p>0 of 0 held operations are open. Queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '.</p><a class="btn" href="#activity">Open Evidence</a></div></section>';
+  }
+  return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
+    '<a href="#approvals">all approvals</a></div><div class="overview-table-scroll"><table class="overview-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting</th><th></th></tr></thead><tbody>' +
+    shown.map(overviewDecisionRow).join("") + '</tbody></table></div></section>';
+}
+
+function displayArgValue(args, kind) {
+  const found = (args || []).find(function (a) { return a && a.kind === kind; });
+  return found ? found.value : null;
+}
+
+function blockedDestinationCounts() {
+  const counts = {};
+  state.inbox.forEach(function (item) {
+    if (item.resolved || item.kind !== "blocked_egress") return;
+    const dest = item.destination_category || displayArgValue(item.display_template_args, "destination_category") || "destination not served";
+    const key = String(dest);
+    counts[key] = counts[key] || { destination: key, count: 0, agent: item.agent_id || "Unknown", last: item.created_at || null };
+    counts[key].count += 1;
+  });
+  state.activity.forEach(function (entry) {
+    if (entry.category !== "egress" && String(entry.display_template_id || "").indexOf("blocked_egress") < 0) return;
+    const dest = displayArgValue(entry.display_template_args, "destination_category") || "destination not served";
+    const key = String(dest);
+    counts[key] = counts[key] || { destination: key, count: 0, agent: entry.agent_id || "Unknown", last: entry.emitted_at || null };
+    counts[key].count += 1;
+    if (entry.emitted_at && (!counts[key].last || (parseEvidenceTimestamp(entry.emitted_at) || 0) > (parseEvidenceTimestamp(counts[key].last) || 0))) counts[key].last = entry.emitted_at;
+  });
+  return Object.keys(counts).map(function (k) { return counts[k]; }).sort(function (a, b) { return b.count - a.count; });
+}
+
+function egressHourBars() {
+  if (!sourceLoaded(HUB + "/activity")) return "";
+  const buckets = Array.from({ length: OVERVIEW_EGRESS_HOUR_BUCKETS }, function () { return { allowed: 0, blocked: 0 }; });
+  const end = Date.now();
+  const hourMs = 60 * 60 * 1000;
+  state.activity.forEach(function (entry) {
+    if (entry.category !== "egress" && String(entry.display_template_id || "").indexOf("egress") < 0) return;
+    const t = parseEvidenceTimestamp(entry.emitted_at || "");
+    if (!Number.isFinite(t) || t > end || end - t >= OVERVIEW_EGRESS_HOUR_BUCKETS * hourMs) return;
+    const index = OVERVIEW_EGRESS_HOUR_BUCKETS - 1 - Math.floor((end - t) / hourMs);
+    const blocked = String(entry.display_template_id || "").indexOf("blocked") >= 0;
+    if (blocked) buckets[index].blocked += 1;
+    else buckets[index].allowed += 1;
+  });
+  const max = Math.max(1, ...buckets.map(function (b) { return b.allowed + b.blocked; }));
+  if (!buckets.some(function (b) { return b.allowed || b.blocked; })) {
+    return '<p class="muted">Hourly egress series was read, but no egress rows were served for this window. This is not a kernel zero.</p>';
+  }
+  return '<div class="overview-bars" role="img" aria-label="Hourly egress events, blocked hours in red">' +
+    buckets.map(function (b) {
+      const h = Math.max(10, Math.round(((b.allowed + b.blocked) / max) * 100));
+      return '<i class="' + (b.blocked ? "blocked" : "allowed") + '" style="height:' + h + '%" title="' + escHtml(b.blocked + " blocked, " + b.allowed + " allowed") + '"></i>';
+    }).join("") + '</div>';
+}
+
+function renderOverviewEgressPanel(home) {
+  const d = home.digest || {};
+  const blocksKnown = typeof d.kernel_blocks === "number";
+  const allowsKnown = typeof d.kernel_allows === "number";
+  const held = heldApprovalItems(null).filter(function (i) {
+    return String(i.operation_category || i.display_template_id || "").indexOf("egress") >= 0;
+  }).length;
+  const total = blocksKnown && allowsKnown ? d.kernel_blocks + d.kernel_allows : null;
+  const countLine = blocksKnown && allowsKnown
+    ? '<p class="muted"><strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(total) + ' observed outbound connections blocked; ' + escHtml(d.kernel_allows) + ' allowed. Window closed ' + escHtml(d.window_end ? relTimeFromIso(d.window_end) : "at an unknown time") + '.</p>'
+    : '<p class="muted">Egress counts are Not evaluated because blocked and allowed kernel counts were not both served. This is not zero traffic.</p>';
+  const bars = sourceLoaded(HUB + "/activity")
+    ? egressHourBars()
+    : '<p class="muted">Hourly egress series not served: ' + escHtml(overviewSourceReason(HUB + "/activity", "activity read")) + '.</p>';
+  const destinations = blockedDestinationCounts();
+  const shown = destinations.slice(0, OVERVIEW_BLOCKED_DESTINATION_LIMIT);
+  const rows = shown.length
+    ? shown.map(function (r) {
+        return '<tr><td class="mono">' + escHtml(r.destination) + '</td><td>' + escHtml(r.agent) + '</td><td>' + escHtml(r.count) + '</td><td class="mono muted">' + escHtml(r.last ? relTimeFromIso(r.last) : "Unknown") + '</td></tr>';
+      }).join("")
+    : '<tr><td colspan="4" class="muted">Blocked destination detail not served for this window.</td></tr>';
+  return '<section class="card"><div class="card-head-row"><h3>Egress enforcement <span class="count-age">last 24h</span></h3><a href="#enforcement">enforcement</a></div>' +
+    '<div class="overview-kpis"><div><dt>Blocked</dt><dd>' + (blocksKnown ? escHtml(d.kernel_blocks) : '<span class="unknown-value">Unknown</span>') + '</dd></div>' +
+    '<div><dt>Allowed</dt><dd>' + (allowsKnown ? escHtml(d.kernel_allows) : '<span class="unknown-value">Unknown</span>') + '</dd></div>' +
+    '<div><dt>Held for you</dt><dd>' + (sourceLoaded(HUB + "/inbox") ? escHtml(held) : '<span class="unknown-value">Unknown</span>') + '</dd></div></div>' +
+    countLine + bars +
+    '<div class="overview-table-scroll"><table class="overview-table"><thead><tr><th>Blocked destination</th><th>Agent</th><th>Count</th><th>Last</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+    '<p class="muted">showing ' + escHtml(shown.length) + ' of ' + escHtml(destinations.length) + ' blocked destination' + (destinations.length === 1 ? "" : "s") + '</p></section>';
+}
+
+function severityClass(level) {
+  const v = String(level || "info").toLowerCase();
+  if (v === "critical" || v === "high" || v === "medium" || v === "low") return v;
+  return "info";
+}
+
+function renderOverviewFindingsPanel() {
+  const unknown = !sourceLoaded("/api/anomaly/findings") || state.posture.anomaliesUnknown !== false;
+  const findings = unknown ? [] : (state.posture.anomalies || []);
+  const shown = findings.slice(0, OVERVIEW_FINDING_LIMIT);
+  const list = unknown
+    ? '<div class="overview-empty"><h3>Sentinel findings Unknown</h3><p>' + escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) + '. This is not a confirmation of zero findings.</p><button class="btn" data-action="retry-panel" data-read="/api/anomaly/findings">Retry Anomaly findings</button></div>'
+    : shown.length
+      ? '<div class="overview-list">' + shown.map(function (f) {
+          const sev = severityClass(f.severity);
+          return '<div class="item"><span class="sev ' + sev + '"><b></b>' + escHtml(sev) + '</span><div class="body"><div class="title">' + escHtml(f.summary || f.detector_id || f.finding_id || "Sentinel finding") + '</div><div class="detail">Sentinel: ' + escHtml(f.detector_id || "Unknown") + '</div></div><span class="mono muted">' + escHtml(relTimeFromIso(f.created_at || f.observed_at)) + '</span></div>';
+        }).join("") + '</div>'
+      : '<div class="overview-empty"><h3>No open Sentinel findings</h3><p>0 of 0 open findings. Sentinels answered ' + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + '.</p><a class="btn" href="#findings">Open Findings</a></div>';
+  return '<section class="card"><div class="card-head-row"><h3>Findings <span class="count-age">' +
+    (unknown ? "Not evaluated" : "showing " + shown.length + " of " + findings.length) + '</span></h3><a href="#findings">all findings</a></div>' + list +
+    '<div class="card-head-row" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:10px;"><h3>Fleet <span class="count-age">this machine plus saved machines</span></h3><a href="#machines">machines</a></div>' +
+    '<p class="muted">Fleet enforcement status comes from the Machines screen health probes; this Overview does not infer remote protection from local evidence.</p></section>';
+}
+
+function agentBudgetText(agent) {
+  const daily = agent && agent.budget_summary && agent.budget_summary.daily;
+  if (!daily) return "Unknown";
+  return String(daily.used) + " of " + String(daily.cap) + " " + String(daily.unit || "");
+}
+
+function agentStateChip(agent) {
+  const status = agentEvidenceStatus(agent);
+  if (status === "active") return overviewChip("good", "RUNNING", sourceReadAge("/api/posture/home") || "");
+  if (agent.status === "paused") return overviewChip("neutral", "IDLE");
+  if (agent.status === "locked_down") return overviewChip("locked", "LOCKED DOWN");
+  if (agent.status === "error") return overviewChip("bad", "ERROR");
+  return overviewChip("unknown", "UNKNOWN");
+}
+
+function agentEnforcementChip(agent) {
+  return agentEvidenceStatus(agent) === "active"
+    ? overviewChip("good", "CONFIRMED", sourceReadAge("/api/posture/home") || "")
+    : overviewChip("unknown", "UNKNOWN");
+}
+
+function renderOverviewAgentsTable() {
+  if (!sourceLoaded(HUB + "/agents")) {
+    return '<section class="card"><div class="card-head-row"><h3>Agents <span class="count-age">Not evaluated</span></h3></div><div class="overview-empty"><h3>Agent roster Unknown</h3><p>' + escHtml(overviewSourceReason(HUB + "/agents", "agent roster")) + '.</p><button class="btn" data-action="retry-panel" data-read="' + HUB + "/agents" + '">Retry</button></div></section>';
+  }
+  const shown = state.agents.slice(0, OVERVIEW_AGENT_LIMIT);
+  const rows = shown.map(function (a) {
+    const owner = a.identity_id || "Unknown";
+    const template = a.channel_template_id || "Unknown";
+    const policyAge = sourceReadAge(HUB + "/policies") || sourceReadAge(HUB + "/agents") || "Unknown";
+    return '<tr><td><a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(a.agent_id) + '">' + escHtml(a.agent_id) + '</a></td>' +
+      '<td>' + escHtml(owner) + '</td><td>' + escHtml(a.harness || "Unknown") + '</td><td>' + escHtml(template) + '</td>' +
+      '<td class="mono">Unknown hosts · Unknown MCP · Unknown tools<br><span class="muted">' + escHtml((a.policy_id || "policy Unknown") + " · read " + policyAge) + '</span></td>' +
+      '<td>' + agentEnforcementChip(a) + '</td><td>' + agentStateChip(a) + '</td><td>' + escHtml(agentBudgetText(a)) + '</td><td class="mono muted">' + escHtml(a.last_activity_at ? relTimeFromIso(a.last_activity_at) : "no evidence in window") + '</td></tr>';
+  }).join("");
+  return '<section class="card"><div class="card-head-row"><h3>Agents <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(state.agents.length) + '</span></h3><span class="count-age">Reach (allowed of requested) · policy read ' + escHtml(sourceReadAge(HUB + "/policies") || "Unknown") + '</span></div>' +
+    '<div class="overview-table-scroll"><table class="overview-table"><thead><tr><th>Agent</th><th>Owner</th><th>Harness</th><th>Policy template</th><th>Reach (allowed of requested)</th><th>Enforcement</th><th>State</th><th>Budget today</th><th>Last activity</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
+}
 function renderPostureStory(d) {
   // F2 BLOCKER-1: three-state from the shared verdict. Never "verified clean"
   // over a tampered sealed entry; a neutral "sealed history not re-verifiable at
@@ -3498,103 +3755,75 @@ function renderPostureScreen() {
   const home = state.posture.home;
   const head =
     '<div class="page-head"><div>' +
-      '<p class="eyebrow">Posture</p>' +
-      '<h1>How safe you are right now.</h1>' +
-      '<p class="sub">The full posture detail, on this one surface. Castle Wall reads protected only on a fresh enforcement check. Every number traces to your signed audit trail.</p>' +
+      '<p class="eyebrow">Overview</p>' +
+      '<h1>Overview</h1>' +
+      '<p class="sub">What needs attention now. Every number states its denominator and evidence age; Unknown is not counted as protected.</p>' +
     '</div></div>';
   if (!sourceLoaded("/api/posture/home") || !home) {
     const why = state.posture.homeError
-      ? 'Protection status unavailable. This dashboard could not read the latest check. ' + escHtml(state.posture.homeError)
-      : 'Protection status unavailable. Current data is Unknown.';
-    return '<section class="concierge-wrap">' + head +
+      ? 'Protection status unavailable. Overview unavailable. This dashboard could not read the latest posture check. ' + escHtml(state.posture.homeError)
+      : 'Protection status unavailable. Overview unavailable. Current posture is Unknown.';
+    return '<section class="overview-page">' + head +
       '<section class="card"><p class="muted">' + why + '</p></section>' + renderSourceRead("/api/posture/home") +
       '</section>';
   }
+  const machineLine = home.origin_machine
+    ? '<p class="muted overview-machine">Machine <span class="mono">' + escHtml(home.origin_machine) + '</span></p>'
+    : '';
+  if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
+    return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + '</section>';
+  }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
-  // ADDITIVE vault-level line. The wall label above is the MACHINE arm-state and
-  // is unchanged; a Mac armed by an earlier install renders it protected while
-  // this vault is on no wall, so the vault's own claim gets its own sentence
-  // rather than being folded into that label. NOTE: this whole browser script
-  // lives inside a TypeScript template literal, so a backtick here would
-  // terminate it; comments in this file use plain words, never code quotes.
+  const detectedTotal = detectedAgentCount(home);
+  const protectedTotal = protectedAgentCount(home);
+  const requested = typeof home.protection_requested_count === "number" ? home.protection_requested_count : detectedTotal;
+  const confirmed = protectedTotal;
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
-  const vaultNotice =
-    vaultProvision === "not_yet_walled"
-      ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
-      : "";
-  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
+  const vaultNotice = vaultProvision === "not_yet_walled"
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    : "";
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = !sourceLoaded("/api/anomaly/findings") || home.anomaly_findings_unknown === true;
-  // F2 BLOCKER-1: three-state audit-chain pill from the shared verdict.
-  const chainPill = home.digest && home.digest.chain_verified
-    ? '<span class="pill tone-verified">Verified</span>'
-    : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
-      ? '<span class="pill tone-degraded">Suffix-only</span>'
-      : '<span class="pill tone-unverified">Unverified</span>';
-  // S3 evidence spine. Every tile carries, where the payload already supports
-  // it, a denominator, a freshness stamp, and a link to its evidence. Nothing
-  // here fetches new data: detectedTotal, the wall's evidence timestamp, and the
-  // digest window all come from the /api/posture/home payload already in state.
-  // Tiles the payload cannot honestly qualify (approvals, anomalies) get an
-  // evidence link only, with no invented denominator or age.
-  const detectedTotal =
-    ((home.agents && home.agents.length) || 0) +
-    ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
   const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
   const digest = home.digest || {};
+  const wallAge = wallEvidenceAt ? relTimeFromIso(wallEvidenceAt) : "";
+  const wallChip = wall.text === "Enforcing"
+    ? overviewChip("good", "ENFORCING", wallAge)
+    : wall.text === "Coarse-only" || wall.text === "Degraded"
+      ? overviewChip("warn", wall.text.toUpperCase(), wallAge || "evidence not current")
+      : wall.text === "Locked down"
+        ? overviewChip("locked", "LOCKED DOWN", wallAge)
+        : overviewChip("unknown", "UNKNOWN", wallAge || "no evidence");
+  const pendingKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
+  const pending = pendingKnown ? heldApprovalItems(null) : [];
+  const chainVerified = digest.chain_verified === true && !!digest.window_end;
+  const chainChip = chainVerified
+    ? overviewChip("good", "VERIFIED", relTimeFromIso(digest.window_end))
+    : digest.chain_verdict === "verified_suffix_only"
+      ? overviewChip("warn", "SUFFIX ONLY", digest.window_end ? relTimeFromIso(digest.window_end) : "")
+      : overviewChip("unknown", "NOT YET VERIFIED", digest.window_end ? relTimeFromIso(digest.window_end) : "no check age");
   const metricCards =
-    '<div class="posture-metrics">' +
-      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested", {
-        of: detectedTotal,
-        // Hash route, matching the SPA's own nav ids, so this stays in-app.
-        ev: { href: "#agents", text: "agents" },
-      }) +
-      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed", {
-        of: home.protection_requested_count,
-        ev: { href: "/posture/evidence", text: "evidence" },
-      }) +
-      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall", {
-        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
-        // of this render. No evidence says so outright: absence must read as
-        // absence, never as a recent check that happened to pass.
-        fresh: wallEvidenceAt,
-        freshNone: "no enforcement evidence yet",
-      }) +
-      vaultNotice + renderSourceRead(HUB + "/inbox") +
-      postureMetricCard(!sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : escHtml(pending), "Approvals waiting") +
-      postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
-      postureMetricCard(chainPill, "Audit chain", {
-        // The digest window is the period this verdict covers; its end states
-        // how current the verdict is.
-        fresh: digest.window_end,
-        freshNone: "no verify on record",
-        ev: { href: "/api/audit-log", text: "audit log" },
-      }) +
+    '<div class="overview-tiles" aria-label="At a glance">' +
+      overviewTile("Protected agents", escHtml(protectedTotal) + " " + overviewSmall("of " + detectedTotal + " detected"), overviewEvidence("/api/posture/home", "posture", "#agents") + ' · <a href="#agents">agents</a>', "#agents") +
+      overviewTile("Enforcement confirmed", escHtml(confirmed) + " " + overviewSmall("of " + requested + " requested"), overviewEvidence("/api/posture/home", "posture", "#enforcement") + ' · <a href="#enforcement">evidence</a>', "#enforcement") +
+      overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
+      overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + ' · <a href="#approvals">decide</a>' : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue")), "#approvals") +
+      overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(sourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
+      overviewTile("Audit chain", chainChip, (digest.entry_count !== undefined ? escHtml(digest.entry_count) + " entries" : "entry count not served") + " · " + (digest.window_end ? "checked " + escHtml(relTimeFromIso(digest.window_end)) : "last check Not evaluated"), "#activity") +
     '</div>';
-  const storyToggle =
-    '<label class="story-toggle"><input type="checkbox" data-action="posture-story-plain"' +
-    (state.posture.storyPlain ? ' checked' : '') + '> Plain summary</label>';
   return [
-    '<section class="concierge-wrap">',
+    '<section class="overview-page">',
       head,
-      '<section class="card">',
-        '<h3>At a glance</h3>',
-        metricCards,
-        '<p class="muted">Machine: ' + escHtml(home.origin_machine || "(local)") + '</p>',
-      '</section>',
-      '<section class="card">',
-        '<div class="card-head-row"><h3>Today&#39;s story</h3>' + storyToggle + '</div>',
-        renderPostureStory(home.digest || {}),
-        postureStoryFoot(home.digest || {}),
-      '</section>',
-      '<section class="card">',
-        '<h3>Anomaly findings</h3>',
-        renderPostureAnomalies(findings, anomalyUnknown), renderSourceRead("/api/anomaly/findings"),
-      '</section>',
-      '<section class="card">',
-        '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
-        renderPostureAgentRows(home),
-      '</section>',
+      machineLine,
+      metricCards,
+      vaultNotice,
+      renderOverviewDecisionQueue(),
+      '<div class="overview-two">',
+        renderOverviewEgressPanel(home),
+        renderOverviewFindingsPanel(),
+      '</div>',
+      renderOverviewAgentsTable(),
+      '<p class="muted">Every count on this page names what it is out of and when the evidence was read. Unknown is never counted as protected, and green appears only inside the freshness window.</p>',
     '</section>'
   ].join("");
 }
@@ -3892,7 +4121,7 @@ function renderEnforcementScreen() {
     : '<span class="pm-fresh none">no enforcement evidence yet</span>';
   const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
   const vaultNotice = vaultProvision === "not_yet_walled"
-    ? '<p class="muted">This vault is not on this machine\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+    ? '<p class="muted">This vault is not on ${LOCAL_CASTLE_WALL_SUBJECT_PLACEHOLDER}\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
     : "";
   const layers = postureLayerLines().map(function (l) {
     const dotCls = layerDotClass(l);
@@ -4298,6 +4527,7 @@ const panelJobs = [
   { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
   { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
+  { paths: [HUB + "/budgets"], load: async function () { const r = await api("/budgets"); state.budgets = r.data.budgets || []; } },
   { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
   { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
   { paths: [AUTO_TRIGGER], load: fetchAutoTriggerState },

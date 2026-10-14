@@ -3,7 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 const DEADLINE_MS = 5 * 1000; // UI responsiveness budget, not evidence freshness.
-const home = { origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest: {}, protection_requested_count: 0, enforcement_confirmed_count: 0 };
+const home = {
+  origin_machine: "fixture-mac",
+  agents: [{ agent_id: "fixture", status: "active", harness: "codex", policy_protected: false, enforcement_active: "unknown" }],
+  castle_wall: { arm_state: "unknown" },
+  digest: {},
+  protection_requested_count: 1,
+  enforcement_confirmed_count: 0,
+};
 const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
 const pending = () => new Promise<never>(() => {});
 function testElement() {
@@ -77,7 +84,7 @@ describe("dashboard bounded independent hydration", () => {
   it("publishes home without waiting for anomaly findings", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/anomaly/findings": pending }); await settle();
     expect(h.main.innerHTML).toContain("fixture-mac"); expect(h.main.innerHTML).toContain("not a confirmation of zero findings");
-    await vi.advanceTimersByTimeAsync(DEADLINE_MS); expect(h.main.innerHTML).toContain(">Retry</button>");
+    await vi.advanceTimersByTimeAsync(DEADLINE_MS); expect(h.main.innerHTML).toContain("Retry Anomaly findings</button>");
   });
   it.each([401, 403, 500])("shows an honest HTTP %s failure", async (status) => {
     vi.useFakeTimers(); const h = harness({ "/api/posture/home": () => Promise.resolve(response({ error: "no" }, status)) }); await settle();
@@ -105,7 +112,7 @@ describe("dashboard bounded independent hydration", () => {
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
-    expect(h.main.innerHTML).toMatch(/pm-v[^>]*>Unknown<.*?pm-l[^>]*>Approvals waiting/s);
+    expect(h.main.innerHTML).toMatch(/Approvals waiting[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -162,8 +169,8 @@ describe("dashboard bounded independent hydration", () => {
     for (let i = 0; i < 96; i++) await runInContext('api("/agents/detail-' + i + '").catch(function () {})', h.context);
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
-    expect(h.main.innerHTML).toMatch(/pm-v[^>]*>Unknown<.*?pm-l[^>]*>Approvals waiting/s);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting[\s\S]*?Not evaluated/);
+    expect(runInContext("sourceReads.size", h.context)).toBe(21); // The fixed source inventory has twenty-one entries.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -318,10 +325,10 @@ describe("dashboard bounded independent hydration", () => {
   it("fresh home evidence expires before a current read and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
     const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();
-    expect(h.main.innerHTML).toContain(">Enforcing</span>");
-    await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+    expect(h.main.innerHTML).toContain(">ENFORCING");
+    await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">ENFORCING");
     hang = true; runInContext('void fetchAll()', h.context); await settle();
-    expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+    expect(h.main.innerHTML).not.toContain(">ENFORCING");
   });
   it("a fresh loaded seal becomes Unknown while its refresh is pending", async () => {
     vi.useFakeTimers(); let hang = false;
@@ -509,7 +516,7 @@ describe("dashboard bounded independent hydration", () => {
   it("generic activity events reread privacy, handoff, honeypot, and anomaly panels", async () => {
     vi.useFakeTimers(); let anomalyReads = 0;
     const h = harness({ "/api/anomaly/findings": () => ++anomalyReads === 1 ? response({ data: { findings: [] } }) : pending() }); await settle();
-    expect(h.main.innerHTML).toContain("No open anomaly findings.");
+    expect(h.main.innerHTML).toContain("No open Sentinel findings");
     const before = h.calls.length;
     h.streams.at(-1)!.listeners.activity({ data: JSON.stringify({ entry_id: "generic-audit", category: "other", display_template_id: "audit.other" }) });
     await settle();
@@ -760,7 +767,7 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("1 agent. Click one");
     expect(h.main.innerHTML).not.toContain("1 agents.");
     runInContext('state.route = "posture"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Not protected");
+    expect(h.main.innerHTML).toContain("UNKNOWN");
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {
