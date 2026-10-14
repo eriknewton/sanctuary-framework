@@ -494,6 +494,22 @@ export class HubService {
     return this.deps.agentRegistry.list(safeFilter);
   }
 
+  /** Project stored control permissions through the composed executor for console reads. */
+  async projectAgentCapabilities(record: LocalAgentRecord): Promise<LocalAgentRecord> {
+    const capabilities = { ...record.capabilities };
+    // Must match renderAgentControlButtons in dashboard/v1_1/client.ts: permission AND executor support, never stored intent alone.
+    // Continuing paths: stored false stays false; only explicit support returns true; missing or failed probes disable the control.
+    for (const action of HUB_AGENT_CONTROL_ACTIONS) {
+      const key = `can_${action}` as keyof Pick<LocalAgentRecord["capabilities"], "can_pause" | "can_resume" | "can_restart" | "can_unwrap" | "can_lockdown">;
+      let supported = false;
+      try { supported = await this.deps.agentController.supports?.(action, record.agent_id) === true; }
+      catch { /* A failed support probe is not evidence that a control can run. */ }
+      // Must match assertCapability in hub-service.ts: only a boolean true grants stored permission.
+      capabilities[key] = record.capabilities[key] === true && supported;
+    }
+    return { ...record, capabilities };
+  }
+
   getAgent(agentId: string): LocalAgentRecord {
     const record = this.deps.agentRegistry.get(agentId);
     if (!record) throw new HubNotFoundError(`agent ${agentId}`);
@@ -576,10 +592,13 @@ export class HubService {
       unwrap: c.can_unwrap,
       lockdown: c.can_lockdown,
     };
-    if (!supports[action]) throw new HubCapabilityError(action);
-    const executorSupports = this.deps.agentController.supports
-      ? await this.deps.agentController.supports(action, record.agent_id)
-      : true;
+    // Must match projectAgentCapabilities in hub-service.ts: malformed stored flags never grant permission.
+    if (supports[action] !== true) throw new HubCapabilityError(action);
+    // Must match projectAgentCapabilities above: only an explicit true from the probe is executor support, so a
+    // missing probe, a non-boolean answer or a failed probe refuses before any Tier 1 work is queued.
+    let executorSupports = false;
+    try { executorSupports = (await this.deps.agentController.supports?.(action, record.agent_id)) === true; }
+    catch { /* A failed support probe is not evidence that a control can run. */ }
     if (!executorSupports) {
       const reasonByAction: Record<HubAgentControlAction, string> = {
         pause: "agent_control_pause_unsupported_no_process_handle",
