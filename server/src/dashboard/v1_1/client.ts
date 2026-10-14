@@ -5885,7 +5885,8 @@ async function onExitExportStart() {
 
 async function onEvidenceJsonExport() {
   try {
-    const body = await api("/api/audit-log?limit=" + EVIDENCE_JSON_EXPORT_LIMIT, { method: "GET" });
+    // api() sends the exact /api/audit-log path unprefixed, so the read relies on the route's default limit.
+    const body = await api("/api/audit-log", { method: "GET" });
     // The audit log read answers with an entry array, and with an empty array both for an empty log and
     // for a log it could not read, so an empty answer is reported as no entries, never as a downloaded log.
     if (!Array.isArray(body)) throw new Error("the audit log read did not return entries");

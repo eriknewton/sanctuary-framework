@@ -1799,7 +1799,11 @@ describe("slice 5 Evidence wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("JSON: latest 50 audit entries");
     h.click({ "data-action": "evidence-export-json" });
     await settle();
-    expect(h.requests.some((r) => r.url === "/api/audit-log?limit=50")).toBe(true);
+    expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
+    // The label's bound is the audit log route's own default limit, read from its source.
+    const dashboardSource = readFileSync(new URL("../../../src/principal-policy/dashboard.ts", import.meta.url), "utf8");
+    const routeDefault = dashboardSource.match(/private handleAuditLog\(url: URL[^]*?searchParams\.get\("limit"\) \?\? "(\d+)"/)![1];
+    expect(h.el.main!.innerHTML).toContain("JSON: latest " + routeDefault + " audit entries");
     expect(h.downloads).toHaveLength(0);
     expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
     expect(h.el["toast-host"]!.innerHTML).not.toContain("downloaded");
