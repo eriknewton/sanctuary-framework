@@ -16,18 +16,19 @@ import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js
 describe("v1.1 dashboard Tier 1 button copy", () => {
   it("lockdown has four states: idle / pending / partial / engaged", () => {
     const c = TIER1_BUTTON_COPY.lockdown;
-    expect(c.idle).toBe("Lockdown");
+    expect(c.idle).toBe("Lock down");
     expect(c.pending).toBe("Awaiting approval");
-    expect(c.partial).toBe("Lockdown partial");
-    expect(c.engaged).toBe("Lockdown ON");
-    expect(c.cancelled).toContain("not engaged");
+    expect(c.partial).toBe("Partly locked down");
+    expect(c.engaged).toBe("Locked down");
+    expect(c.cancelled).toBe("Not locked down");
   });
 
   it("unwrap has three states: idle / pending / engaged", () => {
     const c = TIER1_BUTTON_COPY.unwrap;
-    expect(c.idle).toBe("Unwrap");
+    expect(c.idle).toBe("Remove protection");
     expect(c.pending).toContain("pending");
-    expect(c.engaged).toBe("Unwrapped");
+    expect(c.engaged).toBe("Protection removed");
+    expect(c.cancelled).toBe("Removal denied");
   });
 
   it("policy_change has three states: idle / pending / engaged", () => {
@@ -79,7 +80,7 @@ describe("v1.1 dashboard Tier 1 client logic", () => {
     const src = getClientScript();
     expect(src).toContain('t1.state === "partial"');
     expect(src).toContain('payload.outcome === "partial"');
-    expect(src).toContain("Lockdown partial");
+    expect(src).toContain("Partly locked down");
   });
 
   it("client script does not render failed lockdown approvals as engaged", async () => {

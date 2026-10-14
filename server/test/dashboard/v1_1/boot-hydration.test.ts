@@ -3,7 +3,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 const DEADLINE_MS = 5 * 1000; // UI responsiveness budget, not evidence freshness.
-const home = { origin_machine: "fixture-mac", agents: [], castle_wall: { arm_state: "unknown" }, digest: {}, protection_requested_count: 0, enforcement_confirmed_count: 0 };
+const home = {
+  origin_machine: "fixture-mac",
+  agents: [{ agent_id: "fixture", status: "active", harness: "codex", policy_protected: false, enforcement_active: "unknown" }],
+  // Overview detected counts require the served unprotected-harness list; this
+  // fixture is intentionally not the first-run path.
+  unwrapped: { origin_machine: "fixture-mac", detection_method: "config_file_presence", unwrapped: [] },
+  castle_wall: { arm_state: "unknown" },
+  digest: {},
+  protection_requested_count: 1,
+  enforcement_confirmed_count: 0,
+};
 const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
 const pending = () => new Promise<never>(() => {});
 function testElement() {
@@ -77,7 +87,8 @@ describe("dashboard bounded independent hydration", () => {
   it("publishes home without waiting for anomaly findings", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/anomaly/findings": pending }); await settle();
     expect(h.main.innerHTML).toContain("fixture-mac"); expect(h.main.innerHTML).toContain("not a confirmation of zero findings");
-    await vi.advanceTimersByTimeAsync(DEADLINE_MS); expect(h.main.innerHTML).toContain(">Retry</button>");
+    // Retarget reason: this pins the failed findings read, not a later checked-empty detector state.
+    await vi.advanceTimersByTimeAsync(DEADLINE_MS); expect(h.main.innerHTML).toContain("Retry Anomaly findings</button>");
   });
   it.each([401, 403, 500])("shows an honest HTTP %s failure", async (status) => {
     vi.useFakeTimers(); const h = harness({ "/api/posture/home": () => Promise.resolve(response({ error: "no" }, status)) }); await settle();
@@ -105,7 +116,8 @@ describe("dashboard bounded independent hydration", () => {
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
-    expect(h.main.innerHTML).toMatch(/pm-v[^>]*>Unknown<.*?pm-l[^>]*>Approvals waiting/s);
+    // Pins the Approvals waiting tile, not a later queue empty state.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -162,8 +174,9 @@ describe("dashboard bounded independent hydration", () => {
     for (let i = 0; i < 96; i++) await runInContext('api("/agents/detail-' + i + '").catch(function () {})', h.context);
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
-    expect(h.main.innerHTML).toMatch(/pm-v[^>]*>Unknown<.*?pm-l[^>]*>Approvals waiting/s);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries.
+    // Pins the Approvals waiting tile, not a later queue empty state.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -277,13 +290,52 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('let focused = false; document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : key === "data-read" ? "/api/posture/home" : null; } }; document.getElementById("main").querySelector = function (selector) { return selector.includes("retry-panel") && selector.includes("data-read") ? { focus: function () { focused = true; } } : null; }; state.posture.homeError = "new error"; rerender()', h.context);
     expect(runInContext('focused', h.context)).toBe(false);
   });
+  it("restores a stable control only when the selector has exactly one match", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      let focused = null;
+      document.activeElement = { tagName: "BUTTON", getAttribute: function (key) { return key === "data-action" ? "retry-panel" : null; } };
+      const first = { focus: function () { focused = "first"; } };
+      const second = { focus: function () { focused = "second"; } };
+      document.getElementById("main").querySelector = function () { return first; };
+      document.getElementById("main").querySelectorAll = function () { return [first, second]; };
+      state.posture.homeError = "ambiguous";
+      rerender();
+    `, h.context);
+    expect(runInContext("focused", h.context)).toBeNull();
+    runInContext(`
+      document.getElementById("main").querySelectorAll = function () { return [{ focus: function () { focused = "only"; } }]; };
+      rerender();
+    `, h.context);
+    expect(runInContext("focused", h.context)).toBe("only");
+  });
+  it("escapes agent ids before building a focus-restore selector", async () => {
+    vi.useFakeTimers(); const h = harness(); await settle();
+    runInContext(`
+      let selectorSeen = null;
+      document.activeElement = {
+        tagName: "BUTTON",
+        getAttribute: function (key) {
+          return key === "data-action" ? "agent-pause" : key === "data-agent-id" ? 'bad"] [data-action="other' : null;
+        }
+      };
+      document.getElementById("main").querySelector = function (selector) { selectorSeen = selector; return null; };
+      document.getElementById("main").querySelectorAll = function (selector) { selectorSeen = selector; return []; };
+      state.posture.homeError = "escape";
+      rerender();
+    `, h.context);
+    const selector = runInContext("selectorSeen", h.context) as string;
+    expect(selector).toContain('[data-action="agent-pause"]');
+    expect(selector).not.toContain('bad"] [data-action="other');
+  });
   it("fresh home evidence expires before a current read and unread evidence never becomes Enforcing", async () => {
     vi.useFakeTimers(); const timestamp = new Date().toISOString(); let hang = false;
     const h = harness({ "/api/posture/home": () => hang ? pending() : response({ ...home, castle_wall: { arm_state: "armed", last_enforcement_evidence_at: timestamp, freshness_window_ms: 1000 } }) }); await settle();
-    expect(h.main.innerHTML).toContain(">Enforcing</span>");
-    await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+    // Retarget reason: the Overview Castle Wall chip may be green only while the served evidence window is current.
+    expect(h.main.innerHTML).toContain(">ENFORCING");
+    await vi.advanceTimersByTimeAsync(1001); expect(h.main.innerHTML).not.toContain(">ENFORCING");
     hang = true; runInContext('void fetchAll()', h.context); await settle();
-    expect(h.main.innerHTML).not.toContain(">Enforcing</span>");
+    expect(h.main.innerHTML).not.toContain(">ENFORCING");
   });
   it("a fresh loaded seal becomes Unknown while its refresh is pending", async () => {
     vi.useFakeTimers(); let hang = false;
@@ -450,6 +502,7 @@ describe("dashboard bounded independent hydration", () => {
   it("anomaly 503 stays local and cannot render a checked empty detector", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/anomaly/findings": () => response({}, 503) }); await settle();
     expect(h.main.innerHTML).toContain("fixture-mac"); expect(h.main.innerHTML).not.toContain("detector answered");
+    // Retarget reason: this proves the failed-read branch, not the checked-empty Sentinel copy.
     expect(h.main.innerHTML).toContain("Retry Anomaly findings");
     runInContext('state.route = "agents"; rerender()', h.context); expect(h.main.innerHTML).not.toContain("Anomaly findings");
   });
@@ -471,7 +524,8 @@ describe("dashboard bounded independent hydration", () => {
   it("generic activity events reread privacy, handoff, honeypot, and anomaly panels", async () => {
     vi.useFakeTimers(); let anomalyReads = 0;
     const h = harness({ "/api/anomaly/findings": () => ++anomalyReads === 1 ? response({ data: { findings: [] } }) : pending() }); await settle();
-    expect(h.main.innerHTML).toContain("No open anomaly findings.");
+    // Retarget reason: this is the checked-empty Sentinel branch before the reread starts.
+    expect(h.main.innerHTML).toContain("No open Sentinel findings");
     const before = h.calls.length;
     h.streams.at(-1)!.listeners.activity({ data: JSON.stringify({ entry_id: "generic-audit", category: "other", display_template_id: "audit.other" }) });
     await settle();
@@ -722,7 +776,8 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("1 agent. Click one");
     expect(h.main.innerHTML).not.toContain("1 agents.");
     runInContext('state.route = "posture"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Not protected");
+    // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
+    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {

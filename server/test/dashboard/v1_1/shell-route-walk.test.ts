@@ -4,7 +4,8 @@
  * The rail folded fourteen destinations into eight plus a Configure group.
  * The thirteen older hash ids are frozen surfaces (bookmarks, deep links,
  * links inside other screens), so each must still render its own screen when
- * navigated directly, and the five new ids must render theirs. This walks
+ * navigated directly, and the six new ids (five from slice 2, Machines from
+ * slice 2b) must render theirs. This walks
  * every id through the client's real route switch (renderMain, run in a
  * minimal DOM) and fails on the switch's "Route not found." fallback. It also
  * pins the rail: exactly eight destinations in the buyer's words, in order,
@@ -20,8 +21,9 @@ const FROZEN_ROUTE_IDS = [
   "posture", "agents", "policy", "activity", "dashboard", "attestation", "health",
   "auto-trigger", "intelligence", "privacy", "honeypot", "coordination", "exit-drill",
 ];
-// The hash ids the slice 2 rail adds.
-const NEW_ROUTE_IDS = ["approvals", "enforcement", "findings", "integrations", "settings"];
+// The hash ids the slice 2 rail adds, and Machines (slice 2b), which moved
+// from the /fleet page link to a shell screen.
+const NEW_ROUTE_IDS = ["approvals", "machines", "enforcement", "findings", "integrations", "settings"];
 // Reached by clicking an agent, never from the rail; walked so it cannot rot.
 const INTERNAL_ROUTE_IDS = ["agent-detail"];
 
@@ -42,7 +44,7 @@ function clientInMinimalDom() {
     },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
     sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Date,
-    Element: class {}, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
+    Element: class {}, setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     // Reads never settle: every screen renders its honest not-loaded state.
     fetch: pending,
@@ -74,10 +76,11 @@ describe("slice 2 shell route walk", () => {
     },
   );
 
-  it("walks all thirteen frozen ids and the five new ones", () => {
+  // Retargeted (slice 2b): six new ids, Machines among them.
+  it("walks all thirteen frozen ids and the six new ones", () => {
     expect(FROZEN_ROUTE_IDS).toHaveLength(13);
-    expect(NEW_ROUTE_IDS).toHaveLength(5);
-    expect(new Set([...FROZEN_ROUTE_IDS, ...NEW_ROUTE_IDS]).size).toBe(18);
+    expect(NEW_ROUTE_IDS).toHaveLength(6);
+    expect(new Set([...FROZEN_ROUTE_IDS, ...NEW_ROUTE_IDS]).size).toBe(19);
   });
 
   it("every folded route lights a rail item that the rendered rail carries", () => {
@@ -104,7 +107,8 @@ describe("slice 2 shell route walk", () => {
       "Overview #posture",
       "Approvals #approvals",
       "Agents #agents",
-      "Machines /fleet",
+      // Retargeted (slice 2b): Machines is a shell screen, not the /fleet link.
+      "Machines #machines",
       "Enforcement #enforcement",
       "Findings #findings",
       "Evidence #activity",
