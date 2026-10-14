@@ -1079,7 +1079,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(h.el["machines-summary"]!.textContent).toContain("machines online");
   });
 
-  it("persistent first-visit failures return an empty text node and still render the other rows and restore focus", async () => {
+  it("persistent first-visit failures draw a fixed-text placeholder row and still render the other rows and restore focus", async () => {
     vi.useFakeTimers();
     const brokenUrl = "http://broken.fixture:3501/";
     const normalUrl = "http://normal.fixture:3501/";
@@ -1105,10 +1105,13 @@ describe("slice 2b shell wired consumers", () => {
     setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl, persistent: true };
     expect(() => h.navigate("machines")).not.toThrow();
     const fallback = returnedRow.mock.calls.find(([url]) => url === brokenUrl)?.[1];
-    // If both constructors fail, the guard returns an empty text node so
-    // appending this row cannot abort hydration before the other rows or focus.
-    expect(fallback).toBeInstanceOf(FakeText);
-    expect(fallback.textContent).toBe("");
+    // If both constructors fail, the guard returns a placeholder row of fixed
+    // text, so the list still shows one entry per counted machine.
+    expect(fallback).toBeInstanceOf(FakeElement);
+    expect(fallback.className).toBe("machine-row");
+    expect(fallback.textContent).toBe("One machine could not be shown; use Check again.");
+    expect(fallback.textContent).not.toContain("broken");
+    expect(machinesHtml(h)).toContain("One machine could not be shown; use Check again.");
     const normalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
     expect(normalLink).toBeTruthy();
     expect(fakeActiveElement).toBe(normalLink);

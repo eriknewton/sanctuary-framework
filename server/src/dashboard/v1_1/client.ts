@@ -4025,6 +4025,7 @@ const FLEET_PROBE_VIEW = {
   state_UNPROBED: { word: "Unchecked", cls: "unknown" }
 };
 const FLEET_ROW_UPDATE_REASON = "Unknown: this row could not be updated; use Check again.";
+const FLEET_ROW_DRAW_FAILED = "One machine could not be shown; use Check again.";
 const fleet = { round: 0, roundStartedAt: null, roundDone: false, probes: {}, ageTimer: null, controller: null, paintScheduled: false, machines: null, paintRows: {}, rowUpdateFailed: {} };
 
 // Only an http or https address becomes a link or a probe target: the list
@@ -4310,8 +4311,18 @@ function guardedMachineRow(machine, index) {
     fleet.rowUpdateFailed[machine.url] = true;
     try { return makeMachineUpdateFallbackRow(machine, index); }
     catch (fallbackError) {
-      // A row whose fallback also fails must not abort the list or focus restore.
-      return document.createTextNode("");
+      // A row whose fallback also fails still takes its place in the list as
+      // fixed text that reads no machine field, so the list never silently
+      // shows fewer machines than the summary counts; if even that fails, an
+      // empty node keeps the other rows and the focus restore running.
+      try {
+        const placeholder = document.createElement("div");
+        placeholder.className = "machine-row";
+        placeholder.appendChild(makeTextElement("span", "muted", FLEET_ROW_DRAW_FAILED));
+        return placeholder;
+      } catch (placeholderError) {
+        return document.createTextNode("");
+      }
     }
   }
 }
