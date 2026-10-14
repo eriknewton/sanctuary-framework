@@ -46,7 +46,7 @@ Sanctuary includes encryption software, and you are responsible for complying wi
 
 ## 7. Trademarks
 
-"Sanctuary Framework" and "Castle Wall" are trademarks of Erik Newton. Section 6 of the license does not grant permission to use them, beyond the reasonable and customary use needed to describe where the software came from and to carry the content of any NOTICE file.
+"Sanctuary Framework" and "Castle Wall" are trademarks of Erik Newton. Section 6 of the license does not grant permission to use them, beyond the reasonable and customary use needed to describe where the software came from and to include the text of its NOTICE file.
 
 ## 8. Contributions
 
