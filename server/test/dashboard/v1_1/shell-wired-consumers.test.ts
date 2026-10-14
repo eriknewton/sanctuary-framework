@@ -818,6 +818,37 @@ describe("slice 2 shell wired consumers", () => {
     expect(main).not.toContain("Nothing waiting on you.");
   });
 
+  it("the empty Approvals drawer states what still waits behind a filter or the agent scope, never a calm zero", async () => {
+    vi.useFakeTimers();
+    const items = [
+      { ...heldItem, item_id: "held-a", tier: "tier2", agent_id: "fixture-agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "held-b", tier: "tier2", agent_id: "fixture-agent-b", operation_category: "state_delete", resolved: false },
+    ];
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = ["fixture-agent-a", "fixture-agent-b", "fixture-agent-c"].map((agent_id) => ({ agent_id, status: "active", model_provider }));
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    // The drawer is the last block of the layout, so everything from its class on is the drawer.
+    const drawer = () => { const html = h.el.main!.innerHTML; return html.slice(html.indexOf("card approval-drawer")); };
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_import";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    expect(drawer()).toContain("2 of 2 held operations in this scope are waiting on you");
+    categorySelect.value = "";
+    h.change(categorySelect);
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait on other agents");
+  });
+
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [] } })) });
