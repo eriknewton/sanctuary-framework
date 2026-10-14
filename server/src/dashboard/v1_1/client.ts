@@ -251,6 +251,14 @@ const state = {
     filters: { search: "", source: "", severity: "", agent: "", from: "", to: "" },
     snoozeDialog: null
   },
+  approvals: {
+    selectedId: null,
+    alwaysAllow: false,
+    confirmingTier1Id: null,
+    cancelledTier1Id: null,
+    inFlightItemId: null,
+    filters: { state: "all", agent: "", tier: "both", category: "" }
+  },
   activity: [],
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
@@ -390,6 +398,7 @@ function shortTime(iso) {
 }
 
 function promptForOperatorToken() {
+  if (!window.prompt) return false;
   const entered = window.prompt("Operator token required for this action.");
   if (!entered || !entered.trim()) return false;
   TOKEN = entered.trim();
@@ -892,6 +901,8 @@ const TIME_RANGE_ROUTES = ["activity"];
 // route-walk test asserts this for every hash id but "dashboard".
 const ROUTE_FULL = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail", "approvals", "machines", "enforcement", "findings", "integrations", "settings", "attestation"];
 function setRoute(route) {
+  // A queued reach read belongs to the open detail route, never to a remembered selection.
+  if (route !== "agent-detail") agentReachPendingId = null;
   state.route = route;
   const app = document.getElementById("app");
   if (!app) return;
@@ -911,7 +922,7 @@ function setRoute(route) {
   // Tunability UX: entering the Policy surface loads the LIVE plain-English
   // policy from the operator-bearer-gated GET /api/policy/current. Fired
   // fire-and-forget; loadPolicyView rerenders when the view arrives.
-  if (route === "policy") void loadPolicyView();
+  if (route === "policy" || route === "approvals") void loadPolicyView();
   // Machines probes on every entry, as the Fleet Switcher does on load, and
   // keeps its check age current while it shows.
 }
@@ -947,7 +958,7 @@ async function readPolicyView() {
           : (e.message || "Could not load policy.");
   } finally {
     state.policyView.loading = false;
-    if (state.route === "policy") rerender();
+    if (state.route === "policy" || state.route === "approvals") rerender();
   }
 }
 
@@ -1741,6 +1752,7 @@ function durationLabelFromMs(ms) {
 // Inventory pages hold one screenful; detail lists hold twenty rows to keep review bounded.
 const AGENTS_PAGE_SIZE = 25;
 const AGENT_DETAIL_LIST_LIMIT = 20;
+const AGENT_STATE_FILTERS = [["", "All states"], ["active", "Protected"], ["unknown", "Unknown"], ["paused", "Paused"], ["locked_down", "Locked down"], ["error", "Error"], ["ownerless", "Ownerless"]];
 const AGENT_TABS = ["overview", "approvals", "activity", "policy", "identity", "memory", "evidence"];
 function agentEmpty(title, reason, href, action) {
   return '<div class="overview-empty"><h3>' + escHtml(title) + '</h3><p>' + escHtml(reason) + '</p><a class="btn" href="' + escHtml(href) + '">' + escHtml(action) + '</a></div>';
@@ -1760,7 +1772,7 @@ function renderAgentsList() {
     overviewTile("Protected of detected", count(protectedCount, denominator), escHtml("Current per-agent enforcement evidence required · posture read " + (loadedSourceReadAge("/api/posture/home") || "Unknown")), "#agents?state=active") +
     overviewTile("Ownerless", count(loaded ? state.agents.filter(function (a) { return !a.identity_id; }).length : null, total), escHtml("Of loaded registered agents; detected-only ownership Unknown · " + rosterAge), "#agents?state=ownerless") +
     overviewTile("At risk", overviewChip("unknown", "Not evaluated"), escHtml("Risk evaluation not served for " + (total === null ? "Unknown" : total) + " registered agents · " + rosterAge), "#agents");
-  if (!loaded) return '<h1>Agents</h1><div class="overview-tiles">' + tiles + '</div>' + renderOverviewAgentsTable();
+  if (!loaded) return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div>' + renderOverviewAgentsTable();
   const filters = state.agentInventory;
   const rows = state.agents.filter(function (a) {
     return (!filters.harness || a.harness === filters.harness) && (!filters.status || (filters.status === "ownerless" ? !a.identity_id : agentEvidenceStatus(a) === filters.status));
@@ -1774,13 +1786,13 @@ function renderAgentsList() {
     return '<label>' + label + '<select data-action="' + action + '">' + values.map(function (v) { return '<option value="' + escHtml(v[0]) + '"' + (v[0] === selected ? ' selected' : '') + '>' + escHtml(v[1]) + '</option>'; }).join("") + '</select></label>';
   };
   const harnesses = Array.from(new Set(state.agents.map(function (a) { return a.harness; }))).sort();
-  const controls = select("State", "agents-state", [["", "All states"], ["active", "Protected"], ["unknown", "Unknown"], ["paused", "Paused"], ["locked_down", "Locked down"], ["error", "Error"], ["ownerless", "Ownerless"]], filters.status) +
+  const controls = select("State", "agents-state", AGENT_STATE_FILTERS, filters.status) +
     select("Harness", "agents-harness", [["", "All harnesses"]].concat(harnesses.map(function (h) { return [h, h]; })), filters.harness) +
     select("Sort", "agents-sort", [["name", "Agent A to Z"], ["name-desc", "Agent Z to A"], ["activity", "Last activity"]], filters.sort);
   const page = '<div class="agent-pagination"><span>Page ' + (filters.page + 1) + ' of ' + Math.max(1, Math.ceil(rows.length / AGENTS_PAGE_SIZE)) + ' · ' + escHtml(rosterAge) + '</span>' +
     '<button class="btn" data-action="agents-page" data-page="' + (filters.page - 1) + '"' + (filters.page === 0 ? ' disabled' : '') + '>Previous</button>' +
     '<button class="btn" data-action="agents-page" data-page="' + (filters.page + 1) + '"' + ((filters.page + 1) * AGENTS_PAGE_SIZE >= rows.length ? ' disabled' : '') + '>Next</button></div>';
-  return '<h1>Agents</h1><div class="overview-tiles">' + tiles + '</div><div class="agent-filters">' + controls + '</div>' +
+  return '<h1>Agents</h1><div class="agents-tiles">' + tiles + '</div><div class="agent-filters">' + controls + '</div>' +
     renderOverviewAgentsTable(rows, AGENTS_PAGE_SIZE, filters.page * AGENTS_PAGE_SIZE) + page +
     '<p class="muted">Inventory covers the served roster. Detection uses harness configuration presence; counts are not a process census.</p>';
 }
@@ -1789,11 +1801,12 @@ function agentPolicySummary(agent) {
   return sourceLoaded(HUB + "/policies") && state.policies.find(function (p) { return p.policy_id === agent.policy_id; });
 }
 function renderAgentStanding(agent) {
+  // A served negative policy flag is evidence of intent, not an unanswered policy read.
   const evidence = sourceLoaded("/api/posture/home") && postureEvidenceByAgent(state.posture.home || {})[agent.agent_id];
   const row = function (k, v) { return '<dt>' + k + '</dt><dd>' + v + '</dd>'; };
   return '<section class="card" aria-label="Standing"><h3>Standing</h3><dl class="kv">' +
     row("Status", '<span class="glyph ' + agentDisplayStatus(agent).glyph + '"></span> ' + escHtml(agentDisplayStatus(agent).label)) +
-    row("Protection requested", escHtml(evidence && evidence.policy_protected === true ? "Yes · roster intent; posture read " + loadedSourceReadAge("/api/posture/home") : "Unknown · no agent policy evidence served")) +
+    row("Protection requested", escHtml(evidence && typeof evidence.policy_protected === "boolean" ? (evidence.policy_protected ? "Yes" : "No") + " · roster intent; posture read " + loadedSourceReadAge("/api/posture/home") : "Unknown · no agent policy evidence served")) +
     row("Enforcement confirmed", agentEnforcementChip(agent) + '<span class="muted"> Per-agent posture · ' + escHtml(evidence && evidence.last_enforcement_evidence_at ? relTimeFromIso(evidence.last_enforcement_evidence_at) : "evidence age Unknown") + '</span>') +
     row("Account isolation", "Unknown · account-isolation evidence not served") +
     row("Memory", "Unknown · agent memory inventory not served") +
@@ -1805,7 +1818,7 @@ function renderAgentIdentity(agent) {
   // Only these public metadata fields are rendered; extra response fields never enumerate key material.
   return '<section class="card" aria-label="Identity"><h3>Identity</h3><dl class="kv"><dt>Owner</dt><dd>' + escHtml(agent.identity_id || "Unknown") + '</dd>' +
     '<dt>DID</dt><dd>Unknown · agent DID not served</dd><dt>Fingerprint</dt><dd>Unknown · agent fingerprint not served</dd>' +
-    '<dt>Rotation</dt><dd>Unknown · agent key history not served</dd><dt>Custody</dt><dd>Operator-held. Custody verification for this agent is not served.</dd>' +
+    '<dt>Rotation</dt><dd>Unknown · agent key history not served</dd><dt>Custody</dt><dd>Unknown · custody evidence not served</dd>' +
     '<dt>Evidence age</dt><dd>Roster read ' + escHtml(loadedSourceReadAge(HUB + "/agents") || "Unknown") + '</dd></dl></section>';
 }
 // One unresolved transport slot survives a UI timeout; a transport ignoring abort cannot accumulate reads.
@@ -1874,7 +1887,7 @@ async function loadAgentReach(agentId) {
       const next = agentReachPendingId;
       agentReachPendingId = null;
       // The pending subject reads once admission is free, and only while its detail is still open.
-      if (next && next === state.selectedAgentId) void loadAgentReach(next);
+      if (next && state.route === "agent-detail" && next === state.selectedAgentId) void loadAgentReach(next);
     }
   })();
   try {
@@ -1912,10 +1925,19 @@ function renderAgentReach(agent) {
   }).join("");
   // A configured rule and a fresh read do not prove enforcement; both the scoped reach and posture must confirm it.
   const confirmed = reach && reach.enforcement_confirmed === true && agentEvidenceStatus(agent) === "active";
-  const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : "Reach unavailable. The agent reach source has not answered with a matching agent record.";
-  return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + (read.agentId === agent.agent_id && read.state === "state_FAILED" ? ' Reach read failed · ' + escHtml(relTimeFromIso(new Date(read.readAt).toISOString())) : '') + '</p>' + lanes +
+  // Each read state describes its own evidence; absence never borrows a failure or loading claim.
+  const reachState = read.agentId !== agent.agent_id ? "state_UNREAD" : read.state === "state_LOADED" && !reach && read.data ? "state_EXPIRED" : read.state;
+  const descriptions = {
+    state_UNREAD: "Reach not read yet.",
+    state_LOADING: "Reading this agent's reach.",
+    state_EXPIRED: "Reach read expired after one minute without interaction.",
+    state_FAILED: "Reach read failed · " + relTimeFromIso(new Date(read.readAt).toISOString()),
+    state_LOADED: "The reach source answered without a record for this agent."
+  };
+  const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : descriptions[reachState];
+  return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + lanes +
     '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? relTimeFromIso(new Date(read.readAt).toISOString()) : "Unknown") + '</p>' +
-    '<a class="btn" href="/posture/agent/' + encodeURIComponent(agent.agent_id) + '">All configured reach</a> ' +
+    '<a class="btn" href="/posture/agent/' + escHtml(encodeURIComponent(agent.agent_id)) + '">All configured reach</a> ' +
     '<button class="btn" data-action="agent-reach-refresh" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh reach</button></section>';
 }
 function agentApprovalRows(items) {
@@ -1939,7 +1961,9 @@ function renderAgentTimeline(agent, evidenceTab) {
   const rows = entries && entries.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (e) {
     // The approval category also holds requests and denied or resolved decisions, so only a denial names an outcome.
     const verdict = e.category === "denial" ? ["bad", "DENIED"] : ["neutral", "RECORDED"];
-    const layer = e.category === "egress" || /egress/.test(e.display_template_id) ? "Castle Wall" : ["approval", "denial", "policy_decision"].includes(e.category) ? "Charter" : "Layer Unknown";
+    // Must match categorizeOperation in hub/activity-feed.ts: categories classify operation names, not their audit layer.
+    // Even egress admits dynamic operation names from multiple producers, so no category alone proves a layer.
+    const layer = "Layer not served";
     return '<div class="agent-event"><time>' + escHtml(relTimeFromIso(e.emitted_at)) + '</time>' + overviewChip(verdict[0], verdict[1]) +
       '<a href="' + escHtml(href) + '" title="Evidence entry ' + escHtml(e.entry_id) + '">' + escHtml(renderTemplate(e.display_template_id, e.display_template_args)) + '<small>Entry ' + escHtml(e.entry_id) + '</small></a><span class="muted">' + layer + '</span>' +
       (e.attestation ? '<div class="att">' + renderActionAttestationBadge(e.attestation.state, e.attestation.fragment) + '</div>' : '') + '</div>';
@@ -1971,7 +1995,7 @@ function renderAgentDetail() {
 // Inspect panel for the Agents view (WP-V1.2 reshape). Clicking the
 // inspect affordance opens the panel synchronously via POST
 // /api/hub/agents/:id/inspect/open. The panel is read-only:
-// recent activity, pending Tier 1 approvals, policy summary. States:
+// recent activity, pending approvals, policy summary. States:
 //   1. No panel data yet: show "Open inspect panel" CTA.
 //   1b. Optimistic-open in flight: render an interim "Opening..." pane.
 //   2. Panel loaded: render activity feed + pending approvals + policy
@@ -2084,7 +2108,7 @@ function renderAgentInspectPanel(agent) {
     '<h3>Inspect</h3>' +
     errorBanner +
     '<p>Open the inspect panel to see this agent\'s recent activity, ' +
-      'pending Tier 1 approvals, and policy summary at a glance. ' +
+      'pending approvals, and policy summary at a glance. ' +
       'Read-only; the panel re-fetches on each open.</p>' +
     '<button class="btn btn-primary" data-action="agent-inspect-open" data-agent-id="' + escHtml(agent.agent_id) + '">Open inspect panel</button>' +
   '</div>';
@@ -3254,32 +3278,6 @@ function renderRecognitionHealthCard() {
     '<div style="margin-top:8px;">' + history + '</div>';
 }
 
-function renderApprovalTile(i) {
-  const text = renderTemplate(i.display_template_id, i.display_template_args);
-  const agentId = i.agent_id || (i.display_template_args && i.display_template_args.agent_id) || "this fortress";
-  // Tunability UX: "always allow this" promotes the one-time approval into
-  // a durable standing rule so each interruption teaches the wall instead of
-  // nagging the operator into disabling it. The promote issues the SAME
-  // operator-bearer-gated api() request path as approve/deny and lands on the
-  // REAL english-policy activator (compile -> activate), which runs the
-  // conflict-detector and the #805 downgrade gate server-side. It is offered
-  // ONLY for operations that name a promotable category; policy_change and
-  // other non-operation approvals are not promotable and omit the button.
-  const promotable = promotableOperation(i);
-  const promoteBtn = promotable
-    ? '<button class="btn btn-sm at-promote" data-action="inbox-promote" data-item-id="' + escHtml(i.item_id) + '" title="Turn this into a standing rule so agents can do it without asking you again.">Allow always</button>'
-    : '';
-  return '<div class="approval-tile" data-approval-tile="' + escHtml(i.item_id) + '">' +
-    '<div class="at-what">' + escHtml(text) + '</div>' +
-    '<div class="at-agent"><span class="ad"></span>' + escHtml(agentId) + '</div>' +
-    '<div class="at-actions">' +
-      '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '" title="Let this one operation through">Allow once</button>' +
-      '<button class="btn btn-sm at-deny" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
-      promoteBtn +
-    '</div>' +
-  '</div>';
-}
-
 // The operation an approval names, when it maps to a promotable standing
 // rule. Returns null for approvals with no concrete operation to promote
 // (e.g. policy_change, lockdown, unwrap). Kept in sync with the server
@@ -3309,14 +3307,11 @@ function promotableOperation(i) {
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
-  const pending = pendingApprovalItems();
-  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : pending.length;
-  const countCls = queueCount ? "count" : "count zero";
-  // The Approvals screen renders this same queue body in the main column, and
-  // the fortress column is hidden there (route-full), so the column skips it:
-  // the queue's element ids and its approve/deny controls exist once in the
-  // document. Every other route keeps rendering it here, hidden or shown.
-  const queueBody = state.route === "approvals" ? "" : renderApprovalQueueBody();
+  const evidence = approvalQueueEvidence();
+  const queueCount = !sourceLoaded(HUB + "/inbox") ? "Unknown" : state.inboxRedacted ? state.inboxRedactedCount : evidence.count;
+  // The muted zero badge is the same claim as the green check, so it needs the same earned evidence.
+  const countCls = evidence.earned ? "count zero" : "count";
+  const approvalSummary = evidence.summary;
 
   // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
   // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
@@ -3345,7 +3340,7 @@ function renderFortress() {
   fortress.innerHTML = [
       '<div class="rail-section">',
       '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + queueCount + '</span></div>',
-      queueBody,
+      approvalSummary,
     '</div>',
     '<div class="rail-section">',
       '<div class="rail-section-label">Right now</div>',
@@ -4090,43 +4085,327 @@ function renderSearchResults() {
       : '<div class="sr-empty" data-search-nothing-loaded="1">Nothing searchable has loaded yet, so no result is known.</div>');
 }
 
-// The queue body shared by the Approvals screen and the fortress column:
-// Unknown with a Retry until the queue read loads, the redacted notice when
-// approvals are hidden, the Allow once / Deny / Allow always tiles, or the
-// earned empty state.
-function renderApprovalQueueBody() {
-  const pending = pendingApprovalItems();
-  if (!sourceLoaded(HUB + "/inbox")) return renderSourceRead(HUB + "/inbox");
-  if (state.inboxRedacted) return '<div class="queue-empty" data-pending-approvals-redacted="1">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</div>';
-  if (pending.length) return '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>';
-  // The green check is earned only by an empty fortress-wide queue. Scoped
-  // to one agent while other agents' holds wait, the empty state names them
-  // and carries no check.
-  const others = heldApprovalItems(null).length;
-  if (others > 0) {
-    return '<div class="queue-empty" data-scoped-empty="1">Nothing waiting for ' + escHtml(state.agentScope.selectedAgentId || "this agent") +
-      '. ' + others + ' of ' + others + ' held operations wait on other agents; choose All agents in the scope menu to see them.</div>';
+// One page bounds the Approvals queue and its evidence claims.
+const APPROVAL_QUEUE_ITEM_CAP = 100; // 100 matches HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts, the one page this client reads.
+// Must match CHARTER_APPROVAL_ITEM_ID_PREFIX in server/src/hub/charter-approval-bridge.ts.
+const CHARTER_APPROVAL_ITEM_ID_PREFIX = "charter.approval.";
+
+// All three approval surfaces share the same evidence bounds so none can earn a false calm zero.
+function approvalQueueEvidence() {
+  const ready = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
+  const full = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP;
+  // A decided item is no longer held, so only waiting items with an unrecognized tier are counted.
+  const unknown = state.inbox.filter(function (i) {
+    return i.kind === "approval_pending" && !i.resolved && i.tier !== "tier1" && i.tier !== "tier2";
+  }).length;
+  const warning = ready && unknown
+    ? '<p class="muted">' + (unknown === 1
+      ? '1 held item carries a tier this console does not recognize. It is not shown here and cannot be decided from this screen.'
+      : unknown + ' held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.') + '</p>' : "";
+  const waiting = pendingApprovalItems().length;
+  const outside = heldApprovalItems(null).length - waiting;
+  let title = "Nothing selected";
+  let line = "";
+  // A partial or redacted read cannot establish an empty queue.
+  const earned = ready && !full && !unknown && !waiting && !outside;
+  const pageEdge = " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
+  if (!ready) line = state.inboxRedacted ? "Approvals are hidden, not empty. Pending count: " + state.inboxRedactedCount + "." : "Approval data is Unknown until the queue read loads.";
+  // On a full page the count outside the scope is only a lower bound, and the scoped agent may have holds past the page.
+  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + (full ? "At least " : "") + heldOperationsPhrase(outside, "waits", "wait") + " outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
+  else if (full && !waiting) {
+    // The inbox serves no total, so a full page cannot rule out a held operation beyond its edge.
+    line = state.inbox.some(function (i) { return i.kind === "approval_pending"; }) ? "No recognized held operation is waiting in this page." : "None of the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items is a held operation.";
+    line += pageEdge;
+  } else if (unknown && !waiting) {
+    // Unrecognized holds are not shown, so the empty state says what is known instead of rendering blank.
+    line = "No recognized held operation is waiting.";
+  } else if (earned) {
+    title = "No approvals waiting";
+    line = "0 of 0 held operations are waiting on you.";
   }
-  return '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+  const emptyHtml = '<div class="queue-empty"' + (outside && !waiting ? ' data-scoped-empty="1"' : '') + '>' +
+    (earned ? '<span class="qe-check"></span>Nothing waiting on you.' : escHtml(line)) + '</div>';
+  let summary = emptyHtml;
+  if (ready && waiting) {
+    // Full-page counts describe only a lower bound, never the fortress total.
+    const count = full ? "At least " + heldOperationsPhrase(waiting) + " waiting (from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items)." : heldOperationsPhrase(waiting) + " waiting.";
+    summary = '<div class="queue-empty"><span class="qe-warn"></span>' + escHtml(count) + ' <a href="#approvals">Open Approvals</a>.</div>';
+  }
+  if (!sourceLoaded(HUB + "/inbox")) summary = renderSourceRead(HUB + "/inbox");
+  else if (state.inboxRedacted) summary = '<div class="queue-empty" data-pending-approvals-redacted="1">' + escHtml(line) + '</div>';
+  // The badge counts every waiting hold, recognized or not, and on a full page it is only a lower bound.
+  const count = (waiting + unknown) + (full ? "+" : "");
+  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned };
+}
+
+// "1 held operation" or "N held operations", with the verb that agrees when one is given.
+function heldOperationsPhrase(n, singularVerb, pluralVerb) {
+  const phrase = n === 1 ? "1 held operation" : n + " held operations";
+  return singularVerb ? phrase + " " + (n === 1 ? singularVerb : pluralVerb) : phrase;
+}
+
+function resetApprovalConsent() {
+  // Consent belongs to the selected request and never transfers to a replacement or a changed view.
+  state.approvals.alwaysAllow = false;
+  state.approvals.confirmingTier1Id = null;
+  state.approvals.cancelledTier1Id = null;
+}
+
+function approvalItemsForScreen() {
+  const scope = state.agentScope.selectedAgentId;
+  return state.inbox.filter(function (i) {
+    if (i.kind !== "approval_pending") return false;
+    if (i.tier !== "tier1" && i.tier !== "tier2") return false;
+    if (scope && (i.agent_id || "") !== scope) return false;
+    return true;
+  });
+}
+
+function approvalArg(item, names, fallback) {
+  const args = item && item.display_template_args;
+  if (!Array.isArray(args)) return fallback || "";
+  for (let i = 0; i < args.length; i++) {
+    if (names.indexOf(args[i].kind) >= 0) return String(args[i].value);
+  }
+  return fallback || "";
+}
+
+function approvalAgentId(item) {
+  return item.agent_id || approvalArg(item, ["agent_id"], "this fortress");
+}
+
+function approvalOperation(item) {
+  return item.operation_category || String(item.display_template_id || "").split(".").pop() || "approval";
+}
+
+function approvalText(item) {
+  return renderTemplate(item.display_template_id, item.display_template_args);
+}
+
+function approvalHoldReason(item) {
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  // Hub controls and the catch-all category carry no policy-gate reason in the served item.
+  if (item.operation_category === "other" || !isCharterApprovalItem(item)) return "Held for your decision (" + approvalOperation(item) + ", " + tier + ").";
+  return approvalOperation(item) + " is a " + tier + " operation under the operator policy.";
+}
+
+function isCharterApprovalItem(item) {
+  return !!(item && typeof item.item_id === "string" && item.item_id.indexOf(CHARTER_APPROVAL_ITEM_ID_PREFIX) === 0);
+}
+
+function approvalRecordLine(item) {
+  return isCharterApprovalItem(item) ? "recorded in your audit log" : "marked decided in this inbox";
+}
+
+function approvalOutcomeLine(item) {
+  return isCharterApprovalItem(item) ? "outcome in your audit log" : "outcome not reported by the inbox";
+}
+
+function approvalPolicyUnavailableReason() {
+  if (state.policyView.loadError) return state.policyView.loadError;
+  const read = sourceRead(POLICY + "/current");
+  if (read && read.state === "state_FAILED") return read.error || "Policy engine is not configured on this fortress.";
+  if (read && read.state === "state_NOT_SERVED") return read.error || DASHBOARD_MODE_NOT_SERVED_MESSAGE;
+  if (state.policyView.loading || (read && read.state === "state_LOADING")) return "Checking the policy-change path.";
+  if (!sourceLoaded(POLICY + "/current")) return "Checking the policy-change path.";
+  return "";
+}
+
+function approvalStandingState(item) {
+  const op = promotableOperation(item);
+  if (!op) return { enabled: false, reason: "Always allow is unavailable for this operation." };
+  if (item.tier === "tier1") return { enabled: false, reason: "Tier 1 approvals cannot become standing rules from this drawer." };
+  const unavailable = approvalPolicyUnavailableReason();
+  if (unavailable) return { enabled: false, reason: unavailable };
+  // The standing rule is activated into the fortress policy through the policy engine; this console has no
+  // control that removes one, so the note states that bound instead of promising a revocation path.
+  return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
+}
+
+function approvalDecisionDisabled(item) {
+  // Pending requests retain disabled controls until settlement so repeated clicks cannot compete.
+  return state.approvals.inFlightItemId === item.item_id ? " disabled" : "";
+}
+
+function renderApprovalRow(item, selectedId) {
+  const selected = item.item_id === selectedId;
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const created = item.created_at || "";
+  const age = created ? relTimeFromIso(created) : "age unknown";
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  if (item.resolved) {
+    // The inbox serves no operator decision outcome, so the screen never
+    // infers allow or deny from agent-control result fields.
+    const outcomeLine = approvalOutcomeLine(item);
+    return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+      '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+      '<td><strong>' + escHtml(agent) + '</strong></td>' +
+      '<td class="mono">' + escHtml(op) + '</td>' +
+      '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+      '<td class="mono muted">Decided at ' + escHtml(shortTime(item.resolved_at || created)) + '</td>' +
+      '<td><span class="state-chip neutral"><i aria-hidden="true"></i>DECIDED</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
+    '</tr>';
+  }
+  const disabled = approvalDecisionDisabled(item);
+  const decisionCell = item.tier === "tier1"
+    ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>'
+    : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>';
+  return '<tr class="' + (selected ? "sel" : "") + '" data-approval-row="' + escHtml(item.item_id) + '">' +
+    '<td><button class="link-btn" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">' + escHtml(tier) + '</button></td>' +
+    '<td><strong>' + escHtml(agent) + '</strong></td>' +
+    '<td class="mono">' + escHtml(op) + '</td>' +
+    '<td>' + escHtml(approvalHoldReason(item)) + '</td>' +
+    '<td class="mono">' + escHtml(age) + '</td>' +
+    '<td>' + decisionCell + '</td>' +
+  '</tr>';
+}
+
+function renderApprovalDrawer(item, empty) {
+  if (!item) {
+    const e = empty || {};
+    const evidence = approvalQueueEvidence();
+    // Filters can hide loaded holds but cannot establish that no holds exist.
+    const title = e.filteredOut ? "Nothing selected" : evidence.title;
+    const line = e.filteredOut
+      ? "No held operation matches these filters. " + heldOperationsPhrase(e.waiting, "in this scope is", "in this scope are") + " waiting on you."
+      : evidence.line;
+    return '<aside class="card approval-drawer"><div class="approval-empty"><div class="empty-glyph neutral" aria-hidden="true"></div><h3>' + escHtml(title) + '</h3><p>' + escHtml(line) + ' Queue checked ' + escHtml(sourceReadAge(HUB + "/inbox") || "at an unknown time") + '.</p>' + evidence.warning + '<a class="btn" href="#activity">Open Evidence</a></div></aside>';
+  }
+  const agent = approvalAgentId(item);
+  const op = approvalOperation(item);
+  const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
+  const standing = approvalStandingState(item);
+  const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
+  const disabled = approvalDecisionDisabled(item);
+  const primaryAction = checked ? "inbox-promote" : "inbox-approve";
+  const primaryLabel = checked ? "Allow always" : "Allow once";
+  const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
+    (checked ? " checked" : "") + (standing.enabled && !disabled ? "" : " disabled") + '><span>' +
+    (standing.enabled ? "Always allow this operation for every agent on this fortress. " : "Always allow is unavailable. ") +
+    '<strong class="warn">' + escHtml(standing.reason) + '</strong></span></label>';
+  const tier1Confirming = state.approvals.confirmingTier1Id === item.item_id;
+  const tier1Cancelled = state.approvals.cancelledTier1Id === item.item_id;
+  const startButton = '<button class="btn btn-primary approval-tier1-step" data-action="approval-start-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button>';
+  const cancelButton = '<button class="btn approval-tier1-step" data-action="approval-cancel-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Cancel</button>';
+  const primaryButton = item.resolved ? "" : item.tier === "tier1"
+    ? (tier1Confirming || tier1Cancelled ? cancelButton : startButton)
+    : '<button class="btn btn-primary" data-approval-primary="' + escHtml(item.item_id) + '" data-action="' + primaryAction + '" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>' + primaryLabel + '</button>';
+  const denyButton = item.resolved ? "" : '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button>';
+  // Confirm occupies a separate row so the second click in the first-step slot can only cancel.
+  const confirmRow = !item.resolved && tier1Confirming
+    ? '<div class="approval-confirm-row"><button class="btn btn-primary" data-action="approval-confirm-tier1-allow" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Confirm ' + escHtml(op) + '</button></div>' : "";
+  // Keep Cancel in its original slot and focused after disarming; a new Allow step uses a separate slot.
+  const restartButton = !item.resolved && tier1Cancelled ? startButton : "";
+  const standingEffect = checked
+    ? "Later matching operations stop asking only if the policy engine accepts both steps."
+    : "The next matching operation asks again.";
+  // A Tier 1 Allow once only arms the request; the card says so, matching the note below it.
+  const allowCopy = checked
+    ? "Allows this request once, then requests a standing rule for every agent on this fortress. " + standingEffect
+    : item.tier === "tier1" && !item.resolved
+      ? "Allow once arms this request, and Confirm " + op + " sends the approval; the decision is " + approvalRecordLine(item) + "."
+      : "Allow once sends this approval and the decision is " + approvalRecordLine(item) + ".";
+  const tier1Note = item.tier === "tier1" && !item.resolved
+    ? '<div class="approval-tier-note">Tier 1 takes two steps here: Allow once, then Confirm ' + escHtml(op) + '. Only Confirm sends the approval.</div>'
+    : "";
+  return '<aside class="card approval-drawer" aria-label="Selected approval">' +
+    '<div class="approval-drawer-head"><div><span class="pill">' + escHtml(tier) + '</span> <span class="state-chip ' + (item.resolved ? "neutral" : "warn") + '"><i aria-hidden="true"></i>' + (item.resolved ? "DECIDED" : "WAITING") + '</span></div><h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3><div class="mono">' + escHtml(op) + '</div><p class="muted">Requested by ' + escHtml(agent) + ' · request id ' + escHtml(item.item_id) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>What it wants to do</h4><p>' + escHtml(approvalText(item)) + '</p></div>' +
+    // The inbox contract carries typed template args only, no free agent prose. The drawer must not invent a context channel.
+    '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
+    '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
+    tier1Note +
+    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
+  '</aside>';
+}
+
+function approvalFilterOptions(items, field, current) {
+  const seen = Object.create(null);
+  items.forEach(function (item) {
+    const value = field === "agent" ? approvalAgentId(item) : approvalOperation(item);
+    if (value) seen[value] = true;
+  });
+  // A stale filter remains visible and selected, so choosing All can actually clear it.
+  const stale = current && !seen[current]
+    ? '<option value="' + escHtml(current) + '" selected>' + escHtml(current) + ' (none loaded)</option>' : "";
+  return stale + Object.keys(seen).sort().map(function (value) {
+    return '<option value="' + escHtml(value) + '"' + (current === value ? " selected" : "") + '>' + escHtml(value) + '</option>';
+  }).join("");
+}
+
+function filterApprovalItems(items) {
+  const f = state.approvals.filters || {};
+  return items.filter(function (item) {
+    if (f.state === "waiting" && item.resolved) return false;
+    if (f.state === "decided" && !item.resolved) return false;
+    if (f.agent && approvalAgentId(item) !== f.agent) return false;
+    if (f.tier === "tier1" && item.tier !== "tier1") return false;
+    if (f.tier === "tier2" && item.tier !== "tier2") return false;
+    if (f.category && approvalOperation(item) !== f.category) return false;
+    return true;
+  });
 }
 
 function renderApprovalsScreen() {
-  const w = approvalWaitingSummary();
-  const countLine = w.known
-    ? '<span class="count-age">' + escHtml(w.sentence) + '</span>'
-    : '<span class="count-age">Unknown until the approval queue loads</span>';
-  // The fortress column renders the same queue beside Talk's full page; on
-  // this screen it skips the queue body (renderFortress), so the queue's
-  // element ids exist once in the document.
+  if (!sourceLoaded(HUB + "/inbox")) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approval data is Unknown until the queue read loads.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  if (state.inboxRedacted) {
+    return '<section class="concierge-wrap"><div class="page-head"><div><p class="eyebrow">Approvals</p><h1>Held operations waiting on you.</h1><p class="sub">Approvals are hidden, not empty. Pending count: ' + escHtml(state.inboxRedactedCount) + '.</p></div></div>' + renderSourceRead(HUB + "/inbox") + '</section>';
+  }
+  const all = approvalItemsForScreen();
+  const filtered = filterApprovalItems(all);
+  // Waiting operations get the bounded decision slots before decided history can consume them.
+  const capped = filtered.filter(function (i) { return !i.resolved; }).concat(filtered.filter(function (i) { return !!i.resolved; })).slice(0, APPROVAL_QUEUE_ITEM_CAP);
+  const allWaitingCount = all.filter(function (i) { return !i.resolved; }).length;
+  const waiting = capped.filter(function (i) { return !i.resolved; }).sort(function (a, b) {
+    return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
+  });
+  const decided = capped.filter(function (i) { return !!i.resolved; });
+  const selectedId = capped.some(function (i) { return i.item_id === state.approvals.selectedId; })
+    ? state.approvals.selectedId
+    : (waiting[0] || capped[0] || {}).item_id || null;
+  if (state.approvals.selectedId !== selectedId) resetApprovalConsent();
+  state.approvals.selectedId = selectedId;
+  const selected = capped.find(function (i) { return i.item_id === selectedId; }) || null;
+  const oldest = waiting.length && waiting[0].created_at ? relTimeFromIso(waiting[0].created_at) : "none waiting";
+  const rows = [
+    waiting.length ? '<tr class="sect"><td colspan="6">Waiting on you · ' + waiting.length + ' of ' + allWaitingCount + ' · oldest wait ' + escHtml(oldest) + '</td></tr>' : "",
+    waiting.map(function (i) { return renderApprovalRow(i, selectedId); }).join(""),
+    decided.length ? '<tr class="sect"><td colspan="6">Decided · showing ' + decided.length + ' of ' + filtered.filter(function (i) { return !!i.resolved; }).length + '</td></tr>' : "",
+    decided.map(function (i) { return renderApprovalRow(i, selectedId); }).join("")
+  ].join("");
+  const evidence = approvalQueueEvidence();
+  const noFilterMatch = all.length > 0 && filtered.length === 0;
+  // One inbox read returns at most APPROVAL_QUEUE_ITEM_CAP items of every kind and serves no total,
+  // so a full page means held operations past it may exist; the counts above cover the loaded page only.
+  const pageFullNotice = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP
+    ? '<p class="muted" data-inbox-page-full="1">The inbox read returned a full page of ' + APPROVAL_QUEUE_ITEM_CAP + ' items; held operations beyond it are not shown here.</p>'
+    : "";
+  const body = capped.length ? '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+    noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
+    evidence.emptyHtml;
+  const f = state.approvals.filters;
+  const filterBar = '<div class="approval-filters" role="group" aria-label="Filter approvals">' +
+      '<label class="filter-field">State<select class="input" data-action="approval-filter-state"><option value="all"' + (f.state === "all" ? " selected" : "") + '>All</option><option value="waiting"' + (f.state === "waiting" ? " selected" : "") + '>Waiting</option><option value="decided"' + (f.state === "decided" ? " selected" : "") + '>Decided</option></select></label>' +
+      '<label class="filter-field">Agent<select class="input" data-action="approval-filter-agent"><option value="">All</option>' + approvalFilterOptions(all, "agent", f.agent) + '</select></label>' +
+      '<label class="filter-field">Tier<select class="input" data-action="approval-filter-tier"><option value="both"' + (f.tier === "both" ? " selected" : "") + '>Tier 1 and Tier 2</option><option value="tier1"' + (f.tier === "tier1" ? " selected" : "") + '>Tier 1</option><option value="tier2"' + (f.tier === "tier2" ? " selected" : "") + '>Tier 2</option></select></label>' +
+      '<label class="filter-field">Category<select class="input" data-action="approval-filter-category"><option value="">All</option>' + approvalFilterOptions(all, "category", f.category) + '</select></label>' +
+      '<span class="count-age">showing ' + capped.length + ' of ' + all.length + ' · cap ' + APPROVAL_QUEUE_ITEM_CAP + '</span>' +
+    '</div>';
   return [
-    '<section class="concierge-wrap">',
+    '<section class="concierge-wrap approvals-wide">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Approvals</p>',
         '<h1>Held operations waiting on you.</h1>',
-        '<p class="sub">Each one is held until you decide. Allow once lets this operation through; Deny refuses it; Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged. A decision on a Charter hold is recorded in your audit log; a decision on any other held item is recorded in this inbox.</p>',
+        '<p class="sub">A decision on a Charter hold is recorded in your audit log; a decision on any other held item is marked decided in this inbox.</p>',
       '</div></div>',
-      '<section class="card"><h3>Waiting on you ' + countLine + '</h3>' + renderApprovalQueueBody() + '</section>',
-      '<p class="muted">Blocked actions, privacy events, budget warnings and decided approvals are in <a href="#activity">Evidence</a>.</p>',
+      filterBar,
+      '<p class="muted">Left rail agent scope applies first; these controls then narrow that scoped queue.</p>',
+      pageFullNotice,
+      evidence.warning,
+      '<div class="approval-layout"><section class="card"><h3>Queue <span class="count-age">showing ' + capped.length + ' of ' + all.length + '</span></h3>' + body + '</section>' + renderApprovalDrawer(selected, { filteredOut: noFilterMatch, waiting: allWaitingCount, total: all.length }) + '</div>',
     '</section>'
   ].join("");
 }
@@ -5377,6 +5656,80 @@ async function onAgentControl(agentId, action) {
 }
 
 async function onInboxAction(itemId, action) {
+  // One request at a time prevents duplicate clicks from issuing competing decisions.
+  if (state.approvals.inFlightItemId) return false;
+  state.approvals.inFlightItemId = itemId;
+  rerender();
+  try {
+    return await performInboxAction(itemId, action);
+  } finally {
+    state.approvals.inFlightItemId = null;
+    resetApprovalConsent();
+    rerender();
+  }
+}
+
+// Below the stacking breakpoint the drawer sits under the whole queue, so selecting a row moves focus to
+// the drawer's heading, which brings it into view. The target is a heading, not a decision control, so a
+// stray key press after the click cannot decide.
+function focusApprovalDrawer() {
+  const main = document.getElementById("main");
+  const head = main && main.querySelector('[data-approval-drawer-focus="1"]');
+  if (head && typeof head.focus === "function") head.focus();
+}
+function focusTier1Cancel() {
+  const main = document.getElementById("main");
+  const cancel = main && main.querySelector('[data-action="approval-cancel-tier1-allow"]');
+  if (cancel) cancel.focus();
+}
+function state_ARMEDTier1(itemId) {
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  // Arming binds consent to the current unresolved Tier 1 request, never a stale or in-flight row.
+  if (!item || item.resolved || item.tier !== "tier1" || state.approvals.selectedId !== itemId || state.approvals.inFlightItemId) return;
+  state.approvals.confirmingTier1Id = itemId;
+  state.approvals.cancelledTier1Id = null;
+  rerender();
+  focusTier1Cancel();
+}
+function state_CANCELLEDTier1(itemId) {
+  // An in-flight approval cannot be cancelled by a local control after submission.
+  if (state.approvals.inFlightItemId) return;
+  // Cancellation disarms the request before repainting, so no subsequent Confirm can submit it.
+  state.approvals.confirmingTier1Id = null;
+  state.approvals.cancelledTier1Id = itemId;
+  rerender();
+  focusTier1Cancel();
+}
+async function state_APPROVINGAlwaysAllow(itemId) {
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  // Only an explicitly checked, available standing option on this waiting item can begin promotion.
+  if (!item || item.resolved || state.approvals.selectedId !== itemId || !state.approvals.alwaysAllow || !approvalStandingState(item).enabled || state.approvals.inFlightItemId) return;
+  const op = promotableOperation(item);
+  state.approvals.inFlightItemId = itemId;
+  rerender();
+  try {
+    // A refused approval never grants a standing rule; only the successful continuation reaches compile.
+    if (!await performInboxAction(itemId, "approve")) return;
+    await state_PROMOTINGAlwaysAllow(itemId, op);
+  } finally {
+    state.approvals.inFlightItemId = null;
+    resetApprovalConsent();
+    rerender();
+  }
+}
+async function state_PROMOTINGAlwaysAllow(itemId, op) {
+  try {
+    await onInboxPromote(itemId, op);
+  } catch (e) {
+    // Approval has already succeeded, so a policy failure must report that partial outcome explicitly.
+    toast("Allowed once. The standing rule was not added: " + e.message, "error");
+  } finally {
+    await fetchAll(true);
+    rerender();
+  }
+}
+
+async function performInboxAction(itemId, action) {
   // WP-V1.2 reshape: direct-agent chat surface removed; the
   // pending-approval bookkeeping that previously synced with chat
   // session state is gone. Inbox approve/deny now is a clean inbox-only
@@ -5443,13 +5796,17 @@ async function onInboxAction(itemId, action) {
       void onAgentInspectOpen(boundAgentId);
     }
     rerender();
+    return true;
   } catch (e) {
+    await fetchAll(true);
     // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
     if (e.status === 409) {
       toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
     } else {
       toast("Inbox action failed: " + e.message, "error");
     }
+    rerender();
+    return false;
   }
 }
 
@@ -5471,40 +5828,17 @@ async function onInboxAction(itemId, action) {
 // agent on loopback cannot promote by network position alone. This never
 // creates an agent-readable policy path (AGENTS.md hard rule 7): the agent
 // sees only the generic gate denial, never the promoted rule.
-async function onInboxPromote(itemId) {
-  const item = state.inbox.find(function (x) { return x.item_id === itemId; });
-  if (!item) return;
-  const op = promotableOperation(item);
-  if (!op) {
-    toast("This approval cannot be turned into a standing rule.", "error");
-    return;
-  }
-  try {
-    // Step 1: compile the standing rule from plain English. The compiler
-    // recognizes "auto-allow <op>" deterministically (high confidence), so
-    // no substrate call is needed and the draft is inspectable.
-    const compiled = await policyApi("/compile", {
-      method: "POST",
-      body: { english_text: "auto-allow " + op }
-    });
-    const draft = compiled && compiled.data && compiled.data.draft;
-    if (!draft || !draft.draft_id) {
-      toast("Could not prepare a rule for " + op + ".", "error");
-      return;
-    }
-    // Step 2: activate the draft through the REAL activator. The server
-    // enforces conflict detection + the #805 downgrade gate; we surface its
-    // decision honestly rather than pretending success.
-    await activateStandingRule(draft.draft_id, op, false);
-  } catch (e) {
-    if (e.status === 401 || e.status === 403) {
-      toast("Operator token required to change policy.", "error");
-    } else if (e.status === 503) {
-      toast("Policy engine is not configured on this fortress.", "error");
-    } else {
-      toast("Could not add standing rule: " + e.message, "error");
-    }
-  }
+async function onInboxPromote(itemId, approvedOperation) {
+  // The approved operation is captured before refetch because resolved Charter holds leave the projection.
+  const op = approvedOperation;
+  const compiled = await policyApi("/compile", {
+    method: "POST",
+    body: { english_text: "auto-allow " + op }
+  });
+  const draft = compiled && compiled.data && compiled.data.draft;
+  // Missing draft evidence cannot authorize an activation.
+  if (!draft || !draft.draft_id) throw new Error("Could not prepare a rule for " + op + ".");
+  await activateStandingRule(draft.draft_id, op, false);
 }
 
 // Activate a compiled standing-rule draft. On a #805 posture-downgrade
@@ -5526,7 +5860,8 @@ async function activateStandingRule(draftId, op, force) {
       await fetchAll(true);
       rerender();
     } else {
-      toast("Rule not activated (" + (status || "refused") + ").", "error");
+      // Only an explicit activated result establishes that the standing rule was added.
+      throw new Error("Rule not activated (" + (status || "refused") + ").");
     }
   } catch (e) {
     if (e.status === 409 && !force) {
@@ -5536,15 +5871,14 @@ async function activateStandingRule(draftId, op, force) {
         "This rule would relax your protection so agents can " + op +
         " without asking you. This is recorded in your audit log. Add it anyway?");
       if (ok) return activateStandingRule(draftId, op, true);
-      toast("Kept your protection: no standing rule added.");
-      return;
+      throw new Error("you chose to keep your protection.");
     }
     if (e.status === 401 || e.status === 403) {
-      toast("Operator token required to change policy.", "error");
+      throw new Error("Operator token required to change policy.");
     } else if (e.status === 503) {
-      toast("Policy engine is not configured on this fortress.", "error");
+      throw new Error("Policy engine is not configured on this fortress.");
     } else {
-      toast("Could not add standing rule: " + e.message, "error");
+      throw e;
     }
   }
 }
@@ -5743,7 +6077,9 @@ function bindHashRoute() {
   function fromHash() {
     const h = (location.hash || "#posture").slice(1);
     if (h.split("?")[0] === "agents") {
-      state.agentInventory.status = new URLSearchParams(h.split("?")[1] || "").get("state") || "";
+      const requestedState = new URLSearchParams(h.split("?")[1] || "").get("state") || "";
+      // The select and filter share one allowed set so an unknown hash cannot silently hide rows.
+      state.agentInventory.status = AGENT_STATE_FILTERS.some(function (option) { return option[0] === requestedState; }) ? requestedState : "";
       state.agentInventory.page = 0;
     }
     setRoute(h.split("?")[0] || "posture");
@@ -5903,6 +6239,8 @@ document.addEventListener("click", function (ev) {
   if (action === "agent-scope-select") {
     const id = tgt.getAttribute("data-agent-id") || "";
     state.agentScope.selectedAgentId = id || null;
+    state.approvals.filters.agent = "";
+    resetApprovalConsent();
     state.agentScope.switcherOpen = false;
     // Scope the queue + ambient posture to the chosen agent and repaint
     // everything that shows them: since slice 2 the queue renders on the
@@ -6072,6 +6410,26 @@ document.addEventListener("click", function (ev) {
     if (i) toast("Template: " + i.display_template_id);
     return;
   }
+  if (action === "approval-select" && itemId) {
+    state.approvals.selectedId = itemId;
+    resetApprovalConsent();
+    rerender();
+    return focusApprovalDrawer();
+  }
+  if (action === "approval-always-allow") {
+    // An in-flight decision retains its consent state until settlement.
+    if (state.approvals.inFlightItemId === state.approvals.selectedId) return;
+    state.approvals.alwaysAllow = !!tgt.checked;
+    state.approvals.confirmingTier1Id = null;
+    return rerender();
+  }
+  if (action === "approval-start-tier1-allow" && itemId) return state_ARMEDTier1(itemId);
+  if (action === "approval-cancel-tier1-allow" && itemId) return state_CANCELLEDTier1(itemId);
+  if (action === "approval-confirm-tier1-allow" && itemId) {
+    // Only an armed confirmation for the selected request may submit a Tier 1 approval.
+    if (state.approvals.confirmingTier1Id !== itemId || state.approvals.selectedId !== itemId) return;
+    return void onInboxAction(itemId, "approve");
+  }
   if (action === "inbox-select" && itemId) {
     state.inboxOps.selected[itemId] = tgt.checked;
     return rerender();
@@ -6103,11 +6461,10 @@ document.addEventListener("click", function (ev) {
     return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
   }
   // Tunability UX: promote-to-standing-rule. Intercepted BEFORE the generic
-  // inbox-* -> onInboxAction slice below, because promote is NOT an
-  // /inbox/:id/<action> hub mutation; it runs the compile -> activate flow
-  // on the real english-policy activator via policyApi().
+  // inbox-* dispatcher: approve the request first, then compile and activate
+  // the standing rule through the existing operator-gated policyApi path.
   if (action === "inbox-promote" && itemId) {
-    return void onInboxPromote(itemId);
+    return void state_APPROVINGAlwaysAllow(itemId);
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
@@ -6198,8 +6555,16 @@ document.addEventListener("change", function (ev) {
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else if (action === "approval-filter-state") state.approvals.filters.state = tgt.value === "waiting" || tgt.value === "decided" ? tgt.value : "all";
+  else if (action === "approval-filter-agent") state.approvals.filters.agent = tgt.value;
+  else if (action === "approval-filter-tier") state.approvals.filters.tier = tgt.value === "tier1" || tgt.value === "tier2" ? tgt.value : "both";
+  else if (action === "approval-filter-category") state.approvals.filters.category = tgt.value;
   else return;
-  saveInboxPrefs();
+  if (action.indexOf("inbox-filter-") === 0) saveInboxPrefs();
+  if (action.indexOf("approval-filter-") === 0) {
+    state.approvals.selectedId = null;
+    resetApprovalConsent();
+  }
   rerender();
 });
 

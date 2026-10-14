@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a declares support only for pause, resume and lockdown already exercised by this drill.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 2: Operator Hub.
  *
@@ -23,7 +24,6 @@
  * Acceptance checklist mapping: Pillar 2 of
  * `server/docs/v1.1-acceptance-checklist.md`.
  */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createServer,

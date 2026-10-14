@@ -785,7 +785,8 @@ describe("agent-native Phase 2 cooperative surface", () => {
     expect(uninstall.example).toBeNull();
     const bounds = await callTool(env.facadeTools, "sanctuary_help", { intent: "what are the bounds" });
     expect(bounds.guidance).toContain("ASSURANCE_MATRIX.md");
-    expect(bounds.guidance).toContain("on a patched host");
+    expect(bounds.guidance).toContain("macOS: proven.");
+    expect(bounds.guidance).toContain("Linux enforcement is proven on Ubuntu 24.04 (x86-64) only;");
     expect(bounds.guidance).toContain("Windows");
     expect(bounds.guidance).toContain("Tier 1");
 

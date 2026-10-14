@@ -504,6 +504,7 @@ export class HubService {
       let supported = false;
       try { supported = await this.deps.agentController.supports?.(action, record.agent_id) === true; }
       catch { /* A failed support probe is not evidence that a control can run. */ }
+      // Must match assertCapability in hub-service.ts: only a boolean true grants stored permission.
       capabilities[key] = record.capabilities[key] === true && supported;
     }
     return { ...record, capabilities };
@@ -591,7 +592,8 @@ export class HubService {
       unwrap: c.can_unwrap,
       lockdown: c.can_lockdown,
     };
-    if (!supports[action]) throw new HubCapabilityError(action);
+    // Must match projectAgentCapabilities in hub-service.ts: malformed stored flags never grant permission.
+    if (supports[action] !== true) throw new HubCapabilityError(action);
     // Must match projectAgentCapabilities above: only an explicit true from the probe is executor support, so a
     // missing probe, a non-boolean answer or a failed probe refuses before any Tier 1 work is queued.
     let executorSupports = false;

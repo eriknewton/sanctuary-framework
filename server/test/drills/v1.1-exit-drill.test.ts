@@ -1,4 +1,4 @@
-// fail-before-exempt: A7 updates this existing drill adapter for the required export-result field; dedicated dashboard tests carry the pre-fix witness.
+// fail-before-exempt: Slice 6a declares the export-only fixture support probe as false, preserving its existing no-control behavior.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 4: Portability and Exit.
  *

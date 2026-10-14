@@ -46,7 +46,8 @@ const home = (digest: Record<string, unknown> = {}) => ({
 });
 const heldItem = {
   item_id: "item-1", kind: "approval_pending", tier: "tier1", agent_id: "fixture-agent",
-  display_template_id: "approval_pending.tier1.lockdown", display_template_args: {}, resolved: false,
+  display_template_id: "approval_pending.tier1.lockdown", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }], resolved: false,
+  created_at: "2026-10-14T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "lockdown",
 };
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
@@ -63,6 +64,7 @@ class FakeElement {
   className = "";
   hidden = false;
   disabled = false;
+  checked = false;
   value = "";
   replaceCount = 0;
   private classes = new Set<string>();
@@ -114,6 +116,13 @@ class FakeElement {
         if (found) return found;
       }
     }
+    // Parse only rendered button and heading attributes for focus assertions; the fake does not lay out HTML.
+    // Headings are included because the Approvals drawer moves focus to its heading, not to a decision control.
+    for (const match of this.html.matchAll(/<(button|h3)\b([^>]*)>/g)) {
+      const attrs = Object.fromEntries([...match[2]!.matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1]!, m[2]!]));
+      const element = new FakeElement(attrs, match[1]!);
+      if (element.matches(selector)) return element;
+    }
     return null;
   }
   querySelectorAll(selector: string): FakeElement[] {
@@ -145,6 +154,7 @@ class FakeElement {
     this.append(...children);
   }
   focus() { fakeActiveElement = this; }
+  remove() {}
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
     const index = this.parentElement.children.indexOf(this);
@@ -220,14 +230,23 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   });
   runInContext(getClientScript(), context);
   const navigate = (route: string) => { location.hash = "#" + route; };
-  const click = (attrs: Record<string, string>, inside: string[] = []) => {
+  const click = (attrs: Record<string, string>, inside: string[] = [], checked = false) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
+    target.checked = checked;
+    docListeners.click!({ target });
+  };
+  const clickRenderedButton = (action: string) => {
+    const markup = [...el.main!.innerHTML.matchAll(/<button\b([^>]*)>/g)].find(m => m[1]!.includes(`data-action="${action}"`));
+    expect(markup, `rendered ${action} button`).toBeDefined();
+    expect(markup![1]).not.toMatch(/\bdisabled\b/);
+    const attrs = Object.fromEntries([...markup![1]!.matchAll(/([\w-]+)="([^"]*)"/g)].map(m => [m[1]!, m[2]!]));
+    const target = new FakeElement(attrs, "BUTTON");
     docListeners.click!({ target });
   };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
   const change = (target: FakeElement) => docListeners.change!({ target });
-  return { el, railLink, context, navigate, click, type, change };
+  return { el, railLink, context, navigate, click, clickRenderedButton, type, change };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => {
@@ -272,7 +291,8 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the time range is disabled with its reason off Evidence and enabled on Evidence", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    // A held item keeps the queue populated while this fixture checks the independent time-range control.
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     const range = h.el["time-range"]!;
     expect(range.disabled).toBe(true);
@@ -329,7 +349,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(html).toContain("waiting approvals hidden");
   });
 
-  it("the approval queue's element id exists once on the Approvals screen", async () => {
+  it("the approval queue's element id lives only on the Approvals screen", async () => {
     vi.useFakeTimers();
     const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
@@ -337,9 +357,10 @@ describe("slice 2 shell wired consumers", () => {
     const doc = h.el.main!.innerHTML + h.el.fortress!.innerHTML;
     expect(doc.match(/id="approval-queue"/g) ?? []).toHaveLength(1);
     expect(h.el.main!.innerHTML).toContain('id="approval-queue"');
-    // Beside Talk's full page the column shows, and carries the queue.
+    // The right rail links to Approvals and no longer duplicates the queue controls.
     h.navigate("dashboard");
-    expect(h.el.fortress!.innerHTML).toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).not.toContain('id="approval-queue"');
+    expect(h.el.fortress!.innerHTML).toContain("Open Approvals");
   });
 
   it("the Enforcement egress line shows an absent kernel count as Unknown, never 0", async () => {
@@ -365,16 +386,16 @@ describe("slice 2 shell wired consumers", () => {
 
   it("the Approvals and seal copy claim only what the paths do", async () => {
     vi.useFakeTimers();
-    const h = boot();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Charter holds are recorded in the audit log by the gate; nothing signs
-    // a decision with an operator key, and other held items are not
-    // audit-appended on their path.
+    // Ordinary hub inbox decisions resolve in the inbox store; only Charter
+    // holds go through the operator audit queue.
     expect(main).not.toContain("operator key");
     expect(main).not.toContain("Every decision is signed");
-    expect(main).toContain("A decision on a Charter hold is recorded in your audit log");
+    expect(main).toContain("marked decided in this inbox");
+    expect(main).toContain('href="#activity">Evidence</a>');
     // Lockdown revokes network access for confined agents; agents keep running.
     runInContext('state.posture.sealOpen = true; state.tier1.lockdown.state = "engaged"; renderTopbar();', h.context);
     const pop = h.el["posture-seal-pop"]!.innerHTML;
@@ -495,18 +516,260 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("Nothing pending.");
   });
 
-  it("the Approvals subtitle promises no signed policy and says Allow always is refused when the engine is not configured", async () => {
+  it("the Approvals subtitle says where each decision is recorded", async () => {
     vi.useFakeTimers();
     const h = boot();
     await settle();
     h.navigate("approvals");
     const main = h.el.main!.innerHTML;
-    // Allow always asks the policy engine to compile and activate a standing
-    // rule; where the engine is not configured it is refused and the policy
-    // is unchanged. The subtitle may promise no more than that.
     expect(main).not.toContain("signed policy");
     expect(main).not.toContain("Allow always writes");
-    expect(main).toContain("Allow always asks Sanctuary to add a standing rule to your policy; if the policy engine is not configured on this machine, it refuses and your policy is unchanged.");
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is marked decided in this inbox.");
+  });
+
+  it("Approvals names Charter and hub decision records without inferring an operator outcome", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const items = [
+      { ...heldItem, item_id: "charter.approval.wait", tier: "tier2", agent_id: "agent-c", operation_category: "state_export", resolved: false, created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "hub-wait", tier: "tier2", agent_id: "agent-h", operation_category: "state_import", resolved: false, created_at: "2026-10-14T16:40:00.000Z" },
+      { ...heldItem, item_id: "charter.approval.decided", tier: "tier2", agent_id: "agent-c", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:45:00.000Z", resolution_payload: { outcome: "engaged" } },
+      { ...heldItem, item_id: "hub-decided", tier: "tier2", agent_id: "agent-h", operation_category: "state_delete", resolved: true, resolved_at: "2026-10-14T16:46:00.000Z", resolution_payload: { outcome: "engaged" } },
+    ];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    let main = h.el.main!.innerHTML;
+    expect(main).toContain("A decision on a Charter hold is recorded in your audit log; a decision on any other held item is marked decided in this inbox.");
+    expect(main).toContain("Waiting on you · 2 of 2");
+    expect(main).toMatch(/data-approval-row="charter\.approval\.wait"[\s\S]*?recorded in your audit log/);
+    expect(main).toMatch(/data-approval-row="hub-wait"[\s\S]*?marked decided in this inbox/);
+    expect(main).toMatch(/data-approval-row="charter\.approval\.decided"[\s\S]*?DECIDED[\s\S]*?outcome in your audit log[\s\S]*?href="#activity">Evidence<\/a>/);
+    expect(main).toMatch(/data-approval-row="hub-decided"[\s\S]*?DECIDED[\s\S]*?outcome not reported by the inbox/);
+    expect(main).not.toMatch(/ALLOWED ONCE|DENIED|ALWAYS ALLOW/);
+    h.click({ "data-action": "approval-select", "data-item-id": "hub-wait" });
+    main = h.el.main!.innerHTML;
+    expect(main).toMatch(/If you decide[\s\S]*?marked decided in this inbox[\s\S]*?Decision marked decided in this inbox/);
+  });
+
+  it("Approvals uses plain operator copy for always allow and never renders route paths", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    runInContext("state.approvals.alwaysAllow = true; rerender();", h.context);
+    const main = h.el.main!.innerHTML;
+    expect(main).not.toContain("/api/");
+    expect(main).toContain("Always allow this operation for every agent on this fortress.");
+    // The rule is added to the fortress policy and this console cannot remove it, so the note claims neither a
+    // signature nor a revocation path.
+    // The screen escapes the apostrophe as &#039; (escHtml), so the rendered markup carries that entity.
+    expect(main).toContain("Adds a standing rule to this fortress&#039;s policy. The console has no control to remove a standing rule yet.");
+    expect(main).not.toContain("signed policy");
+    expect(main).not.toContain("revocable");
+    expect(main).toContain("Allow always first allows this request, then asks the policy engine to compile a standing rule for state_export and activate it with your operator token.");
+    expect(main).toMatch(/approval-effects[\s\S]*?<strong>Allow always<\/strong>/);
+    expect(main).toContain("Either step can be refused; your policy changes only if both succeed.");
+    expect(main).toContain("Later matching operations stop asking only if the policy engine accepts both steps.");
+  });
+
+  it("Approvals renders grouped waiting and decided rows with served fields only", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-14T17:00:00.000Z"));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", operation_category: "state_export", created_at: "2026-10-14T16:30:00.000Z" },
+      { ...heldItem, item_id: "decided-1", operation_category: "state_import", created_at: "2026-10-14T15:30:00.000Z", resolved: true, resolved_at: "2026-10-14T15:35:00.000Z" },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("State");
+    expect(main).toContain("Agent");
+    expect(main).toContain("Tier");
+    expect(main).toContain("Category");
+    expect(main).toContain("Waiting on you");
+    expect(main).toContain("oldest wait");
+    expect(main).toContain("Decided");
+    expect(main).toContain("showing 2 of 2");
+    expect(main).toContain("Selected approval");
+    expect(main).toContain("What it wants to do");
+    expect(main).toContain("Why it is held");
+    expect(main).toContain("If you decide");
+    expect(main).toContain("marked decided in this inbox");
+    expect(main).toContain("outcome not reported by the inbox");
+    expect(main).toContain("Decided at");
+    expect(main).not.toContain("Context the agent gave");
+    expect(main).not.toContain("Note for the audit record");
+    expect(main).not.toContain("server reported this hold");
+  });
+
+  it("Approvals renders hostile served typed args as literal text", async () => {
+    vi.useFakeTimers();
+    const hostile = '<img src=x onerror="alert(1)">';
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "wait-1", agent_id: hostile, display_template_args: [{ kind: "agent_id", value: hostile }] },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(main).not.toContain(hostile);
+    expect(main).not.toContain("Agent-supplied text");
+  });
+
+  it("Approvals disables the standing-rule checkbox when policy activation is unavailable", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/policy/current": () => Promise.resolve(response({}, 503)),
+    });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Always allow is unavailable");
+    expect(main).toContain("Policy engine is not configured on this fortress.");
+    expect(main).toContain('data-action="approval-always-allow" disabled');
+    expect(main).not.toContain('data-action="inbox-promote"');
+  });
+
+  it("Tier 1 approvals require drawer confirmation while Tier 2 keeps inline decisions", async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+        { ...heldItem, item_id: "tier1-1", tier: "tier1", operation_category: "state_export" },
+        { ...heldItem, item_id: "tier2-1", tier: "tier2", operation_category: "state_delete" },
+      ] } })),
+      "/api/hub/inbox/tier1-1/approve": () => { calls.push("/api/hub/inbox/tier1-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier1-1", resolved: true } } })); },
+      "/api/hub/inbox/tier2-1/approve": () => { calls.push("/api/hub/inbox/tier2-1/approve"); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "tier2-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    let html = h.el.main!.innerHTML;
+    expect(html).not.toContain('data-action="inbox-approve" data-item-id="tier1-1"');
+    expect(html).toContain('data-action="inbox-approve" data-item-id="tier2-1"');
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual([]);
+    html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1"');
+    expect(html).toContain("Confirm state_export");
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
+    await settle();
+    expect(calls).toEqual(["/api/hub/inbox/tier1-1/approve"]);
+  });
+
+  it("Approvals drawer buttons still use the existing inbox decision path with empty bodies", async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
+      "/api/hub/inbox/wait-1/approve": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/approve", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+      "/api/hub/inbox/wait-1/deny": (init) => { calls.push({ url: "/api/hub/inbox/wait-1/deny", body: init && init.body }); return Promise.resolve(response({ data: { item: { ...heldItem, item_id: "wait-1", resolved: true } } })); },
+    });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain('data-approval-primary="wait-1" data-action="inbox-approve"');
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
+    await settle();
+    expect(calls).toEqual([
+      { url: "/api/hub/inbox/wait-1/approve", body: "{}" },
+      { url: "/api/hub/inbox/wait-1/deny", body: "{}" },
+    ]);
+  });
+
+  it("Approvals filters narrow rows and counts after the left rail agent scope", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [
+      { ...heldItem, item_id: "a-wait", tier: "tier1", agent_id: "agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "b-wait", tier: "tier2", agent_id: "agent-b", operation_category: "state_delete", resolved: false },
+      { ...heldItem, item_id: "a-decided", tier: "tier2", agent_id: "agent-a", operation_category: "state_import", resolved: true, resolved_at: "2026-10-14T16:50:00.000Z" },
+    ] } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 3 of 3");
+    const stateSelect = new FakeElement({ "data-action": "approval-filter-state" }, "select");
+    stateSelect.value = "waiting";
+    h.change(stateSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 2 of 3");
+    const tierSelect = new FakeElement({ "data-action": "approval-filter-tier" }, "select");
+    tierSelect.value = "tier2";
+    h.change(tierSelect);
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 3");
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_export";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+    // Retargeted from the old scope hint text: the scope now applies before the filters, so the queue counts the
+    // scoped rows and the other agent's option and row are gone.
+    expect(h.el.main!.innerHTML).toContain("showing 0 of 2");
+    expect(h.el.main!.innerHTML).not.toContain('<option value="agent-b"');
+    expect(h.el.main!.innerHTML).not.toContain('data-approval-row="b-wait"');
+  });
+
+  it("Approvals cap reports showing M of N past the loaded inbox page cap", async () => {
+    vi.useFakeTimers();
+    const items = Array.from({ length: 101 }, (_, index) => ({
+      ...heldItem,
+      item_id: `item-${index}`,
+      tier: "tier2",
+      agent_id: `agent-${index}`,
+      operation_category: "state_export",
+      resolved: false,
+    }));
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain("showing 100 of 101");
+    expect(h.el.main!.innerHTML).toContain("cap 100");
+  });
+
+  it("Approvals says a full inbox page may hide more held operations, and says nothing when the page is not full", async () => {
+    vi.useFakeTimers();
+    // One inbox read returns at most 100 items of every kind and no total (HUB_INBOX_DEFAULT_LIMIT).
+    const page = (approvals: number, others: number) => [
+      ...Array.from({ length: approvals }, (_, index) => ({ ...heldItem, item_id: `held-${index}`, tier: "tier2", operation_category: "state_export", resolved: false })),
+      ...Array.from({ length: others }, (_, index) => ({ item_id: `egress-${index}`, kind: "blocked_egress", agent_id: "agent-a", created_at: "2026-10-14T16:00:00.000Z", resolved: false, destination_category: "paste-site", display_template_id: "blocked_egress.egress_policy_deny", display_template_args: [] })),
+    ];
+    const full = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 40) } })) });
+    await settle();
+    full.navigate("approvals");
+    expect(full.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(full.el.main!.innerHTML).toContain('data-inbox-page-full="1"');
+    expect(full.el.main!.innerHTML).toContain("The inbox read returned a full page of 100 items; held operations beyond it are not shown here.");
+    const partial = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 39) } })) });
+    await settle();
+    partial.navigate("approvals");
+    expect(partial.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(partial.el.main!.innerHTML).not.toContain('data-inbox-page-full="1"');
+  });
+
+  it("refused decisions show the refusal and repaint from server state", async () => {
+    vi.useFakeTimers();
+    const inboxItems: Array<Record<string, unknown>> = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: false }];
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+      "/api/hub/inbox/wait-1/approve": () => {
+        return Promise.resolve(response({ error: "operator session required" }, 401));
+      },
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: operator session required");
+    // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
+    expect(h.el.main!.innerHTML).toContain("WAITING");
+    expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
+    expect(h.el.main!.innerHTML).not.toContain("Decided at");
   });
 
   it("search says nothing searchable has loaded, not no match, when no group has loaded", async () => {
@@ -608,9 +871,41 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["notify-count"]!.innerHTML).toContain("0 of 2");
     const main = h.el.main!.innerHTML;
     expect(main).toContain('data-scoped-empty="1"');
-    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 of 2 held operations wait on other agents");
+    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
     expect(main).not.toContain("qe-check");
     expect(main).not.toContain("Nothing waiting on you.");
+  });
+
+  it("the empty Approvals drawer states what still waits behind a filter or the agent scope, never a calm zero", async () => {
+    vi.useFakeTimers();
+    const items = [
+      { ...heldItem, item_id: "held-a", tier: "tier2", agent_id: "fixture-agent-a", operation_category: "state_export", resolved: false },
+      { ...heldItem, item_id: "held-b", tier: "tier2", agent_id: "fixture-agent-b", operation_category: "state_delete", resolved: false },
+    ];
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = ["fixture-agent-a", "fixture-agent-b", "fixture-agent-c"].map((agent_id) => ({ agent_id, status: "active", model_provider }));
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+    });
+    await settle();
+    h.navigate("approvals");
+    // The drawer is the last block of the layout, so everything from its class on is the drawer.
+    const drawer = () => { const html = h.el.main!.innerHTML; return html.slice(html.indexOf("card approval-drawer")); };
+    const categorySelect = new FakeElement({ "data-action": "approval-filter-category" }, "select");
+    categorySelect.value = "state_import";
+    h.change(categorySelect);
+    expect(h.el.main!.innerHTML).toContain("No held operation matches these filters");
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    // The count is the waiting holds in scope, with no denominator that would also count decided items.
+    expect(drawer()).toContain("No held operation matches these filters. 2 held operations in this scope are waiting on you.");
+    categorySelect.value = "";
+    h.change(categorySelect);
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
+    expect(drawer()).not.toContain("No approvals waiting");
+    expect(drawer()).not.toContain("0 of 0 held operations");
+    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
   });
 
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
@@ -1830,6 +2125,17 @@ describe("slice 6a Agents wired consumers", () => {
     const inventory = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1];
     h.navigate("posture");
     expect(h.el.main!.innerHTML).toContain(inventory);
+    const protectedAgent = await start("evidenced-protected");
+    const protectedTile = protectedAgent.h.el.main!.innerHTML.match(/<div class="overview-tile">(?:(?!<div class="overview-tile">)[\s\S])*?Protected of detected[\s\S]*?<\/div>/)![0];
+    expect(protectedTile).toContain('<span class="ot-value">1 of 1</span>');
+    detail(protectedAgent.h); await settle();
+    for (const region of [
+      protectedAgent.h.el.main!.innerHTML.match(/<header class="agent-entity-header">([\s\S]*?)<\/header>/)![1]!,
+      protectedAgent.h.el.main!.innerHTML.match(/<section class="card" aria-label="Standing">([\s\S]*?)<\/section>/)![1]!,
+    ]) {
+      expect(region).toContain('state-chip good');
+      expect(region).toContain("CONFIRMED");
+    }
   });
 
   it("6a inventory filters, sorts and pages the shared table with a bounded page", async () => {
@@ -1856,8 +2162,16 @@ describe("slice 6a Agents wired consumers", () => {
     expect(h.el.main!.innerHTML).not.toContain('state-chip good');
     detail(h);
     expect(h.el.main!.innerHTML).toContain('aria-label="Standing"');
-    expect(h.el.main!.innerHTML).toContain("UNKNOWN");
-    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    const unknownHeader = h.el.main!.innerHTML.match(/<header class="agent-entity-header">([\s\S]*?)<\/header>/)![1]!;
+    const unknownStanding = h.el.main!.innerHTML.match(/<section class="card" aria-label="Standing">([\s\S]*?)<\/section>/)![1]!;
+    for (const region of [unknownHeader, unknownStanding]) {
+      expect(region).toContain("UNKNOWN");
+      expect(region).not.toContain('state-chip good');
+    }
+    runInContext('state.posture.home.agents[0].policy_protected = false; rerender()', h.context);
+    expect(h.el.main!.innerHTML).toContain("No · roster intent; posture read");
+    runInContext('state.posture.home.agents = []; rerender()', h.context);
+    expect(h.el.main!.innerHTML).toContain("Unknown · no agent policy evidence served");
     const missing = await start("unknown", { "/api/hub/agents": () => Promise.reject(new Error("offline")) });
     expect(missing.h.el.main!.innerHTML).toContain("Total");
     expect(missing.h.el.main!.innerHTML).not.toContain("0 of 0");
@@ -1910,9 +2224,11 @@ describe("slice 6a Agents wired consumers", () => {
         expect(html).toContain("Research policy");
         expect(html).toContain("version Unknown");
       }
-      if (tab === "identity") expect(html).toContain("Operator-held");
+      // Custody has no served evidence, matching the other unknown identity fields.
+      if (tab === "identity") expect(html).toContain("Unknown · custody evidence not served");
       if (tab === "activity" || tab === "evidence") {
-        expect(html).toContain("Castle Wall");
+        // Denial categories do not identify which layer made the decision.
+        expect(html).toContain("Layer not served");
         expect(html).toContain('state-chip bad');
         expect(html).toContain("entry-1");
         expect(html).toContain("showing 1 of 1");
@@ -1933,6 +2249,10 @@ describe("slice 6a Agents wired consumers", () => {
     runInContext('state.chat.inspect.panelByAgentId["research-agent"] = { pending_approvals: __items, recent_activity: [], opened_at: new Date().toISOString() }', h.context);
     detail(h); h.click({ "data-action": "agent-tab", "data-tab": "approvals" });
     const inspect = runInContext("renderAgentInspectPanel(state.agents[0])", h.context) as string;
+    runInContext('delete state.chat.inspect.panelByAgentId["research-agent"]', h.context);
+    const inspectCta = runInContext("renderAgentInspectPanel(state.agents[0])", h.context) as string;
+    expect(inspectCta).toContain("pending approvals");
+    expect(inspectCta).not.toContain("pending Tier 1 approvals");
     for (const html of [h.el.main!.innerHTML, inspect]) {
       for (const id of ["held-agent", "missing"]) expect(html).not.toMatch(new RegExp(`data-action="inbox-(approve|deny)" data-item-id="${id}"`));
       expect(html.match(/href="#approvals">Review in Approvals/g)).toHaveLength(2);
@@ -1952,7 +2272,7 @@ describe("slice 6a Agents wired consumers", () => {
     const { h } = await start("protected", { ...routes, "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [all] } })) });
     detail(h);
     expect(h.el.main!.innerHTML).toContain('class="agent-entity-actions"');
-    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) { h.click({ "data-action": `agent-${action}`, "data-agent-id": "research-agent" }); await settle(); }
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) { h.clickRenderedButton(`agent-${action}`); await settle(); }
     expect(calls).toEqual(["pause", "resume", "restart", "lockdown", "unwrap"]);
     expect(h.el["toast-host"]!.textContent).toContain("Approval pending");
   });
@@ -1990,7 +2310,8 @@ describe("slice 6a Agents wired consumers", () => {
     // 257 exceeds the 256 configured-destination budget for one detail read.
     payload = { ...payload, destinations: Array.from({ length: 257 }, () => sc.reach.destinations[0]!) };
     h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
-    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    // Failed reads name the read failure instead of borrowing unread copy.
+    expect(h.el.main!.innerHTML).toContain("Reach read failed");
     expect(runInContext("state.agentReach.data", h.context)).toBeNull();
     // 2049 exceeds the 2048-character destination/rule budget.
     payload = { ...payload, destinations: [{ ...sc.reach.destinations[0]!, destination: "x".repeat(2049) }] };
@@ -2028,7 +2349,8 @@ describe("slice 6a Agents wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("docs.example.test");
     // One minute plus one millisecond crosses the configured-read freshness window.
     await vi.advanceTimersByTimeAsync(60 * 1000 + 1);
-    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    // Expiry records that a previous read aged out, not that it failed.
+    expect(h.el.main!.innerHTML).toContain("Reach read expired after one minute without interaction.");
     expect(h.el.main!.innerHTML).not.toContain("docs.example.test");
     expect(runInContext("state.agentReach.data", h.context)).toBeNull();
   });
@@ -2048,7 +2370,8 @@ describe("slice 6a Agents wired consumers", () => {
     failed = true;
     h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
     const html = h.el.main!.innerHTML;
-    for (const label of ["Reach unavailable", "Approvals Unknown", "Activity Unknown", "Policy summary Unknown", "UNKNOWN"]) expect(html).toContain(label);
+    // Failed reach and absent independent sources retain their distinct labels.
+    for (const label of ["Reach read failed", "Approvals Unknown", "Activity Unknown", "Policy summary Unknown", "UNKNOWN"]) expect(html).toContain(label);
     expect(html).not.toContain("docs.example.test");
     expect(html).not.toContain('state-chip good');
     expect(html).toContain("Reach read failed");
@@ -2068,7 +2391,8 @@ describe("slice 6a Agents wired consumers", () => {
     expect(h.el.main!.innerHTML).not.toContain('state-chip good');
     reach.agent_id = "other-agent";
     h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
-    expect(h.el.main!.innerHTML).toContain("Reach unavailable");
+    // Failed reads name the read failure instead of borrowing unread copy.
+    expect(h.el.main!.innerHTML).toContain("Reach read failed");
     expect(h.el.main!.innerHTML).not.toContain("&lt;img");
   });
 
@@ -2102,8 +2426,397 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).toContain("Entry entry-approval");
     expect(html).toContain("RECORDED");
     expect(html).not.toContain("APPROVED");
+    entry.category = "egress";
+    await runInContext("fetchAll()", h.context); await settle();
+    expect(h.el.main!.innerHTML).toContain("Layer not served");
+    expect(h.el.main!.innerHTML).not.toContain("Castle Wall");
   });
 
+  const reachSentences = {
+    state_UNREAD: "Reach not read yet.",
+    state_LOADING: "Reading this agent's reach.",
+    state_EXPIRED: "Reach read expired after one minute without interaction.",
+    state_FAILED: "Reach read failed",
+    state_LOADED: "The reach source answered without a record for this agent.",
+  };
+  for (const [readState, sentence] of Object.entries(reachSentences)) {
+    it(`6a r2 ${readState} names only its own reach state`, async () => {
+      const { h } = await start();
+      runInContext(`state.selectedAgentId = "research-agent"; state.agentReach = { state: "${readState}", agentId: "research-agent", data: null, readAt: Date.now() };`, h.context);
+      h.navigate("agent-detail");
+      const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+      // The production escape helper encodes the apostrophe in loading copy.
+      expect(html).toContain(escapeHtml(sentence).replaceAll("'", "&#039;"));
+      for (const other of Object.values(reachSentences).filter(value => value !== sentence)) expect(html).not.toContain(escapeHtml(other).replaceAll("'", "&#039;"));
+      expect(html).not.toContain("The agent reach source has not answered");
+      if (["state_UNREAD", "state_EXPIRED"].includes(readState)) expect(html).toContain('data-action="agent-reach-refresh"');
+    });
+  }
+
+  it("6a r2 a loaded reach read past its one-minute age reads expired", async () => {
+    const { h } = await start();
+    // AGENT_REACH_MAX_AGE_MS is the client's own constant, so the read is exactly one millisecond past its age.
+    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - AGENT_REACH_MAX_AGE_MS - 1 };', h.context);
+    h.navigate("agent-detail");
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain("The reach source answered without a record for this agent.");
+  });
+
+  it("6a r2 unknown hash state selects All states and keeps the roster", async () => {
+    const { h } = await start();
+    h.navigate("agents?state=nope");
+    expect(h.el.main!.innerHTML).toContain('<option value="" selected>All states</option>');
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 1");
+    expect(h.el.main!.innerHTML).toContain('data-agent-id="research-agent"');
+  });
+
+  it("6a r2 leaving detail clears the pending reach subject before admission frees", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    h.navigate("overview");
+    finish(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent"]);
+    expect(runInContext("agentReachPendingId", h.context)).toBeNull();
+  });
+});
+
+describe("Approvals round-one decision and evidence states", () => {
+  const cap = 100; // Must match HUB_INBOX_DEFAULT_LIMIT: one inbox page.
+  const tier2 = { ...heldItem, tier: "tier2", operation_category: "state_export" };
+  const drawer = (h: ReturnType<typeof boot>) => h.el.main!.innerHTML.split('<aside class="card approval-drawer"')[1] || "";
+  const checkbox = (h: ReturnType<typeof boot>) => h.click({ "data-action": "approval-always-allow" }, [], true);
+  const changeFilter = (h: ReturnType<typeof boot>, field: string, value: string) => {
+    const select = new FakeElement({ "data-action": `approval-filter-${field}` }, "select");
+    select.value = value;
+    h.change(select);
+  };
+  const inbox = (items: unknown[]) => () => Promise.resolve(response({ data: { items } }));
+  const pageOthers = (count: number) => Array.from({ length: count }, (_, index) => ({ ...heldItem, kind: "blocked_egress", item_id: `other-${index}` }));
+
+  it("a full page without holds earns no empty claim on the queue, drawer or fortress", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox(pageOthers(cap)) });
+    await settle();
+    h.navigate("approvals");
+    const sentence = `None of the first ${cap} inbox items is a held operation. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`;
+    for (const html of [h.el.main!.innerHTML.split("<aside")[0]!, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain(sentence);
+      expect(html).not.toMatch(/qe-check|Nothing waiting on you\.|No approvals waiting|0 of 0 held operations/);
+    }
+  });
+
+  it("a full page fortress summary states at least the loaded hold count", async () => {
+    vi.useFakeTimers();
+    const holdCount = 3; // Three visible holds amid the rest of a full page.
+    const h = boot({ "/api/hub/inbox": inbox([...Array.from({ length: holdCount }, (_, i) => ({ ...heldItem, item_id: `hold-${i}` })), ...pageOthers(cap - holdCount)]) });
+    await settle();
+    expect(h.el.fortress!.innerHTML).toContain(`At least ${holdCount} held operations waiting (from the first ${cap} inbox items).`);
+  });
+
+  it("unrecognized tiers remain visible as an uncertainty on every approval surface", async () => {
+    vi.useFakeTimers();
+    const items = [{ ...heldItem, tier: "tier9" }];
+    const h = boot({ "/api/hub/inbox": inbox(items) });
+    await settle();
+    h.navigate("approvals");
+    const line = "1 held item carries a tier this console does not recognize. It is not shown here and cannot be decided from this screen.";
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain(line);
+      expect(html).not.toMatch(/qe-check|Nothing waiting on you\.|No approvals waiting|0 of 0 held operations/);
+    }
+    items.push({ ...heldItem, item_id: "known", tier: "tier2" });
+    await runInContext("fetchAll(true);", h.context);
+    expect(h.el.main!.innerHTML).toContain(line);
+    expect(h.el.fortress!.innerHTML).toContain(line);
+  });
+
+  it("the fortress names holds outside an empty agent scope including Charter holds", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([{ ...heldItem, item_id: "charter.approval.one", agent_id: undefined }]) });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
+    const line = "Nothing waiting for agent-empty. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain(line);
+      expect(html).not.toContain("qe-check");
+    }
+  });
+
+  for (const failure of ["none", "approve", "compile", "activate", "missing draft", "refused status", "downgrade cancelled", "downgrade confirmed", "override refused"]) {
+    it(`Always allow orders approve, compile, activate and reports ${failure} refusal honestly`, async () => {
+      vi.useFakeTimers();
+      const calls: string[] = [];
+      const requestId = failure === "none" ? "charter.approval.one" : "item-1";
+      let items = [{ ...tier2, item_id: requestId }];
+      const h = boot({
+        "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+        [`/api/hub/inbox/${requestId}/approve`]: (init) => {
+          calls.push("approve");
+          expect(init?.body).toBe("{}");
+          if (failure === "approve") return Promise.resolve(response({ error: "refused" }, 401));
+          const resolved = { ...tier2, item_id: requestId, resolved: true };
+          // Charter holds disappear from the served projection immediately after a decision.
+          items = failure === "none" ? [] : [resolved];
+          return Promise.resolve(response({ data: { item: resolved } }));
+        },
+        "/api/policy/compile": (init) => {
+          calls.push("compile");
+          expect(JSON.parse(String(init?.body))).toEqual({ english_text: "auto-allow state_export" });
+          return Promise.resolve(failure === "compile" ? response({ error: "compile refused" }, 422) : response({ data: { draft: failure === "missing draft" ? null : { draft_id: "rule" } } }));
+        },
+        "/api/policy/drafts/rule/activate": (init) => {
+          calls.push("activate");
+          expect(init?.body).toBe("{}");
+          if (failure.startsWith("downgrade") || failure === "override refused") return Promise.resolve(response({ error: "downgrade" }, 409));
+          return Promise.resolve(failure === "activate" ? response({ error: "activate refused" }, 503) : response({ data: { status: failure === "refused status" ? "refused" : "activated" } }));
+        },
+        "/api/policy/drafts/rule/activate?override_downgrade=true": () => {
+          calls.push("override");
+          return Promise.resolve(failure === "override refused" ? response({ error: "override refused" }, 409) : response({ data: { status: "activated" } }));
+        },
+      });
+      runInContext(`window.confirm = function () { return ${failure !== "downgrade cancelled"}; };`, h.context);
+      await settle();
+      h.navigate("approvals");
+      await settle();
+      checkbox(h);
+      expect(drawer(h)).toContain('data-action="inbox-promote"');
+      h.click({ "data-action": "inbox-promote", "data-item-id": requestId });
+      // Approval, promotion and the final repaint each drain a bounded refresh wave.
+      await settle();
+      await settle();
+      const expected = failure === "approve" ? ["approve"] : failure === "compile" || failure === "missing draft" ? ["approve", "compile"] : ["approve", "compile", "activate"];
+      if (failure === "downgrade confirmed" || failure === "override refused") expected.push("override");
+      expect(calls).toEqual(expected);
+      if (failure === "approve") {
+        expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed: refused");
+        expect(drawer(h)).toContain("WAITING");
+      } else {
+        expect(drawer(h)).toContain(failure === "none" ? "No approvals waiting" : "DECIDED");
+        if (failure !== "none" && failure !== "downgrade confirmed") expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added:");
+        // A declined downgrade reads as one sentence, not a second "no standing rule added" after the first.
+        if (failure === "downgrade cancelled") {
+          expect(h.el["toast-host"]!.innerHTML).toContain("Allowed once. The standing rule was not added: you chose to keep your protection.");
+          expect(h.el["toast-host"]!.innerHTML).not.toContain("no standing rule added");
+        }
+      }
+      expect(runInContext("state.approvals.alwaysAllow", h.context)).toBe(false);
+    });
+  }
+
+  it("Always allow resets when fallback selection or scope changes the drawer", async () => {
+    vi.useFakeTimers();
+    let items = [{ ...tier2, agent_id: "agent-a" }, { ...tier2, item_id: "item-2", agent_id: "agent-b" }];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    checkbox(h);
+    items = items.slice(1);
+    await runInContext("fetchAll(true)", h.context);
+    expect(drawer(h)).toContain('data-item-id="item-2"');
+    expect(drawer(h)).not.toContain('data-action="approval-always-allow" checked');
+    checkbox(h);
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-b" });
+    expect(drawer(h)).not.toContain('data-action="approval-always-allow" checked');
+  });
+
+  for (const mode of ["loading", "not served", "401", "503", "tier1", "other"]) {
+    it(`Always allow is disabled with a reason for ${mode}`, async () => {
+      vi.useFakeTimers();
+      const h = boot({
+        "/api/hub/inbox": inbox([{ ...tier2, ...(mode === "tier1" ? { tier: "tier1" } : mode === "other" ? { operation_category: "other" } : {}) }]),
+        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { sections: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
+      });
+      await settle();
+      h.navigate("approvals");
+      await settle();
+      if (mode === "not served") runInContext('markSourceNotServed(POLICY + "/current"); rerender();', h.context);
+      const reasons: Record<string, string> = {
+        loading: "Checking the policy-change path.", "not served": "Not available in this dashboard mode.", "401": "Operator token required", "503": "Policy engine is not configured", tier1: "Tier 1 approvals cannot become standing rules", other: "Always allow is unavailable for this operation.",
+      };
+      expect(drawer(h)).toContain('data-action="approval-always-allow" disabled');
+      expect(drawer(h).toLowerCase()).toContain(reasons[mode]!.toLowerCase());
+      checkbox(h);
+      expect(drawer(h)).not.toContain('data-action="inbox-promote"');
+    });
+  }
+
+  it("Review in drawer moves focus to the drawer heading, never to a decision control", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([heldItem, { ...heldItem, item_id: "item-2", tier: "tier2" }]) });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "approval-select", "data-item-id": "item-1" });
+    const focused = fakeActiveElement as FakeElement;
+    expect(focused.getAttribute("data-approval-drawer-focus")).toBe("1");
+    expect(focused.getAttribute("data-action")).toBeNull();
+    expect(drawer(h)).toContain('<h3 tabindex="-1" data-approval-drawer-focus="1">Selected approval</h3>');
+  });
+
+  it("a Tier 1 drawer says Allow once arms the request and only Confirm sends it", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([heldItem]) });
+    await settle();
+    h.navigate("approvals");
+    const html = drawer(h);
+    expect(html).toContain("Allow once arms this request, and Confirm ");
+    expect(html).not.toContain("Allow once sends this approval");
+  });
+
+  it("Tier 1 double-click disarms in the original slot and keeps focus on Cancel", async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const h = boot({ "/api/hub/inbox": inbox([heldItem]), "/api/hub/inbox/item-1/approve": () => { calls.push("approve"); return never(); } });
+    await settle();
+    h.navigate("approvals");
+    const clickFirstSlot = () => {
+      const toolbar = drawer(h).match(/<div class="toolbar">([\s\S]*?)<\/div>/)![1]!;
+      const button = toolbar.match(/<button\b([^>]*)>/)![1]!;
+      h.click(Object.fromEntries([...button.matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1]!, m[2]!])));
+    };
+    clickFirstSlot();
+    const armed = drawer(h);
+    expect(armed).toContain('data-action="approval-cancel-tier1-allow"');
+    expect(armed).toMatch(/<\/div><div class="approval-confirm-row">.*data-action="approval-confirm-tier1-allow"/);
+    expect((fakeActiveElement as FakeElement).getAttribute("data-action")).toBe("approval-cancel-tier1-allow");
+    clickFirstSlot();
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "item-1" });
+    await settle();
+    expect(calls).toEqual([]);
+    expect(drawer(h)).toContain("WAITING");
+    expect(drawer(h)).not.toContain('data-action="approval-confirm-tier1-allow"');
+    expect((fakeActiveElement as FakeElement).getAttribute("data-action")).toBe("approval-cancel-tier1-allow");
+    expect(drawer(h)).toContain("Only Confirm sends the approval.");
+  });
+
+  for (const mode of ["once", "always", "tier1"]) {
+  it(`pending ${mode} decisions disable the item's controls and ignore repeat clicks`, async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    let finish!: (value: unknown) => void;
+    const h = boot({ "/api/hub/inbox": inbox([mode === "tier1" ? heldItem : tier2]), "/api/hub/inbox/item-1/approve": () => { calls.push("approve"); return new Promise((resolve) => { finish = resolve; }); }, "/api/hub/inbox/item-1/deny": () => { calls.push("deny"); return never(); } });
+    await settle();
+    h.navigate("approvals");
+    await settle();
+    if (mode === "always") checkbox(h);
+    if (mode === "tier1") h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "item-1" });
+    const action = mode === "always" ? "inbox-promote" : mode === "tier1" ? "approval-confirm-tier1-allow" : "inbox-approve";
+    h.click({ "data-action": action, "data-item-id": "item-1" });
+    expect(drawer(h)).toContain(`data-action="${action}" data-item-id="item-1" disabled`);
+    for (const button of h.el.main!.innerHTML.matchAll(/<button\b[^>]*data-action="(?:inbox-approve|inbox-deny|inbox-promote|approval-confirm-tier1-allow)"[^>]*>/g)) expect(button[0]).toContain(" disabled");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "item-1" });
+    h.click({ "data-action": "inbox-deny", "data-item-id": "item-1" });
+    expect(calls).toEqual(["approve"]);
+    finish(response({ data: { item: tier2 } }));
+    await settle();
+    await settle();
+    expect(drawer(h)).not.toMatch(/data-item-id="item-1" disabled/);
+  });
+  }
+
+  it("stale agent and category filters stay selected and agent scope clears the agent filter", async () => {
+    vi.useFakeTimers();
+    let items = [tier2];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })) });
+    await settle();
+    h.navigate("approvals");
+    changeFilter(h, "agent", "fixture-agent");
+    changeFilter(h, "category", "state_export");
+    items = [{ ...tier2, agent_id: "new-agent", operation_category: "state_delete" }];
+    await runInContext("fetchAll(true)", h.context);
+    expect(h.el.main!.innerHTML).toContain('<option value="fixture-agent" selected>fixture-agent (none loaded)</option>');
+    expect(h.el.main!.innerHTML).toContain('<option value="state_export" selected>state_export (none loaded)</option>');
+    changeFilter(h, "category", "");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "new-agent" });
+    expect(runInContext("state.approvals.filters.agent", h.context)).toBe("");
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 1");
+  });
+
+  it("waiting rows precede the cap even when decided history comes first", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([...Array.from({ length: cap }, (_, i) => ({ ...tier2, item_id: `decided-${i}`, resolved: true })), { ...tier2, item_id: "waiting-last" }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="waiting-last"');
+    expect(h.el.main!.innerHTML).toContain("Waiting on you · 1 of 1");
+    expect(h.el.main!.innerHTML).toContain(`showing ${cap} of ${cap + 1}`);
+  });
+
+  for (const mode of ["redacted", "failed"]) {
+    it(`Approvals ${mode} reads render no rows or calm zero`, async () => {
+      vi.useFakeTimers();
+      const h = boot({ "/api/hub/inbox": () => Promise.resolve(mode === "failed" ? response({}, 500) : response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 2 } })) });
+      await settle();
+      h.navigate("approvals");
+      expect(h.el.main!.innerHTML).toContain(mode === "failed" ? "Unknown" : "Approvals are hidden, not empty");
+      expect(h.el.main!.innerHTML).not.toMatch(/data-approval-row|qe-check|No approvals waiting|0 of 0/);
+    });
+  }
+
+  it("hub controls and other categories state the hold without inventing a policy reason", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([heldItem, { ...tier2, item_id: "other", operation_category: "other" }, { ...heldItem, item_id: "export", operation_category: "exit_bundle_export" }]) });
+    await settle();
+    h.navigate("approvals");
+    expect(drawer(h)).toContain("Held for your decision (lockdown, Tier 1).");
+    h.click({ "data-action": "approval-select", "data-item-id": "other" });
+    expect(drawer(h)).toContain("Held for your decision (other, Tier 2).");
+    h.click({ "data-action": "approval-select", "data-item-id": "export" });
+    expect(drawer(h)).toContain("Held for your decision (exit_bundle_export, Tier 1).");
+  });
+
+  it("an unrecognized-tier count names only waiting items, and alone it says no recognized hold waits", async () => {
+    vi.useFakeTimers();
+    // A decided item is no longer held, so it must not inflate the waiting count; with no recognized hold
+    // waiting the queue still says so in words rather than leaving an empty notice.
+    const h = boot({ "/api/hub/inbox": inbox([{ ...heldItem, item_id: "decided", tier: "tier9", resolved: true }, { ...heldItem, item_id: "waiting", tier: "tier9" }]) });
+    await settle();
+    h.navigate("approvals");
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain("1 held item carries a tier this console does not recognize.");
+      expect(html).not.toContain("2 held items carry");
+      expect(html).not.toContain("1 held items");
+    }
+    for (const html of [drawer(h), h.el.fortress!.innerHTML]) expect(html).toContain("No recognized held operation is waiting.");
+    expect(h.el.fortress!.innerHTML).not.toContain('<div class="queue-empty"></div>');
+  });
+
+  it("a scoped empty on a full page states a lower bound, never an exact count", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": inbox([{ ...heldItem, item_id: "charter.approval.one", agent_id: undefined }, ...pageOthers(cap - 1)]) });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
+    for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
+      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
+      expect(html).not.toContain("1 of 1 held operation");
+    }
+  });
+
+  it("the fortress count badge is a lower bound on a full page and counts unrecognized holds", async () => {
+    vi.useFakeTimers();
+    const holdCount = 3; // Three visible holds amid the rest of a full page.
+    const full = boot({ "/api/hub/inbox": inbox([...Array.from({ length: holdCount }, (_, i) => ({ ...heldItem, item_id: `hold-${i}` })), ...pageOthers(cap - holdCount)]) });
+    await settle();
+    expect(full.el.fortress!.innerHTML).toContain(`<span class="count" id="queue-count">${holdCount}+</span>`);
+    const unrecognized = boot({ "/api/hub/inbox": inbox([{ ...heldItem, tier: "tier9" }]) });
+    await settle();
+    expect(unrecognized.el.fortress!.innerHTML).toContain('<span class="count" id="queue-count">1</span>');
+    const earned = boot({ "/api/hub/inbox": inbox([]) });
+    await settle();
+    expect(earned.el.fortress!.innerHTML).toContain('<span class="count zero" id="queue-count">0</span>');
+  });
 });
 
 

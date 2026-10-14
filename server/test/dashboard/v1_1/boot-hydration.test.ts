@@ -127,6 +127,7 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('state.route = "agents"; void fetchAll()', h.context); await settle();
     expect(h.main.innerHTML).not.toContain("No protected agents yet");
     expect(h.main.innerHTML).toContain("Unknown");
+    // The shared table keeps the Agents retry route with its current control label.
     expect(h.main.innerHTML).toContain('data-action="retry-panel" data-read="/api/hub/agents"');
   });
   it("never renders protective home or agent statuses with stale or invalid evidence", async () => {
@@ -146,6 +147,7 @@ describe("dashboard bounded independent hydration", () => {
       expect.soft(h.main.innerHTML, timestamp).not.toContain(">Enforcing</span>");
       expect.soft(runInContext("homeFreshnessTimer", h.context), timestamp).toBeNull();
       runInContext('state.route = "agents"; rerender()', h.context);
+      // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
       expect.soft(h.main.innerHTML, timestamp).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     }
   });
@@ -635,14 +637,19 @@ describe("D5 closure", () => {
       state.route = "agents"; rerender();
     `, h.context);
     const rendered = () => h.main.innerHTML + runInContext('renderAgentInspectPanel(state.agents[0])', h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext(`state.posture.home.agents = [{ agent_id: "other", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60000 }]; rerender()`, h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('state.posture.home.agents[0].agent_id = "fixture"; rerender()', h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(rendered()).toContain('state-dot live'); expect(rendered()).toContain('state-chip good');
     runInContext('sourceRead("/api/posture/home").state = "state_LOADING"; rerender()', h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('sourceRead("/api/posture/home").state = "state_LOADED"; state.posture.home.agents[0].last_enforcement_evidence_at = "2000-01-01T00:00:00Z"; rerender()', h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
   });
   it.each(["stream", "polling"])("shows stopped %s updates on every route until Retry", async mode => {
@@ -691,9 +698,11 @@ describe("D5 closure", () => {
         ? response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] })
         : pending(),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(h.main.innerHTML).toContain('state-chip good');
     await vi.advanceTimersByTimeAsync(1001);
     await settle();
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(h.main.innerHTML).not.toMatch(/state-chip good|state-dot live|att-agent verified/i);
   });
   it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
@@ -774,7 +783,9 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("<dt>Protection requested</dt>");
     expect(h.main.innerHTML).not.toContain("<dt>Protected agents</dt>");
     runInContext('state.route = "agents"; rerender()', h.context);
+    // The inventory now reports the loaded-row denominator instead of a prose agent count.
     expect(h.main.innerHTML).toContain("showing 1 of 1");
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
     expect(h.main.innerHTML).not.toContain('state-chip good');
     runInContext('state.route = "posture"; rerender()', h.context);
     // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
