@@ -6,7 +6,7 @@
 # (server/test/structure/debt-handle-register-reconciliation.test.ts): it
 # asserts every `DEBT(<HANDLE>)` marker across server/src, server/test,
 # castle-wall-daemon/src, and castle-wall-daemon/tests is uniquely shaped, but
-# it can never read the private `Open_Defects_Register` (that lives in the
+# it can never read the private defect register (that lives in the
 # coordinator repo, across a repository boundary a public CI job cannot
 # cross). This script is the piece that DOES read the register, run by a
 # coordinator who has both repos checked out. It never runs in this
@@ -25,8 +25,9 @@
 #   scripts/reconcile-debt-handles.sh                     # list handles only
 #   scripts/reconcile-debt-handles.sh <register-path>      # + unmatched report
 #
-# <register-path> is expected to be a private register file, e.g.
-#   ~/Code/Claude/Review/Sanctuary/Open_Defects_Register_2026-08-05.md
+# <register-path> is expected to be the private defect listing the coordinator
+# generates from its typed defect register, e.g.
+#   ~/Code/Claude/Review/Sanctuary/Private_Defect_Listing.md
 # A handle counts as matched when it appears in the register file as a WHOLE
 # TOKEN -- not preceded or followed by another handle-shape character
 # ([A-Z0-9-]) -- so "BRIDGE-SELF-INFLATION" does not false-match a register
@@ -119,7 +120,7 @@ echo "Distinct handles: $DISTINCT_COUNT"
 if [[ -z "$REGISTER_PATH" ]]; then
   echo ""
   echo "No register path given -- pass one to reconcile against it, e.g.:"
-  echo "  $0 ~/Code/Claude/Review/Sanctuary/Open_Defects_Register_2026-08-05.md"
+  echo "  $0 ~/Code/Claude/Review/Sanctuary/Private_Defect_Listing.md"
   echo "A bare listing does not reconcile anything, so this is not success."
   exit 2
 fi
