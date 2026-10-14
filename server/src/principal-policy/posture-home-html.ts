@@ -1265,7 +1265,7 @@ export function renderPostureHomeHTML(): string {
   function unavailableApprovalsHTML() {
     return '<div class="approval-locked" data-approvals-unavailable="1">' +
       '<div class="approval-locked-title">Approval queue unavailable.</div>' +
-      '<div class="approval-detail">This page received an unreadable approval response, so it cannot verify whether anything is waiting on your decision.</div>' +
+      '<div class="approval-detail">The approval queue read failed or returned something unreadable, so this page cannot verify whether anything is waiting on your decision.</div>' +
       "</div>";
   }
 
