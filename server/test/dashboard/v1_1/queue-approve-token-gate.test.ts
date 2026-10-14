@@ -32,9 +32,9 @@
  *     tokenless approve through and fail this test.
  */
 
+import { renderApprovalFixture } from "./approval-render-fixture.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
@@ -188,13 +188,14 @@ async function startRig(): Promise<Rig> {
 }
 
 describe("wave 1 approvals queue: client routes Approve/Deny through the gated inbox path", () => {
-  it("queue tiles emit the SAME data-action hooks the inbox rows use (no second approve path)", () => {
+  it("the live drawer emits the existing decision hooks (no second approve path)", () => {
     const src = getClientScript();
-    // The rail queue tile renderer exists and emits inbox-approve / inbox-deny
-    // on the tile, so the dispatcher routes them through onInboxAction.
-    expect(src).toContain("function renderApprovalTile");
-    expect(src).toContain('data-action="inbox-approve"');
-    expect(src).toContain('data-action="inbox-deny"');
+    // Render the current drawer: dead tile source cannot establish a shipped control.
+    const html = renderApprovalFixture();
+    expect(html).toContain('class="card approval-drawer"');
+    expect(html).toContain('data-action="inbox-approve"');
+    expect(html).toContain('data-action="inbox-deny"');
+    expect(src).not.toContain("function renderApprovalTile");
     // onInboxAction issues exactly one approve/deny path: the gated POST.
     expect(src).toContain('api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST"');
     // No loopback/auto-auth shortcut and no second, weaker approve endpoint:

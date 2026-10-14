@@ -146,6 +146,10 @@ export const HUB_CHAT_TURNS_MAX_LIMIT = 1000;
 
 /**
  * Default + max inbox-list page size.
+ *
+ * HUB_INBOX_DEFAULT_LIMIT must match APPROVAL_QUEUE_ITEM_CAP in dashboard/v1_1/client.ts: the console reads
+ * one default page and treats a page of this size as full, so it never claims an empty queue from it.
+ * Changing one without the other breaks that full-page wording silently.
  */
 export const HUB_INBOX_DEFAULT_LIMIT = 100;
 export const HUB_INBOX_MAX_LIMIT = 500;
