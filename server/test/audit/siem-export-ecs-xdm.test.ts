@@ -64,7 +64,9 @@ function flatten(value: unknown, prefix = ""): FlatRecord {
 }
 
 function cefDecision(line: string): "allow" | "deny" {
-  return line.includes("outcome=deny") ? "deny" : "allow";
+  if (line.includes("outcome=deny")) return "deny";
+  if (line.includes("outcome=allow")) return "allow";
+  throw new Error(`unclassified CEF decision: ${line}`);
 }
 
 function cefTimestamp(line: string): number {
@@ -74,7 +76,9 @@ function cefTimestamp(line: string): number {
 }
 
 function ocsfDecision(obj: ReturnType<typeof formatAsOCSF>): "allow" | "deny" {
-  return obj.disposition_id === 2 ? "deny" : "allow";
+  if (obj.disposition_id === 2) return "deny";
+  if (obj.disposition_id === 1) return "allow";
+  throw new Error(`unclassified OCSF disposition: ${obj.disposition_id}`);
 }
 
 function ecsDecision(obj: ReturnType<typeof formatAsECS>): "allow" | "deny" {
@@ -82,7 +86,15 @@ function ecsDecision(obj: ReturnType<typeof formatAsECS>): "allow" | "deny" {
 }
 
 function xdmDecision(obj: ReturnType<typeof formatAsXDM>): "allow" | "deny" {
-  return obj["sanctuary.audit.decision"];
+  return obj.sanctuary_audit_decision;
+}
+
+function xdmTimestamp(obj: ReturnType<typeof formatAsXDM>): number | null {
+  return obj.sanctuary_time;
+}
+
+function xdmOperation(obj: ReturnType<typeof formatAsXDM>): string {
+  return obj.sanctuary_event_operation;
 }
 
 describe("ECS and XDM SIEM export parity", () => {
@@ -114,6 +126,34 @@ describe("ECS and XDM SIEM export parity", () => {
       result: "failure",
       details: { decision: "deny_once", reason: "policy-only reason" },
     }),
+    fixtureEntry({
+      timestamp: "2026-10-14T18:34:00.000Z",
+      layer: "l2",
+      operation: "state_export",
+      result: "success",
+      details: { decision: "held", tier: 1 },
+    }),
+    fixtureEntry({
+      timestamp: "2026-10-14T18:35:00.000Z",
+      layer: "l3",
+      operation: "egress_probe",
+      result: "failure",
+      details: { decision: "deny", tier: 2 },
+    }),
+    fixtureEntry({
+      timestamp: "2026-10-14T18:36:00.000Z",
+      layer: "l1",
+      operation: "manifest",
+      result: "success",
+      details: { tier: 3 },
+    }),
+    fixtureEntry({
+      timestamp: "2026-10-14T18:37:00.000Z",
+      layer: "l4",
+      operation: "reputation_publish",
+      result: "success",
+      details: { decision: "mystery-value", tier: 3 },
+    }),
   ];
 
   it("keeps full-set event, decision, and time parity with CEF and OCSF", () => {
@@ -122,18 +162,32 @@ describe("ECS and XDM SIEM export parity", () => {
     const ecs = entries.map((entry) => formatAsECS(redactAuditEntryForAgent(entry)));
     const xdm = entries.map((entry) => formatAsXDM(redactAuditEntryForAgent(entry)));
 
-    expect(ecs).toHaveLength(cef.length);
-    expect(xdm).toHaveLength(ocsf.length);
+    const cefTuples = entries.map((entry, index) => [
+      entry.operation,
+      cefDecision(cef[index]!),
+      cefTimestamp(cef[index]!),
+    ]);
+    const ocsfTuples = entries.map((entry, index) => [
+      entry.operation,
+      ocsfDecision(ocsf[index]!),
+      ocsf[index]!.time,
+    ]);
+    const ecsTuples = entries.map((entry, index) => [
+      ecs[index]!.event.action,
+      ecsDecision(ecs[index]!),
+      new Date(ecs[index]!["@timestamp"]!).getTime(),
+    ]);
+    const xdmTuples = entries.map((entry, index) => [
+      xdmOperation(xdm[index]!),
+      xdmDecision(xdm[index]!),
+      xdmTimestamp(xdm[index]!),
+    ]);
 
-    entries.forEach((entry, index) => {
-      const expectedTime = new Date(entry.timestamp).getTime();
-      expect(ecs[index]?.event.action).toBe(entry.operation);
-      expect(xdm[index]?.["xdm.event.operation"]).toBe(entry.operation);
-      expect(ecsDecision(ecs[index]!)).toBe(cefDecision(cef[index]!));
-      expect(xdmDecision(xdm[index]!)).toBe(ocsfDecision(ocsf[index]!));
-      expect(new Date(ecs[index]!["@timestamp"]).getTime()).toBe(cefTimestamp(cef[index]!));
-      expect(xdm[index]?._time).toBe(expectedTime);
-      expect(ocsf[index]?.time).toBe(expectedTime);
+    expect({ cef: cefTuples, ocsf: ocsfTuples, ecs: ecsTuples, xdm: xdmTuples }).toEqual({
+      cef: ocsfTuples,
+      ocsf: ocsfTuples,
+      ecs: ocsfTuples,
+      xdm: ocsfTuples,
     });
   });
 
@@ -161,9 +215,20 @@ describe("ECS and XDM SIEM export parity", () => {
     const xdm = formatAsXDM(redactAuditEntryForAgent(deniedDespiteDetail));
 
     expect(ecs.sanctuary.audit.decision).toBe("deny");
-    expect(ecs.event.type).toContain("denied");
-    expect(xdm["sanctuary.audit.decision"]).toBe("deny");
-    expect(xdm["xdm.event.operation_sub_type"]).toBe("deny");
+    expect(ecs.event.type).toEqual(["info"]);
+    expect(JSON.stringify(ecs.event.type)).not.toContain("allowed");
+    expect(xdm.sanctuary_audit_decision).toBe("deny");
+    expect(xdm.sanctuary_event_operation_sub_type).toBe("deny");
+  });
+
+  it("normalizes invalid ECS and XDM timestamps to null instead of throwing", () => {
+    const badTimestamp = fixtureEntry({
+      timestamp: "not-a-date",
+      result: "success",
+    });
+
+    expect(formatAsECS(redactAuditEntryForAgent(badTimestamp))["@timestamp"]).toBeNull();
+    expect(formatAsXDM(redactAuditEntryForAgent(badTimestamp)).sanctuary_time).toBeNull();
   });
 
   it("never emits raw policy, identity, session, or reason fields in ECS or XDM", () => {

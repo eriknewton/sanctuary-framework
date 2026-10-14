@@ -1,30 +1,27 @@
 {
   "description": "Sanctuary audit ECS export ingest pipeline. Repo-verified only; no live Elastic tenant drill in this slice.",
-  "processors": [
-    {
-      "set": {
-        "field": "event.dataset",
-        "value": "sanctuary.audit",
-        "if": "ctx.event != null && ctx.event.dataset == null"
-      }
-    },
-    {
-      "set": {
-        "field": "event.module",
-        "value": "sanctuary",
-        "if": "ctx.event != null && ctx.event.module == null"
-      }
-    }
-  ],
-  "fields": [
-    "@timestamp",
-    "event.dataset",
-    "event.module",
-    "event.action",
-    "event.outcome",
-    "event.type",
-    "event.severity",
-    "sanctuary.audit.decision",
-    "sanctuary.audit.result"
-  ]
+  "version": 1,
+  "processors": [],
+  "_meta": {
+    "verified_by": "repo schema and fixture tests only",
+    "note": "The formatter already emits the ECS fields this pipeline indexes; no mutation processor is needed.",
+    "fields": [
+      "@timestamp",
+      "ecs.version",
+      "event.kind",
+      "event.category",
+      "event.type",
+      "event.module",
+      "event.dataset",
+      "event.provider",
+      "event.action",
+      "event.outcome",
+      "event.severity",
+      "service.name",
+      "service.type",
+      "user.id",
+      "sanctuary.audit.decision",
+      "sanctuary.audit.result"
+    ]
+  }
 }

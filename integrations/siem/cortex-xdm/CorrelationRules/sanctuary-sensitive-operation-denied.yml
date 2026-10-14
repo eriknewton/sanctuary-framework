@@ -1,0 +1,14 @@
+alert_name: Sanctuary sensitive operation denied
+alert_category: Audit
+severity: SEV_0x0_MEDIUM
+execution_mode: scheduled
+search_window: 10m
+xql_query: |
+  datamodel dataset = xdm
+  | filter sanctuary.audit.decision = "deny" and xdm.event.operation in ("identity_sign", "state_delete", "reputation_import")
+alert_fields:
+  - _time
+  - xdm.event.operation
+  - xdm.event.outcome
+  - sanctuary.audit.decision
+  - sanctuary.audit.result

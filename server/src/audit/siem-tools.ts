@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — SIEM Export Tool
+ * Sanctuary MCP Server - SIEM Export Tool
  *
  * Registers the audit_export_siem MCP tool that exports audit log entries
  * in standard SIEM formats (CEF, OCSF, ECS, and XDM).
@@ -8,7 +8,7 @@
  * the export bulk-decrypts audit events across all principals, each carrying its
  * policy tier and approve/deny decision, so auto-allowing it would hand the agent
  * a policy-inference oracle (no-read invariant, CLAUDE.md #7). The operator IS
- * allowed to see this structure, so the rich SIEM fields are preserved — only the
+ * allowed to see this structure, so the rich SIEM fields are preserved; only the
  * gate changed (Tier 3 → Tier 1; CISO MED-1).
  */
 
@@ -24,17 +24,22 @@ import {
 } from "./siem-formatter.js";
 import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
 
-type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
+export type SIEMExportFormat = "cef" | "ocsf" | "ecs" | "xdm";
 
-const SIEM_EXPORT_FORMATS: SIEMExportFormat[] = ["cef", "ocsf", "ecs", "xdm"];
+export const SIEM_EXPORT_FORMATS = ["cef", "ocsf", "ecs", "xdm"] as const;
+
+function isSIEMExportFormat(value: string): value is SIEMExportFormat {
+  return (SIEM_EXPORT_FORMATS as readonly string[]).includes(value);
+}
 
 export function createSIEMTools(
   auditLog: AuditLog,
   // OWN-IDENTITY FILTER (CISO MED-3): `audit_export_siem` is agent-callable, so
-  // it must export only the CALLER's own entries (system/gate entries — which
-  // carry operator-only context — are never returned). Optional so existing
-  // callers that pre-date the filter still construct; when absent, the tool
-  // fails closed (exports nothing) rather than degrading open.
+  // it must export only the CALLER's own entries. System-owned gate entries that
+  // carry operator-only context are never returned; the caller's own
+  // approval-proof rows remain in scope. Optional so existing callers that
+  // pre-date the filter still construct; when absent, the tool fails closed
+  // (exports nothing) rather than degrading open.
   currentSessionBinding?: () => SessionBinding | undefined
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
@@ -42,7 +47,7 @@ export function createSIEMTools(
       name: "audit_export_siem",
       description:
         "Export the caller's own redacted audit view in CEF, OCSF, ECS, or XDM for SIEM ingestion. " +
-        "Raw policy tier, rule ids, system/gate entries, and approve-vs-auto distinctions " +
+        "Raw policy tier, rule ids, system-owned gate entries, and approve-vs-auto distinctions " +
         "are not included; Tier 1 approval still required (bulk audit export).",
       inputSchema: {
         type: "object",
@@ -100,8 +105,8 @@ export function createSIEMTools(
       },
       handler: async (args) => {
         // Parse and validate inputs
-        const format = String(args.format || "").toLowerCase() as SIEMExportFormat;
-        if (!SIEM_EXPORT_FORMATS.includes(format)) {
+        const requestedFormat = String(args.format || "").toLowerCase();
+        if (!isSIEMExportFormat(requestedFormat)) {
           return {
             content: [
               {
@@ -113,6 +118,7 @@ export function createSIEMTools(
             ],
           };
         }
+        const format: SIEMExportFormat = requestedFormat;
 
         // Parse time range (default to 24 hours ago if since not specified)
         let since: string | undefined;
@@ -208,7 +214,7 @@ export function createSIEMTools(
 
         // Query audit log scoped to the caller's identity BEFORE the limit
         // (AuditLog.query applies identity_id before its slice), so the
-        // over-fetch window is entirely the caller's OWN entries — a caller with
+        // over-fetch window is entirely the caller's OWN entries; a caller with
         // many other-identity entries ahead of theirs is no longer undercounted
         // (CISO LOW, 2026-06-16). `result.total` is the caller's own in-window
         // population; the remaining tool/decision/result/until filters + the
@@ -235,7 +241,7 @@ export function createSIEMTools(
 
         if (filterDecision) {
           // Filter on the AGENT-SAFE coarse decision (2-valued allow/deny),
-          // derived from the entry `result` alone — never the raw operator
+          // derived from the entry `result` alone, never the raw operator
           // `gate_decision` detail NOR the fine-grained `decision` value (both
           // would re-introduce a policy read; `decision` was removed from the
           // agent corpus, CISO HIGH 2026-06-16). The schema enum keeps

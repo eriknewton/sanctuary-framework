@@ -1,0 +1,7 @@
+id: sanctuary_audit_1_0
+name: Sanctuary Audit 1.0
+fromversion: 8.0.0
+rules:
+  - name: SanctuaryAudit_1_0
+    file: SanctuaryAudit_1_0.xif
+schema: SanctuaryAudit_1_0_schema.json

@@ -1,16 +1,14 @@
 [MODEL: dataset="sanctuary_audit_raw"]
 ALTER
-  _time = _time,
-  xdm.event.type = "application",
-  xdm.event.description = xdm.event.description,
-  xdm.event.operation = xdm.event.operation,
-  xdm.event.operation_sub_type = xdm.event.operation_sub_type,
-  xdm.event.outcome = if(
-    xdm.event.outcome = "success", XDM_CONST.OUTCOME_SUCCESS,
-    xdm.event.outcome = "failure", XDM_CONST.OUTCOME_FAILED,
-    xdm.event.outcome
-  ),
-  xdm.event.is_completed = xdm.event.is_completed,
-  xdm.observer.product = xdm.observer.product,
-  xdm.observer.vendor = xdm.observer.vendor,
-  xdm.source.identity.username = xdm.source.identity.username
+  _time = sanctuary_time;
+  xdm.event.type = sanctuary_event_type;
+  xdm.event.description = sanctuary_event_description;
+  xdm.event.operation = sanctuary_event_operation;
+  xdm.event.operation_sub_type = sanctuary_event_operation_sub_type;
+  xdm.event.outcome = if(sanctuary_event_outcome = "success", XDM_CONST.OUTCOME_SUCCESS, if(sanctuary_event_outcome = "failure", XDM_CONST.OUTCOME_FAILED, sanctuary_event_outcome));
+  xdm.event.is_completed = sanctuary_event_is_completed;
+  xdm.observer.product = sanctuary_observer_product;
+  xdm.observer.vendor = sanctuary_observer_vendor;
+  xdm.source.user.username = sanctuary_source_user_username;
+  sanctuary.audit.decision = sanctuary_audit_decision;
+  sanctuary.audit.result = sanctuary_audit_result;
