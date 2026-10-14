@@ -695,6 +695,26 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el.main!.innerHTML).toContain("cap 100");
   });
 
+  it("Approvals says a full inbox page may hide more held operations, and says nothing when the page is not full", async () => {
+    vi.useFakeTimers();
+    // One inbox read returns at most 100 items of every kind and no total (HUB_INBOX_DEFAULT_LIMIT).
+    const page = (approvals: number, others: number) => [
+      ...Array.from({ length: approvals }, (_, index) => ({ ...heldItem, item_id: `held-${index}`, tier: "tier2", operation_category: "state_export", resolved: false })),
+      ...Array.from({ length: others }, (_, index) => ({ item_id: `egress-${index}`, kind: "blocked_egress", agent_id: "agent-a", created_at: "2026-10-14T16:00:00.000Z", resolved: false, destination_category: "paste-site", display_template_id: "blocked_egress.egress_policy_deny", display_template_args: [] })),
+    ];
+    const full = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 40) } })) });
+    await settle();
+    full.navigate("approvals");
+    expect(full.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(full.el.main!.innerHTML).toContain('data-inbox-page-full="1"');
+    expect(full.el.main!.innerHTML).toContain("The inbox read returned a full page of 100 items; held operations beyond it are not shown here.");
+    const partial = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: page(60, 39) } })) });
+    await settle();
+    partial.navigate("approvals");
+    expect(partial.el.main!.innerHTML).toContain("showing 60 of 60");
+    expect(partial.el.main!.innerHTML).not.toContain('data-inbox-page-full="1"');
+  });
+
   it("refused decisions show the refusal and repaint from server state", async () => {
     vi.useFakeTimers();
     let inboxItems: Array<Record<string, unknown>> = [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export", resolved: false }];
