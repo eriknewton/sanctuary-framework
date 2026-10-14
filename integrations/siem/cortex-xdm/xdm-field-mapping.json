@@ -1,7 +1,7 @@
 {
   "name": "sanctuary-audit-xdm-raw-fields",
   "format": "xdm",
-  "verified_by": "repo schema and fixture tests for field names only",
+  "verified_by": "repo schema and fixture tests for field names and raw-to-home pairs only",
   "contract": "mapping must match SIEM_XDM_FIELD_HOMES in server/src/audit/siem-formatter.ts",
   "dataset": "sanctuary_audit_raw",
   "raw_fields": [

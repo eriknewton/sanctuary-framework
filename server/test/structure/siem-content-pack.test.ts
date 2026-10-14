@@ -235,7 +235,9 @@ describe("SIEM field mappings", () => {
       } else {
         file.text += "\nchart `event.not_a_real_field`";
       }
-      expect(() => checkPackFile(parsePackText(file.relativePath, file.text)), path).toThrow();
+      // The planted name itself must be the refusal, not some other throw on the way.
+      expect(() => checkPackFile(parsePackText(file.relativePath, file.text)), path)
+        .toThrow(/references event\.not_a_real_field/);
     }
   });
 

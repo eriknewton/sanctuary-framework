@@ -10,9 +10,10 @@ This directory contains repo-local field mapping files for the redacted
 
 The formatter mapping table is the source of truth and is pinned in
 `server/src/audit/siem-formatter.ts`. ECS uses the ECS 8.11.0
-categorization pairing `event.category` with `event.type`; the coarse decision
-is represented as `event.outcome` plus `sanctuary.audit.decision`, so a denied
-decision never reads as allowed.
+categorization pairing `event.category` with `event.type`. The result is
+carried by `event.outcome` and the coarse decision by `event.severity` and
+`sanctuary.audit.decision`; the decision is deny exactly when the result is
+failure, so a denied decision never reads as allowed.
 
 Each row groups fields built from the same source value. The description adds
 "Sanctuary " to the operation; severity is a numeric projection of the coarse
@@ -27,8 +28,8 @@ decision. Constant values are marked explicitly.
 | Result | `event.outcome`, `sanctuary.audit.result` | raw `sanctuary_event_outcome`, home `xdm.event.outcome`; raw `sanctuary_audit_result`, no standard XDM home |
 | constant: 8.11.0 | `ecs.version` | none |
 | constant: event | `event.kind` | none |
-| constant: configuration category | `event.category` | none |
-| constant: info type | `event.type` | none |
+| constant: ["configuration"] | `event.category` | none |
+| constant: ["info"] | `event.type` | none |
 | constant: sanctuary | `event.module` | none |
 | constant: sanctuary.audit | `event.dataset` | none |
 | constant: sanctuary-mcp | `event.provider`, `service.name` | none |

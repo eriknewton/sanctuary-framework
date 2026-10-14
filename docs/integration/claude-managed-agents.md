@@ -89,9 +89,10 @@ not across sessions. For durable identity across sessions:
 run Sanctuary: one identity per thread agent, or a shared identity via seed.
 
 **SIEM export.** Use `audit_export_siem` to export CEF, OCSF, ECS, or raw Cortex
-events for XDM modeling from inside the container. Field names and raw-to-home
-pairs under `integrations/siem/` are checked against formatter tables by repo
-tests; null XDM homes keep those values as raw dataset fields. Run a tenant
+events for XDM modeling from inside the container. Field names under
+`integrations/siem/`, and the Cortex mapping file's raw-to-home pairs, are
+checked against formatter tables by repo tests; null XDM homes keep those values
+as raw dataset fields. Run a tenant
 drill before treating either mapping as installed evidence.
 
 ## Troubleshooting

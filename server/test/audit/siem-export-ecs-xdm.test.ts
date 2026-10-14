@@ -185,11 +185,18 @@ describe("ECS and XDM SIEM export parity", () => {
       xdmTimestamp(obj),
     ]);
 
+    // Every arm is held to the fixture itself, so a change confined to OCSF, or one shared by all
+    // four formats, still fails here.
+    const expected = entries.map((entry) => [
+      entry.operation,
+      entry.result === "failure" ? "deny" : "allow",
+      Date.parse(entry.timestamp),
+    ]);
     expect({ cef: cefTuples, ocsf: ocsfTuples, ecs: ecsTuples, xdm: xdmTuples }).toEqual({
-      cef: ocsfTuples,
-      ocsf: ocsfTuples,
-      ecs: ocsfTuples,
-      xdm: ocsfTuples,
+      cef: expected,
+      ocsf: expected,
+      ecs: expected,
+      xdm: expected,
     });
   });
 
