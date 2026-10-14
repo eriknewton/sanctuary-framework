@@ -357,8 +357,8 @@ describe("SIEM Export Integration", () => {
       expect(tool.name).toBe("audit_export_siem");
       expect(tool.description).toContain("CEF");
       expect(tool.description).toContain("OCSF");
-      expect(tool.description).toContain("Splunk");
-      expect(tool.description).toContain("Datadog");
+      expect(tool.description).toContain("ECS");
+      expect(tool.description).toContain("XDM");
     });
 
     it("should have properly typed input schema", () => {
