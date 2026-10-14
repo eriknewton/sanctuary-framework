@@ -17,23 +17,23 @@ wide: true
 <section class="section scope-layout" id="harnesses" aria-labelledby="harnesses-title"><div><div class="section-heading"><span class="section-index">03</span><h2 id="harnesses-title">Read the scope before installing</h2></div><a href="https://github.com/eriknewton/sanctuary-framework/blob/main/ASSURANCE_MATRIX.md" class="text-link">Read the full Assurance Matrix</a></div><table class="scope-table"><thead>
 <tr><th scope="col">Area</th><th scope="col">Current evidence</th></tr>
 </thead><tbody>
-<tr><td>State encryption</td><td>
+<tr><th scope="row">State encryption</th><td>
 <p>AES-GCM tamper rejection and initialization-vector uniqueness are test-proven; those tests do not establish hardware-backed key custody.</p>
 </td></tr>
 
-<tr><td>Approval policy</td><td>
+<tr><th scope="row">Approval policy</th><td>
 <p>The policy engine and refusal behavior when an approval channel is unreachable are test-proven; an end-to-end drill across all approval channels remains unproven.</p>
 </td></tr>
 
-<tr><td>Agent wrapping</td><td>
+<tr><th scope="row">Agent wrapping</th><td>
 <p>Partial: representative configuration paths are tested; every harness version and non-MCP tool surface are not covered.</p>
 </td></tr>
 
-<tr><td>Audit chain</td><td>
+<tr><th scope="row">Audit chain</th><td>
 <p>Partial: external verification proof remains outstanding.</p>
 </td></tr>
 
-<tr><td>Exit</td><td>
+<tr><th scope="row">Exit</th><td>
 <p>Partial: the complete export and import guarantee remains unproven.</p>
 </td></tr>
 </tbody></table></section>

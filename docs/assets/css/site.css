@@ -222,8 +222,8 @@ main, section, article, figure, .hero-copy { min-width: 0; }
 .section-head-note { margin-left: auto; color: var(--ink-3); font: 400 .75rem/1.6 var(--mono); }
 .proof-table { width: 100%; border-collapse: collapse; text-align: left; table-layout: fixed; }
 .proof-table col:nth-child(1) { width: 16%; }
-.proof-table col:nth-child(2) { width: 56%; }
-.proof-table col:nth-child(3) { width: 12%; }
+.proof-table col:nth-child(2) { width: 52%; }
+.proof-table col:nth-child(3) { width: 16%; }
 .proof-table col:nth-child(4) { width: 16%; }
 .proof-table thead th { color: var(--ink-3); font-size: .75rem; font-weight: 500; padding: 0 16px 12px 0; border-bottom: 1px solid var(--rule); }
 .proof-table td, .proof-table tbody th { padding: 24px 24px 24px 0; border-bottom: 1px solid var(--rule); font-size: .875rem; line-height: 1.75; vertical-align: top; }
@@ -231,6 +231,7 @@ main, section, article, figure, .hero-copy { min-width: 0; }
 .proof-table tbody th { font-family: var(--display); font-size: 1rem; font-weight: 600; }
 .proof-table tbody th { color: var(--ink); text-align: left; }
 .architecture { white-space: nowrap; }
+.proof-table time { white-space: nowrap; }
 .proof-table .date { color: var(--ink-3); font: 400 .75rem/1.75 var(--mono); }
 .qualification { color: var(--ink-2); }
 .record-link { display: block; line-height: 1.6; }
@@ -242,9 +243,9 @@ main, section, article, figure, .hero-copy { min-width: 0; }
 .text-link { display: inline-block; margin-top: 24px; font-size: .875rem; }
 .scope-layout { display: grid; grid-template-columns: minmax(0,280px) minmax(0,1fr); gap: 64px; }
 .scope-table { border-collapse: collapse; text-align: left; width: 100%; }
-.scope-table th { color: var(--ink-3); font-size: .75rem; font-weight: 500; padding-bottom: 12px; }
-.scope-table td { vertical-align: top; border-top: 1px solid var(--rule); padding: 16px 0; font-size: .875rem; }
-.scope-table td:first-child { width: 28%; padding-right: 24px; font-weight: 600; }
+.scope-table thead th { color: var(--ink-3); font-size: .75rem; font-weight: 500; padding-bottom: 12px; }
+.scope-table td, .scope-table tbody th { vertical-align: top; border-top: 1px solid var(--rule); padding: 16px 0; font-size: .875rem; }
+.scope-table tbody th { color: var(--ink); text-align: left; width: 28%; padding-right: 24px; font-weight: 600; }
 .scope-table td:nth-child(2) { color: var(--ink-2); }
 .install-panel { padding: 40px; border: 1px solid var(--rule); border-radius: var(--rad-lg); background: var(--surface); display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 64px; }
 .install-panel h2 { font-size: 2rem; }
@@ -294,7 +295,7 @@ blockquote { margin: 24px 0; padding: 4px 0 4px 24px; border-left: 2px solid var
   .header-inner { gap: 16px; }
   .scope-layout, .founder { gap: 32px; grid-template-columns: minmax(0,220px) minmax(0,1fr); }
 }
-@media (max-width: 1000px) {
+@media (max-width: 1100px) {
   .proof-table, .proof-table tbody, .proof-table tr, .proof-table td, .proof-table tbody th { display: block; width: 100%; }
   .proof-table colgroup { display: none; }
   /* Keep table headers available to assistive technology when rows stack. */
@@ -327,7 +328,7 @@ blockquote { margin: 24px 0; padding: 4px 0 4px 24px; border-left: 2px solid var
 
   .boundary-content, .scope-layout, .founder, .install-panel { display: block; }
   .boundary-content > div + div, .scope-layout > table, .founder-copy, .install-panel > div + div { margin-top: 24px; }
-  .scope-table td:first-child { padding-right: 16px; }
+  .scope-table tbody th { padding-right: 16px; }
   .install-panel { padding: 24px; }
   .founder-copy > p { font-size: 1.25rem; }
   .footer-top { display: block; }

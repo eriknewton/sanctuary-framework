@@ -33,15 +33,25 @@ Keep passphrases, recovery keys and dashboard tokens out of the agent conversati
 
 Prerequisites for the npm path: Node.js 22 or newer and npm 10 or newer. Before installing, open the [release verification instructions](https://github.com/eriknewton/sanctuary-framework/blob/main/README.md#verify-before-you-trust).
 
-For a Claude Code configuration, use the headless command from the README Quickstart:
+Choose the action that matches your task. Install first and check the result afterward. Removal is a separate action, only when you intend to remove the npm installation.
+
+**Install for Claude Code**, using the README's headless command:
 
 ```bash
 npx -y @sanctuary-framework/mcp-server protect --claude-code --no-open --no-dashboard
-npx -y @sanctuary-framework/mcp-server doctor --json
-npx -y @sanctuary-framework/mcp-server uninstall
 ```
 
-Run `doctor` after setup. Run `uninstall` only when you intend to remove the npm installation. These are separate lifecycle actions.
+**Check the installation:**
+
+```bash
+npx -y @sanctuary-framework/mcp-server doctor --json
+```
+
+**Remove only when intended**, using a separate command:
+
+```bash
+npx -y @sanctuary-framework/mcp-server uninstall
+```
 
 Treat this as cooperative MCP setup; it does not install and arm the macOS operating-system wall.
 
