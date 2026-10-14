@@ -145,24 +145,57 @@ describe("renderDashboardHTML", () => {
     }));
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
     expect(html).toContain("must match shieldStatusMark in server/src/dashboard/html.ts");
-    const clientFns = html.match(/function shieldStatusMarkForLight\(light\) \{[\s\S]*?\n  \}\n\n  function renderShield\(light, headline\) \{[\s\S]*?\n  \}/)![0]!;
+    const clientFns = html.match(/function shieldStatusMarkForLight\(light\) \{[\s\S]*?\n  \}\n\n  function renderShield\(light, headline\) \{[\s\S]*?\n  \}\n\n  function renderActivity[\s\S]*?\n  function currentAuditFilter/)![0]!.replace(/\n  function currentAuditFilter$/, "");
     for (const light of lights) {
-      const updatedMark = runInNewContext(`
-        const writes = [];
-        const classList = { remove() {}, add() {} };
-        const document = {
-          getElementById: function (id) {
-            if (id === "shield") return { classList };
-            if (id === "shield-status-mark") return { setAttribute: function (key, value) { if (key === "d") writes.push(value); } };
-            return { textContent: "" };
-          }
+      const result = runInNewContext(`
+        const dWrites = [];
+        const classCalls = [];
+        const classes = new Set(["green", "yellow", "red"]);
+        const ids = {
+          shield: {
+            classList: {
+              remove: function (...names) { classCalls.push(["remove", names]); names.forEach((name) => classes.delete(name)); },
+              add: function (...names) { classCalls.push(["add", names]); names.forEach((name) => classes.add(name)); },
+            },
+          },
+          "shield-status-mark": {
+            setAttribute: function (key, value) { if (key === "d") dWrites.push(value); },
+          },
+          "hero-copy": { textContent: "" },
+          "hero-sub": { textContent: "" },
+          "mode-pill": { textContent: "" },
+          "agent-name": { textContent: "" },
+          "agent-did": { textContent: "" },
         };
+        const document = {
+          getElementById: function (id) { return ids[id] || { textContent: "", innerHTML: "" }; },
+          querySelector: function () { return null; },
+        };
+        let snapshot;
+        function wireApprovalButtons() {}
+        function renderActivity() {}
+        function renderApprovals() {}
+        function renderPrivacy() {}
+        function renderAudit() {}
+        function currentAuditFilter() { return "all"; }
         function heroCopyForLight() { return "copy"; }
         ${clientFns}
-        renderShield(${JSON.stringify(light)}, "headline");
-        writes[0];
-      `) as string;
-      expect(updatedMark, light).toBe(serverMarks.get(light));
+        renderAll({
+          overall: { light: ${JSON.stringify(light)}, headline: "headline" },
+          mode: "fixture",
+          server_version: "test",
+          agent: { display_name: "agent", did_fingerprint: "did" },
+          activity: [],
+          pending_approvals: [],
+          privacy: {},
+          audit: [],
+        });
+        ({ dWrites, classCalls, classes: Array.from(classes).sort() });
+      `) as { dWrites: string[]; classCalls: [string, string[]][]; classes: string[] };
+      expect(result.classCalls, light).toContainEqual(["remove", ["green", "yellow", "red"]]);
+      expect(result.classCalls, light).toContainEqual(["add", [light]]);
+      expect(result.classes, light).toEqual([light]);
+      expect(result.dWrites, light).toEqual([serverMarks.get(light)]);
     }
   });
 

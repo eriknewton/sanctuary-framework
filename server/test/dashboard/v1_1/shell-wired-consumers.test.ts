@@ -24,8 +24,9 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
+import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
-import { TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
+import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 
 const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
   ok: status >= 200 && status < 300,
@@ -47,6 +48,7 @@ const heldItem = {
 const emptyData = { data: { configured: false, surfaces: [], agents: [], items: [], traps: [], entries: [], policies: [], findings: [], rules: [], recommendations: [], messages: [] } };
 
 let fakeActiveElement: unknown = null;
+let setAttributeThrowFor: { name: string; value: string } | null = null;
 
 class FakeElement {
   attrs: Record<string, string>;
@@ -79,7 +81,10 @@ class FakeElement {
     has: (c: string) => this.classes.has(c),
   };
   getAttribute(name: string) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name]! : null; }
-  setAttribute(name: string, value: string) { this.attrs[name] = String(value); }
+  setAttribute(name: string, value: string) {
+    if (setAttributeThrowFor && setAttributeThrowFor.name === name && setAttributeThrowFor.value === String(value)) throw new Error("fixture row build failed");
+    this.attrs[name] = String(value);
+  }
   removeAttribute(name: string) { delete this.attrs[name]; }
   inside: string[] = [];
   closest(selector: string) { return this.inside.includes(selector) ? this : null; }
@@ -136,6 +141,7 @@ class FakeElement {
     if (index < 0) return;
     if (next instanceof FakeElement) next.parentElement = this.parentElement;
     this.parentElement.children[index] = next;
+    this.parentElement = null;
   }
 }
 class FakeText {
@@ -214,7 +220,10 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   return { el, railLink, context, navigate, click, type, change };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  setAttributeThrowFor = null;
+  vi.useRealTimers();
+});
 
 describe("slice 2 shell wired consumers", () => {
   it("the rail pill and the bell read Unknown before the queue loads, never a zero", async () => {
@@ -668,6 +677,8 @@ describe("slice 2b shell wired consumers", () => {
     expect(html).toContain("1 of 4 machines online · 1 not healthy · 2 Unknown · <span id=\"machines-age\">checked 3s ago</span>");
     expect(html.match(/state-chip good/g) ?? []).toHaveLength(1);
     expect(html.match(/state-chip unknown/g) ?? []).toHaveLength(2);
+    expect(h.el["machines-list"]!.textContent).toContain("erik-mba");
+    expect(h.el["machines-list"]!.textContent).toContain("http://mba.fixture:3501");
     // This binds the unanswered mba row to its own Unknown chip; aggregate
     // chip counts alone would miss a row-to-state swap.
     expect(html).toMatch(/data-machine-url="http:\/\/mba\.fixture:3501"[^>]*><span [^>]*class="state-chip unknown"/);
@@ -733,7 +744,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(machinesHtml(h)).not.toContain("state-chip good");
   });
 
-  it("Machines treats hostile saved entries as text and never probes or links non-web addresses", async () => {
+  it("Machines treats saved entries with script-like text as text and never probes or links non-web addresses", async () => {
     vi.useFakeTimers();
     const fetched: string[] = [];
     const h = boot({}, {
@@ -757,7 +768,7 @@ describe("slice 2b shell wired consumers", () => {
     expect(h.el["machines-list"]!.textContent).toContain('"><script>alert(1)</script>');
     expect(html).not.toMatch(/<(?:img|script)\b/i);
     expect(html).not.toMatch(/\sonerror="/i);
-    // The only href keeps the parsed web address; hostile non-web entries
+    // The only href keeps the parsed web address; non-web entries
     // remain text, and the saved path is not silently retargeted to root.
     expect([...html.matchAll(/\shref="([^"]*)"/g)].map((m) => m[1])).toEqual(["http://safe.fixture:3501/console?name=%22%3E%3Cscript%3Ealert(1)%3C/script%3E"]);
     expect(fetched.filter((url) => url.endsWith("/api/health")).sort()).toEqual(["http://fixture/api/health", "http://safe.fixture:3501/api/health"]);
@@ -780,10 +791,76 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", h.context));
     expect(fetched.filter((url) => url.endsWith("/api/health"))).toHaveLength(limit);
+    // The capped-round summary is past tense only after every in-cap probe
+    // answered, and must not restore the old second count for capped rows.
     expect(machinesHtml(h)).toContain(`checked ${limit} of 2501 machines; the rest are listed unchecked`);
+    expect(machinesHtml(h)).not.toContain("unprobed");
     expect(h.el["machines-list"]!.textContent).toContain("build-2499");
+    // The row chip uses the same word as the summary; "Unprobed" was an
+    // internal state name and is not operator copy.
     expect(h.el["machines-list"]!.textContent).toContain("Unchecked");
+    expect(attrsOf(machinesHtml(h)).some((value) => value.startsWith("Unchecked"))).toBe(true);
     expect(h.el["machines-list"]!.replaceCount).toBe(1);
+  });
+
+  it("a capped round with the named limit still in flight does not double-count checking rows", async () => {
+    vi.useFakeTimers();
+    const limitProbe = boot();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", limitProbe.context));
+    const h = boot({}, {
+      ...storage(Array.from({ length: limit + 1 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }))),
+      fetch: () => new Promise(() => {}),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const html = machinesHtml(h);
+    expect(html).toContain(`checking ${limit} of ${limit + 2} machines; the rest are listed unchecked`);
+    expect(html).not.toContain(`${limit} checking`);
+    expect(html).not.toContain("unprobed");
+  });
+
+  it("the cap phrase uses the named web-address count at the 25 and 26 row boundaries", async () => {
+    vi.useFakeTimers();
+    const limitProbe = boot();
+    const limit = Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", limitProbe.context));
+    const atLimit = boot({}, {
+      ...storage(Array.from({ length: limit - 1 }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` }))),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    atLimit.navigate("machines");
+    await settle();
+    expect(Number(runInContext("FLEET_PROBED_MACHINE_LIMIT", atLimit.context))).toBe(limit);
+    expect(machinesHtml(atLimit)).toContain(`${limit} of ${limit} machines online`);
+    expect(machinesHtml(atLimit)).not.toContain("the rest are listed unchecked");
+
+    const overLimit = boot({}, {
+      ...storage([
+        ...Array.from({ length: limit }, (_, i) => ({ name: `peer-${i}`, url: `http://peer-${i}.fixture:3501` })),
+        { name: "plain text", url: "not-a-web-address" },
+      ]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    overLimit.navigate("machines");
+    await settle();
+    expect(machinesHtml(overLimit)).toContain(`checked ${limit} of ${limit + 1} machines; the rest are listed unchecked`);
+    expect(machinesHtml(overLimit)).toContain("1 Unknown");
+    expect(machinesHtml(overLimit)).not.toContain(`checked ${limit} of ${limit + 2} machines; the rest are listed unchecked`);
+  });
+
+  it("an empty saved list has no cap clause", async () => {
+    vi.useFakeTimers();
+    const h = boot({}, {
+      ...storage([]),
+      fetch: () => Promise.resolve(response({ ok: true })),
+    });
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect(machinesHtml(h)).toContain("1 of 1 machine online");
+    expect(machinesHtml(h)).not.toContain("the rest are listed unchecked");
   });
 
   it("this machine stays inside the probe cap even when saved after twenty-five peers", async () => {
@@ -848,32 +925,86 @@ describe("slice 2b shell wired consumers", () => {
     link!.focus();
     releasePeer(response({ ok: true }));
     await settle();
+    const newLink = h.el["machines-list"]!.querySelector('[href="http://peer.fixture:3501/"]');
+    expect(newLink).toBeTruthy();
+    expect(newLink).not.toBe(link);
+    expect(h.el["machines-list"]!.contains(link)).toBe(false);
     expect((runInContext("document.activeElement && document.activeElement.getAttribute('href')", h.context))).toBe("http://peer.fixture:3501/");
+    expect(fakeActiveElement).toBe(newLink);
     expect(runInContext("document.getElementById('machines-list').contains(document.activeElement)", h.context)).toBe(true);
   });
 
-  it("one selector-hostile machine row does not stop the rest of the paint batch", async () => {
+  it("a saved address with control characters does not stop the rest of the paint batch", async () => {
     vi.useFakeTimers();
-    let releaseHostile: (value: unknown) => void = () => {};
+    let releaseControlAddress: (value: unknown) => void = () => {};
     let releaseNormal: (value: unknown) => void = () => {};
-    const hostile = "http://bad.fixture:3501/\fline\nbreak";
+    const controlAddress = "http://bad.fixture:3501/\fline\nbreak";
     const h = boot({
-      "http://bad.fixture:3501/api/health": () => new Promise((resolve) => { releaseHostile = resolve; }),
+      "http://bad.fixture:3501/api/health": () => new Promise((resolve) => { releaseControlAddress = resolve; }),
       "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
       "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
-    }, storage([{ name: "hostile", url: hostile }, { name: "normal", url: "http://normal.fixture:3501/" }]));
+    }, storage([{ name: "control chars", url: controlAddress }, { name: "normal", url: "http://normal.fixture:3501/" }]));
     await settle();
     h.navigate("machines");
     await settle();
-    releaseHostile(response({ ok: true }));
+    releaseControlAddress(response({ ok: true }));
     releaseNormal(response({ ok: false }));
     await settle();
     const html = machinesHtml(h);
-    expect(html).toContain('data-machine-url="' + hostile + '"');
+    expect(html).toContain('data-machine-url="' + controlAddress + '"');
     expect(html).toContain('data-machine-url="http://normal.fixture:3501/"');
     expect(html).toContain("Online");
     expect(html).toContain("Not healthy");
     expect(html).not.toContain("Checking");
+  });
+
+  it("each painted row carries its generated index and repaint lookup uses it", async () => {
+    vi.useFakeTimers();
+    let releasePeer: (value: unknown) => void = () => {};
+    const h = boot({
+      "http://peer.fixture:3501/api/health": () => new Promise((resolve) => { releasePeer = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "peer", url: "http://peer.fixture:3501/" }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    expect([...machinesHtml(h).matchAll(/data-machine-index="(\d+)"/g)].map((m) => Number(m[1]))).toEqual([0, 1]);
+    const peerRow = h.el["machines-list"]!.querySelector('[data-machine-url="http://peer.fixture:3501/"]');
+    expect(peerRow?.getAttribute("data-machine-index")).toBe("1");
+    peerRow!.removeAttribute("data-machine-index");
+    releasePeer(response({ ok: true }));
+    await settle();
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip checking"/);
+    expect(machinesHtml(h)).not.toMatch(/data-machine-url="http:\/\/peer\.fixture:3501\/"[^>]*><span [^>]*class="state-chip good"/);
+  });
+
+  it("a row build failure leaves that row visible and still restores focus after another row repaints", async () => {
+    vi.useFakeTimers();
+    let releaseBroken: (value: unknown) => void = () => {};
+    let releaseNormal: (value: unknown) => void = () => {};
+    const brokenUrl = "http://broken.fixture:3501/";
+    const normalUrl = "http://normal.fixture:3501/";
+    const h = boot({
+      "http://broken.fixture:3501/api/health": () => new Promise((resolve) => { releaseBroken = resolve; }),
+      "http://normal.fixture:3501/api/health": () => new Promise((resolve) => { releaseNormal = resolve; }),
+      "http://fixture/api/health": () => Promise.resolve(response({ ok: true })),
+    }, storage([{ name: "broken", url: brokenUrl }, { name: "normal", url: normalUrl }]));
+    await settle();
+    h.navigate("machines");
+    await settle();
+    const normalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(normalLink).toBeTruthy();
+    normalLink!.focus();
+    setAttributeThrowFor = { name: "data-machine-url", value: brokenUrl };
+    releaseBroken(response({ ok: true }));
+    releaseNormal(response({ ok: false }));
+    await settle();
+    const newNormalLink = h.el["machines-list"]!.querySelector('[href="http://normal.fixture:3501/"]');
+    expect(newNormalLink).toBeTruthy();
+    expect(newNormalLink).not.toBe(normalLink);
+    expect(fakeActiveElement).toBe(newNormalLink);
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/broken\.fixture:3501\/"[^>]*><span [^>]*class="state-chip checking"/);
+    expect(machinesHtml(h)).toMatch(/data-machine-url="http:\/\/normal\.fixture:3501\/"[^>]*><span [^>]*class="state-chip bad"/);
   });
 
   it("a Fleet link click changes route once and starts one probe wave", async () => {
@@ -963,11 +1094,12 @@ describe("slice 2b shell wired consumers", () => {
     h.navigate("agents");
     const html = h.el.main!.innerHTML;
     const dot = (id: string) => html.match(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ([^"]+)"></span>([^<]*)</span>`));
+    const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
     expect(dot("no-evidence")![1]).toBe("unknown");
     expect(dot("no-evidence")![2]).toBe("Unknown");
     expect(dot("paused-one")![1]).toBe("idle");
     expect(dot("unwrapping-one")![1]).toBe("idle");
-    expect(dot("unwrapping-one")![2]).toBe("Unwrapping");
+    expect(dot("unwrapping-one")![2]).toBe(unwrappingLabel);
     expect(dot("locked-one")![1]).toBe("locked");
     expect(dot("off-enum")![1]).toBe("unknown");
     // The inspect pane's pill wears the same Unknown tone as its dot, and
@@ -982,8 +1114,44 @@ describe("slice 2b shell wired consumers", () => {
     const unwrappingDetail = runInContext("renderAgentDetail()", h.context) as string;
     const fortressCard = runInContext("renderFortressAgentsCard()", h.context) as string;
     expect(unwrappingPane).toContain('<span class="pill tone-degraded"><span class="state-dot idle"');
-    expect(unwrappingDetail).toContain('<dt>Status</dt><dd><span class="glyph idle"></span> Unwrapping</dd>');
+    expect(unwrappingDetail).toContain(`<dt>Status</dt><dd><span class="glyph idle"></span> ${unwrappingLabel}</dd>`);
     expect(fortressCard).toMatch(/data-agent-id="unwrapping-one"[\s\S]*?<span class="glyph idle"/);
+  });
+
+  it("every wire agent status agrees with the status table mark in each agent view", async () => {
+    vi.useFakeTimers();
+    const now = new Date().toISOString();
+    const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+    const agents = HUB_AGENT_STATUSES.map((status) => ({ agent_id: `agent-${status}`, status, harness: "h", model_provider }));
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+      "/api/posture/home": () => Promise.resolve(response({
+        ...home(),
+        agents: [{ agent_id: "agent-active", enforcement_active: "active", last_enforcement_evidence_at: now, freshness_window_ms: 60000 }],
+      })),
+    });
+    await settle();
+    h.navigate("agents");
+    const tableStatuses = Object.keys(STATUS_MAPPING).sort();
+    expect([...HUB_AGENT_STATUSES].sort()).toEqual(tableStatuses);
+    const glyphToDot: Record<string, string> = { online: "live", idle: "idle", offline: "locked", away: "off", unknown: "unknown" };
+    for (const status of HUB_AGENT_STATUSES) {
+      const id = `agent-${status}`;
+      const expectedGlyph = STATUS_MAPPING[status].glyph;
+      const expectedDot = glyphToDot[expectedGlyph];
+      expect(runInContext(`STATUS_MAP[${JSON.stringify(status)}].glyph`, h.context), status).toBe(expectedGlyph);
+      expect(runInContext(`agentStateClass(${JSON.stringify(status)})`, h.context), status).toBe(expectedDot);
+      const listHtml = h.el.main!.innerHTML;
+      expect(listHtml, status).toMatch(new RegExp(`data-agent-id="${id}"[\\s\\S]*?<span class="state-dot ${expectedDot}"></span>`));
+      runInContext(`state.chat.inspect.panelByAgentId[${JSON.stringify(id)}] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: "2026-10-14T00:00:00.000Z" }; state.selectedAgentId = ${JSON.stringify(id)};`, h.context);
+      const agentExpr = `state.agents.find(function (a) { return a.agent_id === ${JSON.stringify(id)}; })`;
+      const pane = runInContext(`renderAgentInspectPanel(${agentExpr})`, h.context) as string;
+      const detail = runInContext("renderAgentDetail()", h.context) as string;
+      const fortress = runInContext("renderFortressAgentsCard()", h.context) as string;
+      expect(pane, status).toContain(`<span class="state-dot ${expectedDot}"`);
+      expect(detail, status).toContain(`<span class="glyph ${expectedGlyph}"></span>`);
+      expect(fortress, status).toMatch(new RegExp(`data-agent-row="${id}"[\\s\\S]*?<span class="glyph ${expectedGlyph}"`));
+    }
   });
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {

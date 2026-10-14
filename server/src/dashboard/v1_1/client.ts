@@ -4165,8 +4165,14 @@ function fleetSummary(machines) {
     else unknown++;
   });
   const parts = [online + " of " + total + noun + " online"];
-  if (unprobed) parts.push((fleet.roundDone && !checking ? "checked " : "checking ") + probeable + " of " + total + noun + "; the rest are listed unchecked");
-  if (checking) parts.push(checking + " checking");
+  if (unprobed) {
+    const cappedWebTotal = probeable + unprobed;
+    const cappedNoun = cappedWebTotal === 1 ? " machine" : " machines";
+    // Tense follows live work: "checking" appears only while at least one
+    // in-cap probe is still in flight, otherwise the cap summary is past tense.
+    parts.push((checking ? "checking " : "checked ") + probeable + " of " + cappedWebTotal + cappedNoun + "; the rest are listed unchecked");
+  }
+  if (checking && !unprobed) parts.push(checking + " checking");
   if (notHealthy) parts.push(notHealthy + " not healthy");
   if (unknown) parts.push(unknown + " Unknown");
   return { text: parts.join(" · "), age: "checked " + durationLabelFromMs(Date.now() - fleet.roundStartedAt) + " ago" };
@@ -4219,7 +4225,7 @@ function machineStatusReason(machine, status) {
   return !machine.origin
     ? "Unknown: this saved address is not a web address, so it was not linked or checked."
     : status === FLEET_PROBE.UNPROBED
-      ? "Unknown: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
+      ? "Unchecked: this row is past the " + FLEET_PROBED_MACHINE_LIMIT + "-machine probe cap, so it was listed but not checked."
       : status === FLEET_PROBE.UNKNOWN
         ? "Unknown: no answer to the health check within " + FLEET_PROBE_DEADLINE_SECONDS + " seconds, or an answer that was not the health check. This is not proof the machine is down."
         : status === FLEET_PROBE.NOT_HEALTHY ? "The machine answered its health check with ok false."
@@ -4285,18 +4291,22 @@ function paintMachinesScreen() {
   const pending = fleet.paintRows || {};
   fleet.paintRows = {};
   const focus = captureInputFocus(listEl);
-  Object.keys(pending).forEach(function (url) {
-    const index = machines.findIndex(function (m) { return m.url === url; });
-    if (index < 0 || !listEl.querySelector) return;
-    let oldRow;
-    try {
-      // Row lookup is by the generated numeric index; saved machine addresses
-      // can contain selector-hostile control characters.
-      oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
-    } catch (e) { return; }
-    if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
-  });
-  restoreInputFocus(listEl, focus);
+  try {
+    Object.keys(pending).forEach(function (url) {
+      try {
+        const index = machines.findIndex(function (m) { return m.url === url; });
+        if (index < 0 || !listEl.querySelector) return;
+        // Row lookup is by the generated numeric index; saved machine addresses
+        // can contain control characters that are not safe selector text.
+        const oldRow = listEl.querySelector('[data-machine-index="' + index + '"]');
+        if (oldRow && typeof oldRow.replaceWith === "function") oldRow.replaceWith(makeMachineRow(machines[index], index));
+      } catch (e) { return; }
+    });
+  } finally {
+    // restoreInputFocus enforces the exactly-one-match rule, so a replaced
+    // row can regain focus without moving the operator to a sibling control.
+    restoreInputFocus(listEl, focus);
+  }
 }
 
 function hydrateMachinesScreen() {
