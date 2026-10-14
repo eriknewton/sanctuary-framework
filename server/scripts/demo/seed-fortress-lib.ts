@@ -80,7 +80,8 @@ export interface SeedDemoFortressOptions {
   /** Cancellation waits for in-flight work before releasing resources and the root. */
   signal?: AbortSignal;
   /**
-   * Awaited once, after every seeded record is written and before the dashboard is constructed.
+   * Awaited once, after the seeded fortress records are written and before the dashboard is constructed;
+   * the two pending approvals are opened after the dashboard starts, so they are not yet written here.
    * The CLI uses it to hold seeding open for a signal so interruption is reachable on purpose.
    */
   holdBeforeDashboard?: () => Promise<void>;

@@ -661,6 +661,7 @@ describe("seedDemoFortress", () => {
     try {
       await waitForOutput(run, DEMO_SEED_HOLD_LINE);
       run.child.kill("SIGINT");
+      // POSIX interruption code: 128 + SIGINT (2).
       expect(await waitForExit(run)).toEqual({ code: 128 + 2, signal: null });
       expect(run.stderr).toContain("Demo seeding was interrupted by SIGINT.");
       expect(await pathExists(run.home!)).toBe(true);
@@ -670,22 +671,25 @@ describe("seedDemoFortress", () => {
     expect(await pathExists(run.home!)).toBe(false);
   });
 
+  // uid 0 ignores directory write bits, so a root that cannot be removed cannot be built when running as root.
   it.skipIf(process.getuid?.() === 0)("reports a root it cannot remove and keeps the interruption exit code", async () => {
     const run = await spawnCli(["--port", String(await getFreePort())], { [DEMO_SEED_HOLD_ENV]: "1" });
-    let locked: string | undefined;
     try {
       await waitForOutput(run, DEMO_SEED_HOLD_LINE);
-      locked = join(run.home!, "locked");
+      const locked = join(run.home!, "locked");
       await mkdir(locked);
       await writeFile(join(locked, "pinned"), "held open by a read-only parent\n");
+      // The shared cleanup owns the restore, so a timeout that runs afterEach before this test's finally still
+      // makes the root removable; a restore only in the finally would run after the memoized removal failed.
+      stops.push(() => chmod(locked, DEMO_DIRECTORY_MODE).catch(() => undefined));
       await chmod(locked, LOCKED_DIRECTORY_MODE);
       run.child.kill("SIGINT");
+      // POSIX interruption code: 128 + SIGINT (2).
       expect(await waitForExit(run)).toEqual({ code: 128 + 2, signal: null });
       expect(run.stderr).toContain("Demo seeding was interrupted by SIGINT.");
       expect(run.stderr).toContain(`Could not remove demo root ${run.home}: `);
       expect(await pathExists(run.home!)).toBe(true);
     } finally {
-      if (locked) await chmod(locked, DEMO_DIRECTORY_MODE).catch(() => undefined);
       await cleanupOwned();
     }
     expect(await pathExists(run.home!)).toBe(false);
