@@ -2105,6 +2105,7 @@ body {
  * 4 inventory tiles and 8px gaps (two design spacing units) are independent of Overview. */
 .agents-tiles { --agents-tile-count: 4; --agents-tile-gap: 8px; display: grid; grid-template-columns: repeat(var(--agents-tile-count), minmax(0, 1fr)); gap: var(--agents-tile-gap); }
 .agents-tiles .overview-tile { overflow-wrap: anywhere; }
+/* The shared agents table serves Overview and Agents, so its chip glyph and word stay together on both screens. */
 .overview-table-agents .state-chip { display: inline-flex; flex-wrap: nowrap; white-space: nowrap; }
 .agent-entity { display: grid; gap: 16px; min-width: 0; }
 .agent-entity-header h1 { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }
