@@ -3461,6 +3461,8 @@ export function generateFleetSwitcherHTML(options: {
       box-shadow: var(--shadow);
       padding: 16px;
       display: flex;
+      /* Let the fixed status words and action group wrap while identity keeps its intrinsic text width. */
+      flex-wrap: wrap;
       align-items: center;
       gap: 12px;
     }
@@ -3481,10 +3483,10 @@ export function generateFleetSwitcherHTML(options: {
       font-size: var(--text-xs);
       color: var(--ink-3);
       flex-shrink: 0;
-      /* 11ch = "Not healthy" and "Not checked", the longest status words, in this monospace face, so every card's name starts at the same x. */
+      /* 11ch = "Not healthy" and "Not checked", the longest status words, in this monospace face, so names align when status and identity share one row. */
       min-width: 11ch;
     }
-    .machine-card .info { flex: 1; min-width: 0; }
+    .machine-card .info { flex: 1 1 auto; min-width: 0; }
     .machine-card .name {
       font-weight: 600;
       font-size: 15px;
