@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds only a registration pin to this file (the two frozen exact ids stay registered); it asserts existing behavior and so passes against pre-fix source by construction, and deleting either catalog entry in templates.ts turns it red. The categorizer change is pinned by activity-feed-categorizer.test.ts, which fails on pre-fix source.
 /**
  * Hub activity entries resolve through the dashboard category sentences.
  * Exercises the real audit feed projection and the embedded client renderer.
@@ -174,6 +175,15 @@ function clientRenderer() {
 }
 
 describe("activity template namespace fallback", () => {
+  // fail-before-exempt: deleting either corresponding catalog entry in templates.ts turns its pin red.
+  it.each([
+    "activity.agent_policy_change_engaged",
+    "activity.agent_policy_change_denied",
+  ])("keeps the unused exact id %s registered", (id) => {
+    // Registration remains frozen even though the hub serves category-qualified ids for these operations.
+    expect(listRegisteredTemplateIds()).toContain(id);
+  });
+
   for (const category of categories) {
     const namespace = HUB_ACTIVITY_TEMPLATE_NAMESPACES[category];
 

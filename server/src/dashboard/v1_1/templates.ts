@@ -27,14 +27,17 @@ import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
 // Must match ACTIVITY_TEMPLATE_NAMESPACES in client.ts, injected from hub/constants.ts.
 const ACTIVITY_TEMPLATE_NAMESPACES = Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES);
 
-// Categories whose sentence only says an event of that kind was recorded, so it holds for every operation the hub
-// files there. The other category sentences assert an actor or an outcome (an operator approval or denial, traffic
-// that left, a decision, an internal handoff, a lifecycle change, a change applied) that an operation in the category
-// need not carry: the hub files by prefix, substring and catch-all rules, so views and refusals land there too.
-const ACTIVITY_CATEGORIES_WITH_GENERAL_SENTENCES: ReadonlyArray<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES> = [
+/**
+ * Categories whose operation-suffixed ids keep their own registered sentence because every operation filed there
+ * makes that sentence true; all others use the general audit sentence, subject to its verified-agent requirement.
+ * Must match categorizeOperation in hub/activity-feed.ts: privacy accepts privacy_event or the privacy_ prefix,
+ * and other records any audit event. A rule filing into a kept category must preserve its sentence's truth.
+ * Frozen so consumers cannot change this contract after the fallback map has been built.
+ */
+export const ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE: ReadonlyArray<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES> = Object.freeze([
   "privacy",
   "other",
-];
+]);
 
 /** The registered sentence an operation-suffixed activity id renders through, and the arg it needs to render. */
 export interface ActivityFallbackTemplate {
@@ -53,7 +56,7 @@ export const ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE: Readonly<Record<string, Ac
   Object.fromEntries(
     (Object.keys(HUB_ACTIVITY_TEMPLATE_NAMESPACES) as Array<keyof typeof HUB_ACTIVITY_TEMPLATE_NAMESPACES>).map(
       (category) => {
-        const template = ACTIVITY_CATEGORIES_WITH_GENERAL_SENTENCES.includes(category)
+        const template = ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE.includes(category)
           ? HUB_ACTIVITY_TEMPLATE_NAMESPACES[category]
           : HUB_ACTIVITY_TEMPLATE_NAMESPACES.other;
         // The generic sentence names its agent and reads "(fortress)" when none is served. The hub serves agent_id
@@ -279,8 +282,15 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
     "Fortress lockdown failed; no confined agent was locked.",
   "activity.lifecycle.fortress_lockdown_no_agents": () =>
     "Fortress lockdown found no confined agents to lock.",
+  // Registered but not served: templateIdFor in hub/activity-feed.ts emits activity.lifecycle.agent_policy_change_engaged.
+  // Serving this exact id is not a lookup-only change: hub-service.ts writes agent_policy_change_engaged for both policy
+  // and channel-template bindings, while "Template binding changed" describes only the channel-template writer.
   "activity.agent_policy_change_engaged": (a) =>
     `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
+  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied, and this id stays
+  // unserved with its engaged counterpart. buildTemplateArgs in hub/activity-feed.ts already maps this writer's
+  // current_template and proposed_template onto the channel_template_id and policy_id this sentence reads; agent_id
+  // is served only when the row's producer signature re-verifies, so any other row would read "(unknown)".
   "activity.agent_policy_change_denied": (a) =>
     `Template binding denied on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.config": (a) =>

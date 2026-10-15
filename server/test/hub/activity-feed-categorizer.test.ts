@@ -17,6 +17,7 @@ import { randomBytes } from "node:crypto";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { aggregateActivity } from "../../src/hub/activity-feed.js";
+import { ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE } from "../../src/dashboard/v1_1/templates.js";
 
 const IDENTITY_ID = "operator-categorizer-test-001";
 
@@ -127,5 +128,85 @@ describe("Activity feed categorizer: non-lifecycle bucket regressions", () => {
 
   it("handoff events map to handoff", async () => {
     expect(await categoryFor(rig, "l2", "handoff_created")).toBe("handoff");
+  });
+});
+
+describe("Activity feed categorizer: template honesty contracts", () => {
+  it("ties the frozen keep set to the categorizer's declared sentence rules", async () => {
+    const kept: readonly string[] = ACTIVITY_CATEGORIES_KEEPING_OWN_SENTENCE;
+    // Full-set equality catches even removal of other, whose fallback would otherwise stay identical.
+    expect([...kept].sort()).toEqual(["other", "privacy"]);
+    // Runtime immutability keeps the exported contract from drifting after the fallback map is built.
+    expect(Object.isFrozen(kept)).toBe(true);
+    // Must match the privacy rule in categorizeOperation, which lowercases the operation before it matches.
+    const declaredRules: Readonly<Record<string, (operation: string) => boolean>> = {
+      privacy: (operation) => {
+        const op = operation.toLowerCase();
+        return op === "privacy_event" || op.startsWith("privacy_");
+      },
+    };
+    // Every kept category except other declares its rule, so a kept category added without one fails here instead of
+    // passing unchecked when no corpus name happens to land in it.
+    expect(kept.filter((category) => category !== "other").sort()).toEqual(Object.keys(declaredRules).sort());
+    const operations = [
+      "tier1_approval_granted",
+      "egress_policy_deny",
+      "tool_auto_deny",
+      "principal_policy_view",
+      "agent_inspect_panel_opened",
+      "config_read_failed",
+      "handoff_view",
+      // Includes every CONTRADICTING_OPERATIONS case in activity-template-fallback.test.ts.
+      "cross_harness_approval_audit_trail_viewed",
+      "cross_harness_approval_deduped",
+      "egress_blocked",
+      "handoff_created",
+      // Positive controls ensure the kept-category checks also exercise legitimate privacy and other rows.
+      "privacy_event",
+      "privacy_denied",
+      "unclassified_fixture_event",
+    ];
+    // The privacy controls hold the reverse direction: the categorizer still files the names privacy's rule accepts
+    // under privacy. other needs no control, since it declares no rule and l2's catch-all files under policy_decision.
+    const expectedControlCategory: Readonly<Record<string, string>> = {
+      privacy_event: "privacy",
+      privacy_denied: "privacy",
+    };
+    // categoryFor matches by substring in one shared log per layer, so no corpus name may contain another.
+    for (const name of operations) {
+      for (const other of operations) {
+        if (other !== name) expect(other.includes(name), `${other} contains ${name}`).toBe(false);
+      }
+    }
+    for (const layer of ["l1", "l2", "l3", "l4"] as const) {
+      const rig = await startRig();
+      for (const operation of operations) {
+        const category = await categoryFor(rig, layer, operation);
+        expect(category, `${layer}:${operation} must reach the real feed projection`).toBeDefined();
+        if (operation in expectedControlCategory) {
+          expect(category, `${layer}:${operation} control`).toBe(expectedControlCategory[operation]);
+        }
+        if (category !== undefined && category !== "other" && kept.includes(category)) {
+          // A kept sentence is honest only when each operation filed there satisfies its declared rule.
+          expect(declaredRules[category]?.(operation), `${layer}:${operation} filed under ${category}`).toBe(true);
+        }
+      }
+    }
+  });
+
+  // fail-before-exempt: making templateIdFor serve activity.<operation> for either operation turns its pin red.
+  it.each([
+    { operation: "agent_policy_change_engaged", category: "lifecycle" },
+    { operation: "agent_policy_change_denied", category: "denial" },
+  ])("keeps $operation on its category-qualified served id", async ({ operation, category }) => {
+    const rig = await startRig();
+    await rig.auditLog.append("l2", operation, IDENTITY_ID, {});
+    await rig.auditLog.flush();
+    const entries = await aggregateActivity({ auditLog: rig.auditLog, identityId: IDENTITY_ID });
+    // The feed serves category-qualified ids for both operations: the engaged operation's policy and channel-template
+    // writers make its exact sentence too narrow, and the denied id stays unserved with its engaged counterpart.
+    expect(entries.map((entry) => ({ category: entry.category, id: entry.display_template_id }))).toEqual([
+      { category, id: `activity.${category}.${operation}` },
+    ]);
   });
 });
