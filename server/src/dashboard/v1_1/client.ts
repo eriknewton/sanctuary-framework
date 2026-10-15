@@ -27,6 +27,7 @@
  * UBAI-retirement rule: no Universal-Basic-AI surfaces.
  */
 
+import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
 
 /**
@@ -59,6 +60,15 @@ export const DASHBOARD_CLIENT_MODE_NOT_SERVED_ERROR =
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MODE = "standalone";
 export const DASHBOARD_CLIENT_MODE_NOT_SERVED_MESSAGE =
   "Not available in this dashboard mode.";
+
+// Must cover AuditChainVerdictStatus in operational/audit-log.ts; the browser
+// receives this typed map verbatim, and the wired test compares the whole union.
+const EVIDENCE_CHAIN_VERDICTS = {
+  verified: { kind: "good", word: "CHAIN VERIFIED", summary: "Routine entries and any readable sealed region verified clean." },
+  verified_suffix_only: { kind: "warn", word: "RECENT ENTRIES VERIFIED", summary: "Recent entries are verified. The sealed older region could not be verified at this privilege." },
+  findings: { kind: "bad", word: "INTEGRITY FINDINGS", summary: "The server reported integrity findings." },
+  key_unavailable: { kind: "unknown", word: "NOT VERIFIED", summary: "The audit key is not available, so the chain was not verified." },
+} satisfies Record<AuditChainVerdictStatus, { kind: string; word: string; summary: string }>;
 
 const CLIENT_SCRIPT = String.raw`
 "use strict";
@@ -158,6 +168,7 @@ const DASHBOARD_MODE_NOT_SERVED_MESSAGE = ${JSON.stringify(DASHBOARD_CLIENT_MODE
 // Protection additionally requires fresh evidence. Fixed sources never evict.
 const sourceReads = new Map([
   INBOX_PREFS, HUB + "/agents", HUB + "/inbox", HUB + "/activity",
+  "/api/posture/evidence",
   HUB + "/policies", HUB + "/activity?category=privacy", HUB + "/activity?category=handoff",
   HUB + "/recognition/did-web", HUB + "/intelligence/status", HUB + "/intelligence/config",
   HUB + "/chat/concierge/history", POLICY + "/current", AUTO_TRIGGER + "/rules",
@@ -169,6 +180,12 @@ const READ_BACKOFF_MAX_MS = 60 * 1000; // At most one automatic retry per minute
 function readKey(url) {
   const parsed = new URL(url, location.origin);
   parsed.searchParams.delete("_t"); parsed.searchParams.delete("session");
+  // Filter changes share one bounded read slot; queuePanel invalidates the old revision.
+  if (parsed.pathname === "/api/posture/evidence") {
+    ["agent", "since", "operation_type", "layer", "result", "limit"].forEach(function (key) {
+      parsed.searchParams.delete(key);
+    });
+  }
   return parsed.origin + parsed.pathname + parsed.search;
 }
 function sourceRead(path) { return sourceReads.get(readKey(path)); }
@@ -232,6 +249,7 @@ function validateReadBody(key, body) {
   if (key === readKey(HUB + "/recognition/did-web") && typeof data.configured !== "boolean") return false;
   if (key === readKey(HUB + "/intelligence/status") && !Array.isArray(data.surfaces)) return false;
   if (key === readKey("/api/posture/home") && (!body.castle_wall || !Array.isArray(body.agents) || !body.digest)) return false;
+  if (key === readKey("/api/posture/evidence") && (!Array.isArray(body.entries) || !Array.isArray(body.integrity_findings))) return false;
   if (key === readKey("/api/sovereignty") && (!body.live_enforcement || typeof body.live_enforcement !== "object")) return false;
   return true;
 }
@@ -264,6 +282,11 @@ const state = {
     filters: { state: "all", agent: "", tier: "both", category: "" }
   },
   activity: [],
+  evidence: {
+    view: null,
+    filters: { query: "", layer: "", agent: "", event: "", result: "", from: "" },
+    selectedIndex: 0
+  },
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
   // Tunability UX: plain-English view of the LIVE Principal Policy, fetched
@@ -521,6 +544,7 @@ function readLabel(path) {
     [INBOX_PREFS, "Saved inbox filters"], ["/api/posture/home", "Protection status"],
     ["/api/sovereignty", "Protection evidence"], ["/api/anomaly", "Anomaly findings"],
     [HUB + "/agents", "Agents"], [HUB + "/inbox", "Decisions"],
+    ["/api/posture/evidence", "Chain verification"],
     [HUB + "/activity?category=privacy", "Privacy"], [HUB + "/activity?category=handoff", "Coordination"],
     [HUB + "/activity", "Activity"], [HUB + "/policies", "Agent policies"],
     [HUB + "/intelligence/status", "Intelligence status"], [HUB + "/intelligence/config", "Intelligence configuration"], [HUB + "/intelligence", "Intelligence"], [HUB + "/recognition", "Recognition"],
@@ -582,10 +606,11 @@ async function api(path, opts, deadlineAt) {
   init.cache = "no-store";
   init.headers["Cache-Control"] = "no-cache";
   init.headers["Pragma"] = "no-cache";
-  let url = HUB + path;
+  // The audit download uses the same bearer and read handling as hub calls.
+  let url = path === "/api/audit-log" ? path : HUB + path;
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") {
-    url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+    url += (url.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
   url = credentialedReadUrl(url, method);
   let res = await dashboardResponse(url, init, deadlineAt);
@@ -869,7 +894,7 @@ function inboxActions(item) {
 }
 
 const INBOX_ACTION_LABEL = {
-  approve: "Approve",
+  approve: "Allow once",
   deny: "Deny",
   dismiss: "Dismiss",
   review_receipt: "Review receipt",
@@ -3351,6 +3376,205 @@ function promotableOperation(i) {
   return op;
 }
 
+const EVIDENCE_LAYER_NAMES = {
+  // Must match validLayers in server/src/principal-policy/posture-routes.ts.
+  l1: "Castle Wall",
+  l2: "Sentinels",
+  l3: "Charter",
+  l4: "Heralds"
+};
+const EVIDENCE_LAYER_ORDER = ["l1", "l2", "l3", "l4"];
+const EVIDENCE_ROUTE_DEFAULT_LIMIT = 50; // Must match buildEvidence default in principal-policy/posture-routes.ts.
+const EVIDENCE_CHAIN_VERDICTS = ${JSON.stringify(EVIDENCE_CHAIN_VERDICTS)};
+// 50 is the route default limit in buildEvidence, so the first page and the
+// server window have the same bound unless the route changes.
+const EVIDENCE_PAGE_SIZE = EVIDENCE_ROUTE_DEFAULT_LIMIT;
+const EVIDENCE_DETAIL_VALUE_MAX_CHARS = 240; // 240 = four 60-char lines in the drawer key-value column.
+const EVIDENCE_RAW_RECORD_MAX_CHARS = 6000; // 6000 = about 100 60-char lines, enough for inspection without unbounded DOM growth.
+// The decided approvals list shows at most one audit page of rows, so the screen's two lists share one row budget.
+const EVIDENCE_DECIDED_APPROVAL_LIMIT = EVIDENCE_PAGE_SIZE;
+const EVIDENCE_DETAIL_KEY_LIMIT = EVIDENCE_PAGE_SIZE; // One record gets at most the same row budget as one audit page.
+const EVIDENCE_SINCE_ROUND_MS = 60 * 1000; // One minute: the time range start sent with the read is rounded to it.
+const EVIDENCE_FINDING_DISPLAY_LIMIT = 5; // Five findings fit in the strip before the table leaves the first viewport.
+// Must match the limit default in handleAuditLog in server/src/principal-policy/dashboard.ts: the audit
+// log read serves the most recent entries up to this limit, so the export says it is that bound.
+const EVIDENCE_JSON_EXPORT_LIMIT = 50;
+
+function evidenceLayerName(layer) {
+  return EVIDENCE_LAYER_NAMES[layer] || "Unknown";
+}
+
+function evidenceTimestamp(entry) {
+  return entry && entry.timestamp || "";
+}
+
+// Invariant: the Evidence read serves AuditEntry only, so every cell reads a
+// served AuditEntry field or says the value is missing.
+function evidenceAgent(entry) {
+  return entry && entry.identity_id || "agent not named";
+}
+
+function evidenceEvent(entry) {
+  return entry && entry.operation || "operation not named";
+}
+
+function evidenceResult(entry) {
+  const raw = String(entry && entry.result || "").toLowerCase();
+  if (raw === "success" || raw === "failure") return raw;
+  return "";
+}
+
+function cappedText(value, maxChars) {
+  var raw;
+  if (value === null) raw = "null";
+  else if (value === undefined) raw = "missing";
+  else if (typeof value === "string") raw = value;
+  else {
+    try { raw = JSON.stringify(value); } catch (_e) { raw = String(value); }
+  }
+  if (raw.length <= maxChars) return raw;
+  return raw.slice(0, maxChars) + "... truncated at " + maxChars + " chars";
+}
+
+function evidenceDetailsList(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" && !Array.isArray(entry.details) ? entry.details : null;
+  if (!details) return "";
+  const keys = Object.keys(details).sort();
+  if (!keys.length) return "";
+  return '<dt>Details</dt><dd>showing ' + Math.min(keys.length, EVIDENCE_DETAIL_KEY_LIMIT) + ' of ' + keys.length + ' fields</dd>' + keys.slice(0, EVIDENCE_DETAIL_KEY_LIMIT).map(function (key) {
+    return '<dt>' + escHtml(cappedText(key, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dt><dd>' + escHtml(cappedText(details[key], EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+  }).join("");
+}
+
+function evidenceContributorsList(entry) {
+  const contributors = entry && Array.isArray(entry.contributors) ? entry.contributors : [];
+  if (!contributors.length) return "";
+  return '<dt>contributors</dt><dd>' + escHtml(cappedText(contributors, EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</dd>';
+}
+
+function evidenceEntryText(entry) {
+  const details = entry && entry.details && typeof entry.details === "object" ? entry.details : {};
+  return [
+    evidenceEvent(entry),
+    evidenceAgent(entry),
+    evidenceResult(entry),
+    evidenceLayerName(entry && entry.layer),
+    JSON.stringify(details)
+  ].filter(Boolean).join(" ");
+}
+
+function evidenceMatchesQuery(entry, query) {
+  const trimmed = String(query || "").trim().toLowerCase();
+  if (!trimmed) return true;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const haystack = evidenceEntryText(entry).toLowerCase();
+  return words.every(function (word) {
+    const split = word.indexOf(":");
+    if (split > 0) {
+      const field = word.slice(0, split);
+      const value = word.slice(split + 1);
+      if (field === "agent") return String(evidenceAgent(entry)).toLowerCase().indexOf(value) >= 0;
+      if (field === "layer") return evidenceLayerName(entry.layer).toLowerCase().indexOf(value) >= 0 || String(entry.layer || "").toLowerCase() === value;
+      if (field === "result") return evidenceResult(entry).toLowerCase().indexOf(value) >= 0;
+      if (field === "event" || field === "operation" || field === "text") return haystack.indexOf(value) >= 0;
+    }
+    return haystack.indexOf(word) >= 0;
+  });
+}
+
+function applyEvidenceHashFilters(hash) {
+  const route = String(hash || "").split("?")[0];
+  if (route !== "activity") return;
+  const qs = String(hash || "").split("?")[1] || "";
+  const params = new URLSearchParams(qs);
+  const filters = state.evidence.filters;
+  filters.query = params.get("q") || "";
+  const layer = params.get("layer") || "";
+  filters.layer = EVIDENCE_LAYER_NAMES[layer] ? layer : "";
+  filters.agent = params.get("agent") || "";
+  filters.event = params.get("event") || "";
+  const result = params.get("result") || "";
+  filters.result = result === "success" || result === "failure" ? result : "";
+  filters.from = evidenceFromDate(params.get("from") || "");
+}
+
+// The From filter is a calendar date in the operator's own time zone (what a date input holds), so
+// anything that is not a real YYYY-MM-DD date is dropped instead of sent as a window that matches nothing.
+function evidenceFromDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!m) return "";
+  const local = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return local.getFullYear() === Number(m[1]) && local.getMonth() === Number(m[2]) - 1 && local.getDate() === Number(m[3]) ? value : "";
+}
+
+// The start of the Evidence read's window: the later of the From date's local midnight and the start of
+// the top-bar time range. The time range start is rounded down to the minute, so reads within one minute
+// ask for the same window and a repeated read compares equal.
+function evidenceSinceIso() {
+  const from = evidenceFromDate(state.evidence.filters.from);
+  const fromMs = from ? new Date(Number(from.slice(0, 4)), Number(from.slice(5, 7)) - 1, Number(from.slice(8, 10))).getTime() : null;
+  const windowMs = TIME_RANGE_MS[state.timeRange];
+  const rangeMs = typeof windowMs === "number" ? Math.floor((Date.now() - windowMs) / EVIDENCE_SINCE_ROUND_MS) * EVIDENCE_SINCE_ROUND_MS : null;
+  const since = fromMs === null ? rangeMs : rangeMs === null ? fromMs : Math.max(fromMs, rangeMs);
+  return since === null ? "" : new Date(since).toISOString();
+}
+
+function evidenceHashFromFilters() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.query) params.set("q", filters.query);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.agent) params.set("agent", filters.agent);
+  if (filters.event) params.set("event", filters.event);
+  if (filters.result) params.set("result", filters.result);
+  if (filters.from) params.set("from", filters.from);
+  const qs = params.toString();
+  return "#activity" + (qs ? "?" + qs : "");
+}
+
+function setEvidenceFilter(name, value) {
+  if (!Object.prototype.hasOwnProperty.call(state.evidence.filters, name)) return;
+  const previousUrl = evidenceReadUrl();
+  state.evidence.filters[name] = value;
+  state.evidence.selectedIndex = 0;
+  const nextHash = evidenceHashFromFilters();
+  if (location.hash !== nextHash) location.hash = nextHash;
+  else rerender();
+  if (evidenceReadUrl() !== previousUrl) queueEvidenceRead();
+}
+
+function evidenceReadUrl() {
+  const params = new URLSearchParams();
+  const filters = state.evidence.filters;
+  if (filters.agent) params.set("agent", filters.agent);
+  const since = evidenceSinceIso();
+  if (since) params.set("since", since);
+  if (filters.event) params.set("operation_type", filters.event);
+  if (filters.layer) params.set("layer", filters.layer);
+  if (filters.result) params.set("result", filters.result);
+  params.set("limit", String(EVIDENCE_PAGE_SIZE));
+  const qs = params.toString();
+  return "/api/posture/evidence" + (qs ? "?" + qs : "");
+}
+
+function queueEvidenceRead() {
+  const job = panelJobs.find(function (candidate) {
+    return candidate.paths.indexOf("/api/posture/evidence") >= 0;
+  });
+  if (job) { void queuePanel(job); rerender(); }
+}
+
+function filteredEvidenceEntries(entries) {
+  const filters = state.evidence.filters;
+  return (entries || []).filter(function (entry) {
+    return evidenceMatchesQuery(entry, filters.query);
+  });
+}
+
+function renderEvidenceStatusChip(kind, word) {
+  return '<span class="state-chip ' + escHtml(kind) + '"><i aria-hidden="true"></i>' + escHtml(word) + '</span>';
+}
+
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
@@ -3409,6 +3633,129 @@ function renderFortress() {
   restoreRetryFocus(active, fortress);
 }
 
+function renderEvidenceIntegrity(view) {
+  const read = sourceRead("/api/posture/evidence");
+  if (!sourceLoaded("/api/posture/evidence") || !view) {
+    const reason = read && read.error ? read.error : "server verification has not answered";
+    return '<section class="evidence-integrity unknown"><div class="ei-badge">' + renderEvidenceStatusChip("unknown", "UNKNOWN") +
+      '</div><div class="ei-facts"><strong>Chain verification Unknown</strong><span>' + escHtml(reason) + '</span></div></section>';
+  }
+  const findings = Array.isArray(view.integrity_findings) ? view.integrity_findings : [];
+  const total = typeof view.total === "number" ? view.total : "Unknown";
+  const sealed = renderSealedRegion(view.sealed_region);
+  const status = view.chain_verdict;
+  const known = Object.prototype.hasOwnProperty.call(EVIDENCE_CHAIN_VERDICTS, status);
+  // Only the served whole-chain verdict with no findings earns CHAIN VERIFIED.
+  // Continuing paths: verified -> clean; suffix -> qualified; any served finding -> bad, whatever the
+  // served verdict, so no reassuring word sits above a finding; key unavailable or an unrecognized
+  // verdict -> no verification claim.
+  const verdict = known ? EVIDENCE_CHAIN_VERDICTS[findings.length ? "findings" : status] : {
+    kind: "unknown", word: "UNKNOWN", summary: "The audit chain status was not recognized or was not served."
+  };
+  const chipKind = verdict.kind;
+  const chipWord = verdict.word;
+  const summary = verdict.summary;
+  const shownFindings = findings.slice(0, EVIDENCE_FINDING_DISPLAY_LIMIT).map(function (finding) {
+    return '<span>' + escHtml(cappedText(finding.kind || "finding", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + ': ' +
+      escHtml(cappedText(finding.message || "message not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS)) + '</span>';
+  }).join("");
+  const findingCount = findings.length
+    ? '<span>showing ' + escHtml(Math.min(findings.length, EVIDENCE_FINDING_DISPLAY_LIMIT)) + ' of ' + escHtml(findings.length) + ' findings</span>'
+    : '<span><b>0</b> integrity findings reported for the whole chain</span>';
+  return '<section class="evidence-integrity ' + escHtml(chipKind) + '"><div class="ei-badge">' + renderEvidenceStatusChip(chipKind, chipWord) + '</div>' +
+    '<div class="ei-facts"><strong>' + escHtml(summary) + '</strong><span><b>' + escHtml(total) + '</b> entries in the served window before page limit and result filter</span>' +
+    findingCount + '<span>sealed region: ' + escHtml(sealed) + '</span><span>age of this read: ' + escHtml(sourceReadAge("/api/posture/evidence") || "now") + '</span>' +
+    shownFindings + '</div></section>';
+}
+
+// Must match SealedRegionVerdict in server/src/operational/audit-log.ts: every served status has its own
+// words here, and a status this list does not name reads Unknown, never a verification.
+function renderSealedRegion(sealed) {
+  if (!sealed || typeof sealed !== "object") return "Unknown";
+  if (sealed.status === "not_present") return "no sealed legacy region present";
+  if (sealed.status === "empty") return "sealed legacy region is empty";
+  if (sealed.status === "verified") return "sealed region verified, entries verified " + String(sealed.entries_verified || 0);
+  if (sealed.status === "unreadable") return "sealed older region unreadable at this privilege: " + cappedText(sealed.note || "reason not served", EVIDENCE_DETAIL_VALUE_MAX_CHARS);
+  if (sealed.status === "incomplete") return "sealed region incomplete, highest present " + String(sealed.highest_present || 0) + " of expected tip " + String(sealed.expected_tip || 0);
+  if (sealed.status === "hash_mismatch") return "sealed region hash mismatch at sequence " + String(sealed.sequence || "unknown");
+  return "Unknown";
+}
+
+function renderEvidenceQueryBar() {
+  const f = state.evidence.filters;
+  const layerOptions = ['<option value="">Any</option>'].concat(EVIDENCE_LAYER_ORDER.map(function (token) {
+    return '<option value="' + token + '"' + (f.layer === token ? ' selected' : '') + '>' + escHtml(evidenceLayerName(token)) + '</option>';
+  })).join("");
+  const resultOptions = ["", "success", "failure"].map(function (value) {
+    const label = value ? sentenceCase(value) : "Any";
+    return '<option value="' + escHtml(value) + '"' + (f.result === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  }).join("");
+  const chips = [
+    "Layer: " + (f.layer ? evidenceLayerName(f.layer) : "Any"),
+    "Agent: " + (f.agent || "Any"),
+    "Event: " + (f.event || "Any"),
+    "Result: " + (f.result ? sentenceCase(f.result) : "Any"),
+    "From: " + (f.from || "Any"),
+    "Time range: " + TIME_RANGE_LABEL[state.timeRange]
+  ].map(function (chip) { return '<span class="evidence-chip">' + escHtml(chip) + '</span>'; }).join("");
+  return '<section class="card evidence-query"><div class="filter-bar" role="group" aria-label="Filter evidence entries">' +
+    '<label class="field evidence-query-field"><span class="field-label">Query</span><input class="input" data-action="evidence-filter-query" placeholder="agent: layer: result: event: or text" value="' + escHtml(f.query) + '"></label>' +
+    '<label class="field"><span class="field-label">Layer</span><select class="input" data-action="evidence-filter-layer">' + layerOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">Agent</span><input class="input" data-action="evidence-filter-agent" value="' + escHtml(f.agent) + '"></label>' +
+    '<label class="field"><span class="field-label">Event</span><input class="input" data-action="evidence-filter-event" value="' + escHtml(f.event) + '"></label>' +
+    '<label class="field"><span class="field-label">Result</span><select class="input" data-action="evidence-filter-result">' + resultOptions + '</select></label>' +
+    '<label class="field"><span class="field-label">From</span><input class="input" data-action="evidence-filter-from" type="date" value="' + escHtml(f.from) + '"></label>' +
+    '</div><div class="evidence-chips">' + chips + '<span class="evidence-chip">Query searches only the entries loaded on this page</span></div></section>';
+}
+
+function renderEvidenceRow(entry, index) {
+  const selected = state.evidence.selectedIndex === index;
+  const result = evidenceResult(entry);
+  const resultKind = result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown";
+  return '<tr' + (selected ? ' class="sel"' : '') + ' data-evidence-row="' + escHtml(index) + '">' +
+    '<td class="mono">' + escHtml(shortTime(evidenceTimestamp(entry)) || "timestamp missing") + '</td>' +
+    '<td><span class="lay">' + escHtml(evidenceLayerName(entry.layer)) + '</span></td>' +
+    '<td><span class="row">' + escHtml(evidenceAgent(entry)) + '</span></td>' +
+    '<td><button class="btn" data-action="evidence-select" data-evidence-index="' + index + '" aria-pressed="' + selected + '">' + escHtml(evidenceEvent(entry)) + '</button></td>' +
+    '<td>' + renderEvidenceStatusChip(resultKind, result ? sentenceCase(result) : "Missing") + '</td>' +
+  '</tr>';
+}
+
+function renderEvidenceDrawer(entry) {
+  if (!entry) {
+    return '<aside class="panel evidence-detail"><div class="overview-empty"><h3>No record selected</h3><p>Select an entry to inspect the served audit record.</p></div></aside>';
+  }
+  const result = evidenceResult(entry);
+  const details = evidenceDetailsList(entry);
+  const contributors = evidenceContributorsList(entry);
+  const raw = cappedText(entry, EVIDENCE_RAW_RECORD_MAX_CHARS);
+  return '<aside class="panel evidence-detail" aria-label="Selected entry">' +
+    '<div class="hd"><div class="t">' + escHtml(evidenceEvent(entry)) + '</div><div class="m">' + escHtml(evidenceTimestamp(entry)) + ' · ' + escHtml(evidenceLayerName(entry.layer)) + '</div></div>' +
+    '<div class="sec"><h3>What happened</h3><dl class="kv">' +
+      '<dt>Operation</dt><dd>' + escHtml(evidenceEvent(entry)) + '</dd>' +
+      '<dt>Agent</dt><dd>' + escHtml(evidenceAgent(entry)) + '</dd>' +
+      '<dt>Layer</dt><dd>' + escHtml(evidenceLayerName(entry.layer)) + '</dd>' +
+      '<dt>Result</dt><dd>' + renderEvidenceStatusChip(result === "success" ? "neutral" : result === "failure" ? "bad" : "unknown", result ? sentenceCase(result) : "Missing") + '</dd>' +
+      '<dt>Time</dt><dd>' + escHtml(evidenceTimestamp(entry) || "timestamp missing") + '</dd>' +
+      details + contributors +
+    '</dl></div>' +
+    '<div class="sec"><h3>Seal</h3><div class="chain">' +
+      '<p class="muted">Per-entry seal data is not served by this read. Chain integrity is the strip above.</p>' +
+    '</div></div>' +
+    '<div class="sec"><h3>Raw record</h3><pre class="json">' + escHtml(raw) + '</pre></div>' +
+  '</aside>';
+}
+
+function renderEvidenceExports() {
+  return '<section class="card evidence-export"><h3>Export</h3><div class="toolbar">' +
+    '<button class="btn" data-action="evidence-export-json">JSON: latest ' + EVIDENCE_JSON_EXPORT_LIMIT + ' audit entries</button>' +
+    '<button class="btn" disabled title="CEF export is available from the audit_export_siem tool, not from this dashboard yet.">CEF unavailable from this dashboard</button>' +
+    '<button class="btn" disabled title="Compliance bundle export is Tier 1 through compliance_generate_eu_ai_act_bundle, not from this dashboard yet.">Compliance bundle unavailable from this dashboard</button>' +
+    '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
+    '<a class="btn" href="#exit-drill">Exit drill</a>' +
+  '</div></section>';
+}
+
 // Wave 1 (2026-06-30): the Activity screen. The heavy six-field inbox
 // filter panel + the full multi-kind inbox (privacy events, blocked egress,
 // budget warnings, recovery prompts, agent errors, AND the tiered approvals)
@@ -3420,6 +3767,74 @@ function renderFortress() {
 // token-gated paths (onInboxAction -> api()). No behavior change; only the
 // home of the panel moved.
 function renderActivityScreen() {
+  const view = state.evidence.view;
+  // Must match AuditLog.query in server/src/operational/audit-log.ts, which serves the most recent
+  // entries oldest first (filtered.slice(-limit)); the table lists that page newest first.
+  const entries = sourceLoaded("/api/posture/evidence") && view && Array.isArray(view.entries) ? view.entries.slice().reverse() : [];
+  const filtered = filteredEvidenceEntries(entries);
+  const shown = filtered.slice(0, EVIDENCE_PAGE_SIZE);
+  if (!shown[state.evidence.selectedIndex]) state.evidence.selectedIndex = 0;
+  const selected = shown[state.evidence.selectedIndex] || null;
+  const total = view && typeof view.total === "number" ? view.total : "Unknown";
+  // buildEvidence applies the page limit before the result filter and serves total before both, so a
+  // result filter narrows only the most recent page, and the count says so.
+  const resultScopeLine = state.evidence.filters.result
+    ? '<p class="muted" data-evidence-result-scope="1">The result filter checks the ' + EVIDENCE_PAGE_SIZE + ' most recent entries in the window; ' + escHtml(total) + ' counts entries of every result.</p>'
+    : "";
+  const searchedLine = state.evidence.filters.query
+    ? "searching the " + entries.length + " entries loaded"
+    : "search is local to the " + entries.length + " entries loaded";
+  // The top-bar time range is a server filter too (evidenceSinceIso sends it as since), so a range that
+  // matches nothing is a filtered view, never an empty log; Clear filters leaves the range in place.
+  const timeRangeActive = state.timeRange !== "all";
+  const noMatchNote = timeRangeActive
+    ? entries.length + " entries were loaded for " + TIME_RANGE_LABEL[state.timeRange] + ". The time range, the active server filters or page-local search have no matches on this page. Clear filters keeps the time range; change it in the top bar."
+    : entries.length + " entries were loaded. The active server filters or page-local search have no matches on this page.";
+  const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
+    ? entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
+      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p><a class="btn" href="#activity">Clear filters</a></div>'
+      : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
+    : "";
+  const table = sourceLoaded("/api/posture/evidence")
+    ? '<section class="panel evidence-entries" aria-label="Entries"><div class="ph"><h2>Entries <span class="n">showing ' + escHtml(shown.length) + ' of ' + escHtml(total) + '</span></h2><span class="hint">page size ' + EVIDENCE_PAGE_SIZE + ' · ' + escHtml(searchedLine) + '</span></div>' + resultScopeLine +
+      (shown.length ? '<div class="overview-table-scroll"><table class="overview-table evidence-table"><thead><tr><th>Time</th><th>Layer</th><th>Agent</th><th>Event</th><th>Result</th></tr></thead><tbody>' + shown.map(renderEvidenceRow).join("") + '</tbody></table></div>' : empty) + '</section>'
+    : '<section class="panel evidence-entries" aria-label="Entries"><div class="overview-empty"><h3>Entries Unknown</h3><p>The server verification read has not loaded entries.</p></div></section>';
+  const operations = renderEvidenceOperationsSection();
+  return [
+    '<section class="evidence-page">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Evidence</p>',
+        '<h1>Evidence</h1>',
+        // The subtitle names the source and makes no completeness or tamper claim: not every decision is
+        // recorded here (inbox decisions stay in the inbox), and integrity is the strip's to state.
+        '<p class="sub">The audit log this fortress keeps. Integrity is shown only from the server verification read.</p>',
+      '</div></div>',
+      renderEvidenceIntegrity(view),
+      renderEvidenceQueryBar(),
+      renderSourceRead("/api/posture/evidence"),
+      '<div class="evidence-layout">' + table + renderEvidenceDrawer(selected) + '</div>',
+      renderEvidenceExports(),
+      operations,
+    '</section>'
+  ].join("");
+}
+
+function renderEvidenceDecidedApprovals() {
+  if (!sourceLoaded(HUB + "/inbox")) return "";
+  if (state.inboxRedacted) return '<section class="card"><h3>Decided approvals</h3><p>Approvals are hidden, not empty. Paste the operator token to review them.</p></section>';
+  const decided = state.inbox.filter(function (item) { return item.kind === "approval_pending" && item.resolved; });
+  const shown = filterInbox(decided).slice(0, EVIDENCE_DECIDED_APPROVAL_LIMIT);
+  // Resolution is a served historical fact, never permission to decide the item again.
+  return '<section class="card"><h3>Decided approvals</h3><p class="muted">showing ' + shown.length + ' of ' + decided.length +
+    ' loaded decisions · inbox read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</p>' +
+    (shown.length ? shown.map(function (item) {
+      return '<div class="row" data-decided-approval="' + escHtml(item.item_id) + '"><div class="grow">' +
+        escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '</div>' +
+        renderEvidenceStatusChip("neutral", "Resolved") + '<span class="mono">' + escHtml(item.resolved_at || "resolution time not served") + '</span></div>';
+    }).join("") : '<p class="muted">No decided approvals in this loaded view.</p>') + '</section>';
+}
+
+function renderEvidenceOperationsSection() {
   const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
   const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   const batchToolbar = selectedIds.length
@@ -3433,10 +3848,10 @@ function renderActivityScreen() {
     : "";
   const snoozeDialog = state.inboxOps.snoozeDialog
     ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="3600000">1h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="14400000">4h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="86400000">1d</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="604800000">1w</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (MS_PER_HOUR) + '">1h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (4 * MS_PER_HOUR) + '">4h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (24 * MS_PER_HOUR) + '">1d</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (7 * 24 * MS_PER_HOUR) + '">1w</button>' +
         '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
         '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
         '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
@@ -3479,9 +3894,14 @@ function renderActivityScreen() {
     function renderInboxRow(i) {
       var text = renderTemplate(i.display_template_id, i.display_template_args);
       var actions = inboxActions(i);
-      var buttons = actions.map(function (act) {
-        return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
-      }).join("");
+      // Invariant: as on the Overview, a held approval is decided inline only at Tier 2; every other
+      // served tier links to Approvals, where a Tier 1 decision takes the drawer's two steps.
+      var reviewInApprovals = i.kind === "approval_pending" && i.tier !== "tier2";
+      var buttons = reviewInApprovals
+        ? '<a class="btn" href="#approvals" data-evidence-review="' + escHtml(i.item_id) + '">Review in Approvals</a>'
+        : actions.map(function (act) {
+          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
+        }).join("");
       var tierBadge = i.kind === "approval_pending"
         ? '<span class="pill">' + escHtml(i.tier) + '</span>'
         : '<span class="pill">' + escHtml(i.kind) + '</span>';
@@ -3505,24 +3925,8 @@ function renderActivityScreen() {
   // every open item, so a narrowed list never reads as the whole inbox.
   const inboxCount = sourceLoaded(HUB + "/inbox") ? visibleInbox.length + " of " + total : "Unknown";
   if (!sourceLoaded(HUB + "/inbox")) inboxRows = renderSourceRead(HUB + "/inbox");
-  // Export: Exit drill folds in here as an action, beside the two evidence
-  // exports the posture board already links. No new route is served.
-  const exportGroup =
-    '<section class="card export-group"><h3>Export</h3>' +
-      '<p class="muted">Take your evidence, or your whole fortress, with you.</p>' +
-      '<div class="toolbar">' +
-        '<a class="btn" href="/posture/evidence">Open the signed Evidence view</a>' +
-        '<a class="btn" href="/api/audit-log">Audit log (JSON)</a>' +
-        '<a class="btn" href="#exit-drill">Exit drill: export the fortress</a>' +
-      '</div>' +
-    '</section>';
   return [
-    '<section class="concierge-wrap">',
-      '<div class="page-head"><div>',
-        '<p class="eyebrow">Activity</p>',
-        '<h1>Everything across your fortress.</h1>',
-        '<p class="sub">Approvals, blocked actions, privacy events, and budget warnings, with filters to find one. Approve or deny right here. Anything waiting on you also shows in the rail.</p>',
-      '</div></div>',
+    '<section class="evidence-ops">',
       '<section class="card">',
         '<h3>This fortress</h3>',
         (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
@@ -3530,9 +3934,9 @@ function renderActivityScreen() {
         '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
       '</section>',
       '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      renderEvidenceDecidedApprovals(),
       '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
       '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
-      exportGroup,
     '</section>'
   ].join("");
 }
@@ -5236,6 +5640,15 @@ const panelJobs = [
   } },
   { paths: [HUB + "/inbox"], load: async function () { const r = await api("/inbox"); applyInboxPayload(r.data || {}); } },
   { paths: [HUB + "/activity"], load: async function () { const r = await api("/activity"); state.activity = r.data.entries || []; } },
+  { paths: ["/api/posture/evidence"], load: async function (deadlineAt) {
+    const url = evidenceReadUrl();
+    const sep = url.indexOf("?") >= 0 ? "&" : "?";
+    const res = await readResponse(credentialedReadUrl(url + sep + "_t=" + Date.now(), "GET"), {
+      headers: Object.assign({ "Cache-Control": "no-cache", "Pragma": "no-cache" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+      cache: "no-store"
+    }, deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now()));
+    state.evidence.view = await res.json();
+  } },
   { paths: [HUB + "/policies"], load: async function () { const r = await api("/policies"); state.policies = r.data.policies || []; } },
   { paths: [HUB + "/activity?category=privacy"], load: async function () { const r = await api("/activity?category=privacy"); state.privacyEvents = r.data.entries || []; } },
   { paths: [HUB + "/activity?category=handoff"], load: async function () { const r = await api("/activity?category=handoff"); state.handoffEvents = r.data.entries || []; } },
@@ -6070,6 +6483,41 @@ async function onExitExportStart() {
   }
 }
 
+async function onEvidenceJsonExport() {
+  try {
+    // api() sends the exact /api/audit-log path unprefixed, so the read relies on the route's default limit.
+    const body = await api("/api/audit-log", { method: "GET" });
+    // Must match handleAuditLog in server/src/principal-policy/dashboard.ts: with an audit log it serves the
+    // query result object ({ entries, total, integrity_findings }), and without one, or when the query fails,
+    // an empty array. An empty answer of either shape is reported as no entries, never as a downloaded log.
+    const entries = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.entries) ? body.entries : null;
+    if (!entries) throw new Error("the audit log read did not return entries");
+    if (!entries.length) {
+      toast("No audit entries were returned, so nothing was exported. The audit log read returns none both for an empty log and for a log it could not read.", "info");
+      return;
+    }
+    // The file is the served answer unchanged, so the export carries the read's own total and findings with its entries.
+    downloadJsonFile(body, "sanctuary-audit-log.json");
+    toast("Downloaded the latest " + entries.length + (entries.length === 1 ? " audit entry" : " audit entries") + " as JSON (at most " + EVIDENCE_JSON_EXPORT_LIMIT + ").", "info");
+  } catch (e) {
+    toast("Audit log JSON export failed: " + (e && e.message ? e.message : "unknown"), "error");
+  }
+}
+
+function downloadJsonFile(body, filename) {
+  if (typeof Blob === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) throw new Error("File downloads are not available in this browser.");
+  const blob = new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  a.style.display = "none";
+  if (document.body && document.body.appendChild) document.body.appendChild(a);
+  if (typeof a.click === "function") a.click();
+  if (a.parentElement && a.parentElement.removeChild) a.parentElement.removeChild(a);
+  if (URL.revokeObjectURL) URL.revokeObjectURL(href);
+}
+
 async function onDidWebCompromisedRotation() {
   if (state.recognition.rotating) return;
   state.recognition.rotating = true;
@@ -6229,6 +6677,9 @@ function rerender() {
 function bindHashRoute() {
   function fromHash() {
     const h = (location.hash || "#posture").slice(1);
+    const previousUrl = evidenceReadUrl();
+    applyEvidenceHashFilters(h);
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
     if (h.split("?")[0] === "agents") {
       const requestedState = new URLSearchParams(h.split("?")[1] || "").get("state") || "";
       // The select and filter share one allowed set so an unknown hash cannot silently hide rows.
@@ -6489,6 +6940,12 @@ document.addEventListener("click", function (ev) {
   // WP-V1.2 reshape click-to-inspect handler ────────────────────────
   if (action === "agent-inspect-open" && agentId) return void onAgentInspectOpen(agentId);
   if (action === "exit-export-start") return void onExitExportStart();
+  if (action === "evidence-select") {
+    const index = Number(tgt.getAttribute("data-evidence-index"));
+    if (Number.isInteger(index) && index >= 0 && index < EVIDENCE_PAGE_SIZE) state.evidence.selectedIndex = index;
+    return rerender();
+  }
+  if (action === "evidence-export-json") return void onEvidenceJsonExport();
   if (action === "did-web-rotate-compromised") return void onDidWebCompromisedRotation();
   if (action === "exit-mark-verified") { state.exitDrill.step = 5; return rerender(); }
   if (action === "open-agent" && agentId) {
@@ -6612,7 +7069,7 @@ document.addEventListener("click", function (ev) {
   if (action === "inbox-batch-snooze-custom") {
     const input = document.querySelector('[data-action="inbox-snooze-custom"]');
     const raw = input && input.value ? input.value : "";
-    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
+    return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + MS_PER_HOUR).toISOString());
   }
   // Tunability UX: promote-to-standing-rule. Intercepted BEFORE the generic
   // inbox-* dispatcher: approve the request first, then compile and activate
@@ -6687,6 +7144,14 @@ document.addEventListener("input", function (ev) {
     state.inboxOps.filters.to = tgt.value;
     saveInboxPrefs();
     rerender();
+  } else if (action === "evidence-filter-query") {
+    setEvidenceFilter("query", tgt.value);
+  } else if (action === "evidence-filter-agent") {
+    setEvidenceFilter("agent", tgt.value);
+  } else if (action === "evidence-filter-event") {
+    setEvidenceFilter("event", tgt.value);
+  } else if (action === "evidence-filter-from") {
+    setEvidenceFilter("from", evidenceFromDate(tgt.value));
   }
 });
 
@@ -6701,14 +7166,20 @@ document.addEventListener("change", function (ev) {
     return rerender();
   }
   if (action === "time-range") {
-    // A client-side window only: it narrows what is already loaded and is not
-    // saved with the inbox preferences.
+    // Not saved with the inbox preferences. It narrows the loaded inbox list on the client, and it is
+    // sent with the Evidence entries read as that read's window start, so the table, its counts and the
+    // integrity strip's entry total cover the range the control shows.
+    const previousUrl = evidenceReadUrl();
     state.timeRange = Object.prototype.hasOwnProperty.call(TIME_RANGE_LABEL, tgt.value) ? tgt.value : "all";
-    return rerender();
+    rerender();
+    if (evidenceReadUrl() !== previousUrl) { state.evidence.selectedIndex = 0; queueEvidenceRead(); }
+    return;
   }
   if (action === "inbox-filter-source") state.inboxOps.filters.source = tgt.value;
   else if (action === "inbox-filter-severity") state.inboxOps.filters.severity = tgt.value;
   else if (action === "inbox-filter-agent") state.inboxOps.filters.agent = tgt.value;
+  else if (action === "evidence-filter-layer") return setEvidenceFilter("layer", tgt.value);
+  else if (action === "evidence-filter-result") return setEvidenceFilter("result", tgt.value);
   else if (action === "approval-filter-state") state.approvals.filters.state = tgt.value === "waiting" || tgt.value === "decided" ? tgt.value : "all";
   else if (action === "approval-filter-agent") state.approvals.filters.agent = tgt.value;
   else if (action === "approval-filter-tier") state.approvals.filters.tier = tgt.value === "tier1" || tgt.value === "tier2" ? tgt.value : "both";

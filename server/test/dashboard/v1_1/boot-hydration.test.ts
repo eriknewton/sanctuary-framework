@@ -116,7 +116,10 @@ describe("dashboard bounded independent hydration", () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
     runInContext('state.route = "activity"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Read timed out"); expect(runInContext("state.inboxOps.filters.search", h.context)).toBe(""); expect(h.main.innerHTML).toContain("Activity");
+    expect(h.main.innerHTML).toContain("Read timed out");
+    // The activity route's screen is now titled Evidence (slice 5); the kept inbox still reports its timed-out read.
+    expect(h.main.innerHTML).toContain("Evidence");
+    expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
@@ -184,7 +187,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
     expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(22); // Twenty after the unused budgets read was removed, plus the fleet roster and Sentinel findings; dynamic failures add none.
+    expect(runInContext("sourceReads.size", h.context)).toBe(23); // Main's twenty-one, which include the Evidence verification read, plus the fleet roster and Sentinel findings; dynamic failures add none.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
