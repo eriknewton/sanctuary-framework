@@ -285,7 +285,7 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
     target.inside = inside;
     // Both forms stay: slice 5's tests pass `checked: "true"` in attrs, slice 4's pass the third argument.
     target.checked = checked || attrs.checked === "true";
-    docListeners.click!({ target, detail });
+    docListeners.click!({ target, detail, stopPropagation() {} });
   };
   const clickRenderedButton = (action: string) => {
     const markup = [...el.main!.innerHTML.matchAll(/<button\b([^>]*)>/g)].find(m => m[1]!.includes(`data-action="${action}"`));
@@ -3770,7 +3770,8 @@ describe("Approvals follow-ups", () => {
       expect(h.el["notify-count"]!.innerHTML).toContain(count);
       for (const element of [h.railLink, h.el["btn-notifications"]!]) {
         for (const attr of ["title", "aria-label"]) {
-          expect(element.getAttribute(attr)).toContain(full ? "At least 0 of at least 3 held operations wait on you" : "0 of 3 held operations wait on you");
+          // Full-page sentences now bound the observed counts to the served page, preserving the scoped denominator.
+          expect(element.getAttribute(attr)).toContain(full ? `0 of 3 held operations in the first ${pageCap} inbox items wait on you` : "0 of 3 held operations wait on you");
           if (full) expect(element.getAttribute(attr)).toContain("a held operation may be waiting past them");
         }
       }
@@ -3889,13 +3890,20 @@ describe("Approvals follow-ups", () => {
 
   it("batch dismiss reports successes separately from refused items", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": inbox([tier2, heldItem]),
-      "/api/hub/inbox/item-1/dismiss": () => Promise.resolve(response({ data: { item: tier2 } })),
-      "/api/hub/inbox/refused/dismiss": () => Promise.resolve(response({ error: "refused" }, 409)),
+    // Both selected IDs are served; 403 exercises the ordinary refusal path rather than the Tier 1 conflict toast.
+    let items = [other, heldItem];
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/inbox/other/dismiss": () => { items = [{ ...other, resolved: true }, heldItem]; return Promise.resolve(response({ data: { item: items[0] } })); },
+      "/api/hub/inbox/item-1/dismiss": () => Promise.resolve(response({ error: "refused" }, 403)),
     });
-    await settle(); runInContext('state.inboxOps.selected = { "item-1": true, refused: true };', h.context);
+    await settle(); runInContext('state.inboxOps.selected = { other: true, "item-1": true };', h.context);
     await runInContext('onInboxBatchAction("dismiss")', h.context);
     expect(h.el["toast-host"]!.innerHTML).toContain("Dismissed 1 item; skipped 1 item.");
+    expect(h.el["toast-host"]!.innerHTML).toContain("Inbox action failed:");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("Tier 1 items cannot be dismissed");
+    h.navigate("approvals");
+    expect(drawer(h)).toContain('data-action="inbox-deny" data-item-id="item-1"');
+    expect(runInContext('state.inbox.find(i => i.item_id === "item-1").resolved', h.context)).toBe(false);
   });
 
   for (const kind of ["non-hold", "decided", "unrecognized"]) {
@@ -3987,4 +3995,157 @@ describe("Approvals follow-ups", () => {
       } else expect(empty[2]).toContain('href="#activity">Clear filters</a>');
     });
   }
+});
+
+describe("Approvals round-two surface evidence", () => {
+  const pageCap = 100; // Must match APPROVAL_QUEUE_ITEM_CAP in client.ts and HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts.
+  const recognized = (count: number) => Array.from({ length: count }, (_, i) => ({ ...heldItem, item_id: `recognized-${i}` }));
+  const unknown = (count: number) => recognized(count).map(i => ({ ...i, tier: "tier9" }));
+  const fullPage = (holds: ReturnType<typeof recognized>) => holds.concat(Array.from({ length: pageCap - holds.length }, (_, i) => ({ ...heldItem, item_id: `notice-${i}`, kind: "blocked_egress" })));
+  const bootItems = async (items: unknown[]) => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/posture/home": () => Promise.resolve(response({ ...home(), agents: [{ agent_id: heldItem.agent_id }] })),
+    });
+    await settle(); h.navigate("posture");
+    return h;
+  };
+  const tile = (h: ReturnType<typeof boot>) => h.el.main!.innerHTML.split('>Approvals waiting</a>')[1]!.split('</div>')[0]!;
+  const tierWarning = (count: number) => count === 1 ? "1 held item carries a tier this console does not recognize" : `${count} held items carry a tier this console does not recognize`;
+
+  for (const count of [0, 2]) { // Zero and two distinguish absence from plural recognized holds.
+    it(`Overview tile marks the fortress-wide full-page recognized count ${count} with its source bound`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      expect(tile(h)).toContain(`<span class="ot-value">${count}+</span>`);
+      expect(tile(h)).toContain(`from the first ${pageCap} inbox items`);
+    });
+  }
+  for (const count of [1, 2]) { // Singular and plural unknown-tier wording are distinct product branches.
+    it(`Overview tile qualifies zero with ${count} unrecognized-tier holds`, async () => {
+      const h = await bootItems(unknown(count));
+      expect(tile(h)).toContain(tierWarning(count));
+      expect(tile(h)).toContain('<span class="ot-value">0</span>');
+    });
+  }
+
+  for (const count of [0, 1, 2]) { // Empty, singular and plural sentences each have a distinct grammar boundary.
+    it(`rail and bell describe ${count} recognized holds within the full page and separate the page-edge sentence`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        for (const attr of ["title", "aria-label"]) {
+          expect(el.getAttribute(attr)).toContain(`${count} of ${count} held ${count === 1 ? "operation" : "operations"} in the first ${pageCap} inbox items ${count === 1 ? "waits" : "wait"} on you`);
+          expect(el.getAttribute(attr)).toMatch(/ · queue read [^.]+\. The inbox has at least/);
+          expect(el.getAttribute(attr)).not.toContain("At least");
+        }
+      }
+      expect(h.el["rail-approvals-count"]!.textContent).toBe(`${count}+ of ${count}+`);
+      expect(h.el["notify-count"]!.innerHTML).toContain(`${count}+ of ${count}+`);
+      expect(h.el["notify-count"]!.hidden).toBe(false);
+    });
+  }
+  for (const count of [1, 2]) {
+    it(`rail and bell name ${count} unrecognized-tier holds after the scope clause`, async () => {
+      const h = await bootItems(unknown(count));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      const clause = count === 1 ? "1 held item has" : `${count} held items have`;
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain(`0 of 0 held operations wait on you (scoped to outside-agent); ${clause} a tier this console does not recognize · queue read `);
+      }
+      expect(h.el["notify-count"]!.hidden).toBe(false);
+    });
+  }
+
+  // fail-before-exempt: plant earned: hidden === 0 in the redacted summary to hide the badge incorrectly.
+  it("redacted zero keeps the badge visible and names the hidden queue", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } })) });
+    await settle();
+    // Real DOM boolean properties coerce the base summary's absent earned field to false.
+    expect(Boolean(h.el["notify-count"]!.hidden)).toBe(false);
+    expect(h.el["btn-notifications"]!.classList.contains("waiting")).toBe(true);
+    for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+      for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain("hidden until you paste the operator token");
+    }
+  });
+
+  it("Overview card header marks the recognized total on a full page as a lower bound", async () => {
+    const holds = recognized(2); // Two holds fit in the Overview card without row truncation.
+    const h = await bootItems(fullPage(holds));
+    const header = h.el.main!.innerHTML.split('Needs your decision')[1]!.split('</h3>')[0]!;
+    expect(header).toContain(`showing ${holds.length} of ${holds.length}+ · `);
+  });
+
+  it("batch guard skips raise exactly one summary toast and preserve the admitted decision", async () => {
+    vi.useFakeTimers();
+    let finish!: (value: unknown) => void;
+    const items = recognized(3); // One admitted decision and two skipped batch items detect repeated guard toasts.
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/inbox/recognized-0/deny": () => new Promise(resolve => { finish = resolve; }),
+    });
+    await settle(); h.navigate("activity");
+    h.click({ "data-action": "inbox-deny", "data-item-id": items[0]!.item_id });
+    runInContext('state.inboxOps.selected = { "recognized-1": true, "recognized-2": true };', h.context);
+    await runInContext('onInboxBatchAction("dismiss")', h.context);
+    expect(h.el["toast-host"]!.querySelectorAll(".toast")).toHaveLength(1);
+    expect(h.el["toast-host"]!.textContent).toBe("Dismissed 0 items; skipped 2 items. Another decision is being sent.");
+    expect(h.requests.filter(r => r.init?.method === "POST").map(r => r.url)).toEqual(["/api/hub/inbox/recognized-0/deny"]);
+    finish(response({ data: { item: { ...items[0], resolved: true } } })); await settle();
+    expect(runInContext('state.approvals.inFlightItemId', h.context)).toBeNull();
+  });
+
+  it("Evidence empty page with positive total and no filter states the server count and retries its read", async () => {
+    vi.useFakeTimers();
+    const total = 7; // A positive server count deliberately disagrees with the empty served page.
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context); h.navigate("activity"); await settle();
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain('<h3>No entries on this page</h3>');
+    expect(entries).toContain(`The server counts ${total} entries in this view, but this read shows none.`);
+    expect(entries).not.toContain("No entries match this view");
+    expect(entries).not.toContain("Clear filters");
+    expect(entries).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
+    const before = h.requests.filter(r => r.url.startsWith("/api/posture/evidence")).length;
+    h.click({ "data-action": "retry-panel", "data-read": "/api/posture/evidence" }); await settle();
+    expect(h.requests.filter(r => r.url.startsWith("/api/posture/evidence"))).toHaveLength(before + 1);
+  });
+
+  for (const count of [0, 1]) {
+    it(`seal Charter approvals row warns about the full-page recognized count ${count}`, async () => {
+      const h = await bootItems(fullPage(recognized(count)));
+      h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
+      h.click({ "data-action": "posture-seal-toggle" });
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('<div class="pp-line">').find(line => line.includes('Charter approvals</span>'))!;
+      expect(row).toContain(`<span class="pp-v">${count}+ waiting</span>`);
+      expect(row).toContain('class="pp-dot warn"');
+    });
+  }
+  for (const count of [1, 2]) {
+    it(`seal Charter approvals row separates ${count} unrecognized-tier holds from recognized waiting`, async () => {
+      const h = await bootItems(unknown(count));
+      h.click({ "data-action": "posture-seal-toggle" });
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('Charter approvals</span>')[1]!.split('</div>')[0]!;
+      expect(row).toContain(`<span class="pp-v">0 waiting; ${tierWarning(count)}</span>`);
+      expect(h.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot warn"></span><span class="pp-k">Charter approvals');
+    });
+  }
+  // fail-before-exempt: plant the earned-empty Charter approvals value as "0 waiting" instead of "clear".
+  it("seal Charter approvals is clear only with earned-empty evidence", async () => {
+    const h = await bootItems([]);
+    h.click({ "data-action": "posture-seal-toggle" });
+    expect(h.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot"></span><span class="pp-k">Charter approvals</span><span class="pp-v">clear</span>');
+    expect(tile(h)).toContain('<span class="ot-value">0</span>');
+    expect(h.el["notify-count"]!.hidden).toBe(true);
+    const waiting = await bootItems(recognized(1));
+    waiting.click({ "data-action": "posture-seal-toggle" });
+    expect(waiting.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot warn"></span><span class="pp-k">Charter approvals</span><span class="pp-v">1 waiting</span>');
+    for (const mode of ["unloaded", "redacted"]) {
+      const unavailable = boot({ "/api/hub/inbox": mode === "unloaded" ? never : () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 0 } })) });
+      await settle(); unavailable.click({ "data-action": "posture-seal-toggle" });
+      expect(unavailable.el["posture-seal-pop"]!.innerHTML).toContain('class="pp-dot unknown"></span><span class="pp-k">Charter approvals</span><span class="pp-v">Unknown</span>');
+    }
+  });
 });
