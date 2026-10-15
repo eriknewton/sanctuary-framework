@@ -18,7 +18,7 @@
  * are NOT named here at v1.1 ship.
  */
 
-import { getClientScript } from "./client.js";
+import { APPROVAL_DRAWER_STACK_MAX_PX, getClientScript } from "./client.js";
 import { SANCTUARY_VERSION } from "../../config.js";
 import { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../design-tokens.js";
 import { CONSOLE_FONT_FACE_CSS } from "../design-fonts.js";
@@ -1750,29 +1750,6 @@ body {
   border: 1px solid var(--ochre); border-radius: 999px; padding: 0 7px; font-size: 10px; line-height: 16px;
 }
 .rail-section-label .count.zero { background: var(--paper-3); color: var(--ink-3); border-color: var(--rule); }
-.approval-queue { display: flex; flex-direction: column; gap: 8px; }
-.approval-tile {
-  background: var(--surface); border: 1px solid var(--ochre); border-left: 3px solid var(--ochre);
-  border-radius: var(--rad); padding: 11px 12px;
-  display: flex; flex-direction: column; gap: 8px;
-  transition: opacity 240ms ease, transform 240ms ease, max-height 260ms ease, margin 260ms ease, padding 260ms ease, border-width 260ms ease;
-  max-height: 220px; overflow: hidden;
-}
-.approval-tile.leaving {
-  opacity: 0; transform: translateX(12px);
-  max-height: 0; margin-bottom: -8px; padding-top: 0; padding-bottom: 0; border-width: 0;
-}
-.approval-tile .at-what { font-size: var(--text-base); line-height: 1.45; color: var(--ink); }
-.approval-tile .at-agent {
-  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
-  display: inline-flex; align-items: center; gap: 6px;
-}
-.approval-tile .at-agent .ad { width: 6px; height: 6px; border-radius: 50%; background: var(--ochre); flex-shrink: 0; }
-.approval-tile .at-actions { display: flex; gap: 6px; }
-.approval-tile .at-actions .btn { flex: 1; justify-content: center; }
-.approval-tile .btn.at-approve { background: var(--ink); color: var(--paper); border-color: var(--ink); }
-.approval-tile .btn.at-approve:hover:not(:disabled) { background: var(--ink-2); }
-.approval-tile .btn.at-deny:hover:not(:disabled) { color: var(--rust); border-color: var(--rust); background: var(--rust-bg); }
 .queue-empty {
   display: flex; align-items: center; gap: 9px;
   padding: 13px 13px; border: 1px dashed var(--rule-2); border-radius: var(--rad);
@@ -1865,6 +1842,7 @@ body {
   display: flex; flex-direction: column; gap: var(--space-2);
   border-bottom: 0;
 }
+.approval-confirm-row { display: flex; gap: var(--space-2); padding-block-start: var(--space-2); }
 .approval-decide label {
   color: var(--ink-3); font-family: var(--mono); font-size: 10px;
   letter-spacing: 0.08em; text-transform: uppercase;
@@ -1886,8 +1864,8 @@ body {
 /* Beside the 420px drawer the queue column is the viewport less about 742px (the 232px rail, the page padding,
    the drawer and its gap: 538px at 1280), and the table's columns need about 654px, so below 1400px the drawer
    moves under the queue, as the Evidence record pane does below 1200px. A zero minimum keeps long cells inside
-   the column. */
-@media (max-width: 1400px) {
+   the column. Must match APPROVAL_DRAWER_STACK_MAX_PX and focusApprovalDrawer in client.ts. */
+@media (max-width: ${APPROVAL_DRAWER_STACK_MAX_PX}px) {
   .approval-layout { grid-template-columns: minmax(0, 1fr); }
   .approval-drawer { position: static; }
 }
