@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds only a registration pin to this file (the two frozen exact ids stay registered); it asserts existing behavior and so passes against pre-fix source by construction, and deleting either catalog entry in templates.ts turns it red. The categorizer change is pinned by activity-feed-categorizer.test.ts, which fails on pre-fix source.
 /**
  * Hub activity entries resolve through the dashboard category sentences.
  * Exercises the real audit feed projection and the embedded client renderer.
