@@ -72,6 +72,7 @@ const LIFECYCLE_VERBS = [
   "restart",
 ] as const;
 
+// Must match renderAgentTimeline in dashboard/v1_1/client.ts: a category is not evidence of an audit layer.
 function categorizeOperation(
   layer: AuditEntry["layer"],
   operation: string,

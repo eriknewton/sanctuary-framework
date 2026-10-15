@@ -73,7 +73,7 @@ export const CROSS_PROCESS_LOCK_TIMEOUT_MS = 5_000;
 export const CROSS_PROCESS_LOCK_RETRY_MS = 100;
 /** Maximum wait for the process-owned Unix-domain listener to close. */
 export const KERNEL_LOCK_RELEASE_TIMEOUT_MS = 2_000;
-const KERNEL_SOCKET_PATH_MAX_BYTES = 100;
+export const KERNEL_SOCKET_PATH_MAX_BYTES = 100;
 // 40 = the shared scaffold digest width used in `<digest>.reaper` paths below.
 const BARRIER_SCAFFOLD_DIGEST_HEX_CHARS = 40;
 // 24 = the reader socket digest prefix width used in `<digest>.reader-*.sock`.

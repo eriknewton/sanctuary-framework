@@ -5737,6 +5737,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const sessionUrl = this.authToken ? this.createSessionUrl() : baseUrl;
 
         // Print dashboard URL
+        // Must match DASHBOARD_URL_LINE and DASHBOARD_TOKEN_HINT_CHARS in server/test/demo/seed-fortress.test.ts:
+        // the URL line, then one hint line showing the token's first and last four characters.
         process.stderr.write(
           `\n  Sanctuary Principal Dashboard: ${baseUrl}\n`
         );
@@ -8614,6 +8616,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handleAuditLog(url: URL, res: ServerResponse): void {
     const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
 
+    // Must match onEvidenceJsonExport in server/src/dashboard/v1_1/client.ts, which reads both shapes this
+    // route serves: the AuditLog.query result object, or an empty array when there is no log or the query fails.
     // AuditLog.query is async, but for the dashboard we return what we can
     if (this.auditLog) {
       this.auditLog.query({ limit }).then((entries) => {

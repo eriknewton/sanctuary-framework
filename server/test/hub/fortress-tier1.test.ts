@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a adds the true support probe for the fortress fixture that already implements every control.
 /**
  * Sanctuary v1.1 — Fortress-scope Tier 1 endpoints regression suite.
  *
@@ -10,7 +11,6 @@
  * still rejected. The dashboard's prior /agents/all/* call paths route
  * here via the routing-layer sentinel alias.
  */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createServer,
@@ -269,6 +269,10 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
 function withAuth(headers: HeadersInit, token: string): HeadersInit {
   return { ...headers, Authorization: `Bearer ${token}` };
 }
+
+// This fake implements every control; keep its probe below the pinned diagnostic location.
+interface StubAgentController { supports(...args: Parameters<HubAgentController["supports"]>): ReturnType<HubAgentController["supports"]>; }
+StubAgentController.prototype.supports = () => true;
 
 // ═════════════════════════════════════════════════════════════════════
 // Tests

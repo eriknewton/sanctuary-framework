@@ -3555,7 +3555,7 @@ export function generateFleetSwitcherHTML(options: {
       <label for="machine-url">Dashboard URL</label>
       <input id="machine-url" type="text" placeholder="e.g. https://100.64.0.5:3501" />
     </div>
-    <button onclick="addMachine()">Add Machine</button>
+    <button id="add-machine" type="button">Add Machine</button>
   </div>
   <div id="form-hint" class="form-hint"></div>
 
@@ -3566,14 +3566,41 @@ export function generateFleetSwitcherHTML(options: {
     const STORAGE_KEY = 'sanctuary_fleet_machines';
     const CURRENT_ENDPOINT = ${JSON.stringify(currentEndpoint)};
 
-    function loadMachines() {
+    function loadStoredMachines() {
       try {
-        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-      } catch { return []; }
+        const stored = localStorage.getItem(STORAGE_KEY);
+        return stored === null ? [] : JSON.parse(stored);
+      } catch {
+        // An unreadable saved value is preserved until an explicit Add replaces it.
+        return null;
+      }
     }
 
     function saveMachines(machines) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(machines));
+    }
+
+    function isSavedMachine(value) {
+      return value !== null
+        && typeof value === 'object'
+        && typeof value.name === 'string'
+        && typeof value.url === 'string';
+    }
+
+    function loadMachines() {
+      const stored = loadStoredMachines();
+      return Array.isArray(stored) ? stored.filter(isSavedMachine) : [];
+    }
+
+    function acceptedDashboardUrl(value) {
+      try {
+        // Explicit authority forms resolve to the same machine with or without a page base.
+        if (!/^https?:[/][/]/i.test(value)) return null;
+        const parsed = new URL(value);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? value : null;
+      } catch {
+        return null;
+      }
     }
 
     function showFormHint(message) {
@@ -3610,21 +3637,32 @@ export function generateFleetSwitcherHTML(options: {
       // duplicated here because embedded dashboard JS cannot import a server module.
       { let end = url.length; while (end > 0 && url[end - 1] === '/') end -= 1; url = url.slice(0, end); }
 
+      if (!acceptedDashboardUrl(url)) {
+        urlEl.classList.add('invalid');
+        showFormHint('Enter an http or https address.');
+        return;
+      }
+
       const machines = loadMachines();
       // Prevent duplicates by URL
       if (machines.some(m => m.url === url)) {
         alert('A machine with this URL already exists.');
         return;
       }
-      machines.push({ name, url, added: new Date().toISOString() });
-      saveMachines(machines);
+      const stored = loadStoredMachines();
+      const nextMachines = Array.isArray(stored) ? stored : [];
+      nextMachines.push({ name, url, added: new Date().toISOString() });
+      saveMachines(nextMachines);
       nameEl.value = '';
       urlEl.value = '';
       render();
     }
 
     function removeMachine(url) {
-      const machines = loadMachines().filter(m => m.url !== url);
+      const stored = loadStoredMachines();
+      const machines = Array.isArray(stored)
+        ? stored.filter(m => !(isSavedMachine(m) && m.url === url))
+        : [];
       saveMachines(machines);
       render();
     }
@@ -3651,56 +3689,94 @@ export function generateFleetSwitcherHTML(options: {
         return;
       }
 
-      list.innerHTML = machines.map(m => {
-        const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
-        const key = btoa(m.url).replace(/=/g,'');
-        return \`
-          <div class="machine-card \${isCurrent ? 'current' : ''}" data-url="\${m.url}">
-            <div class="status-dot checking" id="dot-\${key}"></div>
-            <div class="status-label" id="label-\${key}">Checking</div>
-            <div class="info">
-              <div class="name">\${escapeHtml(m.name)}\${isCurrent ? ' <span class="current-badge">CURRENT</span>' : ''}</div>
-              <div class="url">\${escapeHtml(m.url)}</div>
-            </div>
-            <div class="actions">
-              <a href="\${m.url}" class="btn-open">Open Console</a>
-              <button class="btn-remove" onclick="removeMachine('\${escapeHtml(m.url)}')">Remove</button>
-            </div>
-          </div>
-        \`;
-      }).join('');
+      list.replaceChildren();
+      const healthTargets = [];
 
-      // Check health for each machine
-      machines.forEach(async (m) => {
-        const key = btoa(m.url).replace(/=/g,'');
-        const dot = document.getElementById('dot-' + key);
-        const label = document.getElementById('label-' + key);
-        if (!dot) return;
-        const status = await checkHealth(m.url);
+      machines.forEach((m) => {
+        const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
+        const acceptedUrl = acceptedDashboardUrl(m.url);
+        const card = document.createElement('div');
+        card.className = 'machine-card' + (isCurrent ? ' current' : '');
+        card.dataset.url = m.url;
+
+        const dot = document.createElement('div');
+        dot.className = acceptedUrl ? 'status-dot checking' : 'status-dot';
+        card.appendChild(dot);
+
+        const label = document.createElement('div');
+        label.className = 'status-label';
+        label.textContent = acceptedUrl ? 'Checking' : 'Not checked';
+        card.appendChild(label);
+
+        const info = document.createElement('div');
+        info.className = 'info';
+
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = m.name;
+        if (isCurrent) {
+          name.appendChild(document.createTextNode(' '));
+          const badge = document.createElement('span');
+          badge.className = 'current-badge';
+          badge.textContent = 'CURRENT';
+          name.appendChild(badge);
+        }
+        info.appendChild(name);
+
+        const url = document.createElement('div');
+        url.className = 'url';
+        url.textContent = m.url;
+        info.appendChild(url);
+        card.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        if (acceptedUrl) {
+          const open = document.createElement('a');
+          open.className = 'btn-open';
+          open.setAttribute('href', acceptedUrl);
+          open.textContent = 'Open Console';
+          actions.appendChild(open);
+        }
+
+        const remove = document.createElement('button');
+        remove.className = 'btn-remove';
+        remove.type = 'button';
+        remove.textContent = 'Remove';
+        remove.addEventListener('click', () => removeMachine(m.url));
+        actions.appendChild(remove);
+        card.appendChild(actions);
+        list.appendChild(card);
+
+        if (acceptedUrl) healthTargets.push({ url: acceptedUrl, dot, label });
+      });
+
+      // Check health for each accepted machine address.
+      healthTargets.forEach(async (target) => {
+        const { url, dot, label } = target;
+        const status = await checkHealth(url);
         dot.className = 'status-dot ' + status;
         if (label) label.textContent = status === 'online' ? 'Online' : 'Offline';
       });
     }
 
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
-
     // Auto-add current machine if not in list
     (function autoAddCurrent() {
-      const machines = loadMachines();
+      const stored = loadStoredMachines();
+      if (!Array.isArray(stored)) return;
+      const machines = stored.filter(isSavedMachine);
       const origin = location.origin;
       if (!machines.some(m => m.url === origin)) {
         const hostname = location.hostname;
         const name = hostname === '127.0.0.1' || hostname === 'localhost'
           ? 'This machine (local)'
           : hostname;
-        machines.push({ name, url: origin, added: new Date().toISOString() });
-        saveMachines(machines);
+        stored.push({ name, url: origin, added: new Date().toISOString() });
+        saveMachines(stored);
       }
     })();
+
+    document.getElementById('add-machine').addEventListener('click', addMachine);
 
     // Clear the validation hint once the operator starts correcting the fields.
     ['machine-name', 'machine-url'].forEach((id) => {

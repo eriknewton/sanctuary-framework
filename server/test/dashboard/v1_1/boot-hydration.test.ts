@@ -112,12 +112,15 @@ describe("dashboard bounded independent hydration", () => {
     vi.useFakeTimers(); const h = harness({ "/api/inbox/unified/prefs": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     expect(h.main.innerHTML).not.toContain("Saved inbox filters");
     runInContext('state.route = "activity"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("Read timed out"); expect(runInContext("state.inboxOps.filters.search", h.context)).toBe(""); expect(h.main.innerHTML).toContain("Activity");
+    expect(h.main.innerHTML).toContain("Read timed out");
+    // The activity route's screen is now titled Evidence (slice 5); the kept inbox still reports its timed-out read.
+    expect(h.main.innerHTML).toContain("Evidence");
+    expect(runInContext("state.inboxOps.filters.search", h.context)).toBe("");
   });
   it("keeps unavailable approvals distinct from zero", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/hub/inbox": pending }); await vi.advanceTimersByTimeAsync(DEADLINE_MS);
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     expect(h.fortress.innerHTML).toContain("Retry Decisions");
   });
@@ -127,7 +130,8 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('state.route = "agents"; void fetchAll()', h.context); await settle();
     expect(h.main.innerHTML).not.toContain("No protected agents yet");
     expect(h.main.innerHTML).toContain("Unknown");
-    expect(h.main.innerHTML).toContain("Retry Agents");
+    // The shared table keeps the Agents retry route with its current control label.
+    expect(h.main.innerHTML).toContain('data-action="retry-panel" data-read="/api/hub/agents"');
   });
   it("never renders protective home or agent statuses with stale or invalid evidence", async () => {
     vi.useFakeTimers();
@@ -143,10 +147,13 @@ describe("dashboard bounded independent hydration", () => {
         "/api/posture/home": () => response({ ...home, castle_wall: { arm_state: "armed", ...evidence }, agents: [{ agent_id: "fixture", enforcement_active: "active", ...evidence }] }),
       });
       await settle();
-      expect.soft(h.main.innerHTML, timestamp).not.toContain(">Enforcing</span>");
+      // fail-before-exempt: protective-render plant recorded in the slice 3b evidence.
+      // Overview uses an uppercase chip word, so this catches stale and invalid evidence.
+      expect.soft(h.main.innerHTML, timestamp).not.toContain(">ENFORCING");
       expect.soft(runInContext("homeFreshnessTimer", h.context), timestamp).toBeNull();
       runInContext('state.route = "agents"; rerender()', h.context);
-      expect.soft(h.main.innerHTML, timestamp).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+      // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+      expect.soft(h.main.innerHTML, timestamp).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     }
   });
   it("shares one panel deadline across dependent intelligence reads", async () => {
@@ -175,8 +182,8 @@ describe("dashboard bounded independent hydration", () => {
     runInContext('rerender()', h.context);
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
-    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(20); // The fixed source inventory has twenty entries after the unused budgets read was removed.
+    expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
+    expect(runInContext("sourceReads.size", h.context)).toBe(21); // The fixed source inventory includes the Evidence verification read.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -538,7 +545,9 @@ describe("dashboard bounded independent hydration", () => {
       "/api/anomaly/findings",
     ]));
     expect(runInContext('sourceRead("/api/anomaly/findings").state', h.context)).toBe("state_LOADING");
-    expect(h.main.innerHTML).not.toContain("No open anomaly findings.");
+    // fail-before-exempt: checked-empty render plant recorded in the slice 3b evidence.
+    // The loading Overview must not retain its current checked-empty Sentinel copy.
+    expect(h.main.innerHTML).not.toContain("No open Sentinel findings");
   });
   it("keeps later rule details unavailable when the shared deadline runs out", async () => {
     vi.useFakeTimers(); const h = harness({ "/api/auto-trigger/rules": () => response({ data: { rules: [{ rule_id: "first" }, { rule_id: "later" }] } }), "/api/auto-trigger/rules/first": pending });
@@ -634,15 +643,20 @@ describe("D5 closure", () => {
       state.route = "agents"; rerender();
     `, h.context);
     const rendered = () => h.main.innerHTML + runInContext('renderAgentInspectPanel(state.agents[0])', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext(`state.posture.home.agents = [{ agent_id: "other", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 60000 }]; rerender()`, h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('state.posture.home.agents[0].agent_id = "fixture"; rerender()', h.context);
-    expect(rendered()).toContain('state-dot live'); expect(rendered()).toMatch(/protected/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).toContain('state-dot live'); expect(rendered()).toContain('state-chip good');
     runInContext('sourceRead("/api/posture/home").state = "state_LOADING"; rerender()', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
     runInContext('sourceRead("/api/posture/home").state = "state_LOADED"; state.posture.home.agents[0].last_enforcement_evidence_at = "2000-01-01T00:00:00Z"; rerender()', h.context);
-    expect(rendered()).not.toMatch(/protected|state-dot live|att-agent verified|tone-verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(rendered()).not.toMatch(/state-chip good|state-dot live|att-agent verified|tone-verified/i);
   });
   it.each(["stream", "polling"])("shows stopped %s updates on every route until Retry", async mode => {
     vi.useFakeTimers(); const h = harness(); await settle();
@@ -690,10 +704,12 @@ describe("D5 closure", () => {
         ? response({ ...home, agents: [{ agent_id: "fixture", enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString().replace("Z", "+00:00"), freshness_window_ms: 1000 }] })
         : pending(),
     }); await settle(); runInContext('state.route = "agents"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain('state-dot live');
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).toContain('state-chip good');
     await vi.advanceTimersByTimeAsync(1001);
     await settle();
-    expect(h.main.innerHTML).not.toMatch(/protected|state-dot live|att-agent verified/i);
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).not.toMatch(/state-chip good|state-dot live|att-agent verified/i);
   });
   it("coalesces event bursts and invalidates the next read when a later event arrives", async () => {
     vi.useFakeTimers(); const releases: ((value: unknown) => void)[] = [];
@@ -773,11 +789,13 @@ describe("D5 closure", () => {
     expect(h.main.innerHTML).toContain("<dt>Protection requested</dt>");
     expect(h.main.innerHTML).not.toContain("<dt>Protected agents</dt>");
     runInContext('state.route = "agents"; rerender()', h.context);
-    expect(h.main.innerHTML).toContain("1 agent. Click one");
-    expect(h.main.innerHTML).not.toContain("1 agents.");
+    // The inventory now reports the loaded-row denominator instead of a prose agent count.
+    expect(h.main.innerHTML).toContain("showing 1 of 1");
+    // The shared Agents table uses the protective chip; tile labels may name protection without claiming it.
+    expect(h.main.innerHTML).not.toContain('state-chip good');
     runInContext('state.route = "posture"; rerender()', h.context);
     // Pins the per-agent row after the Overview retarget; Castle Wall can also be UNKNOWN.
-    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(h.main.innerHTML).toMatch(/data-agent-id="fixture"[\s\S]*?<span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(h.main.innerHTML).not.toContain("status active");
   });
   it("agent_status events re-read the roster instead of mutating it locally", async () => {

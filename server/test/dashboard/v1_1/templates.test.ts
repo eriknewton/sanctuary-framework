@@ -7,7 +7,7 @@
  *  - Coverage assertion: every Tier 1 operation_category, every privacy
  *    event kind, every blocked_egress reason class has a registered entry.
  */
-// fail-before-exempt: the mirror parity checks added here pass whenever both mirrors already agree, as they do on main; they fail when one mirror is edited alone.
+// fail-before-exempt: slice 6a anchors the approved pending-removal sentence exactly; this inherited sentence already passes on the base, as does mirror parity.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -316,4 +316,8 @@ describe("v1.1 dashboard template registry", () => {
     expect(out).not.toContain("writes are blocked");
     expect(out).not.toContain("[unrecognized template");
   });
+});
+
+it("anchors the approved pending-removal sentence", () => {
+  expect(renderTemplate("approval_pending.tier1.unwrap", [{ kind: "agent_id", value: "agent-alpha" }])).toBe("Request to remove protection from agent agent-alpha. This build refuses unsupported removals before approval is queued.");
 });

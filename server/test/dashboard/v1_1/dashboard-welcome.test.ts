@@ -1,3 +1,4 @@
+// fail-before-exempt: Slice 6a retargets the existing inspect-panel call assertion to the entity Overview; no new behavior test.
 /**
  * Sanctuary v1.2 Dashboard — Concierge surface (WP-V1.2-4)
  *
@@ -116,8 +117,8 @@ describe("v1.2 dashboard click-to-inspect (WP-V1.2 reshape)", () => {
     const script = getClientScript();
     expect(script).toContain("function renderAgentInspectPanel(agent)");
     // The agent-detail render calls into renderAgentInspectPanel and
-    // appends the panel between the identity card and the timeline.
-    expect(script).toContain("const inspectPanel = renderAgentInspectPanel(a);");
+    // keeps the panel in the entity Overview beside activity and approvals.
+    expect(script.match(/function renderAgentDetail\(\)[\s\S]*?\n\}\n/)![0]).toContain("renderAgentInspectPanel(a)");
   });
 
   it("inspect CTA uses the click-to-inspect framing copy (read-only)", () => {
