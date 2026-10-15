@@ -3122,8 +3122,8 @@ describe("slice 6a Agents wired consumers", () => {
   for (const [name, readAt] of [["missing", "undefined"], ["not-a-number", "NaN"], ["text", '"soon"'], ["numeric-text", '"9999999999999999"'], ["symbol", 'Symbol("t")']]) it(`A1 a loaded reach read with a ${name} read time is withheld as undated`, async () => {
     const { h } = await start("evidenced-protected");
     detail(h); await settle();
-    // Fails before the undated arm in renderAgentReach (A1 round 2 fail-before evidence); the numeric-text and symbol
-    // cases also fail before the numeric read time in the A1 closure.
+    // Every case fails at the round 1 head 46a1dd4a, before the undated arm in renderAgentReach (A1 round 2 fail-before
+    // evidence); the symbol case also fails at f894e599, before the numeric read time in the A1 closure.
     const html = runInContext(`state.agentReach.readAt = ${readAt}; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
     expect(html).toContain("Reach read time is unknown, so it is not current.");
     expect(html).not.toContain("The reach source answered without a record for this agent.");
