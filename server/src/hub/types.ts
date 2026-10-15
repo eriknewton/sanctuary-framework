@@ -130,11 +130,11 @@ export interface HubFortressExportResult {
  */
 export interface HubAgentController {
   /**
-   * Optional executor-side support probe. Record capability flags still gate
-   * the UI surface; this probe prevents queuing Tier-1 work whose handler is
-   * known not to exist.
+   * Required executor-side support probe. Served control flags intersect stored
+   * permission with this probe; an unsupported handler cannot be advertised
+   * or queued as Tier 1 work.
    */
-  supports?(
+  supports(
     action: HubAgentControlAction,
     agentId: string,
   ): boolean | Promise<boolean>;

@@ -22,11 +22,36 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
+import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+import { HUB_INBOX_KINDS } from "../../../src/contracts/v1.1/constants.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import type { TypeAliasDeclaration, UnionTypeNode, LiteralTypeNode, StringLiteral, TypeLiteralNode, PropertySignature, Identifier } from "typescript";
+const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
+import type { AuditChainVerdictStatus } from "../../../src/operational/audit-log.js";
+
+// Read the source union at runtime: vitest does not typecheck test files.
+function unionValues(name: string) {
+  const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
+  return (alias.type as UnionTypeNode).types.map((node) => ((node as LiteralTypeNode).literal as StringLiteral).text).sort();
+}
+
+// The `status` literal of each member of an object-type union such as SealedRegionVerdict.
+function unionStatusValues(name: string) {
+  const source = ts.createSourceFile("audit-log.ts", readFileSync(new URL("../../../src/operational/audit-log.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const alias = source.statements.find((node): node is TypeAliasDeclaration => ts.isTypeAliasDeclaration(node) && node.name.text === name)!;
+  return (alias.type as UnionTypeNode).types.map((node) => {
+    const member = (node as TypeLiteralNode).members.find((m) => m.name && (m.name as Identifier).text === "status") as PropertySignature;
+    return ((member.type as LiteralTypeNode).literal as StringLiteral).text;
+  }).sort();
+}
 
 const response = (body: unknown, status = 200, init: Record<string, unknown> = {}) => ({
   ok: status >= 200 && status < 300,
@@ -34,6 +59,7 @@ const response = (body: unknown, status = 200, init: Record<string, unknown> = {
   redirected: false,
   type: "basic",
   json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
   ...init,
 });
 const never = () => new Promise<never>(() => {});
@@ -64,6 +90,7 @@ class FakeElement {
   checked = false;
   value = "";
   replaceCount = 0;
+  style: Record<string, string> = {};
   private classes = new Set<string>();
   constructor(attrs: Record<string, string> = {}, tagName = "DIV") { this.attrs = { ...attrs }; this.tagName = tagName.toUpperCase(); }
   get innerHTML() { return this.children.length ? this.children.map((c) => c.outerHTML).join("") : this.html; }
@@ -140,6 +167,12 @@ class FakeElement {
     this.children.push(child);
     return child;
   }
+  removeChild(child: FakeElement | FakeText) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    if (child instanceof FakeElement) child.parentElement = null;
+    return child;
+  }
   append(...children: Array<FakeElement | FakeText | string>) {
     children.forEach((child) => this.appendChild(typeof child === "string" ? new FakeText(child) : child));
   }
@@ -151,6 +184,7 @@ class FakeElement {
     this.append(...children);
   }
   focus() { fakeActiveElement = this; }
+  click() {}
   remove() {}
   replaceWith(next: FakeElement | FakeText) {
     if (!this.parentElement) return;
@@ -179,11 +213,13 @@ const SHELL_IDS = [
   "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
-function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
+function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}) {
   fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
   el["global-search"] = new FakeInput({ "data-action": "global-search" });
+  const body = new FakeElement({}, "BODY");
+  const downloads: FakeElement[] = [];
   // The rail pill sits inside its rail link, which carries the sentence.
   const railLink = new FakeElement();
   el["rail-approvals-count"]!.parentElement = railLink;
@@ -193,7 +229,7 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   const location = {
     get hash() { return locationHash; },
     set hash(value: string) {
-      const next = String(value);
+      const next = String(value).startsWith("#") ? String(value) : "#" + String(value);
       const changed = next !== locationHash;
       locationHash = next;
       if (changed && winListeners.hashchange) winListeners.hashchange();
@@ -201,26 +237,35 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
     search: "",
     origin: "http://fixture",
   };
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
   const context = createContext({
     document: {
       getElementById: (id: string) => el[id] || (id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: "/api/hub" }) } : null),
       addEventListener: (name: string, fn: (ev: unknown) => void) => { docListeners[name] = fn; },
-      createElement: (tagName: string) => new FakeElement({}, tagName),
+      createElement: (tagName: string) => {
+        const node = new FakeElement({}, tagName);
+        if (tagName === "a") node.click = () => { downloads.push(node); };
+        return node;
+      },
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [],
       get activeElement() { return fakeActiveElement; },
       set activeElement(value: unknown) { fakeActiveElement = value; },
+      body,
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
     },
     window: { addEventListener: (name: string, fn: () => void) => { winListeners[name] = fn; } },
     location, sessionStorage: { getItem: () => null, setItem() {} },
-    URLSearchParams, URL, AbortController, Date, Element: FakeElement, HTMLInputElement: FakeInput,
+    URLSearchParams, URL, AbortController, TextDecoder, Date, Element: FakeElement, HTMLInputElement: FakeInput, Blob,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
     EventSource: class { addEventListener() {} close() {} },
     fetch: (url: string, init?: RequestInit) => {
       const path = url.replace(/([?&])_t=[^&]*&?/, "$1").replace(/[?&]$/, "");
-      if (overrides[path]) return overrides[path]!(init);
+      requests.push({ url: path, init });
+      if (overrides[path]) return overrides[path]!(init, path);
+      const bare = path.split("?")[0]!;
+      if (overrides[bare]) return overrides[bare]!(init, path);
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
     ...extraGlobals,
@@ -230,12 +275,22 @@ function boot(overrides: Record<string, (init?: RequestInit) => unknown> = {}, e
   const click = (attrs: Record<string, string>, inside: string[] = [], checked = false) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
-    target.checked = checked;
+    // Both forms stay: slice 5's tests pass `checked: "true"` in attrs, slice 4's pass the third argument.
+    target.checked = checked || attrs.checked === "true";
+    docListeners.click!({ target });
+  };
+  const clickRenderedButton = (action: string) => {
+    const markup = [...el.main!.innerHTML.matchAll(/<button\b([^>]*)>/g)].find(m => m[1]!.includes(`data-action="${action}"`));
+    expect(markup, `rendered ${action} button`).toBeDefined();
+    expect(markup![1]).not.toMatch(/\bdisabled\b/);
+    const attrs = Object.fromEntries([...markup![1]!.matchAll(/([\w-]+)="([^"]*)"/g)].map(m => [m[1]!, m[2]!]));
+    const target = new FakeElement(attrs, "BUTTON");
     docListeners.click!({ target });
   };
   const type = (text: string) => { el["global-search"]!.value = text; docListeners.input!({ target: el["global-search"] }); };
   const change = (target: FakeElement) => docListeners.change!({ target });
-  return { el, railLink, context, navigate, click, type, change };
+  const input = (action: string, value: string) => { const target = new FakeInput({ "data-action": action }); target.value = value; docListeners.input!({ target }); };
+  return { el, railLink, context, navigate, click, clickRenderedButton, type, change, input, requests, downloads };
 }
 async function settle() { for (let i = 0; i < 100; i++) await Promise.resolve(); } // Finite boot microtask drain.
 afterEach(() => {
@@ -358,19 +413,24 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("enforcement");
     const main = h.el.main!.innerHTML;
-    expect(main).toContain("<strong>4</strong> outbound connections blocked at the kernel");
-    expect(main).toMatch(/<strong class="unknown-value">Unknown<\/strong> allowed/);
+    // Both counts need the common positive gate; an unverified read is not a measured zero.
+    expect(main).toContain("Not evaluated");
+    // This home fixture serves no chain_verdict, so the chain gate withholds its counts.
+    expect(main).toContain("chain not verified");
     expect(main).not.toContain("<strong>0</strong>");
     expect(main).not.toMatch(/\b0 allowed/);
     expect(main).not.toMatch(/of 4 observed/);
   });
 
-  it("the Enforcement egress line keeps its denominator when both kernel counts are read", async () => {
+  it("the Enforcement egress card renders separate verified kernel counts", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/posture/home": () => Promise.resolve(response(home({ kernel_blocks: 4, kernel_allows: 2 }))) });
+    const h = boot({ "/api/posture/home": () => Promise.resolve(response(home({ kernel_blocks: 4, kernel_allows: 2, chain_verified: true, chain_verdict: "verified", window_complete: true, kernel_allow_overrides: 0, window_start: new Date(Date.now() - 1000).toISOString(), window_end: new Date().toISOString() }))) });
     await settle();
     h.navigate("enforcement");
-    expect(h.el.main!.innerHTML).toContain("<strong>4</strong> of 6 observed outbound connections blocked at the kernel; 2 allowed.");
+    // The fixture serves the clean flag and verdict together; counts remain independent served values.
+    expect(h.el.main!.innerHTML).toContain("Blocked <strong>4</strong>");
+    expect(h.el.main!.innerHTML).toContain("Allowed <strong>2</strong>");
+    expect(h.el.main!.innerHTML).not.toContain("of 6");
   });
 
   it("the Approvals and seal copy claim only what the paths do", async () => {
@@ -441,8 +501,8 @@ describe("slice 2 shell wired consumers", () => {
 
     const messages = runInContext("capturedToasts.map(function (toast) { return toast.message; })", h.context) as string[];
     expect(messages).toHaveLength(2);
-    expect(messages[0]).toContain('Sanctuary cannot apply "Remove protection" for this agent: unsupported request refused');
-    expect(messages[1]).toContain('"Remove protection" failed: controller unavailable');
+    expect(messages[0]).toContain('Sanctuary cannot apply "Remove protection" for this agent.');
+    expect(messages[1]).toContain('"Remove protection" failed. Try again.');
     for (const message of messages) {
       expect(message).toContain("Remove protection");
       expect(message).not.toMatch(/wrap/i);
@@ -503,6 +563,33 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("activity");
     expect(h.el.main!.innerHTML).toContain("Nothing pending.");
+  });
+
+  it("Evidence says entries are Unknown when the verification read has not answered", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-10T12:00:00Z"));
+    const h = boot({ "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")) });
+    await settle();
+    const select = new FakeElement({ "data-action": "time-range" }) as FakeElement & { tagName: string };
+    select.tagName = "SELECT";
+    select.value = "24h";
+    h.navigate("activity");
+    // The operator picks the 24 hours range in the top bar.
+    h.change(select);
+    const main = h.el.main!.innerHTML;
+    expect(main).toContain("Entries Unknown");
+    expect(main).toContain("Chain verification Unknown");
+    expect(main).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("Evidence says no entries match only after the server evidence read loads", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })),
+    });
+    await settle();
+    h.navigate("activity");
+    expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
   });
 
   it("the Approvals subtitle says where each decision is recorded", async () => {
@@ -958,7 +1045,7 @@ describe("slice 2b shell wired consumers", () => {
     return html.slice(start, next < 0 ? html.length : next);
   };
   const agentListRowHtml = (html: string, id: string) =>
-    rowSlice(html, '<div class="agent-row', `data-agent-id="${escapedAttr(id)}"`);
+    rowSlice(html, '<tr>', `data-agent-id="${escapedAttr(id)}"`);
   const fortressAgentRowHtml = (html: string, id: string) =>
     rowSlice(html, '<div class="row agent-row"', `data-agent-row="${escapedAttr(id)}"`);
 
@@ -1506,7 +1593,7 @@ describe("slice 2b shell wired consumers", () => {
       h.navigate(route);
       await settle();
       const html = h.el.main!.innerHTML;
-      expect(textOf(html), route).not.toMatch(retired);
+      expect(textOf(html) + h.el["toast-host"]!.textContent, route).not.toMatch(retired);
       for (const a of attrsOf(html)) expect(a, route).not.toMatch(retired);
     }
     h.navigate("activity");
@@ -1548,20 +1635,16 @@ describe("slice 2b shell wired consumers", () => {
     await settle();
     h.navigate("agents");
     const html = h.el.main!.innerHTML;
-    const dot = (id: string) => {
-      const row = agentListRowHtml(html, id);
-      return row.match(/<span class="state-dot ([^"]+)"><\/span>([^<]*)<\/span>/);
-    };
+    const chip = (id: string) => agentListRowHtml(html, id);
     const unwrappingLabel = runInContext("STATUS_MAP.unwrapping.label", h.context) as string;
     const unwrappingGlyph = STATUS_MAPPING.unwrapping.glyph;
     const { dot: unwrappingDot, tone: unwrappingTone } = GLYPH_TO_MARK[unwrappingGlyph]!;
-    expect(dot("no-evidence")![1]).toBe("unknown");
-    expect(dot("no-evidence")![2]).toBe("Unknown");
-    expect(dot("paused-one")![1]).toBe("idle");
-    expect(dot("unwrapping-one")![1]).toBe(unwrappingDot);
-    expect(dot("unwrapping-one")![2]).toBe(unwrappingLabel);
-    expect(dot("locked-one")![1]).toBe("locked");
-    expect(dot("off-enum")![1]).toBe("unknown");
+    expect(chip("no-evidence")).toContain('state-chip unknown');
+    expect(chip("no-evidence")).toContain("UNKNOWN");
+    expect(chip("paused-one")).toContain("PAUSED");
+    expect(chip("unwrapping-one")).toContain(unwrappingLabel.toUpperCase());
+    expect(chip("locked-one")).toContain('state-chip locked');
+    expect(chip("off-enum")).toContain('state-chip unknown');
     // The inspect pane's pill wears the same Unknown tone as its dot, and
     // an activity row without a verdict wears the neutral mark, not a pass.
     runInContext(`state.chat.inspect.panelByAgentId["no-evidence"] = { recent_activity: [{ emitted_at: "2026-10-13T00:00:00.000Z", display_template_id: "activity.egress", display_template_args: [] }], pending_approvals: [], policy_summary: null, opened_at: "2026-10-13T00:00:00.000Z" };`, h.context);
@@ -1603,7 +1686,7 @@ describe("slice 2b shell wired consumers", () => {
       expect(runInContext("STATUS_MAP[__agentStatus].glyph", h.context), status).toBe(expectedGlyph);
       expect(runInContext("agentStateClass(__agentStatus)", h.context), status).toBe(expectedDot);
       const listHtml = h.el.main!.innerHTML;
-      expect(agentListRowHtml(listHtml, id), status).toContain(`<span class="state-dot ${expectedDot}"></span>`);
+      expect(agentListRowHtml(listHtml, id), status).toContain(status === "active" ? "RUNNING" : STATUS_MAPPING[status].label.toUpperCase());
       runInContext("state.chat.inspect.panelByAgentId[__agentId] = { recent_activity: [], pending_approvals: [], policy_summary: null, opened_at: '2026-10-14T00:00:00.000Z' }; state.selectedAgentId = __agentId;", h.context);
       const pane = runInContext("renderAgentInspectPanel(state.agents.find(function (a) { return a.agent_id === __agentId; }))", h.context) as string;
       const detail = runInContext("renderAgentDetail()", h.context) as string;
@@ -1616,14 +1699,19 @@ describe("slice 2b shell wired consumers", () => {
 
   it("the Evidence filter form renders each filter as a labelled field", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem] } })) });
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })),
+    });
     await settle();
     h.navigate("activity");
     const html = h.el.main!.innerHTML;
-    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter the inbox">([\s\S]*?)<\/div>/);
+    const bar = html.match(/<div class="filter-bar" role="group" aria-label="Filter evidence entries">([\s\S]*?)<\/div>/);
     expect(bar, "filter bar").toBeTruthy();
     const labels = [...bar![1]!.matchAll(/<label class="field"><span class="field-label">([^<]+)<\/span><(input|select) class="input"/g)].map((m) => m[1]);
-    expect(labels).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    // The activity route's first filter bar is now the Evidence query bar; the kept inbox bar's six labels are
+    // pinned in "keeps the old Activity inbox, agent, Recognition and batch controls on Evidence".
+    expect(labels).toEqual(["Layer", "Agent", "Event", "Result", "From"]);
+    expect(bar![1]).toContain("Query");
     expect(bar![1]).not.toContain("<br>");
   });
 
@@ -1640,6 +1728,549 @@ describe("slice 2b shell wired consumers", () => {
     expect(out.match(/<span class="trend-bar (good|warn|pending)"/g)).toHaveLength(4);
     expect(textOf(out).replace(/\s+/g, " ").trim()).toBe("2 went ahead 1 stopped 1 other");
   });
+});
+
+describe("slice 5 Evidence wired consumers", () => {
+  const now = "2026-10-14T17:00:00.000Z";
+  const evidencePayload = (overrides: Record<string, unknown> = {}) => ({
+    origin_machine: "fixture-mac",
+    // Served oldest first, as AuditLog.query returns its most recent page; the table lists it newest first.
+    entries: [
+      {
+        timestamp: "2026-10-14T16:57:00.000Z",
+        layer: "l2",
+        identity_id: "sentinel-agent",
+        operation: "sentinel_finding",
+        result: "success",
+        details: { summary: "Finding opened" },
+      },
+      {
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer: "l1",
+        identity_id: "research-agent",
+        operation: "egress",
+        result: "failure",
+        details: {
+          destination: "198.51.100.23:8080",
+          rule_id: "policy-v41/rule-2",
+          agent_saw: "<script>alert(1)</script>",
+          event_text: "<img src=x onerror=alert(1)>",
+        },
+      },
+    ],
+    total: 2,
+    integrity_findings: [],
+    chain_verdict: "verified",
+    sealed_region: { status: "not_present" },
+    ...overrides,
+  });
+  const bootEvidence = async (
+    evidence: Record<string, unknown> = evidencePayload(),
+    overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {},
+    extraGlobals: Record<string, unknown> = {},
+  ) => {
+    const h = boot({
+      "/api/posture/evidence": () => Promise.resolve(response(evidence)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      ...overrides,
+    }, extraGlobals);
+    await settle();
+    h.navigate("activity");
+    await settle();
+    return h;
+  };
+
+  it("renders every audit-chain verdict in its own words, plus failed and missing reads", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+
+    const cases: Record<AuditChainVerdictStatus, { body: Record<string, unknown>; text: string }> = {
+      verified: { body: evidencePayload(), text: "CHAIN VERIFIED" },
+      verified_suffix_only: { body: evidencePayload({ chain_verdict: "verified_suffix_only", sealed_region: { status: "unreadable", note: "operator privilege cannot read sealed region" } }), text: "RECENT ENTRIES VERIFIED" },
+      findings: { body: evidencePayload({ chain_verdict: "findings", integrity_findings: [{ kind: "entry_hash_mismatch", message: "entry mismatch" }] }), text: "INTEGRITY FINDINGS" },
+      key_unavailable: { body: evidencePayload({ chain_verdict: "key_unavailable" }), text: "NOT VERIFIED" },
+    };
+    expect(Object.keys(cases).sort()).toEqual(unionValues("AuditChainVerdictStatus"));
+    for (const status of Object.keys(cases) as AuditChainVerdictStatus[]) {
+      const h = await bootEvidence(cases[status].body);
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain(cases[status].text);
+      if (status !== "verified") expect(html).not.toContain("CHAIN VERIFIED");
+      expect(html, status).toContain("sealed region:");
+      // The read's age is stated on every verdict, never as a verification time.
+      expect(html, status).toContain("age of this read:");
+      expect(html, status).not.toContain("last verified");
+      expect(html, status).not.toContain("signer");
+      expect(html, status).not.toContain("head <span");
+    }
+    const failed = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": () => Promise.reject(new Error("verification offline.")),
+    });
+    expect(failed.el.main!.innerHTML).toContain("Chain verification Unknown");
+    expect(failed.el.main!.innerHTML).toContain("verification offline");
+    const missing = await bootEvidence(evidencePayload(), { "/api/posture/evidence": never });
+    expect(missing.el.main!.innerHTML).toContain("Chain verification Unknown");
+    expect(missing.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+  });
+
+  it("a served finding reads as INTEGRITY FINDINGS under any served verdict, and the findings line covers the whole chain", async () => {
+    for (const status of ["verified", "verified_suffix_only", "key_unavailable"] as const) {
+      const h = await bootEvidence(evidencePayload({ chain_verdict: status, integrity_findings: [{ kind: "entry_hash_mismatch", message: "entry mismatch" }] }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("INTEGRITY FINDINGS");
+      expect(html, status).not.toContain("CHAIN VERIFIED");
+      expect(html, status).not.toContain("RECENT ENTRIES VERIFIED");
+    }
+    const clean = await bootEvidence(evidencePayload());
+    expect(clean.el.main!.innerHTML).toContain("integrity findings reported for the whole chain");
+    expect(clean.el.main!.innerHTML).not.toContain("findings in window");
+  });
+
+  it("words every served sealed region status, over the full SealedRegionVerdict union", async () => {
+    const statuses = unionStatusValues("SealedRegionVerdict");
+    expect(statuses.length).toBeGreaterThan(0);
+    for (const status of statuses) {
+      const h = await bootEvidence(evidencePayload({ sealed_region: { status, entries_verified: 3, note: "fixture note", expected_tip: 9, highest_present: 7, sequence: 4 } }));
+      const html = h.el.main!.innerHTML;
+      expect(html, status).toContain("sealed region: ");
+      expect(html, status).not.toContain("sealed region: Unknown");
+    }
+    const unknown = await bootEvidence(evidencePayload({ sealed_region: { status: "not_a_served_status" } }));
+    expect(unknown.el.main!.innerHTML).toContain("sealed region: Unknown");
+  });
+
+  it("renders only served entry fields and result words, never chain verdict words as entry results", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: [
+        {
+          timestamp: "2026-10-14T16:58:00.000Z",
+          layer: "l3",
+          operation: "proof_commitment",
+          identity_id: "",
+          result: "success",
+          details: { summary: "served field only" },
+        },
+      ],
+      total: 1,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("agent not named");
+    expect(html).toContain("proof_commitment");
+    expect(html).toContain("Success");
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table).not.toMatch(/VERIFIED|BROKEN|Verdict/);
+    expect(table).toContain("<th>Result</th>");
+    expect(html).not.toContain("<td><span class=\"row\">fortress</span></td>");
+    expect(html).not.toContain("<th>Seq</th>");
+    expect(html).not.toContain("<th>Seal</th>");
+  });
+
+  it("the Evidence subtitle names the audit log and claims neither completeness nor tamper evidence", async () => {
+    const h = await bootEvidence(evidencePayload());
+    const sub = h.el.main!.innerHTML.match(/<p class="eyebrow">Evidence<\/p>[\s\S]*?<p class="sub">([^<]*)<\/p>/)?.[1] ?? "";
+    expect(sub).toContain("audit log");
+    // Integrity is the strip's to state from the served verdict, and inbox decisions are not in this log.
+    expect(sub).not.toMatch(/tamper|everything/i);
+  });
+
+  it("maps layer names to frozen tokens and sends every server filter as the route param", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: ["l1", "l2", "l3", "l4"].map((layer) => ({
+        timestamp: "2026-10-14T16:58:00.000Z",
+        layer,
+        identity_id: "agent-" + layer,
+        operation: "event-" + layer,
+        result: "success",
+        details: {},
+      })),
+      total: 4,
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Castle Wall");
+    expect(html).toContain("Sentinels");
+    expect(html).toContain("Charter");
+    expect(html).toContain("Heralds");
+    const layers = { l1: "Castle Wall", l2: "Sentinels", l3: "Charter", l4: "Heralds" };
+    const routeSource = readFileSync(new URL("../../../src/principal-policy/posture-routes.ts", import.meta.url), "utf8");
+    const servedLayers = JSON.parse("[" + routeSource.match(/const validLayers = \[([^\]]+)\]/)![1] + "]");
+    expect(Object.keys(layers).sort()).toEqual(servedLayers.sort());
+    for (const [token, name] of Object.entries(layers)) {
+      h.navigate("activity?layer=" + token);
+      await settle();
+      expect(h.el.main!.innerHTML).toContain('value="' + token + '" selected>' + name);
+      expect(h.requests.at(-1)!.url).toContain("layer=" + token);
+      const select = new FakeElement({ "data-action": "evidence-filter-layer" }, "SELECT");
+      select.value = ""; h.change(select); await settle();
+      select.value = token; h.change(select); await settle();
+      expect(runInContext("location.hash", h.context)).toContain("layer=" + token);
+      expect(h.requests.at(-1)!.url).toContain("layer=" + token);
+    }
+    h.input("evidence-filter-agent", "agent-alpha");
+    h.input("evidence-filter-event", "egress");
+    const result = new FakeElement({ "data-action": "evidence-filter-result" }, "SELECT");
+    result.value = "failure"; h.change(result);
+    h.input("evidence-filter-from", "2026-10-14");
+    await settle();
+    const request = new URL(h.requests.at(-1)!.url, "http://fixture");
+    // The From date is the operator's calendar date, so it is sent as that date's local midnight.
+    expect(Object.fromEntries(request.searchParams)).toEqual({ layer: "l4", agent: "agent-alpha", operation_type: "egress", result: "failure", since: new Date(2026, 9, 14).toISOString(), limit: "50" });
+    h.navigate("activity"); await settle();
+    expect(h.requests.at(-1)!.url).toBe("/api/posture/evidence?limit=50");
+  });
+
+  it("the top-bar time range narrows the entries read, and the later of it and the From date starts the window", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-14T17:00:30.000Z"));
+    const h = await bootEvidence(evidencePayload());
+    expect(h.el.main!.innerHTML).toContain("Time range: all time");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    // The range start is rounded down to the minute.
+    const rangeStart = "2026-10-13T17:00:00.000Z";
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(rangeStart);
+    expect(h.el.main!.innerHTML).toContain("Time range: the last 24 hours");
+    h.input("evidence-filter-from", "2026-10-14");
+    await settle();
+    const later = new Date(Math.max(new Date(2026, 9, 14).getTime(), Date.parse(rangeStart))).toISOString();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.get("since")).toBe(later);
+    h.input("evidence-filter-from", "");
+    range.value = "all"; h.change(range);
+    await settle();
+    expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since")).toBe(false);
+  });
+
+  it("drops a From value that is not a real calendar date instead of sending a window that matches nothing", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const h = await bootEvidence(evidencePayload());
+    for (const bad of ["garbage", "2026-02-30", "2026-1-5"]) {
+      h.navigate("activity?from=" + encodeURIComponent(bad));
+      await settle();
+      expect(new URL(h.requests.at(-1)!.url, "http://fixture").searchParams.has("since"), bad).toBe(false);
+      expect(h.el.main!.innerHTML, bad).toContain("From: Any");
+      expect(h.el.main!.innerHTML, bad).not.toContain("From: " + bad);
+    }
+  });
+
+  it("narrows free-text search only over the loaded page and keeps total as the served window count", async () => {
+    const h = await bootEvidence({
+      ...evidencePayload(),
+      entries: [
+        { timestamp: "2026-10-14T16:57:00.000Z", layer: "l2", identity_id: "two", operation: "other_event", result: "failure", details: { summary: "hay" } },
+        { timestamp: "2026-10-14T16:58:00.000Z", layer: "l1", identity_id: "one", operation: "matched_event", result: "success", details: { summary: "needle" } },
+      ],
+      total: 99,
+    });
+    const before = h.requests.length;
+    h.input("evidence-filter-query", "needle");
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(h.requests.length).toBe(before);
+    expect(html).toContain("showing 1 of 99");
+    expect(html).toContain("searching the 2 entries loaded");
+    expect(html).toContain("matched_event");
+    expect(html).not.toContain("other_event");
+    expect(html).toContain("entries in the served window before page limit and result filter");
+  });
+
+  it("renders hostile details as text and makes no per-entry seal claim when seal fields are absent", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).not.toContain("<img src=x onerror=alert(1)>");
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("Per-entry seal data is not served by this read");
+    expect(html).not.toContain("link ok");
+    expect(html).not.toContain("authenticity verified");
+    expect(html).not.toContain("broken");
+  });
+
+  it("exports JSON through api with the operator token and keeps unavailable exports disabled with reasons", async () => {
+    const blobs: Blob[] = [];
+    const exportedEntry = { timestamp: now, layer: "l1", operation: "egress", identity_id: "research-agent", result: "failure" };
+    const servedBody = { entries: [exportedEntry], total: 1, integrity_findings: [] };
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": (init) => {
+        expect(init?.headers).toMatchObject({ Authorization: "Bearer operator-token" });
+        // Must match the served shape pinned in test/principal-policy/dashboard-audit-log-route-shape.test.ts:
+        // with an audit log wired, handleAuditLog answers with the AuditLog.query result object.
+        return Promise.resolve(response(servedBody));
+      },
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL(blob: Blob) { blobs.push(blob); return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="evidence-export-json"');
+    expect(html).toContain("CEF export is available from the audit_export_siem tool");
+    expect(html).toContain("Compliance bundle export is Tier 1");
+    expect(html).toContain('href="#exit-drill"');
+    expect(html).toContain('href="/posture/evidence"');
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
+    expect(h.downloads).toHaveLength(1);
+    expect((h.downloads[0] as unknown as { download: string }).download).toBe("sanctuary-audit-log.json");
+    expect(JSON.parse(await blobs[0]!.text())).toEqual(servedBody);
+    expect(h.el["toast-host"]!.innerHTML).toContain("Downloaded the latest 1 audit entry as JSON");
+  });
+
+  it("the JSON export reports a served result object with no entries as no entries, never as a downloaded log", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response({ entries: [], total: 0, integrity_findings: [] })),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("export failed");
+  });
+
+  it("the JSON export names its bound and reports an empty audit log read instead of downloading a file", async () => {
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/audit-log": () => Promise.resolve(response([])),
+    }, {
+      sessionStorage: { getItem: (key: string) => key === "authToken" ? "operator-token" : null, setItem() {} },
+      URL: class extends URL { static createObjectURL() { return "blob:fixture"; } static revokeObjectURL() {} },
+    });
+    expect(h.el.main!.innerHTML).toContain("JSON: latest 50 audit entries");
+    h.click({ "data-action": "evidence-export-json" });
+    await settle();
+    expect(h.requests.some((r) => r.url.startsWith("/api/audit-log"))).toBe(true);
+    // The label's bound is the audit log route's own default limit, read from its source.
+    const dashboardSource = readFileSync(new URL("../../../src/principal-policy/dashboard.ts", import.meta.url), "utf8");
+    const routeDefault = dashboardSource.match(/private handleAuditLog\(url: URL[^]*?searchParams\.get\("limit"\) \?\? "(\d+)"/)![1];
+    expect(h.el.main!.innerHTML).toContain("JSON: latest " + routeDefault + " audit entries");
+    expect(h.downloads).toHaveLength(0);
+    expect(h.el["toast-host"]!.innerHTML).toContain("No audit entries were returned, so nothing was exported.");
+    expect(h.el["toast-host"]!.innerHTML).not.toContain("downloaded");
+  });
+
+  it("a result filter says it checks only the most recent page while the count covers every result", async () => {
+    const h = await bootEvidence(evidencePayload({ total: 120 }));
+    expect(h.el.main!.innerHTML).not.toContain("data-evidence-result-scope");
+    const result = new FakeElement({ "data-action": "evidence-filter-result" }, "SELECT");
+    result.value = "failure"; h.change(result);
+    await settle();
+    const html = h.el.main!.innerHTML;
+    expect(h.requests.at(-1)!.url).toContain("result=failure");
+    expect(html).toContain("showing 2 of 120");
+    expect(html).toContain("The result filter checks the 50 most recent entries in the window; 120 counts entries of every result.");
+  });
+
+  it("the Evidence inbox decides only Tier 2 approvals inline and sends Tier 1 and unknown tiers to Approvals", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const inboxItems = [
+      { ...heldItem, item_id: "t1", tier: "tier1", created_at: "2026-10-14T16:50:00.000Z" },
+      { ...heldItem, item_id: "t2", tier: "tier2", created_at: "2026-10-14T16:51:00.000Z" },
+      { ...heldItem, item_id: "tx", tier: undefined, created_at: "2026-10-14T16:52:00.000Z" },
+    ];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2"');
+    expect(html).toContain('data-action="inbox-deny" data-item-id="t2"');
+    // The one-time decision reads the same as on the Overview and the Approvals screen.
+    expect(html).toContain('data-action="inbox-approve" data-item-id="t2">Allow once</button>');
+    expect(html).not.toContain(">Approve</button>");
+    for (const id of ["t1", "tx"]) {
+      expect(html).not.toContain('data-action="inbox-approve" data-item-id="' + id + '"');
+      expect(html).not.toContain('data-action="inbox-deny" data-item-id="' + id + '"');
+      expect(html).toContain('href="#approvals" data-evidence-review="' + id + '">Review in Approvals</a>');
+    }
+  });
+
+  it("keeps the old Activity inbox, agent, Recognition and batch controls on Evidence", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const inboxItems = [
+      { ...heldItem, item_id: "t1", tier: "tier1", created_at: "2026-10-14T16:50:00.000Z" },
+      { ...heldItem, item_id: "t2", tier: "tier2", created_at: "2026-10-14T16:51:00.000Z" },
+      { item_id: "privacy-1", kind: "privacy_event", display_template_id: "privacy_event.filtered", display_template_args: { agent_id: "agent-alpha" }, resolved: false, created_at: "2026-10-14T16:52:00.000Z" },
+    ];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: inboxItems } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [{ agent_id: "agent-alpha", status: "active", capabilities: { can_pause: true, can_resume: true, can_restart: true, can_lockdown: true } }] } })),
+      "/api/hub/recognition/did-web": () => Promise.resolve(response({ data: { configured: true, identifier: "did:web:example.com", days_until_recommended_rotation: 7, key_history: [] } })),
+      "/api/inbox/unified/batch": (init) => {
+        expect(init?.method).toBe("POST");
+        return Promise.resolve(response({ ok: true }));
+      },
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("This fortress");
+    expect(html).toContain("Inbox");
+    expect(html).toContain("Tier 1 approvals");
+    expect(html).toContain("Tier 2 approvals");
+    expect(html).toContain('class="inbox-group-head">Other</h4>');
+    expect(html).toContain("Inbox (3 of 3)");
+    expect(html).toContain("Agents (1)");
+    const bar = html.match(/aria-label="Filter the inbox">([\s\S]*?)<\/div>/)![1]!;
+    expect([...bar.matchAll(/field-label">([^<]+)/g)].map(m => m[1])).toEqual(["Search", "Source", "Severity", "Agent", "From", "To"]);
+    expect(html).toContain('data-action="agent-lockdown"');
+    expect(html).toContain("Recognition Layer health");
+    runInContext(`state.inboxOps.selected = { "privacy-1": true }; rerender();`, h.context);
+    const selectedHtml = h.el.main!.innerHTML;
+    expect(selectedHtml).toContain('data-action="inbox-batch-archive"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-dismiss"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-snooze-open"');
+    expect(selectedHtml).toContain('data-action="inbox-batch-delete"');
+    h.click({ "data-action": "inbox-batch-archive" });
+    await settle();
+    expect(h.requests.some((r) => r.url === "/api/inbox/unified/batch")).toBe(true);
+  });
+  it("keeps unknown statuses unknown and bounds findings, details, contributors and raw text", async () => {
+    const unknown = await bootEvidence(evidencePayload({ chain_verdict: "future_status" }));
+    expect(unknown.el.main!.innerHTML).toContain("status was not recognized");
+    expect(unknown.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+    const findings = Array.from({ length: 7 }, (_, i) => ({ kind: "entry_hash_mismatch", message: "finding-" + i + "<script>" + "x".repeat(300) }));
+    const h = await bootEvidence(evidencePayload({ chain_verdict: "verified", integrity_findings: findings }));
+    expect(h.el.main!.innerHTML).toContain("INTEGRITY FINDINGS");
+    expect(h.el.main!.innerHTML).toContain("showing 5 of 7 findings");
+    expect(h.el.main!.innerHTML).toContain("entry_hash_mismatch: finding-0&lt;script&gt;");
+    expect(h.el.main!.innerHTML).not.toContain("finding-5");
+    expect(h.el.main!.innerHTML).not.toContain("CHAIN VERIFIED");
+    const bounded = await bootEvidence(evidencePayload({ entries: [{ timestamp: now, layer: "l1", operation: "large_record", result: "failure", identity_id: "a", details: { huge: "z".repeat(7000) }, contributors: [{ plugin_id: "fixture-plugin" }] }] }));
+    const pane = bounded.el.main!.innerHTML.match(/<aside class="panel evidence-detail"[\s\S]*?<\/aside>/)![0];
+    expect(pane).toContain("truncated at 240 chars");
+    expect(pane).toContain("truncated at 6000 chars");
+    expect(pane).toContain("contributors</dt>");
+    expect(pane).not.toContain("z".repeat(6001));
+  });
+
+  it("lists the served page newest first and opens the newest entry in the record pane", async () => {
+    const h = await bootEvidence();
+    const html = h.el.main!.innerHTML;
+    const table = html.match(/<table class="overview-table evidence-table">([\s\S]*?)<\/table>/)![1]!;
+    expect(table.indexOf("egress")).toBeGreaterThan(-1);
+    expect(table.indexOf("egress")).toBeLessThan(table.indexOf("sentinel_finding"));
+    expect(html).toMatch(/<aside class="panel evidence-detail"[\s\S]*?198\.51\.100\.23:8080/);
+  });
+
+  it("selects each served record through its rendered control", async () => {
+    const h = await bootEvidence();
+    const controls = [...h.el.main!.innerHTML.matchAll(/data-action="evidence-select" data-evidence-index="(\d+)"/g)];
+    expect(controls).toHaveLength(2);
+    h.click({ "data-action": "evidence-select", "data-evidence-index": controls[1]![1]! });
+    expect(h.el.main!.innerHTML).toMatch(/<aside class="panel evidence-detail"[\s\S]*?sentinel_finding/);
+    expect(h.el.main!.innerHTML).toMatch(/<tr class="sel"[^>]*data-evidence-row="1"/);
+  });
+
+  it("distinguishes a server filter with no match from an empty log", async () => {
+    const h = await bootEvidence(evidencePayload({ entries: [], total: 17 }));
+    h.navigate("activity?result=failure"); await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+    expect(h.el.main!.innerHTML).toContain("showing 0 of 17");
+    const empty = await bootEvidence(evidencePayload({ entries: [], total: 0 }));
+    expect(empty.el.main!.innerHTML).toContain("No audit entries in this view");
+    empty.navigate("activity?agent=absent"); await settle();
+    expect(empty.el.main!.innerHTML).toContain("No entries match this view");
+  });
+
+  it("reads a time range that matches nothing as a filtered view, not an empty log", async () => {
+    const h = await bootEvidence(evidencePayload({ entries: [], total: 0 }));
+    expect(h.el.main!.innerHTML).toContain("No audit entries in this view");
+    const range = new FakeElement({ "data-action": "time-range" }, "SELECT");
+    range.value = "24h"; h.change(range);
+    await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+    expect(h.el.main!.innerHTML).toContain("0 entries were loaded for the last 24 hours.");
+    expect(h.el.main!.innerHTML).toContain("Clear filters keeps the time range; change it in the top bar.");
+    expect(h.el.main!.innerHTML).not.toContain("No audit entries in this view");
+  });
+
+  it("keeps obsolete filter responses hidden until the latest filtered read completes", async () => {
+    vi.useFakeTimers();
+    let release!: (value: unknown) => void;
+    let filtered = false;
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": (_init, url) => {
+        if (url?.includes("agent=second")) { filtered = true; return new Promise(resolve => { release = resolve; }); }
+        return Promise.resolve(response(evidencePayload()));
+      },
+    });
+    h.input("evidence-filter-agent", "second"); await settle();
+    expect(filtered).toBe(true);
+    expect(h.el.main!.innerHTML).toContain("Entries Unknown");
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Selected entry"');
+    release(response(evidencePayload({ entries: [], total: 0 }))); await settle();
+    expect(h.el.main!.innerHTML).toContain("No entries match this view");
+  });
+
+  it("an older filter's response that settles after the filter changed never publishes its rows", async () => {
+    vi.useFakeTimers();
+    const held: Record<string, (value: unknown) => void> = {};
+    const requested: string[] = [];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/posture/evidence": (_init, url) => {
+        const agent = new URL(url!, "http://fixture").searchParams.get("agent");
+        if (agent === "first" || agent === "second") { requested.push(agent); return new Promise(resolve => { held[agent] = resolve; }); }
+        return Promise.resolve(response(evidencePayload()));
+      },
+    });
+    const only = (operation: string) => evidencePayload({ entries: [{ timestamp: "2026-10-14T16:59:00.000Z", layer: "l1", identity_id: "agent-x", operation, result: "success", details: {} }], total: 1 });
+    h.input("evidence-filter-agent", "first"); await settle();
+    h.input("evidence-filter-agent", "second"); await settle();
+    expect(requested).toEqual(["first"]);
+    // The first read settles after the filter moved on: its rows must not appear under the second filter. The
+    // trailing read already marks the source loading, so the screen alone cannot tell; the revision check in
+    // readResponse is what keeps the stale answer out of the view state, so the test reads that state too.
+    held.first!(response(only("first_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+    expect(runInContext("JSON.stringify(state.evidence.view)", h.context)).not.toContain("first_filter_operation");
+    expect(requested).toEqual(["first", "second"]);
+    held.second!(response(only("second_filter_operation"))); await settle();
+    expect(h.el.main!.innerHTML).toContain("second_filter_operation");
+    expect(h.el.main!.innerHTML).not.toContain("first_filter_operation");
+  });
+
+  it("restores Inbox unknown and redacted states and the served fortress identity", async () => {
+    vi.useFakeTimers();
+    const h = await bootEvidence(evidencePayload(), { "/api/hub/inbox": never });
+    expect(h.el.main!.innerHTML).toContain("Inbox (Unknown)");
+    expect(h.el.main!.innerHTML).not.toContain("Nothing pending.");
+    runInContext('config.tenantName = "Fixture tenant"; config.fortressId = "fixture-fortress"; config.identityId = "fixture-operator"; rerender();', h.context);
+    expect(h.el.main!.innerHTML).toContain("fixture-operator");
+    expect(h.el.main!.innerHTML).toContain("Fixture tenant");
+    const redacted = await bootEvidence(evidencePayload(), { "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [], pending_approvals_redacted: true, pending_approvals_count: 3 } })) });
+    expect(redacted.el.main!.innerHTML).toContain("Approvals are hidden, not empty");
+  });
+
+  it("restores all Inbox kinds and drives every batch handler from its control", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(now));
+    const kinds = [...HUB_INBOX_KINDS];
+    const items = [...kinds.map(kind => ({ ...heldItem, kind, item_id: kind, created_at: now })), { ...heldItem, item_id: "decided-1", resolved: true, resolved_at: now, created_at: now }];
+    const h = await bootEvidence(evidencePayload(), {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/inbox/unified/batch": () => Promise.resolve(response({ ok: true })),
+      "/api/hub/inbox/privacy_event/dismiss": () => Promise.resolve(response({ data: {} })),
+    });
+    for (const kind of kinds) expect(h.el.main!.innerHTML).toContain('data-inbox-kind="' + kind + '"');
+    expect(h.el.main!.innerHTML).toContain("Decided approvals");
+    const decided = h.el.main!.innerHTML.match(/data-decided-approval="decided-1"([\s\S]*?)<\/section>/)![1]!;
+    expect(decided).toContain("Resolved");
+    expect(decided).not.toMatch(/data-action="inbox-(approve|deny)/);
+    for (const action of ["archive", "dismiss", "snooze", "delete"]) {
+      expect(h.el.main!.innerHTML).toContain('data-action="inbox-select" data-item-id="privacy_event"');
+      h.click({ "data-action": "inbox-select", "data-item-id": "privacy_event", checked: "true" });
+      const button = "inbox-batch-" + (action === "snooze" ? "snooze-open" : action);
+      expect(h.el.main!.innerHTML).toContain('data-action="' + button + '"');
+      h.click({ "data-action": button });
+      if (action === "snooze") {
+        for (const control of ["inbox-batch-snooze", "inbox-snooze-custom", "inbox-batch-snooze-custom", "inbox-batch-snooze-close"]) expect(h.el.main!.innerHTML).toContain('data-action="' + control + '"');
+        h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+      }
+      await settle();
+      if (action === "dismiss") expect(h.requests.some(r => r.url === "/api/hub/inbox/privacy_event/dismiss" && r.init?.method === "POST")).toBe(true);
+      else expect(h.requests.some(r => r.url === "/api/inbox/unified/batch" && JSON.parse(String(r.init?.body)).action === action)).toBe(true);
+    }
+  });
+
 });
 
 describe("slice 3 Overview wired consumers", () => {
@@ -1669,7 +2300,8 @@ describe("slice 3 Overview wired consumers", () => {
     display_template_args: [{ kind: "agent_id", value: agent_id }],
   });
   const overviewHome = (overrides: Record<string, unknown> = {}, digest: Record<string, unknown> = {}) => ({
-    ...home({ kernel_blocks: 3, kernel_allows: 7, chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: "2026-10-14T17:00:00.000Z", entry_count: 1284, ...digest }),
+    // A verified fixture serves both the verdict and its legacy clean flag.
+    ...home({ kernel_blocks: 3, kernel_allows: 7, chain_verdict: "verified", chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: "2026-10-14T17:00:00.000Z", entry_count: 1284, ...digest }),
     castle_wall: { arm_state: "armed", platform: "macOS kernel", ...evidence },
     agents: [{ agent_id: "research-agent", status: "active", harness: "claude_code", enforcement_active: "active", policy_protected: true, ...evidence }],
     unwrapped,
@@ -1727,7 +2359,7 @@ describe("slice 3 Overview wired consumers", () => {
     for (const label of ["Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
       expect(html).toContain(label);
     }
-    expect(html).toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
+    expect(html).toContain('class="state-chip good overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED');
     expect(html).not.toContain("Protected agents");
     expect(html).not.toContain("Enforcement confirmed");
     expect(html).not.toContain('<a class="overview-tile"');
@@ -1794,7 +2426,7 @@ describe("slice 3 Overview wired consumers", () => {
     const html = h.el.main!.innerHTML;
     expect(html).toContain("Castle Wall");
     expect(html).not.toContain("Enforcement confirmed");
-    expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(html).not.toContain("server reports 1");
   });
 
@@ -1828,9 +2460,10 @@ describe("slice 3 Overview wired consumers", () => {
     }, { chain_verified: true, window_end: "not-a-date" }));
     const html = h.el.main!.innerHTML;
     expect(html).toContain("UNKNOWN");
-    expect(html).toContain("NOT YET VERIFIED");
+    // A claimed verification with an invalid check time is explicitly Unknown.
+    expect(html).toContain("last verified Unknown");
     expect(html).toContain("last check Not evaluated");
-    expect(html).not.toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
+    expect(html).not.toContain('class="state-chip good overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED');
   });
 
   it("Overview state chips cover non-green wall and chain verdicts", async () => {
@@ -2084,6 +2717,686 @@ describe("slice 3 Overview wired consumers", () => {
     expect(html).toContain("PAUSED");
     expect(html).toContain("no activity reported");
     expect(html).not.toContain("CONFIRMED · <span>0s ago");
+  });
+});
+
+
+describe("slice 6a Agents wired consumers", () => {
+  const start = async (name = "protected", overrides: Record<string, (init?: RequestInit) => unknown> = {}) => {
+    vi.useFakeTimers();
+    const sc = agentsScenario(name);
+    const h = boot({
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: sc.agents } })),
+      "/api/posture/home": () => Promise.resolve(response(sc.home)),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: sc.inbox } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: sc.activity } })),
+      "/api/hub/policies": () => Promise.resolve(response({ data: { policies: sc.policies } })),
+      "/api/posture/reach/research-agent": () => Promise.resolve(response(sc.reach)),
+      ...overrides,
+    });
+    await settle();
+    h.navigate("agents");
+    return { h, sc };
+  };
+  const detail = (h: Awaited<ReturnType<typeof start>>["h"]) => h.click({ "data-action": "open-agent", "data-agent-id": "research-agent" });
+
+  it("6a inventory reuses the Overview table and shows evidence-bearing tiles", async () => {
+    const { h } = await start();
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('class="overview-table overview-table-agents"');
+    for (const label of ["Total", "Protected of detected", "Ownerless", "At risk", "Policy template", "Reach (allowed of requested)"]) expect(html).toContain(label);
+    expect(html).toContain("1 of 1");
+    expect(html).toContain("Not evaluated");
+    expect(html).toContain("roster read");
+    const inventory = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1];
+    h.navigate("posture");
+    expect(h.el.main!.innerHTML).toContain(inventory);
+    const protectedAgent = await start("evidenced-protected");
+    const protectedTile = protectedAgent.h.el.main!.innerHTML.match(/<div class="overview-tile">(?:(?!<div class="overview-tile">)[\s\S])*?Protected of detected[\s\S]*?<\/div>/)![0];
+    expect(protectedTile).toContain('<span class="ot-value">1 of 1</span>');
+    detail(protectedAgent.h); await settle();
+    for (const region of [
+      protectedAgent.h.el.main!.innerHTML.match(/<header class="agent-entity-header">([\s\S]*?)<\/header>/)![1]!,
+      protectedAgent.h.el.main!.innerHTML.match(/<section class="card" aria-label="Standing">([\s\S]*?)<\/section>/)![1]!,
+    ]) {
+      expect(region).toContain('state-chip good');
+      expect(region).toContain("CONFIRMED");
+    }
+  });
+
+  it("6a inventory filters, sorts and pages the shared table with a bounded page", async () => {
+    const sc = agentsScenario();
+    const agents = Array.from({ length: 53 }, (_, i) => ({ ...sc.agents[0]!, agent_id: `agent-${String(i).padStart(2, "0")}`, harness: i % 2 ? "hermes" : "claude_code", status: i % 2 ? "paused" : "active" }));
+    const { h } = await start("protected", { "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })) });
+    expect(h.el.main!.innerHTML).toContain("showing 25 of 53");
+    h.click({ "data-action": "agents-page", "data-page": "1" });
+    expect(h.el.main!.innerHTML).toContain("agent-25");
+    expect(h.el.main!.innerHTML).not.toContain('data-agent-id="agent-00"');
+    const change = (action: string, value: string) => { const el = new FakeElement({ "data-action": action }, "SELECT"); el.value = value; h.change(el); };
+    change("agents-harness", "hermes");
+    change("agents-state", "paused");
+    expect(h.el.main!.innerHTML).toContain("showing 25 of 26");
+    change("agents-sort", "name-desc");
+    const rows = h.el.main!.innerHTML;
+    expect(rows.indexOf('data-agent-id="agent-51"')).toBeLessThan(rows.indexOf('data-agent-id="agent-49"'));
+    expect(rows).not.toContain('data-agent-id="agent-00"');
+  });
+
+  it("6a missing sources keep all inventory counts Unknown and stale protection is never green", async () => {
+    const { h } = await start("unknown");
+    expect(h.el.main!.innerHTML).toContain("Protected of detected");
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    detail(h);
+    expect(h.el.main!.innerHTML).toContain('aria-label="Standing"');
+    const unknownHeader = h.el.main!.innerHTML.match(/<header class="agent-entity-header">([\s\S]*?)<\/header>/)![1]!;
+    const unknownStanding = h.el.main!.innerHTML.match(/<section class="card" aria-label="Standing">([\s\S]*?)<\/section>/)![1]!;
+    for (const region of [unknownHeader, unknownStanding]) {
+      expect(region).toContain("UNKNOWN");
+      expect(region).not.toContain('state-chip good');
+    }
+    runInContext('state.posture.home.agents[0].policy_protected = false; rerender()', h.context);
+    expect(h.el.main!.innerHTML).toContain("No · roster intent; posture read");
+    runInContext('state.posture.home.agents = []; rerender()', h.context);
+    expect(h.el.main!.innerHTML).toContain("Unknown · no agent policy evidence served");
+    const missing = await start("unknown", { "/api/hub/agents": () => Promise.reject(new Error("offline")) });
+    expect(missing.h.el.main!.innerHTML).toContain("Total");
+    expect(missing.h.el.main!.innerHTML).not.toContain("0 of 0");
+    const sc = agentsScenario();
+    const evidence = { ...sc.home.agents![0]!, enforcement_active: "active", last_enforcement_evidence_at: new Date().toISOString(), freshness_window_ms: 1000 };
+    const fresh = await start("protected", { "/api/posture/home": () => Promise.resolve(response({ ...sc.home, agents: [evidence] })) });
+    detail(fresh.h); await settle();
+    expect(fresh.h.el.main!.innerHTML).toContain('state-chip good');
+    // A one-second fixture window plus one millisecond proves autonomous header/Standing expiry.
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(fresh.h.el.main!.innerHTML).not.toContain('state-chip good');
+    expect(fresh.h.el.main!.innerHTML).toContain("UNKNOWN");
+  });
+
+  it("6a empty fortress has one first-run action and no inventory wall of zeros", async () => {
+    const { h } = await start("empty");
+    expect(h.el.main!.innerHTML).toContain('data-agents-first-run');
+    expect(h.el.main!.innerHTML).toContain("sanctuary protect");
+    expect(h.el.main!.innerHTML.match(/class="btn"/g)).toHaveLength(1);
+    expect(h.el.main!.innerHTML).not.toContain('class="overview-tiles"');
+  });
+
+  it("6a entity header shares every lifecycle label and keeps unsupported controls disabled", async () => {
+    const { h } = await start(); detail(h);
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('aria-label="Breadcrumb"');
+    expect(html).toContain('aria-label="Agent sections"');
+    expect(html).toContain("Lock down this agent");
+    expect(html).toContain("Rotate identity");
+    expect(html).toContain("Tier 1");
+    expect(html).toMatch(/data-action="agent-unwrap"[^>]*disabled[^>]*>Remove protection/);
+    expect(html).toMatch(/data-action="agent-pause"[^>]*disabled/);
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) {
+      const label = runInContext(`agentControlLabel("${action}")`, h.context) as string;
+      expect(html).toContain(label);
+      expect(runInContext("renderFortressAgentsCard()", h.context)).toContain(label);
+    }
+  });
+
+  for (const [tab, text] of [["overview", "Standing"], ["approvals", "This agent's approvals"], ["activity", "Recent activity"], ["policy", "Effective reach"], ["identity", "Fingerprint"], ["memory", "Memory inventory unavailable"], ["evidence", "Agent evidence"]]) {
+    it(`6a ${tab} tab consumes its served source or states the specific gap`, async () => {
+      const { h } = await start("pending-tier1"); detail(h);
+      h.click({ "data-action": "agent-tab", "data-tab": tab! });
+      await settle();
+      const html = h.el.main!.innerHTML;
+      expect(html).toContain(`data-agent-tab="${tab}"`);
+      expect(html).toContain(text);
+      if (tab === "policy") {
+        for (const lane of ["May reach", "Asks you first", "Never"]) expect(html).toContain(lane);
+        expect(html).toContain("Research policy");
+        expect(html).toContain("version Unknown");
+      }
+      // Custody has no served evidence, matching the other unknown identity fields.
+      if (tab === "identity") expect(html).toContain("Unknown · custody evidence not served");
+      if (tab === "activity" || tab === "evidence") {
+        // Denial categories do not identify which layer made the decision.
+        expect(html).toContain("Layer not served");
+        expect(html).toContain('state-chip bad');
+        expect(html).toContain("entry-1");
+        expect(html).toContain("showing 1 of 1");
+      }
+    });
+  }
+
+  it("6a agent approvals and inspect allow only Tier 2 inline and use the existing decision path", async () => {
+    const sc = agentsScenario("pending-tier1");
+    const items = [sc.approval, { ...sc.approval, item_id: "missing", tier: undefined }, { ...sc.approval, item_id: "tier2", tier: "tier2" }];
+    const calls: string[] = [];
+    const { h } = await start("pending-tier1", {
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+      "/api/hub/inbox/tier2/approve": () => { calls.push("approve"); return Promise.resolve(response({ data: {} })); },
+      "/api/hub/inbox/tier2/deny": () => { calls.push("deny"); return Promise.resolve(response({ data: {} })); },
+    });
+    (h.context as Record<string, unknown>).__items = items;
+    runInContext('state.chat.inspect.panelByAgentId["research-agent"] = { pending_approvals: __items, recent_activity: [], opened_at: new Date().toISOString() }', h.context);
+    detail(h); h.click({ "data-action": "agent-tab", "data-tab": "approvals" });
+    const inspect = runInContext("renderAgentInspectPanel(state.agents[0])", h.context) as string;
+    runInContext('delete state.chat.inspect.panelByAgentId["research-agent"]', h.context);
+    const inspectCta = runInContext("renderAgentInspectPanel(state.agents[0])", h.context) as string;
+    expect(inspectCta).toContain("pending approvals");
+    expect(inspectCta).not.toContain("pending Tier 1 approvals");
+    for (const html of [h.el.main!.innerHTML, inspect]) {
+      for (const id of ["held-agent", "missing"]) expect(html).not.toMatch(new RegExp(`data-action="inbox-(approve|deny)" data-item-id="${id}"`));
+      expect(html.match(/href="#approvals">Review in Approvals/g)).toHaveLength(2);
+      expect(html).toContain('data-action="inbox-approve" data-item-id="tier2">Allow once');
+      expect(html).toContain('data-action="inbox-deny" data-item-id="tier2">Deny');
+    }
+    for (const action of ["approve", "deny"]) { h.click({ "data-action": `inbox-${action}`, "data-item-id": "tier2" }); await settle(); }
+    expect(calls).toEqual(["approve", "deny"]);
+  });
+
+  it("6a controls preserve frozen routes and Tier 1 remains pending until Approvals", async () => {
+    const sc = agentsScenario();
+    const calls: string[] = [];
+    const routes: Record<string, () => unknown> = {};
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) routes[`/api/hub/agents/research-agent/${action}`] = () => { calls.push(action); return Promise.resolve(response({ data: { status: action === "lockdown" || action === "unwrap" ? "approval_pending" : "active" } })); };
+    const all = { ...sc.agents[0]!, capabilities: Object.fromEntries(Object.keys(sc.agents[0]!.capabilities).map(k => [k, true])) };
+    const { h } = await start("protected", { ...routes, "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [all] } })) });
+    detail(h);
+    expect(h.el.main!.innerHTML).toContain('class="agent-entity-actions"');
+    for (const action of ["pause", "resume", "restart", "lockdown", "unwrap"]) { h.clickRenderedButton(`agent-${action}`); await settle(); }
+    expect(calls).toEqual(["pause", "resume", "restart", "lockdown", "unwrap"]);
+    expect(h.el["toast-host"]!.textContent).toContain("Approval pending");
+  });
+
+  for (const status of [422, 500]) it(`6a ${status} control failure toast uses only the operator label`, async () => {
+    const { h } = await start("protected", {
+      "/api/hub/agents/research-agent/unwrap": () => Promise.resolve(response({ ok: false, error: "HubCapabilityError", detail: "capability not supported: agent_control_unwrap_unsupported_operator_decision_pending" }, status)),
+    });
+    h.click({ "data-action": "agent-unwrap", "data-agent-id": "research-agent" }); await settle();
+    const toast = h.el["toast-host"]!.textContent;
+    expect(toast).toContain("Remove protection");
+    expect(toast).not.toMatch(/wrap|HubCapabilityError|capability not supported/i);
+  });
+
+  it("6a hostile labels stay text and identity never enumerates secret fields", async () => {
+    const sc = agentsScenario();
+    const hostile = '<img src=x onerror="hostile()">';
+    const agent = { ...sc.agents[0]!, agent_id: hostile, private_key: "SECRET-MATERIAL", fingerprint: "SECRET-FINGERPRINT" };
+    const { h } = await start("protected", { "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [agent] } })) });
+    h.click({ "data-action": "open-agent", "data-agent-id": hostile });
+    h.click({ "data-action": "agent-tab", "data-tab": "identity" });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-agent-tab="identity"');
+    expect(html).toContain("&lt;img");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("SECRET-");
+    expect(html).not.toContain("private_key");
+  });
+  it("6a reach retains one bounded projection and rejects oversized destination input", async () => {
+    const sc = agentsScenario();
+    let payload = { ...sc.reach, unrelated: "DO-NOT-RETAIN" };
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => Promise.resolve(response(payload)) });
+    detail(h); await settle();
+    expect(runInContext("JSON.stringify(state.agentReach)", h.context)).not.toContain("DO-NOT-RETAIN");
+    // 257 exceeds the 256 configured-destination budget for one detail read.
+    payload = { ...payload, destinations: Array.from({ length: 257 }, () => sc.reach.destinations[0]!) };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    // Failed reads name the read failure instead of borrowing unread copy.
+    expect(h.el.main!.innerHTML).toContain("Reach read failed");
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    // 2049 exceeds the 2048-character destination/rule budget.
+    payload = { ...payload, destinations: [{ ...sc.reach.destinations[0]!, destination: "x".repeat(2049) }] };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    // More than two MiB must be rejected even when the destination list itself is small.
+    payload = { ...payload, destinations: sc.reach.destinations, unrelated: "x".repeat(2 * 1024 * 1024 + 1) };
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+  });
+
+  it("6a reach admission stays bounded through timeout waves and ignores late completion", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    let calls = 0;
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => { calls++; return new Promise(resolve => { finish = resolve; }); } });
+    detail(h); await settle();
+    // Three waves of twenty clicks cross the five-second deadline with fetch ignoring abort.
+    for (let wave = 0; wave < 3; wave++) {
+      await vi.advanceTimersByTimeAsync(5001);
+      for (let click = 0; click < 20; click++) h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" });
+      await settle();
+    }
+    expect(calls).toBe(1);
+    finish(response(sc.reach)); await settle();
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    expect(calls).toBe(2);
+    finish(response(sc.reach)); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+  });
+
+  it("6a reach expires without interaction and does not retain old policy destinations", async () => {
+    const { h } = await start(); detail(h); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    // One minute plus one millisecond crosses the configured-read freshness window.
+    await vi.advanceTimersByTimeAsync(60 * 1000 + 1);
+    // Expiry records that a previous read aged out, not that it failed.
+    expect(h.el.main!.innerHTML).toContain("Reach read expired after one minute without interaction.");
+    expect(h.el.main!.innerHTML).not.toContain("docs.example.test");
+    expect(runInContext("state.agentReach.data", h.context)).toBeNull();
+  });
+
+  it("6a failed detail sources clear prior reach and label each unavailable source", async () => {
+    let failed = false;
+    const sc = agentsScenario();
+    const { h } = await start("protected", {
+      "/api/posture/reach/research-agent": () => Promise.resolve(response(failed ? { error: "offline" } : sc.reach, failed ? 503 : 200)),
+      "/api/hub/inbox": () => Promise.reject(new Error("offline")),
+      "/api/hub/activity": () => Promise.reject(new Error("offline")),
+      "/api/hub/policies": () => Promise.reject(new Error("offline")),
+      "/api/posture/home": () => Promise.reject(new Error("offline")),
+    });
+    detail(h); await settle();
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    failed = true;
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    const html = h.el.main!.innerHTML;
+    // Failed reach and absent independent sources retain their distinct labels.
+    for (const label of ["Reach read failed", "Approvals Unknown", "Activity Unknown", "Policy summary Unknown", "UNKNOWN"]) expect(html).toContain(label);
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain('state-chip good');
+    expect(html).toContain("Reach read failed");
+  });
+
+  it("6a reach reads configured destinations, caps each lane, escapes names and rejects a different subject", async () => {
+    const sc = agentsScenario();
+    const hostile = '<img src=x onerror="tool()">';
+    const reach = { ...sc.reach, destinations: Array.from({ length: 55 }, (_, i) => ({ destination: hostile + i, disposition: "allow", enforcing_layer: "castle_wall", rule_id: `r${i}` })) };
+    const { h } = await start("protected", { "/api/posture/reach/research-agent": () => Promise.resolve(response(reach)) });
+    detail(h); await settle(); h.click({ "data-action": "agent-tab", "data-tab": "policy" });
+    expect(h.el.main!.innerHTML).toContain("&lt;img");
+    expect(h.el.main!.innerHTML).not.toContain("<img");
+    expect(h.el.main!.innerHTML).toContain("showing 20 of 55");
+    expect(h.el.main!.innerHTML).toContain("Configured; enforcement not confirmed");
+    expect(h.el.main!.innerHTML).toContain("requested hosts Unknown");
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+    reach.agent_id = "other-agent";
+    h.click({ "data-action": "agent-reach-refresh", "data-agent-id": "research-agent" }); await settle();
+    // Failed reads name the read failure instead of borrowing unread copy.
+    expect(h.el.main!.innerHTML).toContain("Reach read failed");
+    expect(h.el.main!.innerHTML).not.toContain("&lt;img");
+  });
+
+  it("6a a second agent opened while a reach read holds admission waits as loading, then reads once admission frees", async () => {
+    const sc = agentsScenario();
+    const second = { ...sc.agents[0]!, agent_id: "second-agent" };
+    let finishFirst!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0]!, second] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finishFirst = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    expect(calls).toEqual(["research-agent"]);
+    expect(h.el.main!.innerHTML).not.toContain("Reach read failed");
+    finishFirst(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent", "second-agent"]);
+    expect(h.el.main!.innerHTML).toContain("docs.example.test");
+    expect(h.el.main!.innerHTML).not.toContain("Reach read failed");
+  });
+
+  it("6a an approval-category entry is recorded, never marked approved, since that category also holds denied decisions", async () => {
+    const sc = agentsScenario();
+    const entry = { ...sc.activity[0]!, entry_id: "entry-approval", category: "approval" };
+    const { h } = await start("protected", { "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [entry] } })) });
+    detail(h); await settle();
+    h.click({ "data-action": "agent-tab", "data-tab": "activity" });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain("Entry entry-approval");
+    expect(html).toContain("RECORDED");
+    expect(html).not.toContain("APPROVED");
+    entry.category = "egress";
+    await runInContext("fetchAll()", h.context); await settle();
+    expect(h.el.main!.innerHTML).toContain("Layer not served");
+    expect(h.el.main!.innerHTML).not.toContain("Castle Wall");
+  });
+
+  const reachSentences = {
+    state_UNREAD: "Reach not read yet.",
+    state_LOADING: "Reading this agent's reach.",
+    state_EXPIRED: "Reach read expired after one minute without interaction.",
+    state_FAILED: "Reach read failed",
+    state_LOADED: "The reach source answered without a record for this agent.",
+  };
+  for (const [readState, sentence] of Object.entries(reachSentences)) {
+    it(`6a r2 ${readState} names only its own reach state`, async () => {
+      const { h } = await start();
+      runInContext(`state.selectedAgentId = "research-agent"; state.agentReach = { state: "${readState}", agentId: "research-agent", data: null, readAt: Date.now() };`, h.context);
+      h.navigate("agent-detail");
+      const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+      // The production escape helper encodes the apostrophe in loading copy.
+      expect(html).toContain(escapeHtml(sentence).replaceAll("'", "&#039;"));
+      for (const other of Object.values(reachSentences).filter(value => value !== sentence)) expect(html).not.toContain(escapeHtml(other).replaceAll("'", "&#039;"));
+      expect(html).not.toContain("The agent reach source has not answered");
+      if (["state_UNREAD", "state_EXPIRED"].includes(readState)) expect(html).toContain('data-action="agent-reach-refresh"');
+    });
+  }
+
+  it("6a r2 a loaded reach read past its one-minute age reads expired", async () => {
+    const { h } = await start();
+    // AGENT_REACH_MAX_AGE_MS is the client's own constant, so the read is exactly one millisecond past its age.
+    runInContext('state.selectedAgentId = "research-agent"; state.agentReach = { state: "state_LOADED", agentId: "research-agent", data: { enforcement_confirmed: false, has_wall_policy: true, destinations: [] }, readAt: Date.now() - AGENT_REACH_MAX_AGE_MS - 1 };', h.context);
+    h.navigate("agent-detail");
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain("The reach source answered without a record for this agent.");
+  });
+
+  it("6a r2 unknown hash state selects All states and keeps the roster", async () => {
+    const { h } = await start();
+    h.navigate("agents?state=nope");
+    expect(h.el.main!.innerHTML).toContain('<option value="" selected>All states</option>');
+    expect(h.el.main!.innerHTML).toContain("showing 1 of 1");
+    expect(h.el.main!.innerHTML).toContain('data-agent-id="research-agent"');
+  });
+
+  it("6a r2 leaving detail clears the pending reach subject before admission frees", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    h.navigate("overview");
+    finish(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent"]);
+    expect(runInContext("agentReachPendingId", h.context)).toBeNull();
+  });
+
+  it("6a r2 an agent opened from another route while a read holds admission is read next", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const calls: string[] = [];
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => { calls.push("research-agent"); return new Promise(resolve => { finish = resolve; }); },
+      "/api/posture/reach/second-agent": () => { calls.push("second-agent"); return Promise.resolve(response({ ...sc.reach, agent_id: "second-agent" })); },
+    });
+    detail(h); await settle();
+    h.navigate("agents");
+    // The open-agent handler queues the read before it assigns the hash, and a browser fires hashchange in a later
+    // task; this harness fires it synchronously, so the queue step runs here on its own while the route is #agents.
+    runInContext('state.selectedAgentId = "second-agent"; void loadAgentReach("second-agent")', h.context);
+    finish(response(sc.reach)); await settle();
+    expect(calls).toEqual(["research-agent", "second-agent"]);
+    h.navigate("agent-detail"); await settle();
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
+    expect(html).toContain('<div class="mono">docs.example.test');
+  });
+
+  it("6a r2 leaving detail with a queued subject returns its placeholder to unread", async () => {
+    const sc = agentsScenario();
+    let finish!: (value: unknown) => void;
+    const { h } = await start("protected", {
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: [sc.agents[0], { ...sc.agents[0], agent_id: "second-agent" }] } })),
+      "/api/posture/reach/research-agent": () => new Promise(resolve => { finish = resolve; }),
+    });
+    detail(h); await settle();
+    h.click({ "data-action": "open-agent", "data-agent-id": "second-agent" }); await settle();
+    h.navigate("overview");
+    finish(response(sc.reach)); await settle();
+    h.navigate("agent-detail"); await settle();
+    const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
+    expect(html).toContain("Reach not read yet.");
+    expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
+  });
+});
+
+// These scenarios are also imported by the untracked lane capture script.
+import { overviewScenarios, OVERVIEW_FRESHNESS_MS } from "./fixtures/overview-scenarios.js";
+async function bootOverview3b(change?: (home: Record<string, any>) => void, scenario = "healthy") {
+  vi.useFakeTimers();
+  const scenarios = await overviewScenarios(Date.now());
+  const sc = scenarios.find(row => row.name === scenario)!;
+  change?.(sc.home);
+  const wall = sc.home.castle_wall;
+  // The same served wall evidence feeds the top bar, including adversarial expiry cases.
+  const live = { ...sc.sovereignty.live_enforcement, castle_wall_arm_state: wall.arm_state,
+    evidence_basis: wall.evidence_basis, last_enforcement_evidence_at: wall.last_enforcement_evidence_at,
+    freshness_window_ms: wall.freshness_window_ms };
+  let homeReads = 0;
+  const h = boot({
+    "/api/posture/home": () => { homeReads++; return Promise.resolve(response(sc.home)); },
+    "/api/sovereignty": () => Promise.resolve(response({ live_enforcement: live })),
+    "/api/hub/agents": () => Promise.resolve(response({ data: { agents: sc.agents } })),
+  });
+  await settle(); return Object.assign(h, { homeReads: () => homeReads });
+}
+function outboundHtml(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<section class="card outbound-card">[\s\S]*?<\/section>/)?.[0] ?? "";
+}
+function protectionTile(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Protection requested<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
+}
+describe("Overview 3b served evidence", () => {
+  for (const [name, mutate, reason] of [
+    ["findings zeros", (d: any) => Object.assign(d, { chain_verdict: "findings", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
+    ["key unavailable", (d: any) => Object.assign(d, { chain_verdict: "key_unavailable", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
+    ["incomplete", (d: any) => d.window_complete = false, "window coverage not established"],
+    ["missing completeness", (d: any) => delete d.window_complete, "window completeness not served"],
+    ["bad window", (d: any) => d.window_end = "bad date", "window not stated"],
+    ["missing count", (d: any) => delete d.kernel_blocks, "count not served"],
+    ["negative count", (d: any) => d.kernel_allows = -1, "count not served"],
+    ["unsafe count", (d: any) => d.kernel_blocks = Number.MAX_SAFE_INTEGER + 1, "count not served"],
+  ] as const) it(`withholds both counts for ${name} on both screens`, async () => {
+    const h = await bootOverview3b(home => mutate(home.digest));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain("Not evaluated"); expect(html).toContain(reason);
+      expect(html).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+  it("shows separate served counts with both window dates", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { kernel_blocks: 4, kernel_allows: 2, blocked_destinations: [], blocked_destination_count: 0 }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain('Blocked <strong>4</strong>'); expect(html).toContain('Allowed <strong>2</strong>');
+      expect(html).toContain("window "); expect(html).toContain(" to ");
+      expect(html).toContain(runInContext("shortTime(new Date(Date.now()).toISOString())", h.context));
+      expect(html).toContain(runInContext("shortTime(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())", h.context));
+      expect(html).not.toContain("of 6");
+    }
+  });
+  for (const override of [1, undefined]) it(`withholds Allowed alone for overrides=${override}`, async () => {
+    const h = await bootOverview3b(home => home.digest.kernel_allow_overrides = override);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain("Blocked <strong>16</strong>"); expect(html).toContain("Allowed");
+      // A missing override count is absence of evidence, not evidence of an override.
+      expect(html).toContain(override === 1 ? "1 allowed verdict was overridden after it was recorded" : "override count not served");
+    }
+  });
+  it("caps destination rows separately on both screens and preserves the null bucket", async () => {
+    const h = await bootOverview3b();
+    expect(outboundHtml(h)).toContain("showing 3 of 12");
+    expect(outboundHtml(h)).toContain("destination not recorded");
+    expect(outboundHtml(h)).toContain('href="#enforcement"');
+    h.navigate("enforcement"); expect(outboundHtml(h)).toContain("showing 10 of 12");
+    // Enforcement keeps the canonical Evidence link for every row count.
+    expect(outboundHtml(h)).toContain('href="/posture/evidence"');
+  });
+  for (const [name, change, reason] of [
+    ["absent", (d: any) => delete d.blocked_destinations, "Blocked destinations are not served"],
+    ["not an array", (d: any) => d.blocked_destinations = {}, "Blocked destinations are not served"],
+    ["sum", (d: any) => d.kernel_blocks = 1, "served destination values disagree"],
+    ["distinct count", (d: any) => d.blocked_destination_count = 1, "served destination values disagree"],
+    ["invalid row", (d: any) => d.blocked_destinations[0].blocks = -1, "served destination values disagree"],
+  ] as const) it(`withholds destinations for ${name}`, async () => {
+    const h = await bootOverview3b(home => change(home.digest));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason); expect(outboundHtml(h)).not.toContain("<table");
+    }
+  });
+  it("escapes hostile destinations as text", async () => {
+    const h = await bootOverview3b(home => home.digest.blocked_destinations[0].destination = '<img src=x onerror="alert(1)">');
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain("&lt;img"); expect(outboundHtml(h)).not.toContain("<img");
+    }
+  });
+  it("states an answered zero only after the gate", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { kernel_blocks: 0, blocked_destinations: [], blocked_destination_count: 0 }));
+    for (const route of ["posture", "enforcement"]) { h.navigate(route); expect(outboundHtml(h)).toContain("No blocked connections in this window"); }
+  });
+  for (const [name, change] of [
+    ["absent", (home: any) => delete home.protection_detected_count],
+    ["fractional", (home: any) => home.protection_requested_count = 1.5],
+    ["contradicting", (home: any) => home.protection_requested_count = 100],
+    ["negative", (home: any) => home.protection_requested_count = -1],
+  ] as const) it(`keeps protection unknown for ${name} counts`, async () => {
+    const h = await bootOverview3b(change);
+    expect(protectionTile(h)).toContain("UNKNOWN"); expect(protectionTile(h)).not.toContain("good");
+  });
+  it("renders policy intent as 1 of 3 with its evidence and no enforcement-count consumer", async () => {
+    const h = await bootOverview3b(home => { home.protection_requested_count = 1; home.protection_detected_count = 3; });
+    expect(protectionTile(h)).toContain("1 of 3"); expect(protectionTile(h)).toContain("registered agents plus unprotected harnesses");
+    expect(protectionTile(h)).not.toContain("good"); expect(getClientScript()).not.toContain("enforcement_confirmed_count");
+  });
+  it("shows an unknown protection tile while the home has not answered", async () => {
+    vi.useFakeTimers(); const h = boot({ "/api/posture/home": never }); await settle();
+    expect(protectionTile(h)).toContain("UNKNOWN"); expect(protectionTile(h)).not.toContain("0 of 0");
+  });
+  for (const [label, age, green] of [["inside", OVERVIEW_FRESHNESS_MS - 1, true], ["expired", OVERVIEW_FRESHNESS_MS + 1, false], ["future", -1, false]] as const) {
+    it(`ages the chain badge at ${label}`, async () => {
+      const h = await bootOverview3b(home => home.digest.window_end = new Date(Date.now() - age).toISOString());
+      const html = h.el.main!.innerHTML;
+      expect(html.includes('class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED')).toBe(green);
+      if (!green) { expect(html).toContain("last verified"); expect(html).toContain(", not current"); }
+    });
+  }
+  it("expires the audit chip and rereads at the boundary", async () => {
+    const h = await bootOverview3b(home => home.digest.window_end = new Date(Date.now() - OVERVIEW_FRESHNESS_MS + 1).toISOString());
+    expect(h.el.main!.innerHTML).toContain('></i>VERIFIED');
+    const reads = h.homeReads();
+    await vi.advanceTimersByTimeAsync(2); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('></i>VERIFIED');
+    expect(h.el.main!.innerHTML).toContain("not current");
+    // The existing read-rate floor may defer the network read, never the visual expiry.
+    const rereadFloor = runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number;
+    await vi.advanceTimersByTimeAsync(rereadFloor + 1000); await settle();
+    expect(h.homeReads()).toBeGreaterThan(reads);
+  });
+  for (const [label, age] of [["fresh", 1000], ["stale", OVERVIEW_FRESHNESS_MS + 1], ["absent", null]] as const) {
+    it(`keeps the seal and wall in agreement with ${label} evidence`, async () => {
+      const h = await bootOverview3b(home => home.castle_wall.last_enforcement_evidence_at = age === null ? null : new Date(Date.now() - age).toISOString());
+      expect(h.el["posture-seal-word"]!.textContent).toBe(label === "fresh" ? "Protected" : "Attention");
+      expect(h.el.main!.innerHTML.includes('></i>ENFORCING')).toBe(label === "fresh");
+      expect(h.el.main!.innerHTML).toContain("showing 3 of 12");
+    });
+  }
+  it("keeps chip heads together and separates their wrapping evidence detail", async () => {
+    const h = await bootOverview3b();
+    expect(h.el.main!.innerHTML).toContain('class="overview-chip-head"><i aria-hidden="true"></i>ENFORCING</span>');
+    expect(h.el.main!.innerHTML).toContain('class="overview-chip-detail"');
+    const chip = runInContext('makeMachineRow({ name: "fixture", url: "http://fixture/", probe: { state: "state_UNKNOWN" } }, 0).outerHTML', h.context) as string;
+    // Captured from main 546180fa; this shared chip must survive Overview-only styling.
+    expect(chip.match(/<span[^>]*class="state-chip[^>]*>[\s\S]*?<\/span>/)?.[0]).toBe('<span title="Unknown: this saved address is not a web address, so it was not linked or checked." class="state-chip unknown"><i aria-hidden="true"></i>Unknown</span>');
+    expect(getClientScript()).not.toContain("\u2014");
+  });
+});
+
+describe("round 2 outbound and tile honesty", () => {
+  for (const verdict of ["verified", "verified_suffix_only"] as const) it(`requires a current ${verdict} check beside covered counts`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      chain_verdict: verdict, chain_verified: verdict === "verified", window_complete: true,
+      window_end: new Date(Date.now() - OVERVIEW_FRESHNESS_MS + 1).toISOString(),
+    }));
+    expect(outboundHtml(h)).toContain("Blocked <strong>16</strong>");
+    expect(h.el.main!.innerHTML).toContain(verdict === "verified" ? "></i>VERIFIED" : "></i>SUFFIX ONLY");
+    await vi.advanceTimersByTimeAsync(2); await settle();
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      expect(outboundHtml(h)).toContain("audit check not current");
+      expect(outboundHtml(h)).toContain("last verified 10m ago");
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+      if (route === "posture") expect(h.el.main!.innerHTML).not.toContain("></i>SUFFIX ONLY");
+    }
+  });
+  for (const [value, reason] of [
+    [undefined, "override count not served"], [null, "override count not served"], [-1, "override count not served"],
+    [1.5, "override count not served"], [Number.MAX_SAFE_INTEGER + 1, "override count not served"],
+    [1, "1 allowed verdict was overridden after it was recorded"], [2, "2 allowed verdicts were overridden after they were recorded"],
+  ] as const) it(`states the served override reason for ${value}`, async () => {
+    const h = await bootOverview3b(home => home.digest.kernel_allow_overrides = value);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(outboundHtml(h)).toContain("Blocked <strong>16</strong>");
+    }
+  });
+  for (const [complete, value, reason] of [
+    [undefined, undefined, "window completeness not served"], [null, null, "window completeness not served"],
+    [-1, null, "window completeness not served"], [false, "read_limit", "window larger than one read"],
+    [false, "sealed_region", "sealed audit region coverage not established"],
+    [false, "retention", "retention removed older entries, so window coverage is not established"],
+    [false, "coverage_unknown", "window coverage not established"],
+    [false, "unexpected", "window coverage not established"], [false, undefined, "window coverage not established"],
+  ] as const) it(`states completeness=${complete} reason=${value}`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { window_complete: complete, window_incomplete_reason: value }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(outboundHtml(h)).toContain('class="outbound-reason muted"');
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+  for (const shape of ["no rows", "zero destinations", "all rows undercount"] as const) it(`rejects destination disagreement: ${shape}`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      blocked_destinations: shape !== "all rows undercount" ? [] : [{ destination: "one", blocks: 1, last_blocked_at: null }],
+      blocked_destination_count: shape === "zero destinations" ? 0 : 1,
+    }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain("served destination values disagree");
+      expect(outboundHtml(h)).not.toContain("<table");
+    }
+  });
+  for (const count of [0, 1, 10]) it(`keeps the Enforcement age and Evidence link with ${count} destinations`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      kernel_blocks: count, blocked_destination_count: count,
+      blocked_destinations: Array.from({ length: count }, (_, i) => ({ destination: `host-${i}`, blocks: 1, last_blocked_at: null })),
+    }));
+    h.navigate("enforcement");
+    expect(outboundHtml(h)).toContain("window closed");
+    expect(outboundHtml(h)).toContain('href="/posture/evidence"');
+  });
+  it("gives all three withheld cells an Unknown glyph and a separate reason line", async () => {
+    const h = await bootOverview3b(home => home.digest.chain_verdict = "findings");
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html.match(/class="state-chip unknown overview-chip"/g)).toHaveLength(3);
+      expect(html.match(/<i aria-hidden="true"><\/i>Not evaluated/g)).toHaveLength(3);
+      expect(html.match(/<span class="outbound-reason muted">chain not verified<\/span>/g)).toHaveLength(3);
+    }
+  });
+  for (const scenario of ["first-run-unprotected", "unloaded"]) it(`puts the ${scenario} protection tile inside the grid`, async () => {
+    vi.useFakeTimers();
+    const h = scenario === "unloaded" ? boot({ "/api/posture/home": never }) : await bootOverview3b(undefined, scenario);
+    await settle();
+    expect(h.el.main!.innerHTML).toMatch(/<div class="overview-tiles"[^>]*><div class="overview-tile"><a[^>]*>Protection requested/);
+  });
+  it("starts chip detail on its own block without a leading separator", async () => {
+    const h = await bootOverview3b();
+    expect(h.el.main!.innerHTML).toMatch(/class="overview-chip-detail">[^ ·]/);
+    expect(h.el.main!.innerHTML).not.toContain('class="overview-chip-detail"> ·');
+    expect(renderDashboardV11Html()).toContain('.overview-chip-detail { display: block;');
+  });
+  it("uses container widths for five tiles or three plus two", () => {
+    const html = renderDashboardV11Html();
+    expect(html).toContain('container-type: inline-size');
+    expect(html).toContain('grid-template-columns: repeat(3, minmax(0, 1fr))');
+    expect(html).toMatch(/@container overview \(min-width: \d+px\)/);
+    expect(html).toContain('grid-template-columns: repeat(5, minmax(0, 1fr))');
+    expect(html).not.toContain('repeat(auto-fit, minmax(min(100%, var(--overview-tile-min))');
+    expect(html).toContain('.outbound-reason { display: block;');
   });
 });
 

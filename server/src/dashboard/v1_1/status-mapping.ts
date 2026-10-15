@@ -132,7 +132,7 @@ export const TIER1_BUTTON_COPY: Record<string, Tier1ButtonCopy> = {
     cancelled: "Not locked down",
   },
   // idle must match AGENT_CONTROL_LABELS.unwrap in client.ts. The in-progress
-  // word for this action is STATUS_MAPPING.unwrapping above; engaged and
+  // word for this action is STATUS_MAPPING.unwrapping above; pending, engaged and
   // cancelled have no console consumer yet.
   unwrap: {
     idle: "Remove protection",
