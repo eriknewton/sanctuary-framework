@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only widens the lifted client slice to the shared table presenters the policy screen now uses and adds the paged-list state those presenters read; it asserts no new behavior and so passes against pre-fix source by construction. The slice's new behavior is pinned by boot-hydration, shell-wired-consumers and copy-sweep-tier4 tests, which fail on pre-fix source.
 /**
  * Sanctuary v1.1 Dashboard - honesty regressions.
  *
