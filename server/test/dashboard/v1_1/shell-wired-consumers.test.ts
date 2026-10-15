@@ -3131,6 +3131,17 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).not.toContain("Enforcement confirmed");
   });
 
+  it("A1 a loaded reach read dated past the clock's range reads ahead of this device's clock", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Fails before the read age is computed once in renderAgentReach (A1 round 2 fail-before evidence).
+    // 8.64e15 ms is the largest time a Date can hold, so one more millisecond has no ISO form.
+    const html = runInContext('state.agentReach.readAt = 8.64e15 + 1; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain(escapeHtml("Reach read time is ahead of this device's clock, so it is not current.").replaceAll("'", "&#039;"));
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+  });
+
   it("A1 a loaded reach read exactly one minute old reads expired and one millisecond younger stays current", async () => {
     const { h } = await start("evidenced-protected");
     detail(h); await settle();

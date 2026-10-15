@@ -1949,6 +1949,9 @@ function renderAgentReach(agent) {
     // Configured reach expires at the same one-minute boundary used by the loader.
     else if (now - read.readAt >= AGENT_REACH_MAX_AGE_MS) reachState = "state_EXPIRED";
   }
+  // A read time outside the Date range has no ISO form, so its age reads Unknown instead of throwing while the card renders.
+  const readTime = new Date(read.readAt);
+  const readAge = Number.isFinite(readTime.getTime()) ? relTimeFromIso(readTime.toISOString()) : "time Unknown";
   // Only a current, matching loaded read may expose destinations; malformed clocks remain withheld.
   const reach = reachState === "state_LOADED" && !liveUpdatesStopped && now >= read.readAt && now - read.readAt < AGENT_REACH_MAX_AGE_MS ? read.data : null;
   const intro = '<p>' + escHtml(policy ? policy.display_label : "Policy summary Unknown") + ' · ' + escHtml(agent.policy_id || "policy Unknown") + ' · version Unknown · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies") || "Unknown") + '</p>';
@@ -1968,14 +1971,14 @@ function renderAgentReach(agent) {
     state_STOPPED: "Live updates stopped. Retry to resume.",
     state_FUTURE: "Reach read time is ahead of this device's clock, so it is not current.",
     state_UNDATED: "Reach read time is unknown, so it is not current.",
-    state_FAILED: "Reach read failed · " + relTimeFromIso(new Date(read.readAt).toISOString()),
+    state_FAILED: "Reach read failed · " + readAge,
     state_LOADED: "The reach source answered without a record for this agent."
   };
   // Withheld loaded evidence must not leave lanes visible as though they describe current reach.
   const visibleLanes = ["state_STOPPED", "state_UNDATED", "state_FUTURE", "state_EXPIRED"].includes(reachState) ? "" : lanes;
   const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : descriptions[reachState];
   return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + visibleLanes +
-    '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? relTimeFromIso(new Date(read.readAt).toISOString()) : "Unknown") + '</p>' +
+    '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? readAge : "Unknown") + '</p>' +
     '<a class="btn" href="/posture/agent/' + escHtml(encodeURIComponent(agent.agent_id)) + '">All configured reach</a> ' +
     '<button class="btn" data-action="agent-reach-refresh" data-agent-id="' + escHtml(agent.agent_id) + '">Refresh reach</button></section>';
 }
