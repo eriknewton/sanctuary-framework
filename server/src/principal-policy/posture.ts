@@ -1142,7 +1142,10 @@ function blockedDestinationLabel(details: Record<string, unknown> | undefined): 
   return (label + (port !== null && port >= 0 && port <= DESTINATION_PORT_MAX ? ":" + port : "")).slice(0, DESTINATION_LABEL_MAX_CHARS);
 }
 
-/** Settle retention from the eager in-memory view and two cheap public reads; never re-reads the chain from disk. */
+/**
+ * Settle retention from the eager in-memory view and three cheap public reads (the rotation floor, and the chain head
+ * before and after the view); never re-reads the chain from disk.
+ */
 async function routineWindowCoverage(
   auditLog: AuditLog, windowStart: string, readRetained: (limit: number) => ReturnType<AuditLog["query"]>,
 ): Promise<AuditDigest["window_incomplete_reason"]> {
@@ -1156,9 +1159,9 @@ async function routineWindowCoverage(
     // in-memory view; a full on-disk re-read per board paint or stream push is the load this surface must not pay. The
     // read budget is raised to the retention cap so a log retained in full is read in full.
     const retained = await readRetained(Math.max(DIGEST_QUERY_ENTRY_LIMIT, auditLog.getRetentionConfig().maxEntries));
-    // The view's oldest sequence is derived from the head and the count, which holds only when both describe the same
-    // chain state; a head that moved while the view was read means the count no longer matches it, so coverage is
-    // unknown. Must match "withholds coverage for an append between the chain head and eager view reads" and
+    // The view's oldest sequence is derived from the first head and the count, so a head that moved while the view was
+    // read cannot support a complete window, and coverage is unknown. Must match "withholds coverage for an append
+    // between the chain head and eager view reads" and
     // "withholds coverage when a reloaded view races an append" in test/principal-policy/overview-digest.test.ts.
     if ((await auditLog.getChainHead()).sequence !== head.sequence) return "coverage_unknown";
     // The floor entry is found by position, so every entry in the view must be in hand; an empty log has none to prove from.
