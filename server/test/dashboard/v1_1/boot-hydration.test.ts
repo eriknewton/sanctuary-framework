@@ -14,7 +14,11 @@ const home = {
   protection_requested_count: 1,
   enforcement_confirmed_count: 0,
 };
-const response = (body: unknown, status = 200) => ({ ok: status === 200, status, json: async () => body });
+// Policy reads share the pre-decode byte budget, so fixtures expose the same stream as fetch.
+const response = (body: unknown, status = 200) => ({
+  ok: status === 200, status, json: async () => body,
+  body: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } }),
+});
 const pending = () => new Promise<never>(() => {});
 function testElement() {
   const classes = new Set<string>();
@@ -55,7 +59,7 @@ function harness(overrides: Record<string, () => unknown> = {}, hub = "/api/hub"
   const context = createContext({
     document: { getElementById: (id: string) => elements[id] || (id === "main" ? main : id === "fortress" ? fortress : id === "dashboard-config" ? { textContent: JSON.stringify({ hubApiBase: hub }) } : null), addEventListener: (event: string, listener: (event: unknown) => void) => { listeners[event] = listener; }, querySelectorAll: () => [], documentElement: { setAttribute() {}, removeAttribute() {} } },
     window: { addEventListener() {} }, location: { hash: "", search: "", origin: "http://fixture" },
-    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, Element, Date,
+    sessionStorage: { getItem: () => null }, URLSearchParams, URL, AbortController, TextDecoder, Element, Date,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, EventSource: class { listeners: Record<string, (event: { data: string }) => void> = {}; constructor() { streams.push(this); } close() {} addEventListener(name: string, listener: (event: { data: string }) => void) { this.listeners[name] = listener; } },
     fetch: (url: string) => {
       urls.push(url);
@@ -183,7 +187,7 @@ describe("dashboard bounded independent hydration", () => {
     expect(h.fortress.innerHTML).not.toContain("Nothing waiting on you");
     // Pins the Approvals waiting tile, not a later queue empty state.
     expect(h.main.innerHTML).toMatch(/Approvals waiting<\/a><span class="ot-value"><span class="state-chip unknown overview-chip"[\s\S]*?Not evaluated/);
-    expect(runInContext("sourceReads.size", h.context)).toBe(21); // The fixed source inventory includes the Evidence verification read.
+    expect(runInContext("sourceReads.size", h.context)).toBe(23); // Main's twenty-one, which include the Evidence verification read, plus the fleet roster and Sentinel findings; dynamic failures add none.
   });
 
   it("shows unavailable rather than an empty agent list after timeout", async () => {
@@ -566,13 +570,14 @@ describe("dashboard bounded independent hydration", () => {
   it("policy activation does not reuse a pre-activation policy read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
     const h = harness({
-      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], marker: "new" } } }),
+      "/api/policy/current": () => ++reads === 1 ? new Promise(resolve => { release = resolve; }) : response({ data: { view: { lines: [], policy_version: 2 } } }),
       "/api/policy/drafts/fixture/activate": () => response({ data: { status: "activated" } }),
     }); await settle();
     runInContext('state.route = "policy"; void loadPolicyView()', h.context); await settle();
     runInContext('void activateStandingRule("fixture", "fixture-op", false)', h.context); await settle();
-    release(response({ data: { view: { lines: [], marker: "old" } } })); await settle();
-    expect(runInContext('state.policyView.view.marker', h.context)).toBe("new"); expect(reads).toBe(2);
+    release(response({ data: { view: { lines: [], policy_version: 1 } } })); await settle();
+    // The bounded view retains the real policy version, not a synthetic marker field.
+    expect(runInContext('state.policyView.view.policy_version', h.context)).toBe(2); expect(reads).toBe(2);
   });
   it("recognition mutation cannot be overwritten by a pre-mutation health read", async () => {
     vi.useFakeTimers(); let release!: (value: unknown) => void; let reads = 0;
