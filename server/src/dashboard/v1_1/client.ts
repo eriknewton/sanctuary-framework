@@ -1937,23 +1937,25 @@ function renderAgentReach(agent) {
   const policy = agentPolicySummary(agent);
   const read = state.agentReach;
   const now = Date.now();
+  // Only a numeric read time can be aged; any other value counts as no time, so no comparison or Date below can throw.
+  const readMs = typeof read.readAt === "number" ? read.readAt : NaN;
   // A different subject has no read here, regardless of the stored read's state.
   let reachState = read.agentId !== agent.agent_id ? "state_UNREAD" : read.state;
   if (reachState === "state_LOADED" && read.data) {
     // A stopped stream cannot establish current reach even when its last read is recent.
     if (liveUpdatesStopped) reachState = "state_STOPPED";
     // A read time that is not a finite number cannot be aged, so it cannot establish freshness either.
-    else if (typeof read.readAt !== "number" || !Number.isFinite(read.readAt)) reachState = "state_UNDATED";
+    else if (!Number.isFinite(readMs)) reachState = "state_UNDATED";
     // A future read cannot establish freshness against this device's clock.
-    else if (now < read.readAt) reachState = "state_FUTURE";
+    else if (now < readMs) reachState = "state_FUTURE";
     // Configured reach expires at the same one-minute boundary used by the loader.
-    else if (now - read.readAt >= AGENT_REACH_MAX_AGE_MS) reachState = "state_EXPIRED";
+    else if (now - readMs >= AGENT_REACH_MAX_AGE_MS) reachState = "state_EXPIRED";
   }
   // A read time outside the Date range has no ISO form, so its age reads Unknown instead of throwing while the card renders.
-  const readTime = new Date(read.readAt);
+  const readTime = new Date(readMs);
   const readAge = Number.isFinite(readTime.getTime()) ? relTimeFromIso(readTime.toISOString()) : "time Unknown";
   // Only a current, matching loaded read may expose destinations; malformed clocks remain withheld.
-  const reach = reachState === "state_LOADED" && !liveUpdatesStopped && now >= read.readAt && now - read.readAt < AGENT_REACH_MAX_AGE_MS ? read.data : null;
+  const reach = reachState === "state_LOADED" && !liveUpdatesStopped && now >= readMs && now - readMs < AGENT_REACH_MAX_AGE_MS ? read.data : null;
   const intro = '<p>' + escHtml(policy ? policy.display_label : "Policy summary Unknown") + ' · ' + escHtml(agent.policy_id || "policy Unknown") + ' · version Unknown · policy read ' + escHtml(loadedSourceReadAge(HUB + "/policies") || "Unknown") + '</p>';
   const lanes = [["allow", "May reach"], ["prompt", "Asks you first"], ["deny", "Never"]].map(function (lane) {
     const entries = reach ? reach.destinations.filter(function (d) { return d.disposition === lane[0]; }) : [];

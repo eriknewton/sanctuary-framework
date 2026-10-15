@@ -3118,10 +3118,12 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).not.toContain("Enforcement confirmed");
   });
 
-  for (const [name, readAt] of [["missing", "undefined"], ["not-a-number", "NaN"], ["text", '"soon"']]) it(`A1 a loaded reach read with a ${name} read time is withheld as undated`, async () => {
+  // Numeric text and a symbol are not numbers, so neither may be compared or dated as one.
+  for (const [name, readAt] of [["missing", "undefined"], ["not-a-number", "NaN"], ["text", '"soon"'], ["numeric-text", '"9999999999999999"'], ["symbol", 'Symbol("t")']]) it(`A1 a loaded reach read with a ${name} read time is withheld as undated`, async () => {
     const { h } = await start("evidenced-protected");
     detail(h); await settle();
-    // Fails before the undated arm in renderAgentReach (A1 round 2 fail-before evidence).
+    // Fails before the undated arm in renderAgentReach (A1 round 2 fail-before evidence); the numeric-text and symbol
+    // cases also fail before the numeric read time in the A1 closure.
     const html = runInContext(`state.agentReach.readAt = ${readAt}; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
     expect(html).toContain("Reach read time is unknown, so it is not current.");
     expect(html).not.toContain("The reach source answered without a record for this agent.");
@@ -3140,6 +3142,17 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).toContain(escapeHtml("Reach read time is ahead of this device's clock, so it is not current.").replaceAll("'", "&#039;"));
     expect(html).not.toContain('class="agent-reach-lane"');
     expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  it("A1 a loaded reach read with no record and a symbol read time renders the no-record sentence", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Fails before the numeric read time in renderAgentReach (A1 closure fail-before evidence).
+    const html = runInContext('state.agentReach.data = null; state.agentReach.readAt = Symbol("t"); renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))', h.context) as string;
+    expect(html).toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
   });
 
   it("A1 a loaded reach read exactly one minute old reads expired and one millisecond younger stays current", async () => {
