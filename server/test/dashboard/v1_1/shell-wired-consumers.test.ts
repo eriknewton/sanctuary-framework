@@ -22,6 +22,7 @@
  * fields; activity rows without a verdict wearing no pass mark; and the
  * auto-trigger trend naming each bar shape in words.
  */
+import { mfpScenario } from "./fixtures/mfp-scenarios.js";
 import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
@@ -266,6 +267,8 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       if (overrides[path]) return overrides[path]!(init, path);
       const bare = path.split("?")[0]!;
       if (overrides[bare]) return overrides[bare]!(init, path);
+      // Standing-rule tests require a valid policy view; malformed policy data now fails the whole read.
+      if (path === "/api/policy/current") return Promise.resolve(response({ data: { view: { lines: [] } } }));
       return Promise.resolve(response(path === "/api/posture/home" ? home() : emptyData));
     },
     ...extraGlobals,
@@ -632,7 +635,8 @@ describe("slice 2 shell wired consumers", () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [{ ...heldItem, item_id: "wait-1", tier: "tier2", operation_category: "state_export" }] } })),
-      "/api/policy/current": () => Promise.resolve(response({ data: { view: { sections: [] } } })),
+      // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: { lines: [] } } })),
     });
     await settle();
     h.navigate("approvals");
@@ -3547,7 +3551,8 @@ describe("Approvals round-one decision and evidence states", () => {
       vi.useFakeTimers();
       const h = boot({
         "/api/hub/inbox": inbox([{ ...tier2, ...(mode === "tier1" ? { tier: "tier1" } : mode === "other" ? { operation_category: "other" } : {}) }]),
-        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { sections: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
+        // Policy fixtures serve the view's real lines field; a malformed policy view now fails the whole read.
+        "/api/policy/current": mode === "loading" ? never : () => Promise.resolve(response({ data: { view: { lines: [] } } }, mode === "401" ? 401 : mode === "503" ? 503 : 200)),
       });
       await settle();
       h.navigate("approvals");
@@ -3728,4 +3733,526 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     expect(earned.el.fortress!.innerHTML).toContain('<span class="count zero" id="queue-count">0</span>');
   });
+});
+
+
+describe("slice 6b Machines Findings Policies wired consumers", () => {
+  async function mfpBoot(route: string, change?: (s: ReturnType<typeof mfpScenario>) => void, overrides = {}) {
+    vi.useFakeTimers();
+    const s = mfpScenario();
+    change?.(s);
+    const h = boot({
+      "/api/fleet/roster": () => Promise.resolve(response(s.roster)),
+      "/api/sentinels/findings": () => Promise.resolve(response({ data: { findings: s.findings } })),
+      "/api/policy/current": () => Promise.resolve(response({ data: { view: s.policy } })),
+      "/api/hub/agents": () => Promise.resolve(response({ data: { agents: s.agents } })),
+      ...overrides,
+    });
+    await settle(); h.navigate(route); await settle();
+    return h;
+  }
+  it("reads the authenticated roster separately from browser-saved machines", async () => {
+    const h = await mfpBoot("machines");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).toContain('Build box');
+    expect(html).toContain('ADMITTED');
+    expect(html).toContain('Saved in this browser');
+    expect(html).toContain('Showing 1 of 1');
+    expect(html).toContain('Enrollment status is not served');
+    expect(html).toContain('Last check');
+  });
+  it("never derives roster trust or drift from attestation or reach", async () => {
+    const h = await mfpBoot("machines", s => {
+      Object.assign(s.roster.nodes[0]!, { trust_state: undefined, policy: undefined, attestation_status: 'verified', reach: 'recent' });
+    });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-roster');
+    expect(html).not.toContain('ADMITTED');
+    expect(html).not.toContain('IN SYNC');
+    expect(html.match(/state-chip unknown/g)!.length).toBeGreaterThanOrEqual(3);
+  });
+  it("shows a roster read failure as Unknown without old rows or a zero", async () => {
+    const h = await mfpBoot("machines", undefined, { '/api/fleet/roster': () => Promise.reject(new Error('unavailable')) });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Showing 0 of 0');
+    expect(h.el.main!.innerHTML).toContain('data-read="/api/fleet/roster"');
+  });
+  it("paginates the roster with a bounded page and an exact denominator", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = Array.from({ length: 51 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, label: 'Machine ' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).not.toContain('Machine 25<');
+    h.click({ 'data-action': 'mfp-page', 'data-list': 'roster', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Machine 25<');
+  });
+  it("ranks the served Sentinel vocabulary and declares its five-level display scale", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-findings');
+    for (const level of ['critical', 'high', 'medium', 'low', 'info']) expect(html).toContain('mfp-severity ' + level);
+    expect(html.indexOf('alert outbound observation')).toBeLessThan(html.indexOf('warn outbound observation'));
+    expect(html.indexOf('warn outbound observation')).toBeLessThan(html.indexOf('info outbound observation'));
+    expect(html).toContain('egress-volume');
+    expect(html).toContain('Read-only');
+    expect(html).toContain('Lifecycle is not served');
+    expect(html).not.toMatch(/data-action="finding-(resolve|dismiss|acknowledge)"/);
+  });
+  it("opens finding evidence in a drawer and escapes hostile text throughout", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("findings", s => { s.findings[1]!.summary = hostile; s.findings[1]!.details = { evidence: hostile }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('aria-label="Finding evidence"');
+    expect(html).toContain('baseline');
+    expect(html).toContain('&lt;img');
+    expect(html).not.toContain(hostile);
+    expect(html).toContain('egress_blocked');
+    expect(html).toContain('data-action="mfp-finding-close"');
+  });
+  it("keeps findings Unknown when the Sentinel source fails", async () => {
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('No findings returned');
+  });
+  it("bounds the findings queue and clears a selected record when its source fails", async () => {
+    let failed = false;
+    const s = mfpScenario();
+    s.findings = Array.from({ length: 51 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+    const h = await mfpBoot("findings", undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response({ data: { findings: s.findings } })) });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'f-0' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true;
+    h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+  });
+  it("renders policy groups beside the served rule table with truthful metadata", async () => {
+    const h = await mfpBoot("policy");
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-mfp-policy');
+    // The approval group takes its heading from POLICY_SECTION_TITLES, the same name the rule table uses.
+    for (const label of ['What agents may reach', 'Always asks you first', 'What is never allowed', 'Rule table', 'Version 7', 'Signature state is not served']) expect(html).toContain(label);
+    expect(html).toContain('export your saved state off the machine');
+    expect(html).toContain('data-action="template-picker-open"');
+    expect(html).not.toContain('state-chip good');
+  });
+  it("does not retain policy metadata or rules after a failed read", async () => {
+    const h = await mfpBoot("policy", undefined, { '/api/policy/current': () => Promise.reject(new Error('offline')) });
+    expect(h.el.main!.innerHTML).toContain('Policy Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Version 7');
+    expect(h.el.main!.innerHTML).not.toContain('export your saved state off the machine');
+  });
+  it("bounds served policy lines and escapes their text", async () => {
+    const h = await mfpBoot("policy", s => { s.policy.lines = Array.from({ length: 51 }, () => ({ section: 'approval', text: '<script>bad()</script>' })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 51');
+    expect(h.el.main!.innerHTML).toContain('&lt;script&gt;');
+    expect(h.el.main!.innerHTML).not.toContain('<script>bad()');
+  });
+  it("shows evidenced empty states for all three screens", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = []; s.findings = []; s.policy.lines = []; });
+    expect(h.el.main!.innerHTML).toContain('No machines in the roster');
+    h.navigate('findings'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No findings returned');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('No policy lines returned');
+  });
+  it("rejects malformed roster entries without claiming a checked empty fleet", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("rejects malformed findings without a lifecycle or empty claim", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = [null as never]; });
+    expect(h.el.main!.innerHTML).toContain('Sentinel findings Unknown');
+  });
+  it("refuses an oversized roster response within its read budget", async () => {
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = 'x'.repeat(2 * 1024 * 1024); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+  });
+  it("bounds repeated snapshots and exposes records beyond the preview cap", async () => {
+    const h = await mfpBoot("findings", s => { s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i })); });
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+    expect(h.el.main!.innerHTML).toContain('Only the first 500');
+    for (let i = 0; i < 22; i++) h.click({ 'data-action': 'mfp-page', 'data-list': 'findings', 'data-step': '1' });
+    expect(h.el.main!.innerHTML).toContain('Page 20 of 20');
+    expect(h.el.main!.innerHTML).not.toContain('data-finding-id="f-500"');
+    for (let i = 0; i < 3; i++) { h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle(); }
+    expect(h.el.main!.innerHTML).toContain('Showing 25 of 501');
+  });
+  it("folds Auto-trigger and Honeypots into both Findings and Policies", async () => {
+    const h = await mfpBoot("findings");
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+    h.navigate('policy'); await settle();
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="auto-trigger"');
+    expect(h.el.main!.innerHTML).toContain('data-folded-route="honeypot"');
+  });
+  it("6b the roster, findings and policy lists render no link into a raw read", async () => {
+    // Read URLs carry the launch session only inside fetch calls (credentialedReadUrl), never in a rendered link.
+    for (const route of ["machines", "findings", "policy"]) {
+      const h = await mfpBoot(route);
+      expect(h.el.main!.innerHTML).toContain('returned records');
+      expect(h.el.main!.innerHTML).not.toMatch(/href="\/api\//);
+    }
+  });
+  it("6b the Findings screen keeps the anomaly findings the Overview tile counts and links to", async () => {
+    const h = await mfpBoot("findings", undefined, { "/api/anomaly/findings": () => Promise.resolve(response({ data: { findings: [
+      { finding_id: "anomaly-1", severity: "medium", detector_id: "egress-volume", summary: "Unusual outbound volume", created_at: "2026-10-14T16:46:00.000Z" },
+    ] } })) });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('data-anomaly-findings');
+    expect(html).toContain('1 open');
+    expect(html).toContain('Unusual outbound volume');
+    expect(html).toContain('data-mfp-findings');
+  });
+  it("6b retains at most the record cap from each roster, findings and policy snapshot", async () => {
+    const h = await mfpBoot("findings", s => {
+      s.findings = Array.from({ length: 501 }, (_, i) => ({ ...s.findings[0]!, finding_id: 'f-' + i }));
+      s.roster.nodes = Array.from({ length: 501 }, (_, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i }));
+      s.policy.lines = Array.from({ length: 501 }, (_, i) => ({ ...s.policy.lines[0]!, text: 'Policy line ' + i }));
+    });
+    h.navigate('machines'); await settle();
+    h.navigate('policy'); await settle();
+    // The render pages within the cap too, so only the retained state shows whether a snapshot was cut on arrival.
+    expect(runInContext("state.mfp.findings.length", h.context)).toBe(500);
+    expect(runInContext("state.mfp.totals.findings", h.context)).toBe(501);
+    expect(runInContext("state.mfp.roster.nodes.length", h.context)).toBe(500);
+    expect(runInContext("state.policyView.view.lines.length", h.context)).toBe(500);
+  });
+  it("6b each finding row shows the served alert as High, warn as Medium and info as Info", async () => {
+    const h = await mfpBoot("findings");
+    const html = h.el.main!.innerHTML;
+    const row = (summary: string) => (html.match(new RegExp('<tr[^>]*>(?:(?!</tr>)[\\s\\S])*' + summary + '(?:(?!</tr>)[\\s\\S])*</tr>')) || [''])[0];
+    expect(row('alert outbound observation')).toContain('mfp-severity high');
+    expect(row('alert outbound observation')).toContain('>High<');
+    expect(row('warn outbound observation')).toContain('mfp-severity medium');
+    expect(row('info outbound observation')).toContain('mfp-severity info');
+  });
+  it("6b roster trust verdicts never render a green chip", async () => {
+    const h = await mfpBoot("machines", s => {
+      s.roster.nodes = ['admitted', 'revoked', 'untrusted'].map((trust_state, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state, reach: 'recent', policy: { drift_state: 'in_sync' } })) as never;
+    });
+    const roster = (h.el.main!.innerHTML.match(/<section class="card" data-mfp-roster>[\s\S]*?<\/section>/) || [''])[0];
+    expect(roster).toContain('ADMITTED');
+    expect(roster).toContain('REVOKED');
+    expect(roster).not.toContain('state-chip good');
+  });
+  it("6b escapes hostile roster labels and node ids", async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    const h = await mfpBoot("machines", s => { s.roster.nodes[0]!.label = hostile; s.roster.nodes[0]!.node_id = hostile + '-id'; });
+    const html = h.el.main!.innerHTML;
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain(hostile);
+  });
+  it("6b the evidence drawer previews at most the evidence character limit", async () => {
+    const h = await mfpBoot("findings", s => { s.findings[1]!.details = { evidence: 'z'.repeat(20 * 1024) }; });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    const pre = (h.el.main!.innerHTML.match(/<pre>([\s\S]*?)<\/pre>/) || ['', ''])[1]!;
+    const previewed = (pre.match(/z/g) || []).length;
+    expect(previewed).toBeGreaterThan(0);
+    expect(previewed).toBeLessThanOrEqual(16 * 1024);
+    expect(h.el.main!.innerHTML).toContain('Evidence preview truncated at ' + 16 * 1024 + ' characters of');
+  });
+  it("6b refuses roster entries whose node id or label is not text", async () => {
+    for (const change of [
+      (n: Record<string, unknown>) => { n.node_id = 7; },
+      (n: Record<string, unknown>) => { n.label = { text: 'Build box' }; },
+    ]) {
+      const h = await mfpBoot("machines", s => { change(s.roster.nodes[0] as never); });
+      expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    }
+  });
+
+  // Round 2: public read behavior and reachable per-item controls.
+  const r2Sources = [
+    { route: 'machines', path: '/api/fleet/roster', key: 'roster', unknown: 'Fleet roster Unknown', old: 'Build box', read: 'fetchMfpRead("/api/fleet/roster", "roster")' },
+    { route: 'findings', path: '/api/sentinels/findings', key: 'findings', unknown: 'Sentinel findings Unknown', old: 'alert outbound observation', read: 'fetchMfpRead("/api/sentinels/findings", "findings")' },
+    { route: 'policy', path: '/api/policy/current', key: 'policy', unknown: 'Policy Unknown', old: 'export your saved state off the machine', read: 'readPolicyView()' },
+  ];
+  function r2Body(key: string, label?: string) {
+    const s = mfpScenario();
+    if (label) { s.roster.nodes[0]!.label = label; s.findings[0]!.summary = label; s.policy.lines[0]!.text = label; }
+    return key === 'roster' ? s.roster : { data: key === 'findings' ? { findings: s.findings } : { view: s.policy } };
+  }
+  function r2Retry(h: Awaited<ReturnType<typeof mfpBoot>>, path: string) {
+    const button = h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + path + '"]');
+    expect(button, 'rendered retry for ' + path).not.toBeNull();
+    h.click(button!.attrs);
+  }
+  for (const source of r2Sources) {
+    it('6b r2 retries a rejected ' + source.key + ' read exactly once', async () => {
+      const read = vi.fn(() => Promise.reject(new Error('offline')));
+      const h = await mfpBoot(source.route, undefined, { [source.path]: read });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      const before = read.mock.calls.length;
+      r2Retry(h, source.path); await settle();
+      expect(read.mock.calls.length).toBe(before + 1);
+    });
+    it('6b r2 rejects malformed ' + source.key + ' records with a retry control', async () => {
+      const body = source.key === 'roster' ? { available: true, nodes: [null] }
+        : { data: source.key === 'findings' ? { findings: [null] } : { view: { lines: [null] } } };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 drops the ' + source.key + ' snapshot and total after refresh failure', async () => {
+      let failed = false;
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body(source.key))) });
+      expect(h.el.main!.innerHTML).toContain(source.old);
+      failed = true;
+      h.click({ 'data-action': 'retry-panel', 'data-read': source.path }); await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain(source.old);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(0);
+      expect(runInContext(source.key === 'policy' ? 'state.policyView.view' : 'state.mfp.' + source.key, h.context)).toEqual(source.key === 'findings' ? [] : null);
+    });
+    it('6b r2 times out the ' + source.key + ' read with a retry control', async () => {
+      const h = await mfpBoot(source.route, undefined, { [source.path]: never });
+      await vi.advanceTimersByTimeAsync(runInContext('DASHBOARD_READ_DEADLINE_MS + 1', h.context));
+      await settle();
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).toContain('Read timed out');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    it('6b r2 rejects an oversized ' + source.key + ' body with a retry control', async () => {
+      // Padding exceeds the two MiB body budget without relying on a field-length validator.
+      const body = { ...r2Body(source.key), padding: 'x'.repeat(2 * 1024 * 1024) };
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => Promise.resolve(response(body)) });
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="' + source.path + '"]')).not.toBeNull();
+    });
+    for (const outcome of ['success', 'failure']) {
+      it('6b r2 ignores older ' + source.key + ' ' + outcome + ' after the newer read loads', async () => {
+        let wave = false;
+        const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+        const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+        wave = true;
+        const a = runInContext(source.read, h.context); await settle();
+        const b = runInContext(source.read, h.context); await settle();
+        expect(pending).toHaveLength(2);
+        pending[1]!.resolve(response(r2Body(source.key, 'newer snapshot'))); await b; await settle();
+        if (outcome === 'success') pending[0]!.resolve(response(r2Body(source.key, 'older snapshot')));
+        else pending[0]!.reject(new Error('old failure'));
+        await a; await settle();
+        runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).toContain('newer snapshot');
+        expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+        expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+      });
+    }
+    it('6b keeps the ' + source.key + ' snapshot for the trailing read when a queued refresh supersedes the read', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      const total = runInContext('state.mfp.totals.' + source.key, h.context);
+      expect(total).toBeGreaterThan(0);
+      wave = true;
+      const job = source.key === 'policy' ? 'policyPanelJob' : 'panelJobs.find(function (job) { return job.paths[0] === ' + JSON.stringify(source.path) + '; })';
+      // Two refreshes, as two stream events queue them: the first starts a read and the second supersedes it.
+      const first = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      const trailing = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      expect(pending).toHaveLength(1);
+      pending[0]!.resolve(response(r2Body(source.key, 'superseded snapshot'))); await first; await settle();
+      expect(runInContext('sourceRead(' + JSON.stringify(source.path) + ').state', h.context)).not.toBe('state_FAILED');
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(total);
+      expect(pending).toHaveLength(2);
+      pending[1]!.resolve(response(r2Body(source.key, 'trailing snapshot'))); await trailing; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain('trailing snapshot');
+      expect(h.el.main!.innerHTML).not.toContain('superseded snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+    });
+    it('6b leaves the ' + source.key + ' read Unknown when an older success lands after a newer failure', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      wave = true;
+      const a = runInContext(source.read, h.context); await settle();
+      const b = runInContext(source.read, h.context); await settle();
+      expect(pending).toHaveLength(2);
+      pending[1]!.reject(new Error('newer failure')); await b; await settle();
+      pending[0]!.resolve(response(r2Body(source.key, 'older snapshot'))); await a; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain(source.unknown);
+      expect(h.el.main!.innerHTML).not.toContain('older snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(false);
+    });
+    it('6b keeps the ' + source.key + ' snapshot for the trailing read when a superseded read fails', async () => {
+      let wave = false;
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const h = await mfpBoot(source.route, undefined, { [source.path]: () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body(source.key))) });
+      const total = runInContext('state.mfp.totals.' + source.key, h.context);
+      expect(total).toBeGreaterThan(0);
+      wave = true;
+      const job = source.key === 'policy' ? 'policyPanelJob' : 'panelJobs.find(function (job) { return job.paths[0] === ' + JSON.stringify(source.path) + '; })';
+      const first = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      const trailing = runInContext('queuePanel(' + job + ')', h.context); await settle();
+      expect(pending).toHaveLength(1);
+      // The superseded read fails instead of succeeding; the trailing read still owns the source.
+      pending[0]!.reject(new Error('superseded failure')); await first; await settle();
+      expect(runInContext('sourceRead(' + JSON.stringify(source.path) + ').state', h.context)).not.toBe('state_FAILED');
+      expect(runInContext('state.mfp.totals.' + source.key, h.context)).toBe(total);
+      expect(pending).toHaveLength(2);
+      pending[1]!.resolve(response(r2Body(source.key, 'trailing snapshot'))); await trailing; await settle();
+      runInContext('rerender()', h.context);
+      expect(h.el.main!.innerHTML).toContain('trailing snapshot');
+      expect(runInContext('sourceLoaded(' + JSON.stringify(source.path) + ')', h.context)).toBe(true);
+    });
+  }
+  it('6b keeps an open finding through two activity frames that supersede its read', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    // The activity frame handler queues this refresh through queueStreamRefresh; two frames arrive during one read.
+    const first = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    const second = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    pending[0]!.resolve(response(r2Body('findings'))); await settle();
+    expect(pending).toHaveLength(2);
+    pending[1]!.resolve(response(r2Body('findings'))); await first; await second; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+  });
+  it('6b keeps an open finding when a read superseded by two activity frames fails', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    const first = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    const second = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    pending[0]!.reject(new Error('superseded failure')); await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(pending).toHaveLength(2);
+    pending[1]!.resolve(response(r2Body('findings'))); await first; await second; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe('finding-alert');
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+  });
+  it('6b closes the open finding when live updates stop, so a restart cannot reopen it', async () => {
+    let wave = false;
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => wave ? new Promise((resolve, reject) => pending.push({ resolve, reject })) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    wave = true;
+    // A stop lands while a findings read is in flight; that read then returns the same finding.
+    const read = runInContext('queueStreamRefresh(["/api/sentinels/findings"])', h.context); await settle();
+    expect(pending).toHaveLength(1);
+    runInContext('stopLiveUpdates()', h.context);
+    pending[0]!.resolve(response(r2Body('findings'))); await read; await settle();
+    expect(runInContext('state.mfp.findingId', h.context)).toBe(null);
+    wave = false;
+    // The operator's Retry restarts live updates and rereads every source, the same finding included.
+    await runInContext('retryPanel("/api/sentinels/findings")', h.context); await settle();
+    runInContext('rerender()', h.context);
+    expect(runInContext('sourceLoaded("/api/sentinels/findings")', h.context)).toBe(true);
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+  });
+  it('6b r2 closes a selected finding through failure and recovery', async () => {
+    let failed = false;
+    const h = await mfpBoot('findings', undefined, { '/api/sentinels/findings': () => failed ? Promise.reject(new Error('offline')) : Promise.resolve(response(r2Body('findings'))) });
+    h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-alert' });
+    expect(h.el.main!.innerHTML).toContain('aria-label="Finding evidence"');
+    failed = true; h.click({ 'data-action': 'retry-panel', 'data-read': '/api/sentinels/findings' }); await settle();
+    failed = false; r2Retry(h, '/api/sentinels/findings'); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('aria-label="Finding evidence"');
+    expect(runInContext('state.mfp.findingId', h.context)).toBeNull();
+  });
+  it('6b r2 renders only server severity values and keeps all five legend words', async () => {
+    const h = await mfpBoot('findings', s => {
+      s.findings = ['critical', 'low', 'high', 'medium', 'other', 'info', 'warn', 'alert'].map((severity, i) => ({ ...s.findings[0]!, severity, finding_id: 'severity-' + i, summary: 'Observation ' + i })) as never;
+    });
+    const html = h.el.main!.innerHTML;
+    const legend = html.match(/<div class="mfp-legend"[\s\S]*?<\/div>/)![0];
+    for (const word of ['Critical', 'High', 'Medium', 'Low', 'Info']) expect(legend).toContain('>' + word + '<');
+    expect(html).toContain('Critical and Low are display levels not emitted');
+    const rows = html.match(/<tbody>([\s\S]*?)<\/tbody>/)![1]!;
+    for (let i = 0; i < 5; i++) {
+      const row = rows.split('</tr>').find(row => row.includes('Observation ' + i))!;
+      expect(row).toContain('UNKNOWN');
+      expect(row).not.toMatch(/mfp-severity|>Critical<|>High<|>Medium<|>Low<|>Info</);
+    }
+    expect(rows.indexOf('Observation 5')).toBeLessThan(rows.indexOf('Observation 0'));
+    expect(rows).not.toMatch(/>Critical<|>Low</);
+  });
+  for (const agent of [null, '', undefined]) {
+    it('6b r2 leaves unserved agent scope unknown for ' + String(agent), async () => {
+      const h = await mfpBoot('findings', s => { s.findings = [{ ...s.findings[0]!, agent_id: agent }] as never; });
+      expect(h.el.main!.innerHTML).toContain('Unknown · agent not served');
+      h.click({ 'data-action': 'mfp-finding', 'data-finding-id': 'finding-info' });
+      const drawer = h.el.main!.innerHTML.match(/<aside class="mfp-drawer"[\s\S]*?<\/aside>/)![0];
+      expect(drawer).toContain('Unknown · agent not served');
+      expect(h.el.main!.innerHTML).not.toContain('Fortress-wide');
+    });
+  }
+  it('6b r2 distinguishes unevaluable and proven untrusted nodes', async () => {
+    const h = await mfpBoot('machines', s => { s.roster.nodes = [false, true].map((trust_evaluable, i) => ({ ...s.roster.nodes[0]!, node_id: 'node-' + i, trust_state: 'untrusted', trust_evaluable })); });
+    // Main's overviewChip wraps the glyph and word in an overview-chip-head span; the chip state and word are what this pins.
+    expect(h.el.main!.innerHTML).toMatch(/state-chip warn[^>]*><span class="overview-chip-head"><i[^>]*><\/i>NOT EVALUATED/);
+    expect(h.el.main!.innerHTML).toContain('Trust could not be evaluated; treated as untrusted');
+    expect(h.el.main!.innerHTML).toMatch(/state-chip bad[^>]*><span class="overview-chip-head"><i[^>]*><\/i>UNTRUSTED/);
+    expect(h.el.main!.innerHTML).not.toContain('state-chip good');
+  });
+  it('6b r2 rejects a nonboolean trust evaluation flag', async () => {
+    const h = await mfpBoot('machines', s => { Object.assign(s.roster.nodes[0]!, { trust_evaluable: 'false' }); });
+    expect(h.el.main!.innerHTML).toContain('Fleet roster Unknown');
+    expect(h.el.main!.innerHTML).not.toContain('Build box');
+    expect(h.el.main!.querySelector('[data-action="retry-panel"][data-read="/api/fleet/roster"]')).not.toBeNull();
+  });
+  it('6b r2 uses the shared policy heading and template severities', async () => {
+    const h = await mfpBoot('policy');
+    expect(h.el.main!.innerHTML).toContain('<h3>Always asks you first</h3>');
+    expect(h.el.main!.innerHTML).not.toContain('What asks you first');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity medium">MEDIUM</span>');
+    expect(h.el.main!.innerHTML).toContain('<span class="severity low">LOW</span>');
+  });
+  it('6b r2 leaves an empty policy read without a pager', async () => {
+    const h = await mfpBoot('policy', s => { s.policy.lines = []; });
+    const panel = h.el.main!.innerHTML.split('data-mfp-policy')[1]!.split('Channel templates')[0]!;
+    expect(panel).toContain('No policy lines returned');
+    expect(panel).not.toContain('Showing 0 of 0');
+    expect(panel).not.toContain('mfp-pager');
+  });
+  for (const list of [
+    { key: 'rules', route: 'auto-trigger', path: '/api/auto-trigger/rules', field: 'rules', row: (i: number) => ({ rule_id: 'rule-' + i, history: [] }), marker: 'rule-26', controls: ['auto-trigger-threshold-save'] },
+    { key: 'recommendations', route: 'auto-trigger', path: '/api/auto-trigger/recommendations', field: 'recommendations', row: (i: number) => ({ rule_id: 'recommendation-' + i }), marker: 'recommendation-26', controls: ['auto-trigger-accept', 'auto-trigger-reject'] },
+    { key: 'credentialTraps', route: 'honeypot', path: '/api/honeypot/credential-traps', field: 'traps', row: (i: number) => ({ fake_credential_name: 'credential-' + i }), marker: 'credential-26', controls: [] },
+    { key: 'toolTraps', route: 'honeypot', path: '/api/honeypot/tool-traps', field: 'traps', row: (i: number) => ({ fake_tool_name: 'tool-' + i }), marker: 'tool-26', controls: [] },
+  ]) {
+    it('6b r2 pages all ' + list.key + ' on both folded screens and the standalone route', async () => {
+      const rows = Array.from({ length: 26 }, (_, i) => list.row(i + 1)); // One beyond the 25-row page.
+      const h = await mfpBoot('findings', undefined, { [list.path]: () => Promise.resolve(response({ data: { [list.field]: rows } })) });
+      // Rule detail hydration is serial, so drain its bounded fixture wave before paging.
+      for (let i = 0; i < rows.length; i++) await settle();
+      for (const route of ['findings', 'policy', list.route]) {
+        runInContext('state.mfp.pages.' + list.key + ' = 0', h.context);
+        h.navigate(route); await settle(); runInContext('rerender()', h.context);
+        expect(h.el.main!.innerHTML).not.toContain(list.marker);
+        expect(h.el.main!.querySelector('[data-action="mfp-page"][data-list="' + list.key + '"][data-step="1"]')).not.toBeNull();
+        h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        for (const action of list.controls) expect(h.el.main!.innerHTML).toContain('data-action="' + action + '" data-rule-id="' + list.marker + '"');
+        runInContext('state.mfp.pages.' + list.key + ' = 999; rerender()', h.context); // Deliberately beyond the last page.
+        expect(h.el.main!.innerHTML).toContain(list.marker);
+        expect(runInContext('state.mfp.pages.' + list.key, h.context)).toBe(1);
+      }
+      // Per-item controls remain reachable beyond the main snapshot cap too.
+      const extra = Array.from({ length: 501 }, (_, i) => list.row(i + 1));
+      h.context.r2Rows = extra;
+      const target = list.route === 'honeypot' ? 'state.honeypot.' + list.key : 'state.autoTrigger.' + list.key;
+      runInContext(target + ' = r2Rows; state.mfp.pages.' + list.key + ' = 19; rerender()', h.context);
+      h.click({ 'data-action': 'mfp-page', 'data-list': list.key, 'data-step': '1' });
+      expect(h.el.main!.innerHTML).toContain(list.marker.replace('26', '501'));
+      expect(h.el.main!.innerHTML).toContain('Page 21 of 21');
+      expect(h.el.main!.innerHTML).not.toContain('Only the first 500');
+    });
+  }
+
 });

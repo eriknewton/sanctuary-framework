@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only widens the lifted client slice to the shared table presenters the policy screen now uses and adds the paged-list state those presenters read; it asserts no new behavior and so passes against pre-fix source by construction. The slice's new behavior is pinned by boot-hydration, shell-wired-consumers and copy-sweep-tier4 tests, which fail on pre-fix source.
 /**
  * Sanctuary v1.1 Dashboard - honesty regressions.
  *
@@ -14,11 +15,12 @@ function liftDashboardRenderers(): {
   renderPolicy: (state: unknown) => string;
 } {
   const src = getClientScript();
-  const end = src.indexOf("// ── Render: exit drill");
+  // Include the shared table presenters used by the policy screen.
+  const end = src.indexOf("// ── Hub API actions");
   let chunk = src.slice(0, end);
   chunk = chunk.replace(/const\s+state\s*=/, "var state =");
   const wrapper = `
-    var document = { getElementById: () => null };
+    var document = { getElementById: () => null, addEventListener: () => {} };
     var window = { matchMedia: () => null };
     var sessionStorage = { getItem: () => null, setItem: () => null };
     var location = { hash: "", host: "test", origin: "http://test" };
@@ -39,6 +41,7 @@ function liftDashboardRenderers(): {
 
 function fakeState(extras: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    mfp: { pages: { policy: 0, bindings: 0 }, totals: { policy: 0 } },
     agents: [],
     activity: [],
     policyView: { view: null, loadError: null, loading: false },

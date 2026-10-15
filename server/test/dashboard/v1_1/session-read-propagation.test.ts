@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only makes the policy-read stub answer with a real Response, because the policy reads now consume the body bytes before parsing JSON; it asserts no new behavior and so passes against pre-fix source by construction. The slice's new behavior is pinned by boot-hydration, shell-wired-consumers and copy-sweep-tier4 tests, which fail on pre-fix source.
 /** v1.1 launch-session read propagation. */
 
 import { describe, expect, it } from "vitest";
@@ -50,7 +51,8 @@ function loadClient(options: {
         }
         return { ok: true, status: 200, json: async () => ({ session_id: options.streamSession ?? "" }) };
       }
-      return { ok: true, status: 200, json: async () => ({ data: { findings: [], agents: [], rules: [], view: {} } }) };
+      // Policy reads consume bytes before JSON, as a real fetch response does.
+      return new Response(JSON.stringify({ data: { findings: [], agents: [], rules: [], view: {} } }), { status: 200 });
     },
     EventSource: class {
       constructor(url: string) { streams.push(url); }
