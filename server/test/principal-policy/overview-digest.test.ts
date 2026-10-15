@@ -215,44 +215,76 @@ describe("round 2 destination labels", () => {
 describe("round 2 coverage read bounds", () => {
   // The posture surface builds the digest inside runEagerReads (buildDigest in posture-routes.ts); this mirrors it.
   const eagerDigest = (audit: AuditLog) => audit.runEagerReads(() => digest(audit));
-  // fail-before-exempt: existing behavior; plant complete after finding the floor entry without the sequence-1 check.
+  // Fails before the head re-check in routineWindowCoverage (round 2 fail-before evidence).
   it("withholds coverage for an append between the chain head and eager view reads", async () => {
-    // Freeze the backstop clock so a timed reload cannot discard the prefix during this schedule.
-    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
-    const firstSequence = 1; // Audit chains start at sequence one.
-    const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
-    const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
-    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
-    const readHead = audit.getChainHead.bind(audit);
-    const head = vi.spyOn(audit, "getChainHead");
+    let clock: { mockRestore(): void } | undefined;
+    let head: { mockRestore(): void } | undefined;
     try {
+      // Freeze the backstop clock so a timed reload cannot discard the prefix during this schedule.
+      clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+      const readHead = audit.getChainHead.bind(audit);
       for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
       expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
-      head.mockImplementationOnce(async () => {
+      const spy = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
+        const snapshot = await readHead();
+        await append(audit, appendedCount + 1);
+        return snapshot;
+      });
+      head = spy;
+      const result = await eagerDigest(audit);
+      // The coverage check reads the head once before and once after the view.
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect((await readHead()).sequence).toBe(appendedCount + 1);
+      // Must match routineWindowCoverage in posture.ts: a head that moved during the view read cannot vouch for coverage.
+      expect(result).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
+    } finally {
+      head?.mockRestore();
+      clock?.mockRestore();
+    }
+  });
+  // Fails before the head re-check in routineWindowCoverage (round 2 fail-before evidence).
+  it("withholds coverage when a reloaded view races an append", async () => {
+    const reverifyMs = 60 * 1000; // This log's backstop interval; the clock steps past it once to force a disk reload.
+    let clock: { mockRestore(): void } | undefined;
+    let head: { mockRestore(): void } | undefined;
+    try {
+      let now = NOW;
+      clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Disk keeps two entries, so a view reloaded from disk starts above the first sequence.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount, eagerReverifyIntervalMs: reverifyMs });
+      const readHead = audit.getChainHead.bind(audit);
+      for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
+      now += reverifyMs; // The next eager read reloads the view from disk.
+      expect((await audit.runEagerReads(() => audit.query({}))).entries).toHaveLength(retainedCount);
+      head = vi.spyOn(audit, "getChainHead").mockImplementationOnce(async () => {
         const snapshot = await readHead();
         await append(audit, appendedCount + 1);
         return snapshot;
       });
       const result = await eagerDigest(audit);
-      expect(head).toHaveBeenCalledOnce();
-      expect((await readHead()).sequence).toBe(appendedCount + 1);
-      // Must match routineWindowCoverage in posture.ts: a raced view cannot vouch for complete coverage.
-      expect(result.window_complete).toBe(false);
-      expect(["retention", "coverage_unknown"]).toContain(result.window_incomplete_reason);
+      // Must match routineWindowCoverage in posture.ts: a head that moved during the view read cannot vouch for coverage.
+      expect(result).toMatchObject({ window_complete: false, window_incomplete_reason: "coverage_unknown" });
     } finally {
-      head.mockRestore();
-      clock.mockRestore();
+      head?.mockRestore();
+      clock?.mockRestore();
     }
   });
   // fail-before-exempt: existing behavior; plant retention whenever the authenticated base sequence exceeds one.
   it("covers a pruned prefix still held in the eager view but reports retention outside it", async () => {
-    // Freeze the backstop clock so a timed reload cannot discard the prefix before the eager read.
-    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
-    const firstSequence = 1; // Audit chains start at sequence one.
-    const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
-    const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
-    const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
+    let clock: { mockRestore(): void } | undefined;
     try {
+      // Freeze the backstop clock so a timed reload cannot discard the prefix before the eager read.
+      clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+      const firstSequence = 1; // Audit chains start at sequence one.
+      const retainedCount = 2; // Keep a suffix with a floor entry distinct from the tip.
+      const appendedCount = retainedCount + firstSequence; // One extra append rotates the first entry off disk.
+      const audit = new AuditLog(new MemoryStorage(), generateRandomKey(), { maxEntries: retainedCount });
       for (let seq = firstSequence; seq <= appendedCount; seq++) await append(audit, seq);
       expect(await audit.authenticatedRotationFloor()).toMatchObject({ status: "valid", base_sequence: firstSequence + 1 });
       await audit.runEagerReads(async () => {
@@ -266,7 +298,7 @@ describe("round 2 coverage read bounds", () => {
       // A disk read loses the rotated prefix, so its smaller count cannot claim complete coverage.
       expect(await digest(audit)).toMatchObject({ window_complete: false, window_incomplete_reason: "retention", kernel_blocks: retainedCount });
     } finally {
-      clock.mockRestore();
+      clock?.mockRestore();
     }
   });
   it("settles coverage from the eager view without re-reading the chain from disk", async () => {
