@@ -4096,15 +4096,15 @@ describe("Approvals round-two surface evidence", () => {
     expect(runInContext('state.approvals.inFlightItemId', h.context)).toBeNull();
   });
 
-  it("Evidence empty page with positive total and no filter states the server count and retries its read", async () => {
+  // A positive server count deliberately disagrees with the empty served page; one entry takes the singular noun.
+  for (const total of [7, 1]) it(`Evidence empty page with a total of ${total} and no filter states the server count and retries its read`, async () => {
     vi.useFakeTimers();
-    const total = 7; // A positive server count deliberately disagrees with the empty served page.
     const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
     await settle();
     runInContext('state.timeRange = "all";', h.context); h.navigate("activity"); await settle();
     const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
     expect(entries).toContain('<h3>No entries on this page</h3>');
-    expect(entries).toContain(`The server counts ${total} entries in this view, but this read shows none.`);
+    expect(entries).toContain(`The server counts ${total} ${total === 1 ? "entry" : "entries"} in this view, but this read shows none.`);
     expect(entries).not.toContain("No entries match this view");
     expect(entries).not.toContain("Clear filters");
     expect(entries).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');

@@ -3743,7 +3743,7 @@ function renderActivityScreen() {
   const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
     // A positive server count with no active filter proves neither a match failure nor an empty window.
     ? !entries.length && total > 0 && !activeFilterNames.length
-      ? '<div class="overview-empty"><h3>No entries on this page</h3><p>' + escHtml("The server counts " + total + " entries in this view, but this read shows none.") + '</p><button class="btn" data-action="retry-panel" data-read="/api/posture/evidence">Retry</button></div>'
+      ? '<div class="overview-empty"><h3>No entries on this page</h3><p>' + escHtml("The server counts " + total + (total === 1 ? " entry" : " entries") + " in this view, but this read shows none.") + '</p><button class="btn" data-action="retry-panel" data-read="/api/posture/evidence">Retry</button></div>'
       : entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
       ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p>' + clearFiltersLink + '</div>'
       : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
