@@ -4326,7 +4326,7 @@ function renderPostureScreen() {
   // Only earned evidence permits an unqualified zero; full pages and unknown tiers retain their bounds below.
   const pendingValue = pendingEvidence.earned ? "0" : pending.length + (pendingEvidence.full ? "+" : "");
   const pendingNote = (pendingEvidence.full ? "from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items · " : "") +
-    (pendingEvidence.unknown ? pendingEvidence.unknownLine + ". " : "");
+    (pendingEvidence.unknown ? pendingEvidence.unknownLine + " · " : "");
   const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
   // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
   const checkCurrent = auditChainCheckCurrent(digest);
@@ -4426,7 +4426,8 @@ function approvalWaitingSummary() {
     ? heldOperationsPhrase(of) + " in the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items " + (of === 1 ? "waits" : "wait")
     : heldOperationsPhrase(of, "waits", "wait")) + " on you";
   // Unknown tiers cannot disappear into a recognized zero, even when the current agent scope hides them.
-  const unknownClause = evidence.unknown ? "; " + evidence.unknown + (evidence.unknown === 1 ? " held item has" : " held items have") + " a tier this console does not recognize" : "";
+  // The wording comes from approvalQueueEvidence so the queue warning, tile, seal row and this sentence say it the same way.
+  const unknownClause = evidence.unknown ? "; " + evidence.unknownLine : "";
   return { known: true, n: n, of: of, full: evidence.full, earned: evidence.earned, sentence: countLine + (scope ? " (scoped to " + scope + ")" : "") + unknownClause + " · queue read " + age + (evidence.full ? "." + evidence.pageEdge : "") };
 }
 

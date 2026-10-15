@@ -4025,7 +4025,7 @@ describe("Approvals round-two surface evidence", () => {
   for (const count of [1, 2]) { // Singular and plural unknown-tier wording are distinct product branches.
     it(`Overview tile qualifies zero with ${count} unrecognized-tier holds`, async () => {
       const h = await bootItems(unknown(count));
-      expect(tile(h)).toContain(tierWarning(count));
+      expect(tile(h)).toContain(tierWarning(count) + " · ");
       expect(tile(h)).toContain('<span class="ot-value">0</span>');
     });
   }
@@ -4049,9 +4049,8 @@ describe("Approvals round-two surface evidence", () => {
     it(`rail and bell name ${count} unrecognized-tier holds after the scope clause`, async () => {
       const h = await bootItems(unknown(count));
       h.click({ "data-action": "agent-scope-select", "data-agent-id": "outside-agent" });
-      const clause = count === 1 ? "1 held item has" : `${count} held items have`;
       for (const el of [h.railLink, h.el["btn-notifications"]!]) {
-        for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain(`0 of 0 held operations wait on you (scoped to outside-agent); ${clause} a tier this console does not recognize · queue read `);
+        for (const attr of ["title", "aria-label"]) expect(el.getAttribute(attr)).toContain(`0 of 0 held operations wait on you (scoped to outside-agent); ${tierWarning(count)} · queue read `);
       }
       expect(h.el["notify-count"]!.hidden).toBe(false);
     });
