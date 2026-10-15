@@ -287,9 +287,10 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   // and channel-template bindings, while "Template binding changed" describes only the channel-template writer.
   "activity.agent_policy_change_engaged": (a) =>
     `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
-  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied. Serving it is not a
-  // lookup-only change either: its one writer in hub-service.ts records current_template and proposed_template, not
-  // the channel_template_id and policy_id this sentence reads.
+  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied, and this id stays
+  // unserved with its engaged counterpart. buildTemplateArgs in hub/activity-feed.ts already maps this writer's
+  // current_template and proposed_template onto the channel_template_id and policy_id this sentence reads; agent_id
+  // is served only when the row's producer signature re-verifies, so any other row would read "(unknown)".
   "activity.agent_policy_change_denied": (a) =>
     `Template binding denied on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.config": (a) =>
