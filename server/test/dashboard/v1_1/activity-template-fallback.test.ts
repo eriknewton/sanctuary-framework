@@ -174,6 +174,15 @@ function clientRenderer() {
 }
 
 describe("activity template namespace fallback", () => {
+  // fail-before-exempt: deleting either corresponding catalog entry in templates.ts turns its pin red.
+  it.each([
+    "activity.agent_policy_change_engaged",
+    "activity.agent_policy_change_denied",
+  ])("keeps the unused exact id %s registered", (id) => {
+    // Registration remains frozen even though the hub serves category-qualified ids for these operations.
+    expect(listRegisteredTemplateIds()).toContain(id);
+  });
+
   for (const category of categories) {
     const namespace = HUB_ACTIVITY_TEMPLATE_NAMESPACES[category];
 
