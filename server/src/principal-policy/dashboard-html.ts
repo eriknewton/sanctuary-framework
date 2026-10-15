@@ -3481,7 +3481,8 @@ export function generateFleetSwitcherHTML(options: {
       font-size: var(--text-xs);
       color: var(--ink-3);
       flex-shrink: 0;
-      min-width: 56px;
+      /* 11ch = "Not healthy" and "Not checked", the longest status words, in this monospace face, so every card's name starts at the same x. */
+      min-width: 11ch;
     }
     .machine-card .info { flex: 1; min-width: 0; }
     .machine-card .name {
