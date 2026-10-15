@@ -287,8 +287,9 @@ const TEMPLATES: Record<string, TemplateRenderer> = {
   // and channel-template bindings, while "Template binding changed" describes only the channel-template writer.
   "activity.agent_policy_change_engaged": (a) =>
     `Template binding changed on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
-  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied; this entry stays frozen
-  // with its engaged counterpart because serving the pair requires distinguishing that operation's two writers above.
+  // Registered but not served: templateIdFor emits activity.denial.agent_policy_change_denied. Serving it is not a
+  // lookup-only change either: its one writer in hub-service.ts records current_template and proposed_template, not
+  // the channel_template_id and policy_id this sentence reads.
   "activity.agent_policy_change_denied": (a) =>
     `Template binding denied on agent ${arg(a, "agent_id")}: ${arg(a, "channel_template_id", "default none")} to ${arg(a, "policy_id")}.`,
   "activity.config": (a) =>
