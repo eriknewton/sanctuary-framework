@@ -1550,13 +1550,19 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
   function auxHarness(
     pendingFailure: { status?: number } | null,
     inboxFailure?: { status?: number } | null,
+    pendingRows: unknown[] = [],
   ): AuxHarness {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("var lastApprovals = ");
     const end = html.indexOf("// Apply a fresh home payload");
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
+    const helpersStart = html.indexOf("function normalizeLegacyApproval");
+    const helpersEnd = html.indexOf("function lockedApprovalsHTML", helpersStart);
+    if (start < 0 || end <= start || helpersStart < 0 || helpersEnd <= helpersStart) {
+      throw new Error("Missing approval helper or refreshAuxiliary slice anchor");
+    }
     const source =
+      // Use the shipped normalization and availability rules so the harness cannot invent inbox semantics.
+      html.slice(helpersStart, helpersEnd) +
       html.slice(start, end) +
       "\nreturn { refreshAuxiliary: refreshAuxiliary," +
       " state: function () { return lastApprovals; } };";
@@ -1568,7 +1574,7 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     const api = (path: string): Promise<unknown> => {
       if (path === "/api/pending") {
         if (pendingFailure) return rejection(pendingFailure);
-        return Promise.resolve([]);
+        return Promise.resolve(pendingRows);
       }
       if (path === "/api/approval-inbox?status=pending") {
         if (inboxFailure) return rejection(inboxFailure);
@@ -1583,21 +1589,8 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
       }
       return Promise.resolve({ findings: [] });
     };
-    const buildApprovalState = (
-      legacy: unknown,
-      inbox: unknown,
-      _status: unknown,
-      queueDenied?: boolean,
-    ): { locked: boolean; unavailable: boolean; rows: unknown[] } => ({
-      locked: queueDenied === true,
-      unavailable: legacy === null || inbox === null,
-      rows: [],
-    });
     // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    return new Function("api", "buildApprovalState", source)(
-      api,
-      buildApprovalState,
-    ) as AuxHarness;
+    return new Function("api", source)(api) as AuxHarness;
   }
 
   it("marks the approval state LOCKED when /api/pending answers 401", async () => {
@@ -1612,6 +1605,7 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     expect(h.state().locked).toBe(false);
   });
 
+  // fail-before-exempt: plant PENDING_FAILURE_AS_EMPTY changes the pending catch's null to [].
   it("a non-401 /api/pending failure is unavailable, not locked or empty", async () => {
     const h = auxHarness({ status: 503 });
     await h.refreshAuxiliary();
@@ -1626,6 +1620,7 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
     expect(h.state().unavailable).toBe(true);
   });
 
+  // fail-before-exempt: plant INBOX_DENIAL_IGNORED removes noteDenied(e) from the inbox catch.
   it("a 401 inbox failure stays on the locked path, not unavailable", async () => {
     const h = auxHarness(null, { status: 401 });
     await h.refreshAuxiliary();
@@ -1674,6 +1669,18 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
   it("never blocks the rest of the page when the INBOX read is the denied one", async () => {
     const h = auxHarness(null, { status: 401 });
     await expect(h.refreshAuxiliary()).resolves.toBeUndefined();
+  });
+
+  // fail-before-exempt: plant INBOX_404_UNAVAILABLE returns malformed entries from the inbox catch.
+  it("a 404 inbox route leaves the legacy queue available and unlocked", async () => {
+    const pending = { id: "legacy-pending", operation: "state_export" };
+    const h = auxHarness(null, { status: 404 /* HTTP Not Found: wrap has no inbox route. */ }, [pending]);
+    await h.refreshAuxiliary();
+    expect(h.state().locked).toBe(false);
+    expect(h.state().unavailable).toBe(false);
+    expect(h.state().rows).toEqual([
+      expect.objectContaining({ id: pending.id, source: "legacy", title: pending.operation }),
+    ]);
   });
 });
 
