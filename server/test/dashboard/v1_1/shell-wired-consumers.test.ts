@@ -3118,6 +3118,35 @@ describe("slice 6a Agents wired consumers", () => {
     expect(html).not.toContain("Enforcement confirmed");
   });
 
+  for (const [name, readAt] of [["missing", "undefined"], ["not-a-number", "NaN"], ["text", '"soon"']]) it(`A1 a loaded reach read with a ${name} read time is withheld as undated`, async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // Fails before the undated arm in renderAgentReach (A1 round 2 fail-before evidence).
+    const html = runInContext(`state.agentReach.readAt = ${readAt}; renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
+    expect(html).toContain("Reach read time is unknown, so it is not current.");
+    expect(html).not.toContain("The reach source answered without a record for this agent.");
+    expect(html).not.toContain("Reach read expired after one minute without interaction.");
+    expect(html).not.toContain('class="agent-reach-lane"');
+    expect(html).not.toContain("docs.example.test");
+    expect(html).not.toContain("Enforcement confirmed");
+  });
+
+  it("A1 a loaded reach read exactly one minute old reads expired and one millisecond younger stays current", async () => {
+    const { h } = await start("evidenced-protected");
+    detail(h); await settle();
+    // fail-before-exempt: pins the existing one-minute boundary; a planted change from >= to > in renderAgentReach turns it red.
+    // start() runs under fake timers, so the clock does not move between setting each read time and rendering it.
+    const render = (age: string) => runInContext(`state.agentReach.readAt = Date.now() - (${age}); renderAgentReach(state.agents.find(a => a.agent_id === "research-agent"))`, h.context) as string;
+    const atLimit = render("AGENT_REACH_MAX_AGE_MS");
+    expect(atLimit).toContain("Reach read expired after one minute without interaction.");
+    expect(atLimit).not.toContain('class="agent-reach-lane"');
+    expect(atLimit).not.toContain("docs.example.test");
+    const justYounger = render("AGENT_REACH_MAX_AGE_MS - 1");
+    expect(justYounger).not.toContain("Reach read expired after one minute without interaction.");
+    expect(justYounger).toContain('class="agent-reach-lane"');
+    expect(justYounger).toContain("docs.example.test");
+  });
+
   for (const key of ["Enter", " "]) it(`A1 row inspect ${JSON.stringify(key)} resets the tab and reads reach once`, async () => {
     const { h } = await start();
     runInContext('state.agentTab = "evidence"', h.context);

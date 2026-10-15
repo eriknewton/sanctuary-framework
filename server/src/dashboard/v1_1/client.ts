@@ -1942,6 +1942,8 @@ function renderAgentReach(agent) {
   if (reachState === "state_LOADED" && read.data) {
     // A stopped stream cannot establish current reach even when its last read is recent.
     if (liveUpdatesStopped) reachState = "state_STOPPED";
+    // A read time that is not a finite number cannot be aged, so it cannot establish freshness either.
+    else if (typeof read.readAt !== "number" || !Number.isFinite(read.readAt)) reachState = "state_UNDATED";
     // A future read cannot establish freshness against this device's clock.
     else if (now < read.readAt) reachState = "state_FUTURE";
     // Configured reach expires at the same one-minute boundary used by the loader.
@@ -1965,11 +1967,12 @@ function renderAgentReach(agent) {
     state_EXPIRED: "Reach read expired after one minute without interaction.",
     state_STOPPED: "Live updates stopped. Retry to resume.",
     state_FUTURE: "Reach read time is ahead of this device's clock, so it is not current.",
+    state_UNDATED: "Reach read time is unknown, so it is not current.",
     state_FAILED: "Reach read failed · " + relTimeFromIso(new Date(read.readAt).toISOString()),
     state_LOADED: "The reach source answered without a record for this agent."
   };
   // Withheld loaded evidence must not leave lanes visible as though they describe current reach.
-  const visibleLanes = ["state_STOPPED", "state_FUTURE", "state_EXPIRED"].includes(reachState) ? "" : lanes;
+  const visibleLanes = ["state_STOPPED", "state_UNDATED", "state_FUTURE", "state_EXPIRED"].includes(reachState) ? "" : lanes;
   const description = reach ? (confirmed ? "Enforcement confirmed" : "Configured; enforcement not confirmed") + (reach.has_wall_policy ? "" : ". No Castle Wall ruleset applies") : descriptions[reachState];
   return '<section class="card" aria-label="Effective reach"><h3>Effective reach</h3>' + intro + '<p>' + escHtml(description) + '</p>' + visibleLanes +
     '<p class="muted">' + (reach ? reach.destinations.filter(function (d) { return d.disposition === "allow"; }).length + ' allowed destinations; ' : '') + 'requested hosts Unknown · MCP servers Unknown · tools Unknown · reach read ' + escHtml(reach ? relTimeFromIso(new Date(read.readAt).toISOString()) : "Unknown") + '</p>' +
