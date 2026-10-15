@@ -3474,7 +3474,7 @@ export function generateFleetSwitcherHTML(options: {
     .machine-card .status-dot.online { background: var(--sage); }
     .machine-card .status-dot.offline { background: var(--rust); }
     .machine-card .status-dot.checking { background: var(--ochre); }
-    /* Unknown is hollow because an unread probe earns neither the pass nor the failure color. */
+    /* Unknown is hollow because a probe without an explicit boolean health answer earns neither the pass nor the failure color. */
     .machine-card .status-dot.unknown { background: transparent; border: 1px solid var(--ink-3); } /* One CSS pixel outlines the hollow dot. */
     .machine-card .status-label {
       font-family: var(--mono);
@@ -3680,13 +3680,13 @@ export function generateFleetSwitcherHTML(options: {
         state_NOT_HEALTHY: { word: 'Not healthy', cls: 'offline' },
         state_UNKNOWN: { word: 'Unknown', cls: 'unknown' }
       };
+      let timeout;
       try {
         const controller = new AbortController();
         // 3000 ms = FLEET_PROBE_DEADLINE_SECONDS (3) times 1000 ms per second; must match
         // FLEET_PROBE_DEADLINE_MS in server/src/dashboard/v1_1/client.ts so both views give a machine the same time to answer.
-        const timeout = setTimeout(() => controller.abort(), 3000);
+        timeout = setTimeout(() => controller.abort(), 3000);
         const resp = await fetch(url + '/api/health', { signal: controller.signal });
-        clearTimeout(timeout);
         // Only a non-redirecting successful response is evidence from this machine's health endpoint.
         if (!resp.ok || resp.redirected) return PROBE_VIEW.state_UNKNOWN;
         const data = await resp.json();
@@ -3699,6 +3699,9 @@ export function generateFleetSwitcherHTML(options: {
       } catch {
         // A failed, aborted or unreadable probe is not evidence that the machine is unhealthy.
         return PROBE_VIEW.state_UNKNOWN;
+      } finally {
+        // The deadline also covers the body read, so a machine that answers headers and then stalls settles to Unknown.
+        clearTimeout(timeout);
       }
     }
 

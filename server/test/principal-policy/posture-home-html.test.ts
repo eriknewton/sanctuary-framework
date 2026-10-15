@@ -1,3 +1,4 @@
+// fail-before-exempt: this change runs the approval harness through the page's real helpers instead of a hand-written buildApprovalState and adds one pin for an inbox read that fails without a denial; both assert existing page behavior and so pass against pre-fix source by construction, and an inbox catch that answers an unread body turns the pin red. The probe-word change is pinned by fleet-switcher-probe-status.test.ts, which fails on pre-fix source.
 import { describe, expect, it } from "vitest";
 import {
   custodyPill,
@@ -1672,7 +1673,8 @@ describe("posture home - refreshAuxiliary distinguishes a denied queue read from
   });
 
   // fail-before-exempt: plant INBOX_404_UNAVAILABLE returns malformed entries from the inbox catch.
-  it("a 404 inbox route leaves the legacy queue available and unlocked", async () => {
+  // The page does not tell a 404 from other non-denial failures; a missing route is the case this pins.
+  it("an inbox read that fails without a denial, such as a 404 from a server with no inbox route, leaves the legacy queue available and unlocked", async () => {
     const pending = { id: "legacy-pending", operation: "state_export" };
     const h = auxHarness(null, { status: 404 /* HTTP Not Found: wrap has no inbox route. */ }, [pending]);
     await h.refreshAuxiliary();

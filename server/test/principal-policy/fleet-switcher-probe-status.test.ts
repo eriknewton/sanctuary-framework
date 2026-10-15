@@ -23,7 +23,9 @@ class PageNode {
 
 type ProbeFetch = (url: string, options: { signal: AbortSignal }) => Promise<unknown>;
 
-async function probe(fetch: ProbeFetch, abort = false): Promise<{ word: string; cls: string }> {
+// abort: true fires the probe deadline before the response arrives; "after-headers" fires it once the response
+// headers have been handled, so a body that stalls is still inside the deadline.
+async function probe(fetch: ProbeFetch, abort: boolean | "after-headers" = false): Promise<{ word: string; cls: string }> {
   const scriptMatch = page().match(/<script>\s*(const STORAGE_KEY[\s\S]*?)<\/script>/);
   if (!scriptMatch) throw new Error("Missing Fleet Switcher script anchor");
   const end = scriptMatch[1].indexOf("// Auto-add current machine");
@@ -68,7 +70,12 @@ async function probe(fetch: ProbeFetch, abort = false): Promise<{ word: string; 
     { origin: "http://127.0.0.1:3501" },
     fetch, setTimeout, clearTimeout, AbortController,
   );
-  if (abort) {
+  if (abort === "after-headers") {
+    // A real macrotask turn lets the stubbed fetch resolve and the script handle the headers first.
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    if (!deadline) throw new Error("Probe cleared its deadline before reading the body");
+    deadline();
+  } else if (abort) {
     if (!deadline) throw new Error("Probe did not schedule an abort");
     deadline();
   }
@@ -113,6 +120,38 @@ describe("Fleet Switcher probe status", () => {
     expect(result.cls).toBe("status-dot unknown");
     expect(result.cls).not.toContain("offline");
     expect(result.cls).not.toContain("online");
+  });
+
+  it("a body that stalls after its headers reads Unknown when the deadline passes", async () => {
+    const stalled: ProbeFetch = async (_url, { signal }) => ({
+      ok: true,
+      redirected: false,
+      // The body never arrives on its own; only the probe's abort settles the read.
+      json: () => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      }),
+    });
+    expect(await probe(stalled, "after-headers")).toEqual({ word: "Unknown", cls: "status-dot unknown" });
+  });
+
+  it("reserves room in the status label for its longest word", () => {
+    const html = page();
+    const style = html.match(/<style>([\s\S]*?)<\/style>/)?.[1];
+    if (!style) throw new Error("Missing Fleet Switcher style anchor");
+    const labelRule = style.match(/\.machine-card \.status-label\s*\{([^}]+)\}/)?.[1];
+    if (!labelRule) throw new Error("Missing status label rule");
+    const reserved = labelRule.match(/min-width:\s*(\d+)ch\b/);
+    expect(reserved, "status label min-width in ch").not.toBeNull();
+    // The words come from the page script itself, so a new or longer word cannot slip past this check.
+    const script = html.match(/<script>\s*(const STORAGE_KEY[\s\S]*?)<\/script>/)?.[1];
+    if (!script) throw new Error("Missing Fleet Switcher script anchor");
+    const words = [...script.matchAll(/word: '([^']+)'/g)].map((match) => match[1]);
+    const initial = script.match(/label\.textContent = acceptedUrl \? '([^']+)' : '([^']+)'/);
+    if (!initial) throw new Error("Missing initial status label anchor");
+    words.push(initial[1], initial[2]);
+    // 5 = the three probe words plus the two labels a card shows before its probe settles.
+    expect(words).toHaveLength(5);
+    expect(Number(reserved![1])).toBeGreaterThanOrEqual(Math.max(...words.map((word) => word.length)));
   });
 
   it("styles unknown distinctly from online, failure and checking", () => {
