@@ -29,6 +29,8 @@
 
 import type { AuditChainVerdictStatus } from "../../operational/audit-log.js";
 import { castleWallLocalPlatformSubject } from "../../castle-wall/provision-state.js";
+import { HUB_ACTIVITY_TEMPLATE_NAMESPACES } from "../../hub/constants.js";
+import { ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE } from "./templates.js";
 
 /**
  * Returns the inline client script body. The HTML shell wraps this in
@@ -703,6 +705,16 @@ function arg(args, kind, fallback) {
   return fallback;
 }
 
+// True when the first arg of the kind, the one arg() renders, carries a nonempty string. Must match hasArgValue in
+// templates.ts.
+function hasArgValue(args, kind) {
+  if (!Array.isArray(args)) return false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] && args[i].kind === kind) return typeof args[i].value === "string" && args[i].value.length > 0;
+  }
+  return false;
+}
+
 // Cross-file contract: every key here must have a matching key in the
 // server TEMPLATES registry in templates.ts (this map is a mirror of that
 // registry). Enforced by the full-set parity test in
@@ -774,8 +786,22 @@ const TEMPLATES = {
   "activity.other": (a) => "Audit event recorded for agent " + arg(a,"agent_id","(fortress)") + "."
 };
 
+// Must match ACTIVITY_TEMPLATE_NAMESPACES in templates.ts, sourced from hub/constants.ts.
+const ACTIVITY_TEMPLATE_NAMESPACES = ${JSON.stringify(Object.values(HUB_ACTIVITY_TEMPLATE_NAMESPACES))};
+// Must match ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE in templates.ts, injected from it when the script is built.
+const ACTIVITY_FALLBACK_TEMPLATES = ${JSON.stringify(ACTIVITY_FALLBACK_TEMPLATE_BY_NAMESPACE)};
+
 function renderTemplate(id, args) {
-  const fn = TEMPLATES[id];
+  let fn = TEMPLATES[id];
+  if (!fn && typeof id === "string") {
+    // The hub serves operation-suffixed ids; the dashboard registers sentences per category. An operation renders its
+    // category's sentence only where that sentence is true of every operation the hub files there.
+    const namespace = ACTIVITY_TEMPLATE_NAMESPACES.find((prefix) => id.startsWith(prefix + "."));
+    const fallback = namespace ? ACTIVITY_FALLBACK_TEMPLATES[namespace] : undefined;
+    // A row without a verified agent never renders a sentence that would name the fortress as its subject: the hub
+    // serves agent_id only for a re-verified producer signature, so the row keeps the diagnostic fallback instead.
+    if (fallback && (fallback.requiredArg === null || hasArgValue(args, fallback.requiredArg))) fn = TEMPLATES[fallback.template];
+  }
   if (!fn) return "[unrecognized template: " + id + "]";
   try { return fn(args || []); } catch (e) { return "[template render failed: " + id + "]"; }
 }
