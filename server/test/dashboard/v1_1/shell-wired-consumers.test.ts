@@ -27,6 +27,7 @@ import { agentsScenario } from "./fixtures/agents-scenarios.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { HUB_AGENT_STATUSES } from "../../../src/contracts/v1.1/constants.js";
+import { renderDashboardV11Html } from "../../../src/dashboard/v1_1/html.js";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 import { STATUS_MAPPING, TIER1_BUTTON_COPY } from "../../../src/dashboard/v1_1/status-mapping.js";
 
@@ -371,19 +372,24 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     h.navigate("enforcement");
     const main = h.el.main!.innerHTML;
-    expect(main).toContain("<strong>4</strong> outbound connections blocked at the kernel");
-    expect(main).toMatch(/<strong class="unknown-value">Unknown<\/strong> allowed/);
+    // Both counts need the common positive gate; an unverified read is not a measured zero.
+    expect(main).toContain("Not evaluated");
+    // This home fixture serves no chain_verdict, so the chain gate withholds its counts.
+    expect(main).toContain("chain not verified");
     expect(main).not.toContain("<strong>0</strong>");
     expect(main).not.toMatch(/\b0 allowed/);
     expect(main).not.toMatch(/of 4 observed/);
   });
 
-  it("the Enforcement egress line keeps its denominator when both kernel counts are read", async () => {
+  it("the Enforcement egress card renders separate verified kernel counts", async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/posture/home": () => Promise.resolve(response(home({ kernel_blocks: 4, kernel_allows: 2 }))) });
+    const h = boot({ "/api/posture/home": () => Promise.resolve(response(home({ kernel_blocks: 4, kernel_allows: 2, chain_verified: true, chain_verdict: "verified", window_complete: true, kernel_allow_overrides: 0, window_start: new Date(Date.now() - 1000).toISOString(), window_end: new Date().toISOString() }))) });
     await settle();
     h.navigate("enforcement");
-    expect(h.el.main!.innerHTML).toContain("<strong>4</strong> of 6 observed outbound connections blocked at the kernel; 2 allowed.");
+    // The fixture serves the clean flag and verdict together; counts remain independent served values.
+    expect(h.el.main!.innerHTML).toContain("Blocked <strong>4</strong>");
+    expect(h.el.main!.innerHTML).toContain("Allowed <strong>2</strong>");
+    expect(h.el.main!.innerHTML).not.toContain("of 6");
   });
 
   it("the Approvals and seal copy claim only what the paths do", async () => {
@@ -1679,7 +1685,8 @@ describe("slice 3 Overview wired consumers", () => {
     display_template_args: [{ kind: "agent_id", value: agent_id }],
   });
   const overviewHome = (overrides: Record<string, unknown> = {}, digest: Record<string, unknown> = {}) => ({
-    ...home({ kernel_blocks: 3, kernel_allows: 7, chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: "2026-10-14T17:00:00.000Z", entry_count: 1284, ...digest }),
+    // A verified fixture serves both the verdict and its legacy clean flag.
+    ...home({ kernel_blocks: 3, kernel_allows: 7, chain_verdict: "verified", chain_verified: true, window_start: "2026-10-14T16:00:00.000Z", window_end: "2026-10-14T17:00:00.000Z", entry_count: 1284, ...digest }),
     castle_wall: { arm_state: "armed", platform: "macOS kernel", ...evidence },
     agents: [{ agent_id: "research-agent", status: "active", harness: "claude_code", enforcement_active: "active", policy_protected: true, ...evidence }],
     unwrapped,
@@ -1737,7 +1744,7 @@ describe("slice 3 Overview wired consumers", () => {
     for (const label of ["Castle Wall", "Approvals waiting", "Open Sentinel findings", "Audit chain"]) {
       expect(html).toContain(label);
     }
-    expect(html).toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
+    expect(html).toContain('class="state-chip good overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED');
     expect(html).not.toContain("Protected agents");
     expect(html).not.toContain("Enforcement confirmed");
     expect(html).not.toContain('<a class="overview-tile"');
@@ -1804,7 +1811,7 @@ describe("slice 3 Overview wired consumers", () => {
     const html = h.el.main!.innerHTML;
     expect(html).toContain("Castle Wall");
     expect(html).not.toContain("Enforcement confirmed");
-    expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
+    expect(html).toMatch(/data-agent-id="research-agent"[\s\S]*?<span class="state-chip unknown overview-chip"><span class="overview-chip-head"><i aria-hidden="true"><\/i>UNKNOWN<\/span>/);
     expect(html).not.toContain("server reports 1");
   });
 
@@ -1838,9 +1845,10 @@ describe("slice 3 Overview wired consumers", () => {
     }, { chain_verified: true, window_end: "not-a-date" }));
     const html = h.el.main!.innerHTML;
     expect(html).toContain("UNKNOWN");
-    expect(html).toContain("NOT YET VERIFIED");
+    // A claimed verification with an invalid check time is explicitly Unknown.
+    expect(html).toContain("last verified Unknown");
     expect(html).toContain("last check Not evaluated");
-    expect(html).not.toContain('class="state-chip good"><i aria-hidden="true"></i>VERIFIED');
+    expect(html).not.toContain('class="state-chip good overview-chip"><span class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED');
   });
 
   it("Overview state chips cover non-green wall and chain verdicts", async () => {
@@ -2528,6 +2536,252 @@ describe("slice 6a Agents wired consumers", () => {
     const html = h.el.main!.innerHTML.match(/<section class="card" aria-label="Effective reach">([\s\S]*?)<\/section>/)![1]!;
     expect(html).toContain("Reach not read yet.");
     expect(html).not.toContain(escapeHtml("Reading this agent's reach.").replaceAll("'", "&#039;"));
+  });
+});
+
+// These scenarios are also imported by the untracked lane capture script.
+import { overviewScenarios, OVERVIEW_FRESHNESS_MS } from "./fixtures/overview-scenarios.js";
+async function bootOverview3b(change?: (home: Record<string, any>) => void, scenario = "healthy") {
+  vi.useFakeTimers();
+  const scenarios = await overviewScenarios(Date.now());
+  const sc = scenarios.find(row => row.name === scenario)!;
+  change?.(sc.home);
+  const wall = sc.home.castle_wall;
+  // The same served wall evidence feeds the top bar, including adversarial expiry cases.
+  const live = { ...sc.sovereignty.live_enforcement, castle_wall_arm_state: wall.arm_state,
+    evidence_basis: wall.evidence_basis, last_enforcement_evidence_at: wall.last_enforcement_evidence_at,
+    freshness_window_ms: wall.freshness_window_ms };
+  let homeReads = 0;
+  const h = boot({
+    "/api/posture/home": () => { homeReads++; return Promise.resolve(response(sc.home)); },
+    "/api/sovereignty": () => Promise.resolve(response({ live_enforcement: live })),
+    "/api/hub/agents": () => Promise.resolve(response({ data: { agents: sc.agents } })),
+  });
+  await settle(); return Object.assign(h, { homeReads: () => homeReads });
+}
+function outboundHtml(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<section class="card outbound-card">[\s\S]*?<\/section>/)?.[0] ?? "";
+}
+function protectionTile(h: ReturnType<typeof boot>) {
+  return h.el.main!.innerHTML.match(/<div class="overview-tile"><a[^>]*>Protection requested<\/a>[\s\S]*?<\/div>/)?.[0] ?? "";
+}
+describe("Overview 3b served evidence", () => {
+  for (const [name, mutate, reason] of [
+    ["findings zeros", (d: any) => Object.assign(d, { chain_verdict: "findings", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
+    ["key unavailable", (d: any) => Object.assign(d, { chain_verdict: "key_unavailable", kernel_blocks: 0, kernel_allows: 0 }), "chain not verified"],
+    ["incomplete", (d: any) => d.window_complete = false, "window coverage not established"],
+    ["missing completeness", (d: any) => delete d.window_complete, "window completeness not served"],
+    ["bad window", (d: any) => d.window_end = "bad date", "window not stated"],
+    ["missing count", (d: any) => delete d.kernel_blocks, "count not served"],
+    ["negative count", (d: any) => d.kernel_allows = -1, "count not served"],
+    ["unsafe count", (d: any) => d.kernel_blocks = Number.MAX_SAFE_INTEGER + 1, "count not served"],
+  ] as const) it(`withholds both counts for ${name} on both screens`, async () => {
+    const h = await bootOverview3b(home => mutate(home.digest));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain("Not evaluated"); expect(html).toContain(reason);
+      expect(html).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+  it("shows separate served counts with both window dates", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { kernel_blocks: 4, kernel_allows: 2, blocked_destinations: [], blocked_destination_count: 0 }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain('Blocked <strong>4</strong>'); expect(html).toContain('Allowed <strong>2</strong>');
+      expect(html).toContain("window "); expect(html).toContain(" to ");
+      expect(html).toContain(runInContext("shortTime(new Date(Date.now()).toISOString())", h.context));
+      expect(html).toContain(runInContext("shortTime(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())", h.context));
+      expect(html).not.toContain("of 6");
+    }
+  });
+  for (const override of [1, undefined]) it(`withholds Allowed alone for overrides=${override}`, async () => {
+    const h = await bootOverview3b(home => home.digest.kernel_allow_overrides = override);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html).toContain("Blocked <strong>16</strong>"); expect(html).toContain("Allowed");
+      // A missing override count is absence of evidence, not evidence of an override.
+      expect(html).toContain(override === 1 ? "1 allowed verdict was overridden after it was recorded" : "override count not served");
+    }
+  });
+  it("caps destination rows separately on both screens and preserves the null bucket", async () => {
+    const h = await bootOverview3b();
+    expect(outboundHtml(h)).toContain("showing 3 of 12");
+    expect(outboundHtml(h)).toContain("destination not recorded");
+    expect(outboundHtml(h)).toContain('href="#enforcement"');
+    h.navigate("enforcement"); expect(outboundHtml(h)).toContain("showing 10 of 12");
+    // Enforcement keeps the canonical Evidence link for every row count.
+    expect(outboundHtml(h)).toContain('href="/posture/evidence"');
+  });
+  for (const [name, change, reason] of [
+    ["absent", (d: any) => delete d.blocked_destinations, "Blocked destinations are not served"],
+    ["not an array", (d: any) => d.blocked_destinations = {}, "Blocked destinations are not served"],
+    ["sum", (d: any) => d.kernel_blocks = 1, "served destination values disagree"],
+    ["distinct count", (d: any) => d.blocked_destination_count = 1, "served destination values disagree"],
+    ["invalid row", (d: any) => d.blocked_destinations[0].blocks = -1, "served destination values disagree"],
+  ] as const) it(`withholds destinations for ${name}`, async () => {
+    const h = await bootOverview3b(home => change(home.digest));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason); expect(outboundHtml(h)).not.toContain("<table");
+    }
+  });
+  it("escapes hostile destinations as text", async () => {
+    const h = await bootOverview3b(home => home.digest.blocked_destinations[0].destination = '<img src=x onerror="alert(1)">');
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain("&lt;img"); expect(outboundHtml(h)).not.toContain("<img");
+    }
+  });
+  it("states an answered zero only after the gate", async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { kernel_blocks: 0, blocked_destinations: [], blocked_destination_count: 0 }));
+    for (const route of ["posture", "enforcement"]) { h.navigate(route); expect(outboundHtml(h)).toContain("No blocked connections in this window"); }
+  });
+  for (const [name, change] of [
+    ["absent", (home: any) => delete home.protection_detected_count],
+    ["fractional", (home: any) => home.protection_requested_count = 1.5],
+    ["contradicting", (home: any) => home.protection_requested_count = 100],
+    ["negative", (home: any) => home.protection_requested_count = -1],
+  ] as const) it(`keeps protection unknown for ${name} counts`, async () => {
+    const h = await bootOverview3b(change);
+    expect(protectionTile(h)).toContain("UNKNOWN"); expect(protectionTile(h)).not.toContain("good");
+  });
+  it("renders policy intent as 1 of 3 with its evidence and no enforcement-count consumer", async () => {
+    const h = await bootOverview3b(home => { home.protection_requested_count = 1; home.protection_detected_count = 3; });
+    expect(protectionTile(h)).toContain("1 of 3"); expect(protectionTile(h)).toContain("registered agents plus unprotected harnesses");
+    expect(protectionTile(h)).not.toContain("good"); expect(getClientScript()).not.toContain("enforcement_confirmed_count");
+  });
+  it("shows an unknown protection tile while the home has not answered", async () => {
+    vi.useFakeTimers(); const h = boot({ "/api/posture/home": never }); await settle();
+    expect(protectionTile(h)).toContain("UNKNOWN"); expect(protectionTile(h)).not.toContain("0 of 0");
+  });
+  for (const [label, age, green] of [["inside", OVERVIEW_FRESHNESS_MS - 1, true], ["expired", OVERVIEW_FRESHNESS_MS + 1, false], ["future", -1, false]] as const) {
+    it(`ages the chain badge at ${label}`, async () => {
+      const h = await bootOverview3b(home => home.digest.window_end = new Date(Date.now() - age).toISOString());
+      const html = h.el.main!.innerHTML;
+      expect(html.includes('class="overview-chip-head"><i aria-hidden="true"></i>VERIFIED')).toBe(green);
+      if (!green) { expect(html).toContain("last verified"); expect(html).toContain(", not current"); }
+    });
+  }
+  it("expires the audit chip and rereads at the boundary", async () => {
+    const h = await bootOverview3b(home => home.digest.window_end = new Date(Date.now() - OVERVIEW_FRESHNESS_MS + 1).toISOString());
+    expect(h.el.main!.innerHTML).toContain('></i>VERIFIED');
+    const reads = h.homeReads();
+    await vi.advanceTimersByTimeAsync(2); await settle();
+    expect(h.el.main!.innerHTML).not.toContain('></i>VERIFIED');
+    expect(h.el.main!.innerHTML).toContain("not current");
+    // The existing read-rate floor may defer the network read, never the visual expiry.
+    const rereadFloor = runInContext("DASHBOARD_SEAL_REREAD_MIN_INTERVAL_MS", h.context) as number;
+    await vi.advanceTimersByTimeAsync(rereadFloor + 1000); await settle();
+    expect(h.homeReads()).toBeGreaterThan(reads);
+  });
+  for (const [label, age] of [["fresh", 1000], ["stale", OVERVIEW_FRESHNESS_MS + 1], ["absent", null]] as const) {
+    it(`keeps the seal and wall in agreement with ${label} evidence`, async () => {
+      const h = await bootOverview3b(home => home.castle_wall.last_enforcement_evidence_at = age === null ? null : new Date(Date.now() - age).toISOString());
+      expect(h.el["posture-seal-word"]!.textContent).toBe(label === "fresh" ? "Protected" : "Attention");
+      expect(h.el.main!.innerHTML.includes('></i>ENFORCING')).toBe(label === "fresh");
+      expect(h.el.main!.innerHTML).toContain("showing 3 of 12");
+    });
+  }
+  it("keeps chip heads together and separates their wrapping evidence detail", async () => {
+    const h = await bootOverview3b();
+    expect(h.el.main!.innerHTML).toContain('class="overview-chip-head"><i aria-hidden="true"></i>ENFORCING</span>');
+    expect(h.el.main!.innerHTML).toContain('class="overview-chip-detail"');
+    const chip = runInContext('makeMachineRow({ name: "fixture", url: "http://fixture/", probe: { state: "state_UNKNOWN" } }, 0).outerHTML', h.context) as string;
+    // Captured from main 546180fa; this shared chip must survive Overview-only styling.
+    expect(chip.match(/<span[^>]*class="state-chip[^>]*>[\s\S]*?<\/span>/)?.[0]).toBe('<span title="Unknown: this saved address is not a web address, so it was not linked or checked." class="state-chip unknown"><i aria-hidden="true"></i>Unknown</span>');
+    expect(getClientScript()).not.toContain("\u2014");
+  });
+});
+
+describe("round 2 outbound and tile honesty", () => {
+  for (const verdict of ["verified", "verified_suffix_only"] as const) it(`requires a current ${verdict} check beside covered counts`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      chain_verdict: verdict, chain_verified: verdict === "verified", window_complete: true,
+      window_end: new Date(Date.now() - OVERVIEW_FRESHNESS_MS + 1).toISOString(),
+    }));
+    expect(outboundHtml(h)).toContain("Blocked <strong>16</strong>");
+    expect(h.el.main!.innerHTML).toContain(verdict === "verified" ? "></i>VERIFIED" : "></i>SUFFIX ONLY");
+    await vi.advanceTimersByTimeAsync(2); await settle();
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route);
+      expect(outboundHtml(h)).toContain("audit check not current");
+      expect(outboundHtml(h)).toContain("last verified 10m ago");
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+      if (route === "posture") expect(h.el.main!.innerHTML).not.toContain("></i>SUFFIX ONLY");
+    }
+  });
+  for (const [value, reason] of [
+    [undefined, "override count not served"], [null, "override count not served"], [-1, "override count not served"],
+    [1.5, "override count not served"], [Number.MAX_SAFE_INTEGER + 1, "override count not served"],
+    [1, "1 allowed verdict was overridden after it was recorded"], [2, "2 allowed verdicts were overridden after they were recorded"],
+  ] as const) it(`states the served override reason for ${value}`, async () => {
+    const h = await bootOverview3b(home => home.digest.kernel_allow_overrides = value);
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(outboundHtml(h)).toContain("Blocked <strong>16</strong>");
+    }
+  });
+  for (const [complete, value, reason] of [
+    [undefined, undefined, "window completeness not served"], [null, null, "window completeness not served"],
+    [-1, null, "window completeness not served"], [false, "read_limit", "window larger than one read"],
+    [false, "sealed_region", "sealed audit region coverage not established"],
+    [false, "retention", "retention removed older entries, so window coverage is not established"],
+    [false, "coverage_unknown", "window coverage not established"],
+    [false, "unexpected", "window coverage not established"], [false, undefined, "window coverage not established"],
+  ] as const) it(`states completeness=${complete} reason=${value}`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, { window_complete: complete, window_incomplete_reason: value }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain(reason);
+      expect(outboundHtml(h)).toContain('class="outbound-reason muted"');
+      expect(outboundHtml(h)).not.toMatch(/<strong>\d+<\/strong>/);
+    }
+  });
+  for (const shape of ["no rows", "zero destinations", "all rows undercount"] as const) it(`rejects destination disagreement: ${shape}`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      blocked_destinations: shape !== "all rows undercount" ? [] : [{ destination: "one", blocks: 1, last_blocked_at: null }],
+      blocked_destination_count: shape === "zero destinations" ? 0 : 1,
+    }));
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); expect(outboundHtml(h)).toContain("served destination values disagree");
+      expect(outboundHtml(h)).not.toContain("<table");
+    }
+  });
+  for (const count of [0, 1, 10]) it(`keeps the Enforcement age and Evidence link with ${count} destinations`, async () => {
+    const h = await bootOverview3b(home => Object.assign(home.digest, {
+      kernel_blocks: count, blocked_destination_count: count,
+      blocked_destinations: Array.from({ length: count }, (_, i) => ({ destination: `host-${i}`, blocks: 1, last_blocked_at: null })),
+    }));
+    h.navigate("enforcement");
+    expect(outboundHtml(h)).toContain("window closed");
+    expect(outboundHtml(h)).toContain('href="/posture/evidence"');
+  });
+  it("gives all three withheld cells an Unknown glyph and a separate reason line", async () => {
+    const h = await bootOverview3b(home => home.digest.chain_verdict = "findings");
+    for (const route of ["posture", "enforcement"]) {
+      h.navigate(route); const html = outboundHtml(h);
+      expect(html.match(/class="state-chip unknown overview-chip"/g)).toHaveLength(3);
+      expect(html.match(/<i aria-hidden="true"><\/i>Not evaluated/g)).toHaveLength(3);
+      expect(html.match(/<span class="outbound-reason muted">chain not verified<\/span>/g)).toHaveLength(3);
+    }
+  });
+  for (const scenario of ["first-run-unprotected", "unloaded"]) it(`puts the ${scenario} protection tile inside the grid`, async () => {
+    vi.useFakeTimers();
+    const h = scenario === "unloaded" ? boot({ "/api/posture/home": never }) : await bootOverview3b(undefined, scenario);
+    await settle();
+    expect(h.el.main!.innerHTML).toMatch(/<div class="overview-tiles"[^>]*><div class="overview-tile"><a[^>]*>Protection requested/);
+  });
+  it("starts chip detail on its own block without a leading separator", async () => {
+    const h = await bootOverview3b();
+    expect(h.el.main!.innerHTML).toMatch(/class="overview-chip-detail">[^ ·]/);
+    expect(h.el.main!.innerHTML).not.toContain('class="overview-chip-detail"> ·');
+    expect(renderDashboardV11Html()).toContain('.overview-chip-detail { display: block;');
+  });
+  it("uses container widths for five tiles or three plus two", () => {
+    const html = renderDashboardV11Html();
+    expect(html).toContain('container-type: inline-size');
+    expect(html).toContain('grid-template-columns: repeat(3, minmax(0, 1fr))');
+    expect(html).toMatch(/@container overview \(min-width: \d+px\)/);
+    expect(html).toContain('grid-template-columns: repeat(5, minmax(0, 1fr))');
+    expect(html).not.toContain('repeat(auto-fit, minmax(min(100%, var(--overview-tile-min))');
+    expect(html).toContain('.outbound-reason { display: block;');
   });
 });
 
