@@ -1297,6 +1297,7 @@ let talkUserScrollEpoch = 0;
 // "At the bottom" tolerance: 4 CSS px absorbs the sub-pixel remainder of
 // scrollTop + clientHeight against scrollHeight under zoom and fractional
 // device pixel ratios, where an exact equality never holds at the true bottom.
+// Must match BOTTOM_SLACK_PX in server/test/e2e/talk-follow-ownership.e2e.ts.
 const TALK_BOTTOM_SLACK_PX = 4;
 // Motion threshold for the scroll-epoch watcher: half a CSS px, below which a
 // scroll event is layout jitter from fractional scrollTop, not a reader moving.

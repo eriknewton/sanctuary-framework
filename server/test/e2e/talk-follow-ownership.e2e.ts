@@ -9,12 +9,14 @@
  *
  *   (a) A suggestion click, then a refused send, leaves the suggestion in the
  *       live input and the next send posts that same text.
- *   (b) Moving Talk from the side panel to the full page while a send is in
- *       flight keeps the send's follow request and makes exactly one POST.
+ *   (b) A mid-history reader who sends and then moves Talk from the side
+ *       panel to the full page while the send is in flight is followed to the
+ *       reply, with exactly one POST.
  *   (c) A background refresh that changes nothing keeps the reply nodes and
  *       the operator's text selection.
- *   (d) A wheel at the bottom of the history that cannot move it keeps follow
- *       and never scrolls the outer page.
+ *   (d1) A wheel that cannot move the history during a send does not revoke
+ *       the send's follow request. (d2) A wheel at the bottom of the history
+ *       never scrolls the outer page.
  *   (e) A reader who scrolls up during a send is not pulled down by the reply.
  *   (f1, f2) Closing the panel saves the reader's real position: reopening
  *       the panel, or then opening full-page Talk, restores it instead of
@@ -143,7 +145,8 @@ async function historyGeometry(page: Page) {
   });
 }
 
-/** Within 4 px of the bottom: the client's own TALK_BOTTOM_SLACK_PX tolerance. */
+/** Within 4 px of the bottom: the client's own "at the bottom" tolerance. */
+// Must match TALK_BOTTOM_SLACK_PX in server/src/dashboard/v1_1/client.ts.
 const BOTTOM_SLACK_PX = 4;
 async function atBottom(page: Page): Promise<boolean> {
   const g = await historyGeometry(page);
@@ -162,6 +165,15 @@ async function waitForSeededHistory(page: Page, seed = DEFAULT_SEED): Promise<vo
 
 // A reader position well clear of both ends of the overflowing history.
 const READER_OFFSET_PX = 120;
+// Long enough for the scroll event of a programmatic scrollTop write to be
+// delivered (it fires on the next animation frame, about 16 ms at 60 Hz).
+const SCROLL_EVENT_SETTLE_MS = 100;
+
+async function scrollReaderTo(page: Page, top: number): Promise<void> {
+  await page.evaluate((offset) => { document.getElementById("concierge-history")!.scrollTop = offset; }, top);
+  await page.waitForTimeout(SCROLL_EVENT_SETTLE_MS);
+  expect((await historyGeometry(page))!.top, "test premise: the reader is where the test put it").toBe(top);
+}
 
 test.describe("Talk mounted owner on a real engine", () => {
   test("(a) a suggestion click then a refused send keeps the suggestion visible and as the next send's payload", async ({ page, dashboard }) => {
@@ -181,19 +193,26 @@ test.describe("Talk mounted owner on a real engine", () => {
     await expect(input).toHaveValue(suggestion);
   });
 
-  test("(b) moving from the panel to full-page Talk during a send keeps follow and makes exactly one POST", async ({ page, dashboard }) => {
+  test("(b) a mid-history reader who sends, then moves from the panel to full-page Talk, is followed to the reply with one POST", async ({ page, dashboard }) => {
     const stub = await installConciergeStub(page, { seed: DEFAULT_SEED, holdPosts: true });
     await gotoRoute(page, dashboard.url, "posture");
     await page.locator("#btn-talk").click();
     await waitForSeededHistory(page);
     await expectOverflow(page);
+    // The reader leaves the bottom BEFORE the send, so position alone can never
+    // pull the moved host down; only the send's follow request can. The wait
+    // lets the scroll event land before the send records its epoch.
+    await scrollReaderTo(page, READER_OFFSET_PX);
     const panelInput = page.locator('#talk-panel-body input[data-action="concierge-input"]');
     await panelInput.fill("moving question");
     await page.locator('#talk-panel-body [data-action="concierge-send"]').click();
     await expect.poll(() => stub.posts.length).toBe(1);
+    expect((await historyGeometry(page))!.top, "the send itself did not move the reader").toBe(READER_OFFSET_PX);
     await page.locator('[data-action="talk-open-full"]').click();
     await expect(page.locator('#main input[data-action="concierge-input"]')).toBeDisabled();
     await expect(page.locator("#talk-panel")).toBeHidden();
+    // Still in flight: the moved host honours the send's follow request on mount.
+    expect(await atBottom(page), "the remounted host follows the in-flight send").toBe(true);
     stub.release();
     await expect(page.locator("#concierge-history .concierge-msg")).toHaveCount(DEFAULT_SEED + 2);
     await expect(page.locator('#main input[data-action="concierge-input"]')).toBeEnabled();
@@ -232,15 +251,35 @@ test.describe("Talk mounted owner on a real engine", () => {
     expect(kept.selection, "the selection survives the refresh").toBe("Seed 3:");
   });
 
-  test("(d) a no-motion wheel at the bottom keeps follow and the outer page stays at scrollY 0", async ({ page, dashboard }) => {
+  test("(d1) a no-motion wheel during a send does not revoke the send's follow request", async ({ page, dashboard }) => {
     const stub = await installConciergeStub(page, { seed: DEFAULT_SEED, holdPosts: true });
     await gotoRoute(page, dashboard.url, "dashboard");
     await waitForSeededHistory(page);
     await expectOverflow(page);
-    await expect.poll(() => atBottom(page), { message: "a long thread opens at its latest message" }).toBe(true);
+    // The reader sits at the top, so the reply reaches the bottom only through
+    // the send's follow request, and an upward wheel there cannot move anything.
+    await scrollReaderTo(page, 0);
     await page.locator('#main input[data-action="concierge-input"]').fill("wheel question");
     await page.locator('#main [data-action="concierge-send"]').click();
     await expect.poll(() => stub.posts.length).toBe(1);
+    const box = await page.locator("#concierge-history").boundingBox();
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.wheel(0, -400);
+    await page.waitForTimeout(300);
+    expect((await historyGeometry(page))!.top, "the wheel produced no displacement").toBe(0);
+    expect(await page.evaluate(() => window.scrollY), "outer page did not scroll").toBe(0);
+    stub.release();
+    await expect(page.locator("#concierge-history .concierge-msg")).toHaveCount(DEFAULT_SEED + 2);
+    await expect.poll(() => atBottom(page), { message: "follow survives a no-motion wheel" }).toBe(true);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  });
+
+  test("(d2) a no-motion wheel at the bottom never scrolls the outer page", async ({ page, dashboard }) => {
+    await installConciergeStub(page, { seed: DEFAULT_SEED });
+    await gotoRoute(page, dashboard.url, "dashboard");
+    await waitForSeededHistory(page);
+    await expectOverflow(page);
+    await expect.poll(() => atBottom(page), { message: "a long thread opens at its latest message" }).toBe(true);
     const box = await page.locator("#concierge-history").boundingBox();
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
     // Downward wheel at the bottom: the history cannot move, and
@@ -248,10 +287,7 @@ test.describe("Talk mounted owner on a real engine", () => {
     await page.mouse.wheel(0, 400);
     await page.waitForTimeout(300);
     expect(await page.evaluate(() => window.scrollY), "outer page did not scroll").toBe(0);
-    stub.release();
-    await expect(page.locator("#concierge-history .concierge-msg")).toHaveCount(DEFAULT_SEED + 2);
-    await expect.poll(() => atBottom(page), { message: "follow survives a no-motion wheel" }).toBe(true);
-    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    expect(await atBottom(page)).toBe(true);
   });
 
   test("(e) a reader who scrolls up during a send is not pulled down by the reply", async ({ page, dashboard }) => {
@@ -287,8 +323,7 @@ test.describe("Talk mounted owner on a real engine", () => {
     await page.locator("#btn-talk").click();
     await waitForSeededHistory(page);
     await expectOverflow(page);
-    await page.evaluate((offset) => { document.getElementById("concierge-history")!.scrollTop = offset; }, READER_OFFSET_PX);
-    await page.waitForTimeout(100);
+    await scrollReaderTo(page, READER_OFFSET_PX);
     await page.locator('[data-action="talk-close"]').click();
     await expect(page.locator("#talk-panel")).toBeHidden();
   }
