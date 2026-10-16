@@ -19,9 +19,8 @@
   <meta name="twitter:image" content="{{ page.image | absolute_url }}">
   {% endif %}
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+  <link rel="preload" href="{{ '/assets/fonts/Manrope-wght.latin.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ '/assets/fonts/SpaceGrotesk-wght.latin.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
 
   <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
 
