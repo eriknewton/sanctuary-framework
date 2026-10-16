@@ -35,6 +35,7 @@ import { test, expect } from "./fixtures/dashboard.js";
 interface PageElement {
   scrollTop: number; clientHeight: number; scrollHeight: number; isConnected: boolean;
   firstChild: unknown; getAttribute(name: string): string | null; closest(selector: string): PageElement | null;
+  addEventListener(type: string, listener: () => void, options?: { once?: boolean }): void;
 }
 interface PageRange { setStart(node: unknown, offset: number): void; setEnd(node: unknown, offset: number): void }
 interface PageSelection { toString(): string; removeAllRanges(): void; addRange(range: PageRange): void }
@@ -165,13 +166,37 @@ async function waitForSeededHistory(page: Page, seed = DEFAULT_SEED): Promise<vo
 
 // A reader position well clear of both ends of the overflowing history.
 const READER_OFFSET_PX = 120;
-// Long enough for the scroll event of a programmatic scrollTop write to be
-// delivered (it fires on the next animation frame, about 16 ms at 60 Hz).
-const SCROLL_EVENT_SETTLE_MS = 100;
+// Upper bound on waiting for the scroll event of a programmatic scrollTop write (it normally fires on
+// the next animation frame, about 16 ms at 60 Hz). The helper resolves on the event itself, so this is
+// only a ceiling that turns a never-delivered event into a loud failure, not a sleep.
+const SCROLL_EVENT_TIMEOUT_MS = 2_000;
 
+// Moves the reader and waits until the page has delivered the resulting scroll event, so the Talk
+// scroll watcher has seen the move before the test's next action (a fixed sleep could let a slow
+// runner deliver the event after a send click and revoke follow, a flake rather than a false pass).
 async function scrollReaderTo(page: Page, top: number): Promise<void> {
-  await page.evaluate((offset) => { document.getElementById("concierge-history")!.scrollTop = offset; }, top);
-  await page.waitForTimeout(SCROLL_EVENT_SETTLE_MS);
+  const delivered = await page.evaluate(
+    ({ offset, timeoutMs }) =>
+      new Promise<boolean>((resolve) => {
+        const history = document.getElementById("concierge-history")!;
+        if (history.scrollTop === offset) {
+          resolve(true);
+          return;
+        }
+        const timer = setTimeout(() => resolve(false), timeoutMs);
+        history.addEventListener(
+          "scroll",
+          () => {
+            clearTimeout(timer);
+            resolve(true);
+          },
+          { once: true },
+        );
+        history.scrollTop = offset;
+      }),
+    { offset: top, timeoutMs: SCROLL_EVENT_TIMEOUT_MS },
+  );
+  expect(delivered, "test premise: the scroll event was delivered").toBe(true);
   expect((await historyGeometry(page))!.top, "test premise: the reader is where the test put it").toBe(top);
 }
 
