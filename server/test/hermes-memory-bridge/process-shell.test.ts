@@ -128,6 +128,7 @@ class ParkingDocumentWriteStorage extends FilesystemStorage {
 }
 
 class ParkingAuditStorage extends FilesystemStorage {
+  private readonly pendingAuditWrites = new Set<Promise<void>>();
   private releaseAudit: (() => void) | undefined;
   auditWriteParked = false;
   readonly parked = new Promise<void>((resolve) => {
@@ -138,26 +139,38 @@ class ParkingAuditStorage extends FilesystemStorage {
     super(root);
   }
 
+  private trackAuditWrite(write: Promise<void>): Promise<void> {
+    this.pendingAuditWrites.add(write);
+    void write.then(
+      () => { this.pendingAuditWrites.delete(write); },
+      () => { this.pendingAuditWrites.delete(write); },
+    );
+    return write;
+  }
+
   override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
-    void key;
     if (namespace === "_audit") {
       this.auditWriteParked = true;
-      await this.parked;
+      return this.trackAuditWrite((async () => { await this.parked; await super.write(namespace, key, data); })());
     }
     return super.write(namespace, key, data);
   }
 
   override async writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void> {
-    void key;
     if (namespace === "_audit") {
       this.auditWriteParked = true;
-      await this.parked;
+      return this.trackAuditWrite((async () => { await this.parked; await super.writeDurable(namespace, key, data); })());
     }
     return super.writeDurable(namespace, key, data);
   }
 
   release(): void {
     this.releaseAudit?.();
+  }
+
+  async releaseAndDrain(): Promise<void> {
+    this.release();
+    await Promise.allSettled([...this.pendingAuditWrites]);
   }
 }
 
@@ -2042,8 +2055,9 @@ describe("Hermes memory process shell", () => {
       const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
       await exitWithinSharedTail;
+      expect(parkedStorage.auditWriteParked).toBe(true);
     } finally {
-      parkedStorage.release();
+      await parkedStorage.releaseAndDrain();
     }
   });
 
