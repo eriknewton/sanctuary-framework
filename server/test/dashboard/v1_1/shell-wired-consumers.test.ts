@@ -214,7 +214,7 @@ const SHELL_IDS = [
   "machines-summary", "machines-age", "machines-list", "toast-host",
 ];
 
-function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}, options: { deferredHashchange?: boolean } = {}) {
+function boot(overrides: Record<string, (init?: RequestInit, url?: string) => unknown> = {}, extraGlobals: Record<string, unknown> = {}, options: { deferredHashchange?: boolean; templateContent?: boolean } = {}) {
   fakeActiveElement = null;
   const el: Record<string, FakeElement> = {};
   for (const id of SHELL_IDS) el[id] = new FakeElement({ id });
@@ -250,6 +250,8 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
       createElement: (tagName: string) => {
         const node = new FakeElement({}, tagName);
         if (tagName === "a") node.click = () => { downloads.push(node); };
+        // Opt-in native template content, for the Talk owner feature check only.
+        if (tagName === "template" && options.templateContent) Object.assign(node, { content: new FakeElement({}, "FRAGMENT") });
         return node;
       },
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
@@ -4922,4 +4924,186 @@ describe("Read-only scoped notice evidence boundary", () => {
     expect(entries).not.toContain('data-action="retry-panel"');
   });
 
+});
+
+describe("Talk split draft ownership", () => {
+  it("explicit suggestion updates the live mounted draft before a refused send", async () => {
+    const h = boot({ "/api/hub/chat/concierge": () => Promise.resolve(response({ error: "refused" }, 403)) });
+    await settle();
+    const mounted = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { value: "draft A", isConnected: true });
+    Object.assign(h.context, { mounted });
+    runInContext('state.chat.concierge.composer="draft A"; talkOwner={input:mounted};', h.context);
+    h.click({ "data-action": "concierge-suggestion", "data-suggestion-id": "summarize-hour" });
+    expect(mounted.value).toBe("Summarize what happened in this fortress in the last hour.");
+    await settle();
+    expect(runInContext("state.chat.concierge.composer", h.context)).toBe(mounted.value);
+    expect(h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST")).toHaveLength(1);
+  });
+
+  it("a host change carries an unrevoked send follow to the new host's history", async () => {
+    const h = boot(); await settle();
+    const makeHost = () => {
+      const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+        scrollTop: 0, clientHeight: 100, scrollHeight: 500,
+        addEventListener() {}, removeEventListener() {}, isConnected: true,
+      });
+      const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+      const host = new FakeElement();
+      host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+        : selector === 'input[data-action="concierge-input"]' ? input
+        : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+      return { host, history };
+    };
+    const first = makeHost(); const second = makeHost();
+    Object.assign(h.context, { firstHost: first.host, secondHost: second.host });
+    runInContext('attachTalkOwner(firstHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch}; disposeTalkOwner(); attachTalkOwner(secondHost);', h.context);
+    expect(runInContext("!!talkFollowIntent", h.context)).toBe(true);
+    expect(second.history.scrollTop).toBe(500);
+  });
+
+  it("changed legacy history restores its own mid-thread offset without outer-page scrolling", async () => {
+    const h = boot(); await settle();
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 73, clientHeight: 100, scrollHeight: 500, scrollIntoView: vi.fn(),
+    });
+    Object.assign(h.context, { testHistory: history });
+    runInContext('var snapshot=captureTalkViewport(testHistory); testHistory.scrollTop=0; testHistory.scrollHeight=600; restoreTalkViewport(testHistory,snapshot,false);', h.context);
+    expect(history.scrollTop).toBe(73);
+    expect(history.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("a zero-motion scroll event leaves the follow epoch alone while a moved history bumps it", async () => {
+    const h = boot(); await settle();
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener(name: string, fn: (ev: unknown) => void) { listeners[name] = fn; },
+      removeEventListener() {},
+    });
+    const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+    const host = new FakeElement();
+    host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+      : selector === 'input[data-action="concierge-input"]' ? input
+      : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+    Object.assign(h.context, { testHost: host });
+    runInContext('attachTalkOwner(testHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch};', h.context);
+    // The VM DOM has no wheel or layout; the real no-motion wheel is covered by
+    // test/e2e/talk-follow-ownership.e2e.ts (d). This proves only the epoch rule.
+    expect(listeners.scroll).toBeTypeOf("function");
+    listeners.scroll!({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(true);
+    history.scrollTop = 10; listeners.scroll!({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(false);
+  });
+
+  it("contains a wheel at the history's ends so the outer page never moves under the reader", () => {
+    // Native Chromium chained a no-motion wheel at the bottom of the history to the page (0 to 28 px).
+    const rule = /\.concierge-history \{([^}]*)\}/.exec(renderDashboardV11Html());
+    expect(rule?.[1]).toMatch(/overscroll-behavior:\s*contain;/);
+  });
+
+  it("a hidden history's zero geometry never overwrites the saved reader position", async () => {
+    const h = boot(); await settle();
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener() {}, removeEventListener() {},
+    });
+    const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+    const host = new FakeElement();
+    host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+      : selector === 'input[data-action="concierge-input"]' ? input
+      : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+    Object.assign(h.context, { testHost: host });
+    runInContext('talkViewportState={top:73,following:false}; attachTalkOwner(testHost);', h.context);
+    expect(history.scrollTop).toBe(73);
+    // panel.hidden = true drops the layout box: every geometry field reads 0.
+    Object.assign(history, { scrollTop: 0, clientHeight: 0, scrollHeight: 0 });
+    runInContext("disposeTalkOwner();", h.context);
+    expect(runInContext("JSON.stringify(talkViewportState)", h.context)).toBe(JSON.stringify({ top: 73, following: false }));
+  });
+
+  it("a legacy reader who scrolls during an in-flight send is not pulled down by the reply", async () => {
+    const posts: Array<(value: unknown) => void> = [];
+    const h = boot({ "/api/hub/chat/concierge": () => new Promise((resolve) => posts.push(resolve)) });
+    await settle();
+    expect(runInContext("talkDomOwnerSupported", h.context)).toBe(false);
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener(name: string, fn: (ev: unknown) => void) { listeners[name] = fn; },
+      removeEventListener() {},
+    });
+    // The VM DOM does not parse innerHTML into elements, so the written history is this one fake.
+    h.el["concierge-history"] = history;
+    const main = h.el.main!;
+    const ownQuery = main.querySelector.bind(main);
+    main.querySelector = (selector: string) => selector === "#concierge-history" ? history : ownQuery(selector);
+    h.navigate("dashboard"); await settle();
+    const send = async (scrollDuringFlight: boolean) => {
+      runInContext('state.chat.concierge.composer="question"; void onConciergeSend();', h.context);
+      await settle();
+      if (scrollDuringFlight) { history.scrollTop = 200; listeners.scroll?.({ isTrusted: true }); }
+      posts.shift()!(response({ data: { reply_text: "answer", served_by: "local" } }));
+      await settle();
+    };
+    await send(false);
+    expect(history.scrollTop, "an unrevoked send follows its reply").toBe(500);
+    await send(true);
+    expect(history.scrollTop, "a real scroll during the send revoked follow").toBe(200);
+  });
+
+  it("a legacy panel-to-full-page move restores the panel reader's current position, not its last write", async () => {
+    const h = boot(); await settle();
+    const makeHistory = () => Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener() {}, removeEventListener() {},
+    });
+    const panelHistory = makeHistory(); const mainHistory = makeHistory();
+    // The VM DOM does not parse innerHTML, so each host answers with its fake
+    // history only once Talk markup has been written into it.
+    const answer = (host: FakeElement, history: FakeElement) => {
+      const ownQuery = host.querySelector.bind(host);
+      host.querySelector = (selector: string) => selector === "#concierge-history"
+        ? (host.innerHTML.includes('id="concierge-history"') ? history : null) : ownQuery(selector);
+    };
+    answer(h.el["talk-panel-body"]!, panelHistory); answer(h.el.main!, mainHistory);
+    h.el["concierge-history"] = panelHistory;
+    h.click({ "data-action": "talk-toggle" });
+    expect(panelHistory.scrollTop, "the panel opens a long thread at its latest message").toBe(500);
+    panelHistory.scrollTop = 200;
+    h.click({ "data-action": "talk-open-full" });
+    h.navigate("dashboard"); await settle();
+    expect(mainHistory.scrollTop).toBe(200);
+  });
+
+  it("an engine missing Node.isConnected or Element.replaceChildren takes the legacy Talk path", async () => {
+    const connectedNode = { prototype: { isConnected: false } };
+    class NoReplaceChildren {}
+    const missingNode = boot({}, {}, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", missingNode.context)).toBe(false);
+    const missingReplace = boot({}, { Node: connectedNode, Element: NoReplaceChildren }, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", missingReplace.context)).toBe(false);
+    const complete = boot({}, { Node: connectedNode }, { templateContent: true }); await settle();
+    expect(runInContext("talkDomOwnerSupported", complete.context)).toBe(true);
+  });
+
+  it("a send whose first render throws still settles, so the next send posts", async () => {
+    const h = boot({ "/api/hub/chat/concierge": () => Promise.resolve(response({ data: { reply_text: "ok" } })) });
+    await settle();
+    const main = h.el.main!;
+    let throwOnce = false;
+    Object.defineProperty(h.el, "main", {
+      configurable: true,
+      get() { if (throwOnce) { throwOnce = false; throw new Error("fixture render failure"); } return main; },
+    });
+    const posts = () => h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST").length;
+    throwOnce = true;
+    runInContext('state.chat.concierge.composer="first"; void onConciergeSend().catch(function () {});', h.context);
+    await settle();
+    expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
+    expect(posts(), "the failed render happened before any POST").toBe(0);
+    runInContext('state.chat.concierge.composer="second"; void onConciergeSend();', h.context);
+    await settle();
+    expect(posts()).toBe(1);
+  });
 });

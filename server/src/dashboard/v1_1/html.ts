@@ -800,6 +800,10 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  /* A wheel at either end of the history must not chain to the outer page:
+     the Talk follow contract treats a no-motion wheel as "still reading here",
+     and a page that moves under the reader breaks that (native Chromium, 10-16). */
+  overscroll-behavior: contain;
   padding: 18px 4px 6px;
   display: flex; flex-direction: column; gap: 18px;
 }
