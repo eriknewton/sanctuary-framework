@@ -3855,8 +3855,9 @@ function renderActivityScreen() {
     (timeRangeActive ? (serverFiltersActive || searchActive ? " Clear filters keeps the time range; change it in the top bar." : " Change the time range in the top bar.") : "");
   const clearFiltersLink = serverFiltersActive || searchActive ? '<a class="btn" href="#activity">Clear filters</a>' : "";
   const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
-    // A positive server count with no active filter proves neither a match failure nor an empty window.
-    ? !entries.length && total > 0 && !activeFilterNames.length
+    // AuditLog.query applies range/agent/layer/operation before total and paging; only buildEvidence's result
+    // post-filter can explain an empty served page with a positive total. Page-local search runs after that read.
+    ? !entries.length && total > 0 && !state.evidence.filters.result
       ? '<div class="overview-empty"><h3>No entries on this page</h3><p>' + escHtml("The server counts " + total + (total === 1 ? " entry" : " entries") + " in this view, but this read shows none.") + '</p><button class="btn" data-action="retry-panel" data-read="/api/posture/evidence">Retry</button></div>'
       : entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
       ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p>' + clearFiltersLink + '</div>'
@@ -4755,8 +4756,8 @@ function approvalQueueEvidence() {
   const earned = ready && !full && !unknown && !waiting && !outside;
   const pageEdge = " The inbox has at least " + APPROVAL_QUEUE_ITEM_CAP + " items and this read shows only the first " + APPROVAL_QUEUE_ITEM_CAP + ", so a held operation may be waiting past them.";
   if (!ready) line = state.inboxRedacted ? "Approvals are hidden, not empty. Pending count: " + state.inboxRedactedCount + "." : "Approval data is Unknown until the queue read loads.";
-  // On a full page the count outside the scope is only a lower bound, and the scoped agent may have holds past the page.
-  else if (outside && !waiting) line = "Nothing waiting for " + (state.agentScope.selectedAgentId || "this agent") + ". " + (full ? "At least " : "") + heldOperationsPhrase(outside, "waits", "wait") + " outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
+  // Observed recognized holds cannot exclude unknown tiers or holds beyond this page in the selected scope.
+  else if (outside && !waiting) line = "No recognized held operation for " + (state.agentScope.selectedAgentId || "this agent") + " is waiting in this read. " + (full ? "At least " : "") + heldOperationsPhrase(outside, "waits", "wait") + " outside this agent scope; choose All agents in the scope menu to see them." + (full ? pageEdge : "");
   else if (full && !waiting) {
     // The inbox serves no total, so a full page cannot rule out a held operation beyond its edge.
     line = state.inbox.some(function (i) { return i.kind === "approval_pending"; }) ? "No recognized held operation is waiting in this page." : "None of the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items is a held operation.";

@@ -960,7 +960,7 @@ describe("slice 2 shell wired consumers", () => {
     expect(h.el["notify-count"]!.innerHTML).toContain("0 of 2");
     const main = h.el.main!.innerHTML;
     expect(main).toContain('data-scoped-empty="1"');
-    expect(main).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
+    expect(main).toContain("No recognized held operation for fixture-agent-c is waiting in this read. 2 held operations wait outside this agent scope");
     expect(main).not.toContain("qe-check");
     expect(main).not.toContain("Nothing waiting on you.");
   });
@@ -994,7 +994,7 @@ describe("slice 2 shell wired consumers", () => {
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "fixture-agent-c" });
     expect(drawer()).not.toContain("No approvals waiting");
     expect(drawer()).not.toContain("0 of 0 held operations");
-    expect(drawer()).toContain("Nothing waiting for fixture-agent-c. 2 held operations wait outside this agent scope");
+    expect(drawer()).toContain("No recognized held operation for fixture-agent-c is waiting in this read. 2 held operations wait outside this agent scope");
   });
 
   it("the bell badge goes and the green check is earned only when nothing waits fortress-wide", async () => {
@@ -3623,7 +3623,7 @@ describe("Approvals round-one decision and evidence states", () => {
     await settle();
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
-    const line = "Nothing waiting for agent-empty. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
+    const line = "No recognized held operation for agent-empty is waiting in this read. 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them.";
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
       expect(html).toContain(line);
       expect(html).not.toContain("qe-check");
@@ -3878,7 +3878,7 @@ describe("Approvals round-one decision and evidence states", () => {
     h.navigate("approvals");
     h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-empty" });
     for (const html of [h.el.main!.innerHTML, drawer(h), h.el.fortress!.innerHTML]) {
-      expect(html).toContain(`Nothing waiting for agent-empty. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
+      expect(html).toContain(`No recognized held operation for agent-empty is waiting in this read. At least 1 held operation waits outside this agent scope; choose All agents in the scope menu to see them. The inbox has at least ${cap} items and this read shows only the first ${cap}, so a held operation may be waiting past them.`);
       expect(html).not.toContain("1 of 1 held operation");
     }
   });
@@ -4723,12 +4723,10 @@ describe("Read-only extraction: Approvals round-two surface evidence", () => {
     expect(h.requests.filter(r => r.url.startsWith("/api/posture/evidence"))).toHaveLength(before + 1);
   });
 
-  // fail-before-exempt: dropping "time range" from activeFilterNames in client.ts sends these views to the retry panel.
-  // An active time range is a filter, so a positive server count with no rows on this page is a no-match view, never a
-  // failed read that Retry could fix.
-  for (const range of ["24h", "7d", "30d"]) it(`Evidence with the ${range} range, no rows and a positive total points to the range, not Retry`, async () => {
+  // AuditLog.query applies the range before total and paging, so a real range-only no-match read has total zero.
+  for (const range of ["24h", "7d", "30d"]) it(`Evidence with the ${range} range, no rows and a zero total points to the range, not Retry`, async () => {
     vi.useFakeTimers();
-    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 12, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ origin_machine: "fixture", entries: [], total: 0, integrity_findings: [], chain_verdict: "verified", sealed_region: { status: "not_present" } })) });
     await settle();
     runInContext('state.timeRange = "' + range + '";', h.context); h.navigate("activity"); await settle();
     const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
@@ -4783,6 +4781,8 @@ describe("Read-only extraction mutation boundaries", () => {
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [heldItem, { ...heldItem, item_id: "unknown-tier", tier: "tier9" }] } })),
       "/api/posture/home": () => Promise.resolve(response({ ...home(), agents: [{ agent_id: heldItem.agent_id }] })),
       "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 1, integrity_findings: [] })),
+      // One beyond the existing 25-row pager makes the read-only Next action reachable.
+      "/api/honeypot/tool-traps": () => Promise.resolve(response({ data: { traps: Array.from({ length: 26 }, (_, i) => ({ fake_tool_name: `readonly-tool-${i + 1}` })) } })),
     });
     await settle();
     for (const route of ["approvals", "posture", "dashboard", "policy", "honeypot"]) {
@@ -4791,6 +4791,12 @@ describe("Read-only extraction mutation boundaries", () => {
       expect(h.el.main!.innerHTML).not.toContain("approval-decision-feedback");
       expect(h.el.main!.innerHTML).not.toContain("approval-feedback-open");
     }
+    h.navigate("honeypot"); await settle();
+    expect(h.el.main!.querySelector('[data-action="mfp-page"][data-list="toolTraps"][data-step="1"]')).not.toBeNull();
+    expect(h.el.main!.innerHTML).not.toContain("readonly-tool-26");
+    h.click({ "data-action": "mfp-page", "data-list": "toolTraps", "data-step": "1" });
+    expect(h.el.main!.innerHTML).toContain("readonly-tool-26");
+    expect(runInContext('state.mfp.pages.toolTraps', h.context)).toBe(1);
     runInContext('state.timeRange = "all";', h.context);
     h.navigate("activity"); await settle();
     expect(h.el.main!.innerHTML).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
@@ -4801,4 +4807,119 @@ describe("Read-only extraction mutation boundaries", () => {
     expect(runInContext('state.approvals.inFlightItemId', h.context)).toBeNull();
     expect(runInContext('state.inbox.every(i => !i.resolved)', h.context)).toBe(true);
   });
+});
+
+
+describe("Read-only scoped notice evidence boundary", () => {
+  const pageCap = 100; // One inbox page, must match HUB_INBOX_DEFAULT_LIMIT in hub/constants.ts.
+  const model_provider = { vendor: "fixture-vendor", model_id: "fixture-model" };
+  const agents = ["agent-a", "agent-b"].map(agent_id => ({ agent_id, status: "active", model_provider }));
+  const decidedA = { ...heldItem, item_id: "decided-a", agent_id: "agent-a", tier: "tier2", resolved: true };
+  const pendingB = { ...heldItem, item_id: "pending-b", agent_id: "agent-b", tier: "tier2" };
+  const unknownA = { ...heldItem, item_id: "unknown-a", agent_id: "agent-a", tier: "tier9" };
+  const scopeA = (h: ReturnType<typeof boot>) => h.click({ "data-action": "agent-scope-select", "data-agent-id": "agent-a" });
+  for (const shape of ["unknown", "full-page"]) {
+    it(`decided-history consumer qualifies observed outside holds for ${shape}`, async () => {
+      vi.useFakeTimers();
+      // The unknown hold belongs to selected A; the full page cannot exclude an unseen A hold.
+      const items = shape === "unknown" ? [decidedA, pendingB, unknownA] : [decidedA, pendingB, ...Array.from({ length: pageCap - 2 }, (_, i) => ({ ...pendingB, item_id: `notice-${i}`, kind: "blocked_egress" }))];
+      const h = boot({
+        "/api/hub/inbox": () => Promise.resolve(response({ data: { items } })),
+        "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+      });
+      await settle(); h.navigate("approvals"); scopeA(h);
+      const queue = h.el.main!.innerHTML.split('<aside')[0]!;
+      expect(queue).toContain('data-approval-row="decided-a"');
+      expect(queue).toContain("1 held operation waits outside this agent scope");
+      expect(queue.indexOf("outside this agent scope")).toBeLessThan(queue.indexOf('<table class="approval-table">'));
+      expect(queue).not.toContain("Nothing waiting for agent-a.");
+      expect(queue).toContain("No recognized held operation for agent-a is waiting in this read.");
+      expect(queue).not.toMatch(/Nothing waiting on you|qe-check/);
+      if (shape === "unknown") expect(queue).toContain("1 held item carries a tier this console does not recognize");
+      else expect(queue).toContain("a held operation may be waiting past them");
+    });
+  }
+  it("defensive Evidence Retry is not masked by page-local search", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context);
+    h.navigate("activity"); await settle();
+    h.input("evidence-filter-query", "absent");
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain("The server counts 7 entries in this view, but this read shows none.");
+    expect(entries).toContain('data-action="retry-panel" data-read="/api/posture/evidence"');
+    expect(entries).not.toContain("Clear filters");
+  });
+  for (const selected of [false, true]) for (const mode of ["earned", "known", "unknown", "loading", "redacted"]) {
+    it(`read-only evidence matrix selected=${selected} mode=${mode}`, async () => {
+      vi.useFakeTimers();
+      const pendingA = { ...decidedA, item_id: "pending-a", resolved: false };
+      const items = mode === "known" ? [decidedA, pendingA, pendingB] : mode === "unknown" ? [decidedA, unknownA] : [decidedA];
+      const h = boot({
+        "/api/hub/inbox": mode === "loading" ? never : () => Promise.resolve(response({ data: { items: mode === "redacted" ? [] : items, pending_approvals_redacted: mode === "redacted", pending_approvals_count: 0 } })),
+        "/api/hub/agents": () => Promise.resolve(response({ data: { agents } })),
+        "/api/posture/home": () => Promise.resolve(response({ ...home(), agents })),
+      });
+      await settle(); h.navigate("approvals");
+      if (selected) scopeA(h);
+      const unknown = mode === "loading" || mode === "redacted";
+      const earned = mode === "earned";
+      const known = mode === "known";
+      const count = mode === "loading" ? "Unknown" : known ? `${selected ? 1 : 2} of 2` : "0 of 0";
+      expect(h.el["rail-approvals-count"]!.textContent).toBe(count);
+      expect(h.el["rail-approvals-count"]!.className).toBe(earned ? "count" : known ? "count hot" : "count unknown");
+      expect(Boolean(h.el["notify-count"]!.hidden)).toBe(earned);
+      for (const el of [h.railLink, h.el["btn-notifications"]!]) {
+        const label = el.getAttribute("aria-label")!;
+        if (mode === "loading") expect(label).toContain("Unknown until the approval queue loads");
+        else if (mode === "redacted") expect(label).toContain("hidden until you paste the operator token");
+        else if (mode === "unknown") expect(label).toContain("1 held item carries a tier this console does not recognize");
+        else expect(label).toContain(known ? `${selected ? 1 : 2} of 2 held operations wait on you` : "0 of 0 held operations wait on you");
+      }
+      if (earned) expect(h.el.fortress!.innerHTML).toContain('qe-check');
+      else {
+        expect(h.el.fortress!.innerHTML).not.toContain('qe-check');
+        expect(h.el.main!.innerHTML).not.toContain("Nothing waiting on you.");
+      }
+      h.navigate("posture");
+      const tile = h.el.main!.innerHTML.split('>Approvals waiting</a>')[1]!.split('</div>')[0]!;
+      if (unknown) expect(tile).toContain(mode === "loading" ? "Not evaluated" : "UNKNOWN");
+      else expect(tile).toContain(`<span class="ot-value">${known ? "2" : "0"}</span>`);
+      if (mode === "unknown") expect(h.el.main!.innerHTML).toContain("1 held item carries a tier this console does not recognize");
+      if (earned) expect(h.el.main!.innerHTML).toContain("No approvals waiting");
+      else expect(h.el.main!.innerHTML).not.toContain("No approvals waiting");
+      h.click({ "data-action": "posture-seal-toggle" }, [], false, { stopPropagation: vi.fn() });
+      const row = h.el["posture-seal-pop"]!.innerHTML.split('<div class="pp-line">').find(line => line.includes('Charter approvals</span>'))!;
+      expect(row).toContain(`class="pp-dot${unknown ? " unknown" : earned ? "" : " warn"}"`);
+      expect(row).toContain(`<span class="pp-v">${unknown ? "Unknown" : earned ? "clear" : known ? "2 waiting" : "0 waiting; 1 held item carries a tier this console does not recognize"}</span>`);
+    });
+  }
+  for (const filters of [{ query: " " }, { agent: "agent-a", query: "absent" }, { layer: "l1" }, { event: "state_write" }]) {
+    it(`defensive inconsistent page keeps Retry with pre-total filters ${JSON.stringify(filters)}`, async () => {
+      vi.useFakeTimers();
+      const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+      await settle(); h.context.testFilters = filters;
+      runInContext('state.timeRange = "24h";', h.context);
+      h.navigate("activity"); await settle();
+      runInContext('Object.assign(state.evidence.filters, testFilters); rerender();', h.context);
+      const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+      expect(entries).toContain('data-action="retry-panel"');
+      expect(entries).not.toContain("Clear filters");
+    });
+  }
+  it("result post-filter may explain an empty positive-total page even with local search", async () => {
+    vi.useFakeTimers();
+    const h = boot({ "/api/posture/evidence": () => Promise.resolve(response({ entries: [], total: 7, integrity_findings: [] })) });
+    await settle();
+    runInContext('state.timeRange = "all";', h.context);
+    h.navigate("activity"); await settle();
+    runInContext('state.evidence.filters.result = "failure"; rerender();', h.context);
+    h.input("evidence-filter-query", "absent");
+    const entries = h.el.main!.innerHTML.split('aria-label="Entries"')[1]!.split('</section>')[0]!;
+    expect(entries).toContain("No entries match this view");
+    expect(entries).toContain("Clear filters");
+    expect(entries).not.toContain('data-action="retry-panel"');
+  });
+
 });
