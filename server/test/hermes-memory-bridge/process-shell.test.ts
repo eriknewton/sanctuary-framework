@@ -716,6 +716,7 @@ describe("Hermes memory process shell", () => {
       storageFor: () => storage, uid: process.getuid?.() ?? 0 });
     try {
       await waitUntil(() => probeCallback !== undefined);
+      expect(pair.shell.readableFlowing).toBe(false); // Assert before a readable observer can itself pause the stream.
       const observeReadable = () => undefined;
       pair.shell.on("readable", observeReadable);
       pair.relay.write(early);
@@ -969,6 +970,7 @@ describe("Hermes memory process shell", () => {
     const observed = startup.catch((error: unknown) => error);
     try {
       await waitUntil(() => callback !== undefined);
+      expect(pair.shell.readableFlowing).toBe(false); // Assert before observer attachment changes stream state.
       const observeReadable = () => undefined;
       pair.shell.on("readable", observeReadable);
       pair.relay.write(Buffer.alloc(1024 * 1024, 0x61));
@@ -1026,7 +1028,7 @@ describe("Hermes memory process shell", () => {
     } finally { write.mockRestore(); pair.close(); }
   });
 
-  it("never admits a native late successful callback after the admission deadline", async () => {
+  it("keeps a timer-first native admission refusal settled despite repeated late callbacks", async () => {
     const fixture = await seededFortress("probe-late-success");
     const pair = await socketPair();
     const storage = new FilesystemStorage(join(fixture.fortressDir, "state"));
@@ -1047,6 +1049,54 @@ describe("Hermes memory process shell", () => {
       expect(reads).not.toHaveBeenCalled();
       expect(pair.shell.destroyed).toBe(true);
     } finally { write.mockRestore(); reads.mockRestore(); pair.close(); }
+  });
+
+  it("refuses a native admission callback invoked after its deadline while the real timer is pending", async () => {
+    const fixture = await seededFortress("probe-callback-deadline");
+    const pair = await socketPair();
+    const storage = new FilesystemStorage(join(fixture.fortressDir, "state"));
+    const reads = vi.spyOn(storage, "read");
+    let callback: ((error?: Error | null) => void) | undefined;
+    let probes = 0;
+    let nonemptyWrites = 0;
+    let settlements = 0;
+    const write = vi.spyOn(pair.shell, "write").mockImplementation(((chunk: Buffer, cb: (error?: Error | null) => void) => {
+      if (chunk.byteLength === 0) { probes++; callback = cb; return true; }
+      nonemptyWrites++;
+      return false;
+    }) as typeof pair.shell.write);
+    const result = runProductionHermesBridgeProcess({ env: fixture.env, relaySocketFactory: () => pair.shell,
+      storageFor: () => storage, uid: process.getuid?.() ?? 0 });
+    const observed = result.then(
+      (handle) => { settlements++; handle.signalStop("SIGTERM"); return { handle }; },
+      (error: unknown) => { settlements++; return { error }; },
+    );
+    try {
+      await waitUntil(() => callback !== undefined);
+      const afterProbe = performance.now();
+      expect(settlements).toBe(0); // The actual admission timer has not dispatched.
+      expect(probes).toBe(1);
+      expect(reads).not.toHaveBeenCalled();
+      expect(nonemptyWrites).toBe(0);
+      const now = vi.spyOn(performance, "now").mockReturnValue(afterProbe + 2001);
+      try { callback!(); } finally { now.mockRestore(); }
+      callback!(); // Repeated completion must not settle startup again.
+      const outcome = await observed;
+      if (!("error" in outcome)) throw new Error("admission unexpectedly succeeded");
+      expect(outcome.error).toMatchObject({ state: "state_CONFIG_CHECKED", message: "relay socket admission timed out" });
+      expect(settlements).toBe(1);
+      expect(reads).not.toHaveBeenCalled();
+      expect(nonemptyWrites).toBe(0); // No Ready frame was offered.
+      expect(pair.shell.destroyed).toBe(true);
+    } finally {
+      callback?.(new Error("fixture cleanup"));
+      const outcome = await observed;
+      if ("handle" in outcome) {
+        outcome.handle.signalStop("SIGTERM");
+        await outcome.handle.exited;
+      }
+      write.mockRestore(); reads.mockRestore(); pair.close();
+    }
   });
 
   it.each([
