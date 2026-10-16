@@ -1814,7 +1814,8 @@ function renderHoneypotPage() {
     '<p class="eyebrow">Honeypots</p>' +
     '<h1>Honeypot traps.</h1>' +
     '<p class="sub">Fake tools and fake credentials. Reads, invocations, and attempted credential use create sentinel findings without revealing the trap.</p>' +
-  '</div></div>' + error + createCta + mfpPager(credentialPage, "credentialTraps", "/api/honeypot/credential-traps") + credentialRows + mfpPager(toolPage, "toolTraps", "/api/honeypot/tool-traps") + toolRows;
+  // Successful empty reads already have an empty state, so only populated lists need a record pager.
+  '</div></div>' + error + createCta + (credentialTraps.length ? mfpPager(credentialPage, "credentialTraps", "/api/honeypot/credential-traps") : "") + credentialRows + (toolTraps.length ? mfpPager(toolPage, "toolTraps", "/api/honeypot/tool-traps") : "") + toolRows;
 }
 
 function relTimeFromIso(iso) {
@@ -2984,7 +2985,8 @@ function renderPolicyCenter() {
     '<p class="policy-subtitle">Principal policy lines and agent template bindings. A template change waits for your approval; approving it records the new template on the agent, and your decision either way is written to your audit log.</p>' +
     renderPolicyPlainEnglishPanel() +
     '<section class="policy-panel"><h2>Channel templates · ' + CHANNEL_TEMPLATES.length + ' shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
-    '<section class="policy-panel"><h2>Per-agent rules</h2><p class="muted">Agent template bindings and daily budgets. Other rule fields are not served here.</p>' + (sourceLoaded(HUB + "/agents") ? mfpPager(bindingPage, "bindings", HUB + "/agents") : "") +
+    // A pager describes served rows; unread sources keep their status and loaded empty agents keep their empty state.
+    '<section class="policy-panel"><h2>Per-agent rules</h2><p class="muted">Agent template bindings and daily budgets. Other rule fields are not served here.</p>' + (sourceLoaded(HUB + "/agents") && state.agents.length ? mfpPager(bindingPage, "bindings", HUB + "/agents") : "") +
       '<div class="rules-scroll"><table class="rules-table">' +
       '<thead><tr><th>AGENT</th><th>TEMPLATE</th><th>ALLOW / BLOCK</th><th>BUDGET</th><th>RETENTION</th><th>MINIMIZE</th><th>APPROVALS</th></tr></thead>' +
       '<tbody>' + (sourceLoaded(HUB + "/agents") ? rows : '<tr><td colspan="7">' + renderSourceRead(HUB + "/agents") + '</td></tr>') + '</tbody></table></div>' +
@@ -3843,15 +3845,21 @@ function renderActivityScreen() {
   const searchedLine = state.evidence.filters.query
     ? "searching the " + entries.length + " entries loaded"
     : "search is local to the " + entries.length + " entries loaded";
-  // The top-bar time range is a server filter too (evidenceSinceIso sends it as since), so a range that
-  // matches nothing is a filtered view, never an empty log; Clear filters leaves the range in place.
   const timeRangeActive = state.timeRange !== "all";
-  const noMatchNote = timeRangeActive
-    ? entries.length + " entries were loaded for " + TIME_RANGE_LABEL[state.timeRange] + ". The time range, the active server filters or page-local search have no matches on this page. Clear filters keeps the time range; change it in the top bar."
-    : entries.length + " entries were loaded. The active server filters or page-local search have no matches on this page.";
+  const serverFiltersActive = Object.keys(state.evidence.filters).some(function (key) { return key !== "query" && !!state.evidence.filters[key]; });
+  const searchActive = !!state.evidence.filters.query;
+  // Name only filters actually applied; a range-only view cannot be cleared by navigating to its existing hash.
+  const activeFilterNames = (timeRangeActive ? ["time range"] : []).concat(serverFiltersActive ? ["server filters"] : [], searchActive ? ["page-local search"] : []);
+  const noMatchNote = entries.length + " entries were loaded" + (timeRangeActive ? " for " + TIME_RANGE_LABEL[state.timeRange] : "") + ". " +
+    (activeFilterNames.length ? "Active filters: " + activeFilterNames.join(", ") + ". " : "") + "No matches on this page." +
+    (timeRangeActive ? (serverFiltersActive || searchActive ? " Clear filters keeps the time range; change it in the top bar." : " Change the time range in the top bar.") : "");
+  const clearFiltersLink = serverFiltersActive || searchActive ? '<a class="btn" href="#activity">Clear filters</a>' : "";
   const empty = sourceLoaded("/api/posture/evidence") && !filtered.length
-    ? entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
-      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p><a class="btn" href="#activity">Clear filters</a></div>'
+    // A positive server count with no active filter proves neither a match failure nor an empty window.
+    ? !entries.length && total > 0 && !activeFilterNames.length
+      ? '<div class="overview-empty"><h3>No entries on this page</h3><p>' + escHtml("The server counts " + total + (total === 1 ? " entry" : " entries") + " in this view, but this read shows none.") + '</p><button class="btn" data-action="retry-panel" data-read="/api/posture/evidence">Retry</button></div>'
+      : entries.length || total > 0 || timeRangeActive || Object.values(state.evidence.filters).some(Boolean)
+      ? '<div class="overview-empty"><h3>No entries match this view</h3><p>' + escHtml(noMatchNote) + '</p>' + clearFiltersLink + '</div>'
       : '<div class="overview-empty"><h3>No audit entries in this view</h3><p>The server returned an empty Evidence window for these filters.</p></div>'
     : "";
   const table = sourceLoaded("/api/posture/evidence")
@@ -4242,13 +4250,18 @@ function renderOverviewDecisionQueue() {
     return (parseEvidenceTimestamp(a.created_at || "") || 0) - (parseEvidenceTimestamp(b.created_at || "") || 0);
   });
   const shown = all.slice(0, OVERVIEW_DECISION_LIMIT);
+  const evidence = approvalQueueEvidence();
   if (!all.length) {
+    // The same evidence bound as Approvals prevents a full or unrecognized page from claiming an empty queue.
+    if (!evidence.earned) return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' + evidence.emptyHtml + evidence.warning + '<a class="btn" href="#approvals">Open Approvals</a></section>';
     return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">0 of 0 · queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '</span></h3></div>' +
       '<div class="overview-empty"><h3>No approvals waiting</h3><p>0 of 0 held operations are open. Queue read ' + escHtml(sourceReadAge(HUB + "/inbox") || "now") + '.</p><a class="btn" href="#activity">Open Evidence</a></div></section>';
   }
-  return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
+  // The card's recognized total covers only the served page, so a full page cannot present it as exact.
+  return '<section class="card"><div class="card-head-row"><h3>Needs your decision <span class="count-age">showing ' + escHtml(shown.length) + ' of ' + escHtml(all.length) + (evidence.full ? '+' : '') + ' · ' + escHtml(oldestAge(all)) + '</span></h3>' +
     '<a href="#approvals">all approvals</a></div><div class="overview-table-scroll"><table class="overview-table overview-table-decisions"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting</th><th></th></tr></thead><tbody>' +
-    shown.map(overviewDecisionRow).join("") + '</tbody></table></div></section>';
+    // Recognized rows do not account for unknown tiers, so the card must retain their separate warning.
+    shown.map(overviewDecisionRow).join("") + '</tbody></table></div>' + evidence.warning + '</section>';
 }
 
 function severityClass(level) {
@@ -4400,7 +4413,8 @@ function renderPostureScreen() {
     : '';
   if (sourceLoaded(HUB + "/agents") && state.agents.length === 0 && (home.agents || []).length === 0) {
     const below = [];
-    if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && heldApprovalItems(null).length) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
+    // An empty agent roster cannot establish that a full or unrecognized inbox page has no holds.
+    if (sourceLoaded(HUB + "/inbox") && ((!state.inboxRedacted && !approvalQueueEvidence().earned) || (state.inboxRedacted && Number(state.inboxRedactedCount) > 0))) below.push(renderOverviewDecisionQueue());
     if (sourceLoaded("/api/anomaly/findings") && state.posture.anomaliesUnknown === false && (state.posture.anomalies || []).length) below.push(renderOverviewFindingsPanel());
     return '<section class="overview-page">' + head + machineLine + overviewFirstRun(home) + '<div class="overview-tiles" aria-label="At a glance">' + renderOverviewProtection(home) + '</div>' + below.join("") + '</section>';
   }
@@ -4425,6 +4439,11 @@ function renderPostureScreen() {
           : overviewChip("unknown", "UNKNOWN", wallAge || "no evidence");
   const pendingKnown = sourceLoaded(HUB + "/inbox") && !state.inboxRedacted;
   const pending = pendingKnown ? heldApprovalItems(null) : [];
+  const pendingEvidence = approvalQueueEvidence();
+  // Only earned evidence permits an unqualified zero; full pages and unknown tiers retain their bounds below.
+  const pendingValue = pendingEvidence.earned ? "0" : pending.length + (pendingEvidence.full ? "+" : "");
+  const pendingNote = (pendingEvidence.full ? "from the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items · " : "") +
+    (pendingEvidence.unknown ? pendingEvidence.unknownLine + " · " : "");
   const chainWindowEnd = parseEvidenceTimestamp(digest.window_end || "");
   // VERIFIED requires current evidence from this digest build; stale and future checks never remain green.
   const checkCurrent = auditChainCheckCurrent(digest);
@@ -4445,7 +4464,7 @@ function renderPostureScreen() {
     '<div class="overview-tiles" aria-label="At a glance">' +
       renderOverviewProtection(home) +
       overviewTile("Castle Wall", wallChip, escHtml((home.castle_wall && home.castle_wall.platform) || "platform not served") + " · " + (wallEvidenceAt ? "evidence " + escHtml(wallAge) : "no enforcement evidence yet"), "#enforcement") +
-      overviewTile("Approvals waiting", pendingKnown ? escHtml(pending.length) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
+      overviewTile("Approvals waiting", pendingKnown ? escHtml(pendingValue) : overviewChip("unknown", state.inboxRedacted ? "UNKNOWN" : "Not evaluated"), pendingKnown ? escHtml(pendingNote) + escHtml(oldestAge(pending)) + " · queue read " + escHtml(loadedSourceReadAge(HUB + "/inbox") || "Unknown") + ' · <a href="#approvals">decide</a>' : (state.inboxRedacted ? escHtml("approval queue hidden; pending count " + state.inboxRedactedCount) : escHtml(overviewSourceReason(HUB + "/inbox", "approval queue"))), "#approvals") +
       // Must match renderAnomalyFindingsCard on the Findings screen: both count /api/anomaly/findings.
       overviewTile("Open Sentinel findings", anomalyUnknown ? overviewChip("unknown", "Not evaluated") : escHtml(findings.length), anomalyUnknown ? escHtml(overviewSourceReason("/api/anomaly/findings", "Sentinels")) : "Sentinels answered " + escHtml(loadedSourceReadAge("/api/anomaly/findings") || "now") + ' · <a href="#findings">findings</a>', "#findings") +
       overviewTile("Audit chain", chainChip, Number.isFinite(chainWindowEnd) ? (chainVerified ? "checked " : "digest from ") + escHtml(relTimeFromIso(digest.window_end)) + (chainVerified ? "" : (digest.chain_verified === true || digest.chain_verdict === "verified_suffix_only") && !checkCurrent ? ", not current" : ", not verified") : "last check Not evaluated", "#activity") +
@@ -4511,25 +4530,39 @@ function sourceReadAge(path) {
 // which no agent scope can narrow.
 function approvalWaitingSummary() {
   if (!sourceLoaded(HUB + "/inbox")) {
-    return { known: false, n: null, of: null, sentence: "Held operations waiting on you: Unknown until the approval queue loads" };
+    return { known: false, n: null, of: null, sentence: "Held operations waiting on you: Unknown until the approval queue loads." };
   }
   const age = sourceReadAge(HUB + "/inbox") || "at an unknown time";
   if (state.inboxRedacted) {
     const hidden = state.inboxRedactedCount;
-    return { known: true, n: hidden, of: hidden, sentence: hidden + " of " + hidden + " held operations wait on you, hidden until you paste the operator token · queue read " + age };
+    // A served redacted count cannot establish emptiness because hidden rows and tiers cannot be checked.
+    return { known: true, n: hidden, of: hidden, earned: false, unrecognized: 0, sentence: hidden + " of " + heldOperationsPhrase(hidden, "waits", "wait") + " on you, hidden until you paste the operator token · queue read " + age + "." };
   }
-  const n = pendingApprovalItems().length;
-  const of = heldApprovalItems(null).length;
+  const evidence = approvalQueueEvidence();
+  const n = evidence.waiting;
+  const of = evidence.total;
   const scope = state.agentScope.selectedAgentId;
-  return { known: true, n: n, of: of, sentence: n + " of " + of + " held operations wait on you" + (scope ? " (scoped to " + scope + ")" : "") + " · queue read " + age };
+  // A full page establishes observed counts only, so the sentence binds them to the served inbox page.
+  const countLine = n + " of " + (evidence.full
+    ? heldOperationsPhrase(of) + " in the first " + APPROVAL_QUEUE_ITEM_CAP + " inbox items " + (of === 1 ? "waits" : "wait")
+    : heldOperationsPhrase(of, "waits", "wait")) + " on you";
+  // Unknown tiers cannot disappear into a recognized zero, even when the current agent scope hides them.
+  // The wording comes from approvalQueueEvidence so the queue warning, tile, seal row and this sentence say it the same way.
+  const unknownClause = evidence.unknown ? "; " + evidence.unknownLine : "";
+  return { known: true, n: n, of: of, full: evidence.full, earned: evidence.earned, unrecognized: evidence.unknown, sentence: countLine + (scope ? " (scoped to " + scope + ")" : "") + unknownClause + " · queue read " + age + "." + (evidence.full ? evidence.pageEdge : "") };
 }
 
 function renderApprovalCounts() {
   const w = approvalWaitingSummary();
-  const text = w.known ? w.n + " of " + w.of : "Unknown";
+  const suffix = w.full ? "+" : "";
+  const text = w.known ? w.n + suffix + " of " + w.of + suffix : "Unknown";
+  // The pill's digits count recognized holds only, so a hold they count, inside or outside the agent scope, looks hot.
+  const counted = w.known && w.of > 0;
+  // An unearned zero cannot look calm because unseen or unrecognized holds may still need a decision.
+  const unknown = !w.known || (!w.earned && !counted);
   const railCount = document.getElementById("rail-approvals-count");
   if (railCount) {
-    railCount.className = "count" + (!w.known ? " unknown" : w.n > 0 ? " hot" : "");
+    railCount.className = "count" + (unknown ? " unknown" : counted ? " hot" : "");
     railCount.textContent = text;
     const link = railCount.parentElement;
     if (link && typeof link.setAttribute === "function") {
@@ -4543,15 +4576,18 @@ function renderApprovalCounts() {
     notify.setAttribute("aria-label", "Approvals: " + w.sentence);
     // The badge goes only when nothing waits fortress-wide: a zero scoped to
     // one agent while other agents' holds wait is not an all-clear, so the
-    // badge stays and reads "0 of N". The title states the count with its
-    // denominator and age either way.
-    if (w.known && w.of === 0) notify.classList.remove("waiting");
+    // badge stays and reads "0 of N". Full pages and unknown tiers also cannot
+    // earn an empty claim; the title states the count bounds and age.
+    if (w.known && w.earned) notify.classList.remove("waiting");
     else notify.classList.add("waiting");
   }
   const badge = document.getElementById("notify-count");
   if (badge) {
-    badge.hidden = w.known && w.of === 0;
-    badge.className = "wait" + (w.known ? "" : " unknown");
+    // Hiding the badge is an empty-queue claim and requires the same evidence as the calm summary.
+    badge.hidden = w.known && w.earned;
+    // The badge signals any observed hold, including a tier this console cannot decide, so only a zero with
+    // nothing observed takes the unknown look.
+    badge.className = "wait" + (unknown && !(w.known && w.unrecognized > 0) ? " unknown" : "");
     badge.innerHTML = '<i aria-hidden="true"></i>' + escHtml(text);
   }
 }
@@ -4706,10 +4742,11 @@ function approvalQueueEvidence() {
   const unknown = state.inbox.filter(function (i) {
     return i.kind === "approval_pending" && !i.resolved && i.tier !== "tier1" && i.tier !== "tier2";
   }).length;
+  const unknownLine = unknown === 1 ? "1 held item carries a tier this console does not recognize" : unknown + " held items carry a tier this console does not recognize";
   const warning = ready && unknown
-    ? '<p class="muted">' + (unknown === 1
-      ? '1 held item carries a tier this console does not recognize. It is not shown here and cannot be decided from this screen.'
-      : unknown + ' held items carry a tier this console does not recognize. They are not shown here and cannot be decided from this screen.') + '</p>' : "";
+    ? '<p class="muted">' + unknownLine + (unknown === 1
+      ? '. It is not shown here and cannot be decided from this screen.'
+      : '. They are not shown here and cannot be decided from this screen.') + '</p>' : "";
   const waiting = pendingApprovalItems().length;
   const outside = heldApprovalItems(null).length - waiting;
   let title = "Nothing selected";
@@ -4741,9 +4778,12 @@ function approvalQueueEvidence() {
   }
   if (!sourceLoaded(HUB + "/inbox")) summary = renderSourceRead(HUB + "/inbox");
   else if (state.inboxRedacted) summary = '<div class="queue-empty" data-pending-approvals-redacted="1">' + escHtml(line) + '</div>';
-  // The badge counts every waiting hold, recognized or not, and on a full page it is only a lower bound.
-  const count = (waiting + unknown) + (full ? "+" : "");
-  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned };
+  // Only recognized holds belong in scoped counts; unknown tiers retain their separate warning and cannot earn calm.
+  const total = waiting + outside;
+  const suffix = full ? "+" : "";
+  // A full page bounds both counts even when every observed hold belongs to the selected scope.
+  const count = waiting + suffix + (outside || full ? " of " + total + suffix : "");
+  return { title: title, line: line, emptyHtml: emptyHtml, summary: summary + warning, warning: warning, count: count, earned: earned, waiting: waiting, outside: outside, total: total, full: full, pageEdge: pageEdge, unknown: unknown, unknownLine: unknownLine };
 }
 
 // "1 held operation" or "N held operations", with the verb that agrees when one is given.
@@ -4991,7 +5031,9 @@ function renderApprovalsScreen() {
   const pageFullNotice = state.inbox.length >= APPROVAL_QUEUE_ITEM_CAP
     ? '<p class="muted" data-inbox-page-full="1">The inbox read returned a full page of ' + APPROVAL_QUEUE_ITEM_CAP + ' items; held operations beyond it are not shown here.</p>'
     : "";
-  const body = capped.length ? '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+  // Decided history cannot hide holds waiting elsewhere when the selected scope has no waiting operations.
+  const outsideNotice = evidence.outside && !evidence.waiting ? evidence.emptyHtml : "";
+  const body = capped.length ? outsideNotice + '<div class="approval-table-wrap" id="approval-queue"><table class="approval-table"><thead><tr><th>Tier</th><th>Agent</th><th>Operation</th><th>Why it asked</th><th>Waiting / decided</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
     noFilterMatch ? '<div class="queue-empty">No held operation matches these filters.</div>' :
     evidence.emptyHtml;
   const f = state.approvals.filters;
@@ -6151,7 +6193,11 @@ function postureLayerLines() {
   else if (seal.arm) wallV = "not enforcing";
   else wallV = "unknown";
   const wallWarn = !(seal.arm === "armed" && seal.freshness.current);
-  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
+  const pending = heldApprovalItems(null).length;
+  const approvalsEvidence = approvalQueueEvidence();
+  // Only a complete, readable queue without recognized or unknown holds can earn a clear Charter row.
+  const approvalsValue = !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : approvalsEvidence.earned ? "clear" :
+    pending + (approvalsEvidence.full ? "+" : "") + " waiting" + (approvalsEvidence.unknown ? "; " + approvalsEvidence.unknownLine : "");
   return [
     { k: "What was evidenced", v: seal.freshness.what, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
     { k: "Evidence time", v: seal.freshness.detail, warn: !seal.freshness.current, off: seal.freshness.state === "absent" },
@@ -6161,7 +6207,8 @@ function postureLayerLines() {
     // protected agents is not evidence that a Sentinel is watching them, so
     // this line is Unknown until a Sentinel report is part of a read.
     { k: "Sentinels watching agents", v: "Unknown", unknown: true },
-    { k: "Charter approvals", v: !sourceLoaded(HUB + "/inbox") || state.inboxRedacted ? "Unknown" : pending ? pending + " waiting" : "clear", warn: pending > 0 },
+    // Every value short of earned clear keeps the warning; unknown values retain the shared Unknown dot.
+    { k: "Charter approvals", v: approvalsValue, warn: approvalsValue !== "clear" },
     // A Heralds layer that is configured but not active is not signing: it
     // reads "configured" with the warn dot, never the pass dot.
     { k: "Heralds (reputation)", v: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 ? "Unknown" : d.layers.l4.status === "active" ? "signed" : "configured", warn: !sourceLoaded("/api/sovereignty") || !d || !d.layers || !d.layers.l4 || d.layers.l4.status !== "active" }
