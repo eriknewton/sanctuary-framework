@@ -172,7 +172,7 @@ class StartupTransportOwner {
     stream.on("error", this.onError);
     stream.on("end", this.onEnd);
     stream.on("close", this.onClose);
-    // Pause JS delivery without Socket's onread-specific native readStop, so empty EOF remains observable.
+    // Set defensive JS pause state without Socket's onread-specific native readStop; synchronous reader attachment, handoff and Ready write precede resume.
     if (stream instanceof net.Socket) Duplex.prototype.pause.call(stream);
     else stream.pause();
   }

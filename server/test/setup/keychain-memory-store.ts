@@ -1,5 +1,6 @@
 /**
- * Global test setup: install an IN-MEMORY credential store for every test.
+ * In-memory credential store helpers. The Vitest setup wrapper installs this
+ * module's exported installer and calls its exported reset before each test.
  *
  * See `src/wrap/keychain-exec.ts` for why. Short version: the suite used to
  * write ~61 entries per run into the developer's real login keychain, and under
