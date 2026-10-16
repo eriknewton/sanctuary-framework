@@ -269,10 +269,36 @@ class AdapterForwarder extends SingleBindForwarder<HermesBridgeMemoryAdapter> im
 
 class AuditForwarder extends SingleBindForwarder<AuditLog> {
   readonly pending = new Set<Promise<void>>();
+  // Records reach the audit log one at a time. The log serializes appends itself, so this changes no
+  // ordering; it exists so a record still waiting its turn at close can be refused before the log
+  // starts its filesystem preamble (namespace directories, lock files) inside a fortress whose master
+  // write barrier this process has already given up.
+  private turnQueue: Promise<void> = Promise.resolve();
+  private handedOff = 0;
+  private refuseAtExit: ((record: HermesBridgeAuditRecord) => void) | undefined;
 
   append(record: HermesBridgeAuditRecord): Promise<void> {
     const target = this.requireTarget();
-    return this.track(this.appendCritical(target, record));
+    const turn = this.turnQueue.then(() => {
+      // Once the barrier is released no append can persist (the storage refuses a raw write without
+      // a live lease). A record that has not been handed off by then is refused here, reported on
+      // stderr, and still rejects back to the core's durability handling: lost loudly, never silently.
+      if (this.refuseAtExit !== undefined) {
+        this.refuseAtExit(record);
+        throw new Error(`Hermes bridge audit record ${record.kind} refused at exit`);
+      }
+      this.handedOff += 1;
+      return this.appendCritical(target, record).finally(() => { this.handedOff -= 1; });
+    });
+    this.turnQueue = turn.then(() => undefined, () => undefined);
+    return this.track(turn);
+  }
+
+  // Returns the count of records already handed to the audit log and still unconfirmed; the caller
+  // reports it so an audit tail abandoned at the drain deadline is visible to the operator.
+  close(refuse: (record: HermesBridgeAuditRecord) => void): number {
+    this.refuseAtExit ??= refuse;
+    return this.handedOff;
   }
 
   private appendCritical(target: AuditLog, record: HermesBridgeAuditRecord): Promise<void> {
@@ -424,6 +450,7 @@ class ShellController {
     private readonly audit: AuditForwarder,
     private readonly barrier: MasterWriteBarrierLease | undefined,
     private readonly stream: Duplex,
+    private readonly stderr: Pick<NodeJS.WriteStream, "write">,
   ) {
     this.stream.on("error", this.keepaliveErrorListener);
     this.exited = new Promise((resolve) => {
@@ -497,11 +524,22 @@ class ShellController {
     const drainedAt = performance.now();
     const drainTailDeadline = drainedAt + DRAIN_TAIL_MS;
     const exitDeadline = drainedAt + EXIT_BUDGET_MS;
-    await this.step(() => withDeadline(Promise.allSettled([...this.audit.pending]).then(() => undefined), drainTailDeadline), "audit_tail_failure");
-    if (this.audit.bound) {
+    const tailDrained = await this.step(() => withDeadline(Promise.allSettled([...this.audit.pending]).then(() => true), drainTailDeadline), "audit_tail_failure");
+    // flush() begins by awaiting the same pending appends, so once the tail missed its deadline the
+    // flush cannot finish inside the budget either; starting it would leave a detached continuation
+    // that attempts the graceful-shutdown checkpoint after the barrier below is released.
+    if (this.audit.bound && tailDrained === true) {
       await this.step(() => withDeadline(this.audit.flush(), drainTailDeadline), "audit_tail_failure");
     }
     await this.step(() => this.writer?.endAndFlush(drainTailDeadline) ?? Promise.resolve());
+    // Close before the barrier is released: every append from here on would be refused by the
+    // storage anyway, and must not touch the fortress tree while the process is tearing down.
+    const unconfirmedAuditRecords = this.audit.close((record) => {
+      this.stderr.write(`hermes-memory-bridge audit: refused ${record.kind} record at exit\n`);
+    });
+    if (unconfirmedAuditRecords > 0) {
+      this.stderr.write(`hermes-memory-bridge audit: ${unconfirmedAuditRecords} record(s) unconfirmed at exit\n`);
+    }
     await this.step(() => withDeadline(this.barrier?.release() ?? Promise.resolve(), exitDeadline), "release_failure");
     this.stream.destroy();
     this.stream.removeAllListeners();
@@ -511,11 +549,12 @@ class ShellController {
     this.exitResolve(this.cause === "fatal" ? EXIT_FATAL_BRIDGE : EXIT_CLEAN);
   }
 
-  private async step(run: () => Promise<unknown>, failure: ExitEvent = "transport_fatal"): Promise<void> {
+  private async step<T>(run: () => Promise<T>, failure: ExitEvent = "transport_fatal"): Promise<T | undefined> {
     try {
-      await run();
+      return await run();
     } catch {
       this.observeExit(failure);
+      return undefined;
     }
   }
 }
@@ -628,7 +667,7 @@ export async function runHermesBridgeProcess(options: HermesBridgeProcessOptions
     if (options.startupStopRequested?.() !== undefined) throw new StartupRefusal(STATE_CHILD_READY, "process stopped before ready");
     // The last pre-ready await must precede this guard: observed transport failure cannot cross the handoff into readiness.
     startupTransport.assertLive(STATE_GATE_WIRED);
-    const controller = new ShellController(composition.auditForwarder, barrier, stream);
+    const controller = new ShellController(composition.auditForwarder, barrier, stream, stderr);
     const writer = new HermesSocketWriter(stream, () => controller.writerFailed());
     composition.writerForwarder.bind(writer);
     controller.attach(core, writer);

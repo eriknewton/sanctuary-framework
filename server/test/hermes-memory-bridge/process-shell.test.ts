@@ -131,6 +131,10 @@ class ParkingAuditStorage extends FilesystemStorage {
   private readonly pendingAuditWrites = new Set<Promise<void>>();
   private releaseAudit: (() => void) | undefined;
   auditWriteParked = false;
+  // Set by a test once shell.exited resolved; every later write-family call counts as backend work
+  // reaching a fortress the shell no longer owns.
+  exitObserved = false;
+  backendWritesAfterExit = 0;
   readonly parked = new Promise<void>((resolve) => {
     this.releaseAudit = resolve;
   });
@@ -149,6 +153,7 @@ class ParkingAuditStorage extends FilesystemStorage {
   }
 
   override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (this.exitObserved) this.backendWritesAfterExit += 1;
     if (namespace === "_audit") {
       this.auditWriteParked = true;
       return this.trackAuditWrite((async () => { await this.parked; await super.write(namespace, key, data); })());
@@ -157,6 +162,7 @@ class ParkingAuditStorage extends FilesystemStorage {
   }
 
   override async writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (this.exitObserved) this.backendWritesAfterExit += 1;
     if (namespace === "_audit") {
       this.auditWriteParked = true;
       return this.trackAuditWrite((async () => { await this.parked; await super.writeDurable(namespace, key, data); })());
@@ -168,9 +174,14 @@ class ParkingAuditStorage extends FilesystemStorage {
     this.releaseAudit?.();
   }
 
+  // Drains to quiescence, not one snapshot: a write released here can settle a queued caller that
+  // starts another write before the first allSettled returns.
   async releaseAndDrain(): Promise<void> {
     this.release();
-    await Promise.allSettled([...this.pendingAuditWrites]);
+    do {
+      await Promise.allSettled([...this.pendingAuditWrites]);
+      await new Promise((resolve) => setImmediate(resolve));
+    } while (this.pendingAuditWrites.size > 0);
   }
 }
 
@@ -2056,6 +2067,45 @@ describe("Hermes memory process shell", () => {
       relay.inject(privateFrame({ type: "relay_shutdown" }));
       await exitWithinSharedTail;
       expect(parkedStorage.auditWriteParked).toBe(true);
+    } finally {
+      await parkedStorage.releaseAndDrain();
+    }
+  });
+
+  it("refuses audit records still queued at exit without touching the released fortress", async () => {
+    const fixture = await seededFortress("shared-exit-queued-audit");
+    const relay = new NeverDrainingDuplex();
+    let stderrText = "";
+    const parkedStorage = new ParkingAuditStorage(join(fixture.fortressDir, "state"));
+    const shell = await runHermesBridgeProcess({
+      env: fixture.env,
+      relaySocketFactory: () => relay,
+      storageFor: () => parkedStorage,
+      stderr: { write: (chunk: string | Uint8Array) => { stderrText += String(chunk); return true; } },
+      uid: process.getuid?.() ?? 0,
+    });
+    try {
+      relay.inject(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.inject(relayPublicFrame("c1", {
+        type: "tools_call",
+        request_id: "insert-queued-audit",
+        name: "memory_insert",
+        arguments: { text: "queued audit at exit", taint: "user_content", passage_id: "passage-queued-audit" },
+      }));
+      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      const sharedTailBoundMs = DRAIN_TAIL_MS + Math.floor(DRAIN_TAIL_MS / 2);
+      const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
+      relay.inject(privateFrame({ type: "relay_shutdown" }));
+      await exitWithinSharedTail;
+      parkedStorage.exitObserved = true;
+      expect(parkedStorage.auditWriteParked).toBe(true);
+      await parkedStorage.releaseAndDrain();
+      // The shutdown appends one record behind the parked one; its turn comes only after the parked
+      // write settles. Either it is refused (reported on stderr) or it reaches the backend after exit.
+      await waitUntil(() => stderrText.includes("refused") || parkedStorage.backendWritesAfterExit > 0);
+      expect(parkedStorage.backendWritesAfterExit).toBe(0);
+      expect(stderrText).toContain("hermes-memory-bridge audit: 1 record(s) unconfirmed at exit\n");
+      expect(stderrText).toContain("hermes-memory-bridge audit: refused terminal record at exit\n");
     } finally {
       await parkedStorage.releaseAndDrain();
     }
