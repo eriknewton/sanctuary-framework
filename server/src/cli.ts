@@ -52,6 +52,20 @@ async function main(): Promise<void> {
     args = [invokedAs, ...args];
   }
 
+  if (args[0] === "hermes-memory-bridge") {
+    if (args.length === 1 || args.slice(1).some((arg) => arg === "--help" || arg === "-h")) {
+      process.stdout.write("Usage: sanctuary hermes-memory-bridge run --relay-fd <fd>\n");
+      return drainAndExit(0);
+    }
+    const { hermesBridgeMain } = await import("./hermes-memory-bridge/index.js");
+    const code = await hermesBridgeMain({
+      argv: args.slice(1),
+      env: process.env,
+      stderr: process.stderr,
+    });
+    return drainAndExit(code);
+  }
+
   // v1.3.3 fix (F-1.3.2-N-001): honor the top-level --fortress flag for
   // state I/O. Pre-fix, `sanctuary --fortress <path> <subcommand>`
   // silently ignored BOTH the flag and the subcommand (dispatch matched
@@ -977,6 +991,8 @@ Usage:
   sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
   sanctuary memory_transcode [opts]       # Project memory into another harness format
   sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive
+  sanctuary hermes-memory-bridge run --relay-fd <fd>
+                                          # Run the Hermes memory relay child
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
@@ -1068,6 +1084,10 @@ Subcommands:
   memory_transcode     Manually create a plaintext cross-harness projection plus
                        an encrypted exact-source recovery archive. This is not sync.
                        Use "sanctuary memory_transcode --help" for options.
+
+  hermes-memory-bridge
+                       Run the private Hermes memory bridge child on the inherited
+                       relay fd. This command is launched by the relay supervisor.
 
   memory_transcode_restore
                        Restore exact source files from a completed encrypted
@@ -1259,6 +1279,9 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
   switch (command) {
     case "dashboard":
       printDashboardHelp();
+      return true;
+    case "hermes-memory-bridge":
+      process.stdout.write("Usage: sanctuary hermes-memory-bridge run --relay-fd <fd>\n");
       return true;
     case "install": {
       const { runInstallCommand } = await import("./cli/install.js");
