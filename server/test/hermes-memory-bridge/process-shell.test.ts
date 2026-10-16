@@ -139,7 +139,10 @@ class ParkingAuditStorage extends FilesystemStorage {
     this.releaseAudit = resolve;
   });
 
-  constructor(root: string) {
+  // Which writes park: every `_audit` entry write by default; a test of the graceful-shutdown
+  // checkpoint parks only checkpoint records (keys ending in the 20-digit sequence), so the per-append
+  // head anchor in the same namespace still passes.
+  constructor(root: string, private readonly parks: (namespace: string, key: string) => boolean = (namespace) => namespace === "_audit") {
     super(root);
   }
 
@@ -154,7 +157,7 @@ class ParkingAuditStorage extends FilesystemStorage {
 
   override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
     if (this.exitObserved) this.backendWritesAfterExit += 1;
-    if (namespace === "_audit") {
+    if (this.parks(namespace, key)) {
       this.auditWriteParked = true;
       return this.trackAuditWrite((async () => { await this.parked; await super.write(namespace, key, data); })());
     }
@@ -163,7 +166,7 @@ class ParkingAuditStorage extends FilesystemStorage {
 
   override async writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void> {
     if (this.exitObserved) this.backendWritesAfterExit += 1;
-    if (namespace === "_audit") {
+    if (this.parks(namespace, key)) {
       this.auditWriteParked = true;
       return this.trackAuditWrite((async () => { await this.parked; await super.writeDurable(namespace, key, data); })());
     }
@@ -2099,13 +2102,50 @@ describe("Hermes memory process shell", () => {
       await exitWithinSharedTail;
       parkedStorage.exitObserved = true;
       expect(parkedStorage.auditWriteParked).toBe(true);
-      await parkedStorage.releaseAndDrain();
-      // The shutdown appends one record behind the parked one; its turn comes only after the parked
-      // write settles. Either it is refused (reported on stderr) or it reaches the backend after exit.
-      await waitUntil(() => stderrText.includes("refused") || parkedStorage.backendWritesAfterExit > 0);
-      expect(parkedStorage.backendWritesAfterExit).toBe(0);
+      // The shutdown appended one record behind the parked one. It is refused at close, before exit,
+      // even though the record ahead of it is still parked and may never settle.
       expect(stderrText).toContain("hermes-memory-bridge audit: 1 record(s) unconfirmed at exit\n");
       expect(stderrText).toContain("hermes-memory-bridge audit: refused terminal record at exit\n");
+      await parkedStorage.releaseAndDrain();
+      expect(parkedStorage.backendWritesAfterExit).toBe(0);
+    } finally {
+      await parkedStorage.releaseAndDrain();
+    }
+  });
+
+  it("reports a shutdown checkpoint that missed the drain tail and starts no audit write after exit", async () => {
+    const fixture = await seededFortress("shared-exit-slow-checkpoint");
+    const relay = new NeverDrainingDuplex();
+    let stderrText = "";
+    const parkedStorage = new ParkingAuditStorage(join(fixture.fortressDir, "state"),
+      (namespace, key) => namespace === "_audit_checkpoints" && /-\d{20}$/.test(key));
+    const shell = await runHermesBridgeProcess({
+      env: fixture.env,
+      relaySocketFactory: () => relay,
+      storageFor: () => parkedStorage,
+      stderr: { write: (chunk: string | Uint8Array) => { stderrText += String(chunk); return true; } },
+      uid: process.getuid?.() ?? 0,
+    });
+    try {
+      relay.inject(privateFrame({ type: "accepted", connection_id: "c1" }));
+      relay.inject(relayPublicFrame("c1", {
+        type: "tools_call",
+        request_id: "insert-slow-checkpoint",
+        name: "memory_insert",
+        arguments: { text: "slow checkpoint at exit", taint: "user_content", passage_id: "passage-slow-checkpoint" },
+      }));
+      await waitUntil(() => stderrText.includes("owner approval is deferred"));
+      const sharedTailBoundMs = DRAIN_TAIL_MS + Math.floor(DRAIN_TAIL_MS / 2);
+      const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
+      relay.inject(privateFrame({ type: "relay_shutdown" }));
+      await exitWithinSharedTail;
+      parkedStorage.exitObserved = true;
+      // The appends drained; the checkpoint write parked, so flush() missed its deadline.
+      expect(parkedStorage.auditWriteParked).toBe(true);
+      expect(stderrText).toContain("hermes-memory-bridge audit: shutdown checkpoint unconfirmed at exit\n");
+      expect(stderrText).not.toContain("record(s) unconfirmed at exit");
+      await parkedStorage.releaseAndDrain();
+      expect(parkedStorage.backendWritesAfterExit).toBe(0);
     } finally {
       await parkedStorage.releaseAndDrain();
     }

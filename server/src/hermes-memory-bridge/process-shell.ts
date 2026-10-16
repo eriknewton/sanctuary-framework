@@ -270,35 +270,65 @@ class AdapterForwarder extends SingleBindForwarder<HermesBridgeMemoryAdapter> im
 class AuditForwarder extends SingleBindForwarder<AuditLog> {
   readonly pending = new Set<Promise<void>>();
   // Records reach the audit log one at a time. The log serializes appends itself, so this changes no
-  // ordering; it exists so a record still waiting its turn at close can be refused before the log
-  // starts its filesystem preamble (namespace directories, lock files) inside a fortress whose master
-  // write barrier this process has already given up.
-  private turnQueue: Promise<void> = Promise.resolve();
+  // ordering; it exists so that every record still waiting its turn at close can be refused at once,
+  // before the log starts its filesystem preamble (namespace directories, lock files) inside a
+  // fortress whose master write barrier this process is giving up.
+  private readonly waiting: Array<{ record: HermesBridgeAuditRecord; settle: (outcome: Promise<void>) => void }> = [];
   private handedOff = 0;
   private refuseAtExit: ((record: HermesBridgeAuditRecord) => void) | undefined;
+  private handOffDeadline: number | undefined;
 
   append(record: HermesBridgeAuditRecord): Promise<void> {
     const target = this.requireTarget();
-    const turn = this.turnQueue.then(() => {
-      // Once the barrier is released no append can persist (the storage refuses a raw write without
-      // a live lease). A record that has not been handed off by then is refused here, reported on
-      // stderr, and still rejects back to the core's durability handling: lost loudly, never silently.
-      if (this.refuseAtExit !== undefined) {
-        this.refuseAtExit(record);
-        throw new Error(`Hermes bridge audit record ${record.kind} refused at exit`);
-      }
-      this.handedOff += 1;
-      return this.appendCritical(target, record).finally(() => { this.handedOff -= 1; });
+    if (this.refuseAtExit !== undefined) return this.track(this.refuse(record));
+    const turn = new Promise<void>((resolve, reject) => {
+      this.waiting.push({ record, settle: (outcome) => { outcome.then(resolve, reject); } });
     });
-    this.turnQueue = turn.then(() => undefined, () => undefined);
+    this.handOffNext(target);
     return this.track(turn);
   }
 
-  // Returns the count of records already handed to the audit log and still unconfirmed; the caller
-  // reports it so an audit tail abandoned at the drain deadline is visible to the operator.
+  // Closes the forwarder before the barrier release and returns the count of records already handed
+  // to the audit log and still unconfirmed, which the caller reports. Every record still waiting is
+  // refused here, synchronously, even when the record ahead of it never settles: a refused record is
+  // reported on stderr and rejects back to the core's durability handling, lost loudly, never
+  // silently. Sealing the log first means a handed-off record's later lock entry, a timed-out flush's
+  // checkpoint and any rotation pass are refused before they touch the filesystem.
   close(refuse: (record: HermesBridgeAuditRecord) => void): number {
-    this.refuseAtExit ??= refuse;
+    if (this.refuseAtExit === undefined) {
+      this.refuseAtExit = refuse;
+      if (this.bound) this.requireTarget().sealWritePath("Hermes bridge shell exit");
+      for (const entry of this.waiting.splice(0)) entry.settle(this.refuse(entry.record));
+    }
     return this.handedOff;
+  }
+
+  // Set at the start of shutdown to the drain-tail deadline. A record whose turn comes after it stays
+  // waiting and is refused by close(): checking the clock at hand-off, rather than relying on close()
+  // running first, means no settlement scheduled between the deadline and close() can slip a record
+  // into the log.
+  stopHandOffAt(deadline: number): void {
+    this.handOffDeadline ??= deadline;
+  }
+
+  private refuse(record: HermesBridgeAuditRecord): Promise<void> {
+    this.refuseAtExit?.(record);
+    return Promise.reject(new Error(`Hermes bridge audit record ${record.kind} refused at exit`));
+  }
+
+  private handOffNext(target: AuditLog): void {
+    if (this.handedOff > 0 || this.refuseAtExit !== undefined) return;
+    if (this.handOffDeadline !== undefined && performance.now() >= this.handOffDeadline) return;
+    const entry = this.waiting.shift();
+    if (entry === undefined) return;
+    this.handedOff += 1;
+    // The async arrow calls into the log synchronously and turns a synchronous throw into a rejection.
+    const outcome = (async () => this.appendCritical(target, entry.record))();
+    entry.settle(outcome);
+    void outcome.then(() => undefined, () => undefined).then(() => {
+      this.handedOff -= 1;
+      this.handOffNext(target);
+    });
   }
 
   private appendCritical(target: AuditLog, record: HermesBridgeAuditRecord): Promise<void> {
@@ -524,22 +554,31 @@ class ShellController {
     const drainedAt = performance.now();
     const drainTailDeadline = drainedAt + DRAIN_TAIL_MS;
     const exitDeadline = drainedAt + EXIT_BUDGET_MS;
+    this.audit.stopHandOffAt(drainTailDeadline);
     const tailDrained = await this.step(() => withDeadline(Promise.allSettled([...this.audit.pending]).then(() => true), drainTailDeadline), "audit_tail_failure");
     // flush() begins by awaiting the same pending appends, so once the tail missed its deadline the
     // flush cannot finish inside the budget either; starting it would leave a detached continuation
     // that attempts the graceful-shutdown checkpoint after the barrier below is released.
+    let flushUnconfirmed = false;
     if (this.audit.bound && tailDrained === true) {
-      await this.step(() => withDeadline(this.audit.flush(), drainTailDeadline), "audit_tail_failure");
+      const flushed = await this.step(() => withDeadline(this.audit.flush().then(() => true), drainTailDeadline), "audit_tail_failure");
+      // A flush that missed its deadline is still running its graceful-shutdown checkpoint; close()
+      // below seals the log, so that checkpoint is refused before it touches the filesystem, and the
+      // operator is told the checkpoint was not confirmed.
+      flushUnconfirmed = flushed !== true;
     }
-    await this.step(() => this.writer?.endAndFlush(drainTailDeadline) ?? Promise.resolve());
-    // Close before the barrier is released: every append from here on would be refused by the
-    // storage anyway, and must not touch the fortress tree while the process is tearing down.
+    // Close before the writer drain and the barrier release: every append from here on would be
+    // refused by the storage anyway, and must not touch the fortress tree while the process tears down.
     const unconfirmedAuditRecords = this.audit.close((record) => {
       this.stderr.write(`hermes-memory-bridge audit: refused ${record.kind} record at exit\n`);
     });
     if (unconfirmedAuditRecords > 0) {
       this.stderr.write(`hermes-memory-bridge audit: ${unconfirmedAuditRecords} record(s) unconfirmed at exit\n`);
     }
+    if (flushUnconfirmed) {
+      this.stderr.write("hermes-memory-bridge audit: shutdown checkpoint unconfirmed at exit\n");
+    }
+    await this.step(() => this.writer?.endAndFlush(drainTailDeadline) ?? Promise.resolve());
     await this.step(() => withDeadline(this.barrier?.release() ?? Promise.resolve(), exitDeadline), "release_failure");
     this.stream.destroy();
     this.stream.removeAllListeners();
