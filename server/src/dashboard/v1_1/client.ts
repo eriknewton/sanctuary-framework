@@ -1276,6 +1276,105 @@ function renderPostureSeal() {
 // generated reply via the standard macOS selection mechanism.
 const __renderCache = { route: null, html: null };
 
+// Talk owns one live composer for the lifetime of its current host. Background
+// reads hydrate only named presentation parts; they never replace the form.
+// Minimal VM DOMs and old engines without native template content retain the
+// former whole-string path; browsers with this primitive use the mounted owner.
+const talkDomOwnerSupported = typeof document.createElement === "function" &&
+  !!document.createElement("template").content;
+let talkOwner = null;
+let talkFollowIntent = null;
+let talkComposing = false;
+let talkViewportState = null;
+let talkUserScrollEpoch = 0;
+function captureTalkViewport(history) {
+  if (!history) return null;
+  return {
+    top: history.scrollTop,
+    following: history.scrollTop + history.clientHeight >= history.scrollHeight - 4
+  };
+}
+function restoreTalkViewport(history, snapshot, forceFollow) {
+  if (!history) return;
+  if (forceFollow || !snapshot || snapshot.following) history.scrollTop = history.scrollHeight;
+  else history.scrollTop = snapshot.top;
+}
+function disposeTalkOwner() {
+  if (!talkOwner) return;
+  talkViewportState = captureTalkViewport(talkOwner.history);
+  talkOwner.history.removeEventListener("scroll", talkOwner.onScroll);
+  talkOwner.host.innerHTML = "";
+  talkOwner = null;
+  talkComposing = false;
+}
+function attachTalkOwner(host) {
+  if (talkOwner && talkOwner.host !== host) disposeTalkOwner();
+  const history = host.querySelector("#concierge-history");
+  const input = host.querySelector('input[data-action="concierge-input"]');
+  if (!history || !input || !host.querySelector("[data-talk-read-status]") ||
+      !host.querySelector("[data-talk-error]")) throw new Error("Talk mount anchors missing");
+  const owner = { host: host, history: history, input: input, lastTop: history.scrollTop };
+  owner.onScroll = function (event) {
+    const moved = Math.abs(history.scrollTop - owner.lastTop) > 0.5;
+    owner.lastTop = history.scrollTop;
+    if (event.isTrusted && moved) talkUserScrollEpoch++;
+  };
+  history.addEventListener("scroll", owner.onScroll);
+  talkOwner = owner;
+  restoreTalkViewport(history, talkViewportState,
+    !!talkFollowIntent && talkFollowIntent.scrollEpoch === talkUserScrollEpoch);
+  owner.lastTop = history.scrollTop;
+}
+function hydrateTalkHost(host) {
+  const owner = talkOwner;
+  if (!owner || owner.host !== host || !owner.input.isConnected || !owner.history.isConnected) {
+    throw new Error("Talk mount disconnected during background refresh");
+  }
+  const template = document.createElement("template");
+  template.innerHTML = renderDashboardConcierge();
+  const fresh = template.content.querySelector(".concierge-wrap");
+  if (!fresh) throw new Error("Talk render shell missing");
+  ["[data-talk-read-status]", ".concierge-meta", "[data-talk-error]"].forEach(function (selector) {
+    const livePart = host.querySelector(selector);
+    const freshPart = fresh.querySelector(selector);
+    if (!livePart || !freshPart) throw new Error("Talk presentation anchor missing: " + selector);
+    if (livePart.innerHTML !== freshPart.innerHTML) livePart.innerHTML = freshPart.innerHTML;
+  });
+  const freshHistory = fresh.querySelector("#concierge-history");
+  if (!freshHistory) throw new Error("Talk history anchor missing");
+  const history = owner.history;
+  const changed = history.innerHTML !== freshHistory.innerHTML;
+  if (changed) {
+    const viewport = captureTalkViewport(history);
+    const requestedFollow = !!talkFollowIntent &&
+      talkFollowIntent.scrollEpoch === talkUserScrollEpoch;
+    // Compare and copy text separators as well as message elements. Cloning
+    // only .children drops the renderer's newline nodes, making a later
+    // unchanged refresh look different and replace selected reply text.
+    const oldNodes = Array.from(history.childNodes);
+    const newNodes = Array.from(freshHistory.childNodes);
+    const appendOnly = oldNodes.length > 0 && newNodes.length > oldNodes.length &&
+      oldNodes.every(function (node, index) { return node.isEqualNode(newNodes[index]); });
+    if (appendOnly) {
+      newNodes.slice(oldNodes.length).forEach(function (node) { history.appendChild(node.cloneNode(true)); });
+    } else {
+      history.replaceChildren(...newNodes.map(function (node) { return node.cloneNode(true); }));
+    }
+    restoreTalkViewport(history, viewport, requestedFollow);
+    owner.lastTop = history.scrollTop;
+  }
+  const sending = state.chat.concierge.sending;
+  owner.input.disabled = sending;
+  host.querySelectorAll(".concierge-suggest").forEach(function (button) { button.disabled = sending; });
+  const send = host.querySelector('[data-action="concierge-send"]');
+  if (!send) throw new Error("Talk send control missing");
+  send.disabled = sending;
+  const label = sending ? "Sending..." : "Send";
+  if (send.textContent !== label) send.textContent = label;
+  state.chat.concierge.pendingScroll = false;
+}
+
+
 // F8 fix: capture focused-input identity + caret position so an SSE-
 // triggered rerender during typing does not clobber the operator's typing
 // experience. innerHTML replacement creates new DOM nodes; we re-find the
@@ -1346,41 +1445,11 @@ function restoreInputFocus(container, focus) {
 function renderMain() {
   const main = document.getElementById("main");
   if (!main) return;
-  const focus = captureInputFocus(main);
-  // Finding DDD (v1.2.0-rc.5): capture whether the operator is
-  // following the conversation BEFORE the DOM is replaced. With the
-  // rc.5 bounded-card layout, .concierge-history is the inner scroll
-  // container (max-height on the card + min-height: 0 + overflow-y:
-  // auto on history). The composer sits OUTSIDE the history's scroll
-  // region, so it stays visible regardless of where the operator has
-  // scrolled. "Following" now means the latest message is visible
-  // inside the history container's viewport. The check compares the
-  // last message's bounding rect to the history element's bounding
-  // rect (both are border-box rects in viewport space, so the
-  // intersection test is direct). The rc.5 restore continues to use
-  // scrollIntoView, which scrolls whichever ancestor is the actual
-  // scroll container, now .concierge-history.
-  let conciergeWasFollowing = false;
-  if (state.route === "dashboard") {
-    const histEl = document.getElementById("concierge-history");
-    if (histEl) {
-      const lastMsg = histEl.querySelector(".concierge-msg:last-child");
-      if (lastMsg) {
-        const histRect = histEl.getBoundingClientRect();
-        const lastRect = lastMsg.getBoundingClientRect();
-        // Following = the last message overlaps the history container's
-        // visible region. If the operator scrolled up past the latest
-        // message, the message is below histRect.bottom (clipped); if
-        // far above the visible region, it's above histRect.top.
-        conciergeWasFollowing =
-          lastRect.top < histRect.bottom && lastRect.bottom > histRect.top;
-      } else {
-        // Empty thread. Treat as following so a fresh exchange lands
-        // in view.
-        conciergeWasFollowing = true;
-      }
-    }
-  }
+  const talkMain = talkDomOwnerSupported && state.route === "dashboard" && !liveUpdatesStopped;
+  const focus = talkMain ? null : captureInputFocus(main);
+  const legacyHistory = !talkDomOwnerSupported ? main.querySelector("#concierge-history") : null;
+  const legacyViewport = legacyHistory ? captureTalkViewport(legacyHistory) : null;
+  if (legacyViewport) talkViewportState = legacyViewport;
   let nextHtml;
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
@@ -1407,42 +1476,30 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
-  // Stopped live updates invalidate every live view, including previously loaded clears.
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
-  // Skip the innerHTML write when the rendered output is byte-identical
-  // to the last write on the same route. Preserves the existing DOM
-  // tree, focus, and any active text selection during no-op poll
-  // cycles. The route-change branch always writes (cache miss).
+  if (talkMain && talkOwner && talkOwner.host === main && !talkOwner.input.isConnected) {
+    throw new Error("Talk composer disconnected during background refresh");
+  }
+  const mountedTalk = talkMain && talkOwner && talkOwner.host === main && talkOwner.input.isConnected;
   let didWrite = false;
-  if (__renderCache.route === state.route && __renderCache.html === nextHtml) {
-    // No-op: DOM already reflects current state.
-  } else {
+  if (mountedTalk) {
+    hydrateTalkHost(main);
+  } else if (__renderCache.route !== state.route || __renderCache.html !== nextHtml || talkMain) {
+    if (talkOwner && (talkOwner.host === main || talkMain)) disposeTalkOwner();
     main.innerHTML = nextHtml;
-    __renderCache.route = state.route;
-    __renderCache.html = nextHtml;
     didWrite = true;
+    __renderCache.route = state.route;
+    __renderCache.html = talkMain ? null : nextHtml;
+    if (talkMain) attachTalkOwner(main);
   }
   if (state.route === "machines") hydrateMachinesScreen();
-  // Finding DDD (v1.2.0-rc.4): bring the latest concierge message into
-  // the viewport when (a) the operator just sent a message
-  // (pendingScroll flag set in onConciergeSend), or (b) the operator
-  // was following the conversation before this render. If the operator
-  // scrolled up to read history, leave their position alone.
-  // scrollIntoView is layout-agnostic; it scrolls whichever ancestor is
-  // the actual scroll container (window in the current layout, or the
-  // history element if a future layout puts a fixed height on it).
-  if (state.route === "dashboard" && didWrite) {
-    const histEl = document.getElementById("concierge-history");
-    if (histEl) {
-      const pending = state.chat.concierge.pendingScroll;
-      if (pending || conciergeWasFollowing) {
-        const lastMsg = histEl.querySelector(".concierge-msg:last-child");
-        if (lastMsg && typeof lastMsg.scrollIntoView === "function") {
-          lastMsg.scrollIntoView({ block: "end", behavior: "auto" });
-        }
-      }
-      state.chat.concierge.pendingScroll = false;
+  if (state.route === "dashboard" && !talkDomOwnerSupported && didWrite) {
+    const history = main.querySelector("#concierge-history");
+    if (history) {
+      restoreTalkViewport(history, legacyViewport || talkViewportState, state.chat.concierge.pendingScroll);
+      talkViewportState = captureTalkViewport(history);
     }
+    state.chat.concierge.pendingScroll = false;
   }
   restoreInputFocus(main, focus);
 }
@@ -1536,8 +1593,9 @@ function renderDashboardConcierge() {
         '<h1>Talk to your fortress.</h1>',
         '<p class="sub">A direct line to Sanctuary, routed through the substrate you chose. Nothing leaves without your hand on it.</p>',
       '</div></div>',
-      activeChatsPanel, renderSourceRead(HUB + "/chat/concierge/history"),
+      activeChatsPanel,
       '<div class="card concierge-card">',
+        '<div data-talk-read-status>' + renderSourceRead(HUB + "/chat/concierge/history") + '</div>',
         '<div class="concierge-header">',
           '<div class="concierge-persona">',
             '<div class="glyph-ring"></div>',
@@ -1545,7 +1603,7 @@ function renderDashboardConcierge() {
           '</div>',
           '<div class="concierge-meta">' + badge + '</div>',
         '</div>',
-        errorBanner,
+        '<div data-talk-error>' + errorBanner + '</div>',
         '<div class="concierge-history" id="concierge-history">' + messagesHtml + '</div>',
         '<form class="concierge-composer" data-action="concierge-submit">',
           '<div class="input-wrap">',
@@ -2828,6 +2886,7 @@ async function onConciergeSend() {
   if (c.sending) return;
   const message = (c.composer || "").trim();
   if (message.length === 0) return;
+  talkFollowIntent = { scrollEpoch: talkUserScrollEpoch };
   c.sending = true;
   c.error = null;
   rerender();
@@ -2851,16 +2910,19 @@ async function onConciergeSend() {
       };
     }
     c.composer = "";
-    // Finding DDD (v1.2.0-rc.3): the operator just submitted a message
-    // and a concierge reply just landed. Force scroll to bottom on the
-    // next render so the new exchange is in view, even if the operator
-    // had drifted up by a poll-cycle's worth of layout shift.
-    c.pendingScroll = true;
+    if (!talkDomOwnerSupported) c.pendingScroll = true;
+    // The operator's successful send is an explicit draft clear, unlike a
+    // background hydration. It may clear only the still-owned input.
+    // A route or panel change can remount Talk while this request is in
+    // flight. The shared composer is still disabled until settlement, so
+    // clear the currently mounted input regardless of scroll-follow intent.
+    if (talkOwner) talkOwner.input.value = "";
   } catch (e) {
     c.error = e.message || "Concierge call failed.";
   } finally {
     c.sending = false;
     rerender();
+    talkFollowIntent = null;
   }
 }
 
@@ -4620,39 +4682,49 @@ function renderShellChrome() {
 // Talk as a panel: the full-page concierge renderer, mounted in the right-hand
 // panel. On Talk's own full-page route the panel stays shut, so the
 // concierge's element ids exist once in the document.
-let talkPanelCache = null;
+let talkPanelLegacyCache = null;
 function renderTalkPanel() {
   const panel = document.getElementById("talk-panel");
   const body = document.getElementById("talk-panel-body");
   if (!panel || !body) return;
   const open = !!state.talk.open && state.route !== "dashboard";
   panel.hidden = !open;
-  if (!open) {
-    if (talkPanelCache !== null) { body.innerHTML = ""; talkPanelCache = null; }
+  if (!talkDomOwnerSupported) {
+    if (!open) {
+      if (talkPanelLegacyCache !== null) {
+        talkViewportState = captureTalkViewport(body.querySelector("#concierge-history"));
+        body.innerHTML = "";
+        talkPanelLegacyCache = null;
+      }
+      return;
+    }
+    const html = renderDashboardConcierge();
+    if (html !== talkPanelLegacyCache) {
+      const prevHistory = body.querySelector("#concierge-history");
+      const viewport = captureTalkViewport(prevHistory) || talkViewportState;
+      const focus = captureInputFocus(body);
+      body.innerHTML = html;
+      talkPanelLegacyCache = html;
+      restoreInputFocus(body, focus);
+      const history = body.querySelector("#concierge-history");
+      if (history) restoreTalkViewport(history, viewport, state.chat.concierge.pendingScroll);
+      talkViewportState = captureTalkViewport(history);
+      state.chat.concierge.pendingScroll = false;
+    }
     return;
   }
-  const html = renderDashboardConcierge();
-  if (html === talkPanelCache) return;
-  let following = true;
-  const prevHist = body.querySelector ? body.querySelector("#concierge-history") : null;
-  if (prevHist) {
-    const lastMsg = prevHist.querySelector(".concierge-msg:last-child");
-    if (lastMsg) {
-      const h = prevHist.getBoundingClientRect();
-      const l = lastMsg.getBoundingClientRect();
-      following = l.top < h.bottom && l.bottom > h.top;
-    }
+  if (!open) {
+    if (talkOwner && talkOwner.host === body) disposeTalkOwner();
+    else if (body.firstChild) body.innerHTML = "";
+    return;
   }
-  const focus = captureInputFocus(body);
-  body.innerHTML = html;
-  talkPanelCache = html;
-  restoreInputFocus(body, focus);
-  const hist = body.querySelector ? body.querySelector("#concierge-history") : null;
-  if (hist && (state.chat.concierge.pendingScroll || following)) {
-    const lastMsg = hist.querySelector(".concierge-msg:last-child");
-    if (lastMsg && typeof lastMsg.scrollIntoView === "function") lastMsg.scrollIntoView({ block: "end", behavior: "auto" });
+  if (talkOwner && talkOwner.host === body) {
+    hydrateTalkHost(body);
+    return;
   }
-  state.chat.concierge.pendingScroll = false;
+  if (talkOwner) disposeTalkOwner();
+  body.innerHTML = renderDashboardConcierge();
+  attachTalkOwner(body);
 }
 
 // Top-bar search over what this page already holds: agents, waiting
@@ -6838,6 +6910,24 @@ document.addEventListener("visibilitychange", function () {
   if (document.visibilityState === "visible") rerender();
 });
 
+document.addEventListener("compositionstart", function (ev) {
+  if (ev.target instanceof HTMLInputElement && ev.target.getAttribute("data-action") === "concierge-input") talkComposing = true;
+});
+document.addEventListener("compositionend", function (ev) {
+  if (ev.target instanceof HTMLInputElement && ev.target.getAttribute("data-action") === "concierge-input") talkComposing = false;
+});
+document.addEventListener("keydown", function (ev) {
+  if (ev.key !== "Enter") return;
+  if (!(ev.target instanceof HTMLInputElement) || ev.target.getAttribute("data-action") !== "concierge-input") return;
+  if (ev.isComposing || talkComposing || ev.keyCode === 229) ev.preventDefault();
+});
+document.addEventListener("submit", function (ev) {
+  const form = ev.target;
+  if (!(form instanceof HTMLFormElement) || form.getAttribute("data-action") !== "concierge-submit") return;
+  ev.preventDefault();
+  if (!talkComposing) void onConciergeSend();
+});
+
 document.addEventListener("click", function (ev) {
   const rawTgt = ev.target;
   if (!(rawTgt instanceof Element)) return;
@@ -7034,6 +7124,7 @@ document.addEventListener("click", function (ev) {
     const found = CONCIERGE_SUGGESTIONS.find(function (s) { return s.id === sid; });
     if (found) {
       state.chat.concierge.composer = found.query;
+      if (talkOwner && talkOwner.input.isConnected) talkOwner.input.value = found.query;
       return void onConciergeSend();
     }
     return;

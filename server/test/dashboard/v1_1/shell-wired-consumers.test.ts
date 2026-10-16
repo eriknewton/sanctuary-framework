@@ -4923,3 +4923,77 @@ describe("Read-only scoped notice evidence boundary", () => {
   });
 
 });
+
+describe("Talk split draft ownership", () => {
+  it("explicit suggestion updates the live mounted draft before a refused send", async () => {
+    const h = boot({ "/api/hub/chat/concierge": () => Promise.resolve(response({ error: "refused" }, 403)) });
+    await settle();
+    const mounted = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { value: "draft A", isConnected: true });
+    Object.assign(h.context, { mounted });
+    runInContext('state.chat.concierge.composer="draft A"; talkOwner={input:mounted};', h.context);
+    h.click({ "data-action": "concierge-suggestion", "data-suggestion-id": "summarize-hour" });
+    expect(mounted.value).toBe("Summarize what happened in this fortress in the last hour.");
+    await settle();
+    expect(runInContext("state.chat.concierge.composer", h.context)).toBe(mounted.value);
+    expect(h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST")).toHaveLength(1);
+  });
+
+  it("a host change retains send follow and opens the long thread at its latest message", async () => {
+    const h = boot(); await settle();
+    const makeHost = () => {
+      const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+        scrollTop: 0, clientHeight: 100, scrollHeight: 500,
+        addEventListener() {}, removeEventListener() {}, isConnected: true,
+      });
+      const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+      const host = new FakeElement();
+      host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+        : selector === 'input[data-action="concierge-input"]' ? input
+        : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+      return { host, history };
+    };
+    const first = makeHost(); const second = makeHost();
+    Object.assign(h.context, { firstHost: first.host, secondHost: second.host });
+    runInContext('attachTalkOwner(firstHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch}; disposeTalkOwner(); attachTalkOwner(secondHost);', h.context);
+    expect(runInContext("!!talkFollowIntent", h.context)).toBe(true);
+    expect(second.history.scrollTop).toBe(500);
+  });
+
+  it("changed legacy history restores its own mid-thread offset without outer-page scrolling", async () => {
+    const h = boot(); await settle();
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 73, clientHeight: 100, scrollHeight: 500, scrollIntoView: vi.fn(),
+    });
+    Object.assign(h.context, { testHistory: history });
+    runInContext('var snapshot=captureTalkViewport(testHistory); testHistory.scrollTop=0; testHistory.scrollHeight=600; restoreTalkViewport(testHistory,snapshot,false);', h.context);
+    expect(history.scrollTop).toBe(73);
+    expect(history.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("a no-motion wheel preserves follow while a moved history revokes it", async () => {
+    const h = boot(); await settle();
+    const listeners: Record<string, (ev: unknown) => void> = {};
+    const history = Object.assign(new FakeElement({ id: "concierge-history" }), {
+      scrollTop: 0, clientHeight: 100, scrollHeight: 500, isConnected: true,
+      addEventListener(name: string, fn: (ev: unknown) => void) { listeners[name] = fn; },
+      removeEventListener() {},
+    });
+    const input = Object.assign(new FakeInput({ "data-action": "concierge-input" }), { isConnected: true });
+    const host = new FakeElement();
+    host.querySelector = (selector: string) => selector === "#concierge-history" ? history
+      : selector === 'input[data-action="concierge-input"]' ? input
+      : selector === "[data-talk-read-status]" || selector === "[data-talk-error]" ? new FakeElement() : null;
+    Object.assign(h.context, { testHost: host });
+    runInContext('attachTalkOwner(testHost); talkFollowIntent={scrollEpoch:talkUserScrollEpoch};', h.context);
+    listeners.wheel?.({ isTrusted: true }); listeners.scroll?.({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(true);
+    history.scrollTop = 10; listeners.scroll?.({ isTrusted: true });
+    expect(runInContext("talkFollowIntent.scrollEpoch===talkUserScrollEpoch", h.context)).toBe(false);
+  });
+
+  it("contains a wheel at the history's ends so the outer page never moves under the reader", () => {
+    // Native Chromium chained a no-motion wheel at the bottom of the history to the page (0 to 28 px).
+    const rule = /\.concierge-history \{([^}]*)\}/.exec(renderDashboardV11Html());
+    expect(rule?.[1]).toMatch(/overscroll-behavior:\s*contain;/);
+  });
+});
