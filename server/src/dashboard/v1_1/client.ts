@@ -1278,31 +1278,78 @@ const __renderCache = { route: null, html: null };
 
 // Talk owns one live composer for the lifetime of its current host. Background
 // reads hydrate only named presentation parts; they never replace the form.
-// Minimal VM DOMs and old engines without native template content retain the
-// former whole-string path; browsers with this primitive use the mounted owner.
+// Minimal VM DOMs and old engines retain the former whole-string path; the
+// mounted owner runs only where every primitive it calls exists. The owner
+// path reads Node.isConnected (hydrateTalkHost's disconnect check), calls
+// Element.replaceChildren (non-append history rewrite) and parses through
+// template.content; an engine missing any one of them would throw mid-hydrate,
+// so the check names all three and such an engine takes the legacy path.
 const talkDomOwnerSupported = typeof document.createElement === "function" &&
-  !!document.createElement("template").content;
+  !!document.createElement("template").content &&
+  typeof Node !== "undefined" && !!Node.prototype && "isConnected" in Node.prototype &&
+  typeof Element !== "undefined" && !!Element.prototype &&
+  typeof Element.prototype.replaceChildren === "function";
 let talkOwner = null;
 let talkFollowIntent = null;
 let talkComposing = false;
 let talkViewportState = null;
 let talkUserScrollEpoch = 0;
+// "At the bottom" tolerance: 4 CSS px absorbs the sub-pixel remainder of
+// scrollTop + clientHeight against scrollHeight under zoom and fractional
+// device pixel ratios, where an exact equality never holds at the true bottom.
+const TALK_BOTTOM_SLACK_PX = 4;
+// Motion threshold for the scroll-epoch watcher: half a CSS px, below which a
+// scroll event is layout jitter from fractional scrollTop, not a reader moving.
+const TALK_SCROLL_MOTION_PX = 0.5;
 function captureTalkViewport(history) {
   if (!history) return null;
+  // A history with no layout box (hidden panel, detached node, unlaid VM fake)
+  // reports 0 for scrollTop, clientHeight and scrollHeight, and 0 + 0 >= 0 - 4
+  // reads as "following". That reading says nothing about where the reader was,
+  // so capture refuses: callers keep the last real snapshot instead of saving a
+  // meaningless one, whatever order a teardown hides and captures in.
+  if (history.isConnected === false || !(history.clientHeight > 0)) return null;
   return {
     top: history.scrollTop,
-    following: history.scrollTop + history.clientHeight >= history.scrollHeight - 4
+    following: history.scrollTop + history.clientHeight >= history.scrollHeight - TALK_BOTTOM_SLACK_PX
   };
+}
+// The only writer of talkViewportState from a live history: a refused capture
+// leaves the saved snapshot untouched rather than clearing it.
+function saveTalkViewport(history) {
+  const snapshot = captureTalkViewport(history);
+  if (snapshot) talkViewportState = snapshot;
+  return snapshot;
 }
 function restoreTalkViewport(history, snapshot, forceFollow) {
   if (!history) return;
   if (forceFollow || !snapshot || snapshot.following) history.scrollTop = history.scrollHeight;
   else history.scrollTop = snapshot.top;
 }
+// A send's follow request survives until the reader actually scrolls. Both the
+// mounted owner and the legacy whole-string path read this one predicate, so
+// there is a single follow policy rather than one per render path.
+function talkFollowRequested() {
+  return !!talkFollowIntent && talkFollowIntent.scrollEpoch === talkUserScrollEpoch;
+}
+// Watches one history element for reader scrolls. Only a trusted scroll whose
+// scrollTop actually moved bumps the epoch: a programmatic restore is followed
+// by watch.lastTop = scrollTop, and a no-motion wheel at either end fires no
+// movement, so neither revokes a send's follow request.
+function watchTalkScroll(history) {
+  const watch = { lastTop: history.scrollTop };
+  watch.onScroll = function (event) {
+    const moved = Math.abs(history.scrollTop - watch.lastTop) > TALK_SCROLL_MOTION_PX;
+    watch.lastTop = history.scrollTop;
+    if (event.isTrusted && moved) talkUserScrollEpoch++;
+  };
+  history.addEventListener("scroll", watch.onScroll);
+  return watch;
+}
 function disposeTalkOwner() {
   if (!talkOwner) return;
-  talkViewportState = captureTalkViewport(talkOwner.history);
-  talkOwner.history.removeEventListener("scroll", talkOwner.onScroll);
+  saveTalkViewport(talkOwner.history);
+  talkOwner.history.removeEventListener("scroll", talkOwner.watch.onScroll);
   talkOwner.host.innerHTML = "";
   talkOwner = null;
   talkComposing = false;
@@ -1313,20 +1360,33 @@ function attachTalkOwner(host) {
   const input = host.querySelector('input[data-action="concierge-input"]');
   if (!history || !input || !host.querySelector("[data-talk-read-status]") ||
       !host.querySelector("[data-talk-error]")) throw new Error("Talk mount anchors missing");
-  const owner = { host: host, history: history, input: input, lastTop: history.scrollTop };
-  owner.onScroll = function (event) {
-    const moved = Math.abs(history.scrollTop - owner.lastTop) > 0.5;
-    owner.lastTop = history.scrollTop;
-    if (event.isTrusted && moved) talkUserScrollEpoch++;
-  };
-  history.addEventListener("scroll", owner.onScroll);
+  const owner = { host: host, history: history, input: input, watch: watchTalkScroll(history) };
   talkOwner = owner;
-  restoreTalkViewport(history, talkViewportState,
-    !!talkFollowIntent && talkFollowIntent.scrollEpoch === talkUserScrollEpoch);
-  owner.lastTop = history.scrollTop;
+  restoreTalkViewport(history, talkViewportState, talkFollowRequested());
+  owner.watch.lastTop = history.scrollTop;
+}
+// Legacy whole-string path, after a write: restore the viewport and watch the
+// new history element. A landed reply (pendingScroll) follows only while the
+// send's follow request is unrevoked, the same epoch rule the mounted owner
+// applies, so a reader who scrolled during the in-flight send stays put.
+// The replaced history element took its old watcher with it; no removal needed.
+function restoreLegacyTalkHistory(history, viewport) {
+  if (history) {
+    restoreTalkViewport(history, viewport || talkViewportState,
+      state.chat.concierge.pendingScroll && talkFollowRequested());
+    saveTalkViewport(history);
+    if (typeof history.addEventListener === "function") watchTalkScroll(history);
+  }
+  state.chat.concierge.pendingScroll = false;
 }
 function hydrateTalkHost(host) {
   const owner = talkOwner;
+  // Fail loud, recover by navigation only: a disconnected owner means some
+  // other writer replaced the mounted composer, so the draft and viewport this
+  // owner holds no longer match the screen. Silently remounting would hide
+  // that second writer and could drop an operator's typed draft; throwing
+  // stops this render, and the next route or panel change disposes the stale
+  // owner and mounts a fresh one from state.
   if (!owner || owner.host !== host || !owner.input.isConnected || !owner.history.isConnected) {
     throw new Error("Talk mount disconnected during background refresh");
   }
@@ -1338,7 +1398,14 @@ function hydrateTalkHost(host) {
     const livePart = host.querySelector(selector);
     const freshPart = fresh.querySelector(selector);
     if (!livePart || !freshPart) throw new Error("Talk presentation anchor missing: " + selector);
-    if (livePart.innerHTML !== freshPart.innerHTML) livePart.innerHTML = freshPart.innerHTML;
+    if (livePart.innerHTML === freshPart.innerHTML) return;
+    // Rewriting a part replaces its controls (the read status carries Retry),
+    // so a keyboard user focused inside it would drop to the page body. Focus
+    // is captured from the part being rewritten and restored into it, on
+    // whichever host (full-page Talk or the panel) this owner is mounted in.
+    const focus = livePart.contains(document.activeElement) ? captureInputFocus(livePart) : null;
+    livePart.innerHTML = freshPart.innerHTML;
+    restoreInputFocus(livePart, focus);
   });
   const freshHistory = fresh.querySelector("#concierge-history");
   if (!freshHistory) throw new Error("Talk history anchor missing");
@@ -1346,8 +1413,7 @@ function hydrateTalkHost(host) {
   const changed = history.innerHTML !== freshHistory.innerHTML;
   if (changed) {
     const viewport = captureTalkViewport(history);
-    const requestedFollow = !!talkFollowIntent &&
-      talkFollowIntent.scrollEpoch === talkUserScrollEpoch;
+    const requestedFollow = talkFollowRequested();
     // Compare and copy text separators as well as message elements. Cloning
     // only .children drops the renderer's newline nodes, making a later
     // unchanged refresh look different and replace selected reply text.
@@ -1360,8 +1426,8 @@ function hydrateTalkHost(host) {
     } else {
       history.replaceChildren(...newNodes.map(function (node) { return node.cloneNode(true); }));
     }
-    restoreTalkViewport(history, viewport, requestedFollow);
-    owner.lastTop = history.scrollTop;
+    restoreTalkViewport(history, viewport || talkViewportState, requestedFollow);
+    owner.watch.lastTop = history.scrollTop;
   }
   const sending = state.chat.concierge.sending;
   owner.input.disabled = sending;
@@ -1447,9 +1513,12 @@ function renderMain() {
   if (!main) return;
   const talkMain = talkDomOwnerSupported && state.route === "dashboard" && !liveUpdatesStopped;
   const focus = talkMain ? null : captureInputFocus(main);
-  const legacyHistory = !talkDomOwnerSupported ? main.querySelector("#concierge-history") : null;
-  const legacyViewport = legacyHistory ? captureTalkViewport(legacyHistory) : null;
-  if (legacyViewport) talkViewportState = legacyViewport;
+  // Legacy capture reads the one live history wherever it is mounted (Talk's
+  // element ids exist once in the document). A panel-to-full-page move runs
+  // renderMain before renderTalkPanel closes the panel, so this is the only
+  // point that sees the panel reader's current position rather than the
+  // panel's previous write.
+  const legacyViewport = !talkDomOwnerSupported ? saveTalkViewport(document.getElementById("concierge-history")) : null;
   let nextHtml;
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
@@ -1477,6 +1546,9 @@ function renderMain() {
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
+  // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
+  // a composer that left the document while still owned was replaced by some
+  // other writer, and a silent remount would discard the draft it held.
   if (talkMain && talkOwner && talkOwner.host === main && !talkOwner.input.isConnected) {
     throw new Error("Talk composer disconnected during background refresh");
   }
@@ -1494,12 +1566,7 @@ function renderMain() {
   }
   if (state.route === "machines") hydrateMachinesScreen();
   if (state.route === "dashboard" && !talkDomOwnerSupported && didWrite) {
-    const history = main.querySelector("#concierge-history");
-    if (history) {
-      restoreTalkViewport(history, legacyViewport || talkViewportState, state.chat.concierge.pendingScroll);
-      talkViewportState = captureTalkViewport(history);
-    }
-    state.chat.concierge.pendingScroll = false;
+    restoreLegacyTalkHistory(main.querySelector("#concierge-history"), legacyViewport);
   }
   restoreInputFocus(main, focus);
 }
@@ -2889,8 +2956,12 @@ async function onConciergeSend() {
   talkFollowIntent = { scrollEpoch: talkUserScrollEpoch };
   c.sending = true;
   c.error = null;
-  rerender();
   try {
+    // Inside the try: c.sending is now true, and only the finally below resets
+    // it. A render that throws here (a fail-loud Talk mount check) must still
+    // reach that finally, or every later send returns early forever. A throw
+    // here happens before the POST, so the request is never sent twice.
+    rerender();
     const res = await api("/chat/concierge", {
       method: "POST",
       body: { message: message }
@@ -2912,17 +2983,18 @@ async function onConciergeSend() {
     c.composer = "";
     if (!talkDomOwnerSupported) c.pendingScroll = true;
     // The operator's successful send is an explicit draft clear, unlike a
-    // background hydration. It may clear only the still-owned input.
-    // A route or panel change can remount Talk while this request is in
-    // flight. The shared composer is still disabled until settlement, so
-    // clear the currently mounted input regardless of scroll-follow intent.
+    // background hydration. A route or panel change can remount Talk while
+    // this request is in flight. The shared composer is still disabled until
+    // settlement, so clear the currently mounted input regardless of
+    // scroll-follow intent.
     if (talkOwner) talkOwner.input.value = "";
   } catch (e) {
     c.error = e.message || "Concierge call failed.";
   } finally {
     c.sending = false;
-    rerender();
-    talkFollowIntent = null;
+    // The settling render still reads the follow request (it lands the reply);
+    // the request ends with this send even if that render throws.
+    try { rerender(); } finally { talkFollowIntent = null; }
   }
 }
 
@@ -4688,34 +4760,34 @@ function renderTalkPanel() {
   const body = document.getElementById("talk-panel-body");
   if (!panel || !body) return;
   const open = !!state.talk.open && state.route !== "dashboard";
-  panel.hidden = !open;
-  if (!talkDomOwnerSupported) {
-    if (!open) {
+  if (!open) {
+    // Capture before hide: a hidden panel's history has no layout box, so any
+    // viewport read after panel.hidden = true is zero geometry. The reader's
+    // position is saved first, and only then is the panel shut.
+    if (!talkDomOwnerSupported) {
       if (talkPanelLegacyCache !== null) {
-        talkViewportState = captureTalkViewport(body.querySelector("#concierge-history"));
+        saveTalkViewport(body.querySelector("#concierge-history"));
         body.innerHTML = "";
         talkPanelLegacyCache = null;
       }
-      return;
-    }
+    } else if (talkOwner && talkOwner.host === body) disposeTalkOwner();
+    else if (body.firstChild) body.innerHTML = "";
+    panel.hidden = true;
+    return;
+  }
+  // Shown before any mount or restore: a scrollTop written into a hidden
+  // panel's history is discarded, so the panel must have layout first.
+  panel.hidden = false;
+  if (!talkDomOwnerSupported) {
     const html = renderDashboardConcierge();
     if (html !== talkPanelLegacyCache) {
-      const prevHistory = body.querySelector("#concierge-history");
-      const viewport = captureTalkViewport(prevHistory) || talkViewportState;
+      const viewport = saveTalkViewport(body.querySelector("#concierge-history"));
       const focus = captureInputFocus(body);
       body.innerHTML = html;
       talkPanelLegacyCache = html;
       restoreInputFocus(body, focus);
-      const history = body.querySelector("#concierge-history");
-      if (history) restoreTalkViewport(history, viewport, state.chat.concierge.pendingScroll);
-      talkViewportState = captureTalkViewport(history);
-      state.chat.concierge.pendingScroll = false;
+      restoreLegacyTalkHistory(body.querySelector("#concierge-history"), viewport);
     }
-    return;
-  }
-  if (!open) {
-    if (talkOwner && talkOwner.host === body) disposeTalkOwner();
-    else if (body.firstChild) body.innerHTML = "";
     return;
   }
   if (talkOwner && talkOwner.host === body) {
