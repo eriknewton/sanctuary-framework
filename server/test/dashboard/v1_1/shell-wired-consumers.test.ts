@@ -281,7 +281,7 @@ function boot(overrides: Record<string, (init?: RequestInit, url?: string) => un
   });
   runInContext(getClientScript(), context);
   const navigate = (route: string) => { location.hash = "#" + route; };
-  const click = (attrs: Record<string, string>, inside: string[] = [], checked = false, event: { stopPropagation?: () => void } = {}) => {
+  const click = (attrs: Record<string, string>, inside: string[] = [], checked = false, event: { stopPropagation?: () => void; preventDefault?: () => void } = {}) => {
     const target = new FakeElement(attrs);
     target.inside = inside;
     // Both forms stay: slice 5's tests pass `checked: "true"` in attrs, slice 4's pass the third argument.
@@ -5105,5 +5105,38 @@ describe("Talk split draft ownership", () => {
     runInContext('state.chat.concierge.composer="second"; void onConciergeSend();', h.context);
     await settle();
     expect(posts()).toBe(1);
+  });
+
+  it("a redraw that throws after the POST settled keeps the message sent: draft cleared, no second POST", async () => {
+    // Capability: a Talk send commits when the POST settles, not when the screen
+    // redraws afterwards. Talk repair (#1640) round-2 follow-up F2.
+    let releasePost: ((value: unknown) => void) | null = null;
+    const h = boot({ "/api/hub/chat/concierge": () => new Promise((resolve) => { releasePost = resolve; }) });
+    await settle();
+    const main = h.el.main!;
+    let throwOnce = false;
+    Object.defineProperty(h.el, "main", {
+      configurable: true,
+      get() { if (throwOnce) { throwOnce = false; throw new Error("fixture render failure"); } return main; },
+    });
+    const posts = () => h.requests.filter(r => r.url === "/api/hub/chat/concierge" && r.init?.method === "POST").length;
+    runInContext('state.chat.concierge.composer="question"; void onConciergeSend();', h.context);
+    await settle();
+    expect(posts()).toBe(1);
+    // The first redraw after the POST settles is the one that throws.
+    throwOnce = true;
+    releasePost!(response({ data: { reply_text: "answer", served_by: "local" } }));
+    await settle();
+    expect(throwOnce, "test premise: the redraw after the POST threw").toBe(false);
+    expect(runInContext("state.chat.concierge.sending", h.context)).toBe(false);
+    expect(runInContext("state.chat.concierge.composer", h.context), "the sent draft is cleared").toBe("");
+    expect(runInContext("state.chat.concierge.badge && state.chat.concierge.badge.substrate", h.context)).toBe("local");
+    const error = runInContext("state.chat.concierge.error", h.context);
+    expect(error, "the redraw failure is reported over a sent message").toMatch(/was sent/);
+    expect(error).not.toMatch(/fixture render failure/);
+    // The operator presses Send again: nothing is left to send.
+    h.click({ "data-action": "concierge-send" }, [], false, { preventDefault() {} });
+    await settle();
+    expect(posts(), "the sent message is never posted twice").toBe(1);
   });
 });

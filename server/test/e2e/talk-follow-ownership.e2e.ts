@@ -23,6 +23,9 @@
  *       jumping to the bottom (a hidden panel has no layout box to read).
  *   (g) A keyboard user on the read-status Retry keeps focus on Retry through
  *       a failed re-read.
+ *   (h) A redraw that throws after the POST settled keeps the message sent:
+ *       the draft clears, the failure reads as a display problem, and Enter in
+ *       the empty composer posts nothing (Talk repair round-2 follow-up F2).
  *
  * Fixture server and route-mocking style match ddd-chat-auto-scroll.e2e.ts.
  */
@@ -36,6 +39,7 @@ interface PageElement {
   scrollTop: number; clientHeight: number; scrollHeight: number; isConnected: boolean;
   firstChild: unknown; getAttribute(name: string): string | null; closest(selector: string): PageElement | null;
   addEventListener(type: string, listener: () => void, options?: { once?: boolean }): void;
+  remove(): void;
 }
 interface PageRange { setStart(node: unknown, offset: number): void; setEnd(node: unknown, offset: number): void }
 interface PageSelection { toString(): string; removeAllRanges(): void; addRange(range: PageRange): void }
@@ -385,5 +389,27 @@ test.describe("Talk mounted owner on a real engine", () => {
       const a = document.activeElement;
       return a ? a.getAttribute("data-action") + "|" + !!a.closest("[data-talk-read-status]") : "none";
     }), "focus stays on the read-status Retry").toBe("retry-panel|true");
+  });
+
+  test("(h) a redraw that throws after the POST settled keeps the message sent, with no second POST", async ({ page, dashboard }) => {
+    const stub = await installConciergeStub(page, { holdPosts: true });
+    await gotoRoute(page, dashboard.url, "dashboard");
+    const input = page.locator('#main input[data-action="concierge-input"]');
+    await input.fill("question");
+    await page.locator('#main [data-action="concierge-send"]').click();
+    await expect.poll(() => stub.posts.length).toBe(1);
+    // Inject the throw into the redraw that follows the POST: the mounted owner
+    // fails loud when its Send control has left the document, so removing it
+    // while the POST is held makes the first redraw after settlement throw.
+    await page.evaluate(() => { document.querySelector('#main [data-action="concierge-send"]')!.remove(); });
+    stub.release();
+    await expect(page.locator("#main [data-talk-error] .banner")).toContainText("was sent");
+    await expect(input).toBeEnabled();
+    await expect(input).toHaveValue("");
+    // The operator presses Enter in the empty composer: nothing is left to send.
+    await input.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    expect(stub.posts, "the sent message is never posted twice").toEqual(["question"]);
   });
 });
