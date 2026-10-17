@@ -11,7 +11,7 @@
  * second click sends nothing and the result names the first request only; consent survives a decision on
  * another row and resets for the decided one; the result survives a route change and clears only through
  * its own control; Allow always reports a refused or unconfirmed standing rule in words on an acknowledged
- * approval. The decision-result witness for defect D5-approval; no reproduction of a live defect is given.
+ * approval. The decision-result witness for D5-approval; this header carries the bare id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
