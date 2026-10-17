@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { stringToBytes, bytesToString } from "../../src/core/encoding.js";
+import { stringToBytes, bytesToString, toBase64url } from "../../src/core/encoding.js";
 import {
   AUDIT_SIGNING_LATCH_V2_KEY,
   AUDIT_SIGNING_HEAD_KEY,
@@ -150,6 +150,49 @@ describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pa
     expect(
       findingsOfKind(findings, "checkpoint_signing_downgrade").some(
         (finding) => finding.sequence === 2
+      )
+    ).toBe(true);
+  });
+
+  it("monotone-MIN pin: the detected floor never follows a later latch over a durable signed record", async () => {
+    // The pin the abort-and-retry contract must keep: with c1 signed and the head floor
+    // committed at 1, a latch that claims a LATER arming sequence (a replaced or replayed latch
+    // at 2) must not move the verdict floor to 2; the three-memory MIN keeps c1 defended.
+    const { storage, masterKey } = await buildSignedFortress(2);
+    type LatchInternals = {
+      signingLatchMacBytes: (data: {
+        armed_at_sequence: number;
+        signer_kid: string;
+        armed_at: string;
+      }) => Uint8Array;
+    };
+    const latchRaw = await storage.read(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_LATCH_V2_KEY);
+    const latch = JSON.parse(bytesToString(latchRaw!)) as {
+      data: { armed_at_sequence: number; signer_kid: string; armed_at: string };
+    };
+    expect(latch.data.armed_at_sequence).toBe(1);
+    const minter = new AuditLog(storage, masterKey) as unknown as LatchInternals;
+    const data = { ...latch.data, armed_at_sequence: 2 };
+    // Must match AUDIT_SIGNING_LATCH_V2_MARKER in audit-log.ts.
+    await storage.write(
+      CHECKPOINT_NAMESPACE,
+      AUDIT_SIGNING_LATCH_V2_KEY,
+      stringToBytes(
+        JSON.stringify({
+          __sanctuary_audit_signing_latch_v2: true,
+          data,
+          mac: toBase64url(minter.signingLatchMacBytes(data)),
+        })
+      )
+    );
+    const head = await readHeadData(storage);
+    expect(head!.lowest_signed_checkpoint_sequence).toBe(1);
+    const { stripCheckpoint } = await import("../helpers/signing-fixture.js");
+    await stripCheckpoint(storage, 1);
+    const findings = await lenientFindings(storage, masterKey);
+    expect(
+      findingsOfKind(findings, "checkpoint_signing_downgrade").some(
+        (finding) => finding.sequence === 1
       )
     ).toBe(true);
   });

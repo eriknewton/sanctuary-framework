@@ -473,6 +473,16 @@ const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
 // `audit/checkpoint-shape.ts` (G1/G5) so this runtime and the raw CLI
 // exporter's control-key allowlist cannot drift.
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
+/** Durable "a checkpoint is owed" marker (plaintext, `_meta`). Written when a
+ * checkpoint is ABORTED because its signing arm sequence failed, read on load
+ * so the next process retries at its first critical append instead of waiting
+ * out a full interval, and removed once a checkpoint record lands. It carries
+ * no trust weight: an attacker who writes it forces one extra checkpoint, one
+ * who deletes it only delays the retry to the next interval or shutdown flush,
+ * because the owed hashes themselves are recomputed from the entry files. */
+// Must match AUDIT_CHECKPOINT_OWED_KEY in core/master-rotation.ts (plaintext-keep
+// recipe) and the `_meta` inventory in test/core/master-rotation-meta-key-parity.test.ts.
+const AUDIT_CHECKPOINT_OWED_KEY = "audit-checkpoint-owed-v1";
 // F2 Option A (Finding 1, adversarial gate 2026-07-15): an OPERATOR-provenance
 // marker that records "the operator has written at least one POST-SPLIT suffix
 // head anchor (an entry above the sealed tip)". It is a NEW key that no pre-#929
@@ -1006,10 +1016,15 @@ export async function probeAuditHeadAnchor(
   }
   const data = parsed.data;
   const mac = parsed.mac;
-  // Must match `loadHeadAnchor`: both readers accept exactly the same anchor
-  // shapes (rule 5, one shared parser), so a pre-anchor the append path wrote
-  // at the genesis floor never reads as a splice here.
-  if (!isRecord(data) || typeof mac !== "string" || !isHeadAnchorDataShape(data)) {
+  if (
+    !isRecord(data) ||
+    typeof mac !== "string" ||
+    typeof data.highest_sequence !== "number" ||
+    !Number.isSafeInteger(data.highest_sequence) ||
+    data.highest_sequence <= 0 ||
+    typeof data.head_hash !== "string" ||
+    !/^[0-9a-f]{64}$/.test(data.head_hash)
+  ) {
     return { status: "tampered" };
   }
   const macKey = derivePurposeKey(masterKey, "audit-head-anchor");
@@ -2157,15 +2172,6 @@ export class AuditLog {
    * written at most once per instance (it is idempotent, but this avoids a
    * `_meta` write on every suffix append). */
   private postSplitSuffixMarkerEnsured = false;
-  /** Set by `verifyHeadAnchor` when the load found NO usable head anchor and
-   * accepted that as the legitimate anchorless state (a fresh store, or a
-   * just-migrated box whose root-owned anchor is superseded). The next append
-   * this instance makes then writes a PRE-ANCHOR at the current head before its
-   * entry (see `persistChainedEntry`), so a stop between the entry and its own
-   * anchor leaves a store the next load accepts instead of `tail_anchor_missing`.
-   * Cleared once the pre-anchor is durable; left set when that write fails so
-   * the next append retries. */
-  private headPreAnchorDue = false;
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
   /**
@@ -2757,29 +2763,6 @@ export class AuditLog {
         const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
         const persistedBytes = stringToBytes(JSON.stringify(envelope));
         try {
-          if (this.headPreAnchorDue) {
-            // First append to an anchorless store, as a named sequence:
-            //   state_ANCHORLESS   (load accepted: fresh, or just-migrated)
-            //   state_PRE_ANCHORED anchor at the CURRENT head, written here
-            //   state_ENTRY_WRITTEN entry N on disk, anchor still at N-1
-            //   state_ANCHORED     anchor at N (the steady-state shape)
-            // Without the pre-anchor, a stop in state_ENTRY_WRITTEN leaves
-            // "entries exist, no anchor", which `verifyHeadAnchor` must keep
-            // reading as whole-log deletion (`tail_anchor_missing`): that rule
-            // is not softened, the writer simply never produces the shape.
-            // With it, every prefix is a state load accepts: a floor at the
-            // current head is exactly what a steady-state append leaves
-            // between its entry and its anchor. The head is `(0, GENESIS)` on
-            // a fresh store (the one zero-floor shape `isHeadAnchorDataShape`
-            // admits) and `(sealed_tip, tip_hash)` after a split; both are
-            // read fresh from disk by `freshenChainStateFromDisk` above, under
-            // the lock, so another process's anchor is never overwritten with
-            // a lower floor.
-            this.assertAuditWriteLockActive(signal);
-            await this.writeHeadAnchor(sequence - 1, prevHash);
-            this.assertAuditWriteLockActive(signal);
-            this.headPreAnchorDue = false;
-          }
           this.assertAuditWriteLockActive(signal);
           await this.writeAuditEntryBytes(key, persistedBytes);
           this.assertAuditWriteLockActive(signal);
@@ -3506,9 +3489,15 @@ export class AuditLog {
 
     const data = parsed.data;
     const mac = parsed.mac;
-    // Must match `probeAuditHeadAnchor`: one shared shape predicate for both
-    // head-anchor readers (rule 5).
-    if (!isRecord(data) || typeof mac !== "string" || !isHeadAnchorDataShape(data)) {
+    if (
+      !isRecord(data) ||
+      typeof mac !== "string" ||
+      typeof data.highest_sequence !== "number" ||
+      !Number.isSafeInteger(data.highest_sequence) ||
+      data.highest_sequence <= 0 ||
+      typeof data.head_hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(data.head_hash)
+    ) {
       return { status: "invalid" };
     }
     let providedMac: Uint8Array;
@@ -3564,10 +3553,6 @@ export class AuditLog {
     findings: AuditIntegrityFinding[],
     sealedTipSequence = 0
   ): Promise<void> {
-    // Every pass starts from "no pre-anchor owed"; only the two anchorless
-    // no-finding arms below set it, so a store with any usable anchor (valid,
-    // or invalid and therefore a finding) never gets a second anchor write.
-    this.headPreAnchorDue = false;
     if (anchor.status === "valid") {
       if (highestChainedSeq < anchor.highest_sequence) {
         findings.push({
@@ -3651,11 +3636,6 @@ export class AuditLog {
         });
         return;
       }
-      // Both proofs passed: the operator owes its own readable anchor, and the
-      // first append writes it as a pre-anchor at the sealed tip BEFORE the
-      // first suffix entry, so a stop between that entry and its anchor cannot
-      // read as the "suffix survives, anchor unreadable" truncation above.
-      this.headPreAnchorDue = true;
       return;
     }
 
@@ -3673,12 +3653,7 @@ export class AuditLog {
         message:
           "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
       });
-      return;
     }
-    // The legitimate anchorless state: nothing audited yet. The first append
-    // pre-anchors at the genesis floor before its entry so the fail-closed rule
-    // just above never has to excuse an interrupted first append.
-    this.headPreAnchorDue = true;
   }
 
   /**
@@ -3962,16 +3937,32 @@ export class AuditLog {
       if (envelope.sequence >= anchor.base_sequence) break;
       if (envelope.sequence !== expectedSequence) return false;
       if (previousHash !== null && envelope.prev_hash !== previousHash) return false;
-      previousHash = envelope.entry_hash;
+      // The link is the RECOMPUTED digest of this entry's bytes, never the
+      // `entry_hash` string the file carries: a stretch whose link fields were
+      // edited to end at the anchor's base hash must still produce that hash
+      // from real content, which is the second-preimage bound this arm rests
+      // on. (The load pass recomputes every entry too; this keeps the
+      // acceptance self-contained rather than dependent on call order.)
+      const recomputed = computeAuditEntryHash({
+        sequence: envelope.sequence,
+        prev_hash: envelope.prev_hash,
+        timestamp: envelope.timestamp,
+        encrypted_payload_bytes: envelope.encrypted_payload_bytes,
+        schema_version: envelope.schema_version,
+      });
+      if (recomputed !== envelope.entry_hash) return false;
+      previousHash = recomputed;
       expectedSequence++;
       index++;
     }
-    const baseSurvives =
-      chainedEntries[index]?.envelope.sequence === anchor.base_sequence;
+    const base = chainedEntries[index]?.envelope;
     return (
-      baseSurvives &&
+      base !== undefined &&
+      base.sequence === anchor.base_sequence &&
       expectedSequence === anchor.base_sequence &&
-      previousHash === anchor.base_prev_hash
+      previousHash === anchor.base_prev_hash &&
+      // The base entry must itself point at the stretch it is accepted over.
+      base.prev_hash === anchor.base_prev_hash
     );
   }
 
@@ -5863,6 +5854,20 @@ export class AuditLog {
       this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
+      // Durable retry of an aborted checkpoint (must match the marker written
+      // in `writeCheckpointIfNeeded`): prime the interval counter so this
+      // process's FIRST critical append retries, instead of the owed
+      // checkpoint waiting out a whole interval after a crash. Read-only
+      // instances never append, so priming is inert for them.
+      if (
+        this.hashesSinceCheckpoint.length > 0 &&
+        this.checkpointInterval > 0 &&
+        (await this.storage
+          .exists(AUDIT_META_NAMESPACE, AUDIT_CHECKPOINT_OWED_KEY)
+          .catch(() => false))
+      ) {
+        this.criticalAppendsSinceCheckpoint = this.checkpointInterval;
+      }
       this.integrityFindings = findings;
       // The reload now keeps only the bounded recent-entry WINDOW resident (the
       // splice in pushWindow slid it during the streaming decrypt), so a large
@@ -7348,12 +7353,16 @@ export class AuditLog {
           await this.readHighestAuditCheckpointSequence(sealedTipSequence);
         this.assertAuditWriteLockActive(signal);
         const checkpointSequence = this.nextSequence - 1;
-        const fromSequence = Math.max(
+        const requestedFromSequence = Math.max(
           previousCheckpointSequence + 1,
           sealedTipSequence + 1
         );
-        const hashes = await this.collectPersistedEntryHashes(
-          fromSequence,
+        // The hashes AND the range come from the entry files under the lock:
+        // rotation may have pruned the low end of the requested range since
+        // the previous checkpoint (see `collectPersistedEntryHashes`), so the
+        // record's `from_sequence` is the range actually covered.
+        const { fromSequence, hashes } = await this.collectPersistedEntryHashes(
+          requestedFromSequence,
           checkpointSequence,
           sealedTipSequence
         );
@@ -7378,13 +7387,41 @@ export class AuditLog {
           // critical append retry this checkpoint, and the entry this call
           // followed is already durable, so the append itself succeeds. Any
           // other failure (the record write) propagates as before.
-          if (err instanceof CheckpointArmAbortedError) return;
+          if (err instanceof CheckpointArmAbortedError) {
+            // Durable retry trigger: a process that dies after this append
+            // acknowledged has no in-memory queue left, so the owed checkpoint
+            // is recorded on disk and the next process primes its interval
+            // counter from it on load. Best-effort by design (see the key's
+            // doc comment): a refused marker write costs promptness, not the
+            // retry itself, which the next interval or shutdown flush still
+            // runs from the entry files.
+            try {
+              this.assertAuditWriteLockActive(signal);
+              await this.storage.write(
+                AUDIT_META_NAMESPACE,
+                AUDIT_CHECKPOINT_OWED_KEY,
+                stringToBytes("1")
+              );
+            } catch {
+              // Non-fatal; the next interval or flush retries regardless.
+            }
+            return;
+          }
           throw err;
         }
         this.assertAuditWriteLockActive(signal);
         this.lastCheckpointSequence = checkpointSequence;
         this.hashesSinceCheckpoint = [];
         this.criticalAppendsSinceCheckpoint = 0;
+        // The owed marker is cleared only after a record landed; a failure to
+        // clear it costs one extra checkpoint on the next load, never a
+        // missed one.
+        try {
+          this.assertAuditWriteLockActive(signal);
+          await this.storage.delete(AUDIT_META_NAMESPACE, AUDIT_CHECKPOINT_OWED_KEY);
+        } catch {
+          // Non-fatal; see above.
+        }
       });
     } finally {
       this.checkpointInFlight = false;
@@ -7433,13 +7470,28 @@ export class AuditLog {
     return highest;
   }
 
+  /**
+   * The entry hashes a checkpoint covers, read from the entry files under the
+   * caller's lock. Returns the range actually covered: when rotation has
+   * pruned entries at the LOW end of the requested range (a checkpoint that
+   * lagged behind rotation, for example after an aborted arm sequence), the
+   * range starts at the lowest surviving entry instead. The rotation anchor
+   * authenticates that cut and `verifyCheckpoints` recomputes a root from the
+   * lowest survivor upward, so a checkpoint starting there verifies normally;
+   * without this a lagging checkpoint could never be written again and every
+   * later interval would be skipped silently. An INTERIOR gap (an entry
+   * missing between the start and the tip) is never papered over: no
+   * checkpoint is minted and the refusal is loud, because a root over a
+   * partial span would only mint a record the next load rejects.
+   */
   private async collectPersistedEntryHashes(
     fromSequence: number,
     toSequence: number,
     sealedTipSequence = 0
-  ): Promise<string[]> {
+  ): Promise<{ fromSequence: number; hashes: string[] }> {
     const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
     const bySequence = new Map<number, string>();
+    let lowestSurviving = Number.POSITIVE_INFINITY;
     for (const meta of metas) {
       // F2 Option A: same guard as `readLatestPersistedChainState`; never
       // attempt a read at or below the sealed tip.
@@ -7451,19 +7503,32 @@ export class AuditLog {
         const parsed = JSON.parse(bytesToString(raw));
         if (isPersistedAuditEnvelopeV2(parsed)) {
           bySequence.set(parsed.sequence, parsed.entry_hash);
+          if (parsed.sequence < lowestSurviving) lowestSurviving = parsed.sequence;
         }
       } catch {
         // Full verification reports malformed entries.
       }
     }
 
+    const start = Math.max(
+      fromSequence,
+      Number.isFinite(lowestSurviving) ? lowestSurviving : fromSequence
+    );
     const hashes: string[] = [];
-    for (let sequence = fromSequence; sequence <= toSequence; sequence++) {
+    for (let sequence = start; sequence <= toSequence; sequence++) {
       const hash = bySequence.get(sequence);
-      if (!hash) break;
+      if (!hash) {
+        // SAFETY: stderr is the contract for a refused checkpoint (operator
+        // console), never an audit-backed logger; the next full load reports
+        // the gap itself as a chain finding.
+        console.error(
+          `[audit-log] checkpoint ${toSequence} not written: audit entry ${sequence} is missing inside the span ${start}..${toSequence}`
+        );
+        return { fromSequence: start, hashes: [] };
+      }
       hashes.push(hash);
     }
-    return hashes;
+    return { fromSequence: start, hashes };
   }
 
   private async writeCheckpointRecord(
@@ -7554,42 +7619,79 @@ export class AuditLog {
       // The head is ensured FIRST precisely so "armed with no head" cannot
       // be produced by an honest crash: post-arm, head-absence is always
       // evidence of deletion or a loudly-diagnosed ensure failure.
+      // Deadline re-check BEFORE the first control write: an expired hold
+      // aborts here, before any arm record lands, so the hold cannot expire
+      // between the latch and the record in the common case (the residual, a
+      // hold that expires inside the one-write window after the latch, leaves
+      // the latch-armed, record-less prefix, which the load accepts and the
+      // next checkpoint completes; see the audit-log interrupted-sequences
+      // witnesses).
+      this.assertAuditWriteLockActive(signal);
       try {
         const latchRead = await this.readSigningLatchV2();
         if (latchRead.status === "absent") {
-          if (!this.signingEvidenceSeen) {
-            await this.writeSigningControlRecord(signal, {
-              record: "head",
-              ensure: true,
-            });
-            const result = await this.writeSigningControlRecord(signal, {
-              record: "latch",
-              // v2 FORWARD commitment: "every audit-checkpoint at or above
-              // this sequence is signed" — written exactly once, immediately
-              // before the first signed checkpoint persists. Not the
-              // round-2/3 historical claim, whose referent had to survive
-              // (R2-c) and whose crash shapes were indistinguishable from
-              // deletion.
-              armed_at_sequence: payload.checkpoint_sequence,
-              signer_kid: signed.signer_kid,
-              armed_at: payload.signed_at,
-            });
-            armedThisWrite = result === "written";
-            this.signingEvidenceSeen = true;
-          } else {
-            // TOCTOU guard: this process has OBSERVED signing evidence, so a
-            // now-absent latch is an erasure, not a fresh fortress. Arming
-            // here would silently re-mint the control records at a rolled
-            // floor; the next LOAD's recovery pass owns this, strict-closed
-            // and latched.
+          // Arming is decided from DURABLE state, never from this process's
+          // memory: a reopened process must reach the same verdict as the one
+          // that crashed. The named states:
+          //   state_NEVER_ARMED   latch absent, head absent
+          //   state_ARM_INCOMPLETE latch absent, head present but with no
+          //                       committed signed tip (the arm's step 1
+          //                       landed, step 2 did not)
+          //   state_LATCH_ERASED  latch absent, head committed a signed tip
+          // The first two re-run the arm here. The third is deletion-shaped
+          // and belongs to the next load's recovery pass; writing a signed
+          // record over it would be the latch-less shape that pass fails
+          // closed on, so the checkpoint is aborted instead. Re-arming over a
+          // zeroed head is not a fail-open: an attacker who can delete the
+          // latch and every signed checkpoint can delete the head too, and
+          // the all-absent store already re-arms silently.
+          const headRead = await this.readSigningHead();
+          const armIncomplete =
+            headRead.status === "absent" ||
+            (headRead.status === "valid" &&
+              headRead.data.highest_signed_checkpoint_sequence === 0 &&
+              headRead.data.lowest_signed_checkpoint_sequence === null);
+          if (!armIncomplete) {
             // SAFETY: stderr diagnostic (operator-facing); the programmatic
             // channel is the next load's strict-closed recovery pass.
             console.error(
-              "[audit-log] signing latch is absent on a store with observed signing evidence; leaving recovery to the next load pass"
+              "[audit-log] signing latch is absent on a store whose signing head committed a signed tip; the checkpoint is not written and recovery belongs to the next load pass"
+            );
+            throw new CheckpointArmAbortedError(
+              new Error(
+                `signing latch absent while the signing head reads ${headRead.status}` +
+                  (headRead.status === "valid" ? " with a committed signed tip" : "")
+              )
             );
           }
+          await this.writeSigningControlRecord(signal, {
+            record: "head",
+            ensure: true,
+          });
+          const result = await this.writeSigningControlRecord(signal, {
+            record: "latch",
+            // v2 FORWARD commitment: "every audit-checkpoint at or above
+            // this sequence is signed" — written exactly once, immediately
+            // before the first signed checkpoint persists. Not the
+            // round-2/3 historical claim, whose referent had to survive
+            // (R2-c) and whose crash shapes were indistinguishable from
+            // deletion.
+            armed_at_sequence: payload.checkpoint_sequence,
+            signer_kid: signed.signer_kid,
+            armed_at: payload.signed_at,
+          });
+          if (result !== "written") {
+            // The chokepoint refused the latch (it found a record it will not
+            // overwrite); a signed record must never land without its latch.
+            throw new CheckpointArmAbortedError(
+              new Error("signing latch write was refused by the control-record chokepoint")
+            );
+          }
+          armedThisWrite = true;
+          this.signingEvidenceSeen = true;
         }
       } catch (err) {
+        if (err instanceof CheckpointArmAbortedError) throw err;
         this.notifySigningControlWriteFailure(
           "signing-latch arm sequence failed; the checkpoint is NOT written and the next critical append retries it",
           err
@@ -7599,7 +7701,9 @@ export class AuditLog {
         // fail closed on (`checkpoint_signing_floor_recovered`, hard on the
         // recovering pass), and that rule is deliberately not softened. The
         // store is left in the head-only or head-plus-latch prefix, both of
-        // which load clean, and the pending hashes stay queued for the retry.
+        // which load clean, and the owed checkpoint is retried from durable
+        // state (the owed marker and the entry files, never this process's
+        // memory alone).
         throw new CheckpointArmAbortedError(err);
       }
     }
@@ -7933,41 +8037,6 @@ function asFilesystemCapabilities(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/**
- * Shape of a head-anchor `data` record, shared by the two readers
- * (`AuditLog.loadHeadAnchor` and `probeAuditHeadAnchor`) so they can never
- * disagree about which anchors exist (rule 5).
- *
- * Two shapes are admitted. A positive floor names a real entry and carries its
- * 64-hex SHA-256 entry hash. The genesis floor `(0, AUDIT_CHAIN_GENESIS)` is the
- * PRE-ANCHOR the first append writes before its entry (see
- * `persistChainedEntry`, state_PRE_ANCHORED): it asserts "nothing has been
- * truncated below sequence 0", which is vacuously true, so admitting it never
- * lowers a floor. It is accepted ONLY in that exact pair: a floor of 0 with any
- * other hash, or a negative floor, is an unknown shape and stays invalid, so the
- * relaxation adds exactly one anchor value, the one this writer mints. A
- * replayed genesis pre-anchor buys an attacker nothing beyond what deleting the
- * anchor, the established marker and every checkpoint already buys today: the
- * whole-wipe shape, which the anti-rollback witnesses, not this floor, exist to
- * catch.
- */
-function isHeadAnchorDataShape(
-  data: Record<string, unknown>
-): data is { highest_sequence: number; head_hash: string } {
-  if (
-    typeof data.highest_sequence !== "number" ||
-    !Number.isSafeInteger(data.highest_sequence) ||
-    typeof data.head_hash !== "string"
-  ) {
-    return false;
-  }
-  if (data.highest_sequence === 0) {
-    return data.head_hash === AUDIT_CHAIN_GENESIS;
-  }
-  // 64 = hex length of a SHA-256 digest (32 bytes, two hex chars each).
-  return data.highest_sequence > 0 && /^[0-9a-f]{64}$/.test(data.head_hash);
 }
 
 function isPersistedAuditEnvelopeV2(

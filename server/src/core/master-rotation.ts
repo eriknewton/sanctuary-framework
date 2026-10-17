@@ -777,6 +777,10 @@ const CONFIG_BASELINE_MAC_PURPOSE = "config-security-baseline-mac";
 const CONFIG_BASELINE_MAC_DOMAIN = "sanctuary.config-security-baseline.v1\n";
 
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
+// Must match AUDIT_CHECKPOINT_OWED_KEY in operational/audit-log.ts: the
+// plaintext "1" owed-checkpoint marker, kept across rotation like the
+// established marker (it carries no key material and no trust weight).
+const AUDIT_CHECKPOINT_OWED_KEY = "audit-checkpoint-owed-v1";
 const PRIMARY_IDENTITY_META_KEY = "primary_identity_id";
 // Must match CASTLE_WALL_PROVISION_META_KEY in
 // castle-wall/provision-state.ts (the writer is wrap/init.ts). Plaintext
@@ -872,6 +876,7 @@ export function classifyMetaKey(key: string): MetaKeyClass | null {
       return "rotation";
     case STATE_META_PUBLIC_KEYS_KEY: // public keys only
     case AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY: // literal "1"
+    case AUDIT_CHECKPOINT_OWED_KEY: // literal "1"
     case PRIMARY_IDENTITY_META_KEY: // identity id string
     case CASTLE_WALL_PROVISION_META_KEY: // literal "not_yet_walled"
       return "plaintext-keep";
