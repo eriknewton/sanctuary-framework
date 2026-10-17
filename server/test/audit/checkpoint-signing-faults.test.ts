@@ -32,8 +32,19 @@ async function readHeadData(storage: {
     : null;
 }
 
+/** The entry whose interval checkpoint meets the injected arm fault. */
+function faultedEntry(identityId: string) {
+  return {
+    layer: "l2" as const,
+    operation: "state_write",
+    identity_id: identityId,
+    result: "success" as const,
+    details: { index: 0 },
+  };
+}
+
 describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pair)", () => {
-  it("crash at arm step 1 (head-ensure fails): no control record persists; the next load recovers loudly, never silently-clean-with-evidence-lost", async () => {
+  it("crash at arm step 1 (head-ensure fails): the checkpoint is aborted, no control record persists, the next load is clean and the next interval arms", async () => {
     const storage = new MemoryStorage();
     const faulty = new FaultInjectingStorage(storage);
     const masterKey = generateRandomKey();
@@ -41,37 +52,54 @@ describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pa
     faulty.failWriteOnCall = {
       namespace: CHECKPOINT_NAMESPACE,
       keyPrefix: AUDIT_SIGNING_HEAD_KEY,
-      calls: [1, 2],
+      calls: [1],
     };
     const writer = new AuditLog(faulty, masterKey, {
       checkpointInterval: 1,
       integrityMode: "lenient",
     });
-    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+    // Direct append, no flush: a flush is the shutdown retry and would re-arm
+    // before the torn prefix is inspected.
+    await writer.appendCritical(faultedEntry(storedIdentity.identity_id));
     faulty.failWriteOnCall = null;
 
-    // The signed checkpoint was still written (bookkeeping never aborts the
-    // audit record)...
+    // The arm sequence failed before anything landed, so the checkpoint is
+    // NOT written: a signed record with no latch is the deletion shape, and
+    // the writer never produces it. The entry itself is durable.
     const record = await storage.read(
       CHECKPOINT_NAMESPACE,
       "audit-checkpoint-" + String(1).padStart(20, "0")
     );
-    expect(record).not.toBeNull();
-    // ...and the recovery pass is hard once, warn thereafter (a §d-named
-    // state, not silence and not a permanent brick from an honest crash).
-    const first = await lenientFindings(storage, masterKey);
+    expect(record).toBeNull();
+    expect(await readHeadData(storage)).toBeNull();
     expect(
-      hardFindings([
-        ...findingsOfKind(first, "checkpoint_signing_floor_recovered"),
-        ...findingsOfKind(first, "checkpoint_signing_head_recovered"),
-      ]).length
-    ).toBeGreaterThanOrEqual(1);
-    const second = await lenientFindings(storage, masterKey);
-    expect(second.every((finding) => finding.severity === "warn")).toBe(true);
+      await storage.read(CHECKPOINT_NAMESPACE, AUDIT_SIGNING_LATCH_V2_KEY)
+    ).toBeNull();
+    // The next load sees an honest never-armed store: no finding of any grade.
+    expect(await lenientFindings(storage, masterKey)).toEqual([]);
+    expect(await strictReadError(storage, masterKey)).toBeNull();
+
+    // The pending hashes were kept, so the next critical interval retries the
+    // whole arm and signs a checkpoint covering both entries.
+    await appendCriticalEntries(writer, 1, storedIdentity.identity_id);
+    const retried = await storage.read(
+      CHECKPOINT_NAMESPACE,
+      "audit-checkpoint-" + String(2).padStart(20, "0")
+    );
+    expect(retried).not.toBeNull();
+    const retriedRecord = JSON.parse(bytesToString(retried!)) as {
+      from_sequence: number;
+      unsigned: boolean;
+    };
+    expect(retriedRecord.from_sequence).toBe(1);
+    expect(retriedRecord.unsigned).toBe(false);
+    const head = await readHeadData(storage);
+    expect(head!.lowest_signed_checkpoint_sequence).toBe(2);
+    expect(await lenientFindings(storage, masterKey)).toEqual([]);
     expect(await strictReadError(storage, masterKey)).toBeNull();
   });
 
-  it("crash at arm step 2 (latch write fails): head + checkpoint survive; the floor recovers at the true first-signed sequence", async () => {
+  it("crash at arm step 2 (latch write fails): the head survives, the checkpoint is aborted, and the retry arms at the true first-signed sequence", async () => {
     const storage = new MemoryStorage();
     const faulty = new FaultInjectingStorage(storage);
     const masterKey = generateRandomKey();
@@ -85,15 +113,27 @@ describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pa
       checkpointInterval: 1,
       integrityMode: "lenient",
     });
+    // Direct append, no flush (a flush is the shutdown retry).
+    await writer.appendCritical(faultedEntry(storedIdentity.identity_id));
+    // Head ensured, latch refused: the checkpoint at 1 is aborted rather than
+    // written latch-less (which the next load would have to read as the
+    // deletion shape). The head alone is a prefix the load accepts.
+    expect(
+      await storage.read(
+        CHECKPOINT_NAMESPACE,
+        "audit-checkpoint-" + String(1).padStart(20, "0")
+      )
+    ).toBeNull();
+    expect(await readHeadData(storage)).not.toBeNull();
+    expect(await lenientFindings(storage, masterKey)).toEqual([]);
+
     await appendCriticalEntries(writer, 2, storedIdentity.identity_id);
     faulty.failWriteOnCall = null;
 
-    // The R2-b regression shape: a swallowed first latch write must never
-    // advance the DETECTED floor past the first signed checkpoint. The
-    // write-path retry stamps the latch at the CURRENT sequence (a true
-    // forward commitment), and the floor stays anchored at 1 by the head's
-    // monotone-MIN witness (committed by append 1's tip+floor head write),
-    // so the three-memory MIN keeps c1 defended.
+    // The R2-b regression shape, restated for the abort: the first SIGNED
+    // checkpoint is now 2 (1 was never written), the retry stamps the latch
+    // at 2 (a true forward commitment) and the head's monotone-MIN floor
+    // lands at 2, so the three-memory MIN defends c2, the real first.
     const latchRaw = await storage.read(
       CHECKPOINT_NAMESPACE,
       AUDIT_SIGNING_LATCH_V2_KEY
@@ -101,15 +141,15 @@ describe("IC-05-DG §f-9: crash-ordering matrix (arm / signed-pair / incident-pa
     expect(latchRaw).not.toBeNull();
     expect(JSON.parse(bytesToString(latchRaw!)).data.armed_at_sequence).toBe(2);
     const head = await readHeadData(storage);
-    expect(head!.lowest_signed_checkpoint_sequence).toBe(1);
-    // The proof that matters: stripping c1 still fires (the floor did NOT
-    // advance to 2, which was exactly R2-b's silent hole).
+    expect(head!.lowest_signed_checkpoint_sequence).toBe(2);
+    // The proof that matters: stripping c2 fires (the floor did NOT advance
+    // to 3, which is R2-b's silent hole moved one sequence up).
     const { stripCheckpoint } = await import("../helpers/signing-fixture.js");
-    await stripCheckpoint(storage, 1);
+    await stripCheckpoint(storage, 2);
     const findings = await lenientFindings(storage, masterKey);
     expect(
       findingsOfKind(findings, "checkpoint_signing_downgrade").some(
-        (finding) => finding.sequence === 1
+        (finding) => finding.sequence === 2
       )
     ).toBe(true);
   });
