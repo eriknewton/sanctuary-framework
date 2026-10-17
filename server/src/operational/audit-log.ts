@@ -2162,12 +2162,6 @@ export class AuditLog {
   private readonly integrityMode: "strict" | "lenient";
   /** See {@link AuditLogConfig.readOnly}. */
   private readonly readOnly: boolean;
-  /**
-   * Set once by {@link sealWritePath}; never cleared. A process that is giving up its master write
-   * barrier seals the write path first, so no later continuation (a queued append, a checkpoint, a
-   * rotation pass) runs the raw-filesystem preamble in a fortress this process no longer owns.
-   */
-  private writePathSealedReason: string | undefined;
   private readonly checkpointInterval: number;
   private readonly checkpointSigner: (
     payload: AuditCheckpointSigningPayload
@@ -2630,18 +2624,6 @@ export class AuditLog {
     const routine = await this.getIntegrityFindings();
     const sealed = await this.verifySealedRegion();
     return foldAuditChainVerdict(routine.length, sealed);
-  }
-
-  /**
-   * Refuse every later entry into the cross-process write path, permanently. Called by an owner that
-   * is about to release its master write barrier (the Hermes bridge shell at exit): the barrier
-   * refuses the entry writes themselves, but the lock and namespace preamble in
-   * {@link withAuditWriteLock} touches the filesystem directly and only this flag can stop it. An
-   * operation already inside the lock is not interrupted; it finishes and releases the lock it holds,
-   * because abandoning a held lock would strand every other writer. Idempotent; the first reason wins.
-   */
-  sealWritePath(reason: string): void {
-    this.writePathSealedReason ??= reason;
   }
 
   /**
@@ -4650,14 +4632,6 @@ export class AuditLog {
         "audit-log: this instance was constructed read-only and refuses its " +
           "cross-process write path; a declared read-only load must not " +
           "reach any audit write"
-      );
-    }
-    // A sealed instance refuses here for the same reason, before any raw-filesystem preamble: its
-    // owner has released (or is releasing) the master write barrier, so nothing may be persisted and
-    // no lock or namespace directory may be created on its behalf.
-    if (this.writePathSealedReason !== undefined) {
-      throw new Error(
-        `audit-log: write path sealed (${this.writePathSealedReason}); no audit write may start`
       );
     }
     const signal: AuditWriteLockAbortSignal = { aborted: false };

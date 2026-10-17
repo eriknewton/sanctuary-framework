@@ -292,12 +292,12 @@ class AuditForwarder extends SingleBindForwarder<AuditLog> {
   // to the audit log and still unconfirmed, which the caller reports. Every record still waiting is
   // refused here, synchronously, even when the record ahead of it never settles: a refused record is
   // reported on stderr and rejects back to the core's durability handling, lost loudly, never
-  // silently. Sealing the log first means a handed-off record's later lock entry, a timed-out flush's
-  // checkpoint and any rotation pass are refused before they touch the filesystem.
+  // silently. A record already handed to the log is not interrupted: the log serializes it under the
+  // audit lock, and once the barrier below is released the fortress storage refuses whatever it has
+  // not yet written. Its count is what the caller reports as unconfirmed.
   close(refuse: (record: HermesBridgeAuditRecord) => void): number {
     if (this.refuseAtExit === undefined) {
       this.refuseAtExit = refuse;
-      if (this.bound) this.requireTarget().sealWritePath("Hermes bridge shell exit");
       for (const entry of this.waiting.splice(0)) entry.settle(this.refuse(entry.record));
     }
     return this.handedOff;
@@ -562,9 +562,10 @@ class ShellController {
     let flushUnconfirmed = false;
     if (this.audit.bound && tailDrained === true) {
       const flushed = await this.step(() => withDeadline(this.audit.flush().then(() => true), drainTailDeadline), "audit_tail_failure");
-      // A flush that missed its deadline is still running its graceful-shutdown checkpoint; close()
-      // below seals the log, so that checkpoint is refused before it touches the filesystem, and the
-      // operator is told the checkpoint was not confirmed.
+      // A flush that missed its deadline may still be running its graceful-shutdown checkpoint. It is
+      // not interrupted (it holds the audit lock, and abandoning a held lock would strand every other
+      // writer); the operator is told the checkpoint was not confirmed, and the barrier release below
+      // decides what the storage still accepts.
       flushUnconfirmed = flushed !== true;
     }
     // Close before the writer drain and the barrier release: every append from here on would be
@@ -579,6 +580,12 @@ class ShellController {
       this.stderr.write("hermes-memory-bridge audit: shutdown checkpoint unconfirmed at exit\n");
     }
     await this.step(() => this.writer?.endAndFlush(drainTailDeadline) ?? Promise.resolve());
+    // Claim atom: the bridge exits within its stop budget and has named, above, every audit operation
+    // it could not confirm. Releasing here does not wait for an audit operation that outlived the
+    // drain tail: it either finishes under the audit lock, which serializes it against the next
+    // owner, or the released barrier's storage refuses its next write. A refusal partway through a
+    // multi-write audit sequence is the residual tracked as audit-log-torn-multi-write-sequences-01;
+    // it is the same state a crash at that instant leaves, and the lines above make it visible, never silent.
     await this.step(() => withDeadline(this.barrier?.release() ?? Promise.resolve(), exitDeadline), "release_failure");
     this.stream.destroy();
     this.stream.removeAllListeners();

@@ -146,11 +146,19 @@ class ParkingAuditStorage extends FilesystemStorage {
     super(root);
   }
 
+  // How each parked write settled once released: "written", or the refusal the storage raised. After
+  // the shell released its master write barrier the storage refuses every later raw mutation, so a
+  // parked write that outlived the exit is expected to land here as a refusal, never as a silent write.
+  readonly parkedWriteOutcomes: string[] = [];
+
   private trackAuditWrite(write: Promise<void>): Promise<void> {
     this.pendingAuditWrites.add(write);
     void write.then(
-      () => { this.pendingAuditWrites.delete(write); },
-      () => { this.pendingAuditWrites.delete(write); },
+      () => { this.pendingAuditWrites.delete(write); this.parkedWriteOutcomes.push("written"); },
+      (error: unknown) => {
+        this.pendingAuditWrites.delete(write);
+        this.parkedWriteOutcomes.push(`refused: ${error instanceof Error ? error.message : String(error)}`);
+      },
     );
     return write;
   }
@@ -2044,16 +2052,27 @@ describe("Hermes memory process shell", () => {
     pair.close();
   });
 
-  it("exits within the shared tail when the audit tail and writer drain are both slow", async () => {
+  it("exits within the stop budget on one shared tail when the audit tail and writer drain are both slow", async () => {
     const fixture = await seededFortress("shared-exit-deadline");
     const relay = new NeverDrainingDuplex();
     let stderrText = "";
+    let unconfirmedReportedAt: number | undefined;
+    let relayClosedAt: number | undefined;
+    relay.once("close", () => { relayClosedAt = performance.now(); });
     const parkedStorage = new ParkingAuditStorage(join(fixture.fortressDir, "state"));
     const shell = await runHermesBridgeProcess({
       env: fixture.env,
       relaySocketFactory: () => relay,
       storageFor: () => parkedStorage,
-      stderr: { write: (chunk: string | Uint8Array) => { stderrText += String(chunk); return true; } },
+      stderr: {
+        write: (chunk: string | Uint8Array) => {
+          stderrText += String(chunk);
+          if (unconfirmedReportedAt === undefined && String(chunk).includes("record(s) unconfirmed at exit")) {
+            unconfirmedReportedAt = performance.now();
+          }
+          return true;
+        },
+      },
       uid: process.getuid?.() ?? 0,
     });
     try {
@@ -2065,17 +2084,26 @@ describe("Hermes memory process shell", () => {
         arguments: { text: "audit tail deadline", taint: "user_content", passage_id: "passage-audit-tail" },
       }));
       await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      const sharedTailBoundMs = DRAIN_TAIL_MS + Math.floor(DRAIN_TAIL_MS / 2);
-      const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
-      await exitWithinSharedTail;
+      // The outer bound is the relay's own kill deadline, measured from the stop signal, so it covers
+      // the core's drain, the shared tail, the barrier release and process cleanup on a loaded runner.
+      await expectExitWithin(shell.exited, EXIT_CLEAN);
       expect(parkedStorage.auditWriteParked).toBe(true);
+      // The sharing claim is measured between two in-process marks that have no filesystem work
+      // between them: the unconfirmed report is written the instant the audit tail gives up, and the
+      // writer drain destroys the never-draining relay stream the instant its own wait gives up. On
+      // one shared deadline the writer's wait is already spent, so the gap is a zero-length timer; a
+      // second tail would put a whole DRAIN_TAIL_MS between them. Half a tail separates the two
+      // outcomes with equal slack on each side, and a timer never fires early.
+      expect(unconfirmedReportedAt).toBeDefined();
+      expect(relayClosedAt).toBeDefined();
+      expect(relayClosedAt! - unconfirmedReportedAt!).toBeLessThan(DRAIN_TAIL_MS / 2);
     } finally {
       await parkedStorage.releaseAndDrain();
     }
   });
 
-  it("refuses audit records still queued at exit without touching the released fortress", async () => {
+  it("refuses audit records still queued at exit and names the record it could not confirm", async () => {
     const fixture = await seededFortress("shared-exit-queued-audit");
     const relay = new NeverDrainingDuplex();
     let stderrText = "";
@@ -2096,24 +2124,40 @@ describe("Hermes memory process shell", () => {
         arguments: { text: "queued audit at exit", taint: "user_content", passage_id: "passage-queued-audit" },
       }));
       await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      const sharedTailBoundMs = DRAIN_TAIL_MS + Math.floor(DRAIN_TAIL_MS / 2);
-      const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
-      await exitWithinSharedTail;
+      await expectExitWithin(shell.exited, EXIT_CLEAN);
       parkedStorage.exitObserved = true;
       expect(parkedStorage.auditWriteParked).toBe(true);
       // The shutdown appended one record behind the parked one. It is refused at close, before exit,
-      // even though the record ahead of it is still parked and may never settle.
+      // even though the record ahead of it is still parked and may never settle; the parked one is
+      // reported as unconfirmed rather than waited for past the tail.
       expect(stderrText).toContain("hermes-memory-bridge audit: 1 record(s) unconfirmed at exit\n");
       expect(stderrText).toContain("hermes-memory-bridge audit: refused terminal record at exit\n");
+      // Residual, recorded rather than hidden (audit-log-torn-multi-write-sequences-01): the parked
+      // write outlives the exit. Released after the barrier is gone, the storage refuses it, and no
+      // later step of its audit sequence reaches the fortress; a fresh log then opens the fortress
+      // exactly as it was before the unconfirmed record.
       await parkedStorage.releaseAndDrain();
+      expect(parkedStorage.parkedWriteOutcomes).toEqual([
+        "refused: master write session was released; refusing a later raw fortress mutation",
+      ]);
       expect(parkedStorage.backendWritesAfterExit).toBe(0);
+      const custody = await establishMaster({ storage: parkedStorage, passphrase: PASS });
+      try {
+        const reopened = new AuditLog(parkedStorage, custody.masterKey, { integrityMode: "lenient" });
+        expect(await reopened.getIntegrityFindings()).toEqual([]);
+        const entries = await reopened.query({ operation_type: "hermes_memory_bridge", limit: 20 });
+        expect(entries.entries.map((entry) => entry.details?.kind)).toEqual([]);
+      } finally {
+        await custody.masterWriteBarrier?.release();
+        custody.masterKey.fill(0);
+      }
     } finally {
       await parkedStorage.releaseAndDrain();
     }
   });
 
-  it("reports a shutdown checkpoint that missed the drain tail and starts no audit write after exit", async () => {
+  it("reports a shutdown checkpoint that missed the drain tail and exits without waiting for it", async () => {
     const fixture = await seededFortress("shared-exit-slow-checkpoint");
     const relay = new NeverDrainingDuplex();
     let stderrText = "";
@@ -2135,17 +2179,33 @@ describe("Hermes memory process shell", () => {
         arguments: { text: "slow checkpoint at exit", taint: "user_content", passage_id: "passage-slow-checkpoint" },
       }));
       await waitUntil(() => stderrText.includes("owner approval is deferred"));
-      const sharedTailBoundMs = DRAIN_TAIL_MS + Math.floor(DRAIN_TAIL_MS / 2);
-      const exitWithinSharedTail = expectExitWithinMs(shell.exited, EXIT_CLEAN, sharedTailBoundMs);
       relay.inject(privateFrame({ type: "relay_shutdown" }));
-      await exitWithinSharedTail;
+      await expectExitWithin(shell.exited, EXIT_CLEAN);
       parkedStorage.exitObserved = true;
-      // The appends drained; the checkpoint write parked, so flush() missed its deadline.
+      // The appends drained; the checkpoint write parked, so flush() missed its deadline and the
+      // checkpoint is reported as unconfirmed, not waited for.
       expect(parkedStorage.auditWriteParked).toBe(true);
       expect(stderrText).toContain("hermes-memory-bridge audit: shutdown checkpoint unconfirmed at exit\n");
       expect(stderrText).not.toContain("record(s) unconfirmed at exit");
+      // Residual, recorded rather than hidden (audit-log-torn-multi-write-sequences-01): the parked
+      // checkpoint write outlives the exit. Released after the barrier is gone, the storage refuses
+      // it and the checkpoint sequence stops there; a fresh log opens the fortress with every entry
+      // the bridge confirmed and no checkpoint for them.
       await parkedStorage.releaseAndDrain();
+      expect(parkedStorage.parkedWriteOutcomes).toEqual([
+        "refused: master write session was released; refusing a later raw fortress mutation",
+      ]);
       expect(parkedStorage.backendWritesAfterExit).toBe(0);
+      const custody = await establishMaster({ storage: parkedStorage, passphrase: PASS });
+      try {
+        const reopened = new AuditLog(parkedStorage, custody.masterKey, { integrityMode: "lenient" });
+        expect(await reopened.getIntegrityFindings()).toEqual([]);
+        const entries = await reopened.query({ operation_type: "hermes_memory_bridge", limit: 20 });
+        expect(entries.entries.some((entry) => entry.details?.kind === "terminal")).toBe(true);
+      } finally {
+        await custody.masterWriteBarrier?.release();
+        custody.masterKey.fill(0);
+      }
     } finally {
       await parkedStorage.releaseAndDrain();
     }
