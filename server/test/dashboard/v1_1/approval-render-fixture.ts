@@ -12,6 +12,8 @@ export function renderApprovalFixture(alwaysAllow = false): string {
     promotableOperation: () => "state_export",
     NON_PROMOTABLE_OPERATIONS: {},
     sourceRead: () => ({ state: "state_LOADED" }), sourceLoaded: () => true,
+    // The decision lock and its drawer echo live beside the settlement code; this fixture renders an idle drawer.
+    decisionInFlight: () => false, renderDecisionInline: () => "",
     escHtml: (v: unknown) => String(v ?? ""),
     renderTemplate: () => "fixture operation",
   }) as string;

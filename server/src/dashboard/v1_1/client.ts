@@ -281,6 +281,10 @@ const state = {
     confirmingTier1Id: null,
     cancelledTier1Id: null,
     inFlightItemId: null,
+    // One retained decision result for every inbox decision, and the lock that is its in-flight form.
+    // Both are owned by the decision-result section below (state_ADMITTEDDecision through state_RELEASEDDecision).
+    lock: null,
+    result: null,
     filters: { state: "all", agent: "", tier: "both", category: "" }
   },
   activity: [],
@@ -1546,6 +1550,9 @@ function renderMain() {
     case "exit-drill": nextHtml = renderExitDrill(); break;
     default: nextHtml = '<p class="muted">Route not found.</p>';
   }
+  // The retained decision result heads every screen that can take a decision, so the outcome of the last
+  // decision is on the screen the operator decided from and survives a route change.
+  if (DECISION_RESULT_ROUTES.indexOf(state.route) >= 0) nextHtml = renderDecisionResult() + nextHtml;
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
   // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
   // a composer that left the document while still owned was replaced by some
@@ -2200,7 +2207,7 @@ function agentApprovalRows(items) {
   return items.slice(0, AGENT_DETAIL_LIST_LIMIT).map(function (item) {
     // Only an explicit Tier 2 hold is safe inline; unknown tiers must take the Approvals review path.
     const controls = item.tier === "tier2"
-      ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>'
+      ? '<button class="btn" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button><button class="btn btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>'
       : '<a class="btn" href="#approvals">Review in Approvals</a>';
     return '<div class="approval-row"><div class="what">' + overviewChip("warn", "WAITING") + ' <span>' + (item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : "Tier Unknown") + '</span> ' +
       escHtml(renderTemplate(item.display_template_id, item.display_template_args)) + '<span class="muted"> · ' + escHtml(item.created_at ? relTimeFromIso(item.created_at) : "age Unknown") + '</span></div><div class="actions">' + controls + '</div></div>';
@@ -4043,20 +4050,20 @@ function renderEvidenceOperationsSection() {
   const batchToolbar = selectedIds.length
     ? '<div class="toolbar" style="margin-bottom:8px;">' +
         '<span class="pill">' + selectedIds.length + ' selected</span>' +
-        '<button class="btn" data-action="inbox-batch-archive">Archive</button>' +
-        '<button class="btn" data-action="inbox-batch-dismiss">Dismiss</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze-open">Snooze</button>' +
-        '<button class="btn btn-danger" data-action="inbox-batch-delete">Delete</button>' +
+        '<button class="btn" data-action="inbox-batch-archive"' + approvalDecisionDisabled() + '>Archive</button>' +
+        '<button class="btn" data-action="inbox-batch-dismiss"' + approvalDecisionDisabled() + '>Dismiss</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-open"' + approvalDecisionDisabled() + '>Snooze</button>' +
+        '<button class="btn btn-danger" data-action="inbox-batch-delete"' + approvalDecisionDisabled() + '>Delete</button>' +
       '</div>'
     : "";
   const snoozeDialog = state.inboxOps.snoozeDialog
     ? '<div class="modal-backdrop"><div class="modal"><h3>Snooze</h3><div class="toolbar">' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (MS_PER_HOUR) + '">1h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (4 * MS_PER_HOUR) + '">4h</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (24 * MS_PER_HOUR) + '">1d</button>' +
-        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (7 * 24 * MS_PER_HOUR) + '">1w</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (4 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>4h</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (24 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1d</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze" data-snooze-ms="' + (7 * 24 * MS_PER_HOUR) + '"' + approvalDecisionDisabled() + '>1w</button>' +
         '<input class="input" data-action="inbox-snooze-custom" type="datetime-local">' +
-        '<button class="btn" data-action="inbox-batch-snooze-custom">Custom</button>' +
+        '<button class="btn" data-action="inbox-batch-snooze-custom"' + approvalDecisionDisabled() + '>Custom</button>' +
         '<button class="btn" data-action="inbox-batch-snooze-close">Cancel</button>' +
       '</div></div></div>'
     : "";
@@ -4103,7 +4110,9 @@ function renderEvidenceOperationsSection() {
       var buttons = reviewInApprovals
         ? '<a class="btn" href="#approvals" data-evidence-review="' + escHtml(i.item_id) + '">Review in Approvals</a>'
         : actions.map(function (act) {
-          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '">' + INBOX_ACTION_LABEL[act] + '</button>';
+          // A decision control shares the one decision lock; a receipt link is not a decision.
+          const decides = act === "approve" || act === "deny" || act === "dismiss";
+          return '<button class="btn" data-action="inbox-' + act + '" data-item-id="' + escHtml(i.item_id) + '"' + (decides ? approvalDecisionDisabled() : "") + '>' + INBOX_ACTION_LABEL[act] + '</button>';
         }).join("");
       var tierBadge = i.kind === "approval_pending"
         ? '<span class="pill">' + escHtml(i.tier) + '</span>'
@@ -4136,7 +4145,7 @@ function renderEvidenceOperationsSection() {
         '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
         '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
       '</section>',
-      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + inboxRows + snoozeDialog + '</section>',
+      '<section class="card"><h3>Inbox (' + inboxCount + ')' + (state.timeRange !== "all" ? ' <span class="count-age">' + escHtml(TIME_RANGE_LABEL[state.timeRange]) + '</span>' : '') + '</h3>' + renderSourceRead(INBOX_PREFS) + filterPanel + (sourceLoaded(HUB + "/inbox") ? batchToolbar : '') + renderDecisionBatchInline() + inboxRows + snoozeDialog + '</section>',
       renderEvidenceDecidedApprovals(),
       '<section class="card"><h3>Agents (' + (sourceLoaded(HUB + "/agents") ? state.agents.length : "Unknown") + ')</h3>' + renderFortressAgentsCard() + '</section>',
       '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
@@ -4363,8 +4372,8 @@ function overviewDecisionRow(item) {
   const tier = item.tier === "tier1" ? "Tier 1" : item.tier === "tier2" ? "Tier 2" : (item.tier ? "Tier " + String(item.tier) : "Tier unknown");
   // Invariant: inline decisions are a positive Tier 2 affordance only; every other served tier stays on the full Approvals path.
   const actions = item.tier === "tier2"
-    ? '<div class="actions"><button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '">Allow once</button>' +
-      '<button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '">Deny</button></div>'
+    ? '<div class="actions"><button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Allow once</button>' +
+      '<button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + approvalDecisionDisabled() + '>Deny</button></div>'
     : '<a class="btn btn-sm" href="#approvals" data-overview-review="' + escHtml(item.item_id) + '">Review in Approvals</a>';
   const agentCell = agentId
     ? '<a href="#agent-detail" data-action="open-agent" data-agent-id="' + escHtml(agentId) + '">' + escHtml(agentId) + '</a>'
@@ -5016,9 +5025,10 @@ function approvalStandingState(item) {
   return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
 }
 
-function approvalDecisionDisabled(item) {
-  // Pending requests retain disabled controls until settlement so repeated clicks cannot compete.
-  return state.approvals.inFlightItemId === item.item_id ? " disabled" : "";
+function approvalDecisionDisabled() {
+  // Invariant: every decision control on every screen reads the one decision lock, so while a decision is in
+  // flight no second request can be clicked anywhere, and each paused control says why.
+  return decisionInFlight() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
 }
 
 function renderApprovalRow(item, selectedId) {
@@ -5041,7 +5051,7 @@ function renderApprovalRow(item, selectedId) {
       '<td><span class="state-chip neutral"><i aria-hidden="true"></i>DECIDED</span><div class="muted">' + escHtml(outcomeLine) + ' · <a href="#activity">Evidence</a></div></td>' +
     '</tr>';
   }
-  const disabled = approvalDecisionDisabled(item);
+  const disabled = approvalDecisionDisabled();
   const decisionCell = item.tier === "tier1"
     ? '<button class="btn btn-sm" data-action="approval-select" data-item-id="' + escHtml(item.item_id) + '">Review in drawer</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>'
     : '<button class="btn btn-sm btn-primary" data-action="inbox-approve" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Allow once</button> <button class="btn btn-sm" data-action="inbox-deny" data-item-id="' + escHtml(item.item_id) + '"' + disabled + '>Deny</button><div class="muted">' + escHtml(approvalRecordLine(item)) + '</div>';
@@ -5071,7 +5081,7 @@ function renderApprovalDrawer(item, empty) {
   const tier = item.tier === "tier1" ? "Tier 1" : "Tier 2";
   const standing = approvalStandingState(item);
   const checked = state.approvals.alwaysAllow && standing.enabled && !item.resolved;
-  const disabled = approvalDecisionDisabled(item);
+  const disabled = approvalDecisionDisabled();
   const primaryAction = checked ? "inbox-promote" : "inbox-approve";
   const primaryLabel = checked ? "Allow always" : "Allow once";
   const checkbox = item.resolved ? "" : '<label class="approval-standing"><input type="checkbox" data-action="approval-always-allow"' +
@@ -5110,7 +5120,7 @@ function renderApprovalDrawer(item, empty) {
     '<div class="approval-drawer-sec"><h4>Why it is held</h4><p>' + escHtml(approvalHoldReason(item)) + '</p></div>' +
     '<div class="approval-drawer-sec"><h4>If you decide</h4><div class="approval-effects"><div><strong>' + primaryLabel + '</strong><p>' + escHtml(allowCopy) + '</p></div><div><strong>Deny</strong><p>Deny sends this refusal and the decision is ' + escHtml(approvalRecordLine(item)) + '.</p></div></div></div>' +
     tier1Note +
-    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
+    '<div class="approval-decide">' + checkbox + '<div class="toolbar">' + primaryButton + denyButton + restartButton + '</div>' + confirmRow + renderDecisionInline(item) + '<p class="muted mono">Decision ' + escHtml(approvalRecordLine(item)) + ' · <a href="#activity">Evidence</a></p></div>' +
   '</aside>';
 }
 
@@ -6476,17 +6486,163 @@ async function onAgentControl(agentId, action) {
 }
 
 async function onInboxAction(itemId, action) {
-  // One request at a time prevents duplicate clicks from issuing competing decisions.
-  if (state.approvals.inFlightItemId) return false;
-  state.approvals.inFlightItemId = itemId;
+  // Invariant: a second decision is never admitted while one holds the lock, so a stale or repeated click
+  // sends nothing and the retained result keeps naming the first request only.
+  if (decisionInFlight()) return false;
+  const result = state_ADMITTEDDecision({ kind: "item", action: action, itemId: itemId, ids: [itemId], subject: decisionSubject(itemId) });
+  let acknowledged = false;
+  await runDecision(result, async function () {
+    const outcome = await performInboxAction(itemId, action);
+    settleDecision(result, outcome.status, outcome.message);
+    acknowledged = outcome.status === "acknowledged";
+  });
+  return acknowledged;
+}
+
+// ── Decision result: one retained outcome for every inbox decision ─────
+// Every per-item and batch decision is admitted into state.approvals.result and settles there; the screens
+// with decision controls render from it, and nothing else reports a decision. Named states, in order:
+// state_ADMITTEDDecision, then settleDecision (acknowledged, refused or uncertain), then
+// refreshAfterDecision, then state_RELEASEDDecision. The lock (state.approvals.lock) is the admitted result
+// and is held through the refresh, so no new decision is taken against a list the last one has not re-read.
+// Must match the reason and note text asserted in test/dashboard/v1_1/approval-decision-result.test.ts.
+const DECISION_BUSY_REASON = "Another decision is being sent.";
+const DECISION_REREAD_NOTE = "The queue could not be re-read after this decision, so this list may be out of date.";
+const DECISION_UNCERTAIN_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
+// The routes whose renderers emit inbox-* or inbox-batch-* controls: Approvals, Overview, Evidence and
+// Agent detail (with its inspect panel). A new decision surface joins this list in the same change.
+const DECISION_RESULT_ROUTES = ["approvals", "posture", "activity", "agent-detail"];
+const DECISION_VERB = { approve: "Allow once", deny: "Deny", dismiss: "Dismiss", archive: "Archive", delete: "Delete", snooze: "Snooze" };
+const DECISION_DONE = { approve: "Allowed once", deny: "Denied", dismiss: "Dismissed", archive: "Archived", delete: "Deleted", snooze: "Snoozed" };
+const DECISION_HEADLINE = { pending: "Sending your decision", acknowledged: "Decision taken", refused: "Decision refused", uncertain: "Decision unconfirmed" };
+
+function decisionInFlight() { return !!state.approvals.lock; }
+function decisionVerb(action) { return DECISION_VERB[action] || action; }
+function decisionDone(action) { return DECISION_DONE[action] || "Done"; }
+function decisionSubject(itemId) {
+  // Captured at admission: after the refresh the item may have left the served projection.
+  const item = state.inbox.find(function (i) { return i.item_id === itemId; });
+  return (item ? approvalOperation(item) + " by " + approvalAgentId(item) + " " : "") + "(request " + itemId + ")";
+}
+function announceDecision(result) {
+  // The shell live region outlives every #main repaint, so an announcement is never lost to innerHTML replacement.
+  const region = document.getElementById("decision-announcement");
+  if (region) region.textContent = DECISION_HEADLINE[result.status] + ". " + result.message;
+}
+function state_ADMITTEDDecision(fields) {
+  // Invariant: the lock and the retained result are set together, so the paused controls and the status text
+  // can never disagree about whether a decision is in flight.
+  const result = Object.assign({ status: "pending", rule: null, refresh: "pending", records: [] }, fields);
+  result.message = "Sending " + decisionVerb(result.action) + " for " + result.subject + ". Other decision controls are paused until the server answers.";
+  state.approvals.lock = result;
+  state.approvals.result = result;
+  state.approvals.inFlightItemId = result.kind === "item" ? result.itemId : null;
+  announceDecision(result);
   rerender();
+  return result;
+}
+function settleDecision(result, status, message) {
+  // Invariant: only the result holding the lock settles, and only once; a late or foreign settlement is
+  // dropped, so the retained outcome always belongs to the admitted request.
+  if (state.approvals.lock !== result || result.status !== "pending") return;
+  result.status = status;
+  result.message = message;
+  announceDecision(result);
+  rerender();
+}
+function extendDecision(result, text, rule) {
+  if (state.approvals.lock !== result) return;
+  result.message += " " + text;
+  if (rule) result.rule = rule;
+  announceDecision(result);
+  rerender();
+}
+async function refreshAfterDecision(result) {
+  // Invariant: the refresh never changes the status. A false return, an inbox read that did not load, or a
+  // thrown repaint all become the plain-English re-read note, so an acknowledged decision cannot read as
+  // refused and a stale list cannot read as current.
+  let loaded = false;
+  try { loaded = !!(await fetchAll(true)) && sourceLoaded(HUB + "/inbox"); }
+  catch (e) { loaded = false; }
+  if (state.approvals.lock !== result) return;
+  result.refresh = loaded ? "loaded" : "unavailable";
+  if (!loaded) announceDecision(result);
+}
+function state_RELEASEDDecision(result) {
+  if (state.approvals.lock !== result) return;
+  state.approvals.lock = null;
+  state.approvals.inFlightItemId = null;
+  // Consent belongs to the selected request; a decision on another row leaves it in place.
+  if (result.ids.indexOf(state.approvals.selectedId) >= 0) resetApprovalConsent();
+  rerender();
+}
+async function runDecision(result, send) {
   try {
-    return await performInboxAction(itemId, action);
-  } finally {
-    state.approvals.inFlightItemId = null;
-    resetApprovalConsent();
-    rerender();
+    try { await send(); }
+    catch (e) { settleDecision(result, "uncertain", "The server's answer could not be read (" + ((e && e.message) || "no detail") + "). " + DECISION_UNCERTAIN_ADVICE); }
+    await refreshAfterDecision(result);
+  } finally { state_RELEASEDDecision(result); }
+}
+function decisionRefusedByServer(error) {
+  // Invariant: only a 4xx answer proves the server refused; no answer, a 5xx or an unreadable body leaves the
+  // decision uncertain, never refused and never acknowledged.
+  const status = error && error.status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
+function decisionOutcomeFromError(action, subject, error) {
+  const http = error && typeof error.status === "number" ? " (HTTP " + error.status + ")" : "";
+  const reason = (error && error.message) || "no answer from the server";
+  if (decisionRefusedByServer(error)) {
+    // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2; the operator needs the next step, not the code.
+    const detail = error.status === 409 && action === "dismiss" ? "Tier 1 items cannot be dismissed. Approve or deny instead." : reason + http + ".";
+    return { status: "refused", message: decisionVerb(action) + " was refused for " + subject + ": " + detail + " The request is still waiting." };
   }
+  return { status: "uncertain", message: "The server did not confirm " + decisionVerb(action) + " for " + subject + " (" + reason + http + "). " + DECISION_UNCERTAIN_ADVICE };
+}
+function decisionAcknowledges(body, itemId) {
+  // Invariant: an acknowledgement is only a 2xx body that names the admitted item as resolved; a 2xx that says
+  // anything else is uncertain, so the screen never shows a decision the server did not confirm.
+  const item = body && body.data && body.data.item;
+  return !!(item && item.item_id === itemId && item.resolved === true);
+}
+function decisionRecordLine(item, action) {
+  if (!item || (action !== "approve" && action !== "deny")) return "";
+  return isCharterApprovalItem(item) ? " Recorded in your audit log." : " Marked decided in this inbox.";
+}
+function renderDecisionResult() {
+  const r = state.approvals.result;
+  if (!r) return "";
+  const note = r.refresh === "unavailable" ? " " + DECISION_REREAD_NOTE : r.status !== "pending" && r.refresh === "pending" ? " Re-reading the queue." : "";
+  const records = r.records.length
+    ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
+  // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock.
+  const clear = r.status === "pending" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + DECISION_HEADLINE[r.status] + '</strong><p>' + escHtml(r.message + note) + '</p>' + records + '</div>' + clear + '</section>';
+}
+function decisionFirstSentence(message) {
+  const first = message.split(". ")[0];
+  return first.slice(-1) === "." ? first : first + ".";
+}
+function renderDecisionBatchInline() {
+  // The Evidence inbox repeats the one-line status of the last batch beside its toolbar, since the result block
+  // at the top of the screen can sit above the fold when the operator decided from this section.
+  const r = state.approvals.result;
+  if (!r || r.kind !== "batch") return "";
+  const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
+    : r.status === "acknowledged" ? decisionFirstSentence(r.message)
+    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
+    : "Unconfirmed. See the decision result at the top of this screen.";
+  return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
+}
+function renderDecisionInline(item) {
+  // The drawer repeats the one-line status for the selected request only; the full text stays in the result block.
+  const r = state.approvals.result;
+  if (!r || r.kind !== "item" || r.itemId !== item.item_id || item.resolved) return "";
+  const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
+    : r.status === "acknowledged" ? decisionDone(r.action) + "."
+    : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
+    : "Unconfirmed. See the decision result at the top of this screen.";
+  return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
 
 // Below the stacking breakpoint the drawer sits under the whole queue, so selecting a row moves focus to
@@ -6505,7 +6661,7 @@ function focusTier1Cancel() {
 function state_ARMEDTier1(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   // Arming binds consent to the current unresolved Tier 1 request, never a stale or in-flight row.
-  if (!item || item.resolved || item.tier !== "tier1" || state.approvals.selectedId !== itemId || state.approvals.inFlightItemId) return;
+  if (!item || item.resolved || item.tier !== "tier1" || state.approvals.selectedId !== itemId || decisionInFlight()) return;
   state.approvals.confirmingTier1Id = itemId;
   state.approvals.cancelledTier1Id = null;
   rerender();
@@ -6513,7 +6669,7 @@ function state_ARMEDTier1(itemId) {
 }
 function state_CANCELLEDTier1(itemId) {
   // An in-flight approval cannot be cancelled by a local control after submission.
-  if (state.approvals.inFlightItemId) return;
+  if (decisionInFlight()) return;
   // Cancellation disarms the request before repainting, so no subsequent Confirm can submit it.
   state.approvals.confirmingTier1Id = null;
   state.approvals.cancelledTier1Id = itemId;
@@ -6523,29 +6679,26 @@ function state_CANCELLEDTier1(itemId) {
 async function state_APPROVINGAlwaysAllow(itemId) {
   const item = state.inbox.find(function (i) { return i.item_id === itemId; });
   // Only an explicitly checked, available standing option on this waiting item can begin promotion.
-  if (!item || item.resolved || state.approvals.selectedId !== itemId || !state.approvals.alwaysAllow || !approvalStandingState(item).enabled || state.approvals.inFlightItemId) return;
+  if (!item || item.resolved || state.approvals.selectedId !== itemId || !state.approvals.alwaysAllow || !approvalStandingState(item).enabled || decisionInFlight()) return;
   const op = promotableOperation(item);
-  state.approvals.inFlightItemId = itemId;
-  rerender();
-  try {
-    // A refused approval never grants a standing rule; only the successful continuation reaches compile.
-    if (!await performInboxAction(itemId, "approve")) return;
-    await state_PROMOTINGAlwaysAllow(itemId, op);
-  } finally {
-    state.approvals.inFlightItemId = null;
-    resetApprovalConsent();
-    rerender();
-  }
+  const result = state_ADMITTEDDecision({ kind: "item", action: "approve", itemId: itemId, ids: [itemId], subject: decisionSubject(itemId), rule: "pending" });
+  await runDecision(result, async function () {
+    const outcome = await performInboxAction(itemId, "approve");
+    settleDecision(result, outcome.status, outcome.message);
+    // Invariant: a refused or unconfirmed approval never grants a standing rule; only an acknowledged approval reaches compile.
+    if (outcome.status !== "acknowledged") { extendDecision(result, "No standing rule was requested.", "refused"); return; }
+    await state_PROMOTINGAlwaysAllow(result, itemId, op);
+  });
 }
-async function state_PROMOTINGAlwaysAllow(itemId, op) {
+async function state_PROMOTINGAlwaysAllow(result, itemId, op) {
   try {
     await onInboxPromote(itemId, op);
+    extendDecision(result, "Standing rule added: agents may " + op + " without asking.", "added");
   } catch (e) {
-    // Approval has already succeeded, so a policy failure must report that partial outcome explicitly.
-    toast("Allowed once. The standing rule was not added: " + e.message, "error");
-  } finally {
-    await fetchAll(true);
-    rerender();
+    // The approval already succeeded, so a policy failure reports that partial outcome in words, never as a refused decision.
+    extendDecision(result, e && e.ruleUncertain
+      ? "The standing rule may not have been added: " + e.message + " Check the policy before relying on it."
+      : "The standing rule was not added: " + ((e && e.message) || "no detail"), e && e.ruleUncertain ? "uncertain" : "refused");
   }
 }
 
@@ -6556,78 +6709,76 @@ async function performInboxAction(itemId, action) {
   // resolve with the lockdown / exit-drill side effects preserved.
   // After approve, the inspect panel for the bound agent (if any) is
   // re-fetched via the route, not through state mutation.
+  // Returns the settled outcome { status, message } for the caller's retained result; it never reports on its own.
   const item0 = state.inbox.find(function (x) { return x.item_id === itemId; });
   const boundAgentId = (item0 && item0.agent_id) || null;
+  const subject = decisionSubject(itemId);
+  let r;
   try {
-    const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
-    const item = (r.data && r.data.item) || null;
-    // payload is resolved here, before the lockdown and exit-drill branches, so both can
-    // read it. Declaring it inside the lockdown if-block puts it out of scope for the
-    // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
-    const payload = item ? (item.resolution_payload || {}) : {};
-    if (item && state.tier1.lockdown.inboxItemId === itemId) {
-      if (action === "approve" && payload.outcome === "engaged") {
-        state.tier1.lockdown.state = "engaged";
-      } else if (action === "approve" && payload.outcome === "partial") {
-        state.tier1.lockdown.state = "partial";
-        toast("Lockdown partially applied. At least one confined agent did not confirm a live stop.", "info");
-      } else {
-        state.tier1.lockdown.state = "idle";
-        if (action === "approve" && payload.outcome) {
-          toast("Lockdown outcome: " + payload.outcome + ".", "error");
-        }
-      }
-      renderTopbar();
-    }
-    if (state.exitDrill.inboxItemId === itemId && action === "approve") {
-      // A7: read the real export values from resolution_payload rather than
-      // a placeholder, so the dashboard renders the honest state_entry_count
-      // and warnings. payload is in scope from the outer block above.
-      // state_entry_count accepts only nonneg integers; fractional or negative
-      // values are stored as null so the renderer omits the field rather than
-      // displaying a nonsensical count.
-      // warnings accepts only string entries; non-string entries are filtered
-      // out before they reach escHtml so a future coercion change cannot widen
-      // the injection surface.
-      const rawCount = payload.state_entry_count;
-      const secCount = (typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 0) ? rawCount : null;
-      const rawWarnings = payload.warnings;
-      const secWarnings = Array.isArray(rawWarnings)
-        ? rawWarnings.filter(function(w) { return typeof w === "string"; })
-        : undefined;
-      state.exitDrill.bundleResult = {
-        bundle_dir: payload.bundle_dir || "(see activity feed)",
-        manifest_hash: payload.manifest_hash || "",
-        artifact_count: typeof payload.artifact_count === "number" ? payload.artifact_count : 0,
-        state_entry_count: secCount,
-        warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
-      };
-    }
-    await fetchAll(true);
-    // After approve on an agent-bound inbox item, refresh the inspect
-    // panel for that agent if the operator is currently viewing it, so
-    // the panel reflects the resolved approval.
-    if (
-      action === "approve" &&
-      boundAgentId &&
-      state.selectedAgentId === boundAgentId &&
-      state.chat.inspect.panelByAgentId[boundAgentId]
-    ) {
-      void onAgentInspectOpen(boundAgentId);
-    }
-    rerender();
-    return true;
+    r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
   } catch (e) {
-    await fetchAll(true);
-    // Tier 1 dismiss returns HubConflictError (409) per binding addendum 1.2.
-    if (e.status === 409) {
-      toast("Tier 1 items cannot be dismissed. Approve or deny.", "error");
-    } else {
-      toast("Inbox action failed: " + e.message, "error");
-    }
-    rerender();
-    return false;
+    return decisionOutcomeFromError(action, subject, e);
   }
+  if (!decisionAcknowledges(r, itemId)) {
+    return { status: "uncertain", message: "The server answered but did not confirm " + decisionVerb(action) + " for " + subject + ". " + DECISION_UNCERTAIN_ADVICE };
+  }
+  const item = r.data.item;
+  // payload is resolved here, before the lockdown and exit-drill branches, so both can
+  // read it. Declaring it inside the lockdown if-block puts it out of scope for the
+  // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
+  const payload = item.resolution_payload || {};
+  let effect = "";
+  if (item && state.tier1.lockdown.inboxItemId === itemId) {
+    if (action === "approve" && payload.outcome === "engaged") {
+      state.tier1.lockdown.state = "engaged";
+      effect = " Lockdown engaged.";
+    } else if (action === "approve" && payload.outcome === "partial") {
+      state.tier1.lockdown.state = "partial";
+      effect = " Lockdown partially applied. At least one confined agent did not confirm a live stop.";
+    } else {
+      state.tier1.lockdown.state = "idle";
+      if (action === "approve" && payload.outcome) {
+        effect = " Lockdown outcome: " + payload.outcome + ".";
+      }
+    }
+    renderTopbar();
+  }
+  if (state.exitDrill.inboxItemId === itemId && action === "approve") {
+    // A7: read the real export values from resolution_payload rather than
+    // a placeholder, so the dashboard renders the honest state_entry_count
+    // and warnings. payload is in scope from the outer block above.
+    // state_entry_count accepts only nonneg integers; fractional or negative
+    // values are stored as null so the renderer omits the field rather than
+    // displaying a nonsensical count.
+    // warnings accepts only string entries; non-string entries are filtered
+    // out before they reach escHtml so a future coercion change cannot widen
+    // the injection surface.
+    const rawCount = payload.state_entry_count;
+    const secCount = (typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 0) ? rawCount : null;
+    const rawWarnings = payload.warnings;
+    const secWarnings = Array.isArray(rawWarnings)
+      ? rawWarnings.filter(function(w) { return typeof w === "string"; })
+      : undefined;
+    state.exitDrill.bundleResult = {
+      bundle_dir: payload.bundle_dir || "(see activity feed)",
+      manifest_hash: payload.manifest_hash || "",
+      artifact_count: typeof payload.artifact_count === "number" ? payload.artifact_count : 0,
+      state_entry_count: secCount,
+      warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
+    };
+  }
+  // After approve on an agent-bound inbox item, refresh the inspect
+  // panel for that agent if the operator is currently viewing it, so
+  // the panel reflects the resolved approval.
+  if (
+    action === "approve" &&
+    boundAgentId &&
+    state.selectedAgentId === boundAgentId &&
+    state.chat.inspect.panelByAgentId[boundAgentId]
+  ) {
+    void onAgentInspectOpen(boundAgentId);
+  }
+  return { status: "acknowledged", message: decisionDone(action) + ": " + subject + "." + decisionRecordLine(item0, action) + effect };
 }
 
 // Tunability UX: promote a pending approval into a durable standing rule.
@@ -6666,6 +6817,7 @@ async function onInboxPromote(itemId, approvedOperation) {
 // we retry with the audited override. The gate is never bypassed silently:
 // a refused promote either stops or goes through the operator-confirmed,
 // server-audited (policy_force_downgrade_used) path.
+// Resolves when the rule is activated and throws otherwise; the caller's retained result carries the outcome.
 async function activateStandingRule(draftId, op, force) {
   const path = "/drafts/" + encodeURIComponent(draftId) + "/activate" +
     (force ? "?override_downgrade=true" : "");
@@ -6673,15 +6825,12 @@ async function activateStandingRule(draftId, op, force) {
     const activated = await policyApi(path, { method: "POST", body: {} });
     const status = activated && activated.data && activated.data.status;
     if (status === "activated") {
-      toast(force
-        ? "Standing rule added (you confirmed it relaxes protection)."
-        : "Standing rule added: agents may " + op + " without asking.");
       if (state.route === "policy") await loadPolicyView(true);
-      await fetchAll(true);
-      rerender();
     } else {
       // Only an explicit activated result establishes that the standing rule was added.
-      throw new Error("Rule not activated (" + (status || "refused") + ").");
+      const notActivated = new Error("Rule not activated (" + (status || "refused") + ").");
+      notActivated.ruleRefused = true;
+      throw notActivated;
     }
   } catch (e) {
     if (e.status === 409 && !force) {
@@ -6693,37 +6842,89 @@ async function activateStandingRule(draftId, op, force) {
       if (ok) return activateStandingRule(draftId, op, true);
       throw new Error("you chose to keep your protection.");
     }
+    let error = e;
     if (e.status === 401 || e.status === 403) {
-      throw new Error("Operator token required to change policy.");
+      error = new Error("Operator token required to change policy.");
     } else if (e.status === 503) {
-      throw new Error("Policy engine is not configured on this fortress.");
-    } else {
-      throw e;
+      error = new Error("Policy engine is not configured on this fortress.");
     }
+    // Invariant: a 4xx, a non-activated status, an unconfigured engine or the operator's own cancel is a definite
+    // refusal; only an activate call with no readable answer may have taken effect, so only that is uncertain.
+    error.ruleUncertain = !(e.ruleRefused || decisionRefusedByServer(e) || e.status === 503);
+    throw error;
   }
 }
 
 async function onInboxBatchAction(action, until) {
+  // The batch shares the one decision lock, so it never overlaps an individual decision or another batch.
+  if (decisionInFlight()) return;
   const ids = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   if (ids.length === 0) return;
-  try {
-    if (action === "archive" || action === "delete" || action === "snooze") {
-      await fetch("/api/inbox/unified/batch", {
-        method: "POST",
-        headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
-        body: JSON.stringify({ action: action, entry_ids: ids, until: until })
-      });
-    }
+  const result = state_ADMITTEDDecision({ kind: "batch", action: action, ids: ids, subject: ids.length + (ids.length === 1 ? " selected item" : " selected items") });
+  await runDecision(result, async function () {
     if (action === "dismiss") {
-      for (const id of ids) await onInboxAction(id, "dismiss");
+      // Each id takes the same path as an individual decision under the batch's lock, and each outcome is kept.
+      for (const id of ids) {
+        const outcome = await performInboxAction(id, "dismiss");
+        result.records.push({ itemId: id, status: outcome.status, message: outcome.message });
+      }
+      settleBatchFromRecords(result);
+    } else if (action === "archive" || action === "delete" || action === "snooze") {
+      settleUnifiedBatch(result, ids, await submitUnifiedBatch(action, ids, until));
+    } else {
+      settleDecision(result, "refused", "Unsupported batch action " + action + "; nothing was sent.");
     }
-    state.inboxOps.selected = {};
-    state.inboxOps.snoozeDialog = null;
-    await fetchAll(true);
-    rerender();
-  } catch (e) {
-    toast("Inbox batch action failed.", "error");
+    // Invariant: the selection clears only on an acknowledgement, so a refused or unconfirmed batch leaves the
+    // operator's choice in place for a retry instead of looking done.
+    if (result.status === "acknowledged") {
+      state.inboxOps.selected = {};
+      state.inboxOps.snoozeDialog = null;
+    }
+  });
+}
+function settleBatchFromRecords(result) {
+  const counts = { acknowledged: 0, refused: 0, uncertain: 0 };
+  result.records.forEach(function (rec) { counts[rec.status]++; });
+  const total = result.records.length;
+  // One unconfirmed item makes the batch unconfirmed; a batch with no acknowledgement is refused.
+  const status = counts.uncertain ? "uncertain" : counts.acknowledged ? "acknowledged" : "refused";
+  const message = decisionDone(result.action) + " " + counts.acknowledged + " of " + total + (total === 1 ? " item." : " items.") +
+    (counts.refused ? " " + counts.refused + (counts.refused === 1 ? " was refused." : " were refused.") : "") +
+    (counts.uncertain ? " " + counts.uncertain + (counts.uncertain === 1 ? " is unconfirmed. " : " are unconfirmed. ") + DECISION_UNCERTAIN_ADVICE : "");
+  settleDecision(result, status, message);
+}
+async function submitUnifiedBatch(action, ids, until) {
+  // The unified inbox keeps its own route and bearer handling; only the answer is now read before anything is reported.
+  const res = await fetch("/api/inbox/unified/batch", {
+    method: "POST",
+    headers: Object.assign({ "Content-Type": "application/json" }, TOKEN ? { "Authorization": "Bearer " + TOKEN } : {}),
+    body: JSON.stringify({ action: action, entry_ids: ids, until: until })
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  return { ok: res.ok, status: res.status, body: body };
+}
+function settleUnifiedBatch(result, ids, answer) {
+  const body = answer.body;
+  if (!answer.ok) {
+    const error = new Error(body && (body.error || body.detail) ? (body.error || body.detail) : "HTTP " + answer.status);
+    error.status = answer.status;
+    const outcome = decisionOutcomeFromError(result.action, result.subject, error);
+    settleDecision(result, outcome.status, outcome.message);
+    return;
   }
+  const summary = body && body.ok === true && body.data && body.data.result;
+  // Invariant: a batch is acknowledged only by a summary whose counts account for every id sent (must match
+  // BatchActionResult in principal-policy/unified-inbox-bridge.ts); anything else is uncertain.
+  const consistent = !!summary && summary.requested === ids.length && Number.isInteger(summary.affected) &&
+    Array.isArray(summary.missing) && summary.affected + summary.missing.length === summary.requested;
+  if (!consistent) {
+    settleDecision(result, "uncertain", "The server answered but did not confirm " + decisionVerb(result.action) + " for " + result.subject + ". " + DECISION_UNCERTAIN_ADVICE);
+    return;
+  }
+  const missing = summary.missing.length;
+  settleDecision(result, "acknowledged", decisionDone(result.action) + " " + summary.affected + " of " + ids.length + (ids.length === 1 ? " item." : " items.") +
+    (missing ? " " + missing + (missing === 1 ? " was not found: " : " were not found: ") + summary.missing.map(String).join(", ") + "." : ""));
 }
 
 async function onExitExportStart() {
@@ -7295,9 +7496,15 @@ document.addEventListener("click", function (ev) {
     rerender();
     return focusApprovalDrawer();
   }
+  if (action === "decision-result-clear") {
+    // A result leaves the screen only through its own control, and never while its decision holds the lock.
+    if (decisionInFlight()) return;
+    state.approvals.result = null;
+    return rerender();
+  }
   if (action === "approval-always-allow") {
     // An in-flight decision retains its consent state until settlement.
-    if (state.approvals.inFlightItemId === state.approvals.selectedId) return;
+    if (decisionInFlight()) return;
     state.approvals.alwaysAllow = !!tgt.checked;
     state.approvals.confirmingTier1Id = null;
     return rerender();
