@@ -14,8 +14,11 @@
  * approval, and an activation answer that cannot be read is unconfirmed, never refused; a decision is sent only
  * against a loaded queue that still holds every admitted request, otherwise nothing is sent and the result says
  * so; the row the operator decided from echoes the outcome; a partly refused batch says so in its headline; an
- * unconfirmed result's Clear control names the check it expects first. The decision-result witness for
- * D5-approval; this header carries the bare id only.
+ * unconfirmed result has no Clear control and stays until the next decision replaces it; a local non-admission
+ * is its own "not sent" outcome, never a refusal; the row Snooze menu and the selection pause while a batch holds
+ * the lock; a batch summary is confirmed only when every count and missing id is accounted for; the result block
+ * heads the stopped-updates panel too. The decision-result witness for D5-approval; this header carries the bare
+ * id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
@@ -47,6 +50,7 @@ const REREAD = "The queue could not be re-read after this decision, so this list
 const REREAD_BUSY = 'disabled title="The queue is being re-read after a decision."';
 const UNCONFIRMED_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
 const CHECK_RULE = " Check the policy before relying on it.";
+const UNCONFIRMED_STAYS = "This result stays on screen until your next decision replaces it.";
 const NOT_SENT_STALE = "the request is no longer waiting in the loaded queue, so nothing was sent.";
 const NOT_SENT_UNREAD = "the queue has not been read since it last changed, so nothing was sent. Re-read the queue first.";
 
@@ -196,13 +200,15 @@ describe("one retained decision result", () => {
       });
       await settle();
       h.navigate("approvals");
+      const requestsBeforeDecision = h.requests.length;
       h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
       await settle();
       expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/approve"]);
       expect(h.result()).toContain('data-decision-status="acknowledged"');
       expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.result()).not.toMatch(/refused|failed/);
-      if (failing === "every read") expect(h.requests.filter((r) => r.init?.method !== "POST" && r.url.startsWith("/api/") && !r.url.startsWith("/api/hub/inbox")).length).toBeGreaterThan(1);
+      // Only the reads the refresh issued after the decision count, so boot traffic cannot satisfy this.
+      if (failing === "every read") expect(h.requests.slice(requestsBeforeDecision).filter((r) => r.init?.method !== "POST" && !r.url.startsWith("/api/hub/inbox")).length).toBeGreaterThan(1);
       expect(h.el["decision-announcement"]!.textContent).toBe("Decision taken. Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.el["toast-host"]!.innerHTML).toBe("");
       expect(h.read("state.approvals.lock")).toBeNull();
@@ -260,10 +266,35 @@ describe("one retained decision result", () => {
       expect(h.result()).toContain('data-decision-status="uncertain"');
       expect(h.result()).toContain("did not confirm Allow once for state export by fixture-agent (request wait-1). " + UNCONFIRMED_ADVICE);
       expect(h.result()).not.toContain("Allowed once");
-      expect(h.result()).toContain('data-action="decision-result-clear">Clear after checking the queue</button>');
+      expect(h.result(), "an unconfirmed result has no Clear control").not.toContain("decision-result-clear");
+      expect(h.result()).toContain(UNCONFIRMED_STAYS);
+      h.click({ "data-action": "decision-result-clear" });
+      expect(h.read("state.approvals.result.status"), "a stray clear click leaves the warning").toBe("uncertain");
       expect(h.main()).toContain("WAITING");
     });
   }
+
+  it("an unconfirmed result is replaced only by the next decision", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/inbox/wait-1/approve": () => Promise.resolve(response({ error: "storage unavailable" }, 500)),
+      "/api/hub/inbox/wait-2/deny": () => Promise.resolve(response(resolvedBody("wait-2"))),
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="uncertain"');
+    expect(h.result()).not.toContain("decision-result-clear");
+    h.navigate("posture");
+    expect(h.result()).toContain('data-decision-status="uncertain"');
+    h.click({ "data-action": "inbox-deny", "data-item-id": "wait-2" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="acknowledged"');
+    expect(h.result()).toContain("Denied: state export by fixture-agent (request wait-2).");
+    expect(h.result()).toContain('data-action="decision-result-clear">Clear</button>');
+  });
 
   for (const [label, answer, status, text] of [
     ["a 500", () => Promise.resolve(response({ error: "storage unavailable" }, 500)), "uncertain", "did not confirm Allow once for state export by fixture-agent (request wait-1) (storage unavailable (HTTP 500))."],
@@ -358,25 +389,30 @@ describe("one retained decision result", () => {
     expect(h.read("Object.keys(state.inboxOps.selected).length")).toBe(0);
   });
 
-  for (const [label, body] of [
-    ["carries no summary", { ok: true }],
-    ["counts more requests than were sent", { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 2, affected: 1, missing: [] } } }],
-    ["counts that do not add up", { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 1, missing: ["wait-9"] } } }],
+  for (const [label, sent, body] of [
+    ["carries no summary", 1, { ok: true }],
+    ["counts more requests than were sent", 1, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 2, affected: 1, missing: [] } } }],
+    ["counts that do not add up", 1, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 1, missing: ["wait-9"] } } }],
+    ["carries a negative count that adds up", 1, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: -1, missing: ["wait-1", "wait-2"] } } }],
+    ["names a missing id this batch did not send", 1, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 0, missing: ["wait-9"] } } }],
+    ["names a missing entry that is not an id", 1, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 0, missing: [{ foreign: "wait-1" }] } } }],
+    ["names the same missing id twice", 2, { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 2, affected: 0, missing: ["wait-1", "wait-1"] } } }],
   ] as const) it(`a unified batch whose answer ${label} reads as unconfirmed and keeps the selection`, async () => {
     vi.useFakeTimers();
     const h = boot({
-      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1")] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
       "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
       "/api/inbox/unified/batch": () => Promise.resolve(response(body)),
     });
     await settle();
     h.navigate("activity");
-    h.read('state.inboxOps.selected["wait-1"] = true; rerender();');
+    h.read('state.inboxOps.selected["wait-1"] = true;' + (sent === 2 ? ' state.inboxOps.selected["wait-2"] = true;' : "") + ' rerender();');
     h.click({ "data-action": "inbox-batch-archive" });
     await settle();
     expect(h.result()).toContain('data-decision-status="uncertain"');
-    expect(h.result()).toContain("did not confirm Archive for 1 selected item.");
+    expect(h.result()).toContain("did not confirm Archive for " + sent + " selected item" + (sent === 1 ? "." : "s."));
     expect(h.result()).not.toContain("Archived");
+    expect(h.result()).not.toContain("[object");
     expect(h.read('state.inboxOps.selected["wait-1"]')).toBe(true);
   });
 
@@ -398,6 +434,7 @@ describe("one retained decision result", () => {
     expect(h.result()).toContain("<strong>Decision partly taken</strong>");
     expect(h.el["decision-announcement"]!.textContent).toContain("Decision partly taken. Dismissed 1 of 2 items. 1 was refused.");
     expect(h.result()).toContain("Dismissed 1 of 2 items. 1 was refused.");
+    expect(h.main(), "the toolbar echo keeps the partial refusal").toContain('<p class="decision-inline" data-decision-status="acknowledged">Dismissed 1 of 2 items. 1 was refused.</p>');
     expect(h.result()).toContain("<li>Dismissed: state export by fixture-agent (request wait-1).</li>");
     expect(h.result()).toContain("<li>Dismiss was refused for state export by fixture-agent (request tier1-1): Tier 1 items cannot be dismissed. Approve or deny instead. The decision was not applied.</li>");
   });
@@ -440,6 +477,10 @@ describe("one retained decision result", () => {
     h.read('state.inboxOps.selected["wait-2"] = true; state.inboxOps.snoozeDialog = true; rerender();');
     for (const control of ["inbox-batch-archive", "inbox-batch-dismiss", "inbox-batch-snooze-open", "inbox-batch-delete", "inbox-batch-snooze-custom"]) expect(h.main()).toContain(`data-action="${control}" ` + BUSY);
     expect(h.main().match(/data-action="inbox-batch-snooze" data-snooze-ms="\d+" disabled title=/g)?.length, "every snooze duration is paused").toBe(4);
+    expect(h.main(), "the row Snooze menu is paused").toContain('data-action="inbox-snooze-menu" data-item-id="wait-2" ' + BUSY + '>...</button>');
+    expect(h.main(), "an item decision leaves the selection live").toContain('data-action="inbox-select" data-item-id="wait-2" checked>');
+    h.click({ "data-action": "inbox-snooze-menu", "data-item-id": "wait-1" });
+    expect(h.read('state.inboxOps.selected["wait-2"] === true && state.inboxOps.selected["wait-1"] !== true'), "the row menu under the lock changes nothing").toBe(true);
     expect(h.main(), "the Evidence row echoes its own decision").toContain('</div><p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
     expect(h.main().split('class="decision-inline"').length - 1, "only the decided row echoes").toBe(1);
     expect(h.main()).toContain('data-action="inbox-approve" data-item-id="wait-2" ' + BUSY);
@@ -463,6 +504,54 @@ describe("one retained decision result", () => {
     expect(h.main()).not.toContain(BUSY);
     h.navigate("activity");
     expect(h.main(), "the decided row echoes the outcome").toContain('<p class="decision-inline" data-decision-status="acknowledged">Allowed once.</p>');
+  });
+
+  it("a batch in flight keeps its selection against the row Snooze menu and the checkboxes until it settles", async () => {
+    vi.useFakeTimers();
+    const answer = gate<unknown>();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      "/api/inbox/unified/batch": () => answer.promise,
+    });
+    await settle();
+    h.navigate("activity");
+    h.read('state.inboxOps.selected["wait-1"] = true; rerender();');
+    h.click({ "data-action": "inbox-batch-archive" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="pending"');
+    expect(h.main()).toContain('data-action="inbox-select" data-item-id="wait-2" ' + BUSY + '>');
+    expect(h.main()).toContain('data-action="inbox-snooze-menu" data-item-id="wait-2" ' + BUSY + '>...</button>');
+    h.click({ "data-action": "inbox-snooze-menu", "data-item-id": "wait-2" });
+    h.click({ "data-action": "inbox-select", "data-item-id": "wait-2" }, true);
+    h.click({ "data-action": "inbox-select", "data-item-id": "wait-1" }, false);
+    expect(h.read("JSON.stringify(state.inboxOps.selected)")).toBe('{"wait-1":true}');
+    expect(h.read("state.inboxOps.snoozeDialog")).toBeFalsy();
+    answer.release(response({ ok: false, error: "delete_confirmation_required" }, 400));
+    await settle();
+    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.read("JSON.stringify(state.inboxOps.selected)"), "the refused batch keeps the selection it sent").toBe('{"wait-1":true}');
+    expect(h.main()).not.toContain(BUSY);
+    h.click({ "data-action": "inbox-snooze-menu", "data-item-id": "wait-2" });
+    expect(h.read("JSON.stringify(state.inboxOps.selected)"), "after release the row menu works again").toBe('{"wait-2":true}');
+  });
+
+  it("the result block heads the stopped-updates panel too", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1")] } })),
+      "/api/hub/inbox/wait-1/approve": () => Promise.resolve(response(resolvedBody("wait-1"))),
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="acknowledged"');
+    h.read("liveUpdatesStopped = true; rerender();");
+    expect(h.main()).toContain("Live updates stopped");
+    expect(h.result()).toContain('data-decision-status="acknowledged"');
+    expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1).");
+    expect(h.main().indexOf('class="decision-result"')).toBeLessThan(h.main().indexOf("Live updates stopped"));
   });
 
   it("controls stay paused with the re-read reason until the queue re-read settles", async () => {
@@ -506,20 +595,25 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.posts()).toEqual([]);
     expect(h.read("state.approvals.lock")).toBeNull();
-    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.result()).toContain('data-decision-status="not_sent"');
+    expect(h.result()).not.toContain('data-decision-status="refused"');
+    expect(h.result()).toContain("<strong>Decision not sent</strong>");
     expect(h.result()).toContain("Allow once was not sent for (request gone-1): " + NOT_SENT_STALE);
-    expect(h.el["decision-announcement"]!.textContent).toBe("Decision refused. Allow once was not sent for (request gone-1): " + NOT_SENT_STALE);
+    expect(h.result()).toContain('data-action="decision-result-clear">Clear</button>');
+    expect(h.el["decision-announcement"]!.textContent).toBe("Decision not sent. Allow once was not sent for (request gone-1): " + NOT_SENT_STALE);
     expect(h.main()).not.toContain(BUSY);
     h.click({ "data-action": "inbox-deny", "data-item-id": "done-1" });
     await settle();
     expect(h.posts()).toEqual([]);
     expect(h.result()).toContain("Deny was not sent for state export by fixture-agent (request done-1): " + NOT_SENT_STALE);
+    expect(h.main(), "the decided row echoes the not-sent outcome").not.toContain('data-decision-status="refused"');
     h.navigate("activity");
     h.read('state.inboxOps.selected["wait-1"] = true; state.inboxOps.selected["done-1"] = true; state.inboxOps.snoozeDialog = true; rerender();');
     h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
     await settle();
     expect(h.posts()).toEqual([]);
-    expect(h.result()).toContain("Snooze was not sent for 2 selected items: 1 of 2 selected items are no longer waiting in the loaded queue, so nothing was sent.");
+    expect(h.result()).toContain("Snooze was not sent for 2 selected items: 1 of the 2 selected items is no longer waiting in the loaded queue, so nothing was sent.");
+    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="not_sent">Not sent. See the decision result at the top of this screen.</p>');
     expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["done-1"] === true')).toBe(true);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
@@ -545,7 +639,7 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
     await settle();
     expect(h.posts()).toEqual([]);
-    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.result()).toContain('data-decision-status="not_sent"');
     expect(h.result()).toContain("Snooze was not sent for 1 selected item: " + NOT_SENT_UNREAD);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();

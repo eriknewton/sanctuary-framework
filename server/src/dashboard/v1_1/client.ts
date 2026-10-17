@@ -1552,8 +1552,10 @@ function renderMain() {
   }
   // The retained decision result heads every screen that can take a decision, so the outcome of the last
   // decision is on the screen the operator decided from and survives a route change.
-  if (DECISION_RESULT_ROUTES.indexOf(state.route) >= 0) nextHtml = renderDecisionResult() + nextHtml;
   if (liveUpdatesStopped) nextHtml = unavailablePanel("Live updates stopped", ["/api/posture/home"]);
+  // Composed after every replacement of the route body above, including the stopped-updates panel, so no path
+  // can drop a retained result from the screen.
+  if (DECISION_RESULT_ROUTES.indexOf(state.route) >= 0) nextHtml = renderDecisionResult() + nextHtml;
   // Fail loud, recover by navigation only (same contract as hydrateTalkHost):
   // a composer that left the document while still owned was replaced by some
   // other writer, and a silent remount would discard the draft it held.
@@ -4119,10 +4121,10 @@ function renderEvidenceOperationsSection() {
         : '<span class="pill">' + escHtml(i.kind) + '</span>';
       return '<div class="row" data-inbox-row="' + escHtml(i.item_id) + '" data-inbox-kind="' + escHtml(i.kind) + '"' +
         (i.kind === "approval_pending" ? ' data-inbox-tier="' + escHtml(i.tier) + '"' : '') + '>' +
-        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + '>' +
+        '<input type="checkbox" data-action="inbox-select" data-item-id="' + escHtml(i.item_id) + '"' + (state.inboxOps.selected[i.item_id] ? ' checked' : '') + batchSelectionDisabled() + '>' +
         '<div class="grow">' + escHtml(text) + '</div>' +
         tierBadge +
-        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '" title="Snooze">...</button>' +
+        '<button class="btn" data-action="inbox-snooze-menu" data-item-id="' + escHtml(i.item_id) + '"' + (decisionInFlight() ? approvalDecisionDisabled() : ' title="Snooze"') + '>...</button>' +
         '<div style="display:flex;gap:4px;">' + buttons + '</div>' + renderDecisionInline(i) +
         '</div>';
     }
@@ -5025,6 +5027,11 @@ function approvalStandingState(item) {
   return { enabled: true, reason: "Adds a standing rule to this fortress's policy. The console has no control to remove a standing rule yet. Allow always first allows this request, then asks the policy engine to compile a standing rule for " + op + " and activate it with your operator token. Either step can be refused; your policy changes only if both succeed." };
 }
 
+function batchSelectionLocked() { return decisionInFlight() && state.approvals.lock.kind === "batch"; }
+function batchSelectionDisabled() {
+  // The selection checkboxes pause only while a batch holds the lock; an item decision leaves them live.
+  return batchSelectionLocked() ? ' disabled title="' + DECISION_BUSY_REASON + '"' : "";
+}
 function approvalDecisionDisabled() {
   // Invariant: every decision control on every screen reads the one decision lock, so while a decision is in
   // flight no second request can be clicked anywhere, and each paused control says why.
@@ -6494,12 +6501,13 @@ function decisionNotAdmissible(ids) {
   if (!sourceLoaded(HUB + "/inbox")) return "the queue has not been read since it last changed, so nothing was sent. Re-read the queue first.";
   const gone = ids.filter(function (id) { const item = state.inbox.find(function (i) { return i.item_id === id; }); return !item || item.resolved; });
   if (gone.length === 0) return "";
-  return (ids.length === 1 ? "the request is no longer waiting in the loaded queue" : gone.length + " of " + ids.length + " selected items are no longer waiting in the loaded queue") + ", so nothing was sent.";
+  return (ids.length === 1 ? "the request is no longer waiting in the loaded queue"
+    : gone.length + " of the " + ids.length + " selected items " + (gone.length === 1 ? "is" : "are") + " no longer waiting in the loaded queue") + ", so nothing was sent.";
 }
 function state_NOTADMITTEDDecision(fields, reason) {
   // Nothing was sent, so no lock is taken; the retained result still tells the operator what did not happen.
   if (decisionInFlight()) return;
-  state.approvals.result = Object.assign({ status: "refused", rule: null, refresh: "loaded", records: [] }, fields, {
+  state.approvals.result = Object.assign({ status: "not_sent", rule: null, refresh: "loaded", records: [] }, fields, {
     message: decisionVerb(fields.action) + " was not sent for " + fields.subject + ": " + reason,
   });
   announceDecision(state.approvals.result);
@@ -6538,7 +6546,9 @@ const DECISION_RESULT_ROUTES = ["approvals", "posture", "activity", "agent-detai
 const DECISION_VERB = { approve: "Allow once", deny: "Deny", dismiss: "Dismiss", archive: "Archive", delete: "Delete", snooze: "Snooze" };
 const DECISION_DONE = { approve: "Allowed once", deny: "Denied", dismiss: "Dismissed", archive: "Archived", delete: "Deleted", snooze: "Snoozed" };
 const DECISION_REREAD_BUSY_REASON = "The queue is being re-read after a decision.";
-const DECISION_HEADLINE = { pending: "Sending your decision", acknowledged: "Decision taken", refused: "Decision refused", uncertain: "Decision unconfirmed" };
+// not_sent is client-side only: nothing reached the server, so it is neither a refusal (a 4xx) nor unconfirmed.
+const DECISION_HEADLINE = { pending: "Sending your decision", acknowledged: "Decision taken", refused: "Decision refused", uncertain: "Decision unconfirmed", not_sent: "Decision not sent" };
+const DECISION_UNCERTAIN_STAYS = "This result stays on screen until your next decision replaces it.";
 
 function decisionInFlight() { return !!state.approvals.lock; }
 function decisionVerb(action) { return DECISION_VERB[action] || action; }
@@ -6654,10 +6664,11 @@ function renderDecisionResult() {
   const records = r.records.length
     ? '<ul>' + r.records.map(function (rec) { return '<li>' + escHtml(rec.message) + '</li>'; }).join("") + '</ul>' : "";
   // Clear waits for the release: a result cannot leave the screen while its decision still holds the lock. An
-  // unconfirmed result names the check the operator owes before clearing it, so the warning is not dropped blindly.
-  const clearLabel = r.status === "uncertain" ? "Clear after checking the queue" : "Clear";
-  const clear = r.status === "pending" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>' + clearLabel + '</button>';
-  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + escHtml(r.message + note) + '</p>' + records + '</div>' + clear + '</section>';
+  // unconfirmed result has no Clear at all: the operator owes the queue a check, and only the next decision
+  // replaces the warning, so it cannot be dismissed unread.
+  const stays = r.status === "uncertain" ? " " + DECISION_UNCERTAIN_STAYS : "";
+  const clear = r.status === "pending" || r.status === "uncertain" ? "" : '<button class="btn btn-sm" data-action="decision-result-clear"' + approvalDecisionDisabled() + '>Clear</button>';
+  return '<section class="decision-result" data-decision-status="' + r.status + '" aria-label="Decision result"><div><strong>' + decisionHeadline(r) + '</strong><p>' + escHtml(r.message + note + stays) + '</p>' + records + '</div>' + clear + '</section>';
 }
 function decisionFirstSentence(message) {
   const first = message.split(". ")[0];
@@ -6668,9 +6679,11 @@ function renderDecisionBatchInline() {
   // at the top of the screen can sit above the fold when the operator decided from this section.
   const r = state.approvals.result;
   if (!r || r.kind !== "batch") return "";
+  // A partly taken batch keeps its whole short message here, so the refusal is not dropped with the second sentence.
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + " for " + r.ids.length + " selected item" + (r.ids.length === 1 ? "" : "s") + "."
-    : r.status === "acknowledged" ? decisionFirstSentence(r.message)
+    : r.status === "acknowledged" ? (decisionHeadline(r) === DECISION_HEADLINE.acknowledged ? decisionFirstSentence(r.message) : r.message)
     : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
+    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
     : "Unconfirmed. See the decision result at the top of this screen.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
@@ -6682,6 +6695,7 @@ function renderDecisionInline(item) {
   const line = r.status === "pending" ? "Sending " + decisionVerb(r.action) + "."
     : r.status === "acknowledged" ? decisionDone(r.action) + "."
     : r.status === "refused" ? "Refused. See the decision result at the top of this screen."
+    : r.status === "not_sent" ? "Not sent. See the decision result at the top of this screen."
     : "Unconfirmed. See the decision result at the top of this screen.";
   return '<p class="decision-inline" data-decision-status="' + r.status + '">' + escHtml(line) + '</p>';
 }
@@ -6853,7 +6867,7 @@ async function onInboxPromote(itemId, approvedOperation) {
   });
   const draft = compiled && compiled.data && compiled.data.draft;
   // Missing draft evidence cannot authorize an activation.
-  if (!draft || !draft.draft_id) throw new Error("Could not prepare a rule for " + op + ".");
+  if (!draft || !draft.draft_id) throw new Error("Could not prepare a rule for " + op.replace(/_/g, " ") + ".");
   await activateStandingRule(draft.draft_id, op, false);
 }
 
@@ -6970,8 +6984,11 @@ function settleUnifiedBatch(result, ids, answer) {
   const summary = body && body.ok === true && body.data && body.data.result;
   // Invariant: a batch is acknowledged only by a summary whose counts account for every id sent (must match
   // BatchActionResult in principal-policy/unified-inbox-bridge.ts); anything else is uncertain.
-  const consistent = !!summary && summary.requested === ids.length && Number.isInteger(summary.affected) &&
-    Array.isArray(summary.missing) && summary.affected + summary.missing.length === summary.requested;
+  const consistent = !!summary && summary.requested === ids.length && Number.isInteger(summary.affected) && summary.affected >= 0 &&
+    Array.isArray(summary.missing) && summary.affected + summary.missing.length === summary.requested &&
+    // Every missing entry must be one of the ids this batch sent, once; a foreign, duplicated or non-string entry
+    // means the summary describes some other batch, so it confirms nothing about this one.
+    summary.missing.every(function (id, index) { return typeof id === "string" && ids.indexOf(id) >= 0 && summary.missing.indexOf(id) === index; });
   if (!consistent) {
     settleDecision(result, "uncertain", "The server answered but did not confirm " + decisionVerb(result.action) + " for " + result.subject + ". " + DECISION_UNCERTAIN_ADVICE);
     return;
@@ -7551,8 +7568,9 @@ document.addEventListener("click", function (ev) {
     return focusApprovalDrawer();
   }
   if (action === "decision-result-clear") {
-    // A result leaves the screen only through its own control, and never while its decision holds the lock.
-    if (decisionInFlight()) return;
+    // A result leaves the screen only through its own control, never while its decision holds the lock, and an
+    // unconfirmed result has no such control: a stray click on a stale button must not clear it either.
+    if (decisionInFlight() || (state.approvals.result && state.approvals.result.status === "uncertain")) return;
     state.approvals.result = null;
     return rerender();
   }
@@ -7571,6 +7589,8 @@ document.addEventListener("click", function (ev) {
     return void onInboxAction(itemId, "approve");
   }
   if (action === "inbox-select" && itemId) {
+    // A batch in flight owns its selection until it settles; a tick under that lock would rewrite what a refusal keeps.
+    if (batchSelectionLocked()) return;
     state.inboxOps.selected[itemId] = tgt.checked;
     return rerender();
   }
@@ -7582,6 +7602,9 @@ document.addEventListener("click", function (ev) {
     return rerender();
   }
   if (action === "inbox-snooze-menu" && itemId) {
+    // Invariant: the row menu replaces the selection, so under the lock it is refused like every other decision
+    // control; otherwise a refused batch would report against a selection the operator no longer sees.
+    if (decisionInFlight()) return;
     state.inboxOps.selected = {};
     state.inboxOps.selected[itemId] = true;
     state.inboxOps.snoozeDialog = true;

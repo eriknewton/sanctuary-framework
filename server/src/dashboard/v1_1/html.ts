@@ -708,24 +708,25 @@ body {
    controls. It sits in normal flow, so settling never covers a control or moves the page under the
    pointer; the border and fill follow the status word only (ochre while sending or unconfirmed, sage
    when the server acknowledged, rust when it refused), and the text stays ink so it reads in both
-   themes. Must match the data-decision-status values in client.ts. */
+   themes; not_sent (nothing reached the server) keeps the ochre default). Must match the data-decision-status
+   values in client.ts, DECISION_HEADLINE. */
 .decision-result {
   display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3);
   background: var(--ochre-bg); color: var(--ink); border: 1px solid var(--ochre);
   border-left-width: 3px; /* 3 = the 1px card border plus 2px, the same accent width the banners use */
-  border-radius: var(--rad); padding: 10px 12px; /* 10 and 12 = the banner-warn padding, so the two read as one family */
+  border-radius: var(--rad); padding: 10px 12px; /* 12 = the banner-warn side padding; 10 = its 8px top padding plus 2px so the headline clears the thicker left accent */
   margin: 0 0 var(--space-3); font-size: var(--text-base);
   overflow-wrap: anywhere;
 }
 .decision-result strong { display: block; margin-bottom: 2px; /* 2 = half the 4px line gap between headline and text */ }
-.decision-result p { margin: 0; color: var(--ink-2); line-height: 1.45; /* 1.45 = the body line-height used by .banner-warn */ }
+.decision-result p { margin: 0; color: var(--ink-2); line-height: 1.45; /* 1.45 = the page body line-height (the body rule above), restated so the paragraph keeps it if a parent rule overrides it */ }
 .decision-result ul { margin: 6px 0 0; padding-left: 18px; /* 6 = half the 12px side padding; 18 = marker width at the base size */ color: var(--ink-2); }
 .decision-result .btn { flex: none; }
 .decision-result[data-decision-status="acknowledged"] { background: var(--sage-bg); border-color: var(--sage); }
 .decision-result[data-decision-status="refused"] { background: var(--rust-bg); border-color: var(--rust); }
 /* The drawer's one-line echo of the result for the selected request (client.ts renderDecisionInline). */
 .decision-inline { margin: 8px 0 0; /* 8 = the toolbar's own gap, so the echo sits as one more toolbar line */ font-size: var(--text-sm); color: var(--ink-2); }
-.decision-inline[data-decision-status="refused"] { color: var(--rust); }
+.decision-inline[data-decision-status="refused"], .decision-inline[data-decision-status="not_sent"] { color: var(--rust); }
 .btn.chip {
   border-radius: 999px; padding: 4px 12px; font-size: var(--text-sm);
   background: var(--surface-2); border-color: var(--ink-3);
