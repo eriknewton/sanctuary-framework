@@ -10,7 +10,7 @@
  * static CLIENT_SCRIPT string into a sandboxed Function so it can be called
  * against synthetic state objects without a real browser.
  */
-// fail-before-exempt: adapts the onInboxAction sandbox to the retained decision result the client now settles on every decision (state.approvals.lock and result, the decision-announcement live region, the inbox source read) and to the acknowledgement shape the server returns (resolved: true); asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the decision paths lives in approval-decision-result.test.ts.
+// fail-before-exempt: adapts the onInboxAction sandbox to the retained decision result the client now settles on every decision (state.approvals.lock and result, the decision-announcement live region, the inbox source read, the admission check against the loaded queue) and to the acknowledgement shape the server returns (resolved: true); asserts nothing new, so it passes against pre-fix source by construction. Fail-before coverage for the decision paths lives in approval-decision-result.test.ts.
 import { describe, expect, it } from "vitest";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
@@ -95,6 +95,7 @@ function makeInboxActionSandbox(): {
       var onAgentInspectOpen = async function() {};
       var document = { getElementById: function() { return null; } };
       var sourceLoaded = function() { return false; };
+      var decisionNotAdmissible = function() { return ""; };
       var HUB = "/api/hub";
       ${fnText}
       await onInboxAction(itemId, action);

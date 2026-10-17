@@ -858,7 +858,7 @@ describe("slice 2 shell wired consumers", () => {
     await settle();
     // The refusal is the retained decision result, not a toast; the server's reason is quoted in it.
     expect(h.el.main!.innerHTML).toContain('data-decision-status="refused"');
-    expect(h.el.main!.innerHTML).toContain("Allow once was refused for state_export by fixture-agent (request wait-1): operator session required (HTTP 401). The request is still waiting.");
+    expect(h.el.main!.innerHTML).toContain("Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied.");
     // Retargeted from "Decided at": a refused decision leaves the row waiting with its controls, repainted from the server.
     expect(h.el.main!.innerHTML).toContain("WAITING");
     expect(h.el.main!.innerHTML).toContain('data-action="inbox-approve" data-item-id="wait-1"');
@@ -3691,9 +3691,9 @@ describe("Approvals round-one decision and evidence states", () => {
       } else {
         expect(drawer(h)).toContain(failure === "none" ? "No approvals waiting" : "DECIDED");
         expect(result).toContain('data-decision-status="acknowledged"');
-        expect(result).toContain("Allowed once: state_export by fixture-agent (request " + requestId + ").");
+        expect(result).toContain("Allowed once: state export by fixture-agent (request " + requestId + ").");
         if (failure !== "none" && failure !== "downgrade confirmed") expect(result).toContain("The standing rule was not added:");
-        else expect(result).toContain("Standing rule added: agents may state_export without asking.");
+        else expect(result).toContain("Standing rule added: agents may state export without asking.");
         // A declined downgrade reads as one sentence, not a second "no standing rule added" after the first.
         if (failure === "downgrade cancelled") {
           expect(result).toContain("The standing rule was not added: you chose to keep your protection.");

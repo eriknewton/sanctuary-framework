@@ -11,7 +11,11 @@
  * second click sends nothing and the result names the first request only; consent survives a decision on
  * another row and resets for the decided one; the result survives a route change and clears only through
  * its own control; Allow always reports a refused or unconfirmed standing rule in words on an acknowledged
- * approval. The decision-result witness for D5-approval; this header carries the bare id only.
+ * approval, and an activation answer that cannot be read is unconfirmed, never refused; a decision is sent only
+ * against a loaded queue that still holds every admitted request, otherwise nothing is sent and the result says
+ * so; the row the operator decided from echoes the outcome; a partly refused batch says so in its headline; an
+ * unconfirmed result's Clear control names the check it expects first. The decision-result witness for
+ * D5-approval; this header carries the bare id only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
@@ -36,9 +40,15 @@ const held = (itemId: string, extra: Record<string, unknown> = {}) => ({
   display_template_id: "approval_pending.tier2.other", display_template_args: [{ kind: "agent_id", value: "fixture-agent" }],
   resolved: false, created_at: "2026-10-17T16:45:00.000Z", identity_id: "operator-fixture", operation_category: "state_export", ...extra,
 });
+const withoutResolved = (item: Record<string, unknown>) => { const copy = { ...item }; delete copy.resolved; return copy; };
 const resolvedBody = (itemId: string) => ({ ok: true, data: { item: { ...held(itemId), resolved: true, resolved_at: "2026-10-17T16:46:00.000Z" } } });
 const BUSY = 'disabled title="Another decision is being sent."';
 const REREAD = "The queue could not be re-read after this decision, so this list may be out of date.";
+const REREAD_BUSY = 'disabled title="The queue is being re-read after a decision."';
+const UNCONFIRMED_ADVICE = "The decision may or may not have been applied. Check the queue before deciding again.";
+const CHECK_RULE = " Check the policy before relying on it.";
+const NOT_SENT_STALE = "the request is no longer waiting in the loaded queue, so nothing was sent.";
+const NOT_SENT_UNREAD = "the queue has not been read since it last changed, so nothing was sent. Re-read the queue first.";
 
 function escapeHtml(raw: string) {
   return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -131,6 +141,7 @@ function boot(overrides: Record<string, Override> = {}) {
       createDocumentFragment: () => new FakeElement({}, "FRAGMENT"),
       createTextNode: (text: string) => new FakeText(text),
       querySelectorAll: () => [],
+      querySelector: () => null,
       get activeElement() { return fakeActiveElement; },
       body: new FakeElement({}, "BODY"),
       documentElement: { setAttribute() {}, removeAttribute() {}, getAttribute: () => null },
@@ -146,6 +157,8 @@ function boot(overrides: Record<string, Override> = {}) {
       const bare = path.split("?")[0]!;
       if (overrides[path]) return overrides[path]!(init, path);
       if (overrides[bare]) return overrides[bare]!(init, path);
+      // "*" answers every path without an override of its own; returning undefined falls through to the defaults.
+      if (overrides["*"]) { const answer = overrides["*"]!(init, path); if (answer !== undefined) return answer; }
       if (path === "/api/policy/current") return Promise.resolve(response({ data: { view: { lines: [] } } }));
       if (path === "/api/posture/evidence") return Promise.resolve(response(evidence));
       if (path === "/api/hub/agents") return Promise.resolve(response({ data: { agents: [{ agent_id: "fixture-agent", status: "active", harness: "fixture", identity_id: "operator-fixture" }] } }));
@@ -177,8 +190,9 @@ describe("one retained decision result", () => {
       let decided = false;
       const h = boot({
         "/api/hub/inbox": () => Promise.resolve(decided ? response({ error: "read failed" }, 500) : response({ data: { items: [held("wait-1")] } })),
-        "/api/posture/home": () => Promise.resolve(decided && failing === "every read" ? response({ error: "read failed" }, 500) : response(home())),
         "/api/hub/inbox/wait-1/approve": () => { decided = true; return Promise.resolve(response(resolvedBody("wait-1"))); },
+        // After the decision every other read the refresh issues fails too, not only the inbox and the home read.
+        "*": () => decided && failing === "every read" ? Promise.resolve(response({ error: "read failed" }, 500)) : undefined,
       });
       await settle();
       h.navigate("approvals");
@@ -186,9 +200,10 @@ describe("one retained decision result", () => {
       await settle();
       expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/approve"]);
       expect(h.result()).toContain('data-decision-status="acknowledged"');
-      expect(h.result()).toContain("Allowed once: state_export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
+      expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.result()).not.toMatch(/refused|failed/);
-      expect(h.el["decision-announcement"]!.textContent).toContain("Decision taken. Allowed once: state_export by fixture-agent (request wait-1).");
+      if (failing === "every read") expect(h.requests.filter((r) => r.init?.method !== "POST" && r.url.startsWith("/api/") && !r.url.startsWith("/api/hub/inbox")).length).toBeGreaterThan(1);
+      expect(h.el["decision-announcement"]!.textContent).toBe("Decision taken. Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
       expect(h.el["toast-host"]!.innerHTML).toBe("");
       expect(h.read("state.approvals.lock")).toBeNull();
       expect(h.read("state.approvals.result.refresh")).toBe("unavailable");
@@ -205,9 +220,10 @@ describe("one retained decision result", () => {
     await settle();
     const main = h.el.main!;
     let throwOnce = false;
+    let threw = false;
     Object.defineProperty(h.el, "main", {
       configurable: true,
-      get() { if (throwOnce) { throwOnce = false; throw new Error("fixture repaint failure"); } return main; },
+      get() { if (throwOnce) { throwOnce = false; threw = true; throw new Error("fixture repaint failure"); } return main; },
     });
     // The inbox panel's final repaint after the decision throws: the client clears the panel's pending entry
     // right before that repaint, so arming there hits the repaint whose failure rejects the whole refresh.
@@ -217,9 +233,9 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-deny", "data-item-id": "wait-1" });
     await settle();
     expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/deny"]);
-    expect(throwOnce, "the armed repaint threw").toBe(false);
+    expect(threw, "the armed repaint threw").toBe(true);
     expect(h.result()).toContain('data-decision-status="acknowledged"');
-    expect(h.result()).toContain("Denied: state_export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
+    expect(h.result()).toContain("Denied: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + REREAD);
     expect(h.result()).not.toMatch(/refused|failed|repaint/);
     expect(h.read("state.approvals.lock")).toBeNull();
     expect(h.read("state.approvals.result.refresh")).toBe("unavailable");
@@ -227,7 +243,7 @@ describe("one retained decision result", () => {
 
   for (const [label, body] of [
     ["names another item", { ok: true, data: { item: { ...held("other"), resolved: true } } }],
-    ["lacks resolved", { ok: true, data: { item: held("wait-1") } }],
+    ["lacks resolved", { ok: true, data: { item: withoutResolved(held("wait-1")) } }],
     ["carries no item", { ok: true, data: {} }],
     ["is not an object", null],
   ] as const) {
@@ -242,16 +258,17 @@ describe("one retained decision result", () => {
       h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
       await settle();
       expect(h.result()).toContain('data-decision-status="uncertain"');
-      expect(h.result()).toContain("did not confirm Allow once for state_export by fixture-agent (request wait-1). The decision may or may not have been applied. Check the queue before deciding again.");
+      expect(h.result()).toContain("did not confirm Allow once for state export by fixture-agent (request wait-1). " + UNCONFIRMED_ADVICE);
       expect(h.result()).not.toContain("Allowed once");
+      expect(h.result()).toContain('data-action="decision-result-clear">Clear after checking the queue</button>');
       expect(h.main()).toContain("WAITING");
     });
   }
 
   for (const [label, answer, status, text] of [
-    ["a 500", () => Promise.resolve(response({ error: "storage unavailable" }, 500)), "uncertain", "did not confirm Allow once for state_export by fixture-agent (request wait-1) (storage unavailable (HTTP 500))."],
+    ["a 500", () => Promise.resolve(response({ error: "storage unavailable" }, 500)), "uncertain", "did not confirm Allow once for state export by fixture-agent (request wait-1) (storage unavailable (HTTP 500))."],
     ["no answer", () => Promise.reject(new Error("network down")), "uncertain", "(network down). The decision may or may not have been applied."],
-    ["a 401", () => Promise.resolve(response({ error: "operator session required" }, 401)), "refused", "Allow once was refused for state_export by fixture-agent (request wait-1): operator session required (HTTP 401). The request is still waiting."],
+    ["a 401", () => Promise.resolve(response({ error: "operator session required" }, 401)), "refused", "Allow once was refused for state export by fixture-agent (request wait-1): operator session required (HTTP 401). The decision was not applied."],
   ] as const) {
     it(`${label} reads as ${status} with the reason`, async () => {
       vi.useFakeTimers();
@@ -270,6 +287,22 @@ describe("one retained decision result", () => {
     });
   }
 
+  it("a 409 on a Tier 2 dismiss keeps the server's reason instead of the Tier 1 sentence", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1")] } })),
+      "/api/hub/inbox/wait-1/dismiss": () => Promise.resolve(response({ error: "already resolved" }, 409)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+    });
+    await settle();
+    h.navigate("activity");
+    h.click({ "data-action": "inbox-dismiss", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.result()).toContain("Dismiss was refused for state export by fixture-agent (request wait-1): already resolved (HTTP 409). The decision was not applied.");
+    expect(h.result()).not.toContain("Tier 1");
+  });
+
   it("a Tier 1 dismiss the server refuses with 409 names the next step instead of the code", async () => {
     vi.useFakeTimers();
     const h = boot({
@@ -282,7 +315,7 @@ describe("one retained decision result", () => {
     h.click({ "data-action": "inbox-dismiss", "data-item-id": "tier1-1" });
     await settle();
     expect(h.result()).toContain('data-decision-status="refused"');
-    expect(h.result()).toContain("Dismiss was refused for state_export by fixture-agent (request tier1-1): Tier 1 items cannot be dismissed. Approve or deny instead. The request is still waiting.");
+    expect(h.result()).toContain("Dismiss was refused for state export by fixture-agent (request tier1-1): Tier 1 items cannot be dismissed. Approve or deny instead. The decision was not applied.");
   });
 
   it("a unified batch the server refuses keeps the selection and never reads as done", async () => {
@@ -325,12 +358,16 @@ describe("one retained decision result", () => {
     expect(h.read("Object.keys(state.inboxOps.selected).length")).toBe(0);
   });
 
-  it("a unified batch answered without consistent counts reads as unconfirmed and keeps the selection", async () => {
+  for (const [label, body] of [
+    ["carries no summary", { ok: true }],
+    ["counts more requests than were sent", { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 2, affected: 1, missing: [] } } }],
+    ["counts that do not add up", { ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 1, missing: ["wait-9"] } } }],
+  ] as const) it(`a unified batch whose answer ${label} reads as unconfirmed and keeps the selection`, async () => {
     vi.useFakeTimers();
     const h = boot({
       "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1")] } })),
       "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
-      "/api/inbox/unified/batch": () => Promise.resolve(response({ ok: true })),
+      "/api/inbox/unified/batch": () => Promise.resolve(response(body)),
     });
     await settle();
     h.navigate("activity");
@@ -339,6 +376,7 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.result()).toContain('data-decision-status="uncertain"');
     expect(h.result()).toContain("did not confirm Archive for 1 selected item.");
+    expect(h.result()).not.toContain("Archived");
     expect(h.read('state.inboxOps.selected["wait-1"]')).toBe(true);
   });
 
@@ -357,43 +395,63 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/dismiss", "/api/hub/inbox/tier1-1/dismiss"]);
     expect(h.result()).toContain('data-decision-status="acknowledged"');
+    expect(h.result()).toContain("<strong>Decision partly taken</strong>");
+    expect(h.el["decision-announcement"]!.textContent).toContain("Decision partly taken. Dismissed 1 of 2 items. 1 was refused.");
     expect(h.result()).toContain("Dismissed 1 of 2 items. 1 was refused.");
-    expect(h.result()).toContain("<li>Dismissed: state_export by fixture-agent (request wait-1).</li>");
-    expect(h.result()).toContain("<li>Dismiss was refused for state_export by fixture-agent (request tier1-1): Tier 1 items cannot be dismissed. Approve or deny instead. The request is still waiting.</li>");
+    expect(h.result()).toContain("<li>Dismissed: state export by fixture-agent (request wait-1).</li>");
+    expect(h.result()).toContain("<li>Dismiss was refused for state export by fixture-agent (request tier1-1): Tier 1 items cannot be dismissed. Approve or deny instead. The decision was not applied.</li>");
   });
 
   it("one lock pauses every decision control on every screen, a second click sends nothing and the result names the first request", async () => {
     vi.useFakeTimers();
     const answer = gate<unknown>();
     const h = boot({
-      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2"), held("tier1-1", { tier: "tier1" })] } })),
       "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
       "/api/hub/inbox/wait-1/approve": () => answer.promise,
+      "/api/hub/inbox/tier1-1/approve": () => Promise.resolve(response(resolvedBody("tier1-1"))),
       "/api/hub/inbox/wait-2/approve": () => Promise.resolve(response(resolvedBody("wait-2"))),
       "/api/inbox/unified/batch": () => Promise.resolve(response({ ok: true, data: { result: { batch_correlation_id: "fixture", requested: 1, affected: 1, missing: [] } } })),
     });
     await settle();
     h.navigate("approvals");
+    await settle();
+    // The Tier 1 request is selected and armed before the lock, so Confirm is on screen while the lock holds.
+    h.click({ "data-action": "approval-select", "data-item-id": "tier1-1" });
+    h.click({ "data-action": "approval-start-tier1-allow", "data-item-id": "tier1-1" });
+    expect(h.main()).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1">Confirm');
     expect(h.main()).not.toContain(BUSY);
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
     await settle();
     expect(h.result()).toContain('data-decision-status="pending"');
-    expect(h.result()).toContain("Sending Allow once for state_export by fixture-agent (request wait-1). Other decision controls are paused until the server answers.");
+    expect(h.result()).toContain("Sending Allow once for state export by fixture-agent (request wait-1). Other decision controls are paused until the server answers.");
     expect(h.main()).toContain('data-action="inbox-approve" data-item-id="wait-2" ' + BUSY);
     expect(h.main()).toContain('data-action="inbox-deny" data-item-id="wait-2" ' + BUSY);
-    expect(h.main()).toContain('<p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
+    expect(h.main()).toContain('data-action="approval-confirm-tier1-allow" data-item-id="tier1-1" ' + BUSY);
+    expect(h.main()).toContain('data-action="approval-cancel-tier1-allow" data-item-id="tier1-1" ' + BUSY);
+    expect(h.main()).toContain('data-action="inbox-deny" data-item-id="tier1-1" ' + BUSY);
+    expect(h.main(), "the queue row echoes its own decision while the drawer shows another request").toContain('</div><p class="decision-inline" data-decision-status="pending">Sending Allow once.</p></td></tr><tr class="" data-approval-row="wait-2">');
+    h.click({ "data-action": "approval-select", "data-item-id": "wait-1" });
+    expect(h.main(), "the drawer echoes the selected request's decision").toContain('<p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
     h.navigate("posture");
     expect(h.main()).toContain('data-action="inbox-approve" data-item-id="wait-2" ' + BUSY);
+    expect(h.main(), "the Overview row echoes its own decision").toContain('data-item-id="wait-1" ' + BUSY + '>Deny</button></div><p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
     h.navigate("activity");
-    h.read('state.inboxOps.selected["wait-2"] = true; rerender();');
-    for (const control of ["inbox-batch-archive", "inbox-batch-dismiss", "inbox-batch-snooze-open", "inbox-batch-delete"]) expect(h.main()).toContain(`data-action="${control}" ` + BUSY);
-    expect(h.main(), "an item decision leaves no batch echo").not.toContain('class="decision-inline"');
+    h.read('state.inboxOps.selected["wait-2"] = true; state.inboxOps.snoozeDialog = true; rerender();');
+    for (const control of ["inbox-batch-archive", "inbox-batch-dismiss", "inbox-batch-snooze-open", "inbox-batch-delete", "inbox-batch-snooze-custom"]) expect(h.main()).toContain(`data-action="${control}" ` + BUSY);
+    expect(h.main().match(/data-action="inbox-batch-snooze" data-snooze-ms="\d+" disabled title=/g)?.length, "every snooze duration is paused").toBe(4);
+    expect(h.main(), "the Evidence row echoes its own decision").toContain('</div><p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
+    expect(h.main().split('class="decision-inline"').length - 1, "only the decided row echoes").toBe(1);
     expect(h.main()).toContain('data-action="inbox-approve" data-item-id="wait-2" ' + BUSY);
     h.read('state.selectedAgentId = "fixture-agent";');
     h.navigate("agent-detail");
     expect(h.main()).toContain('data-action="inbox-approve" data-item-id="wait-2" ' + BUSY);
+    expect(h.main(), "the agent row echoes its own decision").toContain('data-item-id="wait-1" ' + BUSY + '>Allow once</button><p class="decision-inline" data-decision-status="pending">Sending Allow once.</p>');
     h.click({ "data-action": "inbox-approve", "data-item-id": "wait-2" });
     h.click({ "data-action": "inbox-batch-archive" });
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    h.click({ "data-action": "inbox-batch-snooze-custom" });
+    h.click({ "data-action": "approval-confirm-tier1-allow", "data-item-id": "tier1-1" });
     await settle();
     expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/approve"]);
     expect(h.read("state.approvals.result.itemId")).toBe("wait-1");
@@ -403,6 +461,97 @@ describe("one retained decision result", () => {
     expect(h.read("state.approvals.result.itemId")).toBe("wait-1");
     expect(h.result()).toContain('data-decision-status="acknowledged"');
     expect(h.main()).not.toContain(BUSY);
+    h.navigate("activity");
+    expect(h.main(), "the decided row echoes the outcome").toContain('<p class="decision-inline" data-decision-status="acknowledged">Allowed once.</p>');
+  });
+
+  it("controls stay paused with the re-read reason until the queue re-read settles", async () => {
+    vi.useFakeTimers();
+    const reread = gate<unknown>();
+    let decided = false;
+    const h = boot({
+      "/api/hub/inbox": () => decided ? reread.promise : Promise.resolve(response({ data: { items: [held("wait-1"), held("wait-2")] } })),
+      "/api/hub/inbox/wait-1/approve": () => { decided = true; return Promise.resolve(response(resolvedBody("wait-1"))); },
+    });
+    await settle();
+    h.navigate("approvals");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.result()).toContain('data-decision-status="acknowledged"');
+    expect(h.result()).toContain("Re-reading the queue.");
+    // While the queue is re-read the rows are not on screen; Clear is the control that carries the paused reason.
+    expect(h.result()).toContain('data-action="decision-result-clear" ' + REREAD_BUSY + '>Clear</button>');
+    expect(h.main()).not.toContain(BUSY);
+    h.click({ "data-action": "decision-result-clear" });
+    expect(h.read("state.approvals.result"), "Clear waits for the release").not.toBeNull();
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-2" });
+    await settle();
+    expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/approve"]);
+    reread.release(response({ data: { items: [held("wait-2")] } }));
+    await settle();
+    expect(h.read("state.approvals.lock")).toBeNull();
+    expect(h.main()).not.toContain(REREAD_BUSY);
+    expect(h.result()).not.toContain("Re-reading the queue.");
+  });
+
+  it("a decision on a request the loaded queue no longer holds sends nothing and says so", async () => {
+    vi.useFakeTimers();
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(response({ data: { items: [held("wait-1"), { ...held("done-1"), resolved: true }] } })),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+    });
+    await settle();
+    h.navigate("posture");
+    h.click({ "data-action": "inbox-approve", "data-item-id": "gone-1" });
+    await settle();
+    expect(h.posts()).toEqual([]);
+    expect(h.read("state.approvals.lock")).toBeNull();
+    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.result()).toContain("Allow once was not sent for (request gone-1): " + NOT_SENT_STALE);
+    expect(h.el["decision-announcement"]!.textContent).toBe("Decision refused. Allow once was not sent for (request gone-1): " + NOT_SENT_STALE);
+    expect(h.main()).not.toContain(BUSY);
+    h.click({ "data-action": "inbox-deny", "data-item-id": "done-1" });
+    await settle();
+    expect(h.posts()).toEqual([]);
+    expect(h.result()).toContain("Deny was not sent for state export by fixture-agent (request done-1): " + NOT_SENT_STALE);
+    h.navigate("activity");
+    h.read('state.inboxOps.selected["wait-1"] = true; state.inboxOps.selected["done-1"] = true; state.inboxOps.snoozeDialog = true; rerender();');
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    await settle();
+    expect(h.posts()).toEqual([]);
+    expect(h.result()).toContain("Snooze was not sent for 2 selected items: 1 of 2 selected items are no longer waiting in the loaded queue, so nothing was sent.");
+    expect(h.read('state.inboxOps.selected["wait-1"] === true && state.inboxOps.selected["done-1"] === true')).toBe(true);
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.posts(), "a held request still decides").toEqual(["/api/hub/inbox/wait-1/approve"]);
+  });
+
+  it("a decision while the queue read is not current sends nothing and asks for a re-read", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const h = boot({
+      "/api/hub/inbox": () => Promise.resolve(++reads === 1 ? response({ data: { items: [held("wait-1"), held("wait-2")] } }) : response({ error: "read failed" }, 500)),
+      "/api/hub/activity": () => Promise.resolve(response({ data: { entries: [] } })),
+      "/api/hub/inbox/wait-1/approve": () => Promise.resolve(response(resolvedBody("wait-1"))),
+    });
+    await settle();
+    h.navigate("activity");
+    h.read('state.inboxOps.selected["wait-2"] = true; state.inboxOps.snoozeDialog = true; rerender();');
+    expect(h.main()).toContain('data-action="inbox-batch-snooze-custom"');
+    // The second inbox read fails: the rows the operator still sees come from a read that is no longer current.
+    await h.read("fetchAll(true)");
+    await settle();
+    expect(reads).toBe(2);
+    h.click({ "data-action": "inbox-batch-snooze", "data-snooze-ms": "3600000" });
+    await settle();
+    expect(h.posts()).toEqual([]);
+    expect(h.result()).toContain('data-decision-status="refused"');
+    expect(h.result()).toContain("Snooze was not sent for 1 selected item: " + NOT_SENT_UNREAD);
+    h.click({ "data-action": "inbox-approve", "data-item-id": "wait-1" });
+    await settle();
+    expect(h.posts()).toEqual([]);
+    expect(h.result()).toContain("Allow once was not sent for state export by fixture-agent (request wait-1): " + NOT_SENT_UNREAD);
+    expect(h.read("state.approvals.lock")).toBeNull();
   });
 
   it("consent survives a decision on another row and resets for the decided request", async () => {
@@ -441,9 +590,9 @@ describe("one retained decision result", () => {
     await settle();
     expect(h.result()).toContain('data-decision-status="acknowledged"');
     h.navigate("posture");
-    expect(h.result()).toContain("Allowed once: state_export by fixture-agent (request wait-1).");
+    expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1).");
     h.navigate("approvals");
-    expect(h.result()).toContain("Allowed once: state_export by fixture-agent (request wait-1).");
+    expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1).");
     expect(h.result()).toContain('data-action="decision-result-clear"');
     h.click({ "data-action": "decision-result-clear" });
     expect(h.main()).not.toContain("decision-result");
@@ -452,7 +601,10 @@ describe("one retained decision result", () => {
 
   for (const [label, activate, rule, text] of [
     ["refused", () => Promise.resolve(response({ error: "not configured" }, 503)), "refused", "The standing rule was not added: Policy engine is not configured on this fortress."],
-    ["unconfirmed", () => Promise.reject(new Error("network down")), "uncertain", "The standing rule may not have been added: network down Check the policy before relying on it."],
+    ["refused by an explicit status", () => Promise.resolve(response({ ok: true, data: { status: "rejected" } })), "refused", "The standing rule was not added: Rule not activated (rejected)."],
+    ["unconfirmed", () => Promise.reject(new Error("network down")), "uncertain", "The standing rule may not have been added: network down." + CHECK_RULE],
+    ["unconfirmed by an answer without a status", () => Promise.resolve(response({ ok: true, data: {} })), "uncertain", "The standing rule may not have been added: the activation answer could not be read." + CHECK_RULE],
+    ["unconfirmed by an unreadable answer", () => Promise.resolve(response(null)), "uncertain", "The standing rule may not have been added: the activation answer could not be read." + CHECK_RULE],
   ] as const) {
     it(`Allow always reports a ${label} standing rule in words on an acknowledged approval`, async () => {
       vi.useFakeTimers();
@@ -471,7 +623,7 @@ describe("one retained decision result", () => {
       await settle();
       expect(h.posts()).toEqual(["/api/hub/inbox/wait-1/approve", "/api/policy/compile", "/api/policy/drafts/rule/activate"]);
       expect(h.result()).toContain('data-decision-status="acknowledged"');
-      expect(h.result()).toContain("Allowed once: state_export by fixture-agent (request wait-1). Marked decided in this inbox. " + text);
+      expect(h.result()).toContain("Allowed once: state export by fixture-agent (request wait-1). Marked decided in this inbox. " + text);
       expect(h.read("state.approvals.result.rule")).toBe(rule);
       expect(h.el["toast-host"]!.innerHTML).toBe("");
     });

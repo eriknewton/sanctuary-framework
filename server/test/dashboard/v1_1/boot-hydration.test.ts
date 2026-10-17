@@ -1,4 +1,5 @@
 /** Dashboard reads settle independently and missing evidence stays unknown. */
+// fail-before-exempt: adapts three existing refresh and queue-visibility witnesses that drove a decision on a request the loaded queue did not hold; the client now refuses such a decision locally and sends nothing, so the trailing-read witness drives the post-decision refresh directly and the queue-visibility witnesses decide on a request the loaded queue holds; asserts nothing new. Fail-before coverage for admission lives in approval-decision-result.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContext, runInContext } from "node:vm";
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
@@ -267,7 +268,9 @@ describe("dashboard bounded independent hydration", () => {
   it("post-mutation refresh performs a trailing read after an older in-flight read", async () => {
     vi.useFakeTimers(); const h = harness(); await settle();
     runInContext('let releaseOld; let reads = 0; fetch = async function (url) { if (url.includes("/inbox")) { reads++; if (reads === 1) return new Promise(function (resolve) { releaseOld = resolve; }); } return { ok: true, status: 200, json: async function () { return { data: { items: [], agents: [], entries: [], policies: [] } }; } }; }; void fetchAll()', h.context); await settle();
-    runInContext('void onInboxAction("x", "approve")', h.context); await settle();
+    // Retargeted from onInboxAction("x", ...): a decision is admitted only against a loaded queue that holds the
+    // request, so the post-decision refresh is driven directly; fetchAll(true) is what the decision path calls.
+    runInContext('void fetchAll(true)', h.context); await settle();
     runInContext('releaseOld({ ok: true, status: 200, json: async function () { return { data: { items: [{item_id: "obsolete"}] } }; } })', h.context); await settle();
     expect(runInContext('state.inbox', h.context)).toEqual([]);
   });
@@ -611,7 +614,11 @@ describe("dashboard bounded independent hydration", () => {
 describe("D5 closure", () => {
   it.each(["approve", "deny"])("keeps the queue visible while %s is pending or rejected", async action => {
     vi.useFakeTimers(); let reject!: (reason: Error) => void;
-    const h = harness({ ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }) }); await settle();
+    // The decided request is held in the loaded queue, since a decision on an unheld request is refused locally.
+    const h = harness({
+      "/api/hub/inbox": () => response({ data: { items: [{ item_id: "fixture", kind: "approval_pending", tier: "tier2", agent_id: "fixture", resolved: false, created_at: "2026-10-17T16:45:00.000Z" }] } }),
+      ["/api/hub/inbox/fixture/" + action]: () => new Promise((_, r) => { reject = r; }),
+    }); await settle();
     runInContext(`
       let hidden = false;
       const count = { textContent: "1", classList: { add() {} } };
