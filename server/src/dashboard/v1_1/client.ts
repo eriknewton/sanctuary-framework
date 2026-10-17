@@ -2986,19 +2986,21 @@ async function onConciergeSend() {
     // scroll-follow intent.
     if (talkOwner) talkOwner.input.value = "";
     const data = res.data || {};
-    // Update the badge directly from the response so it reflects what
-    // served THIS query even before the next render.
+    // Refetch history so both operator submit + concierge response
+    // render in chronological order. The service persisted both
+    // messages before the response returned; the history endpoint is
+    // the single source of truth for the visible thread.
+    await refreshPanel(HUB + "/chat/concierge/history");
+    // Update the badge from the response AFTER the history refresh: the
+    // history loader (fetchConciergeHistory) writes a generic per-substrate
+    // label from the last reply, and the response carries the more specific
+    // display_label for THIS reply, which must be the one left standing.
     if (data.served_by) {
       state.chat.concierge.badge = {
         substrate: data.served_by,
         displayLabel: data.display_label || substrateBadgeLabel(data.served_by)
       };
     }
-    // Refetch history so both operator submit + concierge response
-    // render in chronological order. The service persisted both
-    // messages before the response returned; the history endpoint is
-    // the single source of truth for the visible thread.
-    await refreshPanel(HUB + "/chat/concierge/history");
     if (!talkDomOwnerSupported) c.pendingScroll = true;
   } catch (e) {
     // After the POST settled, the only thing that can throw is the redraw of
